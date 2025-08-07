@@ -9,6 +9,7 @@ import {
 } from '@/lib/db/queries';
 import type { VisibilityType } from '@/components/visibility-selector';
 import { myProvider } from '@/lib/ai/providers';
+import { searchGroups, type SearchGroupId } from '@/lib/utils';
 
 export async function saveChatModelAsCookie(model: string) {
   const cookieStore = await cookies();
@@ -50,4 +51,35 @@ export async function updateChatVisibility({
   visibility: VisibilityType;
 }) {
   await updateChatVisiblityById({ chatId, visibility });
+}
+
+export async function getGroupConfig(groupId: SearchGroupId) {
+  const group = searchGroups.find(g => g.id === groupId);
+  const instructions = group?.description || 'You are a helpful AI assistant.';
+
+  let activeTools: string[] = [];
+  switch (groupId) {
+    case 'web':
+      activeTools = ['webSearch'];
+      break;
+    case 'academic':
+      activeTools = ['academicSearch'];
+      break;
+    case 'analysis':
+      activeTools = ['codeInterpreter', 'datetime'];
+      break;
+    case 'extreme':
+      activeTools = ['extremeSearch'];
+      break;
+    case 'chat':
+      activeTools = ['getWeather', 'createDocument', 'updateDocument', 'requestSuggestions', 'webSearch', 'datetime', 'extremeSearch', 'academicSearch', 'codeInterpreter'];
+      break;
+    default:
+      activeTools = ['getWeather', 'createDocument', 'updateDocument', 'requestSuggestions', 'webSearch', 'datetime', 'extremeSearch', 'academicSearch', 'codeInterpreter']; // Fallback to chat tools with web search
+  }
+
+  return {
+    tools: activeTools,
+    instructions: instructions,
+  };
 }

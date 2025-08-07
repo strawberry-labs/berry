@@ -18,7 +18,7 @@ import {
   saveMessages,
 } from '@/lib/db/queries';
 import { convertToUIMessages, generateUUID } from '@/lib/utils';
-import { generateTitleFromUserMessage } from '../../actions';
+import { generateTitleFromUserMessage, getGroupConfig } from '../../actions';
 import { createDocument } from '@/lib/ai/tools/create-document';
 import { updateDocument } from '@/lib/ai/tools/update-document';
 import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
@@ -37,6 +37,15 @@ import { ChatSDKError } from '@/lib/errors';
 import type { ChatMessage } from '@/lib/types';
 import type { ChatModel } from '@/lib/ai/models';
 import type { VisibilityType } from '@/components/visibility-selector';
+
+// Import new tools
+import {
+  webSearchTool,
+  academicSearchTool,
+  codeInterpreterTool,
+  extremeSearchTool,
+  datetimeTool,
+} from '@/lib/tools';
 
 export const maxDuration = 60;
 
@@ -78,11 +87,13 @@ export async function POST(request: Request) {
       message,
       selectedChatModel,
       selectedVisibilityType,
+      selectedSearchMode = 'chat',
     }: {
       id: string;
       message: ChatMessage;
       selectedChatModel: ChatModel['id'];
       selectedVisibilityType: VisibilityType;
+      selectedSearchMode?: 'web' | 'analysis' | 'academic' | 'extreme' | 'chat';
     } = requestBody;
 
     const session = await auth();
@@ -149,32 +160,34 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
+    const groupConfig = await getGroupConfig(selectedSearchMode);
+
     const stream = createUIMessageStream({
       execute: ({ writer: dataStream }) => {
+        // Define the complete tool set with proper typing
+        const allTools = {
+          getWeather,
+          createDocument: createDocument({ session, dataStream }),
+          updateDocument: updateDocument({ session, dataStream }),
+          requestSuggestions: requestSuggestions({
+            session,
+            dataStream,
+          }),
+          webSearch: webSearchTool(dataStream),
+          academicSearch: academicSearchTool,
+          codeInterpreter: codeInterpreterTool,
+          extremeSearch: extremeSearchTool(dataStream),
+          datetime: datetimeTool,
+        };
+
         const result = streamText({
           model: myProvider.languageModel(selectedChatModel),
           system: systemPrompt({ selectedChatModel, requestHints }),
           messages: convertToModelMessages(uiMessages),
           stopWhen: stepCountIs(5),
-          experimental_activeTools:
-            selectedChatModel === 'chat-model-reasoning'
-              ? []
-              : [
-                  'getWeather',
-                  'createDocument',
-                  'updateDocument',
-                  'requestSuggestions',
-                ],
+          activeTools: groupConfig.tools as (keyof typeof allTools)[],
           experimental_transform: smoothStream({ chunking: 'word' }),
-          tools: {
-            getWeather,
-            createDocument: createDocument({ session, dataStream }),
-            updateDocument: updateDocument({ session, dataStream }),
-            requestSuggestions: requestSuggestions({
-              session,
-              dataStream,
-            }),
-          },
+          tools: allTools,
           experimental_telemetry: {
             isEnabled: isProductionEnvironment,
             functionId: 'stream-text',

@@ -1,0 +1,42 @@
+import React from 'react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { searchGroups, type SearchGroupId } from '@/lib/utils';
+import { Zap } from 'lucide-react';
+
+interface SearchModeSelectorProps {
+  selectedMode: SearchGroupId;
+  onModeChange: (mode: SearchGroupId) => void;
+  className?: string;
+}
+
+export function SearchModeSelector({
+  selectedMode,
+  onModeChange,
+  className = '',
+}: SearchModeSelectorProps) {
+  const selectedGroup = searchGroups.find(group => group.id === selectedMode);
+
+  return (
+    <div className={`flex items-center gap-2 ${className}`}>
+      <Zap className="h-4 w-4 text-muted-foreground" />
+      <span className="text-sm text-muted-foreground whitespace-nowrap">Mode:</span>
+      <Select value={selectedMode} onValueChange={onModeChange}>
+        <SelectTrigger className="w-auto min-w-[120px] h-8 text-xs">
+          <SelectValue>
+            {selectedGroup?.name || 'Chat'}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {searchGroups.map((group) => (
+            <SelectItem key={group.id} value={group.id}>
+              <div className="flex flex-col gap-1">
+                <div className="font-medium">{group.name}</div>
+                <div className="text-xs text-muted-foreground">{group.description}</div>
+              </div>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+} 

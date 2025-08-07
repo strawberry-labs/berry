@@ -11,3 +11,6 @@ export const isTestEnvironment = Boolean(
 export const guestRegex = /^guest-\d+$/;
 
 export const DUMMY_PASSWORD = generateDummyPassword();
+
+// Daytona snapshot name for code execution
+export const SNAPSHOT_NAME = 'default-python-env';

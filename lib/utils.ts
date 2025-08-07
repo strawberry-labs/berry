@@ -63,6 +63,42 @@ export function generateUUID(): string {
   });
 }
 
+// Search Groups Configuration
+export const searchGroups = [
+  {
+    id: 'web' as const,
+    name: 'Web Search',
+    description: 'General web search with multiple queries and sources',
+    show: true,
+  },
+  {
+    id: 'analysis' as const,
+    name: 'Analysis',
+    description: 'Code execution, stock charts, and currency conversion',
+    show: true,
+  },
+  {
+    id: 'academic' as const,
+    name: 'Academic',
+    description: 'Search academic papers powered by Exa',
+    show: true,
+  },
+  {
+    id: 'extreme' as const,
+    name: 'Extreme',
+    description: 'Deep research with multiple sources and analysis',
+    show: true,
+  },
+  {
+    id: 'chat' as const,
+    name: 'Chat',
+    description: 'Direct conversation with document and weather tools',
+    show: true,
+  },
+] as const;
+
+export type SearchGroupId = typeof searchGroups[number]['id'];
+
 type ResponseMessageWithoutId = CoreToolMessage | CoreAssistantMessage;
 type ResponseMessage = ResponseMessageWithoutId & { id: string };
 

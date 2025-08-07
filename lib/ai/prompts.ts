@@ -33,7 +33,7 @@ Do not update document right after creating it. Wait for user feedback or reques
 `;
 
 export const regularPrompt =
-  'You are a friendly assistant! Keep your responses concise and helpful.';
+  'You are a friendly assistant! Keep your responses concise and helpful. When users ask about current events, news, recent developments, product releases, or information that requires up-to-date knowledge, use the webSearch tool to find the latest information. For general conversation, weather, or document creation tasks, use the appropriate tools available to you.';
 
 export interface RequestHints {
   latitude: Geo['latitude'];
@@ -60,7 +60,7 @@ export const systemPrompt = ({
   const requestPrompt = getRequestPromptFromHints(requestHints);
 
   if (selectedChatModel === 'chat-model-reasoning') {
-    return `${regularPrompt}\n\n${requestPrompt}`;
+    return `${regularPrompt}\n\n${requestPrompt}\n${artifactsPrompt}`;
   } else {
     return `${regularPrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
   }

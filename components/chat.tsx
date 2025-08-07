@@ -12,7 +12,7 @@ import { MultimodalInput } from './multimodal-input';
 import { Messages } from './messages';
 import { Greeting } from './greeting';
 import type { VisibilityType } from './visibility-selector';
-import { useArtifactSelector } from '@/hooks/use-artifact';
+import { useArtifact, useArtifactSelector } from '@/hooks/use-artifact';
 import { unstable_serialize } from 'swr/infinite';
 import { getChatHistoryPaginationKey } from './sidebar-history';
 import { toast } from './toast';
@@ -23,6 +23,7 @@ import { useAutoResume } from '@/hooks/use-auto-resume';
 import { ChatSDKError } from '@/lib/errors';
 import type { Attachment, ChatMessage } from '@/lib/types';
 import { useDataStream } from './data-stream-provider';
+import type { SearchGroupId } from '@/lib/utils';
 
 export function Chat({
   id,
@@ -50,6 +51,12 @@ export function Chat({
   const { setDataStream } = useDataStream();
 
   const [input, setInput] = useState<string>('');
+  const [currentChatModel, setCurrentChatModel] = useState<string>(initialChatModel);
+  const [selectedSearchMode, setSelectedSearchMode] = useState<SearchGroupId>('chat');
+
+  const handleSearchModeChange = (mode: SearchGroupId) => {
+    setSelectedSearchMode(mode);
+  };
 
   const {
     messages,
@@ -72,8 +79,9 @@ export function Chat({
           body: {
             id,
             message: messages.at(-1),
-            selectedChatModel: initialChatModel,
+            selectedChatModel: currentChatModel,
             selectedVisibilityType: visibilityType,
+            selectedSearchMode,
             ...body,
           },
         };
@@ -102,15 +110,10 @@ export function Chat({
 
   useEffect(() => {
     if (query && !hasAppendedQuery) {
-      sendMessage({
-        role: 'user' as const,
-        parts: [{ type: 'text', text: query }],
-      });
-
+      // Handle query parameter logic here
       setHasAppendedQuery(true);
-      window.history.replaceState({}, '', `/chat/${id}`);
     }
-  }, [query, sendMessage, hasAppendedQuery, id]);
+  }, [query, hasAppendedQuery]);
 
   const { data: votes } = useSWR<Array<Vote>>(
     messages.length >= 2 ? `/api/vote?chatId=${id}` : null,
@@ -119,6 +122,8 @@ export function Chat({
 
   const [attachments, setAttachments] = useState<Array<Attachment>>([]);
   const isArtifactVisible = useArtifactSelector((state) => state.isVisible);
+  
+  const [scrollData, setScrollData] = useState<{ isAtBottom: boolean; scrollToBottom: () => void } | null>(null);
 
   useAutoResume({
     autoResume,
@@ -132,18 +137,16 @@ export function Chat({
       <div className="flex flex-col min-w-0 h-dvh bg-background">
         <ChatHeader
           chatId={id}
-          selectedModelId={initialChatModel}
           selectedVisibilityType={initialVisibilityType}
           isReadonly={isReadonly}
-          session={session}
         />
 
         {messages.length === 0 ? (
           // Empty chat state: center chat input vertically, logo above it
           <div className="flex items-center justify-center flex-1 relative">
             {/* Berry logo positioned above the centered chat input */}
-            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-full pb-16">
-              <Greeting />
+            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-full pb-20">
+              <Greeting key="berry-greeting" />
             </div>
             
             {/* Chat input centered vertically */}
@@ -161,6 +164,12 @@ export function Chat({
                   setMessages={setMessages}
                   sendMessage={sendMessage}
                   selectedVisibilityType={visibilityType}
+                  selectedModelId={currentChatModel}
+                  session={session}
+                  onModelChange={setCurrentChatModel}
+                  scrollData={scrollData}
+                  selectedSearchMode={selectedSearchMode}
+                  onSearchModeChange={handleSearchModeChange}
                 />
               )}
             </form>
@@ -168,22 +177,20 @@ export function Chat({
         ) : (
           // Chat with messages: normal layout
           <>
-            <div className="flex justify-center w-full flex-1">
-              <div className="w-full max-w-3xl flex flex-col">
-                <Messages
-                  chatId={id}
-                  status={status}
-                  votes={votes}
-                  messages={messages}
-                  setMessages={setMessages}
-                  regenerate={regenerate}
-                  isReadonly={isReadonly}
-                  isArtifactVisible={isArtifactVisible}
-                />
-              </div>
-            </div>
+            <Messages
+              chatId={id}
+              status={status}
+              votes={votes}
+              messages={messages}
+              setMessages={setMessages}
+              regenerate={regenerate}
+              isReadonly={isReadonly}
+              isArtifactVisible={isArtifactVisible}
+              onScrollDataReady={setScrollData}
+            />
 
-            <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
+            <div className="flex-shrink-0">
+              <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
               {!isReadonly && (
                 <MultimodalInput
                   chatId={id}
@@ -197,9 +204,16 @@ export function Chat({
                   setMessages={setMessages}
                   sendMessage={sendMessage}
                   selectedVisibilityType={visibilityType}
+                  selectedModelId={currentChatModel}
+                  session={session}
+                  onModelChange={setCurrentChatModel}
+                  scrollData={scrollData}
+                  selectedSearchMode={selectedSearchMode}
+                  onSearchModeChange={handleSearchModeChange}
                 />
               )}
-            </form>
+              </form>
+            </div>
           </>
         )}
       </div>
@@ -219,6 +233,11 @@ export function Chat({
         votes={votes}
         isReadonly={isReadonly}
         selectedVisibilityType={visibilityType}
+        selectedSearchMode={selectedSearchMode}
+        onSearchModeChange={handleSearchModeChange}
+        session={session}
+        selectedModelId={currentChatModel}
+        onModelChange={setCurrentChatModel}
       />
     </>
   );

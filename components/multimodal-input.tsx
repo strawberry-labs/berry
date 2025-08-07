@@ -21,13 +21,18 @@ import { PreviewAttachment } from './preview-attachment';
 import { Button } from './ui/button';
 import { Textarea } from './ui/textarea';
 import { SuggestedActions } from './suggested-actions';
+import { DictateButton } from './dictate-button';
 import equal from 'fast-deep-equal';
 import type { UseChatHelpers } from '@ai-sdk/react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowDown } from 'lucide-react';
-import { useScrollToBottom } from '@/hooks/use-scroll-to-bottom';
+
 import type { VisibilityType } from './visibility-selector';
 import type { Attachment, ChatMessage } from '@/lib/types';
+import { ModelSelector } from './model-selector';
+import type { Session } from 'next-auth';
+import { SearchModeSelector } from './search-mode-selector';
+import type { SearchGroupId } from '@/lib/utils';
 
 function PureMultimodalInput({
   chatId,
@@ -42,6 +47,12 @@ function PureMultimodalInput({
   sendMessage,
   className,
   selectedVisibilityType,
+  selectedModelId,
+  session,
+  onModelChange,
+  scrollData,
+  selectedSearchMode,
+  onSearchModeChange,
 }: {
   chatId: string;
   input: string;
@@ -55,6 +66,12 @@ function PureMultimodalInput({
   sendMessage: UseChatHelpers<ChatMessage>['sendMessage'];
   className?: string;
   selectedVisibilityType: VisibilityType;
+  selectedModelId: string;
+  session: Session;
+  onModelChange?: (modelId: string) => void;
+  scrollData?: { isAtBottom: boolean; scrollToBottom: () => void } | null;
+  selectedSearchMode: SearchGroupId;
+  onSearchModeChange: (mode: SearchGroupId) => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { width } = useWindowSize();
@@ -67,15 +84,31 @@ function PureMultimodalInput({
 
   const adjustHeight = () => {
     if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight + 2}px`;
+      const textarea = textareaRef.current;
+      textarea.style.height = 'auto'; // Reset height to recalculate
+
+      const computedStyle = window.getComputedStyle(textarea);
+      const lineHeight = parseFloat(computedStyle.lineHeight) || 0;
+      const paddingTop = parseFloat(computedStyle.paddingTop) || 0;
+      const paddingBottom = parseFloat(computedStyle.paddingBottom) || 0;
+
+      const maxLines = 13;
+      const maxHeight = maxLines * lineHeight + paddingTop + paddingBottom;
+
+      if (textarea.scrollHeight > maxHeight) {
+        textarea.style.height = `${maxHeight}px`;
+        textarea.style.overflowY = 'auto';
+      } else {
+        textarea.style.height = `${textarea.scrollHeight}px`;
+        textarea.style.overflowY = 'hidden';
+      }
     }
   };
 
   const resetHeight = () => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = '98px';
+      textareaRef.current.style.overflowY = 'hidden';
     }
   };
 
@@ -99,11 +132,28 @@ function PureMultimodalInput({
   useEffect(() => {
     setLocalStorageInput(input);
   }, [input, setLocalStorageInput]);
+  
+  // Adjust height on input change
+  useEffect(() => {
+    adjustHeight();
+  }, [input]);
 
   const handleInput = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(event.target.value);
-    adjustHeight();
   };
+
+  const handleTranscriptionReceived = useCallback((transcription: string) => {
+    setInput(currentInput => {
+      console.log('Transcription received:', transcription);
+      console.log('Current input:', currentInput);
+      const trimmedTranscription = transcription.trim();
+      if (currentInput.endsWith(' ') || currentInput.length === 0) {
+        return `${currentInput}${trimmedTranscription}`;
+      } else {
+        return `${currentInput} ${trimmedTranscription}`;
+      }
+    });
+  }, [setInput]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadQueue, setUploadQueue] = useState<Array<string>>([]);
@@ -199,16 +249,17 @@ function PureMultimodalInput({
     [setAttachments],
   );
 
-  const { isAtBottom, scrollToBottom } = useScrollToBottom();
+  const isAtBottom = scrollData?.isAtBottom ?? false;
+  const scrollToBottom = scrollData?.scrollToBottom ?? (() => {});
 
   useEffect(() => {
-    if (status === 'submitted') {
+    if (status === 'submitted' && scrollToBottom) {
       scrollToBottom();
     }
   }, [status, scrollToBottom]);
 
   return (
-    <div className="relative w-full flex flex-col gap-4">
+    <div className={`relative w-full flex gap-4 ${messages.length > 0 ? 'flex-col-reverse' : 'flex-col'}`}>
       <AnimatePresence>
         {!isAtBottom && messages.length > 0 && (
           <motion.div
@@ -256,7 +307,7 @@ function PureMultimodalInput({
       {(attachments.length > 0 || uploadQueue.length > 0) && (
         <div
           data-testid="attachments-preview"
-          className="flex flex-row gap-2 overflow-x-scroll items-end"
+          className="flex flex-row gap-2 overflow-x-auto items-end mb-3"
         >
           {attachments.map((attachment) => (
             <PreviewAttachment key={attachment.url} attachment={attachment} />
@@ -276,49 +327,75 @@ function PureMultimodalInput({
         </div>
       )}
 
-      <Textarea
-        data-testid="multimodal-input"
-        ref={textareaRef}
-        placeholder="Send a message..."
-        value={input}
-        onChange={handleInput}
-        className={cx(
-          'min-h-[24px] max-h-[calc(75dvh)] overflow-hidden resize-none rounded-2xl text-base! bg-muted pb-10 dark:border-zinc-700 focus-visible:ring-0 focus-visible:ring-offset-0',
-          className,
-        )}
-        rows={2}
-        autoFocus
-        onKeyDown={(event) => {
-          if (
-            event.key === 'Enter' &&
-            !event.shiftKey &&
-            !event.nativeEvent.isComposing
-          ) {
-            event.preventDefault();
+      {/* Input Container with unified background */}
+      <div className="relative rounded-xl bg-muted border border-border">
+        <Textarea
+          data-testid="multimodal-input"
+          ref={textareaRef}
+          placeholder="Ask anything..."
+          value={input}
+          onChange={handleInput}
+          className={cx(
+            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled text-base',
+            attachments.length > 0 || uploadQueue.length > 0 
+              ? 'pt-3 px-3 pb-0 rounded-none' 
+              : 'pt-3 px-3 pb-0 rounded-t-xl',
+            className,
+          )}
+          rows={1}
+          autoFocus
+          onKeyDown={(event) => {
+            if (
+              event.key === 'Enter' &&
+              !event.shiftKey &&
+              !event.nativeEvent.isComposing
+            ) {
+              event.preventDefault();
 
-            if (status !== 'ready') {
-              toast.error('Please wait for the model to finish its response!');
-            } else {
-              submitForm();
+              if (status !== 'ready') {
+                toast.error('Please wait for the model to finish its response!');
+              } else {
+                submitForm();
+              }
             }
-          }
-        }}
-      />
-
-      <div className="absolute bottom-0 p-2 w-fit flex flex-row justify-start">
-        <AttachmentsButton fileInputRef={fileInputRef} status={status} />
-      </div>
-
-      <div className="absolute bottom-0 right-0 p-2 w-fit flex flex-row justify-end">
-        {status === 'submitted' ? (
-          <StopButton stop={stop} setMessages={setMessages} />
-        ) : (
-          <SendButton
-            input={input}
-            submitForm={submitForm}
-            uploadQueue={uploadQueue}
-          />
-        )}
+          }}
+        />
+        
+        {/* Bottom toolbar inside the container */}
+        <div className="flex items-center justify-between px-3 py-2 rounded-b-xl bg-muted">
+          <div className="flex items-center gap-2">
+            <AttachmentsButton fileInputRef={fileInputRef} status={status} />
+            <DictateButton 
+              onTranscriptionReceived={handleTranscriptionReceived} 
+              status={status} 
+            />
+            <SearchModeSelector
+              selectedMode={selectedSearchMode}
+              onModeChange={onSearchModeChange}
+              className="ml-1"
+            />
+          </div>
+          
+          <div className="flex items-center gap-2">
+            <ModelSelector
+              session={session}
+              selectedModelId={selectedModelId}
+              onModelChange={onModelChange}
+              className="mr-1"
+              variant="ghost"
+              size="sm"
+            />
+            {status === 'submitted' ? (
+              <StopButton stop={stop} setMessages={setMessages} />
+            ) : (
+              <SendButton
+                input={input}
+                submitForm={submitForm}
+                uploadQueue={uploadQueue}
+              />
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -332,6 +409,11 @@ export const MultimodalInput = memo(
     if (!equal(prevProps.attachments, nextProps.attachments)) return false;
     if (prevProps.selectedVisibilityType !== nextProps.selectedVisibilityType)
       return false;
+    if (prevProps.selectedModelId !== nextProps.selectedModelId) return false;
+    if (prevProps.onModelChange !== nextProps.onModelChange) return false;
+    if (prevProps.selectedSearchMode !== nextProps.selectedSearchMode) return false;
+    if (prevProps.onSearchModeChange !== nextProps.onSearchModeChange) return false;
+    if (!equal(prevProps.scrollData, nextProps.scrollData)) return false;
 
     return true;
   },
@@ -347,15 +429,17 @@ function PureAttachmentsButton({
   return (
     <Button
       data-testid="attachments-button"
-      className="rounded-md rounded-bl-lg p-[7px] h-fit dark:border-zinc-700 dark:hover:bg-zinc-900 hover:bg-zinc-200"
+      className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-accent rounded-full"
       onClick={(event) => {
         event.preventDefault();
         fileInputRef.current?.click();
       }}
       disabled={status !== 'ready'}
       variant="ghost"
+      size="sm"
+      title="Attach files"
     >
-      <PaperclipIcon size={14} />
+      <PaperclipIcon size={16} />
     </Button>
   );
 }
@@ -372,14 +456,16 @@ function PureStopButton({
   return (
     <Button
       data-testid="stop-button"
-      className="rounded-full p-1.5 h-fit border dark:border-zinc-600"
+      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80"
       onClick={(event) => {
         event.preventDefault();
         stop();
         setMessages((messages) => messages);
       }}
+      size="sm"
+      title="Stop generation"
     >
-      <StopIcon size={14} />
+      <StopIcon size={16} />
     </Button>
   );
 }
@@ -398,14 +484,16 @@ function PureSendButton({
   return (
     <Button
       data-testid="send-button"
-      className="rounded-full p-1.5 h-fit border dark:border-zinc-600"
+      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80 disabled:bg-muted-foreground/30"
       onClick={(event) => {
         event.preventDefault();
         submitForm();
       }}
       disabled={input.length === 0 || uploadQueue.length > 0}
+      size="sm"
+      title="Send message"
     >
-      <ArrowUpIcon size={14} />
+      <ArrowUpIcon size={16} />
     </Button>
   );
 }

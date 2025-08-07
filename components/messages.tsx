@@ -1,6 +1,6 @@
 import { PreviewMessage, ThinkingMessage } from './message';
 import { Greeting } from './greeting';
-import { memo } from 'react';
+import { memo, useEffect } from 'react';
 import type { Vote } from '@/lib/db/schema';
 import equal from 'fast-deep-equal';
 import type { UseChatHelpers } from '@ai-sdk/react';
@@ -18,6 +18,7 @@ interface MessagesProps {
   regenerate: UseChatHelpers<ChatMessage>['regenerate'];
   isReadonly: boolean;
   isArtifactVisible: boolean;
+  onScrollDataReady?: (data: { isAtBottom: boolean; scrollToBottom: () => void }) => void;
 }
 
 function PureMessages({
@@ -28,6 +29,7 @@ function PureMessages({
   setMessages,
   regenerate,
   isReadonly,
+  onScrollDataReady,
 }: MessagesProps) {
   const {
     containerRef: messagesContainerRef,
@@ -35,18 +37,30 @@ function PureMessages({
     onViewportEnter,
     onViewportLeave,
     hasSentMessage,
+    isAtBottom,
+    scrollToBottom,
   } = useMessages({
     chatId,
     status,
   });
 
+  // Provide scroll data to parent component
+  useEffect(() => {
+    if (onScrollDataReady) {
+      onScrollDataReady({ isAtBottom, scrollToBottom });
+    }
+  }, [onScrollDataReady, isAtBottom, scrollToBottom]);
+
   useDataStream();
 
   return (
-    <div
+    <div 
       ref={messagesContainerRef}
-      className="flex flex-col min-w-0 gap-6 flex-1 overflow-y-scroll pt-4 relative"
+      className="w-full flex-1 min-h-0 overflow-y-auto"
     >
+      <div className="flex justify-center w-full min-h-full">
+        <div className="w-full max-w-3xl flex flex-col gap-6 pt-4 relative"
+        >
 
       {messages.map((message, index) => (
         <PreviewMessage
@@ -78,6 +92,8 @@ function PureMessages({
         onViewportLeave={onViewportLeave}
         onViewportEnter={onViewportEnter}
       />
+        </div>
+      </div>
     </div>
   );
 }

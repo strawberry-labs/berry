@@ -20,10 +20,12 @@ import type { Session } from 'next-auth';
 export function ModelSelector({
   session,
   selectedModelId,
+  onModelChange,
   className,
 }: {
   session: Session;
   selectedModelId: string;
+  onModelChange?: (modelId: string) => void;
 } & React.ComponentProps<typeof Button>) {
   const [open, setOpen] = useState(false);
   const [optimisticModelId, setOptimisticModelId] =
@@ -76,6 +78,7 @@ export function ModelSelector({
                 startTransition(() => {
                   setOptimisticModelId(id);
                   saveChatModelAsCookie(id);
+                  onModelChange?.(id);
                 });
               }}
               data-active={id === optimisticModelId}

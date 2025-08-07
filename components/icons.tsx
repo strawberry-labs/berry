@@ -831,6 +831,20 @@ export const ChevronDownIcon = ({ size = 16 }: { size?: number }) => (
   </svg>
 );
 
+import Image from 'next/image';
+
+export const BerryIcon = ({ size = 16 }: { size?: number }) => {
+  return (
+    <Image
+      src="/images/berry-logo.png"
+      alt="Berry Logo"
+      width={size}
+      height={size}
+      className="rounded-sm"
+    />
+  );
+};
+
 export const SparklesIcon = ({ size = 16 }: { size?: number }) => (
   <svg
     height={size}
@@ -1167,6 +1181,25 @@ export const WarningIcon = ({ size = 16 }: { size?: number }) => {
         fillRule="evenodd"
         clipRule="evenodd"
         d="M8.55846 0.5C9.13413 0.5 9.65902 0.829456 9.90929 1.34788L15.8073 13.5653C16.1279 14.2293 15.6441 15 14.9068 15H1.09316C0.355835 15 -0.127943 14.2293 0.192608 13.5653L6.09065 1.34787C6.34092 0.829454 6.86581 0.5 7.44148 0.5H8.55846ZM8.74997 4.75V5.5V8V8.75H7.24997V8V5.5V4.75H8.74997ZM7.99997 12C8.55226 12 8.99997 11.5523 8.99997 11C8.99997 10.4477 8.55226 10 7.99997 10C7.44769 10 6.99997 10.4477 6.99997 11C6.99997 11.5523 7.44769 12 7.99997 12Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+};
+
+export const MicrophoneIcon = ({ size = 16 }: { size?: number }) => {
+  return (
+    <svg
+      height={size}
+      strokeLinejoin="round"
+      viewBox="0 0 16 16"
+      width={size}
+      style={{ color: 'currentcolor' }}
+    >
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M8 1C7.17157 1 6.5 1.67157 6.5 2.5V8C6.5 8.82843 7.17157 9.5 8 9.5C8.82843 9.5 9.5 8.82843 9.5 8V2.5C9.5 1.67157 8.82843 1 8 1ZM5 2.5C5 0.843146 6.34315 -0.5 8 -0.5C9.65685 -0.5 11 0.843146 11 2.5V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V2.5ZM3.75 7V7.75H2.25V7C2.25 5.20507 3.70507 3.75 5.5 3.75H5.75V5.25H5.5C4.53351 5.25 3.75 6.03351 3.75 7ZM12.25 7V7.75H13.75V7C13.75 3.82436 11.1756 1.25 8 1.25V2.75C10.3472 2.75 12.25 4.65279 12.25 7ZM8 12.5C11.1756 12.5 13.75 9.92564 13.75 6.75V6H12.25V6.75C12.25 9.09721 10.3472 11 8 11V12.5ZM7.25 13.5V12.5H8.75V13.5V15.25V16H7.25V15.25V13.5Z"
         fill="currentColor"
       />
     </svg>
