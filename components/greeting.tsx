@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion';
-import Image from 'next/image';
 import { memo } from 'react';
+import { BerryIcon } from './icons';
 
 const PureGreeting = () => {
   return (
@@ -15,13 +15,7 @@ const PureGreeting = () => {
           transition={{ delay: 0.5 }}
           className="flex items-center gap-0"
         >
-          <Image
-            src="/images/berry-logo.png"
-            alt="Berry Logo"
-            width={100}
-            height={100}
-            className="rounded-lg -translate-y-2"
-          />
+          <BerryIcon size={100} className="-translate-y-2" />
           <span className="text-6xl font-bold text-foreground">Berry</span>
         </motion.div>
     </div>

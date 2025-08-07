@@ -4,6 +4,7 @@ import {
   wrapLanguageModel,
 } from 'ai';
 import { xai } from '@ai-sdk/xai';
+import { groq } from '@ai-sdk/groq';
 import {
   artifactModel,
   chatModel,
@@ -31,6 +32,7 @@ export const myProvider = isTestEnvironment
         'title-model': xai('grok-2-1212'),
         'artifact-model': xai('grok-2-1212'),
         'grok-3-mini': xai('grok-3-mini'),
+        'berry-b1': groq('openai/gpt-oss-120b'),
       },
       imageModels: {
         'small-model': xai.imageModel('grok-2-image'),

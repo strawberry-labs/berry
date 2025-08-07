@@ -35,6 +35,9 @@ Do not update document right after creating it. Wait for user feedback or reques
 export const regularPrompt =
   'You are a friendly assistant! Keep your responses concise and helpful. When users ask about current events, news, recent developments, product releases, or information that requires up-to-date knowledge, use the webSearch tool to find the latest information. For general conversation, weather, or document creation tasks, use the appropriate tools available to you.';
 
+export const berryB1Prompt =
+  'You are Berry B1, an advanced AI assistant made by StrawberryLabs. You are designed to provide thoughtful, accurate, and helpful responses. Keep your responses concise and helpful. When users ask about current events, news, recent developments, product releases, or information that requires up-to-date knowledge, use the webSearch tool to find the latest information. For general conversation, weather, or document creation tasks, use the appropriate tools available to you.';
+
 export interface RequestHints {
   latitude: Geo['latitude'];
   longitude: Geo['longitude'];
@@ -58,11 +61,14 @@ export const systemPrompt = ({
   requestHints: RequestHints;
 }) => {
   const requestPrompt = getRequestPromptFromHints(requestHints);
+  
+  // Use custom prompt for Berry B1 model
+  const basePrompt = selectedChatModel === 'berry-b1' ? berryB1Prompt : regularPrompt;
 
   if (selectedChatModel === 'chat-model-reasoning') {
-    return `${regularPrompt}\n\n${requestPrompt}\n${artifactsPrompt}`;
+    return `${basePrompt}\n\n${requestPrompt}\n${artifactsPrompt}`;
   } else {
-    return `${regularPrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
+    return `${basePrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
   }
 };
 

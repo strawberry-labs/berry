@@ -22,4 +22,9 @@ export const chatModels: Array<ChatModel> = [
     name: 'Grok 3 Mini',
     description: 'Fast and efficient reasoning model',
   },
+  {
+    id: 'berry-b1',
+    name: 'Berry B1',
+    description: 'Advanced reasoning model by Strawberry Labs',
+  },
 ];

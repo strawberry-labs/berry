@@ -88,12 +88,6 @@ export async function POST(request: Request) {
       selectedChatModel,
       selectedVisibilityType,
       selectedSearchMode = 'chat',
-    }: {
-      id: string;
-      message: ChatMessage;
-      selectedChatModel: ChatModel['id'];
-      selectedVisibilityType: VisibilityType;
-      selectedSearchMode?: 'web' | 'analysis' | 'academic' | 'extreme' | 'chat';
     } = requestBody;
 
     const session = await auth();
@@ -188,6 +182,14 @@ export async function POST(request: Request) {
           activeTools: groupConfig.tools as (keyof typeof allTools)[],
           experimental_transform: smoothStream({ chunking: 'word' }),
           tools: allTools,
+          ...(selectedChatModel === 'berry-b1' && {
+            providerOptions: {
+              groq: {
+                structuredOutputs: false,
+                parallelToolCalls: true,
+              },
+            },
+          }),
           experimental_telemetry: {
             isEnabled: isProductionEnvironment,
             functionId: 'stream-text',
@@ -196,11 +198,34 @@ export async function POST(request: Request) {
 
         result.consumeStream();
 
-        dataStream.merge(
-          result.toUIMessageStream({
-            sendReasoning: true,
-          }),
-        );
+        // Log Groq API response data when stream finishes
+        if (selectedChatModel === 'berry-b1') {
+          // Add logging for stream completion
+          dataStream.merge(
+            result.toUIMessageStream({
+              sendReasoning: true,
+            }).pipeThrough(
+              new TransformStream({
+                transform(chunk, controller) {
+                  // Log completion events
+                  if (chunk.type === 'finish') {
+                    console.log('✅ Groq API Stream Complete:', {
+                      model: selectedChatModel,
+                      timestamp: new Date().toISOString(),
+                    });
+                  }
+                  controller.enqueue(chunk);
+                },
+              })
+            )
+          );
+        } else {
+          dataStream.merge(
+            result.toUIMessageStream({
+              sendReasoning: true,
+            })
+          );
+        }
       },
       generateId: generateUUID,
       onFinish: async ({ messages }) => {

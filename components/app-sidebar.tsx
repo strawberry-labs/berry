@@ -3,7 +3,7 @@
 import type { User } from 'next-auth';
 import { useRouter } from 'next/navigation';
 
-import { PlusIcon } from '@/components/icons';
+import { PlusIcon, BerryIcon } from '@/components/icons';
 import { SidebarHistory } from '@/components/sidebar-history';
 import { SidebarUserNav } from '@/components/sidebar-user-nav';
 import { Button } from '@/components/ui/button';
@@ -34,9 +34,12 @@ export function AppSidebar({ user }: { user: User | undefined }) {
               }}
               className="flex flex-row gap-3 items-center"
             >
-              <span className="text-lg font-semibold px-2 hover:bg-muted rounded-md cursor-pointer">
-                Chatbot
-              </span>
+              <div className="flex items-center gap-2 px-2 hover:bg-muted cursor-pointer pt-1">
+                <BerryIcon size={22} />
+                <span className="text-lg font-semibold">
+                  Berry
+                </span>
+              </div>
             </Link>
             <Tooltip>
               <TooltipTrigger asChild>
