@@ -51,6 +51,13 @@ export const authConfig = {
 
       return session;
     },
+    async redirect({ url, baseUrl }) {
+      return url.startsWith(baseUrl) ? url : baseUrl + "/login";
+    },
+  },
+  pages: {
+    signIn: "/login",
+    error: "/login?error=failed",
   },
   secret: process.env.AUTH_SECRET,
 } satisfies NextAuthConfig

@@ -11,7 +11,7 @@ import { SubmitButton } from '@/components/submit-button';
 import { login, type LoginActionState } from '../actions';
 import { useSession } from 'next-auth/react';
 
-export default function Page() {
+export default function PageOld() {
   const router = useRouter();
 
   const [email, setEmail] = useState('');

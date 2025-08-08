@@ -19,6 +19,7 @@ export async function GET(request: NextRequest) {
 
   const session = await auth();
 
+
   if (!session?.user) {
     return new ChatSDKError('unauthorized:chat').toResponse();
   }

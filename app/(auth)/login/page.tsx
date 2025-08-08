@@ -1,14 +1,21 @@
-import { signIn } from "../auth"
+import { redirect } from 'next/navigation';
 
-export default function SignIn() {
+import { LoginForm } from '@/components/login-form';
+import { auth } from '../auth';
+
+export default async function Page() {
+
+  const session = await auth();
+
+  if(session){
+    redirect('/')
+  }
+
   return (
-    <form
-      action={async () => {
-        "use server"
-        await signIn("github")
-      }}
-    >
-      <button type="submit">Signin with GitHub</button>
-    </form>
+    <div className="bg-muted flex min-h-svh flex-col items-center justify-center p-6 md:p-10">
+      <div className="w-full max-w-sm md:max-w-[24 rem]">
+        <LoginForm />
+      </div>
+    </div>
   )
-} 
+}
