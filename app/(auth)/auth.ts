@@ -1,4 +1,5 @@
 import NextAuth, { NextAuthConfig, type DefaultSession } from 'next-auth';
+import Google from "next-auth/providers/google"
 import GitHub from 'next-auth/providers/github';
 import { DrizzleAdapter } from '@auth/drizzle-adapter';
 import { db } from '@/lib/db/db';
@@ -29,7 +30,7 @@ export const authConfig = {
     sessionsTable:sessions
   }), 
   providers: [
-    GitHub,
+    Google,GitHub,
   ],
   session:{
     strategy:"jwt"
