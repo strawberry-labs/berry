@@ -4,14 +4,18 @@ import { Chat } from '@/components/chat';
 import { DEFAULT_CHAT_MODEL } from '@/lib/ai/models';
 import { generateUUID } from '@/lib/utils';
 import { DataStreamHandler } from '@/components/data-stream-handler';
-import { auth } from '../(auth)/auth';
 import { redirect } from 'next/navigation';
+import { auth } from '../(auth)/auth';
+import { Session } from 'next-auth';
 
 export default async function Page() {
+
   const session = await auth();
 
+  console.log("session: ", session)
+  
   if (!session) {
-    redirect('/api/auth/guest');
+    redirect('/login');
   }
 
   const id = generateUUID();

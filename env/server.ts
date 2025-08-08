@@ -1,4 +1,6 @@
 export const serverEnv = {
+  // AUTH_GITHUB_ID:process.env.AUTH_GITHUB_ID!,
+  // AUTH_GITHUB_SECRET:process.env.AUTH_GITHUB_SECRET!,
   EXA_API_KEY: process.env.EXA_API_KEY!,
   DAYTONA_API_KEY: process.env.DAYTONA_API_KEY!,
   TAVILY_API_KEY: process.env.TAVILY_API_KEY,
