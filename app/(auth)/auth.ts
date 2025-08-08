@@ -1,4 +1,4 @@
-import NextAuth, { type DefaultSession } from 'next-auth';
+import NextAuth, { NextAuthConfig, type DefaultSession } from 'next-auth';
 import GitHub from 'next-auth/providers/github';
 import { DrizzleAdapter } from '@auth/drizzle-adapter';
 import { db } from '@/lib/db/db';
@@ -21,12 +21,7 @@ declare module 'next-auth' {
   }
 }
 
-export const {
-  handlers,
-  auth,
-  signIn,
-  signOut,
-} = NextAuth({
+export const authConfig = {
   adapter: DrizzleAdapter(db, {
     usersTable: user,
     accountsTable: accounts,
@@ -36,25 +31,33 @@ export const {
   providers: [
     GitHub,
   ],
-  //   session: {
-  //   strategy: "database", // Required for database sessions
-  // },
-  // debug: process.env.NODE_ENV === "development",
+  session:{
+    strategy:"jwt"
+  },
+  callbacks:{
+    async jwt({ token, user }) {
+      if (user) {
+        token.id = user.id as string;
+        token.type = user.type;
+      }
+
+      return token;
+    },
+    async session({ session, token }) {
+      if (session.user) {
+        session.user.id = token.id as string;
+        session.user.type = token.type as UserType;
+      }
+
+      return session;
+    },
+  },
   secret: process.env.AUTH_SECRET,
-  // callbacks: {
-  //   async jwt({ token, user }) {
-  //     if (user) {
-  //       token.id = user.id as string;
-  //       token.type = user.type || 'regular';
-  //     }
-  //     return token;
-  //   },
-  //   async session({ session, token }) {
-  //     if (session.user) {
-  //       session.user.id = token.id as string;
-  //       session.user.type = token.type as UserType;
-  //     }
-  //     return session;
-  //   },
-  //  },
-});
+} satisfies NextAuthConfig
+
+export const {
+  handlers,
+  auth,
+  signIn,
+  signOut,
+} = NextAuth(authConfig);
