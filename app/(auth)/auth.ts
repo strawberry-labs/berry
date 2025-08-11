@@ -1,18 +1,24 @@
-import { compare } from 'bcrypt-ts';
-import NextAuth, { type DefaultSession } from 'next-auth';
+import NextAuth, { NextAuthConfig, type DefaultSession } from 'next-auth';
+import Google from "next-auth/providers/google"
+import GitHub from 'next-auth/providers/github';
 import Credentials from 'next-auth/providers/credentials';
-import { createGuestUser, getUser } from '@/lib/db/queries';
-import { authConfig } from './auth.config';
-import { DUMMY_PASSWORD } from '@/lib/constants';
-import type { DefaultJWT } from 'next-auth/jwt';
+import { DrizzleAdapter } from '@auth/drizzle-adapter';
+import { db } from '@/lib/db/db';
+import { verificationTokens, user, accounts } from '@/lib/db/schema';
+// import { createGuestUser } from '@/lib/db/queries';
 
-export type UserType = 'guest' | 'regular';
+export type UserType = 'guest' | 'regular' | 'internal';
+
+export type UserRole = 'user' | 'admin'
+
+export type UserRoleWithGuest = UserRole | 'guest'
 
 declare module 'next-auth' {
   interface Session extends DefaultSession {
     user: {
       id: string;
       type: UserType;
+      role: UserRole
     } & DefaultSession['user'];
   }
 
@@ -20,73 +26,64 @@ declare module 'next-auth' {
     id?: string;
     email?: string | null;
     type: UserType;
+    role: UserRole;
   }
 }
 
-declare module 'next-auth/jwt' {
-  interface JWT extends DefaultJWT {
-    id: string;
-    type: UserType;
-  }
-}
-
-export const {
-  handlers: { GET, POST },
-  auth,
-  signIn,
-  signOut,
-} = NextAuth({
-  ...authConfig,
+export const authConfig = {
+  adapter: DrizzleAdapter(db, {
+    usersTable: user,
+    accountsTable: accounts,
+    verificationTokensTable: verificationTokens,
+  }), 
   providers: [
-    Credentials({
-      credentials: {},
-      async authorize({ email, password }: any) {
-        const users = await getUser(email);
-
-        if (users.length === 0) {
-          await compare(password, DUMMY_PASSWORD);
-          return null;
-        }
-
-        const [user] = users;
-
-        if (!user.password) {
-          await compare(password, DUMMY_PASSWORD);
-          return null;
-        }
-
-        const passwordsMatch = await compare(password, user.password);
-
-        if (!passwordsMatch) return null;
-
-        return { ...user, type: 'regular' };
-      },
-    }),
-    Credentials({
-      id: 'guest',
-      credentials: {},
-      async authorize() {
-        const [guestUser] = await createGuestUser();
-        return { ...guestUser, type: 'guest' };
-      },
-    }),
-  ],
-  callbacks: {
+    Google,GitHub
+  ], 
+  session:{
+    strategy:"jwt"
+  },
+  callbacks:{
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id as string;
-        token.type = user.type;
+        token.type = user.type || "regular";
+        token.role = user.role || 'guest';
       }
 
       return token;
     },
     async session({ session, token }) {
       if (session.user) {
-        session.user.id = token.id;
-        session.user.type = token.type;
+        session.user.id = token.id as string;
+        session.user.type = token.type as UserType;
+        session.user.role = token.role as UserRole
       }
-
       return session;
     },
+    // async redirect({ url, baseUrl }) {
+    //   return url.startsWith(baseUrl) ? url : baseUrl + "/login";
+    // },
+    async signIn({user, account, profile, email, credentials}){
+      const session = await auth();
+      console.log("session", session)
+      console.log("user", user)
+      console.log("account", account)
+      console.log("profile", profile)
+      console.log("email", email)
+      console.log("credentials", credentials)
+      return true
+    },
   },
-});
+  pages: {
+    signIn: "/login",
+    error: "/login?error=failed",
+  },
+  secret: process.env.AUTH_SECRET,
+} satisfies NextAuthConfig
+
+export const {
+  handlers,
+  auth,
+  signIn,
+  signOut,
+} = NextAuth(authConfig);

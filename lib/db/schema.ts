@@ -1,4 +1,7 @@
+import { UserRole } from '@/app/(auth)/auth';
 import type { InferSelectModel } from 'drizzle-orm';
+import  { type AdapterAccountType } from "next-auth/adapters"
+
 import {
   pgTable,
   varchar,
@@ -9,15 +12,96 @@ import {
   primaryKey,
   foreignKey,
   boolean,
+  integer,
 } from 'drizzle-orm/pg-core';
 
 export const user = pgTable('User', {
-  id: uuid('id').primaryKey().notNull().defaultRandom(),
-  email: varchar('email', { length: 64 }).notNull(),
-  password: varchar('password', { length: 64 }),
+  id: uuid('id').primaryKey().notNull().defaultRandom().primaryKey(),
+  name: text("name"),
+  email: text("email").notNull().unique(),
+  emailVerified: timestamp("emailVerified", { mode: "date" }),
+  image: text("image"),
+  role: text("role").$type<UserRole>().notNull().default("user")
 });
 
 export type User = InferSelectModel<typeof user>;
+
+export const accounts = pgTable(
+  "Account",
+  {
+    userId: uuid("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    type: text("type").$type<AdapterAccountType>().notNull(),
+    provider: text("provider").notNull(),
+    providerAccountId: text("providerAccountId").notNull(),
+    refresh_token: text("refresh_token"),
+    access_token: text("access_token"),
+    expires_at: integer("expires_at"),
+    token_type: text("token_type"),
+    scope: text("scope"),
+    id_token: text("id_token"),
+    session_state: text("session_state"),
+  },
+  (account) => ({
+    compoundKey: primaryKey({
+      columns: [account.provider, account.providerAccountId]
+    }),
+  })
+);
+
+export type Accounts = InferSelectModel<typeof accounts>;
+
+// export const sessions = pgTable("session", {
+//   sessionToken: text("sessionToken").primaryKey(),
+//   userId: uuid("userId")
+//     .notNull()
+//     .references(() => user.id, { onDelete: "cascade" }),
+//   expires: timestamp("expires", { mode: "date" }).notNull(),
+// });
+
+// export type Sessions = InferSelectModel<typeof sessions>;
+
+export const verificationTokens = pgTable(
+  "VerificationToken",
+  {
+    identifier: text("identifier").notNull(),
+    token: text("token").notNull(),
+    expires: timestamp("expires", { mode: "date" }).notNull(),
+  },
+  (vt) => ({
+    compoundKey: primaryKey({
+      columns: [vt.identifier, vt.token]
+    }),
+  })
+);
+
+export type VerificationTokens = InferSelectModel<typeof verificationTokens>;
+
+ 
+export const authenticators = pgTable(
+  "Authenticator",
+  {
+    credentialID: text("credentialID").notNull().unique(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    providerAccountId: text("providerAccountId").notNull(),
+    credentialPublicKey: text("credentialPublicKey").notNull(),
+    counter: integer("counter").notNull(),
+    credentialDeviceType: text("credentialDeviceType").notNull(),
+    credentialBackedUp: boolean("credentialBackedUp").notNull(),
+    transports: text("transports"),
+  },
+  (authenticator) => ({
+      compositePK: primaryKey({
+        columns: [authenticator.userId, authenticator.credentialID],
+      }),
+    })
+)
+
+export type Authenticators = InferSelectModel<typeof authenticators>;
+
 
 export const chat = pgTable('Chat', {
   id: uuid('id').primaryKey().notNull().defaultRandom(),

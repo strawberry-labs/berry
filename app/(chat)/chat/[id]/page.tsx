@@ -13,15 +13,16 @@ export default async function Page(props: { params: Promise<{ id: string }> }) {
   const { id } = params;
   const chat = await getChatById({ id });
 
+  const session = await auth();
+
+  if (!session) {
+    redirect('/login');
+  }
+
   if (!chat) {
     notFound();
   }
 
-  const session = await auth();
-
-  if (!session) {
-    redirect('/api/auth/guest');
-  }
 
   if (chat.visibility === 'private') {
     if (!session.user) {

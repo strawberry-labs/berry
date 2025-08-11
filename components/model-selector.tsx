@@ -31,8 +31,8 @@ export function ModelSelector({
   const [optimisticModelId, setOptimisticModelId] =
     useOptimistic(selectedModelId);
 
-  const userType = session.user.type;
-  const { availableChatModelIds } = entitlementsByUserType[userType];
+  const userRole = session.user.role;
+  const { availableChatModelIds } = entitlementsByUserType[userRole];
 
   const availableChatModels = chatModels.filter((chatModel) =>
     availableChatModelIds.includes(chatModel.id),
