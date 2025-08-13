@@ -105,12 +105,12 @@ const PurePreviewMessage = ({
               const key = `message-${message.id}-part-${index}`;
 
               if (
-                (part.type === 'tool-webSearch' ||
-                  part.type === 'tool-academicSearch' ||
-                  part.type === 'tool-extremeSearch') &&
+                (type === 'tool-webSearch' ||
+                  type === 'tool-academicSearch' ||
+                  type === 'tool-extremeSearch') &&
                   part.state === 'input-available'
               ) {
-                return <SearchingIndicator key={key} partType={part.toolCallId} />;
+                return <SearchingIndicator key={key} partType={type} />;
               }
 
               if (type === 'reasoning' && part.text?.trim().length > 0) {
