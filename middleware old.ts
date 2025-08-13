@@ -1,9 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
-import { isDevelopmentEnvironment } from './lib/constants';
 import { getToken } from 'next-auth/jwt';
-
-//routes in which are protected. A guest user will be generated if no token is found
-const protectedRoutes: string[] = ['/', '/chat']
+import { isDevelopmentEnvironment } from './lib/constants';
 
 //routes in which only guest users are allowed
 const guestRoutes: string[] = ['/login', '/check-email']
@@ -32,9 +29,8 @@ export async function middleware(request: NextRequest) {
     secureCookie: !isDevelopmentEnvironment,
   });
 
-  const isProtectedRoute = protectedRoutes.some((route)=> route==='/' ? pathname==='/' : pathname.startsWith(route))
 
-  if(isProtectedRoute && !token){
+  if (!token) {
     const redirectUrl = encodeURIComponent(request.url);
 
     return NextResponse.redirect(
@@ -42,15 +38,15 @@ export async function middleware(request: NextRequest) {
     );
   }
 
-  const isGuest = token?.type === null || token?.type === "guest"
+  const isGuest = token.type === "guest"
 
-  const isGuestRoute = guestRoutes.some((route)=> route==='/' ? pathname==='/' : pathname.startsWith(route))
+  const isGuestRoute = guestRoutes.some((route)=>pathname.startsWith(route))
 
   if (token && !isGuest && isGuestRoute) {
     return NextResponse.redirect(new URL('/', request.url));
   }
 
-  const isRegularRoute = regularRoutes.some((route)=> route==='/' ? pathname==='/' : pathname.startsWith(route))
+  const isRegularRoute = regularRoutes.some((route)=>pathname.startsWith(route))
 
   if(token && isGuest && isRegularRoute){
     return NextResponse.redirect(new URL('/login', request.url));
