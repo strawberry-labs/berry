@@ -89,7 +89,7 @@ export function LoginForm({
               </div>
               <Button type="submit" className="relative w-full flex items-center justify-center" disabled={disable}>
                   <span className="absolute left-[39%]">
-                      {disable && <LoaderIcon className="animate-spin" />}
+                    {disable && <LoaderIcon className="animate-spin" />}
                   </span>
                 <span>Login</span>
               </Button>

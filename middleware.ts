@@ -3,7 +3,7 @@ import { getToken } from 'next-auth/jwt';
 import { isDevelopmentEnvironment } from './lib/constants';
 
 //routes in which only guest users are allowed
-const guestRoutes: string[] = ['login']
+const guestRoutes: string[] = ['/login', '/check-email']
 
 //routes in which only regular users are allowed
 const regularRoutes: string[] = [];
@@ -63,6 +63,7 @@ export const config = {
     '/chat/:id',
     '/api/:path*',
     '/login',
+    '/check-email',
     /*
      * Match all request paths except for the ones starting with:
      * - _next/static (static files)
