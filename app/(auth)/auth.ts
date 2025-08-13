@@ -65,9 +65,11 @@ export const authConfig = {
     },
     async signIn({user, account, profile, email, credentials}){
       const session = await auth();
+
       if(session){
-        await signOut()
+        await signOut({redirect:false})
       }
+
       return true
     },
   },

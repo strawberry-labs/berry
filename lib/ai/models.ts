@@ -17,11 +17,11 @@ export const chatModels: Array<ChatModel> = [
     name: 'Grok 3 Mini',
     description: 'Uses advanced reasoning with chain-of-thought',
   },
-  {
-    id: 'grok-3-mini',
-    name: 'Grok 3 Mini',
-    description: 'Fast and efficient reasoning model',
-  },
+  // {
+  //   id: 'grok-3-mini',
+  //   name: 'Grok 3 Mini',
+  //   description: 'Fast and efficient reasoning model',
+  // },
   {
     id: 'berry-b1',
     name: 'Berry B1',
