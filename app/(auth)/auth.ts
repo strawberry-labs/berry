@@ -1,4 +1,5 @@
 import NextAuth, { NextAuthConfig, type DefaultSession } from 'next-auth';
+import Nodemailer from "next-auth/providers/nodemailer"
 import Apple from "next-auth/providers/apple"
 import Google from "next-auth/providers/google"
 import GitHub from 'next-auth/providers/github';
@@ -32,6 +33,17 @@ export const authConfig = {
     verificationTokensTable: verificationTokens,
   }), 
   providers: [
+    Nodemailer({
+      server: {
+        host: process.env.EMAIL_SERVER_HOST,
+        port: process.env.EMAIL_SERVER_PORT,
+        auth: {
+          user: process.env.EMAIL_SERVER_USER,
+          pass: process.env.EMAIL_SERVER_PASSWORD,
+        },
+      },
+      from: process.env.EMAIL_FROM,
+    }),
     Apple({allowDangerousEmailAccountLinking:true}),
     Google({allowDangerousEmailAccountLinking:true}),
     GitHub({allowDangerousEmailAccountLinking:true}),
@@ -68,6 +80,12 @@ export const authConfig = {
 
       if(session){
         await signOut({redirect:false})
+      }
+
+      if(account && account.provider==="google"){
+        if(profile && !profile.email_verified){
+          return false
+        }
       }
 
       return true

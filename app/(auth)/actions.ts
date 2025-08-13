@@ -4,7 +4,7 @@ import { signIn, signOut } from './auth';
 // For Email Magic Link
 export const emailMagicLink = async (email: string) => {
   await signOut({redirect:false})
-  await signIn('email');
+  await signIn('nodemailer', {email, redirect:false});
   return { status: 'success' };
 };
 
