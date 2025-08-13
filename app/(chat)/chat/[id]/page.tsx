@@ -11,17 +11,20 @@ import { convertToUIMessages } from '@/lib/utils';
 export default async function Page(props: { params: Promise<{ id: string }> }) {
   const params = await props.params;
   const { id } = params;
-  const chat = await getChatById({ id });
 
-  if (!chat) {
-    notFound();
-  }
 
   const session = await auth();
 
   if (!session) {
     redirect('/api/auth/guest');
   }
+
+  const chat = await getChatById({ id });
+
+  if (!chat) {
+    notFound();
+  }
+
 
   if (chat.visibility === 'private') {
     if (!session.user) {
