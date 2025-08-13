@@ -19,6 +19,7 @@ import { MessageReasoning } from './message-reasoning';
 import type { UseChatHelpers } from '@ai-sdk/react';
 import type { ChatMessage } from '@/lib/types';
 import { useDataStream } from './data-stream-provider';
+import { SearchingIndicator } from './searching-indicator';
 
 // Type narrowing is handled by TypeScript's control flow analysis
 // The AI SDK provides proper discriminated unions for tool calls
@@ -102,6 +103,15 @@ const PurePreviewMessage = ({
             {message.parts?.map((part, index) => {
               const { type } = part;
               const key = `message-${message.id}-part-${index}`;
+
+              if (
+                (part.type === 'tool-webSearch' ||
+                  part.type === 'tool-academicSearch' ||
+                  part.type === 'tool-extremeSearch') &&
+                  part.state === 'input-available'
+              ) {
+                return <SearchingIndicator key={key} partType={part.toolCallId} />;
+              }
 
               if (type === 'reasoning' && part.text?.trim().length > 0) {
                 return (
