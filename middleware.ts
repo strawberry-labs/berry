@@ -5,7 +5,7 @@ import { getToken } from 'next-auth/jwt';
 //routes in which are protected. A guest user will be generated if no token is found
 const protectedRoutes: string[] = ['/', '/chat']
 
-//routes in which only guest users are allowed
+//routes in which only unauthenticated and guest users are allowed
 const guestRoutes: string[] = ['/login', '/check-email']
 
 //routes in which only regular users are allowed

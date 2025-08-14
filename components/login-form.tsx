@@ -11,6 +11,7 @@ import { FormEvent, FormEventHandler, useEffect, useState } from "react"
 import { toast } from "./toast"
 import { Session } from "next-auth"
 import { LoaderIcon } from "lucide-react"
+import { BerryIcon } from "./icons"
 
 export function LoginForm({
   className,
@@ -66,6 +67,9 @@ export function LoginForm({
         <CardContent className="grid p-0 md:grid-cols-1">
           <form className="p-6 md:p-8" onSubmit={handleEmailSignIn}>
             <div className="flex flex-col gap-6">
+              <div onClick={handleGuestSignIn} className="cursor-pointer mx-auto p-0">
+              <BerryIcon size={52} className='mx-auto'/>
+              </div>
               <div className="flex flex-col items-center text-center">
                 <h1 className="text-2xl font-bold">Welcome back</h1>
                 <p className="text-muted-foreground text-balance">
@@ -125,14 +129,14 @@ export function LoginForm({
                   <span className="sr-only">Login with Github</span>
                 </Button>
               </div>
-              <div className="after:border-border relative text-center text-sm after:absolute after:inset-0 after:top-1/2 after:z-0 after:flex after:items-center after:border-t">
+              {/* <div className="after:border-border relative text-center text-sm after:absolute after:inset-0 after:top-1/2 after:z-0 after:flex after:items-center after:border-t">
                 <span className="bg-card text-muted-foreground relative z-10 px-2">
                   Or
                 </span>
               </div>
               <Button type="button" variant="outline" className="w-full" onClick={handleGuestSignIn} disabled={disable}>
                 Continue as guest
-              </Button>
+              </Button> */}
             </div>
           </form>
         </CardContent>
