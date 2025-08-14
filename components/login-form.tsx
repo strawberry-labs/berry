@@ -24,6 +24,7 @@ export function LoginForm({
 
   const [email, setEmail] = useState('')
   const [disable, setDisable] = useState(false);
+  const [showLoader, setShowLoader] = useState(false);
 
   // Show error toast if login failed
   useEffect(() => {
@@ -57,6 +58,7 @@ export function LoginForm({
   const handleEmailSignIn = async (e:FormEvent<HTMLFormElement>) =>{
     e.preventDefault();
     setDisable(true)
+    setShowLoader(true)
     await emailMagicLink(email)
     router.push('/check-email')
   }
@@ -93,7 +95,7 @@ export function LoginForm({
               </div>
               <Button type="submit" className="relative w-full flex items-center justify-center" disabled={disable}>
                   <span className="absolute left-[39%]">
-                    {disable && <LoaderIcon className="animate-spin" />}
+                    {disable && showLoader && <LoaderIcon className="animate-spin" />}
                   </span>
                 <span>Login</span>
               </Button>
@@ -129,14 +131,6 @@ export function LoginForm({
                   <span className="sr-only">Login with Github</span>
                 </Button>
               </div>
-              {/* <div className="after:border-border relative text-center text-sm after:absolute after:inset-0 after:top-1/2 after:z-0 after:flex after:items-center after:border-t">
-                <span className="bg-card text-muted-foreground relative z-10 px-2">
-                  Or
-                </span>
-              </div>
-              <Button type="button" variant="outline" className="w-full" onClick={handleGuestSignIn} disabled={disable}>
-                Continue as guest
-              </Button> */}
             </div>
           </form>
         </CardContent>

@@ -19,12 +19,17 @@ export default async function Page(props: { params: Promise<{ id: string }> }) {
     redirect('/api/auth/guest');
   }
 
-  const chat = await getChatById({ id });
+  const chat = await (async ()=>{
+    try{
+      return await getChatById({ id })
+    }catch{
+      return null
+    }
+  })();
 
   if (!chat) {
     notFound();
   }
-
 
   if (chat.visibility === 'private') {
     if (!session.user) {
