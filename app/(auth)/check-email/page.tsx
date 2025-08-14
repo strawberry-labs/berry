@@ -6,7 +6,7 @@ import Link from "next/link";
 
 export default function CheckEmail() {
   return (
-    <div className="bg-muted flex min-h-svh flex-col items-center justify-center gap-6 p-6 md:p-10">
+    <div className="bg-card flex min-h-svh flex-col items-center justify-center gap-6 p-6 md:p-10">
       <div className="w-full max-w-sm md:max-w-[24 rem]">
         <div className="flex flex-col gap-6 p-6 md:p-8">
           <div className="flex flex-col gap-6">

@@ -5,6 +5,7 @@ import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar';
 import { auth } from '../(auth)/auth';
 import Script from 'next/script';
 import { DataStreamProvider } from '@/components/data-stream-provider';
+import { UpdateInformation } from '@/components/update-information';
 
 export const experimental_ppr = true;
 
@@ -15,9 +16,9 @@ export default async function Layout({
 }) {
   const [session, cookieStore] = await Promise.all([auth(), cookies()]);
   
-  // if(session && !session.user.name){
-  //   return <div>enter name</div>
-  // }
+  if(session && !session.user.name){
+    return <UpdateInformation/>
+  }
 
   const isCollapsed = cookieStore.get('sidebar:state')?.value !== 'true';
 

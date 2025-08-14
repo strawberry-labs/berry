@@ -60,18 +60,21 @@ export const authConfig = {
     strategy:"jwt"
   },
   callbacks:{
-    async jwt({ token, user }) {
+    async jwt({ token, user, trigger, session }) {
+      if(trigger && trigger==="update" && session?.name){
+        token.name = session.name
+      }
       if (user) {
         token.id = user.id as string;
         token.type = user.type;
       }
-
       return token;
     },
     async session({ session, token }) {
       if (session.user) {
         session.user.id = token.id as string;
         session.user.type = token.type as UserType;
+        session.user.name = token.name
       }
       return session;
     },

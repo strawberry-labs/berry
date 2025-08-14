@@ -66,9 +66,10 @@ export async function createGuestUser() {
   const email = `guest-${Date.now()}@guest.guest`;
 
   try {
-    return await db.insert(user).values({id:generateUUID(),email, type:'guest' }).returning({
+    return await db.insert(user).values({id:generateUUID(),email, name:"Guest", type:'guest' }).returning({
       id: user.id,
       email: user.email,
+      name: user.name,
       type: user.type
     });
   } catch (error) {
@@ -533,6 +534,24 @@ export async function getStreamIdsByChatId({ chatId }: { chatId: string }) {
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to get stream ids by chat id',
+    );
+  }
+}
+
+export async function updateUserName({userId, newName}:{userId: string, newName: string}) {
+  try{
+  const [updatedUser] = await db
+    .update(user)
+    .set({ name: newName })
+    .where(eq(user.id, userId))
+    .returning();
+    return updatedUser;
+
+    }
+    catch (error) {
+    throw new ChatSDKError(
+      'bad_request:database',
+      'Failed to update name by id',
     );
   }
 }
