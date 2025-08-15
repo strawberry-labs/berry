@@ -1,12 +1,18 @@
 "use client"
 
 import { Button } from "@/components/ui/button";
+import { ThemeSwitcher, ThemeType } from "@/components/ui/shadcn-io/theme-switcher";
 import { ArrowLeft, MailIcon } from "lucide-react";
+import { useTheme } from "next-themes";
 import Link from "next/link";
+import { useState } from "react";
 
 export default function CheckEmail() {
+  const {resolvedTheme, setTheme} = useTheme()
   return (
-    <div className="bg-card flex min-h-svh flex-col items-center justify-center gap-6 p-6 md:p-10">
+    <>
+    <ThemeSwitcher defaultValue="dark" onChange={setTheme} value={resolvedTheme as ThemeType} className="absolute top-4 right-4"/>
+    <div className="bg-muted flex min-h-svh flex-col items-center justify-center gap-6 p-6 md:p-10">
       <div className="w-full max-w-sm md:max-w-[24 rem]">
         <div className="flex flex-col gap-6 p-6 md:p-8">
           <div className="flex flex-col gap-6">
@@ -29,7 +35,7 @@ export default function CheckEmail() {
                 onClick={() => {
                   window.location.href = "mailto:";
                 }}
-              >
+                >
                 Open email app
               </Button>
               <div className="text-center text-base group flex justify-center items-center gap-2 m-0 p-0 cursor-pointer">
@@ -43,5 +49,6 @@ export default function CheckEmail() {
         </div>
       </div>
     </div>
+  </>
   );
 }
