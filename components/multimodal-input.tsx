@@ -366,8 +366,8 @@ function PureMultimodalInput({
         />
         
         {/* Bottom toolbar inside the container */}
-        <div className="flex items-center justify-between px-3 py-2 rounded-b-xl bg-muted">
-          <div className="flex items-center gap-2">
+        <div className="flex items-center justify-between px-3 py-2 rounded-b-xl bg-muted gap-2 min-w-0">
+          <div className="flex items-center gap-1 md:gap-2 min-w-0 flex-1">
             <AttachmentsButton fileInputRef={fileInputRef} status={status} />
             <DictateButton 
               onTranscriptionReceived={handleTranscriptionReceived} 
@@ -376,16 +376,14 @@ function PureMultimodalInput({
             <SearchModeSelector
               selectedMode={selectedSearchMode}
               onModeChange={onSearchModeChange}
-              className="ml-1"
             />
           </div>
           
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 md:gap-2 flex-shrink-0">
             <ModelSelector
               session={session}
               selectedModelId={selectedModelId}
               onModelChange={onModelChange}
-              className="mr-1"
               variant="ghost"
               size="sm"
             />

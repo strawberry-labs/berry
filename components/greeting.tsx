@@ -15,8 +15,17 @@ const PureGreeting = () => {
           transition={{ delay: 0.5 }}
           className="flex items-center gap-0"
         >
-          <BerryIcon size={100} className="-translate-y-2" />
-          <span className="text-6xl font-bold text-foreground">Berry</span>
+          {/* Mobile: size 60, SM: size 80, MD+: size 100 */}
+          <div className="sm:hidden">
+            <BerryIcon size={60} className="-translate-y-2" />
+          </div>
+          <div className="hidden sm:block md:hidden">
+            <BerryIcon size={80} className="-translate-y-2" />
+          </div>
+          <div className="hidden md:block">
+            <BerryIcon size={100} className="-translate-y-2" />
+          </div>
+          <span className="text-4xl sm:text-5xl md:text-6xl font-bold text-foreground">Berry</span>
         </motion.div>
     </div>
   );

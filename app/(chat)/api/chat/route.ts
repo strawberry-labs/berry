@@ -80,7 +80,12 @@ export async function POST(request: Request) {
     const json = await request.json();
     requestBody = postRequestBodySchema.parse(json);
     console.log('⚡ [CHAT API] Request parsing took:', Date.now() - parseStartTime, 'ms');
-  } catch (_) {
+  } catch (error) {
+    console.error('❌ [CHAT API] Request parsing failed:', {
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined,
+      timestamp: new Date().toISOString()
+    });
     return new ChatSDKError('bad_request:api').toResponse();
   }
 
@@ -316,9 +321,22 @@ export async function POST(request: Request) {
     }
   } catch (error) {
     if (error instanceof ChatSDKError) {
+      console.error('❌ [CHAT API] ChatSDKError:', {
+        type: error.type,
+        surface: error.surface,
+        message: error.message,
+        cause: error.cause,
+        statusCode: error.statusCode,
+        timestamp: new Date().toISOString()
+      });
       return error.toResponse();
     }
-    console.error('Unexpected error in chat route:', error);
+    console.error('❌ [CHAT API] Unexpected error:', {
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : 'Unknown',
+      timestamp: new Date().toISOString()
+    });
     return new ChatSDKError('bad_request:api', 'Unexpected error in chat route').toResponse();
   }
 }

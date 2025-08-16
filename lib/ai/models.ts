@@ -32,4 +32,9 @@ export const chatModels: Array<ChatModel> = [
     name: 'GPT-5',
     description: 'Most advanced GPT-5 model with superior capabilities',
   },
+  {
+    id: 'gpt-4o-mini-2024-07-18',
+    name: 'GPT-4o Mini',
+    description: 'OpenAI GPT-4o Mini model with fast performance',
+  },
 ];

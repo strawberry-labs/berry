@@ -43,6 +43,7 @@ export const myProvider = isTestEnvironment
           model: openai('gpt-5-2025-08-07'),
           middleware: extractReasoningMiddleware({ tagName: 'think' }),
         }),
+        'gpt-4o-mini-2024-07-18': openai('gpt-4o-mini-2024-07-18'),
         'title-model': groq('llama-3.1-8b-instant'),
         
       },

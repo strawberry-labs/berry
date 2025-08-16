@@ -19,9 +19,9 @@ export function SearchModeSelector({
   return (
     <div className={`flex items-center gap-2 ${className}`}>
       <Select value={selectedMode} onValueChange={onModeChange}>
-        <SelectTrigger className="w-auto min-w-[120px] h-8 text-xs border border-input bg-background hover:bg-accent hover:text-accent-foreground">
+        <SelectTrigger className="w-fit h-8 text-xs border border-input bg-background hover:bg-accent hover:text-accent-foreground max-w-[100px] md:max-w-none min-w-[80px]">
           <SelectValue>
-            {selectedGroup?.name || 'Chat'}
+            <span className="truncate">{selectedGroup?.name || 'Chat'}</span>
           </SelectValue>
         </SelectTrigger>
         <SelectContent>
