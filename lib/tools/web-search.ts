@@ -2,7 +2,25 @@ import { tool, type UIMessageStreamWriter } from 'ai';
 import { z } from 'zod';
 import { Exa } from 'exa-js';
 import { serverEnv } from '@/env/server';
-import type { ChatMessage } from '@/lib/types';
+
+// Simple in-memory cache with 5-minute TTL
+const searchCache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+const getCachedResult = (cacheKey: string) => {
+  const cached = searchCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.data;
+  }
+  if (cached) {
+    searchCache.delete(cacheKey); // Remove expired cache
+  }
+  return null;
+};
+
+const setCachedResult = (cacheKey: string, data: any) => {
+  searchCache.set(cacheKey, { data, timestamp: Date.now() });
+};
 
 const extractDomain = (url: string): string => {
   const urlPattern = /^https?:\/\/([^/?#]+)(?:[/?#]|$)/i;
@@ -43,52 +61,75 @@ const processDomains = (domains?: string[]): string[] | undefined => {
   return processedDomains.every((domain) => domain.trim() === '') ? undefined : processedDomains;
 };
 
-export const webSearchTool = (dataStream: UIMessageStreamWriter<ChatMessage>) => {
+export const webSearchTool = (dataStream: UIMessageStreamWriter<any>) => {
   return tool({
-    description: 'Search the web for information with 5-10 queries, max results and search depth.',
+    description: 'Search the web for current information using 2-4 focused queries. Fast parallel search with smart deduplication.',
     inputSchema: z.object({
       queries: z.array(
-        z.string().describe('Array of search queries to look up on the web. Default is 5 to 10 queries.'),
+        z.string().describe('Array of 2-4 focused search queries. Use specific, targeted queries for best results.'),
       ),
       maxResults: z.array(
-        z.number().describe('Array of maximum number of results to return per query. Default is 10.'),
-      ),
+        z.number().describe('Array of maximum number of results to return per query. Default is 5.'),
+      ).optional().default([5]),
       topics: z.array(
         z.enum(['general', 'news', 'finance']).describe('Array of topic types to search for. Default is general.'),
-      ),
-      quality: z.enum(['default', 'best']).describe('Search quality x speed level. Default is default.'),
+      ).optional().default(['general']),
+      quality: z.enum(['default', 'best']).describe('Search quality x speed level. Default is default.').optional().default('default'),
       include_domains: z
         .array(z.string())
-        .describe('An array of domains to include in all search results. Default is an empty list.'),
+        .describe('An array of domains to include in all search results. Default is an empty list.')
+        .optional().default([]),
       exclude_domains: z
         .array(z.string())
-        .describe('An array of domains to exclude from all search results. Default is an empty list.'),
+        .describe('An array of domains to exclude from all search results. Default is an empty list.')
+        .optional().default([]),
     }),
     execute: async ({ queries, maxResults, topics, quality, include_domains, exclude_domains }) => {
+      const startTime = Date.now();
+      console.log('🔍 [WEB SEARCH] Tool called with queries:', queries);
       const exa = new Exa(serverEnv.EXA_API_KEY);
       
       try {
-        const allResults: any[] = [];
-        
-        for (let i = 0; i < queries.length; i++) {
-          const query = queries[i];
-          const maxResult = maxResults[i] || 10;
-          const topic = topics[i] || 'general';
+        // Execute all searches in parallel for much faster performance
+        const searchPromises = queries.map(async (query, i) => {
+          const maxResult = maxResults?.[i] || maxResults?.[0] || 5;
+          const topic = topics?.[i] || topics?.[0] || 'general';
+          
+          // Create cache key from query parameters
+          const cacheKey = `${query}:${maxResult}:${topic}:${JSON.stringify(include_domains)}:${JSON.stringify(exclude_domains)}`;
+          
+          // Check cache first
+          const cachedResult = getCachedResult(cacheKey);
+          if (cachedResult) {
+            console.log(`🔍 [WEB SEARCH] Cache hit for query: ${query}`);
+            return cachedResult;
+          }
 
-          const searchResult = await exa.searchAndContents(query, {
-            type: topic === 'news' ? 'neural' : 'auto',
+          const searchOptions = {
+            type: (topic === 'news' ? 'neural' : 'auto') as 'neural' | 'auto',
             numResults: maxResult,
             includeDomains: processDomains(include_domains),
             excludeDomains: processDomains(exclude_domains),
             summary: {
               query: `Summarize this content for: ${query}`,
             },
-          });
+          };
 
-          allResults.push(...searchResult.results);
-        }
+          const result = await exa.searchAndContents(query, searchOptions);
+          
+          // Cache the result
+          setCachedResult(cacheKey, result);
+          
+          return result;
+        });
+
+        const searchResults = await Promise.all(searchPromises);
+        const allResults = searchResults.flatMap(result => result.results);
 
         const deduplicatedResults = deduplicateByDomainAndUrl(allResults);
+        
+        const totalTime = Date.now() - startTime;
+        console.log(`🔍 [WEB SEARCH] Completed ${queries.length} queries in ${totalTime}ms (${deduplicatedResults.length} results)`);
         
         return {
           results: deduplicatedResults.map(result => ({
@@ -99,7 +140,6 @@ export const webSearchTool = (dataStream: UIMessageStreamWriter<ChatMessage>) =>
           })),
         };
       } catch (error) {
-        console.error('Web search error:', error);
         throw error;
       }
     },

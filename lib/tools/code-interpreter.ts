@@ -16,10 +16,6 @@ export const codeInterpreterTool = tool({
     icon: z.enum(['stock', 'date', 'calculation', 'default']).describe('The icon to display for the code snippet.'),
   }),
   execute: async ({ code, title, icon }) => {
-    console.log('Code:', code);
-    console.log('Title:', title);
-    console.log('Icon:', icon);
-
     const daytona = new Daytona({
       apiKey: serverEnv.DAYTONA_API_KEY,
       target: 'us',
@@ -30,9 +26,6 @@ export const codeInterpreterTool = tool({
     });
 
     const execution = await sandbox.process.codeRun(code);
-
-    console.log('Execution:', execution.result);
-    console.log('Execution:', execution.artifacts?.stdout);
 
     let message = '';
 
@@ -46,11 +39,10 @@ export const codeInterpreterTool = tool({
       message += execution.result;
     }
 
-    if (execution.artifacts?.charts) {
-      console.log('Chart:', execution.artifacts.charts[0]);
-    }
-
     let chart;
+    if (execution.artifacts?.charts) {
+      // Charts available
+    }
 
     if (execution.artifacts?.charts) {
       chart = execution.artifacts.charts[0];

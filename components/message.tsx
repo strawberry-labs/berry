@@ -9,6 +9,13 @@ import { Markdown } from './markdown';
 import { MessageActions } from './message-actions';
 import { PreviewAttachment } from './preview-attachment';
 import { Weather } from './weather';
+import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolInput,
+  ToolOutput,
+} from './ai-elements/tool';
 import equal from 'fast-deep-equal';
 import { cn, sanitizeText } from '@/lib/utils';
 import { Button } from './ui/button';
@@ -104,11 +111,60 @@ const PurePreviewMessage = ({
               const { type } = part;
               const key = `message-${message.id}-part-${index}`;
 
-              if (
-                (type === 'tool-academicSearch') &&
-                  part.state === 'input-available'
-              ) {
-                return <SearchingIndicator key={key} partType={type} />;
+              if (type === 'tool-academicSearch') {
+                const { toolCallId, state } = part as any;
+                
+                if (state === 'input-available') {
+                  return <SearchingIndicator key={key} partType={type} />;
+                }
+
+                const defaultOpen = state === 'output-available' || state === 'output-error';
+
+                return (
+                  <div key={toolCallId}>
+                    <Tool defaultOpen={defaultOpen}>
+                      <ToolHeader type="tool-academicSearch" state={state} />
+                      <ToolContent>
+                        {(state === 'input-available' || state === 'output-available' || state === 'output-error') && (
+                          <ToolInput input={(part as any).input} />
+                        )}
+                        {state === 'output-available' && (
+                          <ToolOutput 
+                            output={
+                              <div className="space-y-4">
+                                {(part as any).output?.results?.map((result: any, idx: number) => (
+                                  <div key={idx} className="border-l-2 border-muted pl-4">
+                                    <h4 className="font-medium text-sm mb-1">
+                                      <a 
+                                        href={result.url} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-blue-600 hover:underline"
+                                      >
+                                        {result.title}
+                                      </a>
+                                    </h4>
+                                    <p className="text-xs text-muted-foreground mb-2">{result.url}</p>
+                                    {result.summary && (
+                                      <p className="text-sm">{result.summary}</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            }
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                        {state === 'output-error' && (
+                          <ToolOutput 
+                            output={null}
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                      </ToolContent>
+                    </Tool>
+                  </div>
+                );
               }
 
               if (type === 'reasoning' && part.text?.trim().length > 0) {
@@ -314,6 +370,108 @@ const PurePreviewMessage = ({
                     </div>
                   );
                 }
+              }
+
+              if (type === 'tool-webSearch') {
+                const { toolCallId, state } = part as any;
+                const defaultOpen = state === 'output-available' || state === 'output-error';
+
+                return (
+                  <div key={toolCallId}>
+                    <Tool defaultOpen={defaultOpen}>
+                      <ToolHeader type="tool-webSearch" state={state} />
+                      <ToolContent>
+                        {(state === 'input-available' || state === 'output-available' || state === 'output-error') && (
+                          <ToolInput input={(part as any).input} />
+                        )}
+                        {state === 'output-available' && (
+                          <ToolOutput 
+                            output={
+                              <div className="space-y-4">
+                                {(part as any).output?.results?.map((result: any, idx: number) => (
+                                  <div key={idx} className="border-l-2 border-muted pl-4">
+                                    <h4 className="font-medium text-sm mb-1">
+                                      <a 
+                                        href={result.url} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-blue-600 hover:underline"
+                                      >
+                                        {result.title}
+                                      </a>
+                                    </h4>
+                                    <p className="text-xs text-muted-foreground mb-2">{result.url}</p>
+                                    {result.summary && (
+                                      <p className="text-sm">{result.summary}</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            }
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                        {state === 'output-error' && (
+                          <ToolOutput 
+                            output={null}
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                      </ToolContent>
+                    </Tool>
+                  </div>
+                );
+              }
+
+              if (type === 'tool-extremeSearch') {
+                const { toolCallId, state } = part as any;
+                const defaultOpen = state === 'output-available' || state === 'output-error';
+
+                return (
+                  <div key={toolCallId}>
+                    <Tool defaultOpen={defaultOpen}>
+                      <ToolHeader type="tool-extremeSearch" state={state} />
+                      <ToolContent>
+                        {(state === 'input-available' || state === 'output-available' || state === 'output-error') && (
+                          <ToolInput input={(part as any).input} />
+                        )}
+                        {state === 'output-available' && (
+                          <ToolOutput 
+                            output={
+                              <div className="space-y-4">
+                                {(part as any).output?.results?.map((result: any, idx: number) => (
+                                  <div key={idx} className="border-l-2 border-muted pl-4">
+                                    <h4 className="font-medium text-sm mb-1">
+                                      <a 
+                                        href={result.url} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-blue-600 hover:underline"
+                                      >
+                                        {result.title}
+                                      </a>
+                                    </h4>
+                                    <p className="text-xs text-muted-foreground mb-2">{result.url}</p>
+                                    {result.summary && (
+                                      <p className="text-sm">{result.summary}</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            }
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                        {state === 'output-error' && (
+                          <ToolOutput 
+                            output={null}
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                      </ToolContent>
+                    </Tool>
+                  </div>
+                );
               }
             })}
 

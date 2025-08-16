@@ -197,6 +197,9 @@ export async function POST(request: Request) {
           datetime: datetimeTool,
         };
         console.log('🔧 [CHAT API] Tools setup took:', Date.now() - toolsSetupStartTime, 'ms');
+        console.log('🛠️ [CHAT API] Selected search mode:', selectedSearchMode);
+        console.log('🛠️ [CHAT API] Group config tools:', groupConfig.tools);
+        console.log('🛠️ [CHAT API] Available tools:', Object.keys(allTools));
 
         const streamTextStartTime = Date.now();
         console.log('🤖 [CHAT API] Starting AI model execution with:', selectedChatModel);

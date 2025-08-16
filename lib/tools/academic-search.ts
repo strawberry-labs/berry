@@ -40,7 +40,6 @@ export const academicSearchTool = tool({
         results: processedResults,
       };
     } catch (error) {
-      console.error('Academic search error:', error);
       throw error;
     }
   },

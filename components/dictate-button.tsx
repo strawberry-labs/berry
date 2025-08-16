@@ -41,7 +41,7 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
         onTranscriptionReceived(result.transcription);
       }
     } catch (error) {
-      console.error('Error transcribing audio:', error);
+      // Error transcribing audio
     } finally {
       setIsTranscribing(false);
     }
@@ -79,7 +79,7 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
       mediaRecorder.start();
       setIsRecording(true);
     } catch (error) {
-      console.error('Error starting recording:', error);
+      // Error starting recording
     }
   }, [transcribeAudio]);
 

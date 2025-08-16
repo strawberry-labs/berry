@@ -1,5 +1,7 @@
 import NextAuth, { type NextAuthConfig, type DefaultSession } from 'next-auth';
 import Nodemailer from 'next-auth/providers/nodemailer';
+import type { EmailConfig } from 'next-auth/providers/email';
+import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 import Apple from 'next-auth/providers/apple';
 import Google from 'next-auth/providers/google';
 import GitHub from 'next-auth/providers/github';
@@ -11,43 +13,31 @@ import { db } from '@/lib/db/db';
 
 export type UserType = 'guest' | 'regular';
 
-declare module 'next-auth' {
-  interface Session extends DefaultSession {
-    user: {
-      id: string;
-      type: UserType;
-    } & DefaultSession['user'];
-  }
+type SendVerificationRequestParams = {
+  identifier: string;
+  url: string;
+  expires: Date;
+  provider: any;
+  request: Request;
+};
 
-  interface User {
-    id?: string;
-    email?: string | null;
-    type: UserType;
-  }
-}
+const ses = new SESClient({
+  region: process.env.AWS_REGION || 'us-east-1',
+  credentials: process.env.AWS_ACCESS_KEY_ID
+    ? {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+      }
+    : undefined,
+  maxAttempts: 1, // Reduce retry attempts for faster response
+  requestHandler: {
+    requestTimeout: 3000, // 3 second timeout
+  },
+});
 
-export const authConfig = {
-  adapter: DrizzleAdapter(db, {
-    usersTable: user,
-    accountsTable: accounts,
-    verificationTokensTable: verificationTokens,
-  }),
-  providers: [
-    Nodemailer({
-      server: {
-        host: process.env.EMAIL_SERVER_HOST,
-        port: process.env.EMAIL_SERVER_PORT ? Number(process.env.EMAIL_SERVER_PORT) : undefined,
-        auth: {
-          user: process.env.EMAIL_SERVER_USER,
-          pass: process.env.EMAIL_SERVER_PASSWORD,
-        },
-      },
-      from: process.env.EMAIL_FROM,
-      async sendVerificationRequest({ identifier: email, url, provider }) {
-        const { createTransport } = await import('nodemailer');
-        const transport = createTransport(provider.server);
-
-        const emailTemplate = `<!DOCTYPE html>
+function html(params: SendVerificationRequestParams) {
+  const { url } = params;
+  return `<!DOCTYPE html>
 <html lang="en" xmlns="http://www.w3.org/1999/xhtml">
   <head>
     <meta charset="utf-8" />
@@ -102,9 +92,7 @@ export const authConfig = {
 
                 <!-- Confirmation line -->
                 <p style="margin:0 0 28px 0;font-size:16px;line-height:1.6;color:#334155;">
-                  Confirming this request will securely
-                  log you in using
-                  <a href="mailto:${email}" style="color:#DA1D54;text-decoration:underline;">${email}</a>
+                  Confirming this request will securely log you in using your email address.
                 </p>
 
                 <!-- Footer note -->
@@ -121,13 +109,64 @@ export const authConfig = {
     </table>
   </body>
 </html>`;
+}
 
-        await transport.sendMail({
-          to: email,
-          from: provider.from,
-          subject: 'Login to Berry',
-          html: emailTemplate,
-        });
+function text({ url }: SendVerificationRequestParams) {
+  return `Sign in to Berry:\n${url}\n\nIf you did not request this email, you can safely ignore it.`;
+}
+
+async function sendWithSes(params: SendVerificationRequestParams) {
+  const { identifier, url } = params;
+
+  const FromAddress = process.env.EMAIL_FROM!;
+  const ToAddress = identifier;
+
+  const htmlBody = html(params);
+  const textBody = text(params);
+
+  const command = new SendEmailCommand({
+    Destination: { ToAddresses: [ToAddress] },
+    Source: FromAddress,
+    Message: {
+      Subject: { Data: 'Login to Berry' },
+      Body: {
+        Html: { Data: htmlBody },
+        Text: { Data: textBody },
+      },
+    },
+  });
+
+  await ses.send(command);
+}
+
+declare module 'next-auth' {
+  interface Session extends DefaultSession {
+    user: {
+      id: string;
+      type: UserType;
+    } & DefaultSession['user'];
+  }
+
+  interface User {
+    id?: string;
+    email?: string | null;
+    type: UserType;
+  }
+}
+
+export const authConfig = {
+  adapter: DrizzleAdapter(db, {
+    usersTable: user,
+    accountsTable: accounts,
+    verificationTokensTable: verificationTokens,
+  }),
+  providers: [
+    Nodemailer({
+      server: {}, // Required but unused since we override sendVerificationRequest
+      from: process.env.EMAIL_FROM,
+      maxAge: 24 * 60 * 60, // 24h tokens
+      async sendVerificationRequest(params) {
+        await sendWithSes(params);
       },
     }),
     Apple({ allowDangerousEmailAccountLinking: true }),
