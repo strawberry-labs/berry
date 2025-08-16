@@ -65,11 +65,7 @@ export const systemPrompt = ({
   // Use custom prompt for Berry B1 model
   const basePrompt = selectedChatModel === 'berry-b1' ? berryB1Prompt : regularPrompt;
 
-  if (selectedChatModel === 'chat-model-reasoning') {
-    return `${basePrompt}\n\n${requestPrompt}\n${artifactsPrompt}`;
-  } else {
-    return `${basePrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
-  }
+  return `${basePrompt}\n\n${requestPrompt}`;
 };
 
 export const codePrompt = `
