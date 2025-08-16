@@ -8,6 +8,7 @@ import {
   useEffect,
   useState,
   useCallback,
+  useMemo,
   type Dispatch,
   type SetStateAction,
   type ChangeEvent,
@@ -88,9 +89,9 @@ function PureMultimodalInput({
       textarea.style.height = 'auto'; // Reset height to recalculate
 
       const computedStyle = window.getComputedStyle(textarea);
-      const lineHeight = parseFloat(computedStyle.lineHeight) || 0;
-      const paddingTop = parseFloat(computedStyle.paddingTop) || 0;
-      const paddingBottom = parseFloat(computedStyle.paddingBottom) || 0;
+      const lineHeight = Number.parseFloat(computedStyle.lineHeight) || 0;
+      const paddingTop = Number.parseFloat(computedStyle.paddingTop) || 0;
+      const paddingBottom = Number.parseFloat(computedStyle.paddingBottom) || 0;
 
       const maxLines = 13;
       const maxHeight = maxLines * lineHeight + paddingTop + paddingBottom;
@@ -250,7 +251,10 @@ function PureMultimodalInput({
   );
 
   const isAtBottom = scrollData?.isAtBottom ?? false;
-  const scrollToBottom = scrollData?.scrollToBottom ?? (() => {});
+  const scrollToBottom = useMemo(
+    () => scrollData?.scrollToBottom ?? (() => {}),
+    [scrollData?.scrollToBottom]
+  );
 
   useEffect(() => {
     if (status === 'submitted' && scrollToBottom) {
@@ -336,7 +340,7 @@ function PureMultimodalInput({
           value={input}
           onChange={handleInput}
           className={cx(
-            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled text-base',
+            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled text-lg',
             attachments.length > 0 || uploadQueue.length > 0 
               ? 'pt-3 px-3 pb-0 rounded-none' 
               : 'pt-3 px-3 pb-0 rounded-t-xl',

@@ -16,6 +16,5 @@ export async function GET(request: Request) {
   if (token) {
     return NextResponse.redirect(new URL('/', request.url));
   }
-
   return signIn('guest', { redirect: true, redirectTo: redirectUrl });
 }

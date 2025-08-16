@@ -5,12 +5,11 @@
 // ----> Use structured source collection to provide comprehensive research results
 // ----> Return all collected sources and research data to the user
 
-import Exa from 'exa-js';
+import { Exa } from 'exa-js';
 import { generateText, tool, type UIMessageStreamWriter } from 'ai';
 import { z } from 'zod';
 import { serverEnv } from '@/env/server';
 import { myProvider } from '@/lib/ai/providers';
-import type { ChatMessage } from '@/lib/types';
 
 type SearchResult = {
   title: string;
@@ -28,7 +27,7 @@ type Research = {
 
 export const exa = new Exa(serverEnv.EXA_API_KEY);
 
-const extremeSearch = async (prompt: string, dataStream?: UIMessageStreamWriter<ChatMessage>): Promise<Research> => {
+const extremeSearch = async (prompt: string, dataStream?: UIMessageStreamWriter<any>): Promise<Research> => {
   try {
     // Simplified research approach
     const searchResults = await exa.searchAndContents(prompt, {
@@ -65,7 +64,6 @@ Please provide a detailed analysis and summary of this research topic.`,
       charts: [],
     };
   } catch (error) {
-    console.error('Extreme search error:', error);
     return {
       text: `Error conducting research: ${error instanceof Error ? error.message : 'Unknown error'}`,
       toolResults: [],
@@ -75,8 +73,8 @@ Please provide a detailed analysis and summary of this research topic.`,
   }
 };
 
-export const extremeSearchTool = (dataStream?: UIMessageStreamWriter<ChatMessage>) =>
-  tool({
+export const extremeSearchTool = (dataStream?: UIMessageStreamWriter<any>) => {
+  return tool({
     description: 'Use this tool to conduct an extreme search on a given topic.',
     inputSchema: z.object({
       prompt: z
@@ -97,3 +95,4 @@ export const extremeSearchTool = (dataStream?: UIMessageStreamWriter<ChatMessage
       };
     },
   });
+};

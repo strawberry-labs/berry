@@ -1,6 +1,15 @@
 import { NextResponse, type NextRequest } from 'next/server';
+import { isDevelopmentEnvironment } from './lib/constants';
 import { getToken } from 'next-auth/jwt';
-import { guestRegex, isDevelopmentEnvironment } from './lib/constants';
+
+//routes in which are protected. A guest user will be generated if no token is found
+const protectedRoutes: string[] = ['/', '/chat']
+
+//routes in which only unauthenticated and guest users are allowed
+const guestRoutes: string[] = ['/login', '/check-email']
+
+//routes in which only regular users are allowed
+const regularRoutes: string[] = [];
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -23,7 +32,9 @@ export async function middleware(request: NextRequest) {
     secureCookie: !isDevelopmentEnvironment,
   });
 
-  if (!token) {
+  const isProtectedRoute = protectedRoutes.some((route)=> route==='/' ? pathname==='/' : pathname.startsWith(route))
+
+  if(isProtectedRoute && !token){
     const redirectUrl = encodeURIComponent(request.url);
 
     return NextResponse.redirect(
@@ -31,10 +42,18 @@ export async function middleware(request: NextRequest) {
     );
   }
 
-  const isGuest = guestRegex.test(token?.email ?? '');
+  const isGuest = token?.type === null || token?.type === "guest"
 
-  if (token && !isGuest && ['/login', '/register'].includes(pathname)) {
+  const isGuestRoute = guestRoutes.some((route)=> route==='/' ? pathname==='/' : pathname.startsWith(route))
+
+  if (token && !isGuest && isGuestRoute) {
     return NextResponse.redirect(new URL('/', request.url));
+  }
+
+  const isRegularRoute = regularRoutes.some((route)=> route==='/' ? pathname==='/' : pathname.startsWith(route))
+
+  if(token && isGuest && isRegularRoute){
+    return NextResponse.redirect(new URL('/login', request.url));
   }
 
   return NextResponse.next();
@@ -43,11 +62,11 @@ export async function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     '/',
+    '/chat',
     '/chat/:id',
     '/api/:path*',
     '/login',
-    '/register',
-
+    '/check-email',
     /*
      * Match all request paths except for the ones starting with:
      * - _next/static (static files)

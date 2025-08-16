@@ -2,11 +2,38 @@ import Link from 'next/link';
 import React, { memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { CodeBlock } from './code-block';
+import { AsyncCodeBlock } from './async-code-block';
 
 const components: Partial<Components> = {
-  // @ts-expect-error
-  code: CodeBlock,
+  code: ({ className, children, ...props }) => {
+    const match = /language-(\w+)/.exec(className || '');
+    const codeContent = String(children).replace(/\n$/, '');
+    
+    // Check if it's an inline code block or a fenced code block
+    const isInline = !className?.includes('language-');
+    
+    if (isInline) {
+      return (
+        <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm" {...props}>
+          {children}
+        </code>
+      );
+    }
+    
+    return match ? (
+      <AsyncCodeBlock
+        language={match[1]}
+        code={codeContent}
+        {...props}
+      />
+    ) : (
+      <pre className="p-4 bg-muted rounded-md overflow-x-auto">
+        <code className="font-mono text-sm" {...props}>
+          {children}
+        </code>
+      </pre>
+    );
+  },
   pre: ({ children }) => <>{children}</>,
   ol: ({ node, children, ...props }) => {
     return (
@@ -89,6 +116,50 @@ const components: Partial<Components> = {
       <h6 className="text-sm font-semibold mt-6 mb-2" {...props}>
         {children}
       </h6>
+    );
+  },
+  table: ({ node, children, ...props }) => {
+    return (
+      <div className="overflow-x-auto my-4">
+        <table className="min-w-full border-collapse border border-border" {...props}>
+          {children}
+        </table>
+      </div>
+    );
+  },
+  thead: ({ node, children, ...props }) => {
+    return (
+      <thead className="bg-muted" {...props}>
+        {children}
+      </thead>
+    );
+  },
+  tbody: ({ node, children, ...props }) => {
+    return (
+      <tbody {...props}>
+        {children}
+      </tbody>
+    );
+  },
+  tr: ({ node, children, ...props }) => {
+    return (
+      <tr className="border-b border-border" {...props}>
+        {children}
+      </tr>
+    );
+  },
+  th: ({ node, children, ...props }) => {
+    return (
+      <th className="border border-border px-4 py-2 text-left font-semibold" {...props}>
+        {children}
+      </th>
+    );
+  },
+  td: ({ node, children, ...props }) => {
+    return (
+      <td className="border border-border px-4 py-2" {...props}>
+        {children}
+      </td>
     );
   },
 };

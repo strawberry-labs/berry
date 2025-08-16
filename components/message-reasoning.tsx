@@ -36,7 +36,10 @@ export function MessageReasoning({
       {isLoading ? (
         <div className="flex flex-row gap-2 items-center">
           <div className="font-medium">Reasoning</div>
-          <div className="animate-spin">
+          {/* <div className="animate-spin">
+            <LoaderIcon />
+          </div> */}
+          <div className="animate-spin text-zinc-500">
             <LoaderIcon />
           </div>
         </div>

@@ -18,10 +18,8 @@ export function SearchModeSelector({
 
   return (
     <div className={`flex items-center gap-2 ${className}`}>
-      <Zap className="h-4 w-4 text-muted-foreground" />
-      <span className="text-sm text-muted-foreground whitespace-nowrap">Mode:</span>
       <Select value={selectedMode} onValueChange={onModeChange}>
-        <SelectTrigger className="w-auto min-w-[120px] h-8 text-xs">
+        <SelectTrigger className="w-auto min-w-[120px] h-8 text-xs border border-input bg-background hover:bg-accent hover:text-accent-foreground">
           <SelectValue>
             {selectedGroup?.name || 'Chat'}
           </SelectValue>

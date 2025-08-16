@@ -1,6 +1,6 @@
 import { tool } from 'ai';
 import { z } from 'zod';
-import Exa from 'exa-js';
+import { Exa } from 'exa-js';
 import { serverEnv } from '@/env/server';
 
 export const academicSearchTool = tool({
@@ -40,7 +40,6 @@ export const academicSearchTool = tool({
         results: processedResults,
       };
     } catch (error) {
-      console.error('Academic search error:', error);
       throw error;
     }
   },

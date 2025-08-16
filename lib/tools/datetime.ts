@@ -64,7 +64,6 @@ export const datetimeTool = tool({
         },
       };
     } catch (error) {
-      console.error('Datetime error:', error);
       throw error;
     }
   },

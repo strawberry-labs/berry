@@ -4,11 +4,18 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { memo, useState } from 'react';
 import type { Vote } from '@/lib/db/schema';
 import { DocumentToolCall, DocumentToolResult } from './document';
-import { BerryIcon, PencilEditIcon, SparklesIcon } from './icons';
+import { BerryIcon, PencilEditIcon, } from './icons';
 import { Markdown } from './markdown';
 import { MessageActions } from './message-actions';
 import { PreviewAttachment } from './preview-attachment';
 import { Weather } from './weather';
+import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolInput,
+  ToolOutput,
+} from './ai-elements/tool';
 import equal from 'fast-deep-equal';
 import { cn, sanitizeText } from '@/lib/utils';
 import { Button } from './ui/button';
@@ -19,6 +26,7 @@ import { MessageReasoning } from './message-reasoning';
 import type { UseChatHelpers } from '@ai-sdk/react';
 import type { ChatMessage } from '@/lib/types';
 import { useDataStream } from './data-stream-provider';
+import { SearchingIndicator } from './searching-indicator';
 
 // Type narrowing is handled by TypeScript's control flow analysis
 // The AI SDK provides proper discriminated unions for tool calls
@@ -54,11 +62,22 @@ const PurePreviewMessage = ({
     <AnimatePresence>
       <motion.div
         data-testid={`message-${message.role}`}
-        className="w-full mx-auto max-w-3xl px-4 group/message"
+        className={cn("w-full mx-auto max-w-3xl group/message", {
+          "px-4": message.role === 'user',
+        })}
         initial={{ y: 5, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
         data-role={message.role}
       >
+        {message.role === 'assistant' && (
+          <div className="flex items-center gap-2 mb-3 -ml-2">
+            <div className="size-8 flex items-center justify-center shrink-0">
+              <BerryIcon size={22} />
+            </div>
+            <span className="text-lg font-medium text-muted-foreground">Berry</span>
+          </div>
+        )}
+
         <div
           className={cn(
             'flex gap-4 w-full group-data-[role=user]/message:ml-auto group-data-[role=user]/message:max-w-2xl',
@@ -68,14 +87,6 @@ const PurePreviewMessage = ({
             },
           )}
         >
-          {message.role === 'assistant' && (
-            <div className="size-8 flex items-center rounded-full justify-center shrink-0 bg-background">
-              <div className="translate-y-px">
-                <BerryIcon size={22} />
-              </div>
-            </div>
-          )}
-
           <div
             className={cn('flex flex-col gap-4 w-full', {
               'min-h-96': message.role === 'assistant' && requiresScrollPadding,
@@ -102,6 +113,62 @@ const PurePreviewMessage = ({
             {message.parts?.map((part, index) => {
               const { type } = part;
               const key = `message-${message.id}-part-${index}`;
+
+              if (type === 'tool-academicSearch') {
+                const { toolCallId, state } = part as any;
+                
+                if (state === 'input-available') {
+                  return <SearchingIndicator key={key} partType={type} />;
+                }
+
+                const defaultOpen = state === 'output-available' || state === 'output-error';
+
+                return (
+                  <div key={toolCallId}>
+                    <Tool defaultOpen={defaultOpen}>
+                      <ToolHeader type="tool-academicSearch" state={state} />
+                      <ToolContent>
+                        {(state === 'input-available' || state === 'output-available' || state === 'output-error') && (
+                          <ToolInput input={(part as any).input} />
+                        )}
+                        {state === 'output-available' && (
+                          <ToolOutput 
+                            output={
+                              <div className="space-y-4">
+                                {(part as any).output?.results?.map((result: any, idx: number) => (
+                                  <div key={idx} className="border-l-2 border-muted pl-4">
+                                    <h4 className="font-medium text-sm mb-1">
+                                      <a 
+                                        href={result.url} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-blue-600 hover:underline"
+                                      >
+                                        {result.title}
+                                      </a>
+                                    </h4>
+                                    <p className="text-xs text-muted-foreground mb-2">{result.url}</p>
+                                    {result.summary && (
+                                      <p className="text-sm">{result.summary}</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            }
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                        {state === 'output-error' && (
+                          <ToolOutput 
+                            output={null}
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                      </ToolContent>
+                    </Tool>
+                  </div>
+                );
+              }
 
               if (type === 'reasoning' && part.text?.trim().length > 0) {
                 return (
@@ -307,6 +374,108 @@ const PurePreviewMessage = ({
                   );
                 }
               }
+
+              if (type === 'tool-webSearch') {
+                const { toolCallId, state } = part as any;
+                const defaultOpen = state === 'output-available' || state === 'output-error';
+
+                return (
+                  <div key={toolCallId}>
+                    <Tool defaultOpen={defaultOpen}>
+                      <ToolHeader type="tool-webSearch" state={state} />
+                      <ToolContent>
+                        {(state === 'input-available' || state === 'output-available' || state === 'output-error') && (
+                          <ToolInput input={(part as any).input} />
+                        )}
+                        {state === 'output-available' && (
+                          <ToolOutput 
+                            output={
+                              <div className="space-y-4">
+                                {(part as any).output?.results?.map((result: any, idx: number) => (
+                                  <div key={idx} className="border-l-2 border-muted pl-4">
+                                    <h4 className="font-medium text-sm mb-1">
+                                      <a 
+                                        href={result.url} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-blue-600 hover:underline"
+                                      >
+                                        {result.title}
+                                      </a>
+                                    </h4>
+                                    <p className="text-xs text-muted-foreground mb-2">{result.url}</p>
+                                    {result.summary && (
+                                      <p className="text-sm">{result.summary}</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            }
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                        {state === 'output-error' && (
+                          <ToolOutput 
+                            output={null}
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                      </ToolContent>
+                    </Tool>
+                  </div>
+                );
+              }
+
+              if (type === 'tool-extremeSearch') {
+                const { toolCallId, state } = part as any;
+                const defaultOpen = state === 'output-available' || state === 'output-error';
+
+                return (
+                  <div key={toolCallId}>
+                    <Tool defaultOpen={defaultOpen}>
+                      <ToolHeader type="tool-extremeSearch" state={state} />
+                      <ToolContent>
+                        {(state === 'input-available' || state === 'output-available' || state === 'output-error') && (
+                          <ToolInput input={(part as any).input} />
+                        )}
+                        {state === 'output-available' && (
+                          <ToolOutput 
+                            output={
+                              <div className="space-y-4">
+                                {(part as any).output?.results?.map((result: any, idx: number) => (
+                                  <div key={idx} className="border-l-2 border-muted pl-4">
+                                    <h4 className="font-medium text-sm mb-1">
+                                      <a 
+                                        href={result.url} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-blue-600 hover:underline"
+                                      >
+                                        {result.title}
+                                      </a>
+                                    </h4>
+                                    <p className="text-xs text-muted-foreground mb-2">{result.url}</p>
+                                    {result.summary && (
+                                      <p className="text-sm">{result.summary}</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            }
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                        {state === 'output-error' && (
+                          <ToolOutput 
+                            output={null}
+                            errorText={(part as any).errorText}
+                          />
+                        )}
+                      </ToolContent>
+                    </Tool>
+                  </div>
+                );
+              }
             })}
 
             {!isReadonly && (
@@ -325,19 +494,7 @@ const PurePreviewMessage = ({
   );
 };
 
-export const PreviewMessage = memo(
-  PurePreviewMessage,
-  (prevProps, nextProps) => {
-    if (prevProps.isLoading !== nextProps.isLoading) return false;
-    if (prevProps.message.id !== nextProps.message.id) return false;
-    if (prevProps.requiresScrollPadding !== nextProps.requiresScrollPadding)
-      return false;
-    if (!equal(prevProps.message.parts, nextProps.message.parts)) return false;
-    if (!equal(prevProps.vote, nextProps.vote)) return false;
-
-    return false;
-  },
-);
+export const PreviewMessage = memo(PurePreviewMessage);
 
 export const ThinkingMessage = () => {
   const role = 'assistant';
@@ -345,11 +502,18 @@ export const ThinkingMessage = () => {
   return (
     <motion.div
       data-testid="message-assistant-loading"
-      className="w-full mx-auto max-w-3xl px-4 group/message min-h-96"
+      className="w-full mx-auto max-w-3xl group/message min-h-96"
       initial={{ y: 5, opacity: 0 }}
       animate={{ y: 0, opacity: 1, transition: { delay: 1 } }}
       data-role={role}
     >
+      <div className="flex items-center gap-2 mb-3 -ml-2">
+        <div className="size-8 flex items-center justify-center shrink-0">
+          <BerryIcon size={22} />
+        </div>
+        <span className="text-lg font-medium text-muted-foreground">Berry</span>
+      </div>
+
       <div
         className={cx(
           'flex gap-4 group-data-[role=user]/message:px-3 w-full group-data-[role=user]/message:w-fit group-data-[role=user]/message:ml-auto group-data-[role=user]/message:max-w-2xl group-data-[role=user]/message:py-2 rounded-xl',
@@ -358,10 +522,6 @@ export const ThinkingMessage = () => {
           },
         )}
       >
-        <div className="size-8 flex items-center rounded-full justify-center shrink-0">
-          <BerryIcon size={22} />
-        </div>
-
         <div className="flex flex-col gap-2 w-full">
           <div className="flex flex-col gap-4 text-muted-foreground">
             Hmm...
