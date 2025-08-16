@@ -5,7 +5,6 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
-  useSidebar,
 } from "@/components/ui/sidebar"
 import { BerryIcon, PlusIcon } from "./icons"
 import { useRouter } from "next/navigation"

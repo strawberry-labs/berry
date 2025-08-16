@@ -1,14 +1,10 @@
 "use client"
 
 import {
-  BadgeCheck,
-  Bell,
   ChevronsUpDown,
-  CreditCard,
   LogIn,
   LogOut,
   Palette,
-  Sparkles,
 } from "lucide-react"
 
 import {
@@ -19,7 +15,6 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -31,7 +26,7 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { User } from "next-auth"
+import type { User } from "next-auth"
 import { useRouter } from "next/navigation"
 import { signOut } from "next-auth/react"
 import { useTheme } from "next-themes"

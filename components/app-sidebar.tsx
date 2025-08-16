@@ -13,9 +13,6 @@ import {
   Settings2,
   SquareTerminal,
 } from "lucide-react"
-
-import { NavMain } from "@/components/nav-main"
-import { NavProjects } from "@/components/nav-projects"
 import { NavUser } from "@/components/nav-user"
 import {
   Sidebar,
@@ -25,7 +22,7 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { User } from "next-auth"
+import type { User } from "next-auth"
 import { BerryNewChat } from "./berry-new-chat"
 import { SidebarHistory } from "./sidebar-history"
 

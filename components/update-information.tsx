@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { useState } from "react";
 import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
-import { ThemeSwitcher, ThemeType } from "./ui/shadcn-io/theme-switcher";
+import { ThemeSwitcher, type ThemeType } from "./ui/shadcn-io/theme-switcher";
 import { useTheme } from "next-themes";
 
 export function UpdateInformation() {

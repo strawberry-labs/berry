@@ -2,11 +2,38 @@ import Link from 'next/link';
 import React, { memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { CodeBlock } from './code-block';
+import { AsyncCodeBlock } from './async-code-block';
 
 const components: Partial<Components> = {
-  // @ts-expect-error
-  code: CodeBlock,
+  code: ({ className, children, ...props }) => {
+    const match = /language-(\w+)/.exec(className || '');
+    const codeContent = String(children).replace(/\n$/, '');
+    
+    // Check if it's an inline code block or a fenced code block
+    const isInline = !className?.includes('language-');
+    
+    if (isInline) {
+      return (
+        <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm" {...props}>
+          {children}
+        </code>
+      );
+    }
+    
+    return match ? (
+      <AsyncCodeBlock
+        language={match[1]}
+        code={codeContent}
+        {...props}
+      />
+    ) : (
+      <pre className="p-4 bg-muted rounded-md overflow-x-auto">
+        <code className="font-mono text-sm" {...props}>
+          {children}
+        </code>
+      </pre>
+    );
+  },
   pre: ({ children }) => <>{children}</>,
   ol: ({ node, children, ...props }) => {
     return (

@@ -89,9 +89,9 @@ function PureMultimodalInput({
       textarea.style.height = 'auto'; // Reset height to recalculate
 
       const computedStyle = window.getComputedStyle(textarea);
-      const lineHeight = parseFloat(computedStyle.lineHeight) || 0;
-      const paddingTop = parseFloat(computedStyle.paddingTop) || 0;
-      const paddingBottom = parseFloat(computedStyle.paddingBottom) || 0;
+      const lineHeight = Number.parseFloat(computedStyle.lineHeight) || 0;
+      const paddingTop = Number.parseFloat(computedStyle.paddingTop) || 0;
+      const paddingBottom = Number.parseFloat(computedStyle.paddingBottom) || 0;
 
       const maxLines = 13;
       const maxHeight = maxLines * lineHeight + paddingTop + paddingBottom;

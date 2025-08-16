@@ -1,8 +1,8 @@
 import { LoaderIcon } from 'lucide-react';
 import { BerryIcon } from './icons';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from './ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, } from './ui/dialog';
 import { Input } from './ui/input';
-import { FormEvent, useState } from 'react';
+import { type FormEvent, useState } from 'react';
 import { emailMagicLink, oauthSignIn } from '@/app/(auth)/actions';
 import { useRouter } from 'next/navigation';
 import { Button } from './ui/button';

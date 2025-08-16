@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { memo, useState } from 'react';
 import type { Vote } from '@/lib/db/schema';
 import { DocumentToolCall, DocumentToolResult } from './document';
-import { BerryIcon, PencilEditIcon, SparklesIcon } from './icons';
+import { BerryIcon, PencilEditIcon, } from './icons';
 import { Markdown } from './markdown';
 import { MessageActions } from './message-actions';
 import { PreviewAttachment } from './preview-attachment';
@@ -491,19 +491,7 @@ const PurePreviewMessage = ({
   );
 };
 
-export const PreviewMessage = memo(
-  PurePreviewMessage,
-  (prevProps, nextProps) => {
-    if (prevProps.isLoading !== nextProps.isLoading) return false;
-    if (prevProps.message.id !== nextProps.message.id) return false;
-    if (prevProps.requiresScrollPadding !== nextProps.requiresScrollPadding)
-      return false;
-    if (!equal(prevProps.message.parts, nextProps.message.parts)) return false;
-    if (!equal(prevProps.vote, nextProps.vote)) return false;
-
-    return false;
-  },
-);
+export const PreviewMessage = memo(PurePreviewMessage);
 
 export const ThinkingMessage = () => {
   const role = 'assistant';
