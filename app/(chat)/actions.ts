@@ -21,6 +21,9 @@ export async function generateTitleFromUserMessage({
 }: {
   message: UIMessage;
 }) {
+  const titleStartTime = Date.now();
+  console.log('📝 [TITLE GEN] Starting title generation');
+  
   const { text: title } = await generateText({
     model: myProvider.languageModel('title-model'),
     system: `\n
@@ -31,6 +34,7 @@ export async function generateTitleFromUserMessage({
     prompt: JSON.stringify(message),
   });
 
+  console.log('✅ [TITLE GEN] Title generation completed in:', Date.now() - titleStartTime, 'ms');
   return title;
 }
 

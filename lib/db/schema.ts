@@ -11,6 +11,7 @@ import {
   foreignKey,
   boolean,
   integer,
+  index,
 } from 'drizzle-orm/pg-core';
 import type { AdapterAccountType } from "next-auth/adapters"
 
@@ -101,7 +102,10 @@ export const chat = pgTable('Chat', {
   visibility: varchar('visibility', { enum: ['public', 'private'] })
     .notNull()
     .default('private'),
-});
+}, (table) => ({
+  userIdIdx: index('chat_userId_idx').on(table.userId),
+  createdAtIdx: index('chat_createdAt_idx').on(table.createdAt),
+}));
 
 export type Chat = InferSelectModel<typeof chat>;
 
@@ -128,7 +132,13 @@ export const message = pgTable('Message_v2', {
   parts: json('parts').notNull(),
   attachments: json('attachments').notNull(),
   createdAt: timestamp('createdAt').notNull(),
-});
+}, (table) => ({
+  chatIdIdx: index('message_chatId_idx').on(table.chatId),
+  roleIdx: index('message_role_idx').on(table.role),
+  createdAtIdx: index('message_createdAt_idx').on(table.createdAt),
+  // Composite index for the expensive query: role + createdAt + chatId
+  roleCreatedAtChatIdx: index('message_role_createdAt_chat_idx').on(table.role, table.createdAt, table.chatId),
+}));
 
 export type DBMessage = InferSelectModel<typeof message>;
 
