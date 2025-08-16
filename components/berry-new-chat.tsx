@@ -7,6 +7,7 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
 import { BerryIcon, PlusIcon } from "./icons"
+import { SquarePen } from "lucide-react"
 import { useRouter } from "next/navigation"
 
 export function BerryNewChat() {

@@ -62,11 +62,22 @@ const PurePreviewMessage = ({
     <AnimatePresence>
       <motion.div
         data-testid={`message-${message.role}`}
-        className="w-full mx-auto max-w-3xl px-4 group/message"
+        className={cn("w-full mx-auto max-w-3xl group/message", {
+          "px-4": message.role === 'user',
+        })}
         initial={{ y: 5, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
         data-role={message.role}
       >
+        {message.role === 'assistant' && (
+          <div className="flex items-center gap-2 mb-3 -ml-2">
+            <div className="size-8 flex items-center justify-center shrink-0">
+              <BerryIcon size={22} />
+            </div>
+            <span className="text-lg font-medium text-muted-foreground">Berry</span>
+          </div>
+        )}
+
         <div
           className={cn(
             'flex gap-4 w-full group-data-[role=user]/message:ml-auto group-data-[role=user]/message:max-w-2xl',
@@ -76,14 +87,6 @@ const PurePreviewMessage = ({
             },
           )}
         >
-          {message.role === 'assistant' && (
-            <div className="size-8 flex items-center rounded-full justify-center shrink-0 bg-background">
-              <div className="translate-y-px">
-                <BerryIcon size={22} />
-              </div>
-            </div>
-          )}
-
           <div
             className={cn('flex flex-col gap-4 w-full', {
               'min-h-96': message.role === 'assistant' && requiresScrollPadding,
@@ -499,11 +502,18 @@ export const ThinkingMessage = () => {
   return (
     <motion.div
       data-testid="message-assistant-loading"
-      className="w-full mx-auto max-w-3xl px-4 group/message min-h-96"
+      className="w-full mx-auto max-w-3xl group/message min-h-96"
       initial={{ y: 5, opacity: 0 }}
       animate={{ y: 0, opacity: 1, transition: { delay: 1 } }}
       data-role={role}
     >
+      <div className="flex items-center gap-2 mb-3 -ml-2">
+        <div className="size-8 flex items-center justify-center shrink-0">
+          <BerryIcon size={22} />
+        </div>
+        <span className="text-lg font-medium text-muted-foreground">Berry</span>
+      </div>
+
       <div
         className={cx(
           'flex gap-4 group-data-[role=user]/message:px-3 w-full group-data-[role=user]/message:w-fit group-data-[role=user]/message:ml-auto group-data-[role=user]/message:max-w-2xl group-data-[role=user]/message:py-2 rounded-xl',
@@ -512,10 +522,6 @@ export const ThinkingMessage = () => {
           },
         )}
       >
-        <div className="size-8 flex items-center rounded-full justify-center shrink-0">
-          <BerryIcon size={22} />
-        </div>
-
         <div className="flex flex-col gap-2 w-full">
           <div className="flex flex-col gap-4 text-muted-foreground">
             Hmm...

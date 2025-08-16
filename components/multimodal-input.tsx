@@ -340,7 +340,7 @@ function PureMultimodalInput({
           value={input}
           onChange={handleInput}
           className={cx(
-            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled text-base',
+            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled text-lg',
             attachments.length > 0 || uploadQueue.length > 0 
               ? 'pt-3 px-3 pb-0 rounded-none' 
               : 'pt-3 px-3 pb-0 rounded-t-xl',
