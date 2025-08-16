@@ -8,6 +8,7 @@ const nextConfig: NextConfig = {
   experimental: {
     ppr: true,
   },
+  serverExternalPackages: ['shiki', 'vscode-oniguruma'],
   images: {
     remotePatterns: [
       {
