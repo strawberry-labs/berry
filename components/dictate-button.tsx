@@ -17,6 +17,36 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
+  const transcribeAudio = useCallback(async (audioBlob: Blob) => {
+    try {
+      // Create form data to send to our API route
+      const formData = new FormData();
+      const audioFile = new File([audioBlob], 'recording.webm', { type: 'audio/webm' });
+      formData.append('audio', audioFile);
+
+      // Call our speech-to-text API route
+      const response = await fetch('/api/speech-to-text', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to transcribe audio');
+      }
+
+      const result = await response.json();
+      
+      if (result.transcription) {
+        onTranscriptionReceived(result.transcription);
+      }
+    } catch (error) {
+      console.error('Error transcribing audio:', error);
+    } finally {
+      setIsTranscribing(false);
+    }
+  }, [onTranscriptionReceived]);
+
   const startRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
@@ -51,7 +81,7 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
     } catch (error) {
       console.error('Error starting recording:', error);
     }
-  }, []);
+  }, [transcribeAudio]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -61,35 +91,6 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
     }
   }, [isRecording]);
 
-  const transcribeAudio = useCallback(async (audioBlob: Blob) => {
-    try {
-      // Create form data to send to our API route
-      const formData = new FormData();
-      const audioFile = new File([audioBlob], 'recording.webm', { type: 'audio/webm' });
-      formData.append('audio', audioFile);
-
-      // Call our speech-to-text API route
-      const response = await fetch('/api/speech-to-text', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to transcribe audio');
-      }
-
-      const result = await response.json();
-      
-      if (result.transcription) {
-        onTranscriptionReceived(result.transcription);
-      }
-    } catch (error) {
-      console.error('Error transcribing audio:', error);
-    } finally {
-      setIsTranscribing(false);
-    }
-  }, [onTranscriptionReceived]);
 
   const handleClick = useCallback((event: React.MouseEvent) => {
     event.preventDefault();

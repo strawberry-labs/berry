@@ -5,7 +5,7 @@
 // ----> Use structured source collection to provide comprehensive research results
 // ----> Return all collected sources and research data to the user
 
-import Exa from 'exa-js';
+import { Exa } from 'exa-js';
 import { generateText, tool, type UIMessageStreamWriter } from 'ai';
 import { z } from 'zod';
 import { serverEnv } from '@/env/server';
@@ -75,8 +75,8 @@ Please provide a detailed analysis and summary of this research topic.`,
   }
 };
 
-export const extremeSearchTool = (dataStream?: UIMessageStreamWriter<ChatMessage>) =>
-  tool({
+export const extremeSearchTool = (dataStream?: UIMessageStreamWriter<ChatMessage>) => {
+  return tool({
     description: 'Use this tool to conduct an extreme search on a given topic.',
     inputSchema: z.object({
       prompt: z
@@ -97,3 +97,4 @@ export const extremeSearchTool = (dataStream?: UIMessageStreamWriter<ChatMessage
       };
     },
   });
+};

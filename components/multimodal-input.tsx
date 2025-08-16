@@ -8,6 +8,7 @@ import {
   useEffect,
   useState,
   useCallback,
+  useMemo,
   type Dispatch,
   type SetStateAction,
   type ChangeEvent,
@@ -250,7 +251,10 @@ function PureMultimodalInput({
   );
 
   const isAtBottom = scrollData?.isAtBottom ?? false;
-  const scrollToBottom = scrollData?.scrollToBottom ?? (() => {});
+  const scrollToBottom = useMemo(
+    () => scrollData?.scrollToBottom ?? (() => {}),
+    [scrollData?.scrollToBottom]
+  );
 
   useEffect(() => {
     if (status === 'submitted' && scrollToBottom) {

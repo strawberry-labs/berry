@@ -9,7 +9,7 @@ export default function Component() {
         <div className="mx-auto h-12 w-12 text-primary" />
         <h1 className="mt-4 text-6xl font-bold tracking-tight text-foreground sm:text-7xl">404</h1>
         <p className="mt-4 text-lg text-muted-foreground">
-          Oops, it looks like the page you're looking for doesn't exist.
+          Oops, it looks like the page you&apos;re looking for doesn&apos;t exist.
         </p>
         <div className="mt-6">
           <Link

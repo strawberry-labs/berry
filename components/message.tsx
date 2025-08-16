@@ -105,9 +105,7 @@ const PurePreviewMessage = ({
               const key = `message-${message.id}-part-${index}`;
 
               if (
-                (type === 'tool-webSearch' ||
-                  type === 'tool-academicSearch' ||
-                  type === 'tool-extremeSearch') &&
+                (type === 'tool-academicSearch') &&
                   part.state === 'input-available'
               ) {
                 return <SearchingIndicator key={key} partType={type} />;

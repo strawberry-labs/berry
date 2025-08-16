@@ -1,6 +1,6 @@
 import { tool, type UIMessageStreamWriter } from 'ai';
 import { z } from 'zod';
-import Exa from 'exa-js';
+import { Exa } from 'exa-js';
 import { serverEnv } from '@/env/server';
 import type { ChatMessage } from '@/lib/types';
 
@@ -43,8 +43,8 @@ const processDomains = (domains?: string[]): string[] | undefined => {
   return processedDomains.every((domain) => domain.trim() === '') ? undefined : processedDomains;
 };
 
-export const webSearchTool = (dataStream: UIMessageStreamWriter<ChatMessage>) =>
-  tool({
+export const webSearchTool = (dataStream: UIMessageStreamWriter<ChatMessage>) => {
+  return tool({
     description: 'Search the web for information with 5-10 queries, max results and search depth.',
     inputSchema: z.object({
       queries: z.array(
@@ -104,3 +104,4 @@ export const webSearchTool = (dataStream: UIMessageStreamWriter<ChatMessage>) =>
       }
     },
   });
+};
