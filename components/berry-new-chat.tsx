@@ -11,7 +11,6 @@ import { SquarePen } from "lucide-react"
 import { useRouter } from "next/navigation"
 
 export function BerryNewChat() {
-
   const router = useRouter();
 
   return (

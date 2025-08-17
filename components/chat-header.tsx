@@ -2,7 +2,7 @@
 import { useRouter } from 'next/navigation';
 import { useWindowSize } from 'usehooks-ts';
 import { useEffect, useState } from 'react';
-
+import { Download } from 'lucide-react';
 
 import { SidebarToggle } from '@/components/sidebar-toggle';
 import { Button } from '@/components/ui/button';
@@ -27,10 +27,39 @@ function PureChatHeader({
 
   const { width: windowWidth } = useWindowSize();
   const [isMounted, setIsMounted] = useState(false);
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [showInstallButton, setShowInstallButton] = useState(false);
 
   useEffect(() => {
     setIsMounted(true);
+    
+    // Only show install button when browser provides the install prompt
+    const handler = (e: Event) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      setShowInstallButton(true);
+    };
+
+    window.addEventListener('beforeinstallprompt', handler);
+
+    return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
+
+  const handleInstall = async () => {
+    if (!deferredPrompt) return;
+
+    try {
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      
+      if (outcome === 'accepted') {
+        setDeferredPrompt(null);
+        setShowInstallButton(false);
+      }
+    } catch (error) {
+      console.error('Install prompt failed:', error);
+    }
+  };
 
   return (
     <header className="flex sticky top-0 bg-background py-2 items-center px-2 md:px-2 gap-2 border-b border-border/25 border-t-0">
@@ -43,22 +72,42 @@ function PureChatHeader({
       </div>
 
       {isMounted && (!open || windowWidth < 768) && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              className="order-2 md:order-1 md:px-2 px-2 md:h-fit ml-auto md:ml-0 cursor-pointer border-none"
-              onClick={() => {
-                router.push('/');
-                router.refresh();
-              }}
-            >
-              <PlusIcon />
-              <span className="sr-only">New Chat</span>
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>New Chat</TooltipContent>
-        </Tooltip>
+        <div className="flex items-center gap-1 order-2 md:order-1 ml-auto md:ml-0">
+          {/* PWA Install Button */}
+          {showInstallButton && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  className="md:px-2 px-2 md:h-fit cursor-pointer border-none"
+                  onClick={handleInstall}
+                >
+                  <Download size={16} />
+                  <span className="sr-only">Install App</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Install App</TooltipContent>
+            </Tooltip>
+          )}
+          
+          {/* New Chat Button */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                className="md:px-2 px-2 md:h-fit cursor-pointer border-none"
+                onClick={() => {
+                  router.push('/');
+                  router.refresh();
+                }}
+              >
+                <PlusIcon />
+                <span className="sr-only">New Chat</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>New Chat</TooltipContent>
+          </Tooltip>
+        </div>
       )}
 
 

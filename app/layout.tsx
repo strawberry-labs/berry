@@ -9,11 +9,25 @@ import { SessionProvider } from 'next-auth/react';
 export const metadata: Metadata = {
   metadataBase: new URL('https://chat.vercel.ai'),
   title: 'Berry',
-  description: 'Berry chatbot.',
+  description: 'Berry chatbot - AI-powered conversational assistant',
+  manifest: '/manifest.json',
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: 'default',
+    title: 'Berry',
+  },
+  icons: {
+    icon: '/favicon.ico',
+    apple: '/images/berry-logo.png',
+  },
 };
 
 export const viewport = {
   maximumScale: 1, // Disable auto-zoom on mobile Safari
+  themeColor: [
+    { media: '(prefers-color-scheme: light)', color: 'hsl(0 0% 100%)' },
+    { media: '(prefers-color-scheme: dark)', color: 'hsl(240deg 10% 3.92%)' }
+  ],
 };
 
 const geist = Geist({
@@ -48,6 +62,21 @@ const THEME_COLOR_SCRIPT = `\
   updateThemeColor();
 })();`;
 
+const SW_REGISTRATION_SCRIPT = `\
+(function() {
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+      navigator.serviceWorker.register('/sw.js')
+        .then(function(registration) {
+          console.log('SW registered: ', registration);
+        })
+        .catch(function(registrationError) {
+          console.log('SW registration failed: ', registrationError);
+        });
+    });
+  }
+})();`;
+
 export default async function RootLayout({
   children,
 }: Readonly<{
@@ -67,6 +96,11 @@ export default async function RootLayout({
         <script
           dangerouslySetInnerHTML={{
             __html: THEME_COLOR_SCRIPT,
+          }}
+        />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: SW_REGISTRATION_SCRIPT,
           }}
         />
       </head>

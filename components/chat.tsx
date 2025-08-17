@@ -242,60 +242,94 @@ export function Chat({
 
         <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
           {messages.length === 0 ? (
-            // Empty chat state: center chat input vertically, logo above it
-            <div className="flex items-center justify-center flex-1 relative">
+            // Empty chat state: center everything vertically with keyboard handling
+            <div 
+              className="flex flex-col items-center justify-center flex-1 gap-8 px-4 transition-transform duration-300 ease-in-out"
+              style={{
+                transform: isKeyboardVisible ? `translateY(-${keyboardHeight * 0.4}px)` : 'translateY(0)',
+              }}
+            >
               {/* Berry logo positioned above the centered chat input */}
-              <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-full pb-20">
+              <div className="flex-shrink-0">
                 <Greeting key="berry-greeting" />
+              </div>
+              
+              {/* Centered input for new chat */}
+              <div className="w-full max-w-3xl">
+                <form className="flex mx-auto gap-2 w-full">
+                  {!isReadonly && (
+                    <MultimodalInput
+                      chatId={id}
+                      input={input}
+                      setInput={setInput}
+                      status={status}
+                      stop={stop}
+                      attachments={attachments}
+                      setAttachments={setAttachments}
+                      messages={messages}
+                      setMessages={setMessages}
+                      sendMessage={sendMessage}
+                      selectedVisibilityType={visibilityType}
+                      selectedModelId={currentChatModel}
+                      session={session}
+                      onModelChange={setCurrentChatModel}
+                      scrollData={scrollData}
+                      selectedSearchMode={selectedSearchMode}
+                      onSearchModeChange={handleSearchModeChange}
+                    />
+                  )}
+                </form>
               </div>
             </div>
           ) : (
-            // Chat with messages: scrollable messages area
-            <Messages
-              chatId={id}
-              status={status}
-              votes={votes}
-              messages={messages}
-              setMessages={setMessages}
-              regenerate={regenerate}
-              isReadonly={isReadonly}
-              isArtifactVisible={isArtifactVisible}
-              onScrollDataReady={setScrollData}
-            />
-          )}
+            // Chat with messages: scrollable messages area + bottom input
+            <>
+              <Messages
+                chatId={id}
+                status={status}
+                votes={votes}
+                messages={messages}
+                setMessages={setMessages}
+                regenerate={regenerate}
+                isReadonly={isReadonly}
+                isArtifactVisible={isArtifactVisible}
+                onScrollDataReady={setScrollData}
+              />
 
-          {/* Fixed input area that moves up with keyboard */}
-          <div 
-            className="flex-shrink-0 transition-transform duration-300 ease-in-out"
-            style={{
-              transform: isKeyboardVisible ? `translateY(-8px)` : 'translateY(0)',
-              paddingBottom: isKeyboardVisible ? `${keyboardHeight}px` : '0px',
-            }}
-          >
-            <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
-              {!isReadonly && (
-                <MultimodalInput
-                  chatId={id}
-                  input={input}
-                  setInput={setInput}
-                  status={status}
-                  stop={stop}
-                  attachments={attachments}
-                  setAttachments={setAttachments}
-                  messages={messages}
-                  setMessages={setMessages}
-                  sendMessage={sendMessage}
-                  selectedVisibilityType={visibilityType}
-                  selectedModelId={currentChatModel}
-                  session={session}
-                  onModelChange={setCurrentChatModel}
-                  scrollData={scrollData}
-                  selectedSearchMode={selectedSearchMode}
-                  onSearchModeChange={handleSearchModeChange}
-                />
-              )}
-            </form>
-          </div>
+              {/* Fixed input area at bottom when messages exist */}
+              <div 
+                className="flex-shrink-0 transition-transform duration-300 ease-in-out"
+                style={{
+                  transform: isKeyboardVisible ? `translateY(-8px)` : 'translateY(0)',
+                  paddingBottom: isKeyboardVisible ? `${keyboardHeight}px` : '0px',
+                }}
+              >
+                <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
+                  {!isReadonly && (
+                    <MultimodalInput
+                      chatId={id}
+                      input={input}
+                      setInput={setInput}
+                      status={status}
+                      stop={stop}
+                      attachments={attachments}
+                      setAttachments={setAttachments}
+                      messages={messages}
+                      setMessages={setMessages}
+                      sendMessage={sendMessage}
+                      selectedVisibilityType={visibilityType}
+                      selectedModelId={currentChatModel}
+                      session={session}
+                      onModelChange={setCurrentChatModel}
+                      scrollData={scrollData}
+                      selectedSearchMode={selectedSearchMode}
+                      onSearchModeChange={handleSearchModeChange}
+                    />
+                  )}
+                </form>
+              </div>
+            </>
+          )}
         </div>
       </div>
 
