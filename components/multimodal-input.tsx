@@ -262,6 +262,7 @@ function PureMultimodalInput({
     }
   }, [status, scrollToBottom]);
 
+
   return (
     <div className={`relative w-full flex gap-4 ${messages.length > 0 ? 'flex-col-reverse' : 'flex-col'}`}>
 

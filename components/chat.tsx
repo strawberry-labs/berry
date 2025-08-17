@@ -24,6 +24,7 @@ import { ChatSDKError } from '@/lib/errors';
 import type { Attachment, ChatMessage } from '@/lib/types';
 import { useDataStream } from './data-stream-provider';
 import type { SearchGroupId } from '@/lib/utils';
+import { useWindowSize } from 'usehooks-ts';
 
 export function Chat({
   id,
@@ -124,6 +125,11 @@ export function Chat({
   const isArtifactVisible = useArtifactSelector((state) => state.isVisible);
   
   const [scrollData, setScrollData] = useState<{ isAtBottom: boolean; scrollToBottom: () => void } | null>(null);
+  
+  // Keyboard positioning state
+  const { width } = useWindowSize();
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
 
   useAutoResume({
     autoResume,
@@ -132,25 +138,141 @@ export function Chat({
     setMessages,
   });
 
+  // Keyboard detection for mobile devices
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const initialViewportHeight = window.innerHeight;
+    
+    const handleViewportChange = () => {
+      const isMobile = width < 768;
+      if (!isMobile) {
+        setKeyboardHeight(0);
+        setIsKeyboardVisible(false);
+        return;
+      }
+
+      let currentViewportHeight = window.innerHeight;
+      
+      // Use visual viewport if available (better for iOS)
+      if (window.visualViewport) {
+        currentViewportHeight = window.visualViewport.height;
+      }
+      
+      const heightDifference = initialViewportHeight - currentViewportHeight;
+      
+      // Keyboard is considered open if viewport height decreases by more than 150px
+      if (heightDifference > 150) {
+        setKeyboardHeight(heightDifference);
+        setIsKeyboardVisible(true);
+      } else {
+        setKeyboardHeight(0);
+        setIsKeyboardVisible(false);
+      }
+    };
+
+    // Listen for viewport changes
+    window.addEventListener('resize', handleViewportChange);
+    
+    // Also listen for visual viewport changes (better for iOS)
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', handleViewportChange);
+    }
+
+    // Initial check
+    handleViewportChange();
+
+    // Additional focus-based detection
+    const handleFocusIn = (event: FocusEvent) => {
+      const target = event.target as HTMLElement;
+      const isMobile = width < 768;
+      const isInputElement = target.tagName === 'INPUT' || 
+                           target.tagName === 'TEXTAREA' || 
+                           target.contentEditable === 'true';
+      
+      if (isMobile && isInputElement) {
+        // Proactively set keyboard as visible
+        setTimeout(() => {
+          if (!isKeyboardVisible) {
+            setKeyboardHeight(300);
+            setIsKeyboardVisible(true);
+          }
+        }, 300); // Allow time for keyboard to appear
+      }
+    };
+
+    const handleFocusOut = (event: FocusEvent) => {
+      const isMobile = width < 768;
+      if (isMobile) {
+        setTimeout(() => {
+          const activeElement = document.activeElement as HTMLElement;
+          const isStillFocused = activeElement?.tagName === 'INPUT' || 
+                               activeElement?.tagName === 'TEXTAREA' ||
+                               activeElement?.contentEditable === 'true';
+          
+          if (!isStillFocused) {
+            setIsKeyboardVisible(false);
+            setKeyboardHeight(0);
+          }
+        }, 200);
+      }
+    };
+
+    document.addEventListener('focusin', handleFocusIn);
+    document.addEventListener('focusout', handleFocusOut);
+
+    return () => {
+      window.removeEventListener('resize', handleViewportChange);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', handleViewportChange);
+      }
+      document.removeEventListener('focusin', handleFocusIn);
+      document.removeEventListener('focusout', handleFocusOut);
+    };
+  }, [width, isKeyboardVisible]);
+
   return (
     <>
-      <div className="flex flex-col min-w-0 h-dvh bg-background">
+      <div className="flex flex-col min-w-0 h-dvh bg-background overflow-hidden">
         <ChatHeader
           chatId={id}
           selectedVisibilityType={initialVisibilityType}
           isReadonly={isReadonly}
         />
 
-        {messages.length === 0 ? (
-          // Empty chat state: center chat input vertically, logo above it
-          <div className="flex items-center justify-center flex-1 relative">
-            {/* Berry logo positioned above the centered chat input */}
-            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-full pb-20">
-              <Greeting key="berry-greeting" />
+        <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+          {messages.length === 0 ? (
+            // Empty chat state: center chat input vertically, logo above it
+            <div className="flex items-center justify-center flex-1 relative">
+              {/* Berry logo positioned above the centered chat input */}
+              <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-full pb-20">
+                <Greeting key="berry-greeting" />
+              </div>
             </div>
-            
-            {/* Chat input centered vertically */}
-            <form className="flex mx-auto px-4 gap-2 w-full md:max-w-3xl">
+          ) : (
+            // Chat with messages: scrollable messages area
+            <Messages
+              chatId={id}
+              status={status}
+              votes={votes}
+              messages={messages}
+              setMessages={setMessages}
+              regenerate={regenerate}
+              isReadonly={isReadonly}
+              isArtifactVisible={isArtifactVisible}
+              onScrollDataReady={setScrollData}
+            />
+          )}
+
+          {/* Fixed input area that moves up with keyboard */}
+          <div 
+            className="flex-shrink-0 transition-transform duration-300 ease-in-out"
+            style={{
+              transform: isKeyboardVisible ? `translateY(-8px)` : 'translateY(0)',
+              paddingBottom: isKeyboardVisible ? `${keyboardHeight}px` : '0px',
+            }}
+          >
+            <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
               {!isReadonly && (
                 <MultimodalInput
                   chatId={id}
@@ -174,48 +296,7 @@ export function Chat({
               )}
             </form>
           </div>
-        ) : (
-          // Chat with messages: normal layout
-          <>
-            <Messages
-              chatId={id}
-              status={status}
-              votes={votes}
-              messages={messages}
-              setMessages={setMessages}
-              regenerate={regenerate}
-              isReadonly={isReadonly}
-              isArtifactVisible={isArtifactVisible}
-              onScrollDataReady={setScrollData}
-            />
-
-            <div className="flex-shrink-0">
-              <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
-              {!isReadonly && (
-                <MultimodalInput
-                  chatId={id}
-                  input={input}
-                  setInput={setInput}
-                  status={status}
-                  stop={stop}
-                  attachments={attachments}
-                  setAttachments={setAttachments}
-                  messages={messages}
-                  setMessages={setMessages}
-                  sendMessage={sendMessage}
-                  selectedVisibilityType={visibilityType}
-                  selectedModelId={currentChatModel}
-                  session={session}
-                  onModelChange={setCurrentChatModel}
-                  scrollData={scrollData}
-                  selectedSearchMode={selectedSearchMode}
-                  onSearchModeChange={handleSearchModeChange}
-                />
-              )}
-              </form>
-            </div>
-          </>
-        )}
+        </div>
       </div>
 
       <Artifact

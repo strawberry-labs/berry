@@ -338,6 +338,20 @@
   .table-container::-webkit-scrollbar-thumb:hover {
     background: #555;
   }
+
+  /* Mobile keyboard handling */
+  @media (max-width: 768px) {
+    body {
+      /* Prevent zoom on focus for iOS */
+      -webkit-text-size-adjust: 100%;
+    }
+    
+    /* Prevent viewport resizing issues on mobile keyboards */
+    .keyboard-active {
+      position: fixed;
+      width: 100%;
+    }
+  }
 }
 
 .skeleton {

@@ -1,6 +1,7 @@
 'use client';
 import { useRouter } from 'next/navigation';
 import { useWindowSize } from 'usehooks-ts';
+import { useEffect, useState } from 'react';
 
 
 import { SidebarToggle } from '@/components/sidebar-toggle';
@@ -25,23 +26,28 @@ function PureChatHeader({
   const { open } = useSidebar();
 
   const { width: windowWidth } = useWindowSize();
+  const [isMounted, setIsMounted] = useState(false);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   return (
-    <header className="flex sticky top-0 bg-background py-4 items-center px-2 md:px-2 gap-2 border-b border-border/25">
+    <header className="flex sticky top-0 bg-background py-2 items-center px-2 md:px-2 gap-2 border-b border-border/25 border-t-0">
       <div className="flex items-center gap-2">
         <SidebarToggle />
         {/* Show Berry text on mobile when sidebar is closed */}
-        {windowWidth < 768 && !open && (
-          <span className="text-lg font-medium text-muted-foreground">Berry</span>
+        {isMounted && windowWidth < 768 && !open && (
+          <span className="text-lg font-medium text-white">Berry</span>
         )}
       </div>
 
-      {(!open || windowWidth < 768) && (
+      {isMounted && (!open || windowWidth < 768) && (
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
-              variant="outline"
-              className="order-2 md:order-1 md:px-2 px-2 md:h-fit ml-auto md:ml-0 cursor-pointer"
+              variant="ghost"
+              className="order-2 md:order-1 md:px-2 px-2 md:h-fit ml-auto md:ml-0 cursor-pointer border-none"
               onClick={() => {
                 router.push('/');
                 router.refresh();
@@ -57,7 +63,7 @@ function PureChatHeader({
 
 
 
-      {!isReadonly && (
+      {isMounted && !isReadonly && (
         <VisibilitySelector
           chatId={chatId}
           selectedVisibilityType={selectedVisibilityType}
