@@ -27,8 +27,14 @@ function PureChatHeader({
   const { width: windowWidth } = useWindowSize();
 
   return (
-    <header className="flex sticky top-0 bg-background py-1.5 items-center px-2 md:px-2 gap-2">
-      <SidebarToggle />
+    <header className="flex sticky top-0 bg-background py-4 items-center px-2 md:px-2 gap-2 border-b border-border/25">
+      <div className="flex items-center gap-2">
+        <SidebarToggle />
+        {/* Show Berry text on mobile when sidebar is closed */}
+        {windowWidth < 768 && !open && (
+          <span className="text-lg font-medium text-muted-foreground">Berry</span>
+        )}
+      </div>
 
       {(!open || windowWidth < 768) && (
         <Tooltip>
@@ -42,7 +48,7 @@ function PureChatHeader({
               }}
             >
               <PlusIcon />
-              <span className="md:sr-only">New Chat</span>
+              <span className="sr-only">New Chat</span>
             </Button>
           </TooltipTrigger>
           <TooltipContent>New Chat</TooltipContent>

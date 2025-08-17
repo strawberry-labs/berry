@@ -2,22 +2,39 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Auto-hiding scrollbars - only show when scrolling */
 ::-webkit-scrollbar {
-  width: 4px; /* Adjust as needed for desired slimness */
-  height: 4px; /* For horizontal scrollbars */
+  width: 8px;
+  height: 0px; /* Hide horizontal scrollbar completely */
 }
 
 ::-webkit-scrollbar-track {
-  background: transparent; /* Color of the scrollbar track */
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #888; /* Color of the scrollbar thumb */
-  border-radius: 20px; /* Rounded corners for the thumb */
+  background: transparent;
+  border-radius: 20px;
+  transition: background-color 0.3s ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #555; /* Color of the thumb on hover */
+  background: #888;
+}
+
+/* Show scrollbar only during scroll */
+.scrolling::-webkit-scrollbar-thumb {
+  background: #888;
+}
+
+/* Firefox auto-hide scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.scrolling {
+  scrollbar-color: #888 transparent;
 }
 
 @theme {
@@ -280,6 +297,46 @@
 
   body {
     @apply bg-background text-foreground;
+    /* Prevent horizontal overflow on body */
+    overflow-x: hidden;
+  }
+
+  /* Global text wrapping and overflow prevention */
+  * {
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    hyphens: auto;
+  }
+
+  /* Ensure all containers don't create horizontal overflow */
+  .message-content,
+  .markdown-content,
+  pre:not(.table-container pre),
+  code:not(.table-container code) {
+    max-width: 100%;
+    overflow-x: hidden;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    white-space: pre-wrap;
+  }
+
+  /* Exception for tables - allow horizontal scroll */
+  .table-container {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+
+  .table-container::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  .table-container::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 20px;
+  }
+
+  .table-container::-webkit-scrollbar-thumb:hover {
+    background: #555;
   }
 }
 

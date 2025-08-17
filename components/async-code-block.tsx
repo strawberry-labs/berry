@@ -113,8 +113,8 @@ const AsyncCodeBlock = memo(({ code, language, showLineNumbers = false, classNam
             <IconComponent size={14} />
           </Button>
         </div>
-        <div className="overflow-x-auto p-4">
-          <pre className="text-sm font-mono whitespace-pre-wrap">
+        <div className="overflow-x-hidden p-4">
+          <pre className="text-sm font-mono whitespace-pre-wrap break-words break-all">
             <code>{code}</code>
           </pre>
         </div>
@@ -138,7 +138,7 @@ const AsyncCodeBlock = memo(({ code, language, showLineNumbers = false, classNam
         </Button>
       </div>
       <div 
-        className="overflow-x-auto [&>pre]:!bg-transparent [&>pre]:!p-4 [&>pre]:!m-0"
+        className="overflow-x-hidden [&>pre]:!bg-transparent [&>pre]:!p-4 [&>pre]:!m-0 [&>pre]:whitespace-pre-wrap [&>pre]:break-words [&>pre]:break-all"
         dangerouslySetInnerHTML={{ __html: highlightedCode || '' }} 
       />
     </div>

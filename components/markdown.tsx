@@ -27,7 +27,7 @@ const components: Partial<Components> = {
         {...props}
       />
     ) : (
-      <pre className="p-4 bg-muted rounded-md overflow-x-auto">
+      <pre className="p-4 bg-muted rounded-md overflow-x-hidden whitespace-pre-wrap break-words break-all">
         <code className="font-mono text-sm" {...props}>
           {children}
         </code>
@@ -120,7 +120,7 @@ const components: Partial<Components> = {
   },
   table: ({ node, children, ...props }) => {
     return (
-      <div className="overflow-x-auto my-4">
+      <div className="table-container overflow-x-auto my-4">
         <table className="min-w-full border-collapse border border-border" {...props}>
           {children}
         </table>
@@ -168,9 +168,11 @@ const remarkPlugins = [remarkGfm];
 
 const NonMemoizedMarkdown = ({ children }: { children: string }) => {
   return (
-    <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
-      {children}
-    </ReactMarkdown>
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+        {children}
+      </ReactMarkdown>
+    </div>
   );
 };
 

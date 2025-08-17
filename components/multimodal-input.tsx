@@ -264,30 +264,6 @@ function PureMultimodalInput({
 
   return (
     <div className={`relative w-full flex gap-4 ${messages.length > 0 ? 'flex-col-reverse' : 'flex-col'}`}>
-      <AnimatePresence>
-        {!isAtBottom && messages.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 10 }}
-            transition={{ type: 'spring', stiffness: 300, damping: 20 }}
-            className="absolute left-1/2 bottom-28 -translate-x-1/2 z-50"
-          >
-            <Button
-              data-testid="scroll-to-bottom-button"
-              className="rounded-full cursor-pointer"
-              size="icon"
-              variant="outline"
-              onClick={(event) => {
-                event.preventDefault();
-                scrollToBottom();
-              }}
-            >
-              <ArrowDown />
-            </Button>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {messages.length === 0 &&
         attachments.length === 0 &&
@@ -333,6 +309,31 @@ function PureMultimodalInput({
 
       {/* Input Container with unified background */}
       <div className="relative rounded-xl bg-muted border border-border">
+        {/* Scroll to bottom button positioned above input */}
+        <AnimatePresence>
+          {!isAtBottom && messages.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+              className="absolute left-1/2 -top-12 -translate-x-1/2 z-50"
+            >
+              <Button
+                data-testid="scroll-to-bottom-button"
+                className="rounded-full cursor-pointer"
+                size="icon"
+                variant="outline"
+                onClick={(event) => {
+                  event.preventDefault();
+                  scrollToBottom();
+                }}
+              >
+                <ArrowDown />
+              </Button>
+            </motion.div>
+          )}
+        </AnimatePresence>
         <Textarea
           data-testid="multimodal-input"
           ref={textareaRef}

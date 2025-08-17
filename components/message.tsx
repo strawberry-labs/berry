@@ -62,9 +62,7 @@ const PurePreviewMessage = ({
     <AnimatePresence>
       <motion.div
         data-testid={`message-${message.role}`}
-        className={cn("w-full mx-auto max-w-3xl group/message", {
-          "px-4": message.role === 'user',
-        })}
+        className="w-full mx-auto max-w-3xl group/message"
         initial={{ y: 5, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
         data-role={message.role}
@@ -204,7 +202,7 @@ const PurePreviewMessage = ({
 
                       <div
                         data-testid="message-content"
-                        className={cn('flex flex-col gap-4', {
+                        className={cn('message-content flex flex-col gap-4', {
                           'bg-primary text-primary-foreground px-3 py-2 rounded-xl':
                             message.role === 'user',
                         })}
