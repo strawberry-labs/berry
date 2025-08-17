@@ -112,7 +112,7 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
   return (
     <Button
       data-testid="dictate-button"
-      className={`rounded-md rounded-br-lg p-[7px] h-fit dark:border-zinc-700 dark:hover:bg-zinc-900 hover:bg-zinc-200 relative ${
+      className={`rounded-md rounded-br-lg p-[7px] h-fit dark:border-zinc-700 dark:hover:bg-zinc-900 hover:bg-zinc-200 relative cursor-pointer ${
         isActive ? 'bg-red-100 dark:bg-red-900/20 border-red-300 dark:border-red-700' : ''
       }`}
       onClick={handleClick}

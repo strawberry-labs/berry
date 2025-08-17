@@ -51,7 +51,7 @@ export function NavUser({
           <DropdownMenuTrigger asChild>
             <SidebarMenuButton
               size="lg"
-              className="data-[state=open]:bg-sidebar-accent transition-all duration-200 relative hover:text-current focus:text-current"
+              className="data-[state=open]:bg-sidebar-accent transition-all duration-200 relative hover:text-current focus:text-current cursor-pointer"
             >
               <Avatar className="h-8 w-8 rounded-lg transition-all duration-200 absolute top-1/2 -translate-y-1/2 group-data-[collapsible=icon]:left-0">
                 <AvatarImage src={user?.image || undefined} alt={user?.name || undefined} />
@@ -104,7 +104,7 @@ export function NavUser({
                 Notifications
               </DropdownMenuItem>
             </DropdownMenuGroup> */}
-              <DropdownMenuItem onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}>
+              <DropdownMenuItem onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')} className="cursor-pointer">
                 <Palette/>
                <span> {`Toggle ${resolvedTheme === 'light' ? 'dark' : 'light'} mode`}</span>
               </DropdownMenuItem>
@@ -117,7 +117,7 @@ export function NavUser({
                     redirectTo: '/login',
                   });
                 }
-            }}>
+            }} className="cursor-pointer">
               {isGuest
               ?
               <>

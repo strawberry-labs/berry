@@ -275,7 +275,7 @@ function PureMultimodalInput({
           >
             <Button
               data-testid="scroll-to-bottom-button"
-              className="rounded-full"
+              className="rounded-full cursor-pointer"
               size="icon"
               variant="outline"
               onClick={(event) => {
@@ -369,10 +369,6 @@ function PureMultimodalInput({
         <div className="flex items-center justify-between px-3 py-2 rounded-b-xl bg-muted gap-2 min-w-0">
           <div className="flex items-center gap-1 md:gap-2 min-w-0 flex-1">
             <AttachmentsButton fileInputRef={fileInputRef} status={status} />
-            <DictateButton 
-              onTranscriptionReceived={handleTranscriptionReceived} 
-              status={status} 
-            />
             <SearchModeSelector
               selectedMode={selectedSearchMode}
               onModeChange={onSearchModeChange}
@@ -386,6 +382,10 @@ function PureMultimodalInput({
               onModelChange={onModelChange}
               variant="ghost"
               size="sm"
+            />
+            <DictateButton 
+              onTranscriptionReceived={handleTranscriptionReceived} 
+              status={status} 
             />
             {status === 'submitted' ? (
               <StopButton stop={stop} setMessages={setMessages} />
@@ -431,7 +431,7 @@ function PureAttachmentsButton({
   return (
     <Button
       data-testid="attachments-button"
-      className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-accent rounded-full"
+      className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-accent rounded-full cursor-pointer"
       onClick={(event) => {
         event.preventDefault();
         fileInputRef.current?.click();
@@ -458,7 +458,7 @@ function PureStopButton({
   return (
     <Button
       data-testid="stop-button"
-      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80"
+      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80 cursor-pointer"
       onClick={(event) => {
         event.preventDefault();
         stop();
@@ -486,7 +486,7 @@ function PureSendButton({
   return (
     <Button
       data-testid="send-button"
-      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80 disabled:bg-muted-foreground/30"
+      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80 disabled:bg-muted-foreground/30 cursor-pointer"
       onClick={(event) => {
         event.preventDefault();
         submitForm();

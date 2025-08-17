@@ -71,7 +71,7 @@ export function VisibilitySelector({
         <Button
           data-testid="visibility-selector"
           variant="outline"
-          className="hidden md:flex md:px-2 md:h-[34px]"
+          className="hidden md:flex md:px-2 md:h-[34px] cursor-pointer"
         >
           {selectedVisibility?.icon}
           {selectedVisibility?.label}
@@ -88,7 +88,7 @@ export function VisibilitySelector({
               setVisibilityType(visibility.id);
               setOpen(false);
             }}
-            className="gap-4 group/item flex flex-row justify-between items-center"
+            className="gap-4 group/item flex flex-row justify-between items-center cursor-pointer"
             data-active={visibility.id === visibilityType}
           >
             <div className="flex flex-col gap-1 items-start">

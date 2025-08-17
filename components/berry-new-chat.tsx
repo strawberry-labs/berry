@@ -19,7 +19,7 @@ export function BerryNewChat() {
       <SidebarMenuItem>
             <SidebarMenuButton
               size="lg"
-              className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground transition-all duration-200 relative group/button"
+              className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground transition-all duration-200 relative group/button cursor-pointer"
               onClick={
                 ()=>{
                   router.push('/');

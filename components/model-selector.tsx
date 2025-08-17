@@ -64,7 +64,7 @@ export function ModelSelector({
         <Button
           data-testid="model-selector"
           variant="outline"
-          className="md:px-2 md:h-[34px] px-2 h-8 text-xs md:text-sm max-w-[120px] md:max-w-none flex items-center justify-between gap-1"
+          className="md:px-2 md:h-[34px] px-2 h-8 text-xs md:text-sm max-w-[120px] md:max-w-none flex items-center justify-between gap-1 cursor-pointer"
         >
           <span className="truncate">{selectedChatModel?.name}</span>
           <ChevronDownIcon size={12} />
@@ -93,7 +93,7 @@ export function ModelSelector({
             >
               <button
                 type="button"
-                className="gap-4 group/item flex flex-row justify-between items-center w-full"
+                className="gap-4 group/item flex flex-row justify-between items-center w-full cursor-pointer"
               >
                 <div className="flex flex-col gap-1 items-start">
                   <div>{chatModel.name}</div>
@@ -119,7 +119,7 @@ export function ModelSelector({
             >
               <button
                 type="button"
-                className="gap-4 group/item flex flex-row justify-between items-center w-full"
+                className="gap-4 group/item flex flex-row justify-between items-center w-full cursor-pointer"
               >
                 <div className="flex flex-col gap-1 items-start">
                   <div>{chatModel.name}</div>

@@ -47,7 +47,7 @@ export function SidebarUserNav({ user, isGuest=false }: { user: User, isGuest:bo
             ) : (
               <SidebarMenuButton
                 data-testid="user-nav-button"
-                className="data-[state=open]:bg-sidebar-accent bg-background data-[state=open]:text-sidebar-accent-foreground h-10"
+                className="data-[state=open]:bg-sidebar-accent bg-background data-[state=open]:text-sidebar-accent-foreground h-10 cursor-pointer"
               >
                 <Image
                   src={`https://avatar.vercel.sh/${user.email}`}

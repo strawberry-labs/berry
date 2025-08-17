@@ -19,14 +19,14 @@ export function SearchModeSelector({
   return (
     <div className={`flex items-center gap-2 ${className}`}>
       <Select value={selectedMode} onValueChange={onModeChange}>
-        <SelectTrigger className="w-fit h-8 text-xs border border-input bg-background hover:bg-accent hover:text-accent-foreground max-w-[100px] md:max-w-none min-w-[80px]">
+        <SelectTrigger className="w-fit h-8 text-xs border border-input bg-background hover:bg-accent hover:text-accent-foreground max-w-[100px] md:max-w-none min-w-[80px] cursor-pointer">
           <SelectValue>
             <span className="truncate">{selectedGroup?.name || 'Chat'}</span>
           </SelectValue>
         </SelectTrigger>
         <SelectContent>
           {searchGroups.map((group) => (
-            <SelectItem key={group.id} value={group.id}>
+            <SelectItem key={group.id} value={group.id} className="cursor-pointer">
               <div className="flex flex-col gap-1">
                 <div className="font-medium">{group.name}</div>
                 <div className="text-xs text-muted-foreground">{group.description}</div>
