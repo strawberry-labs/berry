@@ -64,7 +64,7 @@ export function ModelSelector({
         <Button
           data-testid="model-selector"
           variant="outline"
-          className="md:px-2 md:h-[34px] px-2 h-8 text-xs md:text-sm max-w-[120px] md:max-w-none flex items-center justify-between gap-1 cursor-pointer"
+          className="md:px-2 md:h-[34px] px-2 h-8 text-sm max-w-[120px] md:max-w-none flex items-center justify-between gap-1 cursor-pointer bg-muted hover:bg-accent hover:text-accent-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:border-input focus-visible:ring-transparent"
         >
           <span className="truncate">{selectedChatModel?.name}</span>
           <ChevronDownIcon size={12} />

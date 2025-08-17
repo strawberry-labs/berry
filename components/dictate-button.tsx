@@ -112,8 +112,8 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
   return (
     <Button
       data-testid="dictate-button"
-      className={`rounded-md rounded-br-lg p-[7px] h-fit dark:border-zinc-700 dark:hover:bg-zinc-900 hover:bg-zinc-200 relative cursor-pointer ${
-        isActive ? 'bg-red-100 dark:bg-red-900/20 border-red-300 dark:border-red-700' : ''
+      className={`h-10 w-10 p-2 rounded-full hover:bg-[#252626] hover:text-foreground relative cursor-pointer ${
+        isActive ? 'bg-red-100 dark:bg-red-900/20 text-red-600 dark:text-red-400' : 'text-muted-foreground'
       }`}
       onClick={handleClick}
       disabled={isDisabled}
@@ -128,11 +128,11 @@ export function DictateButton({ onTranscriptionReceived, status }: DictateButton
     >
       <div className="relative">
         {isTranscribing ? (
-          <LoaderCircle size={14} className="animate-spin" />
+          <LoaderCircle size={18} className="animate-spin" />
         ) : isRecording ? (
-          <Square size={14} />
+          <Square size={18} />
         ) : (
-          <Mic size={14} />
+          <Mic size={18} />
         )}
       </div>
     </Button>

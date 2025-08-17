@@ -340,7 +340,7 @@ function PureMultimodalInput({
           value={input}
           onChange={handleInput}
           className={cx(
-            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled text-lg',
+            'w-full resize-none border-0 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 scrollbar-styled !text-sm',
             attachments.length > 0 || uploadQueue.length > 0 
               ? 'pt-3 px-3 pb-0 rounded-none' 
               : 'pt-3 px-3 pb-0 rounded-t-xl',
@@ -431,7 +431,7 @@ function PureAttachmentsButton({
   return (
     <Button
       data-testid="attachments-button"
-      className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-accent rounded-full cursor-pointer"
+      className="h-8 w-8 p-2 text-muted-foreground hover:text-foreground hover:bg-[#252626] rounded-full cursor-pointer transform rotate-45"
       onClick={(event) => {
         event.preventDefault();
         fileInputRef.current?.click();
@@ -458,7 +458,7 @@ function PureStopButton({
   return (
     <Button
       data-testid="stop-button"
-      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80 cursor-pointer"
+      className="h-8 w-8 p-2 rounded-full bg-primary hover:bg-primary/80 cursor-pointer"
       onClick={(event) => {
         event.preventDefault();
         stop();
@@ -486,7 +486,7 @@ function PureSendButton({
   return (
     <Button
       data-testid="send-button"
-      className="h-8 w-8 p-0 rounded-full bg-primary hover:bg-primary/80 disabled:bg-muted-foreground/30 cursor-pointer"
+      className="h-8 w-8 p-2 rounded-full bg-primary hover:bg-primary/80 disabled:bg-muted-foreground/30 cursor-pointer"
       onClick={(event) => {
         event.preventDefault();
         submitForm();
