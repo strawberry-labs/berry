@@ -29,11 +29,27 @@ function PureChatHeader({
   const [isMounted, setIsMounted] = useState(false);
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [showInstallButton, setShowInstallButton] = useState(false);
+  const [isIOS, setIsIOS] = useState(false);
+  const [isStandalone, setIsStandalone] = useState(false);
 
   useEffect(() => {
     setIsMounted(true);
     
-    // Only show install button when browser provides the install prompt
+    // Detect iOS devices
+    const iosDetection = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    setIsIOS(iosDetection);
+    
+    // Check if already installed (standalone mode)
+    const standalone = window.matchMedia('(display-mode: standalone)').matches || 
+                     (window.navigator as any).standalone === true;
+    setIsStandalone(standalone);
+    
+    // For iOS Safari: show install button if not already in standalone mode
+    if (iosDetection && !standalone) {
+      setShowInstallButton(true);
+    }
+    
+    // For Android/Desktop: listen for beforeinstallprompt
     const handler = (e: Event) => {
       e.preventDefault();
       setDeferredPrompt(e);
@@ -46,6 +62,13 @@ function PureChatHeader({
   }, []);
 
   const handleInstall = async () => {
+    // iOS Safari: Show manual installation instructions
+    if (isIOS) {
+      alert('To install Berry on iOS:\n\n1. Tap the Share button (⤴️) at the bottom of the screen\n2. Scroll down and tap "Add to Home Screen"\n3. Tap "Add" to confirm\n\nBerry will then appear as an app on your home screen!');
+      return;
+    }
+    
+    // Android/Desktop: Use native install prompt
     if (!deferredPrompt) return;
 
     try {
