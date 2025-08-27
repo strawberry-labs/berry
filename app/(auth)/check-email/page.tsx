@@ -1,18 +1,12 @@
 "use client"
 import { Button } from "@/components/ui/button"
-import { useLayoutEffect, useState } from "react"
+import { useEffect, useLayoutEffect, useState } from "react"
 import { SiGmail } from "react-icons/si";
 import { PiMicrosoftOutlookLogoFill } from "react-icons/pi";
 import { FaYahoo } from "react-icons/fa";
 import { BsEnvelope } from "react-icons/bs";
 
 export default function VerificationPage() {
-
-  const [baseUrl, setBaseUrl] = useState("")
-
-  useLayoutEffect(()=>{
-    setBaseUrl(window.location.hostname)
-  }, [])
 
   const emailProviders = [
     {
@@ -45,7 +39,7 @@ export default function VerificationPage() {
 
         {/* Subtext */}
         <p className="text-lg leading-relaxed">
-          Once verified, you will be able to access <span className="font-medium">{baseUrl}</span>.
+          Once verified, you will be able to access <span className="font-medium">berry.me</span>.
         </p>
 
         {/* Email provider buttons */}
