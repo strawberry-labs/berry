@@ -62,7 +62,7 @@ export function LoginForm({
     setDisable(true)
     setShowLoader(true)
     await emailMagicLink(email)
-    router.push('/check-email')
+    router.push(`/check-email?email=${encodeURIComponent(email)}`);
   }
 
   const {resolvedTheme, setTheme} = useTheme()

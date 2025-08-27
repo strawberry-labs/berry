@@ -1,35 +1,54 @@
 "use client"
 import { Button } from "@/components/ui/button"
-import { useEffect, useLayoutEffect, useState } from "react"
-import { SiGmail } from "react-icons/si";
-import { PiMicrosoftOutlookLogoFill } from "react-icons/pi";
-import { FaYahoo } from "react-icons/fa";
-import { BsEnvelope } from "react-icons/bs";
-
-export default function VerificationPage() {
+import { useState } from "react"
+import { useSearchParams } from "next/navigation";
+import { emailMagicLink } from "../actions";
+import { GmailIcon, OutlookIcon, YahooIcon } from "@/components/icons";
+import Image from "next/image";
 
   const emailProviders = [
     {
       name: "Open Gmail",
-      icon: SiGmail,
+      icon: GmailIcon,
       url: "https://gmail.com/",
     },
     {
       name: "Open Outlook",
-      icon: PiMicrosoftOutlookLogoFill,
+      icon: OutlookIcon,
       url: "https://outlook.live.com/",
     },
     {
       name: "Open Yahoo!",
-      icon: FaYahoo,
+      icon: YahooIcon,
       url: "https://mail.yahoo.com/",
     },
     {
       name: "Open Apple Mail",
-      icon: BsEnvelope,
+      icon: "/images/apple_mail.svg",
       url: "https://icloud.com/mail",
     },
   ]
+
+export default function VerificationPage() {
+
+  const searchParams = useSearchParams();
+
+  const [isCooldown, setIsCooldown] = useState(false);
+
+  const email = searchParams.get('email');
+
+  async function handleResendEmail(email:string){
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if(email && emailRegex.test(email)){
+      if (isCooldown){
+        return;
+      }
+      console.log("Resending email...")
+      setIsCooldown(true);
+      await emailMagicLink(email)
+      setTimeout(() => setIsCooldown(false), 60000);
+    }
+  }
 
   return (
     <div className="bg-muted min-h-screen flex items-center justify-center p-4">
@@ -51,17 +70,18 @@ export default function VerificationPage() {
               size="lg"
               className="h-14 gap-4 text-lg font-normal"
               onClick={() => window.open(provider.url, "_blank")}
-              resizeSVG={false}
             >
 
-                <provider.icon size={20}/>
+            {typeof provider.icon === "string"
+                ? <Image src={provider.icon} width={30} height={30} alt="Apple Mail Icon"/>
+                : <provider.icon size={30}/>}
               {provider.name}
             </Button>
           ))}
         </div>
 
         {/* Footer text */}
-        {/* <p className=" pt-8">
+        <p className=" pt-8">
           {"Didn't receive an email? Check your spam folder or "}
           <Button
           className="p-0 m-0 font-medium"
@@ -69,13 +89,13 @@ export default function VerificationPage() {
           variant={"link"}
             onClick={() => {
               // Handle resend email logic here
-              console.log("Resending email...")
+              handleResendEmail(email||"")
             }}
           >
             resend email
           </Button>
           .
-        </p> */}
+        </p>
       </div>
     </div>
   )
