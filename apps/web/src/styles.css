@@ -1353,6 +1353,216 @@ code, pre {
   z-index: 1;
 }
 
+/* A pending ask_user_question owns the composer surface. The actual text
+   editor stays mounted beneath it, preserving a draft until the agent resumes. */
+.berry-composer-question {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 12;
+  display: flex;
+  max-height: min(560px, 78dvh);
+  min-width: 0;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+  border: 1px solid var(--berry-border-strong);
+  border-radius: 28px;
+  padding: 16px;
+  background: var(--berry-control-bg);
+  box-shadow: var(--berry-shadow-floating), inset 0 1px 0 var(--berry-border);
+  color: var(--berry-text);
+}
+
+.berry-composer-question-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.berry-composer-question-title {
+  margin: 0;
+  color: var(--berry-text);
+  font-size: 17px;
+  font-weight: 560;
+  letter-spacing: -0.015em;
+  line-height: 24px;
+}
+
+.berry-composer-question-count {
+  margin: 3px 0 0;
+  color: var(--berry-text-tertiary);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.berry-composer-question-header-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+}
+
+.berry-composer-question-icon {
+  border-radius: 10px;
+  color: var(--berry-text-secondary);
+}
+
+.berry-composer-question-options {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.berry-composer-question-option {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: 38px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  border: 1px solid transparent;
+  border-radius: 18px;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--berry-text);
+  text-align: left;
+  transition-property: background-color, border-color, box-shadow, transform;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
+}
+
+.berry-composer-question-option:hover,
+.berry-composer-question-option.is-active,
+.berry-composer-question-option.is-selected {
+  border-color: var(--berry-border);
+  background: var(--berry-selected);
+}
+
+.berry-composer-question-option:active {
+  transform: scale(0.99);
+}
+
+.berry-composer-question-number {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--berry-border-strong);
+  border-radius: 999px;
+  color: var(--berry-text-secondary);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.berry-composer-question-option.is-selected .berry-composer-question-number {
+  border-color: var(--berry-text-secondary);
+  color: var(--berry-text);
+}
+
+.berry-composer-question-option-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  color: var(--berry-text);
+  font-size: 15px;
+  line-height: 20px;
+}
+
+.berry-composer-question-option-copy small {
+  overflow: hidden;
+  color: var(--berry-text-tertiary);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.berry-composer-question-next,
+.berry-composer-question-selected {
+  justify-self: end;
+  width: 20px;
+  height: 20px;
+  color: var(--berry-text-tertiary);
+}
+
+.berry-composer-question-selected {
+  color: var(--berry-text);
+}
+
+.berry-composer-question-custom {
+  grid-template-columns: 38px minmax(0, 1fr) max-content;
+  padding-left: 10px;
+}
+
+.berry-composer-question-custom-select,
+.berry-composer-question-custom-label {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.berry-composer-question-custom-select {
+  display: grid;
+  place-items: center;
+}
+
+.berry-composer-question-custom-label {
+  min-height: 32px;
+  color: var(--berry-text-tertiary);
+  font-size: 15px;
+  line-height: 20px;
+}
+
+.berry-composer-question-custom-input {
+  height: 36px;
+  border-color: transparent;
+  background: transparent;
+  padding: 0;
+  color: var(--berry-text);
+  box-shadow: none;
+}
+
+.berry-composer-question-custom-input:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.berry-composer-question-custom-next,
+.berry-composer-question-continue {
+  border-radius: 999px;
+  background: var(--berry-text);
+  color: var(--berry-main-bg);
+}
+
+.berry-composer-question-custom-next:hover,
+.berry-composer-question-continue:hover {
+  background: var(--berry-text-secondary);
+  color: var(--berry-main-bg);
+}
+
+.berry-composer-question-continue {
+  align-self: flex-end;
+  min-height: 36px;
+  padding-inline: 15px;
+}
+
+.berry-composer-question-error {
+  margin: -4px 0 0;
+  color: var(--berry-danger);
+  font-size: 12px;
+  line-height: 16px;
+}
+
 .berry-composer-queue-item {
   display: grid;
   width: 100%;
@@ -1516,6 +1726,21 @@ code, pre {
 }
 
 @media (max-width: 640px) {
+  .berry-composer-question {
+    border-radius: 22px;
+    padding: 12px;
+  }
+
+  .berry-composer-question-option {
+    grid-template-columns: 34px minmax(0, 1fr) 24px;
+    gap: 9px;
+    border-radius: 15px;
+  }
+
+  .berry-composer-question-custom {
+    grid-template-columns: 34px minmax(0, 1fr) max-content;
+  }
+
   .berry-composer-queue {
     right: 10px;
     left: 10px;

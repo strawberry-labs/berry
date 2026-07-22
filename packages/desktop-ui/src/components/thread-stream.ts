@@ -70,6 +70,8 @@ export interface QuestionPrompt {
   question: string;
   options: QuestionOption[];
   multi: boolean;
+  /** Full batched prompt when the agent needs several related decisions. */
+  questions: Array<{ question: string; options: QuestionOption[]; multi: boolean }>;
 }
 
 export interface StreamState {
@@ -259,6 +261,10 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
         },
       };
     case "question.request":
+      {
+        const questions = event.questions?.length
+          ? event.questions
+          : [{ question: event.question, options: event.options, multi: event.multi }];
       return {
         ...state,
         question: {
@@ -267,8 +273,10 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
           question: event.question,
           options: event.options,
           multi: event.multi,
+          questions,
         },
       };
+      }
     case "question.answered":
       return state.question?.questionId === event.questionId ? { ...state, question: null } : state;
     case "session.note":

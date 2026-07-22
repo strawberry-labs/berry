@@ -2925,11 +2925,20 @@ export class BerryHostService {
       const id = requiredString(input.id, "id");
       const answer = requiredString(input.answer, "answer");
       const selectedOptions = arrayOfStrings(input.selectedOptions);
+      const answers = Array.isArray(input.answers)
+        ? input.answers.flatMap((item) => {
+            const record = asRecord(item);
+            const question = typeof record.question === "string" ? record.question.trim() : "";
+            const itemAnswer = typeof record.answer === "string" ? record.answer.trim() : "";
+            if (!question || !itemAnswer) return [];
+            return [{ question, answer: itemAnswer, selectedOptions: arrayOfStrings(record.selectedOptions), skipped: record.skipped === true }];
+          }).slice(0, 5)
+        : [];
       const answeredAt = nowIso();
       this.#db.db
         .prepare("UPDATE questions SET status = 'answered', answer_json = ?, answered_at = ? WHERE id = ?")
-        .run(JSON.stringify({ answer, selectedOptions }), answeredAt, id);
-      const resumed = this.#runtime.resolveQuestion(id, { answer, selectedOptions });
+        .run(JSON.stringify({ answer, selectedOptions, ...(answers.length > 0 ? { answers } : {}) }), answeredAt, id);
+      const resumed = this.#runtime.resolveQuestion(id, { answer, selectedOptions, ...(answers.length > 0 ? { answers } : {}) });
       const question = this.#questionRow(id);
       if (question) this.#publish({ type: "question.updated", question });
       return { ok: true, resumed };
@@ -3600,7 +3609,7 @@ export class BerryHostService {
             taskId,
             sessionId,
             request.toolCallId,
-            JSON.stringify({ question: request.question, options: request.options, multi: request.multi }),
+            JSON.stringify({ question: request.question, options: request.options, multi: request.multi, questions: request.questions }),
             createdAt,
           );
         const question = this.#questionRow(request.questionId);
@@ -4123,28 +4132,36 @@ export class BerryHostService {
         }
       | undefined;
     if (!row) return undefined;
-    const prompt = JSON.parse(row.question_json) as { question?: unknown; options?: unknown; multi?: unknown };
+    const prompt = JSON.parse(row.question_json) as { question?: unknown; options?: unknown; multi?: unknown; questions?: unknown };
+    const normalizedOptions = (value: unknown) => Array.isArray(value)
+      ? value.flatMap((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+          const option = item as { label?: unknown; description?: unknown };
+          if (typeof option.label !== "string") return [];
+          return [{ label: option.label, ...(typeof option.description === "string" ? { description: option.description } : {}) }];
+        })
+      : [];
+    const questions = Array.isArray(prompt.questions)
+      ? prompt.questions.flatMap((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+          const entry = item as { question?: unknown; options?: unknown; multi?: unknown };
+          const question = typeof entry.question === "string" ? entry.question.trim() : "";
+          if (!question) return [];
+          return [{ question, options: normalizedOptions(entry.options), multi: entry.multi === true }];
+        }).slice(0, 5)
+      : [];
+    const legacyQuestion = typeof prompt.question === "string" ? prompt.question : "";
+    const legacyOptions = normalizedOptions(prompt.options);
     return {
       id: row.id,
       taskId: row.task_id,
       sessionId: row.session_id,
       toolCallId: row.tool_call_id,
       status: row.status,
-      question: typeof prompt.question === "string" ? prompt.question : "",
-      options: Array.isArray(prompt.options)
-        ? prompt.options.flatMap((item) => {
-            if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-            const option = item as { label?: unknown; description?: unknown };
-            if (typeof option.label !== "string") return [];
-            return [
-              {
-                label: option.label,
-                ...(typeof option.description === "string" ? { description: option.description } : {}),
-              },
-            ];
-          })
-        : [],
+      question: legacyQuestion,
+      options: legacyOptions,
       multi: prompt.multi === true,
+      ...(questions.length > 0 ? { questions } : {}),
       answer: row.answer_json ? (JSON.parse(row.answer_json) as JsonValue) : null,
       createdAt: row.created_at,
       answeredAt: row.answered_at,

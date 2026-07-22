@@ -106,6 +106,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         stream={stream}
         messages={messages}
         showTodos={false}
+        showQuestions={false}
         showPendingTurnActivity
         showReasoning={showReasoning}
         adapter={adapter}

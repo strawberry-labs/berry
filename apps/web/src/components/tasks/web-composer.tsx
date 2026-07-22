@@ -6,7 +6,7 @@ import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
-import { reduceStream } from "@berry/desktop-ui/components/thread-stream";
+import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { AtSign, Brain, Check, ChevronDown, Ellipsis, FileText, GripVerticalIcon, Hash, ImagePlus, Queue01Icon, SlashSquare, Trash2 } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
@@ -14,6 +14,7 @@ import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
 import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
+import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, type ComposerQuestionAnswer } from "./composer-question-overlay";
 
 interface PendingFileUpload {
   id: string;
@@ -55,6 +56,7 @@ export function Composer({
   onReorderFollowUps,
   onSteerFollowUp,
   planProgress,
+  question,
 }: {
   config: WebConfig;
   activeTask: Task | null;
@@ -86,6 +88,7 @@ export function Composer({
   onReorderFollowUps: (sessionId: string, orderedIds: string[]) => void;
   onSteerFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   planProgress?: PlanProgress | null;
+  question?: QuestionPrompt | null;
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -121,6 +124,23 @@ export function Composer({
     () => config.providers.flatMap((provider) => provider.models.map((item) => ({ id: item.id, label: item.name ?? item.id }))).filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index),
     [config.providers],
   );
+
+  const answerQuestion = React.useCallback(async (answers: ComposerQuestionAnswer[]) => {
+    if (!question || !activeTask?.activeSessionId || !client) throw new Error("This question is no longer available. Refresh and try again.");
+    const sessionId = activeTask.activeSessionId;
+    const transcript = questionAnswerTranscript(answers);
+    const optimisticMessageId = onUserMessage(transcript, sessionId, activeTask.id);
+    const persistedMessage = await client.appendMessage(sessionId, {
+      role: "user",
+      parts: [{ kind: "text", content: transcript }],
+    });
+    if (optimisticMessageId) onUserMessagePersisted(sessionId, optimisticMessageId, persistedMessage);
+    await client.answerQuestion(question.questionId, {
+      answer: questionToolAnswer(answers),
+      selectedOptions: answers.flatMap((item) => item.selectedOptions),
+      answers,
+    });
+  }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
 
   const submit = React.useCallback(async () => {
     if (pendingUploads.some((upload) => upload.state === "uploading")) return;
@@ -335,6 +355,7 @@ export function Composer({
         before={
           <>
             <MentionMenu controller={mentions} />
+            {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} /> : null}
             {variant === "thread" && queuedFollowUps.length > 0 ? (
               <QueuedFollowUpStack
                 followUps={queuedFollowUps}

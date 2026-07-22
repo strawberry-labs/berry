@@ -737,7 +737,14 @@ export class BerryApiClient {
     return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}`, QueuedFollowUpSchema, { method: "DELETE" });
   }
 
-  async answerQuestion(questionId: string, input: { answer: string; selectedOptions?: string[] | undefined }): Promise<{ ok: boolean }> {
+  async answerQuestion(
+    questionId: string,
+    input: {
+      answer: string;
+      selectedOptions?: string[] | undefined;
+      answers?: Array<{ question: string; answer: string; selectedOptions?: string[] | undefined; skipped?: boolean | undefined }> | undefined;
+    },
+  ): Promise<{ ok: boolean }> {
     return this.#request(`/v1/questions/${encodeURIComponent(questionId)}/answer`, z.object({ ok: z.boolean() }), {
       method: "POST",
       body: input,

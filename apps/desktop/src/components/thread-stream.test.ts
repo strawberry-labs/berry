@@ -162,6 +162,28 @@ describe("reduceStream", () => {
     expect(play([{ kind: "question.answered", questionId: "question_1" }], state).question).toBeNull();
   });
 
+  it("keeps every related question from a batched prompt", () => {
+    const state = play([
+      turnStart,
+      {
+        kind: "question.request",
+        questionId: "question_batch_1",
+        toolCallId: "call_question_batch_1",
+        question: "Choose a destination",
+        options: [{ label: "Ocean" }],
+        multi: false,
+        questions: [
+          { question: "Choose a destination", options: [{ label: "Ocean" }], multi: false },
+          { question: "Choose a pace", options: [{ label: "Relaxed" }, { label: "Fast" }], multi: false },
+        ],
+      },
+    ]);
+    expect(state.question?.questions).toEqual([
+      { question: "Choose a destination", options: [{ label: "Ocean" }], multi: false },
+      { question: "Choose a pace", options: [{ label: "Relaxed" }, { label: "Fast" }], multi: false },
+    ]);
+  });
+
   it("keeps session note kind for distinct steering and follow-up markers", () => {
     const state = play([
       turnStart,

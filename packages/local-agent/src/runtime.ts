@@ -71,6 +71,7 @@ export interface QuestionRequestPayload {
   question: string;
   options: Array<{ label: string; description?: string }>;
   multi: boolean;
+  questions: Array<{ question: string; options: Array<{ label: string; description?: string }>; multi: boolean }>;
 }
 
 export interface AssistantMessagePayload {
@@ -1598,23 +1599,32 @@ export class BerryAgentRuntime {
     const active = this.#sessions.get(sessionId)?.active;
     if (!active) throw new Error("No active turn is available for ask_user_question.");
     if (params.signal?.aborted) throw new Error("The turn was aborted.");
+    const questions = (params.questions?.length
+      ? params.questions
+      : [{ question: params.question ?? "", options: params.options ?? [], multi: params.multi === true }])
+      .filter((item) => item.question.trim().length > 0)
+      .slice(0, 5);
+    const first = questions[0];
+    if (!first) throw new Error("ask_user_question requires at least one question.");
     const questionId = createId("question");
     this.#emit(active, {
       kind: "question.request",
       questionId,
       toolCallId: params.toolCallId,
-      question: params.question,
-      options: params.options,
-      multi: params.multi,
+      question: first.question,
+      options: first.options,
+      multi: first.multi,
+      questions,
     });
     active.onQuestionRequest?.({
       questionId,
       sessionId,
       taskId: active.taskId,
       toolCallId: params.toolCallId,
-      question: params.question,
-      options: params.options,
-      multi: params.multi,
+      question: first.question,
+      options: first.options,
+      multi: first.multi,
+      questions,
     });
 
     const abortPromise = new Promise<AskUserQuestionAnswer | { aborted: true; reason: string }>((resolveAbort) => {

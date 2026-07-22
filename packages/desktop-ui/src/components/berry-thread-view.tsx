@@ -98,6 +98,8 @@ export interface BerryThreadViewProps {
   autoScroll?: boolean;
   showReasoning?: boolean;
   showTodos?: boolean;
+  /** Web presents questions over its composer; desktop keeps its inline card. */
+  showQuestions?: boolean;
   /** Show the elapsed turn clock before the provider emits its first work item. */
   showPendingTurnActivity?: boolean;
   adapter?: BerryThreadAdapter;
@@ -118,6 +120,7 @@ export function BerryThreadView({
   autoScroll = true,
   showReasoning = false,
   showTodos = true,
+  showQuestions = true,
   showPendingTurnActivity = false,
   adapter = {},
 }: BerryThreadViewProps) {
@@ -304,7 +307,7 @@ export function BerryThreadView({
                       <BerryApprovalAccordion approval={stream.approval} adapter={adapter} />
                     </BerryActivityStackBlock>
                   ) : null}
-                  {stream.question ? (
+                  {showQuestions && stream.question ? (
                     <BerryActivityStackBlock>
                       <BerryQuestionAccordion question={stream.question} adapter={adapter} />
                     </BerryActivityStackBlock>

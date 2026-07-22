@@ -277,6 +277,44 @@ describe("createBerryTools", () => {
     expect(seen).toEqual([{ question: "Which browser engines?", options: [{ label: "Both", description: "Chromium and WebKit" }], multi: false }]);
   });
 
+  it("batches related user questions through one bridge request", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "berry-tools-"));
+    tempDirs.push(dir);
+    const seen: Array<{ questions: unknown[] | undefined; question: string; options: unknown[]; multi: boolean }> = [];
+    const tools = new Map(
+      createBerryTools({
+        workspacePath: dir,
+        askUserQuestion: async (request) => {
+          seen.push({ question: request.question, options: request.options, multi: request.multi, questions: request.questions });
+          return {
+            answer: "Ocean\nRelaxed",
+            answers: [
+              { question: "Where?", answer: "Ocean", selectedOptions: ["Ocean"] },
+              { question: "How?", answer: "Relaxed", selectedOptions: ["Relaxed"] },
+            ],
+          };
+        },
+      }).map((tool) => [tool.name, tool]),
+    );
+    const text = await run(tools, "ask_user_question", {
+      questions: [
+        { question: "Where?", options: [{ label: "Ocean" }] },
+        { question: "How?", options: [{ label: "Relaxed" }] },
+      ],
+    });
+    expect(text).toContain("Where?: Ocean");
+    expect(text).toContain("How?: Relaxed");
+    expect(seen).toEqual([{
+      question: "Where?",
+      options: [{ label: "Ocean" }],
+      multi: false,
+      questions: [
+        { question: "Where?", options: [{ label: "Ocean" }], multi: false },
+        { question: "How?", options: [{ label: "Relaxed" }], multi: false },
+      ],
+    }]);
+  });
+
   it("reads, writes, and edits files inside the workspace", async () => {
     const { dir, tools } = workspace();
     writeFileSync(join(dir, "a.txt"), "hello world\nsecond line\n");

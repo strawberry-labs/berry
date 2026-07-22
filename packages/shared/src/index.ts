@@ -849,6 +849,24 @@ export const QuestionOptionSchema = z.object({
 });
 export type QuestionOption = z.infer<typeof QuestionOptionSchema>;
 
+/** One decision in a potentially batched ask_user_question request. */
+export const QuestionPromptSchema = z.object({
+  question: z.string().trim().min(1).max(2_000),
+  options: z.array(QuestionOptionSchema).max(12).default([]),
+  multi: z.boolean().default(false),
+});
+export type QuestionPrompt = z.infer<typeof QuestionPromptSchema>;
+
+/** A durable answer record. `skipped` deliberately remains explicit so an
+ * agent can distinguish "no answer yet" from a user choosing to move on. */
+export const QuestionAnswerSchema = z.object({
+  question: z.string().trim().min(1).max(2_000),
+  answer: z.string().trim().min(1).max(4_000),
+  selectedOptions: z.array(z.string().trim().min(1)).max(24).default([]),
+  skipped: z.boolean().default(false),
+});
+export type QuestionAnswer = z.infer<typeof QuestionAnswerSchema>;
+
 export const QuestionRequestSchema = z.object({
   id: z.string(),
   taskId: z.string().nullable(),
@@ -858,6 +876,9 @@ export const QuestionRequestSchema = z.object({
   question: z.string(),
   options: z.array(QuestionOptionSchema).default([]),
   multi: z.boolean().default(false),
+  /** New clients receive the complete batch; older records keep the first
+   * decision in the legacy top-level fields above. */
+  questions: z.array(QuestionPromptSchema).min(1).max(5).optional(),
   answer: JsonValueSchema.nullable(),
   createdAt: ISODateSchema,
   answeredAt: ISODateSchema.nullable(),
@@ -1966,6 +1987,7 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     question: z.string(),
     options: z.array(QuestionOptionSchema).default([]),
     multi: z.boolean().default(false),
+    questions: z.array(QuestionPromptSchema).min(1).max(5).optional(),
   }),
   z.object({ kind: z.literal("question.answered"), questionId: z.string() }),
   z.object({

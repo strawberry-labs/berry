@@ -134,17 +134,34 @@ export interface AskUserQuestionOption {
   description?: string;
 }
 
+export interface AskUserQuestionItem {
+  question: string;
+  options: AskUserQuestionOption[];
+  multi: boolean;
+}
+
 export interface AskUserQuestionParams {
   toolCallId: string;
+  /** A small batch of related decisions. Prefer this over serial prompts. */
+  questions?: AskUserQuestionItem[];
+  /** Legacy one-question form, retained for ACP and older hosts. */
   question: string;
   options: AskUserQuestionOption[];
   multi: boolean;
   signal?: AbortSignal;
 }
 
+export interface AskUserQuestionAnswerItem {
+  question: string;
+  answer: string;
+  selectedOptions?: string[];
+  skipped?: boolean;
+}
+
 export interface AskUserQuestionAnswer {
   answer: string;
   selectedOptions?: string[];
+  answers?: AskUserQuestionAnswerItem[];
 }
 
 export type BerryToolRisk = "read" | "file-edit" | "shell" | "mcp" | "browser";
@@ -754,9 +771,26 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
   const askUserQuestion = defineTool(
     "ask_user_question",
     "Ask user",
-    "Ask the user a clarifying question and wait for their answer before continuing. Use only when the answer is necessary and cannot be inferred safely.",
+    "Ask the user for necessary clarification and wait before continuing. Use `questions` for up to five tightly related decisions so the user can answer them in one panel. Use the legacy `question` form only for one decision. Do not ask for information that can be inferred safely.",
     Type.Object({
-      question: Type.String({ description: "The exact question to show the user" }),
+      questions: Type.Optional(
+        Type.Array(
+          Type.Object({
+            question: Type.String({ description: "The exact question to show the user" }),
+            options: Type.Optional(
+              Type.Array(
+                Type.Object({
+                  label: Type.String({ description: "A concise option label" }),
+                  description: Type.Optional(Type.String({ description: "Optional detail explaining this choice" })),
+                }),
+              ),
+            ),
+            multi: Type.Optional(Type.Boolean({ description: "Whether the user may select more than one option" })),
+          }),
+          { minItems: 1, maxItems: 5, description: "Related questions to show in one response flow" },
+        ),
+      ),
+      question: Type.Optional(Type.String({ description: "The exact question to show the user (legacy single-question form)" })),
       options: Type.Optional(
         Type.Array(
           Type.Object({
@@ -770,29 +804,47 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
     }),
     async (toolCallId, params, signal) => {
       if (!options.askUserQuestion) throw new Error("ask_user_question is not wired in this runtime.");
-      const question = String(params.question ?? "").trim();
-      if (!question) throw new Error("question is required");
-      const choices = Array.isArray(params.options)
-        ? params.options.flatMap((item) => {
-            if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-            const record = item as Record<string, unknown>;
-            const label = typeof record.label === "string" ? record.label.trim() : "";
-            if (!label) return [];
-            const description = typeof record.description === "string" && record.description.trim() ? record.description.trim() : undefined;
-            return [{ label, ...(description ? { description } : {}) }];
+      const normalize = (entry: { question?: unknown; options?: unknown; multi?: unknown }): AskUserQuestionItem | null => {
+        const question = typeof entry.question === "string" ? entry.question.trim() : "";
+        if (!question) return null;
+        const choices = Array.isArray(entry.options)
+          ? entry.options.flatMap((item) => {
+              if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+              const record = item as Record<string, unknown>;
+              const label = typeof record.label === "string" ? record.label.trim() : "";
+              if (!label) return [];
+              const description = typeof record.description === "string" && record.description.trim() ? record.description.trim() : undefined;
+              return [{ label, ...(description ? { description } : {}) }];
+            }).slice(0, 12)
+          : [];
+        return { question, options: choices, multi: entry.multi === true };
+      };
+      const batch = Array.isArray(params.questions)
+        ? params.questions.flatMap((entry) => {
+            const normalized = normalize(entry);
+            return normalized ? [normalized] : [];
           })
         : [];
+      const questions = (batch.length > 0 ? batch : [normalize(params)]).filter((entry): entry is AskUserQuestionItem => Boolean(entry)).slice(0, 5);
+      if (questions.length === 0) throw new Error("question is required");
+      const first = questions[0]!;
       const answer = await options.askUserQuestion({
         toolCallId,
-        question,
-        options: choices,
-        multi: params.multi === true,
+        questions,
+        question: first.question,
+        options: first.options,
+        multi: first.multi,
         ...(signal ? { signal } : {}),
       });
-      return textResult(`User answered: ${answer.answer}`, {
-        question,
-        options: choices,
-        multi: params.multi === true,
+      const answers = answer.answers?.length
+        ? answer.answers
+        : [{ question: first.question, answer: answer.answer, selectedOptions: answer.selectedOptions ?? [] }];
+      return textResult(`User responses:\n${answers.map((item) => `- ${item.question}: ${item.skipped ? "Skipped" : item.answer}`).join("\n")}`, {
+        questions,
+        answers,
+        question: first.question,
+        options: first.options,
+        multi: first.multi,
         answer: answer.answer,
         selectedOptions: answer.selectedOptions ?? [],
       });

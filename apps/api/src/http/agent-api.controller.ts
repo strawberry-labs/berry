@@ -12,6 +12,7 @@ import {
   MessageRoleSchema,
   MobileDeviceRegistrationCreateSchema,
   PermissionModeSchema,
+  QuestionAnswerSchema,
   TaskStatusSchema,
   TurnStateSchema,
   WorkspaceKindSchema,
@@ -113,6 +114,7 @@ const ApprovalDecisionRequestSchema = ApprovalDecisionSchema.pick({ decision: tr
 const AnswerQuestionRequestSchema = z.object({
   answer: z.string().trim().min(1),
   selectedOptions: z.array(z.string()).max(24).optional(),
+  answers: z.array(QuestionAnswerSchema).min(1).max(5).optional(),
 }).strict();
 
 const WorkspaceFileRequestSchema = z.object({ path: z.string().trim().min(1).max(4_096), content: z.string().max(1_048_576) }).strict();
@@ -727,6 +729,7 @@ export class AgentApiController {
       ok: this.sessionHost.resolveQuestion(questionId, {
         answer: request.answer,
         selectedOptions: request.selectedOptions ?? [],
+        ...(request.answers ? { answers: request.answers } : {}),
       }),
     };
   }

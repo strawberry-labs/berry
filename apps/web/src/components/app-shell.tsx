@@ -1219,6 +1219,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onReorderFollowUps={reorderFollowUps}
               onSteerFollowUp={steerFollowUp}
               planProgress={planProgressFromConversation(messages, stream)}
+              question={stream.question}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
               runTurn={runTurn}
