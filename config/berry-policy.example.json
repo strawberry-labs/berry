@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "organization": {
+    "id": "example-org",
+    "name": "Example Org"
+  },
+  "issuedAt": "2026-07-10T00:00:00.000Z",
+  "expiresAt": "2027-07-10T00:00:00.000Z",
+  "policy": {
+    "execpolicy": [
+      {
+        "id": "managed-forbid-sudo",
+        "kind": "prefix_rule",
+        "decision": "forbid",
+        "pattern": ["sudo"],
+        "description": "Privilege escalation is disabled"
+      }
+    ],
+    "modelAllowlist": ["openai/*", "anthropic/*"],
+    "mcpAllowlist": ["company-docs", "ticketing-*"],
+    "pluginAllowlist": ["approved-*"],
+    "sandboxFloor": "workspace-write",
+    "telemetry": "disabled"
+  }
+}

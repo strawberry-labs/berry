@@ -1,0 +1,12 @@
+{
+  "dataCollected": false,
+  "dataShared": false,
+  "dataEncryptedInTransit": true,
+  "usersCanRequestDeletion": true,
+  "dataTypes": [],
+  "notes": [
+    "Berry mobile transmits task, chat, approval, session, and optional push-token data only to the endpoint configured by the user.",
+    "Direct custom/LAN endpoint mode sends chat prompts and responses only to that configured endpoint and disables push notifications.",
+    "The app does not sell data, serve ads, or track users across apps or websites."
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "@berry/host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "berry-host": "./dist/main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest --run",
+    "verify:web": "pnpm build && node scripts/verify-web-search.mjs"
+  },
+  "dependencies": {
+    "@berry/desktop-db": "workspace:*",
+    "@berry/execpolicy": "workspace:*",
+    "@berry/harness": "workspace:*",
+    "@berry/local-agent": "workspace:*",
+    "@berry/local-agent-protocol": "workspace:*",
+    "@berry/router-client": "workspace:*",
+    "@berry/shared": "workspace:*",
+    "@mozilla/readability": "0.6.0",
+    "agent-browser": "0.26.0",
+    "chokidar": "^5.0.0",
+    "linkedom": "0.18.13",
+    "smol-toml": "1.7.0",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.9"
+  }
+}

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "berry-platform.name" . }}-config
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+data:
+  DEPLOYMENT_MODE: {{ .Values.deploymentMode | quote }}
+  BERRY_AUTH_MODE: {{ .Values.auth.mode | quote }}
+  BERRY_AUTH_BASE_URL: {{ .Values.auth.baseUrl | quote }}
+  BERRY_AUTH_TRUSTED_ORIGINS: {{ .Values.auth.trustedOrigins | quote }}
+  BERRY_API_MODEL_MODE: "live"
+  BERRY_BUDGETS_ENABLED: "true"
+  BERRY_BUDGET_FAIL_CLOSED: "true"
+  BERRY_BILLING_PROVIDER: {{ .Values.billing.provider | quote }}
+  BERRY_BILLING_STRIPE_API_BASE_URL: {{ .Values.billing.stripeApiBaseUrl | quote }}
+  BERRY_ROUTER_INFERENCE_BASE_URL: {{ .Values.router.inferenceBaseUrl | quote }}
+  BERRY_ROUTER_COMPLETION_TRANSPORT: {{ .Values.router.completionTransport | quote }}
+  BERRY_SANDBOX_PROVIDER: {{ .Values.sandbox.provider | quote }}
+  BERRY_SANDBOX_IMAGE: {{ .Values.sandbox.templateId | quote }}
+  BERRY_E2B_TEMPLATE_ID: {{ .Values.sandbox.templateId | quote }}
+  BERRY_E2B_KEEP_MEMORY_ON_PAUSE: {{ .Values.sandbox.keepMemoryOnPause | quote }}
+  BERRY_SANDBOX_TTL_SECONDS: {{ .Values.sandbox.ttlSeconds | quote }}
+  BERRY_SANDBOX_CPU_COUNT: {{ .Values.sandbox.cpuCount | quote }}
+  BERRY_SANDBOX_MEMORY_MIB: {{ .Values.sandbox.memoryMiB | quote }}
+  BERRY_SANDBOX_DISK_MIB: {{ .Values.sandbox.diskMiB | quote }}
+  BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS: {{ .Values.sandbox.estimatedHourlyCostMicros | quote }}
+  BERRY_E2B_MINIMUM_EXEC_COST_MICROS: {{ .Values.sandbox.minimumExecCostMicros | quote }}
+  BERRY_ARTIFACT_S3_ENDPOINT: {{ .Values.external.s3.endpoint | quote }}
+  BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT: {{ .Values.external.s3.publicEndpoint | quote }}
+  BERRY_ARTIFACT_S3_BUCKET: {{ .Values.external.s3.artifactBucket | quote }}
+  BERRY_AUDIT_S3_ENDPOINT: {{ .Values.external.s3.endpoint | quote }}
+  BERRY_AUDIT_S3_BUCKET: {{ .Values.external.s3.auditBucket | quote }}
+  BERRY_ARTIFACT_S3_REGION: {{ .Values.external.s3.region | quote }}
+  BERRY_FILE_MAX_UPLOAD_BYTES: {{ .Values.files.maxUploadBytes | quote }}
+  BERRY_FILE_MULTIPART_PART_SIZE: {{ .Values.files.multipartPartSize | quote }}
+  BERRY_FILE_PRESIGN_SECONDS: {{ .Values.files.presignSeconds | quote }}
+  BERRY_WEB_API_BASE_URL: {{ printf "https://%s" .Values.ingress.apiHost | quote }}
+  BERRY_WEB_DEMO_MODE: "false"
+  BERRY_WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}

@@ -1,0 +1,56 @@
+{
+  "chat": {
+    "response": {
+      "id": "chatcmpl_router_1",
+      "model": "anthropic/claude-sonnet-4",
+      "choices": [{ "message": { "content": "routed" }, "finish_reason": "stop" }]
+    },
+    "headers": {
+      "x-berry-served-provider": "anthropic",
+      "x-berry-served-model": "anthropic/claude-sonnet-4",
+      "x-berry-usage-input-tokens": "21",
+      "x-berry-usage-output-tokens": "8",
+      "x-berry-usage-total-tokens": "29"
+    }
+  },
+  "responses": {
+    "events": [
+      { "type": "response.output_text.delta", "delta": "routed" },
+      { "type": "response.completed", "response": { "id": "resp_router_1" } }
+    ],
+    "headers": {
+      "x-berry-served-provider": "openai",
+      "x-berry-served-model": "openai/gpt-4.1-mini",
+      "x-berry-usage-input-tokens": "13",
+      "x-berry-usage-output-tokens": "5"
+    }
+  },
+  "models": {
+    "data": [
+      { "id": "berry/cheap", "owned_by": "berry" },
+      { "id": "berry/fast", "owned_by": "berry" },
+      { "id": "berry/flagship", "owned_by": "berry" }
+    ]
+  },
+  "account": {
+    "account": {
+      "id": "acct_fixture",
+      "email": "router@example.test",
+      "display_name": "Router Fixture",
+      "plan": "pro"
+    },
+    "quota": {
+      "limit": 100,
+      "used": 37,
+      "remaining": 63,
+      "unit": "usd",
+      "resets_at": "2026-08-01T00:00:00.000Z"
+    },
+    "aliases": ["berry/cheap", "berry/fast", "berry/flagship"]
+  },
+  "oauth": {
+    "access_token": "brry_fixture_access",
+    "token_type": "Bearer",
+    "expires_in": 3600
+  }
+}

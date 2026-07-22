@@ -1,0 +1,29 @@
+{
+  "name": "Berry Companion",
+  "shortDescription": "Open Berry tasks, approvals, and page capture from a Chrome side panel.",
+  "category": "productivity",
+  "language": "en-US",
+  "singlePurpose": "Berry Companion connects the browser to the user's configured Berry account or local Berry Desktop host so the user can attach the current page to a task and approve agent actions.",
+  "detailedDescription": [
+    "Berry Companion is the Chrome side panel for Berry. It shows your Berry task list, current thread, composer-lite, pending approvals, and explicit page-capture actions.",
+    "Page content is captured only after the user clicks Selection, Full page, or the Send to Berry context-menu item. Full-page capture requests per-site permission through Chrome before reading page text.",
+    "The extension can connect to a signed-in Berry platform endpoint or to Berry Desktop through Chrome native messaging after the user enables the desktop security setting with their extension ID.",
+    "The extension does not sell data, inject ads, mine browsing history, or transmit page content anywhere except the Berry endpoint or local desktop host selected by the user."
+  ],
+  "permissionsJustification": {
+    "activeTab": "Read the active tab only after an explicit user action.",
+    "contextMenus": "Offer the user-initiated Send to Berry command.",
+    "nativeMessaging": "Connect to Berry Desktop when the user enables the desktop bridge.",
+    "notifications": "Show approval and capture status notifications.",
+    "sidePanel": "Render Berry in Chrome's side panel.",
+    "scripting": "Capture selected or full-page text after active-tab or per-origin permission is granted.",
+    "storage": "Store pending page-capture payloads in Chrome session storage."
+  },
+  "hostPermissionsJustification": "No broad host permissions are requested by default. Optional http/https origin permission is requested per site only when the user chooses full-page capture.",
+  "privacy": {
+    "dataLeavesDevice": "Only page context, task messages, approvals, and device/session metadata sent to the Berry endpoint or local desktop host configured by the user.",
+    "thirdPartySale": false,
+    "tracking": false,
+    "ads": false
+  }
+}

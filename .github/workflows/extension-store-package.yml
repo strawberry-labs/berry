@@ -1,0 +1,40 @@
+name: Extension Store Package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify store metadata
+        run: pnpm check:store
+
+      - name: Build extension
+        run: pnpm --filter @berry/extension build
+
+      - name: Package extension zip
+        run: |
+          mkdir -p artifacts
+          cd apps/extension/dist
+          zip -r ../../../artifacts/berry-companion-extension.zip .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: berry-companion-extension
+          path: artifacts/berry-companion-extension.zip

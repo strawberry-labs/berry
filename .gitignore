@@ -1,0 +1,49 @@
+.DS_Store
+
+# Dependency and build output
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.expo/
+
+# Rust/Tauri output
+target/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+.turbo/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+!deploy/.env.production.example
+
+# Nested research checkouts and large reference bundles remain local-only.
+**/.git/
+research/
+.internal-reference/
+.claude/
+settings-berry-chat/
+dogfood-output/
+.deployment-commit
+*.orig
+source.tar
+deploy/minio-cors.json
+deploy/minio-cors.xml
+deploy/minio-lifecycle.json
+
+# Runtime data produced by the desktop app in development.
+.berry/
+*.log
+
+# Playwright
+test-results/
+playwright-report/
+apps/desktop/test-results/
+apps/desktop/playwright-report/
+
+# Sidecar build output
+apps/desktop/src-tauri/binaries/
+artifacts/

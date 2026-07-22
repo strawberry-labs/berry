@@ -1,0 +1,12 @@
+{
+  "name": "@berry/docs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-docs-site.mjs",
+    "lint": "node scripts/verify-docs-site.mjs",
+    "typecheck": "node scripts/verify-docs-site.mjs",
+    "test": "node scripts/verify-docs-site.mjs"
+  }
+}

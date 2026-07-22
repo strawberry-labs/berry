@@ -1,0 +1,15 @@
+{
+  "id": "__BERRY_ACP_AGENT_ID__",
+  "name": "Berry",
+  "version": "__BERRY_VERSION__",
+  "description": "Local-first coding agent with persistent desktop, CLI, and ACP sessions.",
+  "repository": "https://github.com/__BERRY_GITHUB_REPOSITORY__",
+  "authors": ["__BERRY_AUTHOR__"],
+  "license": "__BERRY_LICENSE__",
+  "distribution": {
+    "npx": {
+      "package": "__BERRY_NPM_PACKAGE__@__BERRY_VERSION__",
+      "args": ["acp"]
+    }
+  }
+}

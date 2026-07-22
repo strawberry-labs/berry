@@ -1,0 +1,256 @@
+name: berry-self-host
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      BERRY_DOMAIN: ${BERRY_DOMAIN:-aesg-v2.berry.me}
+      BERRY_FILES_DOMAIN: ${BERRY_FILES_DOMAIN:-files.aesg-v2.berry.me}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-berry}
+      POSTGRES_USER: ${POSTGRES_USER:-berry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-berry-dev-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    profiles: ["minio"]
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-berry}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-berry-dev-minio-password}
+      MINIO_API_CORS_ALLOW_ORIGIN: "https://${BERRY_DOMAIN}"
+    ports:
+      - "127.0.0.1:${BERRY_MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${BERRY_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    profiles: ["minio"]
+    image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-08-13T08-35-41Z}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "mc alias set berry-minio http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
+       mc mb --ignore-existing berry-minio/$${BERRY_ARTIFACT_S3_BUCKET} &&
+       mc mb --ignore-existing berry-minio/$${BERRY_AUDIT_S3_BUCKET}"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-berry}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-berry-dev-minio-password}
+      BERRY_ARTIFACT_S3_BUCKET: ${BERRY_ARTIFACT_S3_BUCKET:-berry-artifacts}
+      BERRY_AUDIT_S3_BUCKET: ${BERRY_AUDIT_S3_BUCKET:-berry-audit}
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    restart: unless-stopped
+    command: ["node", "apps/api/dist/main.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-self-hosted}
+      BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_REDIS_URL: redis://redis:6379
+      BERRY_BUDGETS_ENABLED: ${BERRY_BUDGETS_ENABLED:-true}
+      BERRY_BUDGET_FAIL_CLOSED: ${BERRY_BUDGET_FAIL_CLOSED:-true}
+      BERRY_BUDGET_SANDBOX_CREATE_ESTIMATE_MICROS: ${BERRY_BUDGET_SANDBOX_CREATE_ESTIMATE_MICROS:-50}
+      BERRY_BUDGET_SANDBOX_EXEC_ESTIMATE_MICROS: ${BERRY_BUDGET_SANDBOX_EXEC_ESTIMATE_MICROS:-25}
+      BERRY_BILLING_PROVIDER: ${BERRY_BILLING_PROVIDER:-none}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_BILLING_METER_EVENT_NAME: ${STRIPE_BILLING_METER_EVENT_NAME:-}
+      STRIPE_CREDIT_PRICE_ID: ${STRIPE_CREDIT_PRICE_ID:-}
+      BERRY_BILLING_STRIPE_API_BASE_URL: ${BERRY_BILLING_STRIPE_API_BASE_URL:-https://api.stripe.com}
+      BERRY_USAGE_SIGNING_SECRETS: ${BERRY_USAGE_SIGNING_SECRETS:-fixture:replace-me-usage-secret}
+      BERRY_USAGE_SIGNATURE_MAX_SKEW_MS: ${BERRY_USAGE_SIGNATURE_MAX_SKEW_MS:-300000}
+      BERRY_POLICY_SIGNING_KEY_ID: ${BERRY_POLICY_SIGNING_KEY_ID:-self-host-2026}
+      BERRY_POLICY_SIGNING_PRIVATE_KEY_PEM: ${BERRY_POLICY_SIGNING_PRIVATE_KEY_PEM:-}
+      BERRY_AUDIT_S3_ENDPOINT: ${BERRY_AUDIT_S3_ENDPOINT:-http://minio:9000}
+      BERRY_AUDIT_S3_REGION: ${BERRY_AUDIT_S3_REGION:-us-east-1}
+      BERRY_AUDIT_S3_BUCKET: ${BERRY_AUDIT_S3_BUCKET:-berry-audit}
+      BERRY_AUDIT_S3_ACCESS_KEY_ID: ${BERRY_AUDIT_S3_ACCESS_KEY_ID:-berry}
+      BERRY_AUDIT_S3_SECRET_ACCESS_KEY: ${BERRY_AUDIT_S3_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-berry-dev-minio-password}}
+      BERRY_AUDIT_S3_PREFIX: ${BERRY_AUDIT_S3_PREFIX:-audit}
+      BERRY_AUTH_MODE: ${BERRY_AUTH_MODE:-better-auth}
+      BERRY_AUTH_SINGLE_USER_EMAIL: ${BERRY_AUTH_SINGLE_USER_EMAIL:-self-host@berry.local}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-replace-me-with-openssl-rand-base64-32}
+      BERRY_AUTH_BASE_URL: ${BERRY_AUTH_BASE_URL:-https://aesg-v2.berry.me}
+      BERRY_AUTH_TRUSTED_ORIGINS: ${BERRY_AUTH_TRUSTED_ORIGINS:-https://aesg-v2.berry.me}
+      BERRY_AUTH_SIGNUP_ENABLED: ${BERRY_AUTH_SIGNUP_ENABLED:-false}
+      BERRY_AUTH_MAX_USERS: ${BERRY_AUTH_MAX_USERS:-10}
+      BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS: ${BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS:-100000000}
+      BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS: ${BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS:-15000000}
+      BERRY_AUTH_ALLOWED_EMAILS: ${BERRY_AUTH_ALLOWED_EMAILS:-}
+      BERRY_AUTH_ALLOWED_EMAIL_DOMAINS: ${BERRY_AUTH_ALLOWED_EMAIL_DOMAINS:-}
+      BERRY_AUTH_ALLOW_OPEN_SIGNUP: ${BERRY_AUTH_ALLOW_OPEN_SIGNUP:-false}
+      BERRY_AUTH_RATE_LIMIT_WINDOW_SECONDS: ${BERRY_AUTH_RATE_LIMIT_WINDOW_SECONDS:-60}
+      BERRY_AUTH_RATE_LIMIT_MAX: ${BERRY_AUTH_RATE_LIMIT_MAX:-30}
+      BERRY_SCIM_BEARER_TOKEN: ${BERRY_SCIM_BEARER_TOKEN:-}
+      BERRY_API_CORS_ORIGINS: ${BERRY_API_CORS_ORIGINS:-https://aesg-v2.berry.me}
+      BERRY_API_JSON_BODY_LIMIT: ${BERRY_API_JSON_BODY_LIMIT:-40mb}
+      BERRY_API_MODEL_MODE: ${BERRY_API_MODEL_MODE:-live}
+      BERRY_ROUTER_INFERENCE_BASE_URL: ${BERRY_ROUTER_INFERENCE_BASE_URL:-}
+      BERRY_ROUTER_API_KEY: ${BERRY_ROUTER_API_KEY:-}
+      BERRY_ROUTER_PROVIDER_ID: ${BERRY_ROUTER_PROVIDER_ID:-router}
+      BERRY_ROUTER_PROVIDER_NAME: ${BERRY_ROUTER_PROVIDER_NAME:-Berry Router}
+      BERRY_ROUTER_CHAT_COMPLETIONS_PATH: ${BERRY_ROUTER_CHAT_COMPLETIONS_PATH:-/chat/completions}
+      BERRY_ROUTER_COMPLETION_TRANSPORT: ${BERRY_ROUTER_COMPLETION_TRANSPORT:-stream}
+      BERRY_ROUTER_MODELS_PATH: ${BERRY_ROUTER_MODELS_PATH:-/models}
+      BERRY_ROUTER_DEFAULT_MODEL: ${BERRY_ROUTER_DEFAULT_MODEL:-kimi-2.6}
+      BERRY_ROUTER_MODELS_JSON: ${BERRY_ROUTER_MODELS_JSON:-[]}
+      BERRY_ROUTER_IMAGE_GENERATIONS_URL: ${BERRY_ROUTER_IMAGE_GENERATIONS_URL:-}
+      BERRY_ROUTER_IMAGE_GENERATIONS_PATH: ${BERRY_ROUTER_IMAGE_GENERATIONS_PATH:-/images/generations}
+      BERRY_ROUTER_IMAGE_MODEL: ${BERRY_ROUTER_IMAGE_MODEL:-}
+      BERRY_ROUTER_IMAGE_RESPONSE_FORMAT: ${BERRY_ROUTER_IMAGE_RESPONSE_FORMAT:-b64_json}
+      BERRY_ROUTER_IMAGE_COST_MICROS: ${BERRY_ROUTER_IMAGE_COST_MICROS:-0}
+      BERRY_CLOUD_MCP_SERVERS_JSON: ${BERRY_CLOUD_MCP_SERVERS_JSON:-[]}
+      BERRY_CLOUD_SKILLS_JSON: ${BERRY_CLOUD_SKILLS_JSON:-[]}
+      BERRY_CLOUD_SKILLS_BASE64: ${BERRY_CLOUD_SKILLS_BASE64:-}
+      BERRY_CLOUD_NETWORK_EGRESS: ${BERRY_CLOUD_NETWORK_EGRESS:-on}
+      BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS: ${BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS:-}
+      BERRYCRAWL_API_KEY: ${BERRYCRAWL_API_KEY:-}
+      BERRY_SANDBOX_PROVIDER: ${BERRY_SANDBOX_PROVIDER:-e2b}
+      BERRY_SANDBOX_IMAGE: ${BERRY_SANDBOX_IMAGE:-base}
+      BERRY_SANDBOX_CWD: ${BERRY_SANDBOX_CWD:-/workspace}
+      BERRY_SANDBOX_DOCKER_IMAGE_ALLOWLIST: ${BERRY_SANDBOX_DOCKER_IMAGE_ALLOWLIST:-node:22-bookworm,node:22-bookworm-slim}
+      BERRY_SANDBOX_TTL_SECONDS: ${BERRY_SANDBOX_TTL_SECONDS:-900}
+      BERRY_SANDBOX_CPU_COUNT: ${BERRY_SANDBOX_CPU_COUNT:-2}
+      BERRY_SANDBOX_MEMORY_MIB: ${BERRY_SANDBOX_MEMORY_MIB:-4096}
+      BERRY_SANDBOX_DISK_MIB: ${BERRY_SANDBOX_DISK_MIB:-10240}
+      E2B_API_KEY: ${E2B_API_KEY:-}
+      BERRY_E2B_TEMPLATE_ID: ${BERRY_E2B_TEMPLATE_ID:-base}
+      BERRY_E2B_DOMAIN: ${BERRY_E2B_DOMAIN:-}
+      BERRY_E2B_REQUEST_TIMEOUT_MS: ${BERRY_E2B_REQUEST_TIMEOUT_MS:-60000}
+      BERRY_E2B_KEEP_MEMORY_ON_PAUSE: ${BERRY_E2B_KEEP_MEMORY_ON_PAUSE:-false}
+      BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS: ${BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS:-}
+      BERRY_E2B_MINIMUM_EXEC_COST_MICROS: ${BERRY_E2B_MINIMUM_EXEC_COST_MICROS:-0}
+      BERRY_ARTIFACT_S3_ENDPOINT: ${BERRY_ARTIFACT_S3_ENDPOINT:-http://minio:9000}
+      BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT: ${BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
+      BERRY_ARTIFACT_S3_REGION: ${BERRY_ARTIFACT_S3_REGION:-us-east-1}
+      BERRY_ARTIFACT_S3_BUCKET: ${BERRY_ARTIFACT_S3_BUCKET:-berry-artifacts}
+      BERRY_ARTIFACT_S3_ACCESS_KEY_ID: ${BERRY_ARTIFACT_S3_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-berry}}
+      BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY: ${BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-berry-dev-minio-password}}
+      BERRY_ARTIFACT_S3_PREFIX: ${BERRY_ARTIFACT_S3_PREFIX:-artifacts}
+      BERRY_ARTIFACT_PUBLIC_BASE_URL: ${BERRY_ARTIFACT_PUBLIC_BASE_URL:-https://aesg-v2.berry.me/v1/artifacts}
+      BERRY_FILE_MAX_UPLOAD_BYTES: ${BERRY_FILE_MAX_UPLOAD_BYTES:-1073741824}
+      BERRY_FILE_MULTIPART_PART_SIZE: ${BERRY_FILE_MULTIPART_PART_SIZE:-16777216}
+      BERRY_FILE_PRESIGN_SECONDS: ${BERRY_FILE_PRESIGN_SECONDS:-900}
+      BERRY_RUNTIME_DB_PATH: /data/berry-runtime.sqlite
+    ports:
+      - "127.0.0.1:${BERRY_API_PORT:-3001}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    volumes:
+      - api_data:/data
+
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: worker
+    restart: unless-stopped
+    command: ["node", "apps/worker/dist/main.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_REDIS_URL: redis://redis:6379
+      BERRY_WORKER_CONCURRENCY: ${BERRY_WORKER_CONCURRENCY:-4}
+
+  web:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: web
+    restart: unless-stopped
+    command: ["apps/web/node_modules/.bin/srvx", "--prod", "-s", "../client", "apps/web/dist/server/server.js"]
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3108
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-self-hosted}
+      BERRY_WEB_API_BASE_URL: ${BERRY_WEB_API_BASE_URL:-https://aesg-v2.berry.me}
+      BERRY_WEB_DEMO_MODE: "false"
+      BERRY_WEB_WORKSPACE_ID: ${BERRY_WEB_WORKSPACE_ID:-self-host}
+      BERRY_WEB_WORKSPACE_PATH: ${BERRY_WEB_WORKSPACE_PATH:-/workspace}
+      BERRY_WEB_SANDBOX_TERMINAL_WS_URL: ${BERRY_WEB_SANDBOX_TERMINAL_WS_URL:-}
+      BERRY_WEB_PROVIDERS_JSON: ${BERRY_WEB_PROVIDERS_JSON:-[]}
+      BERRY_WEB_MCP_HTTP_JSON: ${BERRY_WEB_MCP_HTTP_JSON:-[]}
+      BERRY_WEB_SKILLS_JSON: ${BERRY_WEB_SKILLS_JSON:-[]}
+    ports:
+      - "127.0.0.1:${BERRY_WEB_PORT:-3108}:3108"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3108/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  api_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "config": "",
+    "css": "src/styles/globals.css",
+    "baseColor": "neutral",
+    "cssVariables": true
+  },
+  "iconLibrary": "lucide",
+  "aliases": {
+    "components": "@berry/desktop-ui/components",
+    "ui": "@berry/desktop-ui/components/ui",
+    "utils": "@berry/desktop-ui/lib/utils",
+    "hooks": "@berry/desktop-ui/hooks",
+    "lib": "@berry/desktop-ui/lib"
+  }
+}

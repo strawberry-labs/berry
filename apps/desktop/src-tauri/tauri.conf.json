@@ -1,0 +1,89 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Berry",
+  "version": "0.1.0",
+  "identifier": "dev.berry.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --filter @berry/host build && pnpm --filter @berry/desktop dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm --filter @berry/host build && pnpm --filter @berry/desktop build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Berry",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 400,
+        "minHeight": 500,
+        "resizable": true,
+        "visible": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 30
+        },
+        "backgroundColor": "#181818"
+      }
+    ],
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$DESKTOP/**",
+          "$DOCUMENT/**",
+          "$DOWNLOAD/**",
+          "$PICTURE/**",
+          "$TEMP/**"
+        ]
+      },
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: asset: http://asset.localhost https://models.dev",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost https://models.dev",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'self'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "dmg",
+      "msi",
+      "appimage",
+      "deb"
+    ],
+    "category": "DeveloperTool",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "Local-first desktop agent",
+    "longDescription": "Berry is a local-first coding agent desktop app.",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["berry"]
+      }
+    },
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/berry-chat/berry-chat/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

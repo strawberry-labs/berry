@@ -1,0 +1,220 @@
+.igWrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: min(100%, 260px);
+  margin: 12px auto 18px;
+}
+
+.igCanvas {
+  position: relative;
+  width: 100%;
+  max-width: 208px;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--berry-surface-raised);
+  box-shadow: var(--berry-ring-subtle), var(--berry-shadow-floating);
+}
+
+.igDots,
+.igGlow {
+  position: absolute;
+  inset: 2px;
+  background-repeat: space;
+  background-size: 11px 11px;
+}
+
+.igDots {
+  background-image: radial-gradient(circle, var(--berry-text-tertiary) 0.7px, transparent 1.3px);
+  opacity: 0.24;
+}
+
+.igGlow {
+  background-image: radial-gradient(circle, var(--berry-text-primary) 1.1px, transparent 1.6px);
+  -webkit-mask-image:
+    radial-gradient(ellipse at center, #000 0%, transparent 60%),
+    radial-gradient(ellipse at center, #000 0%, transparent 62%);
+  mask-image:
+    radial-gradient(ellipse at center, #000 0%, transparent 60%),
+    radial-gradient(ellipse at center, #000 0%, transparent 62%);
+  -webkit-mask-repeat: no-repeat, no-repeat;
+  mask-repeat: no-repeat, no-repeat;
+  -webkit-mask-size: 72% 62%, 52% 52%;
+  mask-size: 72% 62%, 52% 52%;
+  -webkit-mask-position: 16% 20%, 30% 32%;
+  mask-position: 16% 20%, 30% 32%;
+  opacity: 0.72;
+  animation:
+    ig-morph 4.2s cubic-bezier(0.35, 1.55, 0.65, 1) infinite,
+    ig-breathe 1.9s cubic-bezier(0.66, 0, 0.34, 1) infinite;
+}
+
+.igRes {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--berry-text-tertiary);
+  background: var(--berry-control-bg);
+  box-shadow: var(--berry-ring-subtle);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+.igMeta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  max-width: 208px;
+  text-align: start;
+}
+
+.igLabel {
+  color: var(--berry-text-primary);
+  font-size: 14px;
+  font-weight: 550;
+  line-height: 1.4;
+}
+
+.igPrompt,
+.igErrorMessage {
+  color: var(--berry-text-tertiary);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+  text-wrap: pretty;
+}
+
+.igError {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  width: min(calc(100% - 32px), 520px);
+  margin: 12px auto 18px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--berry-card-bg);
+  box-shadow: var(--berry-ring-subtle), var(--berry-shadow-floating);
+}
+
+.igErrorCopy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.igErrorLabel {
+  color: var(--berry-text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.igErrorMessage {
+  margin-top: 4px;
+  color: var(--destructive);
+}
+
+.igRetry {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: 40px;
+  gap: 6px;
+  padding: 0 12px 0 10px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--berry-text-primary);
+  background: var(--berry-surface-raised);
+  box-shadow: var(--berry-ring-subtle);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 550;
+  transition-property: background-color, box-shadow, scale;
+  transition-duration: 150ms;
+  transition-timing-function: var(--berry-ease-out-cubic);
+}
+
+.igRetry:hover {
+  background: var(--berry-hover);
+  box-shadow: var(--berry-ring-hover);
+}
+
+.igRetry:active {
+  scale: 0.96;
+}
+
+.igRetry:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.igRetry svg {
+  width: 14px;
+  height: 14px;
+}
+
+@keyframes ig-morph {
+  0% {
+    -webkit-mask-size: 52% 46%, 40% 40%;
+    mask-size: 52% 46%, 40% 40%;
+    -webkit-mask-position: 16% 20%, 30% 32%;
+    mask-position: 16% 20%, 30% 32%;
+  }
+  25% {
+    -webkit-mask-size: 46% 58%, 44% 38%;
+    mask-size: 46% 58%, 44% 38%;
+    -webkit-mask-position: 84% 16%, 66% 30%;
+    mask-position: 84% 16%, 66% 30%;
+  }
+  50% {
+    -webkit-mask-size: 60% 44%, 38% 46%;
+    mask-size: 60% 44%, 38% 46%;
+    -webkit-mask-position: 82% 84%, 62% 68%;
+    mask-position: 82% 84%, 62% 68%;
+  }
+  75% {
+    -webkit-mask-size: 48% 54%, 46% 40%;
+    mask-size: 48% 54%, 46% 40%;
+    -webkit-mask-position: 14% 82%, 34% 66%;
+    mask-position: 14% 82%, 34% 66%;
+  }
+  100% {
+    -webkit-mask-size: 52% 46%, 40% 40%;
+    mask-size: 52% 46%, 40% 40%;
+    -webkit-mask-position: 16% 20%, 30% 32%;
+    mask-position: 16% 20%, 30% 32%;
+  }
+}
+
+@keyframes ig-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .igGlow {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
+@media (max-width: 520px) {
+  .igError {
+    flex-direction: column;
+  }
+}

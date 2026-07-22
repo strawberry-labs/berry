@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "exactOptionalPropertyTypes": false,
+    "verbatimModuleSyntax": true,
+    "rewriteRelativeImportExtensions": false,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@berry/desktop-ui/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

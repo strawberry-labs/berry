@@ -1,0 +1,30 @@
+{
+  "name": "@berry/cli",
+  "version": "0.1.0",
+  "description": "Binary launcher for the Berry coding agent CLI",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "berry": "bin/berry.js"
+  },
+  "files": [
+    "bin/berry.js",
+    "install.js"
+  ],
+  "scripts": {
+    "build": "node --check install.js && node --check bin/berry.js",
+    "lint": "node --check install.js && node --check bin/berry.js",
+    "typecheck": "node --check install.js && node --check bin/berry.js",
+    "test": "vitest --run",
+    "postinstall": "node install.js"
+  },
+  "berry": {
+    "repository": "__BERRY_GITHUB_REPOSITORY__"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
+  }
+}

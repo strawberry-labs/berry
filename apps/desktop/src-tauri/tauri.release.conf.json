@@ -1,0 +1,6 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": ["binaries/berry-host", "binaries/berry-pty", "binaries/berry-sandbox", "binaries/agent-browser"]
+  }
+}

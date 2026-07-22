@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "berry-platform.name" . }}-api
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      {{- include "berry-platform.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "berry-platform.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "apps/api/dist/main.js"]
+          ports:
+            - containerPort: {{ .Values.api.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "berry-platform.name" . }}-config
+          env:
+            - name: PORT
+              value: {{ .Values.api.port | quote }}
+            - name: BERRY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.postgres.existingSecret }}
+                  key: {{ .Values.external.postgres.secretKey }}
+            - name: BERRY_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.redis.existingSecret }}
+                  key: {{ .Values.external.redis.secretKey }}
+            - name: BETTER_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.betterAuthSecretKey }}
+            - name: BERRY_SCIM_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.scimBearerTokenKey }}
+                  optional: true
+            - name: BERRY_POLICY_SIGNING_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.policy.existingSecret }}
+                  key: {{ .Values.policy.keyIdKey }}
+            - name: BERRY_POLICY_SIGNING_PRIVATE_KEY_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.policy.existingSecret }}
+                  key: {{ .Values.policy.privateKeyPemKey }}
+            - name: BERRY_USAGE_SIGNING_SECRETS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.usage.existingSecret }}
+                  key: {{ .Values.usage.signingSecretsKey }}
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.existingSecret }}
+                  key: {{ .Values.billing.stripeSecretKeyKey }}
+                  optional: true
+            - name: STRIPE_BILLING_METER_EVENT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.existingSecret }}
+                  key: {{ .Values.billing.stripeMeterEventNameKey }}
+                  optional: true
+            - name: STRIPE_CREDIT_PRICE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.existingSecret }}
+                  key: {{ .Values.billing.stripeCreditPriceIdKey }}
+                  optional: true
+            - name: BERRY_ROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.router.existingSecret }}
+                  key: {{ .Values.router.apiKeyKey }}
+            {{ if eq .Values.sandbox.provider "e2b" }}
+            - name: E2B_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sandbox.existingSecret }}
+                  key: {{ .Values.sandbox.apiKeyKey }}
+            {{ end }}
+            - name: BERRY_ARTIFACT_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.s3.existingSecret }}
+                  key: {{ .Values.external.s3.accessKeyIdKey }}
+            - name: BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.s3.existingSecret }}
+                  key: {{ .Values.external.s3.secretAccessKeyKey }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.api.port }}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.api.port }}
+            periodSeconds: 30

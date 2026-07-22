@@ -1,0 +1,49 @@
+{
+  "cli": {
+    "version": ">= 14.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "internal-ios": {
+      "distribution": "internal",
+      "channel": "internal",
+      "ios": {
+        "resourceClass": "m-medium"
+      }
+    },
+    "internal-android": {
+      "distribution": "internal",
+      "channel": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "store-ios": {
+      "distribution": "store",
+      "channel": "production",
+      "ios": {
+        "resourceClass": "m-medium"
+      }
+    },
+    "store-android": {
+      "distribution": "store",
+      "channel": "production",
+      "android": {
+        "buildType": "app-bundle"
+      }
+    }
+  },
+  "submit": {
+    "internal-ios": {
+      "ios": {
+        "ascAppId": "replace-with-app-store-connect-app-id"
+      }
+    },
+    "internal-android": {
+      "android": {
+        "track": "internal",
+        "serviceAccountKeyPath": "./google-play-service-account.json"
+      }
+    }
+  }
+}

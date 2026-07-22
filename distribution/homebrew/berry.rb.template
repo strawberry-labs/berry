@@ -1,0 +1,33 @@
+class Berry < Formula
+  desc "Local-first coding agent CLI"
+  homepage "https://github.com/__REPOSITORY__"
+  version "__VERSION__"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "__URL_AARCH64_APPLE_DARWIN__"
+      sha256 "__SHA_AARCH64_APPLE_DARWIN__"
+    else
+      url "__URL_X86_64_APPLE_DARWIN__"
+      sha256 "__SHA_X86_64_APPLE_DARWIN__"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "__URL_AARCH64_UNKNOWN_LINUX_GNU__"
+      sha256 "__SHA_AARCH64_UNKNOWN_LINUX_GNU__"
+    else
+      url "__URL_X86_64_UNKNOWN_LINUX_GNU__"
+      sha256 "__SHA_X86_64_UNKNOWN_LINUX_GNU__"
+    end
+  end
+
+  def install
+    bin.install cached_download => "berry"
+  end
+
+  test do
+    assert_match "berry #{version}", shell_output("#{bin}/berry --version")
+  end
+end

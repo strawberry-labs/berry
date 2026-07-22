@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Berry Companion",
+  "version": "0.1.0",
+  "description": "Capture page context, continue Berry tasks, and approve agent actions from a browser side panel.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "nativeMessaging",
+    "notifications",
+    "sidePanel",
+    "scripting",
+    "storage"
+  ],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "side-panel.html"
+  },
+  "action": {
+    "default_title": "Open Berry"
+  },
+  "commands": {
+    "send-page-to-berry": {
+      "suggested_key": {
+        "default": "Alt+B"
+      },
+      "description": "Send the current page to Berry"
+    }
+  }
+}

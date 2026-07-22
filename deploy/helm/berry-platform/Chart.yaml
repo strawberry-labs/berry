@@ -1,0 +1,6 @@
+apiVersion: v2
+name: berry-platform
+description: Berry web, API, and worker deployment for managed, dedicated, or self-hosted clusters.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

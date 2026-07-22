@@ -1,0 +1,28 @@
+[package]
+name = "berry-desktop"
+version = "0.1.0"
+description = "Berry"
+authors = ["Berry contributors"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+# Berry credential store: AES-256-GCM over a credentials.json file —
+# no OS keychain, no permission prompts.
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
+gethostname = "0.5"
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-deep-link = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

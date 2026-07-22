@@ -1,0 +1,69 @@
+name: Mobile Internal Tracks
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Mobile platform"
+        required: true
+        default: "all"
+        type: choice
+        options: ["all", "ios", "android"]
+      submit:
+        description: "Submit latest internal build to TestFlight/Play internal track"
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify store metadata
+        run: pnpm check:store
+
+      - name: Verify mobile package
+        run: pnpm --filter @berry/mobile typecheck && pnpm --filter @berry/mobile test
+
+      - name: Install EAS CLI
+        run: pnpm dlx eas-cli@latest --version
+
+      - name: Start iOS internal build
+        if: ${{ (inputs.platform == 'all' || inputs.platform == 'ios') && env.EXPO_TOKEN != '' }}
+        working-directory: apps/mobile
+        run: pnpm dlx eas-cli@latest build --platform ios --profile internal-ios --non-interactive --no-wait
+
+      - name: Start Android internal build
+        if: ${{ (inputs.platform == 'all' || inputs.platform == 'android') && env.EXPO_TOKEN != '' }}
+        working-directory: apps/mobile
+        run: pnpm dlx eas-cli@latest build --platform android --profile internal-android --non-interactive --no-wait
+
+      - name: Submit iOS internal build
+        if: ${{ inputs.submit && (inputs.platform == 'all' || inputs.platform == 'ios') && env.EXPO_TOKEN != '' }}
+        working-directory: apps/mobile
+        run: pnpm dlx eas-cli@latest submit --platform ios --profile internal-ios --latest --non-interactive
+
+      - name: Submit Android internal build
+        if: ${{ inputs.submit && (inputs.platform == 'all' || inputs.platform == 'android') && env.EXPO_TOKEN != '' && env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        working-directory: apps/mobile
+        run: |
+          printf '%s' "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" > google-play-service-account.json
+          pnpm dlx eas-cli@latest submit --platform android --profile internal-android --latest --non-interactive
+          rm -f google-play-service-account.json

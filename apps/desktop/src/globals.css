@@ -1,0 +1,1512 @@
+@import "@berry/desktop-ui/styles/globals.css";
+
+@source "../../../packages/desktop-ui/src";
+
+:root {
+  --radius: 0.625rem;
+
+  --background: #ffffff;
+  --foreground: #0d0d0d;
+  --card: #ffffff;
+  --card-foreground: #0d0d0d;
+  --popover: #ffffff;
+  --popover-foreground: #0d0d0d;
+  --primary: #0d0d0d;
+  --primary-foreground: #ffffff;
+  --secondary: #ededed;
+  --secondary-foreground: #212121;
+  --muted: #f4f4f4;
+  --muted-foreground: #5d5d5d;
+  --accent: #0000000a;
+  --accent-foreground: #0d0d0d;
+  --destructive: #e02e2a;
+  --destructive-foreground: #ffffff;
+  --border: #00000014;
+  --input: #ffffff;
+  --ring: #0169cc66;
+  --sidebar: var(--berry-sidebar-bg);
+  --sidebar-foreground: #212121;
+  --sidebar-primary: #0d0d0d;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #0000000a;
+  --sidebar-accent-foreground: #0d0d0d;
+  --sidebar-border: #00000014;
+  --sidebar-ring: #0169cc66;
+
+  --berry-titlebar-height: 56px;
+  /* Floating titlebar controls (AppWindowChrome). 96px left padding clears the
+     macOS traffic lights (x:24 y:25, ~14px tall → center y≈32); the control
+     block is three 28px buttons with 4px gaps (3 × 28 + 2 × 4 = 92px), so its
+     right edge sits at 96 + 92 = 188px. In fullscreen the lights are gone, so
+     the block slides to the left edge (see [data-fullscreen] override). */
+  --berry-window-nav-left: 86px;
+  --berry-window-nav-width: 92px;
+  --berry-task-header-pad-x: 16px;
+  /* Left margin of the main panel once the sidebar collapses offcanvas. */
+  --berry-collapsed-main-margin: 8px;
+  /* Breathing room between the controls' right edge and the header content. */
+  --berry-titlebar-lane-gap: 8px;
+  /* Width of the leading lane the task header reserves while the sidebar is
+     collapsed so the branch chip and title clear the floating controls instead
+     of sliding underneath them. Derived from the real control geometry above;
+     the collapsed margin and header padding cancel against the layout, leaving
+     the header content at nav-left + nav-width + lane-gap + column-gap. */
+  --berry-task-header-control-lane: calc(
+    var(--berry-window-nav-left) + var(--berry-window-nav-width) +
+      var(--berry-titlebar-lane-gap) - var(--berry-collapsed-main-margin) -
+      var(--berry-task-header-pad-x)
+  );
+  /* Berry surface system:
+     main content is opaque (gray-0/gray-900), the window base under the
+     sidebar is the vibrancy fallback, and controls (composer, dropdowns,
+     menus) share one opaque control surface. Rings derive from the theme
+     foreground so they adapt to light/dark automatically. */
+  --berry-main-bg: #ffffff;
+  --berry-surface-under: #f9f9f9;
+  --berry-window-base: var(--berry-sidebar-bg);
+  --berry-sidebar-bg: var(--berry-surface-under);
+  --berry-header-bg: #ffffff;
+  --berry-panel-bg: #ffffff;
+  --berry-card-bg: #ffffff;
+  --berry-surface-raised: #f4f4f4;
+  --berry-user-message-bg: #f4f4f4;
+  --berry-surface-inset: #ededed;
+  --berry-control-bg: #ffffff;
+  --berry-composer-strip: #f4f4f4;
+  --berry-accent: #0169cc;
+  /* Permission mode accents (Berry semantics; dark values sampled from
+     reference shots, light values from Codex's light semantic colors). */
+  --berry-mode-auto-edit: #0169cc;
+  --berry-mode-plan: #924ff7;
+  --berry-mode-full: #d97706;
+  /* Prompt mention token accents (Berry's per-category node colors). */
+  --berry-node-file: #0169cc;
+  --berry-node-command: #d97706;
+  --berry-node-skill: #924ff7;
+  --berry-node-subagent: #0f766e;
+  --berry-node-session: #15803d;
+  --berry-text-primary: #0d0d0d;
+  --berry-text-secondary: #212121;
+  --berry-text-tertiary: #5d5d5d;
+  --berry-text-faint: #8f8f8f;
+  --berry-hover: #0000000a;
+  --berry-selected: #00000014;
+  --berry-border: #00000014;
+  --berry-border-hover: #00000022;
+  --berry-command-bg: #e3e3e3;
+  --berry-command-hover: #d9d9d9;
+  --berry-send-bg: #0d0d0d;
+  --berry-send-hover: #303030;
+  --berry-send-fg: #ffffff;
+  --berry-ring-subtle: 0 0 0 1px color-mix(in srgb, var(--foreground) 8%, transparent);
+  --berry-ring-strong: 0 0 0 1px color-mix(in srgb, var(--foreground) 16%, transparent), inset 0 1px 0 color-mix(in srgb, var(--foreground) 4%, transparent);
+  --berry-ring-hover: 0 0 0 1px color-mix(in srgb, var(--foreground) 17%, transparent);
+  --berry-shadow-floating: 0 18px 52px -36px rgb(0 0 0 / 0.35);
+  --berry-panel-radius: 14px;
+  --berry-ease-out-cubic: cubic-bezier(0.33, 1, 0.68, 1);
+  --berry-ease-codex-expo: var(--ease-smooth-out);
+  --berry-accordion-open-duration: var(--duration-fast);
+  --berry-accordion-close-duration: var(--duration-fast);
+  --berry-accordion-child-enter-duration: var(--duration-fast);
+  --berry-accordion-child-exit-duration: var(--duration-fast);
+  /* Codex --thread-content-max-width: one 48rem column for messages and
+     composer alike (wide markdown blocks may stretch to 56rem). */
+  --berry-content-width: 48rem;
+  --berry-message-width: 48rem;
+  /* Codex composer geometry: a generous squircle. WKWebView has no
+     corner-shape, so a larger plain radius fakes the superellipse read. */
+  --berry-composer-radius: 26px;
+  --berry-composer-pad: 8px;
+  /* Codex "elevation-prominent": a 0.5px hairline ring instead of a border,
+     plus two soft ambient shadows. */
+  --berry-elevation-stroke: 0 0 0 0.5px color-mix(in srgb, var(--foreground) 20%, transparent);
+  --berry-elevation-prominent:
+    var(--berry-elevation-stroke),
+    0 3px 7.5px rgb(0 0 0 / 0.04),
+    0 0 20px rgb(0 0 0 / 0.05);
+}
+
+.dark {
+  --background: #181818;
+  --foreground: #fcfcfc;
+  --card: #212121;
+  --card-foreground: #fcfcfc;
+  --popover: #2d2d2d;
+  --popover-foreground: #fcfcfc;
+  --primary: #fcfcfc;
+  --primary-foreground: #0d0d0d;
+  --secondary: #2d2d2d;
+  --secondary-foreground: #dfdfdf;
+  --muted: #212121;
+  --muted-foreground: #8f8f8f;
+  --accent: #ffffff0d;
+  --accent-foreground: #fcfcfc;
+  --destructive: #f44a4c;
+  --destructive-foreground: #ffffff;
+  --border: #ffffff14;
+  --input: #2d2d2d;
+  --ring: #0169cc80;
+  --sidebar: var(--berry-sidebar-bg);
+  --sidebar-foreground: #dfdfdf;
+  --sidebar-primary: #fcfcfc;
+  --sidebar-primary-foreground: #0d0d0d;
+  --sidebar-accent: #ffffff0d;
+  --sidebar-accent-foreground: #fcfcfc;
+  --sidebar-border: #ffffff14;
+  --sidebar-ring: #0169cc80;
+
+  --berry-main-bg: #181818;
+  --berry-surface-under: #1f1f1f;
+  /* The sidebar is a distinct layer between the main canvas and controls. */
+  --berry-sidebar-bg: #242424;
+  --berry-header-bg: #181818;
+  --berry-panel-bg: #181818;
+  --berry-card-bg: #212121;
+  --berry-surface-raised: #212121;
+  --berry-user-message-bg: #242424;
+  --berry-surface-inset: #1f1f1f;
+  --berry-control-bg: #2d2d2d;
+  --berry-composer-strip: #1f1f1f;
+  --berry-mode-auto-edit: #8ac3fd;
+  --berry-mode-plan: #ac88fc;
+  --berry-mode-full: #f88b3d;
+  --berry-node-file: #8ac3fd;
+  --berry-node-command: #f88b3d;
+  --berry-node-skill: #ac88fc;
+  --berry-node-subagent: #5eead4;
+  --berry-node-session: #86efac;
+  --berry-text-primary: #fcfcfc;
+  --berry-text-secondary: #dfdfdf;
+  --berry-text-tertiary: #949494;
+  --berry-text-faint: #6c6c6c;
+  --berry-hover: #ffffff0d;
+  --berry-selected: #ffffff1a;
+  --berry-border: #ffffff14;
+  --berry-border-hover: #ffffff26;
+  --berry-command-bg: #4d4d4d;
+  --berry-command-hover: #565656;
+  --berry-send-bg: #ffffff;
+  --berry-send-hover: #f0f0f0;
+  --berry-send-fg: #0d0d0d;
+  --berry-shadow-floating: 0 18px 52px -36px rgb(0 0 0 / 0.92);
+}
+
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    background: var(--berry-window-base);
+  }
+
+  body {
+    overflow: hidden;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  /* Codex scrollbars: slim, thumb-only (transparent track), tinted from the
+     theme foreground (their scrollbar-color: <slider> transparent pattern). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--foreground) 24%, transparent) transparent;
+  }
+
+  /* Codex "scrollbar-on-hover": rail lists keep the scrollbar invisible until
+     the pointer is over them. */
+  [data-slot="sidebar-content"] {
+    scrollbar-color: transparent transparent;
+  }
+
+  [data-slot="sidebar-content"]:hover {
+    scrollbar-color: color-mix(in srgb, var(--foreground) 24%, transparent) transparent;
+  }
+}
+
+@layer components {
+  .berry-shell {
+    background: var(--berry-window-base);
+  }
+
+  .berry-shell [data-slot="sidebar-container"] {
+    padding: 0 !important;
+  }
+
+  .berry-shell [data-slot="sidebar-inner"] {
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: var(--berry-sidebar-bg) !important;
+    box-shadow: none !important;
+    /* Surface (bg/border/shadow) crossfades fast between states — 35ms. */
+    transition:
+      background-color 35ms cubic-bezier(0.4, 0, 0.2, 1),
+      border-color 35ms cubic-bezier(0.4, 0, 0.2, 1),
+      box-shadow 35ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* Collapse/expand slide — Material "standard" curve, 200ms (per reference),
+     replacing the stock ease-linear on both the gap and the sliding panel. */
+  .berry-shell [data-slot="sidebar-gap"],
+  .berry-shell [data-slot="sidebar-container"] {
+    transition-duration: var(--duration-fast) !important;
+    transition-timing-function: var(--ease-smooth-out) !important;
+  }
+
+  .berry-main-panel {
+    overflow: hidden;
+    border-radius: 0;
+    background: var(--berry-main-bg);
+    box-shadow: none;
+  }
+
+  @media (min-width: 768px) {
+    /* Flush main panel — no floating card: straight edges, no margin/radius. */
+    .berry-main-panel {
+      height: 100svh !important;
+      margin: 0 !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+    }
+
+    .peer[data-state="collapsed"] ~ .berry-main-panel {
+      margin-left: 0 !important;
+    }
+  }
+
+  /* Vertically centered in the titlebar via transform — no pixel guessing,
+     stays centered whatever the button height is. */
+  .berry-window-nav {
+    top: 50%;
+    transform: translateY(-50%);
+    left: var(--berry-window-nav-left);
+    gap: 4px;
+    color: var(--berry-text-tertiary);
+    transition: left var(--duration-fast) var(--ease-smooth-out);
+  }
+
+  /* Fullscreen hides the traffic lights, so the controls slide to the edge. */
+  :root[data-fullscreen="true"] .berry-window-nav {
+    left: 12px;
+  }
+
+  /* !important so the 28px Berry size beats the button size-* utilities. */
+  .berry-titlebar-control {
+    width: 28px !important;
+    height: 28px !important;
+    border-radius: 8px;
+    color: var(--berry-text-tertiary);
+    outline: none;
+    box-shadow: none;
+    transition-property: background-color, color, box-shadow, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-titlebar-control svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .berry-titlebar-control:hover {
+    background-color: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-titlebar-control:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  .berry-titlebar-control[data-active="true"],
+  .berry-titlebar-control[aria-pressed="true"] {
+    background-color: var(--berry-selected);
+    color: var(--foreground);
+    box-shadow: var(--berry-ring-subtle);
+  }
+
+  .berry-titlebar-control:disabled {
+    color: var(--berry-text-faint);
+    opacity: 1;
+  }
+
+  .berry-app-sidebar {
+    color: var(--sidebar-foreground);
+  }
+
+  .berry-sidebar-header {
+    padding: var(--berry-titlebar-height) 14px 14px;
+  }
+
+  .berry-workspace-switcher-item {
+    color: var(--berry-text-secondary);
+    transition-property: background-color, color;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-workspace-switcher-item:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-workspace-action {
+    color: var(--berry-text-tertiary);
+    border-radius: 8px;
+  }
+
+  .berry-sidebar-workspace-action:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-workspace-action:active,
+  .berry-sidebar-task-action:active {
+    transform: scale(0.96);
+  }
+
+  .berry-sidebar-task-action {
+    color: var(--berry-text-tertiary);
+    border-radius: 8px;
+    transition-property: background-color, color, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-sidebar-task-action:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-task-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
+  }
+
+  .berry-sidebar-commands {
+    gap: 2px;
+  }
+
+  .berry-sidebar-command {
+    height: 34px;
+    gap: 10px;
+    border-radius: 10px;
+    padding: 0 12px;
+    color: var(--berry-text-secondary);
+    /* !important: the shadcn SidebarMenuButton carries a text-sm utility that
+       otherwise beats this components-layer size. */
+    font-size: 14px !important;
+    letter-spacing: 0;
+    transition-property: background-color, color, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-sidebar-command svg {
+    width: 17px;
+    height: 17px;
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-sidebar-command:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  /* "New task" is not highlighted by default — only on hover, like the rest. */
+  .berry-sidebar-command-primary {
+    background: transparent;
+  }
+
+  /* The ⌘N / ⌘K badges are flat until the row is hovered. */
+  .berry-sidebar-command kbd {
+    height: auto;
+    border: 0;
+    background: transparent !important;
+    color: var(--berry-text-tertiary);
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 6px;
+    box-shadow: none;
+    transition-property: background-color, color;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-sidebar-command:hover kbd {
+    background: color-mix(in srgb, var(--foreground) 10%, transparent) !important;
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-sidebar-project-group {
+    padding: 0 12px;
+  }
+
+  .berry-sidebar-segment-row {
+    height: 34px;
+    padding: 0 0 2px;
+  }
+
+  .berry-sidebar-segment {
+    height: 28px;
+    background: var(--berry-surface-inset);
+    color: var(--berry-text-tertiary);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 4%, transparent);
+  }
+
+  .berry-sidebar-segment-button {
+    display: inline-flex;
+    height: 24px;
+    align-items: center;
+    gap: 4px;
+    padding: 0 10px;
+    color: var(--berry-text-tertiary);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0;
+    transition-property: background-color, color, box-shadow, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-sidebar-segment-button-active {
+    background: var(--berry-main-bg);
+    color: var(--berry-text-primary);
+    box-shadow: 0 1px 6px rgb(0 0 0 / 0.22);
+  }
+
+  .berry-sidebar-mini-control {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    color: var(--berry-text-tertiary);
+    transition-property: background-color, color, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-sidebar-mini-control svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .berry-sidebar-mini-control:active {
+    transform: scale(0.96);
+  }
+
+  .berry-sidebar-mini-control:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-tree {
+    gap: 4px;
+    padding-top: 10px;
+  }
+
+  .berry-sidebar-workspace-row,
+  .berry-sidebar-task-row {
+    height: 32px;
+    border-radius: 9px;
+    color: var(--berry-text-secondary);
+    /* !important: the shadcn SidebarMenuButton carries a text-sm utility that
+       otherwise beats this components-layer size. */
+    font-size: 14px !important;
+    letter-spacing: 0;
+    transition-property: background-color, color, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-sidebar-workspace-row {
+    gap: 10px;
+    padding: 0 10px;
+  }
+
+  .berry-sidebar-workspace-row svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .berry-sidebar-project-pin {
+    color: var(--berry-text-tertiary);
+  }
+
+  .berry-sidebar-workspace-row:hover .berry-sidebar-project-pin,
+  .berry-sidebar-workspace-row:focus-visible .berry-sidebar-project-pin,
+  .berry-sidebar-task-row:hover .berry-sidebar-task-meta,
+  .berry-sidebar-task-row:focus-visible .berry-sidebar-task-meta {
+    opacity: 0;
+  }
+
+  .berry-sidebar-row-title {
+    -webkit-mask-image: linear-gradient(to right, black calc(100% - 18px), transparent);
+    mask-image: linear-gradient(to right, black calc(100% - 18px), transparent);
+  }
+
+  .berry-sidebar-workspace-row:hover ~ .berry-sidebar-workspace-action,
+  .berry-sidebar-workspace-row:focus-visible ~ .berry-sidebar-workspace-action,
+  .berry-sidebar-workspace-action:hover,
+  .berry-sidebar-workspace-action:focus-visible,
+  .berry-sidebar-workspace-action[data-state="open"],
+  .berry-sidebar-task-row:hover ~ .berry-sidebar-task-action,
+  .berry-sidebar-task-row:focus-visible ~ .berry-sidebar-task-action,
+  .berry-sidebar-task-action:hover,
+  .berry-sidebar-task-action:focus-visible {
+    opacity: 1;
+  }
+
+  .berry-sidebar-task-list {
+    margin: 6px 0 8px;
+  }
+
+  .berry-sidebar-task-row {
+    height: 32px;
+    padding: 0 10px;
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-sidebar-workspace-row:hover,
+  .berry-sidebar-task-row:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  /* Action buttons are siblings of their row button. Keep the row's hover
+     treatment while the pointer or keyboard focus moves onto one of those
+     controls. Direct-child matching prevents nested chats from activating
+     their parent project's controls. */
+  .berry-sidebar-workspace-item:has(> .berry-sidebar-workspace-action:hover, > .berry-sidebar-workspace-action:focus-visible) > .berry-sidebar-workspace-row,
+  .berry-sidebar-task-item:has(> .berry-sidebar-task-action:hover, > .berry-sidebar-task-action:focus-visible) > .berry-sidebar-task-row {
+    padding-right: 64px !important;
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-workspace-item:has(> .berry-sidebar-workspace-action:hover, > .berry-sidebar-workspace-action:focus-visible) > .berry-sidebar-workspace-row .berry-sidebar-project-pin,
+  .berry-sidebar-task-item:has(> .berry-sidebar-task-action:hover, > .berry-sidebar-task-action:focus-visible) > .berry-sidebar-task-row .berry-sidebar-task-meta {
+    opacity: 0;
+  }
+
+  .berry-sidebar-task-row[data-active="true"] {
+    background: var(--berry-selected);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-task-row span:last-child {
+    color: var(--berry-text-tertiary);
+    font-size: 13px;
+    /* timeAgo values re-render live; tabular digits prevent width jitter. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  .berry-sidebar-empty {
+    color: var(--berry-text-tertiary);
+    font-size: 14px !important;
+  }
+
+  .berry-sidebar-footer {
+    padding: 0 12px 12px;
+  }
+
+  .berry-connect-button {
+    height: 38px !important;
+    border-radius: 10px;
+    color: var(--berry-text-primary);
+    transition-property: background-color, color, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-connect-button:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-connect-avatar {
+    background: var(--berry-surface-inset);
+    box-shadow: var(--berry-ring-subtle);
+  }
+
+  .berry-home-stage {
+    background: var(--berry-main-bg);
+  }
+
+  .berry-home-help {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+  }
+
+  .berry-home-center {
+    gap: 40px;
+    transform: translateY(-8px);
+  }
+
+  .berry-home-title {
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .berry-home-greeting-logo {
+    width: clamp(26px, 2.4vw, 36px);
+    height: clamp(26px, 2.4vw, 36px);
+    flex: none;
+    transform: translateY(1px);
+  }
+
+  .berry-home-greeting {
+    font-family: var(--font-sans);
+    color: var(--berry-text-primary);
+    font-size: clamp(30px, 2.8vw, 38px);
+    font-weight: 600;
+    line-height: 1.12;
+    letter-spacing: 0;
+  }
+
+  .berry-home-composer-wrap {
+    width: min(92%, var(--berry-content-width));
+  }
+
+  /* Codex composer: one control surface (live-sampled #2d2d2d dark / #ffffff
+     light) with the prominent elevation ring; the shell's squircle clip (JS)
+     rounds the outer corners — the input must NOT have its own clip or it gaps
+     the corners. */
+  /* Shell = the darker attached context strip; the prompt box proper is the
+     .berry-composer-card painted on top with its own rounded corners, so the
+     strip reads as a layer BEHIND the box (Codex two-tone stacking). */
+  .berry-composer-shell {
+    padding: 0;
+    border-radius: var(--berry-composer-radius);
+    background: var(--berry-composer-strip);
+  }
+
+  /* The prompt box card. Plain border-radius (not the squircle) so the inset
+     Codex elevation stroke (0.5px, foreground at 20%) hugs the corners exactly
+     — an inset ring can't follow a clip-path and artifacts on the edges. */
+  .berry-composer-card {
+    background: var(--berry-control-bg);
+    /* Fallback radius; the squircle clip + SVG ring (useSquircle ring option)
+       shape the real corners. */
+    border-radius: 22px 22px var(--berry-composer-radius) var(--berry-composer-radius);
+    overflow: hidden;
+  }
+
+
+  /* Thread composer has no context strip: the card IS the whole shell. */
+  .berry-composer-thread .berry-composer-card {
+    border-radius: var(--berry-composer-radius);
+  }
+
+  .berry-composer-home {
+    min-height: 148px;
+  }
+
+  .berry-composer-thread {
+    min-height: 112px;
+  }
+
+  /* Full-width context strip — Codex two-tone: the attached workspace/branch
+     strip is a step darker than the control surface (live-sampled #1f1f1f on
+     #2d2d2d; Codex hangs theirs off the bottom, Berry's sits on top). */
+  .berry-composer-meta {
+    padding: 7px 16px 6px;
+  }
+
+  /* Typing area fills flush and inherits the shell surface. Home rounds only
+     its top corners (squircle via JS fallback); the shell clip rounds the rest. */
+  .berry-composer-input {
+    min-height: 96px;
+    background: transparent;
+  }
+
+  /* Mention/command autocomplete popover — floats above the composer. */
+  .berry-mention-menu {
+    border-radius: 18px;
+    background: var(--popover);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--foreground) 8%, transparent),
+      var(--berry-shadow-floating);
+  }
+
+  .berry-mention-item {
+    transition: background-color 110ms ease-out;
+  }
+
+  .berry-mention-item.is-active {
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  }
+
+  .berry-mention-footer {
+    border-top: 1px solid color-mix(in srgb, var(--foreground) 7%, transparent);
+    margin-top: 2px;
+  }
+
+  .berry-composer-thread .berry-composer-input {
+    min-height: 96px;
+  }
+
+  /* Lexical prompt editor (Berry-style). Codex chat metrics:
+     --codex-chat-font-size 16px, leading = size + 8px; grows with content up
+     to 220px then scrolls. */
+  .berry-prompt-editor {
+    min-height: 44px;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 13px 16px 8px;
+    color: var(--berry-text-primary);
+    font-size: 16px;
+    line-height: 24px;
+    caret-color: var(--foreground);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
+  .berry-prompt-editor::selection,
+  .berry-prompt-editor *::selection {
+    background: color-mix(in srgb, var(--berry-accent) 32%, transparent);
+  }
+
+  .berry-composer-thread .berry-prompt-editor {
+    padding-top: 12px;
+  }
+
+  /* Codex placeholder: theme placeholder color at 50% opacity, single
+     ellipsized line so it never wraps into a clipped second row. */
+  .berry-prompt-placeholder {
+    top: 13px;
+    right: 16px;
+    left: 16px;
+    overflow: hidden;
+    color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+    font-size: 16px;
+    line-height: 24px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .berry-composer-thread .berry-prompt-placeholder {
+    top: 12px;
+  }
+
+  /* Atomic mention token (Berry prompt-mention): colored per category via the
+     node's inline color, medium weight, inline icon before the label. */
+  .berry-prompt-mention {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    vertical-align: bottom;
+    font-weight: 500;
+  }
+
+  .berry-prompt-mention-icon {
+    flex: none;
+    /* DOM-last (Lexical needs the text node first), visually first. */
+    order: -1;
+  }
+
+  /* The thread message editor IS the prompt-box surface (same control grey,
+     same editor metrics as the composer card). No overflow:hidden — the
+     mention menu anchors above the box (bottom-full) and must not be
+     clipped; the padded content never reaches the corners anyway. */
+  .berry-user-editor {
+    background: var(--berry-control-bg);
+  }
+
+  /* Virtualized rows paint-contain (content-visibility:auto inline style);
+     an editing row must not — the mention menu overflows the row box.
+     !important is required to beat the inline style. */
+  [data-slot="message-scroller-item"]:has(.berry-user-editor) {
+    content-visibility: visible !important;
+  }
+
+  .berry-user-editor .berry-user-editor-footer {
+    padding: 0 12px 10px;
+  }
+
+  .berry-composer-controls {
+    min-height: 44px;
+    padding: 0 14px 12px 14px;
+  }
+
+  .berry-composer-icon-button {
+    background: transparent;
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-composer-icon-button:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-pill-control {
+    height: 30px;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--berry-text-secondary);
+    padding: 0 10px;
+    box-shadow: none;
+    /* Codex control labels: text-sm font-medium tracking-[-0.18px]. */
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: -0.18px;
+    transition-property: background-color, color, box-shadow, opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  /* No focus ring on the composer pills (menu selection returns focus to the
+     trigger and lit it up); !important because the Button ring utilities win
+     the cascade otherwise. */
+  .berry-pill-control:focus-visible {
+    outline: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .berry-pill-control svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .berry-pill-control:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-composer-meta .berry-pill-control {
+    height: 34px;
+    border-radius: 10px;
+    background: transparent;
+    font-size: 13px;
+  }
+
+  /* Branch pill matches the workspace switcher. */
+  .berry-composer-branch {
+    height: 28px;
+    border-radius: 10px;
+    color: var(--berry-text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .berry-composer-branch svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .berry-context-ring {
+    display: inline-flex;
+    width: 24px;
+    height: 24px;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9999px;
+    color: var(--muted-foreground);
+    outline: none;
+    transition:
+      background-color var(--duration-quick) var(--ease-smooth-out),
+      color var(--duration-quick) var(--ease-smooth-out),
+      transform var(--duration-quick) var(--ease-smooth-out);
+  }
+
+  .berry-context-ring:hover {
+    background: var(--berry-hover);
+    color: var(--foreground);
+  }
+
+  .berry-context-ring:active {
+    transform: scale(0.96);
+  }
+
+  .berry-context-ring svg {
+    width: 20px;
+    height: 20px;
+    transform: rotate(-90deg);
+  }
+
+  .berry-context-ring-track,
+  .berry-context-ring-value {
+    fill: none;
+    stroke-width: 2;
+  }
+
+  .berry-context-ring-track {
+    stroke: var(--border);
+  }
+
+  .berry-context-ring-value {
+    stroke: currentColor;
+    stroke-linecap: round;
+  }
+
+  .berry-context-ring[data-state="normal"] {
+    color: var(--foreground);
+  }
+
+  .berry-context-ring[data-state="warning"] {
+    color: var(--warning);
+  }
+
+  .berry-context-ring[data-state="critical"] {
+    color: var(--destructive);
+  }
+
+  /* Codex send button: a full circle. */
+  .berry-composer-send {
+    width: 32px !important;
+    height: 32px !important;
+    border-radius: 9999px !important;
+    background: var(--berry-send-bg) !important;
+    color: var(--berry-send-fg) !important;
+    box-shadow: none !important;
+    transition-property: background-color, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-composer-send:hover:not(:disabled) {
+    background: var(--berry-send-hover) !important;
+  }
+
+  .berry-composer-send:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  .berry-composer-send:disabled {
+    background: var(--berry-text-faint) !important;
+    opacity: 0.58;
+  }
+
+  .berry-composer-send svg {
+    width: 16px;
+    height: 16px;
+    stroke-width: 2.2;
+  }
+
+  .berry-task-header {
+    height: 48px;
+    padding: 0 var(--berry-task-header-pad-x);
+    background: var(--berry-main-bg);
+    column-gap: 10px;
+  }
+
+  .berry-task-header h1 {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0;
+  }
+
+  /* Reserved leading lane so the floating titlebar controls never overlap the
+     branch chip or title when the sidebar is collapsed. Rendered by TaskView
+     only for the collapsed desktop sidebar; absent on mobile (no floating
+     controls) and when the sidebar is expanded (header already clears them). */
+  .berry-task-header-control-lane {
+    flex: none;
+    align-self: stretch;
+    width: var(--berry-task-header-control-lane);
+  }
+
+  /* Shared column: thread content and composer use the same max width so
+     messages line up with the prompt box edges (Berry style). */
+  .berry-thread-content {
+    max-width: var(--berry-message-width);
+  }
+
+  .berry-thread-composer-wrap {
+    width: min(92%, var(--berry-content-width));
+  }
+
+  .berry-task-thread--chat .berry-thread-content,
+  .berry-task-thread--chat .berry-thread-composer-wrap {
+    width: min(calc(100% - 32px), 760px);
+    max-width: 760px;
+  }
+
+  .berry-task-thread--chat [data-slot="message-scroller-viewport"] {
+    padding-inline: 0;
+  }
+
+  .berry-thread-content[data-density="compact"] {
+    gap: 16px;
+    padding-block: 28px;
+  }
+
+  .berry-thread-content[data-density="compact"] .berry-activity-stack {
+    font-size: 12px;
+  }
+
+  .berry-thread-content[data-density="compact"] .berry-turn-summary {
+    min-height: 28px;
+    padding-bottom: 6px;
+  }
+
+  .berry-user-message {
+    background: var(--berry-user-message-bg) !important;
+    color: var(--berry-text-primary) !important;
+    box-shadow: var(--berry-ring-subtle);
+  }
+
+  /* Berry assistant messages: flat (no bubble), 13px, relaxed leading. */
+  .berry-assistant-message {
+    color: var(--berry-text-primary);
+    /* Codex chat text: 16px with leading = size + 8px (24px). */
+    font-size: 16px;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .berry-assistant-message :is(h1, h2, h3, h4) {
+    text-wrap: balance;
+  }
+
+  .berry-activity-stack {
+    width: 100%;
+  }
+
+  .berry-activity-surface {
+    border-radius: 12px;
+    background: var(--berry-surface-raised);
+    box-shadow: var(--berry-ring-subtle);
+  }
+
+  /* Activity accordion header: compact, Berry-like density (13px, subtle). */
+  .berry-activity-header {
+    font-size: 13px;
+  }
+
+  .berry-activity-verb {
+    color: var(--muted-foreground);
+    font-weight: 600;
+  }
+
+  .berry-activity-meta {
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Disclosure motion: easeOutCubic keeps accordion expansion, collapse, child
+     fade, summary roll, and chevrons on the same timing curve. Supports both
+     Radix Collapsible and Radix Accordion measured-height variables. */
+  .berry-collapsible[data-state="open"] {
+    animation: berry-collapsible-down var(--berry-accordion-open-duration) var(--berry-ease-codex-expo);
+  }
+
+  .berry-collapsible[data-state="closed"] {
+    animation: berry-collapsible-up var(--berry-accordion-close-duration) var(--berry-ease-codex-expo) forwards;
+  }
+
+  .berry-collapsible[data-state="open"] > * {
+    animation: berry-stream-text-in var(--berry-accordion-child-enter-duration) var(--berry-ease-codex-expo);
+  }
+
+  .berry-collapsible[data-state="closed"] > * {
+    animation: berry-collapsible-fade-out var(--berry-accordion-child-exit-duration) var(--berry-ease-codex-expo) forwards;
+  }
+
+  /* Berry "animated-gradient-text": shimmering label while a step runs.
+     Implemented as bright text with a dim alpha-mask band sweeping across
+     (300% mask sliding over 4s linear) rather than background-clip:text —
+     WKWebView blanks clipped text whenever anything nearby composites (e.g.
+     the roll-in transform on the live summary), and masks don't have that
+     bug. Visually identical to the gradient-text version. */
+  .berry-shimmer {
+    display: inline-block;
+    color: var(--foreground);
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      rgb(0 0 0 / 1) 0%,
+      rgb(0 0 0 / 1) 34%,
+      rgb(0 0 0 / 0.45) 50%,
+      rgb(0 0 0 / 1) 66%,
+      rgb(0 0 0 / 1) 100%
+    );
+    mask-image: linear-gradient(
+      90deg,
+      rgb(0 0 0 / 1) 0%,
+      rgb(0 0 0 / 1) 34%,
+      rgb(0 0 0 / 0.45) 50%,
+      rgb(0 0 0 / 1) 66%,
+      rgb(0 0 0 / 1) 100%
+    );
+    -webkit-mask-size: 300% 100%;
+    mask-size: 300% 100%;
+    animation: berry-shimmer-sweep var(--shimmer-dur, 2s) var(--ease-linear) infinite;
+  }
+
+  /* Live summary line ("Explore · reading foo.ts"): clip to one line and roll
+     the new action up from below whenever it changes (keyed remount). */
+  /* Berry Xq summary rolodex: on content change the new text rolls up from
+     below while the old rolls out the top, both 300ms easeOutCubic, clipped
+     by the wrapper's overflow-hidden. */
+  .berry-roll-enter {
+    min-width: 0;
+    animation: berry-summary-roll-in var(--duration-fast) var(--ease-in-out) both;
+  }
+
+  .berry-roll-exit {
+    min-width: 0;
+    pointer-events: none;
+    animation: berry-summary-roll-out var(--duration-fast) var(--ease-in-out) both;
+  }
+
+  /* Berry tool-row entrance: fade in once per tool id, 0.9s custom ease. */
+  [data-berry-tool-stream-animate="true"] {
+    will-change: opacity;
+    animation: berry-stream-text-in var(--duration-very-slow) var(--ease-in-out) both;
+  }
+
+  /* Berry panel motion: sidebar slides with width/position + opacity over
+     200ms ease-out (the stock shadcn sidebar uses ease-linear). */
+  .berry-shell [data-slot="sidebar-gap"] {
+    transition: width var(--duration-fast) var(--ease-smooth-out);
+  }
+
+  .berry-shell [data-slot="sidebar-container"] {
+    transition-property: left, right, width, opacity;
+    transition-duration: var(--duration-fast);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-shell [data-slot="sidebar"][data-collapsible="offcanvas"] [data-slot="sidebar-container"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* Streaming fade-ins: new text/markers ease in instead of popping. */
+  .berry-stream-text-in {
+    animation: berry-stream-text-in var(--duration-fast) var(--ease-in-out) both;
+  }
+
+  .berry-stream-marker-in {
+    animation: berry-stream-marker-in var(--duration-fast) var(--ease-in-out) both;
+  }
+
+  /* Turn-activity timeline: "Worked for Xs" summary + grouped tool rows. */
+  .berry-turn-summary-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+    transition: color var(--duration-quick) var(--ease-smooth-out);
+  }
+
+  .berry-turn-summary:hover .berry-turn-summary-label {
+    color: var(--foreground);
+  }
+
+  /* Each new tool row / thought fades and lifts in as it arrives. */
+  .berry-activity-row-in {
+    animation: berry-activity-row-in var(--duration-fast) var(--ease-in-out) both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .berry-activity-row-in,
+    .berry-collapsible[data-state="open"],
+    .berry-collapsible[data-state="closed"],
+    .berry-collapsible[data-state="open"] > *,
+    .berry-collapsible[data-state="closed"] > *,
+    [data-berry-tool-stream-animate="true"],
+    .berry-roll-enter,
+    .berry-roll-exit,
+    .berry-shimmer {
+      animation: none;
+      -webkit-mask-image: none;
+      mask-image: none;
+    }
+
+    .berry-collapsible[data-state="open"] {
+      overflow: visible;
+    }
+  }
+
+  /* Editable task title in the task header. */
+  .berry-task-title-input {
+    height: 30px;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--foreground);
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 30px;
+    border: 1px solid transparent;
+    outline: none;
+    text-wrap: balance;
+    transition-property: border-color, background-color, color;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
+  .berry-task-title-input:hover {
+    background: var(--berry-hover);
+  }
+
+  .berry-task-title-input:focus {
+    background: var(--berry-surface-inset);
+    border-color: var(--berry-border-hover);
+  }
+
+  /* Workspace + branch pills in the task header (next to the title). */
+  .berry-task-pill {
+    display: inline-flex;
+    align-items: center;
+    height: 28px;
+    gap: 6px;
+    /* Squircle applied via clip-path in JS; this is the fallback + the shape
+       the inset ring follows. */
+    border-radius: 13px;
+    padding: 0 11px;
+    max-width: 200px;
+    background: var(--berry-surface-raised);
+    color: var(--berry-text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+    /* Inset ring so the squircle clip keeps it (an outset ring would be cut). */
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 8%, transparent);
+  }
+
+  .berry-task-pill svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--berry-text-tertiary);
+  }
+
+  .berry-task-pill-caret {
+    margin-left: -1px;
+    opacity: 0.6;
+  }
+
+  /* Interactive pill (workspace switcher trigger) reacts to hover and press. */
+  .berry-task-pill--interactive {
+    outline: none;
+    transition-property: background-color, color, box-shadow, transform;
+    transition-duration: 140ms;
+    transition-timing-function: ease-out;
+  }
+
+  .berry-task-pill--interactive:hover {
+    background: var(--berry-surface-inset);
+    color: var(--foreground);
+    box-shadow: var(--berry-ring-hover);
+  }
+
+  .berry-task-pill--interactive:active {
+    transform: scale(0.97);
+  }
+
+  /* Pinned-task indicator in sidebar rows. */
+  .berry-pin-badge {
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-pin-badge svg {
+    width: 13px;
+    height: 13px;
+  }
+}
+
+@keyframes berry-stream-text-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes berry-stream-marker-in {
+  0% {
+    color: transparent;
+  }
+  100% {
+    color: var(--muted-foreground);
+  }
+}
+
+@keyframes berry-collapsible-down {
+  from {
+    height: 0;
+    opacity: 0;
+  }
+  to {
+    height: var(--radix-collapsible-content-height, var(--radix-accordion-content-height));
+    opacity: 1;
+  }
+}
+
+@keyframes berry-collapsible-up {
+  from {
+    height: var(--radix-collapsible-content-height, var(--radix-accordion-content-height));
+    opacity: 1;
+  }
+  to {
+    height: 0;
+    opacity: 0;
+  }
+}
+
+/* Berry Xq (AnimatePresence popLayout): on summary change the new content
+   enters from {y: 0.8em, opacity: 0} while the old exits to {y: -0.8em,
+   opacity: 0}, both 300ms easeOutCubic. Because the roll is paced (each item
+   shows ≥800ms), the backwards-fill blank-frame issue that opacity previously
+   caused cannot occur — items never remount mid-animation. */
+@keyframes berry-summary-roll-in {
+  from {
+    transform: translateY(0.8em);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* Collapsible body fades while the panel closes. */
+@keyframes berry-collapsible-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes berry-summary-roll-out {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(-0.8em);
+    opacity: 0;
+  }
+}
+
+@keyframes berry-gradient-flow {
+  0% {
+    background-position: 100% 0;
+  }
+  50% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+@keyframes berry-word-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes berry-shimmer-sweep {
+  0% {
+    -webkit-mask-position: 100% 0;
+    mask-position: 100% 0;
+  }
+  50% {
+    -webkit-mask-position: 0 0;
+    mask-position: 0 0;
+  }
+  100% {
+    -webkit-mask-position: -100% 0;
+    mask-position: -100% 0;
+  }
+}
+
+@keyframes berry-activity-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (max-width: 1100px) {
+  .berry-home-composer-wrap,
+  .berry-thread-composer-wrap {
+    width: calc(100% - 24px);
+  }
+
+  .berry-home-center {
+    gap: 32px;
+    transform: none;
+    padding-inline: 12px;
+  }
+
+  .berry-home-title {
+    gap: 10px;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .berry-home-greeting-logo {
+    width: clamp(24px, 8vw, 32px);
+    height: clamp(24px, 8vw, 32px);
+  }
+
+  .berry-composer-controls {
+    align-content: flex-end;
+  }
+
+  .berry-composer-controls > .ml-auto {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
+@media (max-width: 767px) {
+  /* The titlebar band stays: the desktop window keeps its traffic lights and
+     the chrome (sidebar trigger, nav) is visible at every width. */
+  .berry-main-panel {
+    height: 100svh !important;
+  }
+
+  .berry-home-composer-wrap,
+  .berry-thread-composer-wrap {
+    width: calc(100% - 20px);
+  }
+
+  .berry-composer-meta {
+    padding-inline: 18px;
+  }
+
+  .berry-prompt-editor {
+    padding-inline: 20px;
+  }
+
+  .berry-prompt-placeholder {
+    right: 20px;
+    left: 20px;
+  }
+
+  .berry-composer-controls {
+    padding-inline: 16px;
+  }
+
+  .berry-task-header {
+    height: 52px;
+    padding-inline: 16px;
+  }
+
+  .berry-task-header h1 {
+    font-size: 14px;
+  }
+
+  .berry-task-thread--chat .berry-thread-content,
+  .berry-task-thread--chat .berry-thread-composer-wrap {
+    width: calc(100% - 20px);
+  }
+}

@@ -1,0 +1,14 @@
+Berry
+Copyright (c) 2026 Berry contributors
+
+This product is licensed under the MIT License. See LICENSE for the full
+license text.
+
+Third-party attribution is maintained in THIRD_PARTY_NOTICES.md. The following
+notices must remain present in distributions that include the corresponding
+components:
+
+- Pi: MIT-licensed agent harness work by Mario Zechner.
+- OpenAI Codex: Apache-2.0 attribution for macOS Seatbelt sandbox components.
+- Material Icon Theme: MIT-licensed file/folder SVG icon artwork used by the
+  desktop file tree.

@@ -1,0 +1,33 @@
+{
+  "name": "@berry/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --host 127.0.0.1 --port 3210 --strictPort",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest --run src && pnpm build && playwright test"
+  },
+  "dependencies": {
+    "@berry/api-client": "workspace:*",
+    "@berry/local-agent-protocol": "workspace:*",
+    "@berry/shared": "workspace:*",
+    "@berry/thread-ui": "workspace:*",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@types/chrome": "0.1.12",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.3",
+    "typescript": "^5.8.3",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.9"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@berry/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest --run"
+  },
+  "dependencies": {
+    "@berry/shared": "workspace:*",
+    "bullmq": "^5.65.1",
+    "pg": "8.16.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/pg": "8.15.6",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.9"
+  }
+}

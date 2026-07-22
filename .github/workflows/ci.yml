@@ -1,0 +1,78 @@
+name: Web platform
+
+on:
+  pull_request:
+    paths:
+      - "apps/web/**"
+      - "apps/api/**"
+      - "apps/worker/**"
+      - "packages/**"
+      - "scripts/prepare-web-build.mjs"
+      - "scripts/verify-web-build-assets.mjs"
+      - "deploy/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - "tsconfig.base.json"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - "apps/api/**"
+      - "apps/worker/**"
+      - "packages/**"
+      - "scripts/prepare-web-build.mjs"
+      - "scripts/verify-web-build-assets.mjs"
+      - "deploy/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - "tsconfig.base.json"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: web-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: Compile web platform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web stack
+        run: |
+          pnpm --filter @berry/web... build
+          pnpm --filter @berry/api... build
+          pnpm --filter @berry/worker... build
+
+      - name: Typecheck web stack
+        run: |
+          pnpm --filter @berry/web... typecheck
+          pnpm --filter @berry/api... typecheck
+          pnpm --filter @berry/worker... typecheck

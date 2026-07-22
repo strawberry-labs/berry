@@ -1,0 +1,58 @@
+{
+	"name": "@berry/harness",
+	"version": "0.1.0",
+	"description": "Berry fork of the Pi agent core harness with transport abstraction, state management, and attachment support",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./node": {
+			"types": "./dist/node.d.ts",
+			"import": "./dist/node.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "rm -rf dist",
+		"build": "tsc -p tsconfig.build.json",
+		"lint": "tsc -p tsconfig.build.json --noEmit",
+		"typecheck": "tsc -p tsconfig.build.json --noEmit",
+		"test": "vitest --run --passWithNoTests"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "0.80.3",
+		"ignore": "7.0.5",
+		"typebox": "1.1.38",
+		"yaml": "2.9.0"
+	},
+	"keywords": [
+		"ai",
+		"agent",
+		"llm",
+		"transport",
+		"state-management"
+	],
+	"author": "Berry contributors; derived from Pi by Mario Zechner",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/berry/berry-chat.git",
+		"directory": "packages/harness"
+	},
+	"engines": {
+		"node": ">=22.16.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.16.0",
+		"typescript": "^5.8.3",
+		"vitest": "^4.1.9"
+	}
+}

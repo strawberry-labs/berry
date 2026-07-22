@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a Berry bug with an optional scrubbed support bundle.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Create a scrubbed bundle from Berry with Help > Create issue bundle or `support.issueReport.create`, review the JSON locally, then attach it if it contains no private information.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the visible behavior and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest sequence that triggers the problem.
+      placeholder: |
+        1. Open Berry...
+        2. Click...
+        3. See...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Berry version
+      placeholder: 0.1.0
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Desktop
+        - CLI
+        - Web
+        - Mobile
+        - Extension
+        - Self-host platform
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics bundle
+      description: Attach the reviewed support bundle or paste its config hash and issue-body summary.
+      placeholder: "Config hash: ..."
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I reviewed attachments and removed API keys, credentials, prompts, private file contents, and screenshots containing secrets.
+          required: true

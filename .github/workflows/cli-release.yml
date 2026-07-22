@@ -1,0 +1,131 @@
+name: CLI Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "cli-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: macos-arm64, os: macos-latest }
+          - { label: macos-x64, os: macos-15-intel }
+          - { label: linux-arm64, os: ubuntu-24.04-arm }
+          - { label: linux-x64, os: ubuntu-24.04 }
+          - { label: windows-x64, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - name: Build Node SEA release binary
+        run: node scripts/build-sidecars.mjs --cli-only
+      - name: Verify Bun fallback and SQLite compatibility
+        run: |
+          node scripts/build-cli-bun.mjs
+          node scripts/benchmark-cli-packagers.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berry-cli-${{ matrix.label }}
+          path: |
+            artifacts/cli/berry-*
+            !artifacts/cli/berry-bun-*
+
+  github-release:
+    name: Publish CLI artifacts
+    if: startsWith(github.ref, 'refs/tags/cli-v')
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: berry-cli-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Render install script and Homebrew formula
+        env:
+          BERRY_VERSION: ${{ github.ref_name }}
+          BERRY_GITHUB_REPOSITORY: ${{ github.repository }}
+          BERRY_ARTIFACT_DIR: release-artifacts
+          BERRY_FORMULA_OUTPUT: release-artifacts/berry.rb
+          BERRY_CLI_UPDATE_KEY_ID: ${{ vars.BERRY_CLI_UPDATE_KEY_ID }}
+          BERRY_CLI_UPDATE_PRIVATE_KEY_PEM: ${{ secrets.BERRY_CLI_UPDATE_PRIVATE_KEY_PEM }}
+          BERRY_CLI_UPDATE_ROLLOUT_PERCENTAGE: ${{ vars.BERRY_CLI_UPDATE_ROLLOUT_PERCENTAGE }}
+        run: |
+          version="${BERRY_VERSION#cli-v}"
+          export BERRY_VERSION="$version"
+          sed -e "s|__BERRY_GITHUB_REPOSITORY__|$BERRY_GITHUB_REPOSITORY|g" -e "s|__BERRY_VERSION__|$version|g" scripts/install-berry.sh > release-artifacts/install-berry.sh
+          node scripts/render-homebrew-formula.mjs
+          node scripts/render-cli-update-manifest.mjs release-artifacts release-artifacts/berry-cli-update.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berry-homebrew-formula
+          path: release-artifacts/berry.rb
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+
+  homebrew-tap:
+    name: Update Homebrew tap
+    if: startsWith(github.ref, 'refs/tags/cli-v') && vars.BERRY_HOMEBREW_TAP_REPOSITORY != ''
+    needs: github-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: berry-homebrew-formula
+          path: formula
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.BERRY_HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Commit formula
+        working-directory: tap
+        run: |
+          mkdir -p Formula
+          cp ../formula/berry.rb Formula/berry.rb
+          git config user.name "berry-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add Formula/berry.rb
+          git diff --cached --quiet || git commit -m "berry ${{ github.ref_name }}"
+          git push
+
+  npm-publish:
+    name: Publish npm binary shim
+    if: startsWith(github.ref, 'refs/tags/cli-v') && vars.BERRY_NPM_PACKAGE != ''
+    needs: github-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          registry-url: https://registry.npmjs.org
+      - name: Publish shim
+        working-directory: packages/cli-npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          BERRY_NPM_PACKAGE: ${{ vars.BERRY_NPM_PACKAGE }}
+          BERRY_GITHUB_REPOSITORY: ${{ github.repository }}
+          BERRY_VERSION: ${{ github.ref_name }}
+        run: |
+          version="${BERRY_VERSION#cli-v}"
+          npm pkg set name="$BERRY_NPM_PACKAGE" version="$version" berry.repository="$BERRY_GITHUB_REPOSITORY"
+          npm publish --access public

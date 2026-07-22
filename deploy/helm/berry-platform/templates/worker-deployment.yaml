@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "berry-platform.name" . }}-worker
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "berry-platform.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "berry-platform.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "apps/worker/dist/main.js"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "berry-platform.name" . }}-config
+          env:
+            - name: BERRY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.postgres.existingSecret }}
+                  key: {{ .Values.external.postgres.secretKey }}
+            - name: BERRY_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.redis.existingSecret }}
+                  key: {{ .Values.external.redis.secretKey }}

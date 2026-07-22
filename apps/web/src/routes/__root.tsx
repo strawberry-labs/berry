@@ -1,0 +1,44 @@
+import type { ReactNode } from "react";
+import { createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
+import { AppShell, loadFixtureShellData } from "@/components/app-shell";
+import { loadWebConfig } from "@/lib/config.functions";
+import appCss from "../styles.css?url";
+
+export const Route = createRootRoute({
+  loader: async () => loadFixtureShellData(await loadWebConfig()),
+  head: () => ({
+    meta: [
+      { charSet: "utf-8" },
+      { name: "viewport", content: "width=device-width, initial-scale=1" },
+      { title: "Berry" },
+    ],
+    links: [
+      { rel: "stylesheet", href: appCss },
+      { rel: "icon", href: "/berry-logo.svg", type: "image/svg+xml" },
+    ],
+  }),
+  component: RootComponent,
+});
+
+function RootComponent() {
+  const initial = Route.useLoaderData();
+  return (
+    <RootDocument>
+      <AppShell initial={initial} />
+    </RootDocument>
+  );
+}
+
+function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
+  return (
+    <html lang="en" className="dark">
+      <head>
+        <HeadContent />
+      </head>
+      <body>
+        {children}
+        <Scripts />
+      </body>
+    </html>
+  );
+}

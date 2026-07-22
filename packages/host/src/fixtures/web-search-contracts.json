@@ -1,0 +1,44 @@
+{
+  "brave": {
+    "web": {
+      "results": [
+        {
+          "title": "Berry documentation",
+          "url": "https://docs.berry.test/start",
+          "description": "Build with <strong>Berry</strong>.",
+          "age": "2026-07-10T08:00:00Z"
+        }
+      ]
+    }
+  },
+  "tavily": {
+    "results": [
+      {
+        "title": "Berry release",
+        "url": "https://news.berry.test/release",
+        "content": "The latest Berry release notes.",
+        "score": 0.91,
+        "published_date": "2026-07-09"
+      }
+    ]
+  },
+  "searxng": {
+    "results": [
+      {
+        "title": "Berry source",
+        "url": "https://github.com/berry-chat/berry",
+        "content": "Source repository",
+        "publishedDate": "2026-07-08"
+      }
+    ]
+  },
+  "ollama": {
+    "results": [
+      {
+        "title": "Berry and Ollama",
+        "url": "https://ollama.com/blog/berry",
+        "content": "Using hosted web search with Berry."
+      }
+    ]
+  }
+}

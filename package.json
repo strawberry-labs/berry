@@ -1,0 +1,43 @@
+{
+  "name": "berry-chat",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": ">=22.16.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm check:compose && pnpm check:store && pnpm check:ci && pnpm check:sandbox && pnpm check:security && pnpm check:performance && pnpm check:docs && pnpm check:support && pnpm check:launch",
+    "check:desktop:full": "node scripts/check-desktop-full.mjs",
+    "check:compose": "node scripts/verify-compose-config.mjs",
+    "check:ci": "node scripts/verify-ci-matrix.mjs",
+    "check:sandbox": "node scripts/verify-windows-sandbox-status.mjs",
+    "check:security": "node scripts/verify-security-pass.mjs",
+    "check:performance": "node scripts/verify-performance.mjs",
+    "docs:generate": "pnpm --filter @berry/shared protocol:docs && tsx scripts/generate-cli-reference.ts",
+    "check:docs": "pnpm docs:generate && pnpm --filter @berry/docs build && pnpm --filter @berry/docs test",
+    "check:support": "node scripts/verify-support-loops.mjs",
+    "check:launch": "node scripts/verify-launch-checklist.mjs",
+    "check:store": "node scripts/verify-store-review.mjs",
+    "package": "turbo run package",
+    "release:check": "node scripts/verify-release-prereqs.mjs --all",
+    "release:notes": "node scripts/generate-release-notes.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.0",
+    "esbuild": "0.28.1",
+    "postject": "1.0.0-alpha.6",
+    "tsx": "^4.20.3",
+    "turbo": "^2.5.4",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.9"
+  }
+}

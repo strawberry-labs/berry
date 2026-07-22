@@ -1,0 +1,17 @@
+.git
+.internal-reference
+.claude
+.env
+.env.*
+research
+settings-berry-chat
+dogfood-output
+.turbo
+node_modules
+**/node_modules
+**/dist
+apps/desktop/src-tauri/target
+artifacts
+test-results
+playwright-report
+.DS_Store

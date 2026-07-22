@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/berry-logo.svg" />
+    <title>Berry</title>
+    <style>
+      /* No background here: these are unlayered styles and would override the
+         app's @layer rules — under macOS vibrancy the window base must stay
+         transparent. The splash below paints its own opaque surface. */
+      html,
+      body,
+      #root {
+        margin: 0;
+        height: 100%;
+      }
+
+      .berry-boot-splash {
+        display: flex;
+        height: 100%;
+        min-height: 100svh;
+        align-items: center;
+        justify-content: center;
+        background: #181818;
+        color: #fcfcfc;
+      }
+
+      @media (prefers-color-scheme: light) {
+        .berry-boot-splash {
+          background: #ffffff;
+          color: #0d0d0d;
+        }
+      }
+
+      .berry-boot-mark {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        transform: translateY(-10px);
+        animation: berry-boot-in 260ms ease-out both;
+      }
+
+      .berry-boot-mark img {
+        width: 58px;
+        height: auto;
+        display: block;
+        filter: drop-shadow(0 10px 20px rgb(0 0 0 / 0.22));
+      }
+
+      @keyframes berry-boot-in {
+        from {
+          opacity: 0;
+          transform: translateY(-6px) scale(0.985);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(-10px) scale(1);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .berry-boot-mark {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="berry-boot-splash" role="status" aria-label="Berry loading">
+        <div class="berry-boot-mark">
+          <img src="/berry-logo.svg" alt="" />
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

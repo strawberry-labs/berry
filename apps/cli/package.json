@@ -1,0 +1,34 @@
+{
+  "name": "berry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "berry": "./dist/main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest --run"
+  },
+  "dependencies": {
+    "@berry/acp-adapter": "workspace:*",
+    "@berry/host": "workspace:*",
+    "@berry/local-agent-protocol": "workspace:*",
+    "@berry/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@berry/local-agent": "workspace:*",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.9"
+  }
+}
