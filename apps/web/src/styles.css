@@ -531,44 +531,83 @@ textarea:not([data-slot="textarea"]):focus-visible,
 .mentions-menu {
   position: absolute;
   left: 10px;
-  bottom: calc(100% + 8px);
+  bottom: 100%;
   width: min(420px, calc(100vw - 40px));
   max-height: 320px;
   overflow: auto;
-  border: 1px solid var(--line-strong);
-  background: var(--surface-strong);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
-  padding: 8px;
-  z-index: 20;
+  border: 0;
+  border-radius: 16px;
+  background: var(--berry-card-bg);
+  box-shadow: 0 8px 16px rgb(0 0 0 / 32%), inset 0 0 0 1px rgb(255 255 255 / 20%), 0 0 0 1px rgb(0 0 0 / 62%);
+  padding: 6px;
+  transform: translateY(-8px);
+  z-index: 30;
+}
+
+.mentions-menu[data-side="bottom"] {
+  top: 100%;
+  bottom: auto;
+  transform: translateY(8px);
 }
 
 .mentions-section-title {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 5px 8px;
-  text-transform: uppercase;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .mention-row {
   border: 0;
   background: transparent;
-  border-radius: 6px;
+  border-radius: 10px;
   width: 100%;
+  min-height: 36px;
+  height: 36px;
   text-align: left;
-  padding: 7px 8px;
-  display: grid;
-  gap: 2px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: none;
 }
 
-.mention-row[data-active="true"] {
-  background: var(--berry-accent-soft);
+.mention-row[data-active="true"],
+.mention-row:hover {
+  background: var(--berry-selected);
 }
 
-.mention-row span {
-  color: var(--muted);
-  font-size: 12px;
+.mention-row > svg {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  color: var(--berry-tertiary);
+}
+
+.mention-row-label,
+.mention-row-description {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-row-label {
+  flex: 0 1 auto;
+  max-width: 42%;
+  color: var(--berry-text);
+}
+
+.mention-row-description {
+  flex: 1 1 auto;
+  color: var(--berry-tertiary);
+  opacity: 0.7;
 }
 
 .side-panel {
@@ -1145,6 +1184,197 @@ code, pre {
   grid-template-columns: minmax(0, 1fr);
 }
 
+/* Web task context stays beside the conversation instead of becoming another
+   interrupting block in the message timeline. */
+.berry-web-main .workspace[data-mode="chat"] {
+  grid-template-columns: minmax(0, 1fr) minmax(264px, 292px);
+}
+
+.berry-task-context-rail {
+  min-width: 0;
+  min-height: 0;
+  margin: 12px 14px 12px 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--berry-border);
+  border-radius: 18px;
+  background: var(--berry-card-bg);
+  box-shadow: var(--berry-shadow-floating);
+}
+
+.berry-task-context-rail-header {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  color: var(--berry-text);
+  font-size: 14px;
+  font-weight: 560;
+}
+
+.berry-task-context-rail-header > div > svg {
+  width: 16px;
+  height: 16px;
+  color: var(--berry-text-tertiary);
+}
+
+.berry-task-context-rail-project {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  padding: 2px 12px 12px;
+}
+
+.berry-task-context-rail-eyebrow,
+.berry-composer-queue-label {
+  color: var(--berry-text-tertiary);
+  font-size: 11px;
+  font-weight: 560;
+  letter-spacing: 0.01em;
+}
+
+.berry-task-context-rail-switcher {
+  width: 100%;
+  max-width: none;
+  justify-content: flex-start;
+}
+
+.berry-task-context-rail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 8px 12px;
+}
+
+.berry-task-context-rail-list > .berry-task-context-rail-eyebrow {
+  padding: 0 6px 5px;
+}
+
+.berry-task-context-rail-item {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  border: 0;
+  border-radius: 10px;
+  padding: 8px;
+  background: transparent;
+  color: var(--berry-text-secondary);
+  text-align: left;
+  transition: background-color 140ms ease-out, color 140ms ease-out;
+}
+
+.berry-task-context-rail-item:hover,
+.berry-task-context-rail-item.is-active {
+  background: var(--berry-hover);
+  color: var(--berry-text);
+}
+
+.berry-task-context-rail-item > svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  margin-top: 2px;
+  color: var(--berry-text-tertiary);
+}
+
+.berry-task-context-rail-item > svg[data-status="running"],
+.berry-task-context-rail-item > svg[data-status="queued"] {
+  color: var(--berry-accent);
+}
+
+.berry-task-context-rail-item > svg[data-status="failed"] {
+  color: var(--berry-danger);
+}
+
+.berry-task-context-rail-status {
+  display: block;
+  margin-top: 2px;
+  color: var(--berry-text-tertiary);
+  font-size: 11px;
+}
+
+.berry-task-context-rail-empty {
+  margin: 0;
+  padding: 6px;
+  color: var(--berry-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.berry-project-switcher-popover {
+  border-color: var(--berry-border-strong);
+  background: var(--berry-control-bg);
+  box-shadow: var(--berry-shadow-floating);
+}
+
+.berry-project-switcher-popover [data-slot="command"] {
+  background: transparent;
+}
+
+.berry-project-switcher-popover [data-slot="command-input-wrapper"] {
+  border-color: var(--berry-border);
+}
+
+.berry-project-switcher-popover [cmdk-item] {
+  min-height: 36px;
+}
+
+.berry-composer-project-switcher {
+  max-width: min(260px, 100%);
+  background: transparent;
+}
+
+.berry-composer-queue {
+  display: flex;
+  max-height: 136px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px 9px;
+  overflow: auto;
+  border-bottom: 1px solid var(--berry-border);
+  background: var(--berry-composer-strip);
+}
+
+.berry-composer-queue-list {
+  display: grid;
+  gap: 4px;
+}
+
+.berry-composer-queue-item {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  border-radius: 9px;
+  padding: 5px 5px 5px 8px;
+  background: var(--berry-card-bg);
+  color: var(--berry-text-secondary);
+  font-size: 12px;
+}
+
+.berry-composer-queue-status {
+  flex: none;
+  color: var(--berry-text-tertiary);
+  font-size: 11px;
+}
+
+@media (max-width: 1080px) {
+  .berry-web-main .workspace[data-mode="chat"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .berry-task-context-rail {
+    display: none;
+  }
+}
+
 .berry-web-main .workspace[data-mode="code"] {
   grid-template-columns: minmax(360px, 54%) minmax(320px, 46%);
 }
@@ -1520,6 +1750,9 @@ code, pre {
 .berry-file-viewer-dialog {
   display: flex;
   flex-direction: column;
+  width: 80vw !important;
+  max-width: 80vw !important;
+  height: 85vh !important;
   box-shadow: var(--berry-shadow-lg);
 }
 .berry-file-viewer-header {
@@ -1658,38 +1891,29 @@ code, pre {
 .berry-task-files { width: min(100%, 1160px); margin: 4px auto 28px; padding: 0 24px; }
 .berry-task-file-grid { display: flex; flex-wrap: wrap; gap: 10px; }
 
-/* transitions.dev sliding segmented control, mapped to Berry's shared
-   surfaces so the file-library scope switch matches both themes. */
-.t-tabs {
-  position: relative;
+.berry-file-library-scope-switch {
   display: inline-flex;
-  align-items: center;
-  gap: 3px;
+  overflow: hidden;
+  border: 1px solid var(--berry-border-strong);
+  border-radius: 0;
+  background: var(--berry-main-bg);
+  box-shadow: none;
 }
-.t-tab {
-  position: relative;
-  z-index: 1;
-  transition: color 250ms cubic-bezier(0.22, 1, 0.36, 1);
+.berry-file-library-scope-trigger {
+  height: 100%;
+  border-radius: 0;
+  color: var(--berry-tertiary);
+  background: transparent;
+  box-shadow: none;
+  transition: none;
 }
-.t-tabs-pill {
-  position: absolute;
-  top: 3px;
-  left: 0;
-  height: 30px;
-  width: 0;
-  border-radius: 48px;
+.berry-file-library-scope-trigger + .berry-file-library-scope-trigger {
+  border-left: 1px solid var(--berry-border-strong);
+}
+.berry-file-library-scope-trigger[data-state="active"] {
+  color: var(--berry-text);
   background: var(--berry-control-bg);
-  transform: translateX(0);
-  transition:
-    transform 250ms cubic-bezier(0.22, 1, 0.36, 1),
-    width 250ms cubic-bezier(0.22, 1, 0.36, 1);
-  will-change: transform, width;
-  z-index: 0;
-  pointer-events: none;
-}
-@media (prefers-reduced-motion: reduce) {
-  .t-tabs-pill,
-  .t-tab { transition: none !important; }
+  box-shadow: inset 0 -2px 0 var(--berry-accent);
 }
 .berry-task-file-card { display: flex; width: max-content; min-width: 250px; max-width: min(100%, 420px); min-height: 76px; flex: 0 1 auto; align-items: center; gap: 13px; padding: 12px 14px; border: 0; border-radius: 14px; color: var(--berry-text-primary); background: var(--berry-card-bg); box-shadow: var(--berry-shadow-sm); font: inherit; text-align: left; cursor: pointer; transition-property: box-shadow, background-color, scale; transition-duration: 150ms; }
 .berry-task-file-card > span:last-child { min-width: 0; max-width: 320px; }

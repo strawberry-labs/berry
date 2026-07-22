@@ -5,7 +5,7 @@ import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type PermissionMode, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
-import { BerryTaskHeaderFrame, BerryTaskPill } from "@berry/desktop-ui/components/berry-task-header";
+import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { BerryWorkspaceHomeFrame } from "@berry/desktop-ui/components/berry-workspace-home";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
@@ -31,7 +31,7 @@ import {
   DropdownMenuTrigger,
 } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { FileSearch as FileSearchIcon } from "lucide-react";
-import { AtSign, Brain, Check, CircleHelp, ChevronDown, Ellipsis, FileText, Folder, GitBranch, Hand, Hash, ImagePlus, NotebookPen, PencilLine, Pin, PinOff, ShieldCheck, SlashSquare, Zap } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, CircleHelp, ChevronDown, Ellipsis, FileText, GitBranch, Hand, Hash, ImagePlus, NotebookPen, PencilLine, Pin, PinOff, ShieldCheck, SlashSquare, Zap } from "@berry/desktop-ui/lib/icons";
 import { fixtureMessages, fixtureTasks, message } from "@/lib/fixtures";
 import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileFetchedSessionMessages } from "@/lib/message-reconciliation";
 import { WebConfigSchema, type WebConfig } from "@/lib/config";
@@ -41,7 +41,9 @@ import { PromptEditor, type PromptEditorHandle } from "./prompt-editor";
 import { AuthBoundary, type SignedInUser } from "./shell/auth-boundary";
 import { TaskRouteState } from "./tasks/task-route-state";
 import { Composer } from "./tasks/web-composer";
+import { TaskContextRail } from "./tasks/task-context-rail";
 import { Thread } from "./tasks/web-task-view";
+import { ProjectSwitcher } from "./projects/project-switcher";
 import { replaceTenantValue, settledValue } from "@/lib/management/config-refresh";
 import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sidebar";
 import { ManagementSidebar } from "./management/management-sidebar";
@@ -995,26 +997,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 )}
               </h1>
               {activeWorkspace ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <BerryTaskPill interactive aria-label="Switch workspace" title={activeWorkspace.name}>
-                      <Folder />
-                      <span className="min-w-0 truncate">{activeWorkspace.name}</span>
-                      <ChevronDown className="berry-task-pill-caret shrink-0" />
-                    </BerryTaskPill>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start">
-                    {workspaces.map((workspace) => (
-                      <DropdownMenuItem key={workspace.id} onClick={() => {
-                        setActiveWorkspaceId(workspace.id);
-                        const taskId = tasks.find((task) => task.workspaceId === workspace.id)?.id;
-                        if (taskId) navigateToTask(taskId);
-                      }}>
-                        <Folder /> {workspace.name}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
+                <ProjectSwitcher
+                  workspaces={workspaces}
+                  activeWorkspaceId={activeWorkspaceId}
+                  onSelectWorkspace={(workspaceId) => {
+                    setActiveWorkspaceId(workspaceId);
+                    const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
+                    if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
+                    else if (!taskId) navigateHome();
+                  }}
+                  onCreateProject={() => setCreatingProject(true)}
+                />
               ) : null}
               {activeTask?.worktreeBranch ? (
                 <span className="berry-task-pill hidden sm:inline-flex" title={activeTask.worktreeBranch}>
@@ -1091,7 +1084,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               activeTask={activeTask}
               taskTitles={tasks.map((task) => task.title)}
               client={client}
-              workspacePath={workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.path ?? initial.config.workspacePath}
+              workspaces={workspaces}
+              activeWorkspaceId={activeWorkspaceId}
+              onSelectWorkspace={(workspaceId) => {
+                setActiveWorkspaceId(workspaceId);
+                const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
+                if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
+                else if (!taskId) navigateHome();
+              }}
+              onCreateProject={() => setCreatingProject(true)}
               model={model}
               onModelChange={updateModel}
               variant="thread"
@@ -1127,6 +1128,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onEvent={updateSessionStream}
             />
           </section>
+          <TaskContextRail
+            workspaces={workspaces}
+            activeWorkspaceId={activeWorkspaceId}
+            activeTaskId={activeTask.id}
+            tasks={visibleTasks}
+            onSelectWorkspace={(workspaceId) => {
+              setActiveWorkspaceId(workspaceId);
+              const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
+              if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
+              else if (!taskId) navigateHome();
+            }}
+            onOpenTask={(taskId) => {
+              const task = tasks.find((candidate) => candidate.id === taskId);
+              if (task) setActiveWorkspaceId(task.workspaceId);
+              navigateToTask(taskId);
+            }}
+            onNewTask={navigateHome}
+            onCreateProject={() => setCreatingProject(true)}
+          />
         </div>
         </>
         ) : shellLocation.kind === "task" ? (
@@ -1152,7 +1172,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 activeTask={null}
                 taskTitles={tasks.map((task) => task.title)}
                 client={client}
-                workspacePath={activeWorkspace?.path ?? initial.config.workspacePath}
+                workspaces={workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                onSelectWorkspace={(workspaceId) => setActiveWorkspaceId(workspaceId)}
+                onCreateProject={() => setCreatingProject(true)}
                 model={model}
                 onModelChange={updateModel}
                 variant="home"

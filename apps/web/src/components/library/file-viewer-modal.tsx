@@ -22,7 +22,7 @@ const FlyfishViewer = React.lazy(async () => {
 export function FileViewerModal({ file, onOpenChange }: { file: StoredFile | null; onOpenChange: (open: boolean) => void }) {
   return (
     <Dialog open={Boolean(file)} onOpenChange={onOpenChange}>
-      <DialogContent className="berry-file-viewer-dialog h-[85vh] w-[80vw] max-w-[80vw] gap-0 overflow-hidden rounded-[18px] border-0 bg-[var(--berry-main-bg)] p-0" showCloseButton={false}>
+      <DialogContent className="berry-file-viewer-dialog !z-[60] !h-[85vh] !w-[80vw] !max-w-[80vw] gap-0 overflow-hidden rounded-[18px] border-0 bg-[var(--berry-main-bg)] p-0" showCloseButton={false}>
         {file ? (
           <>
             <DialogHeader className="berry-file-viewer-header flex h-16 shrink-0 flex-row items-center gap-3 px-4 text-left">

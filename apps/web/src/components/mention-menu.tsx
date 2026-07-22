@@ -1,5 +1,6 @@
 import * as React from "react";
 import { BUILT_IN_COMMANDS } from "@berry/shared";
+import { AtSign, FileText, Folder, Hash, SlashSquare, Wand2 } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { filterItems, type DetectedTrigger, type MentionItem, type MentionSection, type MentionTrigger } from "@/lib/mentions";
 import type { PromptEditorHandle, PromptEditorMentions } from "./prompt-editor";
@@ -68,6 +69,12 @@ export function useStaticMentions({
   const open = trigger !== null && flatItems.length > 0;
 
   React.useEffect(() => {
+    // A changed trigger or filter starts at the first live match, matching
+    // native command palettes rather than retaining a stale row index.
+    setActiveIndex(0);
+  }, [query, trigger]);
+
+  React.useEffect(() => {
     setActiveIndex((index) => Math.min(index, Math.max(0, flatItems.length - 1)));
   }, [flatItems.length]);
 
@@ -108,15 +115,52 @@ export function useStaticMentions({
 }
 
 export function MentionMenu({ controller }: { controller: MentionsController }) {
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const [side, setSide] = React.useState<"top" | "bottom">("top");
+
+  React.useLayoutEffect(() => {
+    if (!controller.open) return;
+    const place = () => {
+      const menu = menuRef.current;
+      const editor = document.querySelector<HTMLElement>(".berry-prompt-editor");
+      if (!menu || !editor) return;
+      const editorBounds = editor.getBoundingClientRect();
+      const menuHeight = Math.min(menu.offsetHeight || 0, 320);
+      const spaceAbove = editorBounds.top;
+      const spaceBelow = window.innerHeight - editorBounds.bottom;
+      setSide(spaceAbove >= menuHeight + 8 || spaceAbove >= spaceBelow ? "top" : "bottom");
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [controller.flatItems.length, controller.open, controller.trigger]);
+
+  React.useEffect(() => {
+    if (!controller.open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Element | null;
+      if (!target || menuRef.current?.contains(target)) return;
+      if (target.closest('[data-testid="composer-input"], [data-testid="message-editor-input"]')) return;
+      controller.dismiss();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [controller.dismiss, controller.open]);
+
   if (!controller.open) return null;
+
   let offset = 0;
   return (
-    <div className="mentions-menu" role="listbox" data-testid="mention-menu">
+    <div ref={menuRef} className="mentions-menu" role="listbox" data-testid="mention-menu" data-trigger={controller.trigger} data-side={side}>
       {controller.sections.map((section) => {
         const sectionOffset = offset;
         offset += section.items.length;
         return (
-          <div key={section.key}>
+          <div key={section.key} role="group" aria-label={section.title}>
             <div className="mentions-section-title">{section.title}</div>
             {section.items.map((item, index) => {
               const active = controller.activeIndex === sectionOffset + index;
@@ -131,8 +175,9 @@ export function MentionMenu({ controller }: { controller: MentionsController }) 
                   role="option"
                   aria-selected={active}
                 >
-                  <strong>{item.label}</strong>
-                  {item.description ? <span>{item.description}</span> : null}
+                  <MentionRowIcon category={item.category} />
+                  <strong className="mention-row-label">{item.label}</strong>
+                  {item.description ? <span className="mention-row-description">{item.description}</span> : null}
                 </button>
               );
             })}
@@ -141,4 +186,13 @@ export function MentionMenu({ controller }: { controller: MentionsController }) 
       })}
     </div>
   );
+}
+
+function MentionRowIcon({ category }: { category: MentionItem["category"] }) {
+  if (category === "folders") return <Folder />;
+  if (category === "files") return <FileText />;
+  if (category === "commands") return <SlashSquare />;
+  if (category === "skills") return <Wand2 />;
+  if (category === "sessions") return <Hash />;
+  return <AtSign />;
 }

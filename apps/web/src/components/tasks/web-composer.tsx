@@ -1,17 +1,18 @@
 import * as React from "react";
 import { ArrowUp, Plus, Square } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
-import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type Message, type QueuedFollowUp, type ReasoningLevel, type Task } from "@berry/shared";
+import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type Message, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { reduceStream } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, FileText, Folder, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
+import { ProjectSwitcher } from "../projects/project-switcher";
 
 interface PendingFileUpload {
   id: string;
@@ -27,7 +28,10 @@ export function Composer({
   activeTask,
   taskTitles,
   client,
-  workspacePath,
+  workspaces,
+  activeWorkspaceId,
+  onSelectWorkspace,
+  onCreateProject,
   model,
   onModelChange,
   onUserMessage,
@@ -51,7 +55,10 @@ export function Composer({
   activeTask: Task | null;
   taskTitles: string[];
   client: BerryApiClient | null;
-  workspacePath: string;
+  workspaces: Workspace[];
+  activeWorkspaceId: string;
+  onSelectWorkspace: (workspaceId: string) => void;
+  onCreateProject: () => void;
   model: string;
   onModelChange: (model: string) => void;
   onUserMessage: (text: string, sessionId: string, taskId: string, attachments?: AttachmentInput[]) => string | void;
@@ -292,11 +299,28 @@ export function Composer({
           onDrop: handleDrop,
         }}
         before={<MentionMenu controller={mentions} />}
-        header={variant === "home" ? (
-        <div className="berry-composer-meta flex min-w-0 items-center gap-2 px-2 pt-2">
-          <span className="berry-pill-control flex min-w-0 max-w-[260px] items-center gap-1.5 px-2.5" title={workspacePath}><Folder className="shrink-0" /><span className="truncate">{workspacePath.split("/").filter(Boolean).at(-1) ?? "Workspace"}</span></span>
-        </div>
-      ) : null}
+        header={
+          <>
+            {variant === "home" ? (
+              <div className="berry-composer-meta flex min-w-0 items-center gap-2 px-2 pt-2">
+                <ProjectSwitcher
+                  workspaces={workspaces}
+                  activeWorkspaceId={activeWorkspaceId}
+                  onSelectWorkspace={onSelectWorkspace}
+                  onCreateProject={onCreateProject}
+                  className="berry-composer-project-switcher"
+                />
+              </div>
+            ) : null}
+            {variant === "thread" && queuedFollowUps.length > 0 ? (
+              <QueuedFollowUpStack
+                followUps={queuedFollowUps}
+                onRetry={onRetryFollowUp}
+                onRemove={onRemoveFollowUp}
+              />
+            ) : null}
+          </>
+        }
       >
         {fileDragActive ? (
           <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center gap-2 rounded-[18px] bg-card/95 text-sm font-medium text-card-foreground shadow-[var(--berry-ring-strong)]" role="status">
@@ -305,18 +329,6 @@ export function Composer({
           </div>
         ) : null}
         <div className="berry-composer-input flex min-h-[96px] flex-1 flex-col">
-        {variant === "thread" && queuedFollowUps.length > 0 ? (
-          <div className="grid gap-1 px-3 pt-2" aria-label="Queued follow-ups">
-            {queuedFollowUps.map((followUp) => (
-              <div key={followUp.id} className="flex items-center gap-2 rounded-lg bg-muted/40 px-2 py-1 text-xs">
-                <span className="min-w-0 flex-1 truncate">{followUp.input}</span>
-                <span className="text-muted-foreground">{followUp.status}</span>
-                {followUp.status === "failed" ? <Button variant="ghost" size="sm" onClick={() => void onRetryFollowUp(followUp)}>Retry</Button> : null}
-                <Button variant="ghost" size="sm" onClick={() => void onRemoveFollowUp(followUp)}>Remove</Button>
-              </div>
-            ))}
-          </div>
-        ) : null}
         {attachments.length > 0 || pendingUploads.length > 0 ? (
           <AttachmentGroup className="px-3 pt-2">
             {pendingUploads.map((upload) => (
@@ -386,6 +398,34 @@ export function Composer({
         </div>
       </BerryComposerFrame>
       {uploadError ? <p className="composer-error" role="alert">{uploadError}</p> : null}
+    </div>
+  );
+}
+
+function QueuedFollowUpStack({
+  followUps,
+  onRetry,
+  onRemove,
+}: {
+  followUps: QueuedFollowUp[];
+  onRetry: (followUp: QueuedFollowUp) => Promise<void>;
+  onRemove: (followUp: QueuedFollowUp) => Promise<void>;
+}) {
+  return (
+    <div className="berry-composer-queue" aria-label="Queued follow-ups">
+      <span className="berry-composer-queue-label">Queue</span>
+      <div className="berry-composer-queue-list">
+        {followUps.map((followUp) => (
+          <div key={followUp.id} className="berry-composer-queue-item">
+            <span className="min-w-0 flex-1 truncate">{followUp.input}</span>
+            <span className="berry-composer-queue-status">{followUp.status === "failed" ? "Needs retry" : "Queued"}</span>
+            {followUp.status === "failed" ? (
+              <Button variant="ghost" size="xs" onClick={() => void onRetry(followUp)}>Retry</Button>
+            ) : null}
+            <Button variant="ghost" size="icon-xs" aria-label="Remove queued message" onClick={() => void onRemove(followUp)}>×</Button>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

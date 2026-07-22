@@ -34,10 +34,6 @@ export function TaskFileLibraryDialog({
   const [query, setQuery] = React.useState("");
   const [state, setState] = React.useState<"idle" | "loading" | "ready" | "error">("idle");
   const [error, setError] = React.useState("");
-  const taskTabRef = React.useRef<HTMLButtonElement>(null);
-  const projectTabRef = React.useRef<HTMLButtonElement>(null);
-  const pillRef = React.useRef<HTMLSpanElement>(null);
-  const tabsPaintedRef = React.useRef(false);
 
   const refresh = React.useCallback(async () => {
     if (!client || !open) return;
@@ -62,34 +58,12 @@ export function TaskFileLibraryDialog({
 
   React.useEffect(() => {
     if (!open) {
-      tabsPaintedRef.current = false;
       return;
     }
     setScope("task");
     setQuery("");
   }, [open, taskId]);
   React.useEffect(() => { void refresh(); }, [refresh]);
-  React.useLayoutEffect(() => {
-    if (!open) return;
-    const tab = scope === "task" ? taskTabRef.current : projectTabRef.current;
-    const pill = pillRef.current;
-    if (!tab || !pill) return;
-    const move = (animate: boolean) => {
-      const previous = pill.style.transition;
-      if (!animate) pill.style.transition = "none";
-      pill.style.transform = `translateX(${tab.offsetLeft}px)`;
-      pill.style.width = `${tab.offsetWidth}px`;
-      if (!animate) {
-        void pill.offsetWidth;
-        pill.style.transition = previous;
-      }
-    };
-    move(tabsPaintedRef.current);
-    tabsPaintedRef.current = true;
-    const onResize = () => move(false);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [open, scope]);
 
   const visible = React.useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -114,10 +88,9 @@ export function TaskFileLibraryDialog({
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <Tabs value={scope} onValueChange={(value) => setScope(value as Scope)}>
-                <TabsList className="t-tabs h-9 rounded-full bg-muted p-[3px]">
-                  <span ref={pillRef} className="t-tabs-pill" aria-hidden="true" />
-                  <TabsTrigger ref={taskTabRef} value="task" className="t-tab min-w-24 rounded-full data-[state=active]:bg-transparent data-[state=active]:shadow-none">Task</TabsTrigger>
-                  <TabsTrigger ref={projectTabRef} value="project" className="t-tab min-w-24 rounded-full data-[state=active]:bg-transparent data-[state=active]:shadow-none">Project</TabsTrigger>
+                <TabsList className="berry-file-library-scope-switch h-9 p-0">
+                  <TabsTrigger value="task" className="berry-file-library-scope-trigger min-w-24">Task</TabsTrigger>
+                  <TabsTrigger value="project" className="berry-file-library-scope-trigger min-w-24">Project</TabsTrigger>
                 </TabsList>
               </Tabs>
               <label className="relative block w-full sm:max-w-72">
@@ -154,9 +127,9 @@ export function TaskFileLibraryDialog({
               </div>
             ) : null}
           </div>
+          <FileViewerModal file={selected} onOpenChange={(nextOpen) => { if (!nextOpen) setSelected(null); }} />
         </DialogContent>
       </Dialog>
-      <FileViewerModal file={selected} onOpenChange={(nextOpen) => { if (!nextOpen) setSelected(null); }} />
     </>
   );
 }
