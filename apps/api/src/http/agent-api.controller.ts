@@ -90,6 +90,11 @@ const StartTurnRequestSchema = z.object({
   // and everything after, persist the new input as the user message, and run
   // the turn from that point (mirrors the desktop host's agent.turn).
   replaceFromMessageId: z.string().min(1).optional(),
+  // A queued prompt can be promoted into a new run after the previous run has
+  // already ended. In that case, load the remaining persisted queue into the
+  // new harness immediately after it starts. The promoted prompt is marked
+  // `sending`, so it is intentionally excluded from the runtime queue.
+  drainQueuedFollowUps: z.boolean().optional(),
 }).passthrough();
 
 const SteerTurnRequestSchema = z.object({
@@ -100,6 +105,14 @@ const SteerTurnRequestSchema = z.object({
 const ReorderFollowUpsRequestSchema = z.object({
   followUpIds: z.array(z.string().min(1)).max(100),
 }).strict();
+
+const UpdateFollowUpRequestSchema = z.object({
+  input: z.string().trim().min(1).optional(),
+  attachments: z.array(AttachmentInputSchema).max(100).optional(),
+  status: z.enum(["queued", "sending", "paused", "failed"]).optional(),
+  error: z.string().nullable().optional(),
+  pausedReason: z.string().nullable().optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, "Provide at least one follow-up field");
 
 const ImageGenerationRequestSchema = z.object({
   prompt: z.string().trim().min(1).max(8_000),
@@ -127,6 +140,7 @@ const PreviewRequestSchema = z.object({ port: z.number().int().min(1).max(65_535
 export class AgentApiController {
   readonly #projectionWrites = new Map<string, Promise<void>>();
   readonly #followUpQueueWrites = new Map<string, Promise<void>>();
+  readonly #followUpSendWrites = new Map<string, Promise<{ queued: true }>>();
   readonly #startedAt = Date.now();
 
   constructor(
@@ -197,6 +211,16 @@ export class AgentApiController {
     }));
     await this.sessionHost.replaceFollowUpQueue(sessionId, runtimeFollowUps);
     return followUps;
+  }
+
+  async #sendFollowUpOnce(followUpId: string, action: () => Promise<{ queued: true }>): Promise<{ queued: true }> {
+    const inFlight = this.#followUpSendWrites.get(followUpId);
+    if (inFlight) return inFlight;
+    const pending = action().finally(() => {
+      if (this.#followUpSendWrites.get(followUpId) === pending) this.#followUpSendWrites.delete(followUpId);
+    });
+    this.#followUpSendWrites.set(followUpId, pending);
+    return pending;
   }
 
   @Get("/models/catalog")
@@ -654,6 +678,9 @@ export class AgentApiController {
           this.events.publish(sessionId, parsed);
           if (parsed.kind === "turn.end") {
             this.#queueProjectionWrite(sessionId, () => this.store.updateTask(task.id, { status: parsed.status }));
+            this.#queueProjectionWrite(sessionId, () => parsed.status === "completed"
+              ? this.store.deliverFollowUps(sessionId, httpRequest.auth?.user.id ?? null)
+              : this.store.pauseFollowUps(sessionId, parsed.status === "cancelled" ? "You interrupted the active run." : "The active run ended before this queued prompt could be sent.", httpRequest.auth?.user.id ?? null));
             void Promise.all([
               this.budgets.reconcile({ tenantId, requestId, actualCostMicros, usage }),
               this.usageRepository.ingestInternal(tenantId, {
@@ -684,6 +711,13 @@ export class AgentApiController {
         },
       } as StartTurnOptions);
       activeTurnId = turnId;
+      if (request.drainQueuedFollowUps) {
+        // `startTurn` synchronously installs the active harness. Awaiting this
+        // replacement makes the remaining persisted queue part of this same
+        // serialized run, rather than letting the terminal handler mark it as
+        // delivered without ever executing it.
+        await this.#synchronizeFollowUpQueue(httpRequest, sessionId);
+      }
       return { turnId, sessionId };
     } catch (error) {
       await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
@@ -746,8 +780,10 @@ export class AgentApiController {
   }
 
   @Post("/sessions/:sessionId/cancel")
-  async cancelTurn(@Param("sessionId") sessionId: string) {
-    return { ok: await this.sessionHost.cancel(sessionId) };
+  async cancelTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    const ok = await this.sessionHost.cancel(sessionId);
+    if (ok) await this.store.pauseFollowUps(sessionId, "You interrupted the active run.", httpRequest.auth?.user.id ?? null);
+    return { ok };
   }
 
   @Post("/sessions/:sessionId/steer")
@@ -755,6 +791,10 @@ export class AgentApiController {
     const request = parseBody(SteerTurnRequestSchema, body);
     const session = await this.store.getSession(sessionId);
     const runtimeAttachments = await this.files.runtimeAttachments(tenantIdFromRequest(httpRequest), httpRequest.auth!.user.id, request.attachments ?? [], { taskId: session.taskId, sessionId });
+    // Only persist the user message after the active runtime accepts it. That
+    // keeps a rejected steer recoverable instead of leaving a phantom message
+    // in the conversation history.
+    const result = await this.sessionHost.steer(sessionId, request.input, imagesFromAttachments(runtimeAttachments), normalizeAttachments(runtimeAttachments));
     const message = await this.store.appendMessage(sessionId, { role: "user", parts: userMessageParts(request.input, request.attachments) });
     await this.files.associateInputFiles(tenantIdFromRequest(httpRequest), httpRequest.auth!.user.id, {
       fileIds: runtimeAttachments.flatMap((attachment) => attachment.fileId ? [attachment.fileId] : []),
@@ -762,7 +802,7 @@ export class AgentApiController {
       sessionId,
       messageId: message.id,
     });
-    return this.sessionHost.steer(sessionId, request.input, imagesFromAttachments(runtimeAttachments), normalizeAttachments(runtimeAttachments));
+    return result;
   }
 
   @Get("/sessions/:sessionId/follow-ups")
@@ -776,6 +816,13 @@ export class AgentApiController {
     const reordered = await this.store.reorderFollowUps(sessionId, request.followUpIds, httpRequest.auth?.user.id ?? null);
     if (this.sessionHost.turnState(sessionId).active) await this.#synchronizeFollowUpQueue(httpRequest, sessionId);
     return reordered;
+  }
+
+  @Post("/sessions/:sessionId/follow-ups/resume")
+  async resumeFollowUps(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    const resumed = await this.store.resumeFollowUps(sessionId, httpRequest.auth?.user.id ?? null);
+    if (this.sessionHost.turnState(sessionId).active) await this.#synchronizeFollowUpQueue(httpRequest, sessionId);
+    return resumed;
   }
 
   @Post("/sessions/:sessionId/follow-ups")
@@ -795,31 +842,49 @@ export class AgentApiController {
       await this.#synchronizeFollowUpQueue(httpRequest, sessionId);
       return queued;
     } catch (cause) {
-      await this.store.updateFollowUp(queued.id, { status: "failed", error: cause instanceof Error ? cause.message : "Unable to queue follow-up" }, httpRequest.auth?.user.id ?? null);
-      throw cause;
+      // The record and user message already exist. Return its failed state so
+      // the browser can render a retry action instead of creating a duplicate
+      // optimistic entry after a transport-level error.
+      return this.store.updateFollowUp(queued.id, { status: "failed", error: cause instanceof Error ? cause.message : "Unable to queue follow-up" }, httpRequest.auth?.user.id ?? null);
     }
+  }
+
+  @Patch("/follow-ups/:followUpId")
+  async updateFollowUp(@Req() httpRequest: AuthenticatedRequest, @Param("followUpId") followUpId: string, @Body() body: unknown) {
+    const request = parseBody(UpdateFollowUpRequestSchema, body);
+    const updated = await this.store.updateFollowUp(followUpId, {
+      ...(request.input !== undefined ? { input: request.input } : {}),
+      ...(request.attachments !== undefined ? { attachments: request.attachments } : {}),
+      ...(request.status !== undefined ? { status: request.status } : {}),
+      ...(request.error !== undefined ? { error: request.error } : {}),
+      ...(request.pausedReason !== undefined ? { pausedReason: request.pausedReason } : {}),
+    }, httpRequest.auth?.user.id ?? null);
+    if (this.sessionHost.turnState(updated.sessionId).active) await this.#synchronizeFollowUpQueue(httpRequest, updated.sessionId);
+    return updated;
   }
 
   @Post("/follow-ups/:followUpId/steer")
   async steerFollowUp(@Req() httpRequest: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
-    const followUp = await this.store.updateFollowUp(followUpId, { status: "removed" }, httpRequest.auth?.user.id ?? null);
-    try {
-      await this.#synchronizeFollowUpQueue(httpRequest, followUp.sessionId);
-      const session = await this.store.getSession(followUp.sessionId);
-      const attachments = await this.files.runtimeAttachments(
-        tenantIdFromRequest(httpRequest),
-        httpRequest.auth!.user.id,
-        followUp.attachments,
-        { taskId: session.taskId, sessionId: followUp.sessionId },
-      );
-      return this.sessionHost.steer(followUp.sessionId, followUp.input, imagesFromAttachments(attachments), normalizeAttachments(attachments));
-    } catch (cause) {
-      await this.store.updateFollowUp(followUp.id, { status: "queued", error: cause instanceof Error ? cause.message : "Unable to steer this queued prompt" }, httpRequest.auth?.user.id ?? null);
-      if (this.sessionHost.turnState(followUp.sessionId).active) {
-        await this.#synchronizeFollowUpQueue(httpRequest, followUp.sessionId).catch(() => undefined);
+    return this.#sendFollowUpOnce(followUpId, async () => {
+      const followUp = await this.store.updateFollowUp(followUpId, { status: "sending", error: null, pausedReason: null }, httpRequest.auth?.user.id ?? null);
+      try {
+        await this.#synchronizeFollowUpQueue(httpRequest, followUp.sessionId);
+        const session = await this.store.getSession(followUp.sessionId);
+        const attachments = await this.files.runtimeAttachments(
+          tenantIdFromRequest(httpRequest),
+          httpRequest.auth!.user.id,
+          followUp.attachments,
+          { taskId: session.taskId, sessionId: followUp.sessionId },
+        );
+        await this.sessionHost.steer(followUp.sessionId, followUp.input, imagesFromAttachments(attachments), normalizeAttachments(attachments));
+        await this.store.updateFollowUp(followUp.id, { status: "delivered", error: null, pausedReason: null }, httpRequest.auth?.user.id ?? null);
+        return { queued: true };
+      } catch (cause) {
+        await this.store.updateFollowUp(followUp.id, { status: "failed", error: cause instanceof Error ? cause.message : "Unable to steer this queued prompt" }, httpRequest.auth?.user.id ?? null);
+        if (this.sessionHost.turnState(followUp.sessionId).active) await this.#synchronizeFollowUpQueue(httpRequest, followUp.sessionId).catch(() => undefined);
+        throw cause;
       }
-      throw cause;
-    }
+    });
   }
 
   @Delete("/follow-ups/:followUpId")

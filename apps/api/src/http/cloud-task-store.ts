@@ -69,7 +69,10 @@ export interface CloudTaskStore {
   createFollowUp(input: { taskId: string; sessionId: string; input: string; attachments?: AttachmentInput[] }, ownerUserId?: string | null): Promise<QueuedFollowUp>;
   listFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
   reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
-  updateFollowUp(id: string, input: { status: QueuedFollowUp["status"]; error?: string | null }, ownerUserId?: string | null): Promise<QueuedFollowUp>;
+  updateFollowUp(id: string, input: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp>;
+  pauseFollowUps(sessionId: string, reason: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
+  resumeFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
+  deliverFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
   createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session>;
   getSession(sessionId: string): Promise<Session>;
   appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message>;
@@ -80,6 +83,14 @@ export interface CloudTaskStore {
    * the UI projection back to the edited turn, mirroring the desktop host.
    */
   deleteMessagesFrom(sessionId: string, messageId: string): Promise<void>;
+}
+
+export interface FollowUpUpdateInput {
+  input?: string;
+  attachments?: AttachmentInput[];
+  status?: QueuedFollowUp["status"];
+  error?: string | null;
+  pausedReason?: string | null;
 }
 
 @Injectable()
@@ -253,7 +264,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     await this.getTask(input.taskId, ownerUserId);
     const now = nowIso();
     const ordinal = [...this.#followUps.values()].filter((item) => item.sessionId === input.sessionId).length;
-    const followUp = QueuedFollowUpSchema.parse({ id: randomUuid(), ...input, attachments: input.attachments ?? [], ordinal, status: "queued", error: null, createdAt: now, updatedAt: now });
+    const followUp = QueuedFollowUpSchema.parse({ id: randomUuid(), ...input, attachments: input.attachments ?? [], ordinal, status: "queued", error: null, pausedReason: null, createdAt: now, updatedAt: now });
     this.#followUps.set(followUp.id, followUp);
     return followUp;
   }
@@ -261,7 +272,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   async listFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
     const session = await this.getSession(sessionId);
     await this.getTask(session.taskId, ownerUserId);
-    return [...this.#followUps.values()].filter((item) => item.sessionId === sessionId && item.status !== "removed").sort((a, b) => a.ordinal - b.ordinal);
+    return [...this.#followUps.values()].filter((item) => item.sessionId === sessionId && !["removed", "delivered"].includes(item.status)).sort((a, b) => a.ordinal - b.ordinal);
   }
 
   async reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
@@ -279,13 +290,31 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     return this.listFollowUps(sessionId, ownerUserId);
   }
 
-  async updateFollowUp(id: string, input: { status: QueuedFollowUp["status"]; error?: string | null }, ownerUserId?: string | null): Promise<QueuedFollowUp> {
+  async updateFollowUp(id: string, input: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp> {
     const current = this.#followUps.get(id);
     if (!current) throw new NotFoundException(`Queued follow-up not found: ${id}`);
     await this.getTask(current.taskId, ownerUserId);
     const next = QueuedFollowUpSchema.parse({ ...current, ...input, updatedAt: nowIso() });
     this.#followUps.set(id, next);
     return next;
+  }
+
+  async pauseFollowUps(sessionId: string, reason: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    const current = await this.listFollowUps(sessionId, ownerUserId);
+    await Promise.all(current.filter((item) => item.status === "queued" || item.status === "sending").map((item) => this.updateFollowUp(item.id, { status: "paused", error: null, pausedReason: reason }, ownerUserId)));
+    return this.listFollowUps(sessionId, ownerUserId);
+  }
+
+  async resumeFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    const current = await this.listFollowUps(sessionId, ownerUserId);
+    await Promise.all(current.filter((item) => item.status === "paused").map((item) => this.updateFollowUp(item.id, { status: "queued", error: null, pausedReason: null }, ownerUserId)));
+    return this.listFollowUps(sessionId, ownerUserId);
+  }
+
+  async deliverFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    const current = await this.listFollowUps(sessionId, ownerUserId);
+    await Promise.all(current.filter((item) => item.status === "queued" || item.status === "sending").map((item) => this.updateFollowUp(item.id, { status: "delivered", error: null, pausedReason: null }, ownerUserId)));
+    return this.listFollowUps(sessionId, ownerUserId);
   }
 
   async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session> {
@@ -538,7 +567,7 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
         `INSERT INTO queued_follow_ups (tenant_id, task_id, session_id, ordinal, input, attachments, status, created_at, updated_at)
          SELECT $1::uuid, $2::uuid, $3::uuid, COALESCE(MAX(ordinal) + 1, 0), $4, $5::jsonb, 'queued', $6, $6
          FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $3::uuid
-         RETURNING id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at`,
+         RETURNING id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at`,
         [this.tenantId, input.taskId, input.sessionId, input.input, JSON.stringify(input.attachments ?? []), nowIso()],
       );
       return followUpFromRow(rows[0]!);
@@ -550,8 +579,8 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
       const session = await this.getSessionInTenant(executor, sessionId);
       await this.getTaskInTenant(executor, session.taskId, ownerUserId);
       const rows = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status <> 'removed' ORDER BY ordinal`,
+        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at
+         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status NOT IN ('removed', 'delivered') ORDER BY ordinal`,
         [this.tenantId, sessionId],
       );
       return rows.map(followUpFromRow);
@@ -563,8 +592,8 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
       const session = await this.getSessionInTenant(executor, sessionId);
       await this.getTaskInTenant(executor, session.taskId, ownerUserId);
       const current = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status <> 'removed' ORDER BY ordinal`,
+        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at
+         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status NOT IN ('removed', 'delivered') ORDER BY ordinal`,
         [this.tenantId, sessionId],
       );
       const expected = new Set(current.map((followUp) => followUp.id));
@@ -579,29 +608,55 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
         );
       }
       const reordered = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status <> 'removed' ORDER BY ordinal`,
+        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at
+         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status NOT IN ('removed', 'delivered') ORDER BY ordinal`,
         [this.tenantId, sessionId],
       );
       return reordered.map(followUpFromRow);
     });
   }
 
-  async updateFollowUp(id: string, input: { status: QueuedFollowUp["status"]; error?: string | null }, ownerUserId?: string | null): Promise<QueuedFollowUp> {
+  async updateFollowUp(id: string, input: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp> {
     return this.database.withTenant(this.tenantId, async (executor) => {
       const existing = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at FROM queued_follow_ups WHERE tenant_id = $1::uuid AND id = $2::uuid`,
+        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at FROM queued_follow_ups WHERE tenant_id = $1::uuid AND id = $2::uuid`,
         [this.tenantId, id],
       );
       if (!existing[0]) throw new NotFoundException(`Queued follow-up not found: ${id}`);
       await this.getTaskInTenant(executor, existing[0].task_id, ownerUserId);
+      const current = followUpFromRow(existing[0]!);
+      const next = QueuedFollowUpSchema.parse({
+        ...current,
+        ...input,
+        updatedAt: nowIso(),
+      });
       const rows = await executor.query<QueuedFollowUpRow>(
-        `UPDATE queued_follow_ups SET status = $3, error = $4, updated_at = $5 WHERE tenant_id = $1::uuid AND id = $2::uuid
-         RETURNING id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at`,
-        [this.tenantId, id, input.status, input.error ?? null, nowIso()],
+        `UPDATE queued_follow_ups
+         SET input = $3, attachments = $4::jsonb, status = $5, error = $6, paused_reason = $7, updated_at = $8
+         WHERE tenant_id = $1::uuid AND id = $2::uuid
+         RETURNING id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at`,
+        [this.tenantId, id, next.input, JSON.stringify(next.attachments), next.status, next.error, next.pausedReason, next.updatedAt],
       );
       return followUpFromRow(rows[0]!);
     });
+  }
+
+  async pauseFollowUps(sessionId: string, reason: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    return this.#transitionFollowUps(sessionId, ["queued", "sending"], { status: "paused", error: null, pausedReason: reason }, ownerUserId);
+  }
+
+  async resumeFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    return this.#transitionFollowUps(sessionId, ["paused"], { status: "queued", error: null, pausedReason: null }, ownerUserId);
+  }
+
+  async deliverFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    return this.#transitionFollowUps(sessionId, ["queued", "sending"], { status: "delivered", error: null, pausedReason: null }, ownerUserId);
+  }
+
+  async #transitionFollowUps(sessionId: string, from: QueuedFollowUp["status"][], patch: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    const current = await this.listFollowUps(sessionId, ownerUserId);
+    await Promise.all(current.filter((item) => from.includes(item.status)).map((item) => this.updateFollowUp(item.id, patch, ownerUserId)));
+    return this.listFollowUps(sessionId, ownerUserId);
   }
 
   async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session> {
@@ -843,6 +898,7 @@ interface QueuedFollowUpRow {
   attachments: unknown;
   status: string;
   error: string | null;
+  paused_reason: string | null;
   created_at: Date | string;
   updated_at: Date | string;
 }
@@ -857,6 +913,7 @@ function followUpFromRow(row: QueuedFollowUpRow): QueuedFollowUp {
     attachments: row.attachments,
     status: row.status,
     error: row.error,
+    pausedReason: row.paused_reason,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });

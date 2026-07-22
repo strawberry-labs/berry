@@ -151,6 +151,16 @@ export function MentionMenu({ controller }: { controller: MentionsController }) 
     return () => document.removeEventListener("pointerdown", onPointerDown, true);
   }, [controller.dismiss, controller.open]);
 
+  React.useEffect(() => {
+    if (!controller.open) return;
+    // Keyboard navigation must move the viewport with the highlighted item;
+    // mouse hover already has a naturally visible target. `nearest` keeps the
+    // menu stable until the active row would otherwise leave the scrollport.
+    menuRef.current
+      ?.querySelector<HTMLButtonElement>('.mention-row[data-active="true"]')
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [controller.activeIndex, controller.open]);
+
   if (!controller.open) return null;
 
   let offset = 0;

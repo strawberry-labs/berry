@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowUp, Plus, Square } from "lucide-react";
+import { ArrowUp, GitBranch, Plus, Square } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
 import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type Message, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
@@ -8,13 +8,15 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, Ellipsis, FileText, GripVerticalIcon, Hash, ImagePlus, Queue01Icon, SlashSquare, Trash2 } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, Queue01Icon, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
 import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, type ComposerQuestionAnswer } from "./composer-question-overlay";
+import { QueuedMessageList } from "./queued-message-list";
+import { readFollowUpMode, saveFollowUpMode, type FollowUpMode } from "@/lib/follow-up-mode";
 
 interface PendingFileUpload {
   id: string;
@@ -55,6 +57,9 @@ export function Composer({
   onRetryFollowUp,
   onReorderFollowUps,
   onSteerFollowUp,
+  onUpdateFollowUp,
+  onResumeFollowUps,
+  onSteerMessage,
   planProgress,
   question,
 }: {
@@ -72,7 +77,7 @@ export function Composer({
   onUserMessagePersisted: (sessionId: string, optimisticMessageId: string, message: Message) => void;
   onAssistantMessage: (text: string, sessionId: string, taskId: string) => void;
   onEvent: (sessionId: string, event: Parameters<typeof reduceStream>[1]) => void;
-  runTurn: (task: Task, params: { input: string; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
+  runTurn: (task: Task, params: { input: string; attachments?: AttachmentInput[] | undefined; drainQueuedFollowUps?: boolean | undefined }) => Promise<void>;
   onCancel: () => void;
   variant: "home" | "thread";
   onCreateTask: (options?: { title?: string }) => Promise<Task | null>;
@@ -87,11 +92,15 @@ export function Composer({
   onRetryFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onReorderFollowUps: (sessionId: string, orderedIds: string[]) => void;
   onSteerFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
+  onUpdateFollowUp: (followUp: QueuedFollowUp, input: string) => Promise<void>;
+  onResumeFollowUps: (sessionId: string) => Promise<void>;
+  onSteerMessage: (task: Task, input: string, attachments: AttachmentInput[]) => Promise<void>;
   planProgress?: PlanProgress | null;
   question?: QuestionPrompt | null;
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [followUpMode, setFollowUpMode] = React.useState<FollowUpMode>(() => readFollowUpMode());
   const working = busy || streaming;
   const [attachments, setAttachments] = React.useState<AttachmentInput[]>([]);
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
@@ -142,7 +151,7 @@ export function Composer({
     });
   }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
 
-  const submit = React.useCallback(async () => {
+  const submit = React.useCallback(async (event?: KeyboardEvent | null) => {
     if (pendingUploads.some((upload) => upload.state === "uploading")) return;
     const input = text.trim() || (attachments.length > 0 ? "Review the attached files." : "");
     if (!input) return;
@@ -159,8 +168,10 @@ export function Composer({
       return;
     }
     if (working && activeTask?.activeSessionId && client) {
-      const queueMessages = window.localStorage.getItem("berry.web.queueMessages") !== "false";
-      if (queueMessages) {
+      const mode = event?.shiftKey && (event.metaKey || event.ctrlKey)
+        ? (followUpMode === "queue" ? "steer" : "queue")
+        : followUpMode;
+      if (mode === "queue") {
         const now = new Date().toISOString();
         const optimisticFollowUp: QueuedFollowUp = {
           id: `local_follow_up_${globalThis.crypto.randomUUID()}`,
@@ -171,6 +182,7 @@ export function Composer({
           attachments,
           status: "queued",
           error: null,
+          pausedReason: null,
           createdAt: now,
           updatedAt: now,
         };
@@ -192,15 +204,7 @@ export function Composer({
       }
 
       try {
-        await client.steerTurn(activeTask.activeSessionId, { input, attachments });
-        const optimisticMessageId = onUserMessage(input, activeTask.activeSessionId, activeTask.id, attachments);
-        // The steer endpoint persists the user message itself. Confirm that
-        // exact row immediately so completion cannot leave both the local
-        // bubble and its database copy on screen.
-        if (optimisticMessageId) {
-          const persisted = [...await client.listMessages(activeTask.activeSessionId)].reverse().find((message) => message.role === "user");
-          if (persisted) onUserMessagePersisted(activeTask.activeSessionId, optimisticMessageId, persisted);
-        }
+        await onSteerMessage(activeTask, input, attachments);
         setText("");
         editorRef.current?.clear();
         setAttachments([]);
@@ -211,9 +215,9 @@ export function Composer({
     }
     if (working && activeTask?.activeSessionId && !client) {
       const sessionId = activeTask.activeSessionId;
-      if (window.localStorage.getItem("berry.web.queueMessages") !== "false") {
+      if (followUpMode === "queue") {
         const now = new Date().toISOString();
-        onQueuedFollowUp({ id: `local_follow_up_${globalThis.crypto.randomUUID()}`, taskId: activeTask.id, sessionId, ordinal: queuedFollowUps.length, input, attachments, status: "queued", error: null, createdAt: now, updatedAt: now });
+        onQueuedFollowUp({ id: `local_follow_up_${globalThis.crypto.randomUUID()}`, taskId: activeTask.id, sessionId, ordinal: queuedFollowUps.length, input, attachments, status: "queued", error: null, pausedReason: null, createdAt: now, updatedAt: now });
       }
       setText("");
       editorRef.current?.clear();
@@ -260,7 +264,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, onAssistantMessage, onCommand, onCreateTask, onEvent, onQueuedFollowUp, onQueuedFollowUpFailed, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, text, variant, working]);
+  }, [activeTask, attachments, client, followUpMode, onAssistantMessage, onCommand, onCreateTask, onEvent, onQueuedFollowUp, onQueuedFollowUpFailed, onSteerMessage, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length) return;
@@ -342,10 +346,10 @@ export function Composer({
   }, [addFiles]);
 
   return (
-    <div className={variant === "thread" ? "berry-thread-composer-wrap mx-auto max-w-full px-4 pb-5" : "w-full"}>
+    <div className={variant === "thread" ? "berry-thread-composer-wrap mx-auto max-w-full pb-5" : "w-full"}>
       <BerryComposerFrame
         variant={variant}
-        {...(fileDragActive ? { className: "outline outline-2 -outline-offset-2 outline-[var(--berry-focus)]" } : {})}
+        {...(fileDragActive ? { className: "outline outline-2 -outline-offset-2 outline-[var(--berry-border-strong)]" } : {})}
         shellProps={{
           onDragEnter: handleDragEnter,
           onDragOver: handleDragOver,
@@ -357,12 +361,15 @@ export function Composer({
             <MentionMenu controller={mentions} />
             {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} /> : null}
             {variant === "thread" && queuedFollowUps.length > 0 ? (
-              <QueuedFollowUpStack
+              <QueuedMessageList
                 followUps={queuedFollowUps}
+                active={working}
                 onRetry={onRetryFollowUp}
                 onRemove={onRemoveFollowUp}
                 onReorder={onReorderFollowUps}
-                onSteer={onSteerFollowUp}
+                onSendNow={onSteerFollowUp}
+                onUpdate={onUpdateFollowUp}
+                onResume={onResumeFollowUps}
               />
             ) : null}
             {variant === "thread" && planProgress ? <PlanProgressPill plan={planProgress} /> : null}
@@ -370,8 +377,8 @@ export function Composer({
         }
         header={
           <>
-            {variant === "home" ? (
-              <div className="berry-composer-meta flex min-w-0 items-center gap-2 px-2 pt-2">
+            {variant === "home" || variant === "thread" ? (
+              <div className="berry-composer-meta berry-composer-context-row flex min-w-0 items-center gap-2 px-2 pt-2">
                 <ProjectSwitcher
                   workspaces={workspaces}
                   activeWorkspaceId={activeWorkspaceId}
@@ -379,6 +386,8 @@ export function Composer({
                   onCreateProject={onCreateProject}
                   className="berry-composer-project-switcher"
                 />
+                {variant === "thread" ? <span className="berry-composer-context-value" title={workspaces.find((workspace) => workspace.id === activeTask?.workspaceId)?.path ?? config.workspacePath}><FileText aria-hidden /> Sandbox</span> : null}
+                {variant === "thread" && activeTask?.worktreeBranch ? <span className="berry-composer-context-value"><GitBranch aria-hidden /> {activeTask.worktreeBranch}</span> : null}
               </div>
             ) : null}
           </>
@@ -425,12 +434,13 @@ export function Composer({
             mentions={mentions}
             onPasteEvent={handlePaste}
             onChange={setText}
-            onSubmit={() => void submit()}
+            onSubmit={(event) => void submit(event)}
           />
         </div>
         <div className="berry-composer-controls flex min-w-0 flex-nowrap items-center gap-1">
           <input ref={fileInputRef} className="visually-hidden" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => void addFiles(event.currentTarget.files)} />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-60"><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+          {working && variant === "thread" ? <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-follow-up-mode"><Queue01Icon aria-hidden /> {followUpMode === "queue" ? "Queue" : "Steer"}<ChevronDown aria-hidden /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-52"><DropdownMenuItem onClick={() => { setFollowUpMode("queue"); saveFollowUpMode("queue"); }}><Queue01Icon /> Queue after this response{followUpMode === "queue" ? <Check className="ml-auto" /> : null}</DropdownMenuItem><DropdownMenuItem onClick={() => { setFollowUpMode("steer"); saveFollowUpMode("steer"); }}><ArrowUp /> Steer the current response{followUpMode === "steer" ? <Check className="ml-auto" /> : null}</DropdownMenuItem></DropdownMenuContent></DropdownMenu> : null}
           <span className="min-w-0 flex-1" />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{composerModels.find((item) => item.id === model)?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-64"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => onModelChange(item.id)}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoning[0]!.toUpperCase() + reasoning.slice(1)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-64"><DropdownMenuLabel>Reasoning</DropdownMenuLabel>{(["off", "low", "medium", "high"] as const).map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span className="capitalize">{level}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
@@ -461,134 +471,6 @@ export function Composer({
       </BerryComposerFrame>
       {uploadError ? <p className="composer-error" role="alert">{uploadError}</p> : null}
     </div>
-  );
-}
-
-function QueuedFollowUpStack({
-  followUps,
-  onRetry,
-  onRemove,
-  onReorder,
-  onSteer,
-}: {
-  followUps: QueuedFollowUp[];
-  onRetry: (followUp: QueuedFollowUp) => Promise<void>;
-  onRemove: (followUp: QueuedFollowUp) => Promise<void>;
-  onReorder: (sessionId: string, orderedIds: string[]) => void;
-  onSteer: (followUp: QueuedFollowUp) => Promise<void>;
-}) {
-  const [draggingId, setDraggingId] = React.useState<string | null>(null);
-  const [dropTarget, setDropTarget] = React.useState<{ id: string; position: "before" | "after" } | null>(null);
-
-  const reorder = React.useCallback((sourceId: string, targetId: string, position: "before" | "after") => {
-    if (sourceId === targetId) return;
-    const sourceIndex = followUps.findIndex((followUp) => followUp.id === sourceId);
-    if (sourceIndex < 0) return;
-    const ordered = [...followUps];
-    const [moved] = ordered.splice(sourceIndex, 1);
-    if (!moved) return;
-    const targetIndex = ordered.findIndex((followUp) => followUp.id === targetId);
-    if (targetIndex < 0) return;
-    ordered.splice(position === "before" ? targetIndex : targetIndex + 1, 0, moved);
-    onReorder(moved.sessionId, ordered.map((followUp) => followUp.id));
-  }, [followUps, onReorder]);
-
-  return (
-    <aside className="berry-composer-queue" aria-label="Queued follow-ups" aria-live="polite">
-      <div className="berry-composer-queue-list">
-        {followUps.map((followUp) => {
-          const isSaving = followUp.id.startsWith("local_follow_up_") && followUp.status !== "failed";
-          const status = followUp.status === "failed" ? "Needs retry" : isSaving ? "Saving" : "Steer";
-          return (
-            <div
-              key={followUp.id}
-              className={`berry-composer-queue-item${draggingId === followUp.id ? " is-dragging" : ""}${dropTarget?.id === followUp.id ? ` is-drop-target is-drop-${dropTarget.position}` : ""}`}
-              onDragOver={(event) => {
-                if (!draggingId || draggingId === followUp.id) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-                const bounds = event.currentTarget.getBoundingClientRect();
-                // The queue is rendered in reverse so the item nearest the
-                // composer is first in execution order. A pointer above a
-                // card therefore means "after" it in that logical order.
-                const position = event.clientY < bounds.top + bounds.height / 2 ? "after" : "before";
-                if (dropTarget?.id !== followUp.id || dropTarget.position !== position) {
-                  setDropTarget({ id: followUp.id, position });
-                }
-              }}
-              onDragLeave={(event) => {
-                if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-                if (dropTarget?.id === followUp.id) setDropTarget(null);
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                if (draggingId && dropTarget?.id === followUp.id) reorder(draggingId, followUp.id, dropTarget.position);
-                setDraggingId(null);
-                setDropTarget(null);
-              }}
-            >
-              <button
-                type="button"
-                className="berry-composer-queue-drag-handle"
-                draggable
-                aria-label={`Reorder ${followUp.input}`}
-                onDragStart={(event) => {
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData("text/plain", followUp.id);
-                  setDraggingId(followUp.id);
-                  setDropTarget(null);
-                }}
-                onDragEnd={() => {
-                  setDraggingId(null);
-                  setDropTarget(null);
-                }}
-              >
-                <Queue01Icon className="berry-composer-queue-icon" aria-hidden />
-                <GripVerticalIcon className="berry-composer-queue-grip" aria-hidden />
-              </button>
-              <p className="berry-composer-queue-prompt" title={followUp.input}>{followUp.input}</p>
-              {followUp.status === "failed" ? (
-                <span className="berry-composer-queue-status" data-status={followUp.status}>
-                  <span className="berry-composer-queue-status-error">{status}</span>
-                </span>
-              ) : (
-                <Button
-                  variant="ghost"
-                  size="xs"
-                  className="berry-composer-queue-status"
-                  disabled={isSaving}
-                  aria-label={`Steer with ${followUp.input}`}
-                  onClick={() => void onSteer(followUp)}
-                >
-                  <Queue01Icon aria-hidden />
-                  {status}
-                </Button>
-              )}
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="berry-composer-queue-delete"
-                aria-label={`Remove ${followUp.input} from the queue`}
-                onClick={() => void onRemove(followUp)}
-              >
-                <Trash2 aria-hidden />
-              </Button>
-              <DropdownMenu modal={false}>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon-xs" className="berry-composer-queue-more" aria-label={`More options for ${followUp.input}`}>
-                    <Ellipsis aria-hidden />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent side="top" align="end" className="berry-composer-queue-menu">
-                  {followUp.status === "failed" ? <DropdownMenuItem onClick={() => void onRetry(followUp)}>Retry queueing</DropdownMenuItem> : null}
-                  <DropdownMenuItem onClick={() => void onRemove(followUp)}>Remove from queue</DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          );
-        })}
-      </div>
-    </aside>
   );
 }
 

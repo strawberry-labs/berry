@@ -241,6 +241,8 @@ export interface StartTurnRequest {
   attachments?: AttachmentInput[] | undefined;
   /** Edit-and-resubmit: rewind to before this user message and replace it. */
   replaceFromMessageId?: string | undefined;
+  /** Start this turn by promoting a queued follow-up and drain later queue entries after it. */
+  drainQueuedFollowUps?: boolean | undefined;
 }
 
 export const ManagedModelCatalogSchema = z.object({
@@ -725,6 +727,14 @@ export class BerryApiClient {
       method: "POST",
       body: { followUpIds },
     });
+  }
+
+  async resumeFollowUps(sessionId: string): Promise<QueuedFollowUp[]> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups/resume`, z.array(QueuedFollowUpSchema), { method: "POST" });
+  }
+
+  async updateFollowUp(followUpId: string, input: Partial<Pick<QueuedFollowUp, "input" | "attachments" | "status" | "error" | "pausedReason">>): Promise<QueuedFollowUp> {
+    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}`, QueuedFollowUpSchema, { method: "PATCH", body: input });
   }
 
   async steerFollowUp(followUpId: string): Promise<{ queued: true }> {

@@ -205,6 +205,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
     ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
     : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
+  // A queued item can be triggered from its card, keyboard shortcut, or a
+  // reconciliation refresh. Keep one browser-side lock per item so those
+  // paths cannot start two turns for the same prompt.
+  const followUpSendInFlightRef = React.useRef(new Set<string>());
   const activeSessionId = activeTask?.activeSessionId ?? null;
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
   const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
@@ -326,15 +330,20 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (activeTask) setActiveWorkspaceId(activeTask.workspaceId);
   }, [activeTask]);
 
+  const refreshFollowUps = React.useCallback(async (sessionId: string) => {
+    if (!client) return;
+    const items = await client.listFollowUps(sessionId);
+    setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, items) }));
+  }, [client]);
+
   React.useEffect(() => {
     const sessionId = activeTask?.activeSessionId;
     if (!client || !sessionId) return;
-    let cancelled = false;
-    void client.listFollowUps(sessionId)
-      .then((items) => { if (!cancelled) setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, items) })); })
+    void refreshFollowUps(sessionId)
+      .then(() => undefined)
       .catch((cause) => setResourceError("followUps", cause instanceof Error ? cause.message : "Unable to load queued follow-ups"));
-    return () => { cancelled = true; };
-  }, [activeTask?.activeSessionId, client]);
+    return undefined;
+  }, [activeTask?.activeSessionId, client, refreshFollowUps]);
 
   React.useEffect(() => {
     const openSearch = () => {
@@ -598,6 +607,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           void refreshSessionMessages(sessionId)
             .then(() => resetSessionStream(sessionId))
             .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"));
+          void refreshFollowUps(sessionId)
+            .catch((cause) => setResourceError("followUps", cause instanceof Error ? cause.message : "Unable to refresh queued follow-ups"));
           void refreshAdmin();
         },
         onError: () => {
@@ -616,7 +627,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     };
 
     connect(0);
-  }, [client, refreshAdmin, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionStream]);
+  }, [client, refreshAdmin, refreshFollowUps, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionStream]);
 
   React.useEffect(() => () => {
     for (const sessionId of [...trackedSessionsRef.current]) stopSessionConnection(sessionId);
@@ -647,7 +658,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const runTurn = React.useCallback(async (
     task: Task,
-    params: { input: string; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined },
+    params: { input: string; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined; drainQueuedFollowUps?: boolean | undefined },
   ) => {
     if (!client || !task.activeSessionId) return;
     const sessionId = task.activeSessionId;
@@ -669,6 +680,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         reasoning,
         ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
         ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
+        ...(params.drainQueuedFollowUps ? { drainQueuedFollowUps: true } : {}),
       });
     } catch (cause) {
       stopSessionConnection(sessionId);
@@ -696,10 +708,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       stopSessionConnection(sessionId);
       updateSessionStream(sessionId, { kind: "turn.end", turnId: streamsBySession[sessionId]?.turnId ?? `cancelled_${Date.now()}`, status: "cancelled" });
       await refreshSessionMessages(sessionId);
+      await refreshFollowUps(sessionId);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "Unable to stop the active turn");
     }
-  }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
+  }, [activeTask?.activeSessionId, client, refreshFollowUps, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
 
   // Edit-and-resubmit: optimistically truncate the local thread at the edited
   // message, then rerun the turn from that point (the API rewinds + persists).
@@ -879,27 +892,23 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       .catch((cause) => toast.error(cause instanceof Error ? cause.message : "Unable to save the queue order"));
   }, [client]);
 
-  const steerFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
-    if (!client || isLocalFollowUp(followUp)) return;
-    const previousOrder = savedFollowUpOrder(followUp.sessionId);
-    setFollowUpsBySession((current) => ({
-      ...current,
-      [followUp.sessionId]: (current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id),
-    }));
-    removeFollowUpOrderId(followUp.sessionId, followUp.id);
-    try {
-      await client.steerFollowUp(followUp.id);
-    } catch (cause) {
-      if (previousOrder.length > 0) saveFollowUpOrder(followUp.sessionId, previousOrder);
-      setFollowUpsBySession((current) => ({
-        ...current,
-        [followUp.sessionId]: orderFollowUps(followUp.sessionId, [...(current[followUp.sessionId] ?? []), followUp]),
-      }));
-      toast.error(cause instanceof Error ? cause.message : "Unable to steer the running task");
-    }
-  }, [client]);
-
   const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    if (!isLocalFollowUp(followUp)) {
+      const previous = followUp;
+      const optimistic = { ...followUp, status: "queued" as const, error: null, pausedReason: null, updatedAt: new Date().toISOString() };
+      rememberFollowUp(optimistic);
+      if (!client) return;
+      try {
+        rememberFollowUp(await client.updateFollowUp(followUp.id, { status: "queued", error: null, pausedReason: null }));
+      } catch (cause) {
+        rememberFollowUp(previous);
+        const message = cause instanceof Error ? cause.message : "Unable to retry the follow-up";
+        toast.error(message);
+        throw cause;
+      }
+      return;
+    }
+
     const now = new Date().toISOString();
     const optimisticFollowUp: QueuedFollowUp = {
       ...followUp,
@@ -912,7 +921,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client) return;
     try {
       const retried = await client.followUpTurn(followUp.sessionId, { input: followUp.input, attachments: followUp.attachments });
-      if (!isLocalFollowUp(followUp)) await client.removeFollowUp(followUp.id);
       rememberFollowUp(retried, optimisticFollowUp.id);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Unable to retry the follow-up";
@@ -920,6 +928,83 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       toast.error(message);
     }
   }, [client, markFollowUpFailed, rememberFollowUp]);
+
+  const updateFollowUp = React.useCallback(async (followUp: QueuedFollowUp, input: string) => {
+    const previous = followUp;
+    const optimistic = { ...followUp, input, error: null, updatedAt: new Date().toISOString() };
+    rememberFollowUp(optimistic);
+    if (!client || isLocalFollowUp(followUp)) return;
+    try {
+      rememberFollowUp(await client.updateFollowUp(followUp.id, { input }));
+    } catch (cause) {
+      rememberFollowUp(previous);
+      toast.error(cause instanceof Error ? cause.message : "Unable to update the queued prompt");
+      throw cause;
+    }
+  }, [client, rememberFollowUp]);
+
+  const resumeFollowUps = React.useCallback(async (sessionId: string) => {
+    if (!client) return;
+    try {
+      const resumed = await client.resumeFollowUps(sessionId);
+      setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, resumed) }));
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Unable to resume the queue");
+      throw cause;
+    }
+  }, [client]);
+
+  const sendFollowUpNow = React.useCallback(async (followUp: QueuedFollowUp) => {
+    if (!client || isLocalFollowUp(followUp)) return;
+    if (followUpSendInFlightRef.current.has(followUp.id)) return;
+    const task = tasks.find((item) => item.id === followUp.taskId);
+    if (!task?.activeSessionId) throw new Error("This queued prompt no longer belongs to an active conversation.");
+    const currentlyActive = streamsBySession[followUp.sessionId]?.turnActive || startingSessions.has(followUp.sessionId);
+    const previous = followUp;
+    followUpSendInFlightRef.current.add(followUp.id);
+    rememberFollowUp({ ...followUp, status: "sending", error: null, pausedReason: null, updatedAt: new Date().toISOString() });
+    try {
+      if (currentlyActive) {
+        await client.steerFollowUp(followUp.id);
+      } else {
+        await client.updateFollowUp(followUp.id, { status: "sending", error: null, pausedReason: null });
+        await runTurn(task, {
+          input: followUp.input,
+          ...(followUp.attachments.length > 0 ? { attachments: followUp.attachments } : {}),
+          drainQueuedFollowUps: true,
+        });
+      }
+      await refreshFollowUps(followUp.sessionId);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "Unable to send the queued prompt";
+      if (currentlyActive) {
+        rememberFollowUp({ ...previous, status: "failed", error: message, updatedAt: new Date().toISOString() });
+      } else {
+        try { rememberFollowUp(await client.updateFollowUp(followUp.id, { status: "failed", error: message })); }
+        catch { rememberFollowUp({ ...previous, status: "failed", error: message, updatedAt: new Date().toISOString() }); }
+      }
+      toast.error(message);
+      throw cause;
+    } finally {
+      followUpSendInFlightRef.current.delete(followUp.id);
+    }
+  }, [client, refreshFollowUps, rememberFollowUp, runTurn, startingSessions, streamsBySession, tasks]);
+
+  const steerActiveTurn = React.useCallback(async (task: Task, input: string, attachments: AttachmentInput[]) => {
+    const sessionId = task.activeSessionId;
+    if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
+    const optimistic = optimisticUserMessage(sessionId, input, attachments);
+    replaceSessionMessages(sessionId, (current) => [...current, optimistic]);
+    try {
+      await client.steerTurn(sessionId, { input, attachments });
+      const persisted = [...await client.listMessages(sessionId)].reverse().find((message) => message.role === "user" && fullUserText(message) === input);
+      if (!persisted) throw new Error("The running task did not accept this steering message.");
+      replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, persisted));
+    } catch (cause) {
+      replaceSessionMessages(sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
+      throw cause;
+    }
+  }, [client, replaceSessionMessages]);
 
   const generateImage = React.useCallback(async (task: Task, prompt: string, appendUserMessage: boolean) => {
     const sessionId = task.activeSessionId;
@@ -1019,6 +1104,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       <Toaster position="bottom-right" />
       <BerryShellFrame
         className="berry-web-shell-frame"
+        sidebarWidth="min(20vw, 18rem)"
         chrome={
           <WebWindowChrome
             canGoBack={shellLocation.kind !== "home"}
@@ -1217,7 +1303,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onRemoveFollowUp={removeFollowUp}
               onRetryFollowUp={retryFollowUp}
               onReorderFollowUps={reorderFollowUps}
-              onSteerFollowUp={steerFollowUp}
+              onSteerFollowUp={sendFollowUpNow}
+              onUpdateFollowUp={updateFollowUp}
+              onResumeFollowUps={resumeFollowUps}
+              onSteerMessage={steerActiveTurn}
               planProgress={planProgressFromConversation(messages, stream)}
               question={stream.question}
               onCreateTask={createTask}
@@ -1286,7 +1375,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onRemoveFollowUp={removeFollowUp}
                 onRetryFollowUp={retryFollowUp}
                 onReorderFollowUps={reorderFollowUps}
-                onSteerFollowUp={steerFollowUp}
+                onSteerFollowUp={sendFollowUpNow}
+                onUpdateFollowUp={updateFollowUp}
+                onResumeFollowUps={resumeFollowUps}
+                onSteerMessage={steerActiveTurn}
                 onCreateTask={createTask}
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}

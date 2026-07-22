@@ -204,14 +204,14 @@ function EscapePlugin({ onEscape }: { onEscape: () => void }) {
   return null;
 }
 
-function SubmitPlugin({ onSubmit }: { onSubmit: () => void }) {
+function SubmitPlugin({ onSubmit }: { onSubmit: (event: KeyboardEvent | null) => void }) {
   const [editor] = useLexicalComposerContext();
   const submitRef = React.useRef(onSubmit);
   submitRef.current = onSubmit;
   React.useEffect(() => editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
     if (event?.shiftKey) return false;
     event?.preventDefault();
-    submitRef.current();
+    submitRef.current(event ?? null);
     return true;
   }, COMMAND_PRIORITY_HIGH), [editor]);
   return null;
@@ -299,7 +299,7 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
     initialText?: string | undefined;
     mentions?: PromptEditorMentions | undefined;
     onChange: (text: string) => void;
-    onSubmit: () => void;
+  onSubmit: (event: KeyboardEvent | null) => void;
     onEscape?: (() => void) | undefined;
     onPasteEvent?: ((event: ClipboardEvent) => boolean) | undefined;
     testId?: string;

@@ -21,6 +21,7 @@ import { PERSONAL_CAPABILITIES, PersonalCapabilitiesService } from "./personal-c
 import { OrganizationCapabilitiesController } from "./organization-capabilities.controller.ts";
 import { ORGANIZATION_CAPABILITIES, OrganizationCapabilitiesService } from "./organization-capabilities.service.ts";
 import { ManagementModule, type ManagementModuleOptions } from "../management/management.module.ts";
+import { FilePlatformModule } from "../files/file-platform.module.ts";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -69,6 +70,7 @@ export class AgentApiModule {
         ModelGovernanceModule.register({ ...(options.modelGovernance ?? {}), identity: options.modelGovernance?.identity ?? options.identity }),
         PolicyDistributionModule.register({ ...(options.policyDistribution ?? {}), identity: options.policyDistribution?.identity ?? options.identity }),
         ManagementModule.register({ ...(options.management ?? {}), ...((options.management?.identity ?? options.identity) ? { identity: options.management?.identity ?? options.identity } : {}) }),
+        FilePlatformModule,
         SessionHostModule.register(options.sessionHost),
       ],
       controllers: [AgentApiController, PersonalCapabilitiesController, OrganizationCapabilitiesController],

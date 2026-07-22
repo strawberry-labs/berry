@@ -2292,7 +2292,7 @@ export const MultipartUploadPartUrlSchema = z.object({
 export const MultipartUploadPartUrlsSchema = z.object({ parts: z.array(MultipartUploadPartUrlSchema) });
 export type MultipartUploadPartUrl = z.infer<typeof MultipartUploadPartUrlSchema>;
 
-export const QueuedFollowUpStatusSchema = z.enum(["queued", "delivered", "failed", "removed"]);
+export const QueuedFollowUpStatusSchema = z.enum(["queued", "sending", "paused", "delivered", "failed", "removed"]);
 export const QueuedFollowUpSchema = z.object({
   id: z.string(),
   taskId: z.string(),
@@ -2302,6 +2302,7 @@ export const QueuedFollowUpSchema = z.object({
   attachments: z.array(AttachmentInputSchema).default([]),
   status: QueuedFollowUpStatusSchema,
   error: z.string().nullable().default(null),
+  pausedReason: z.string().nullable().default(null),
   createdAt: ISODateSchema,
   updatedAt: ISODateSchema,
 });

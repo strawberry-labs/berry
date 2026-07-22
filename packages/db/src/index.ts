@@ -2148,6 +2148,19 @@ CREATE POLICY queued_follow_ups_tenant_isolation ON queued_follow_ups
   WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+/**
+ * Queue entries are durable user intent.  A cancelled runtime must not drop
+ * them, so this migration adds a recoverable paused state without changing
+ * the original migration used by already-running installations.
+ */
+export const QUEUED_FOLLOW_UPS_STATE_V2_MIGRATION = `
+ALTER TABLE queued_follow_ups ADD COLUMN IF NOT EXISTS paused_reason text;
+ALTER TABLE queued_follow_ups DROP CONSTRAINT IF EXISTS queued_follow_ups_status_check;
+ALTER TABLE queued_follow_ups
+  ADD CONSTRAINT queued_follow_ups_status_check
+  CHECK (status IN ('queued', 'sending', 'paused', 'delivered', 'failed', 'removed'));
+`.trim();
+
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -2601,4 +2614,5 @@ export const cloudMigrations = [
   { id: 19, name: "settings_administration_v1", sql: MANAGEMENT_ADMIN_MIGRATION },
   { id: 20, name: "message_attachments_v1", sql: MESSAGE_ATTACHMENTS_MIGRATION },
   { id: 21, name: "file_platform_v1", sql: FILE_PLATFORM_MIGRATION },
+  { id: 22, name: "queued_follow_ups_state_v2", sql: QUEUED_FOLLOW_UPS_STATE_V2_MIGRATION },
 ] as const;

@@ -96,8 +96,7 @@ input:not([data-slot="input"]):focus-visible,
 select:focus-visible,
 textarea:not([data-slot="textarea"]):focus-visible,
 [contenteditable="true"]:focus-visible {
-  outline: 2px solid var(--berry-focus);
-  outline-offset: 2px;
+  outline: none;
 }
 
 /* The desktop prompt uses only its caret as focus feedback. A generic
@@ -105,6 +104,24 @@ textarea:not([data-slot="textarea"]):focus-visible,
    horizontal rule, so keep the shared prompt treatment intact on web. */
 .berry-prompt-editor:focus-visible {
   outline: none;
+}
+
+/* Berry's web surface stays visually quiet on focus. Popovers and dialogs are
+   portalled beside `.berry-web-shell`, so this must be document-scoped rather
+   than shell-scoped. Shared shadcn primitives add ring utilities individually;
+   neutralize both direct focus and parent focus-within treatments here. */
+body :focus {
+  outline: none !important;
+  --tw-ring-color: transparent !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+  --tw-ring-offset-shadow: 0 0 #0000 !important;
+}
+
+body :focus-visible,
+body :is([data-slot="attachment"], [data-slot="input-group"], .mgmt-skill-dropzone, .mgmt-searchbox):focus-within {
+  outline: none !important;
+  border-color: var(--berry-border-strong) !important;
+  box-shadow: none !important;
 }
 
 .app-shell {
@@ -530,9 +547,10 @@ textarea:not([data-slot="textarea"]):focus-visible,
 
 .mentions-menu {
   position: absolute;
-  left: 10px;
+  right: 0;
+  left: 0;
   bottom: 100%;
-  width: min(420px, calc(100vw - 40px));
+  width: auto;
   max-height: 320px;
   overflow: auto;
   border: 0;
@@ -599,13 +617,15 @@ textarea:not([data-slot="textarea"]):focus-visible,
 }
 
 .mention-row-label {
-  flex: 0 1 auto;
-  max-width: 42%;
+  /* The command name is the primary scan target; leave the secondary copy to
+     yield first, rather than truncating names after a few words. */
+  flex: 1 1 52%;
+  max-width: 56%;
   color: var(--berry-text);
 }
 
 .mention-row-description {
-  flex: 1 1 auto;
+  flex: 1 2 44%;
   color: var(--berry-tertiary);
   opacity: 0.7;
 }
@@ -1351,6 +1371,141 @@ code, pre {
 .berry-composer-root > .berry-composer-shell {
   position: relative;
   z-index: 1;
+}
+
+/* Pending prompts deliberately sit behind the composer: the card nearest the
+   input is next to run, while later prompts stack upward. */
+.berry-queued-message-list {
+  position: absolute;
+  right: 18px;
+  bottom: calc(100% - 18px);
+  left: 18px;
+  z-index: 0;
+  max-height: min(30dvh, 260px);
+  overflow: hidden;
+  border: 1px solid var(--berry-border);
+  border-radius: 22px 22px 0 0;
+  background: var(--berry-card-bg);
+  box-shadow: var(--berry-shadow-md), inset 0 1px 0 var(--berry-border);
+  pointer-events: auto;
+}
+
+.berry-queued-message-scroll {
+  display: flex;
+  max-height: min(30dvh, 260px);
+  flex-direction: column-reverse;
+  gap: 2px;
+  overflow: auto;
+  padding: 8px 8px 22px;
+}
+
+.berry-queued-message-paused {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--berry-border);
+  padding: 5px 9px 4px 12px;
+  color: var(--berry-text-secondary);
+  font-size: 12px;
+}
+
+.berry-queued-message-paused span,
+.berry-queued-message-paused button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.berry-queued-message-paused svg { width: 14px; height: 14px; }
+
+.berry-queued-message-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 28px minmax(0, 1fr) max-content max-content 26px 26px;
+  align-items: center;
+  gap: 5px;
+  min-height: 46px;
+  border: 1px solid transparent;
+  border-radius: 15px;
+  padding: 6px 5px 6px 7px;
+  color: var(--berry-text-secondary);
+  transition: border-color 120ms ease-out, background-color 120ms ease-out, box-shadow 120ms ease-out, margin 120ms ease-out, opacity 120ms ease-out, transform 120ms ease-out;
+}
+
+.berry-queued-message-row:hover,
+.berry-queued-message-row:focus-within { background: var(--berry-selected); border-color: var(--berry-border); }
+.berry-queued-message-row.is-dragging { opacity: .82; transform: translateY(-2px) scale(1.01); box-shadow: var(--berry-shadow-md); }
+.berry-queued-message-row.is-drop-before { margin-bottom: 12px; box-shadow: 0 6px 0 -5px var(--berry-accent); }
+.berry-queued-message-row.is-drop-after { margin-top: 12px; box-shadow: 0 -6px 0 -5px var(--berry-accent); }
+
+.berry-queued-message-drag {
+  position: relative;
+  display: grid;
+  width: 28px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  background: transparent;
+  color: var(--berry-text-tertiary);
+  cursor: grab;
+}
+.berry-queued-message-drag:active { cursor: grabbing; }
+.berry-queued-message-drag svg { position: absolute; width: 16px; height: 16px; transition: opacity 100ms ease-out, transform 100ms ease-out; }
+.berry-queued-message-grip { opacity: 0; transform: scale(.85); }
+.berry-queued-message-row:hover .berry-queued-message-queue-icon,
+.berry-queued-message-row:focus-within .berry-queued-message-queue-icon { opacity: 0; transform: scale(.85); }
+.berry-queued-message-row:hover .berry-queued-message-grip,
+.berry-queued-message-row:focus-within .berry-queued-message-grip { opacity: 1; transform: scale(1); }
+
+.berry-queued-message-text { overflow: hidden; margin: 0; color: var(--berry-text); font-size: 13px; line-height: 18px; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
+.berry-queued-message-attachments { overflow: hidden; margin: 1px 0 0; color: var(--berry-text-tertiary); font-size: 11px; line-height: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.berry-queued-message-state { display: flex; align-items: center; gap: 4px; margin: 2px 0 0; color: var(--berry-text-tertiary); font-size: 11px; line-height: 14px; }
+.berry-queued-message-state[data-state="failed"] { color: var(--berry-danger); }
+.berry-queued-message-state svg { width: 12px; height: 12px; }
+.berry-queued-message-status { color: var(--berry-text-tertiary); font-size: 11px; white-space: nowrap; }
+.berry-queued-message-action { min-height: 26px; padding-inline: 6px; color: var(--berry-text-secondary); font-size: 12px; }
+.berry-queued-message-action svg { width: 13px; height: 13px; }
+.berry-queued-message-delete { color: var(--berry-text-tertiary); }
+.berry-queued-message-edit { width: 100%; height: 27px; border: 1px solid var(--berry-border-strong); border-radius: 8px; background: var(--berry-control-bg); padding: 0 7px; color: var(--berry-text); font-size: 13px; outline: none; }
+
+.berry-composer-context-row {
+  min-height: 38px;
+  border-bottom: 1px solid var(--berry-border);
+  padding-bottom: 7px;
+}
+
+.berry-composer-context-value {
+  display: inline-flex;
+  max-width: min(30vw, 190px);
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  border-radius: 8px;
+  padding: 4px 6px;
+  color: var(--berry-text-tertiary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.berry-composer-context-value svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.berry-follow-up-mode { gap: 5px; color: var(--berry-text-secondary); font-size: 12px; }
+.berry-follow-up-mode svg { width: 14px; height: 14px; }
+
+@media (max-width: 640px) {
+  .berry-queued-message-list { right: 8px; bottom: calc(100% - 12px); left: 8px; }
+  .berry-queued-message-scroll { max-height: min(38dvh, 300px); padding: 7px 6px 16px; }
+  .berry-queued-message-row { grid-template-columns: 28px minmax(0, 1fr) max-content 26px 26px; }
+  .berry-queued-message-status { display: none; }
+  .berry-queued-message-action { padding-inline: 4px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .berry-queued-message-row,
+  .berry-queued-message-drag svg { transition: none; }
 }
 
 /* A pending ask_user_question owns the composer surface. The actual text
@@ -2640,7 +2795,7 @@ code, pre {
 }
 .mgmt-skill-dropzone:hover { border-color: var(--berry-accent); background: var(--berry-hover); }
 .mgmt-skill-dropzone:active { transform: scale(.99); }
-.mgmt-skill-dropzone:focus-within { border-color: var(--berry-focus); box-shadow: 0 0 0 2px var(--berry-accent-soft); }
+.mgmt-skill-dropzone:focus-within { border-color: var(--berry-border-strong); box-shadow: none; }
 .mgmt-skill-dropzone > input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
 .mgmt-skill-dropzone > svg { width: 19px; height: 19px; flex: none; color: var(--berry-accent); }
 .mgmt-skill-dropzone > span { display: grid; min-width: 0; gap: 3px; }
@@ -2667,7 +2822,7 @@ code, pre {
 
 /* Interactive tables + detail drawer layout */
 .mgmt-table-interactive tbody tr { cursor: pointer; }
-.mgmt-table-interactive tbody tr:focus-visible { outline: 2px solid var(--berry-accent); outline-offset: -2px; }
+.mgmt-table-interactive tbody tr:focus-visible { outline: none; }
 .mgmt-table tbody tr[data-active] { background: var(--berry-accent-soft); box-shadow: inset 2px 0 0 var(--berry-accent); }
 .mgmt-cell-strong { display: grid; gap: 1px; min-width: 0; }
 .mgmt-cell-strong b { font-weight: 580; }
@@ -2734,14 +2889,14 @@ code, pre {
    InputGroup wrapper. The global native fallback above excludes shadcn slots. */
 .mgmt-page :is([data-slot="button"], [data-slot="input"], [data-slot="textarea"], [data-slot="select-trigger"], [data-slot="switch"], [data-slot="checkbox"], [data-slot="tabs-trigger"]):focus-visible {
   outline: none;
-  border-color: var(--berry-focus);
-  box-shadow: 0 0 0 2px var(--berry-accent-soft);
+  border-color: var(--berry-border-strong);
+  box-shadow: none;
 }
 .mgmt-page .mgmt-searchbox:has([data-slot="input-group-control"]:focus-visible) {
-  border-color: var(--berry-focus);
-  box-shadow: 0 0 0 2px var(--berry-accent-soft) !important;
+  border-color: var(--berry-border-strong);
+  box-shadow: none !important;
 }
-.mgmt-page .mgmt-table-interactive tbody tr:focus-visible { outline: 2px solid var(--berry-focus); outline-offset: -2px; box-shadow: inset 0 0 0 1px var(--berry-focus); }
+.mgmt-page .mgmt-table-interactive tbody tr:focus-visible { outline: none; box-shadow: none; }
 
 /* Transitions.dev toggle — the thumb class is supplied by the shared
    shadcn Switch and only animates after the first user interaction. */

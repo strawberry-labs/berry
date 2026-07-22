@@ -14,6 +14,7 @@ import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { BudgetService, InMemoryBudgetHotCounters, InMemoryBudgetRepository } from "../budget/budget.service.ts";
 import { InMemoryModelGovernanceRepository, ModelGovernanceService } from "../model-governance/model-governance.service.ts";
 import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
+import { FilePlatformService } from "../files/file-platform.service.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -159,14 +160,14 @@ describe("AgentApiController", () => {
   });
 
   it("persists queued follow-ups separately from steering", async () => {
-    const followUp = vi.fn(async () => ({ queued: true as const }));
-    app = await createApp(fakeSessionHost({ followUp }));
+    const replaceFollowUpQueue = vi.fn(async () => undefined);
+    app = await createApp(fakeSessionHost({ replaceFollowUpQueue }));
     const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Queue task" }).expect(201);
     const sessionId = created.body.session.id as string;
 
     const queued = await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Run this next" }).expect(201);
     expect(queued.body).toMatchObject({ taskId: created.body.task.id, sessionId, ordinal: 0, input: "Run this next", status: "queued" });
-    expect(followUp).toHaveBeenCalledWith(sessionId, "Run this next", [], undefined);
+    expect(replaceFollowUpQueue).toHaveBeenCalledWith(sessionId, [expect.objectContaining({ input: "Run this next" })]);
     await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(200).expect(({ body }) => {
       expect(body).toEqual([expect.objectContaining({ id: queued.body.id, status: "queued" })]);
     });
@@ -174,6 +175,43 @@ describe("AgentApiController", () => {
       expect(body.status).toBe("removed");
     });
     await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(200).expect([]);
+  });
+
+  it("pauses interrupted follow-ups and lets the user resume them", async () => {
+    const cancel = vi.fn(async () => true);
+    app = await createApp(fakeSessionHost({ cancel }));
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Recover queued work" }).expect(201);
+    const sessionId = created.body.session.id as string;
+
+    const queued = await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Keep this for later" }).expect(201);
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/cancel`).set(authHeader()).expect(201).expect({ ok: true });
+    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(200).expect(({ body }) => {
+      expect(body).toEqual([expect.objectContaining({ id: queued.body.id, status: "paused", pausedReason: "You interrupted the active run." })]);
+    });
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups/resume`).set(authHeader()).expect(201).expect(({ body }) => {
+      expect(body).toEqual([expect.objectContaining({ id: queued.body.id, status: "queued", pausedReason: null })]);
+    });
+  });
+
+  it("loads later queued follow-ups when an idle queued prompt is sent now", async () => {
+    const replaceFollowUpQueue = vi.fn(async () => undefined);
+    app = await createApp(fakeSessionHost({ replaceFollowUpQueue }));
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Drain queued work" }).expect(201);
+    const sessionId = created.body.session.id as string;
+    const first = await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "First queued prompt" }).expect(201);
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Second queued prompt" }).expect(201);
+    await request(app.getHttpServer()).patch(`/v1/follow-ups/${first.body.id}`).set(authHeader()).send({ status: "sending" }).expect(200);
+    replaceFollowUpQueue.mockClear();
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/turns`).set(authHeader()).send({
+      input: "First queued prompt",
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+      drainQueuedFollowUps: true,
+    }).expect(201);
+
+    expect(replaceFollowUpQueue).toHaveBeenCalledWith(sessionId, [expect.objectContaining({ input: "Second queued prompt" })]);
   });
 
   it("owns a bounded browser-safe sandbox workspace per task", async () => {
@@ -211,8 +249,9 @@ describe("AgentApiController", () => {
   it("manages user-scoped skills and remote MCP without returning credentials", async () => {
     const startTurn = vi.fn(() => ({ turnId: "turn_capabilities" }));
     app = await createApp(fakeSessionHost({ startTurn }));
-    const review = await request(app.getHttpServer()).post("/v1/me/skills/review").set(authHeader()).send({ name: "Review helper", description: "Reviews changes", content: "# Review helper\nCheck tests.", source: "text" }).expect(201);
-    const skill = await request(app.getHttpServer()).post("/v1/me/skills").set(authHeader()).send({ name: "Review helper", description: "Reviews changes", content: "# Review helper\nCheck tests.", source: "text", confirmedHash: review.body.hash, trusted: true }).expect(201);
+    const skillContent = "---\nname: review-helper\ndescription: Reviews changes\n---\n# Review helper\nCheck tests.";
+    const review = await request(app.getHttpServer()).post("/v1/me/skills/review").set(authHeader()).send({ name: "review-helper", description: "Reviews changes", content: skillContent, source: "text" }).expect(201);
+    const skill = await request(app.getHttpServer()).post("/v1/me/skills").set(authHeader()).send({ name: "review-helper", description: "Reviews changes", content: skillContent, source: "text", confirmedHash: review.body.hash, trusted: true, enabled: true }).expect(201);
     await request(app.getHttpServer()).get("/v1/me/skills").set(authHeader()).expect(200).expect(({ body }) => expect(body).toContainEqual(expect.objectContaining({ id: skill.body.id, trusted: true })));
     await request(app.getHttpServer()).get("/v1/me/skills").set(authHeader("berry-other-session")).expect(200).expect([]);
 
@@ -223,7 +262,7 @@ describe("AgentApiController", () => {
     await request(app.getHttpServer()).patch(`/v1/me/mcp/${mcp.body.id}`).set(authHeader("berry-other-session")).send({ enabled: false }).expect(404);
     const task = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud" }).expect(201);
     await request(app.getHttpServer()).post(`/v1/sessions/${task.body.session.id}/turns`).set(authHeader()).send({ input: "Use my capabilities", workspacePath: "/workspace", provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" } }).expect(201);
-    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({ extraSkills: [expect.objectContaining({ name: "Review helper" })], mcpServers: [expect.objectContaining({ id: mcp.body.id })] }));
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({ extraSkills: [expect.objectContaining({ name: "review-helper" })], mcpServers: [expect.objectContaining({ id: mcp.body.id })] }));
 
     const oauth = await request(app.getHttpServer()).post("/v1/me/mcp").set(authHeader()).send({ name: "OAuth tools", url: "https://oauth.example.test/mcp", transport: "http-sse", auth: "oauth" }).expect(201);
     const flow = await request(app.getHttpServer()).post(`/v1/me/mcp/${oauth.body.id}/oauth/start`).set(authHeader()).send({ redirectUri: "https://berry.example.test/oauth/callback" }).expect(201);
@@ -563,11 +602,19 @@ async function createApp(sessionHost: SessionHost, options: { budget?: BudgetSer
       ...(options.budget ? { budget: { service: { useValue: options.budget } } } : {}),
       ...(options.modelGovernance ? { modelGovernance: { service: { useValue: options.modelGovernance } } } : {}),
     })],
-  }).compile();
+  })
+    .overrideProvider(FilePlatformService)
+    .useValue(fakeFilePlatformService)
+    .compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
   return nestApp;
 }
+
+const fakeFilePlatformService = {
+  runtimeAttachments: async (_tenantId: string, _userId: string, attachments: unknown[]) => attachments,
+  associateInputFiles: async () => undefined,
+};
 
 function nextTick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -624,6 +671,7 @@ function fakeSessionHost(overrides: Partial<SessionHost> = {}): SessionHost {
     contextStats: async () => ({ usedTokens: 0, source: "unknown" }),
     steer: async () => ({ queued: true }),
     followUp: async () => ({ queued: true }),
+    replaceFollowUpQueue: async () => undefined,
     fork: async () => ({ sessionId: "session_fork" }),
     rewind: async () => {},
     rewindForEdit: async () => {},
