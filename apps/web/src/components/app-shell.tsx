@@ -41,8 +41,8 @@ import { PromptEditor, type PromptEditorHandle } from "./prompt-editor";
 import { AuthBoundary, type SignedInUser } from "./shell/auth-boundary";
 import { TaskRouteState } from "./tasks/task-route-state";
 import { Composer } from "./tasks/web-composer";
-import { TaskContextRail } from "./tasks/task-context-rail";
 import { Thread } from "./tasks/web-task-view";
+import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { replaceTenantValue, settledValue } from "@/lib/management/config-refresh";
 import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sidebar";
@@ -58,6 +58,58 @@ export interface ShellData {
   config: WebConfig;
   tasks: Task[];
   messages: Message[];
+}
+
+const LOCAL_FOLLOW_UP_PREFIX = "local_follow_up_";
+
+function isLocalFollowUp(followUp: QueuedFollowUp): boolean {
+  return followUp.id.startsWith(LOCAL_FOLLOW_UP_PREFIX);
+}
+
+function followUpOrderStorageKey(sessionId: string): string {
+  return `berry.web.followUpOrder:${sessionId}`;
+}
+
+function savedFollowUpOrder(sessionId: string): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const value = JSON.parse(window.localStorage.getItem(followUpOrderStorageKey(sessionId)) ?? "[]");
+    return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveFollowUpOrder(sessionId: string, orderedIds: string[]): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(followUpOrderStorageKey(sessionId), JSON.stringify(orderedIds));
+}
+
+function orderFollowUps(sessionId: string, followUps: QueuedFollowUp[]): QueuedFollowUp[] {
+  const fallback = [...followUps].sort((left, right) => left.ordinal - right.ordinal);
+  const saved = savedFollowUpOrder(sessionId);
+  if (saved.length === 0) return fallback;
+  const position = new Map(saved.map((id, index) => [id, index]));
+  return fallback.sort((left, right) => {
+    const leftPosition = position.get(left.id);
+    const rightPosition = position.get(right.id);
+    if (leftPosition === undefined && rightPosition === undefined) return left.ordinal - right.ordinal;
+    if (leftPosition === undefined) return 1;
+    if (rightPosition === undefined) return -1;
+    return leftPosition - rightPosition;
+  });
+}
+
+function replaceFollowUpOrderId(sessionId: string, oldId: string, newId: string): void {
+  const saved = savedFollowUpOrder(sessionId);
+  if (!saved.includes(oldId)) return;
+  saveFollowUpOrder(sessionId, saved.map((id) => id === oldId ? newId : id));
+}
+
+function removeFollowUpOrderId(sessionId: string, followUpId: string): void {
+  const saved = savedFollowUpOrder(sessionId);
+  if (!saved.includes(followUpId)) return;
+  saveFollowUpOrder(sessionId, saved.filter((id) => id !== followUpId));
 }
 
 export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks" | "messages"> {
@@ -279,7 +331,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client || !sessionId) return;
     let cancelled = false;
     void client.listFollowUps(sessionId)
-      .then((items) => { if (!cancelled) setFollowUpsBySession((current) => ({ ...current, [sessionId]: items })); })
+      .then((items) => { if (!cancelled) setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, items) })); })
       .catch((cause) => setResourceError("followUps", cause instanceof Error ? cause.message : "Unable to load queued follow-ups"));
     return () => { cancelled = true; };
   }, [activeTask?.activeSessionId, client]);
@@ -786,29 +838,88 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [client]);
 
   const removeFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    const previousOrder = savedFollowUpOrder(followUp.sessionId);
     setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: (current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id) }));
+    removeFollowUpOrderId(followUp.sessionId, followUp.id);
+    if (!client || isLocalFollowUp(followUp)) return;
     try {
-      if (client) await client.removeFollowUp(followUp.id);
+      await client.removeFollowUp(followUp.id);
     } catch (cause) {
-      setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: [...(current[followUp.sessionId] ?? []), followUp].sort((a, b) => a.ordinal - b.ordinal) }));
+      if (previousOrder.length > 0) saveFollowUpOrder(followUp.sessionId, previousOrder);
+      setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: orderFollowUps(followUp.sessionId, [...(current[followUp.sessionId] ?? []), followUp]) }));
       toast.error(cause instanceof Error ? cause.message : "Unable to remove the follow-up");
     }
   }, [client]);
 
-  const rememberFollowUp = React.useCallback((followUp: QueuedFollowUp) => {
-    setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: [...(current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id), followUp].sort((a, b) => a.ordinal - b.ordinal) }));
+  const rememberFollowUp = React.useCallback((followUp: QueuedFollowUp, replaceId?: string) => {
+    if (replaceId) replaceFollowUpOrderId(followUp.sessionId, replaceId, followUp.id);
+    setFollowUpsBySession((current) => ({
+      ...current,
+      [followUp.sessionId]: orderFollowUps(followUp.sessionId, [
+        ...(current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id && item.id !== replaceId),
+        followUp,
+      ]),
+    }));
   }, []);
 
+  const markFollowUpFailed = React.useCallback((followUp: QueuedFollowUp, error: string) => {
+    rememberFollowUp({ ...followUp, status: "failed", error, updatedAt: new Date().toISOString() });
+  }, [rememberFollowUp]);
+
+  const reorderFollowUps = React.useCallback((sessionId: string, orderedIds: string[]) => {
+    saveFollowUpOrder(sessionId, orderedIds);
+    setFollowUpsBySession((current) => ({
+      ...current,
+      [sessionId]: orderFollowUps(sessionId, current[sessionId] ?? []),
+    }));
+    const hasLocalFollowUp = orderedIds.some((id) => id.startsWith(LOCAL_FOLLOW_UP_PREFIX));
+    if (!client || hasLocalFollowUp) return;
+    void client.reorderFollowUps(sessionId, orderedIds)
+      .then((followUps) => setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, followUps) })))
+      .catch((cause) => toast.error(cause instanceof Error ? cause.message : "Unable to save the queue order"));
+  }, [client]);
+
+  const steerFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    if (!client || isLocalFollowUp(followUp)) return;
+    const previousOrder = savedFollowUpOrder(followUp.sessionId);
+    setFollowUpsBySession((current) => ({
+      ...current,
+      [followUp.sessionId]: (current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id),
+    }));
+    removeFollowUpOrderId(followUp.sessionId, followUp.id);
+    try {
+      await client.steerFollowUp(followUp.id);
+    } catch (cause) {
+      if (previousOrder.length > 0) saveFollowUpOrder(followUp.sessionId, previousOrder);
+      setFollowUpsBySession((current) => ({
+        ...current,
+        [followUp.sessionId]: orderFollowUps(followUp.sessionId, [...(current[followUp.sessionId] ?? []), followUp]),
+      }));
+      toast.error(cause instanceof Error ? cause.message : "Unable to steer the running task");
+    }
+  }, [client]);
+
   const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    const now = new Date().toISOString();
+    const optimisticFollowUp: QueuedFollowUp = {
+      ...followUp,
+      id: `${LOCAL_FOLLOW_UP_PREFIX}${globalThis.crypto.randomUUID()}`,
+      status: "queued",
+      error: null,
+      updatedAt: now,
+    };
+    rememberFollowUp(optimisticFollowUp, followUp.id);
     if (!client) return;
     try {
       const retried = await client.followUpTurn(followUp.sessionId, { input: followUp.input, attachments: followUp.attachments });
-      await client.removeFollowUp(followUp.id);
-      setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: [...(current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id), retried].sort((a, b) => a.ordinal - b.ordinal) }));
+      if (!isLocalFollowUp(followUp)) await client.removeFollowUp(followUp.id);
+      rememberFollowUp(retried, optimisticFollowUp.id);
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to retry the follow-up");
+      const message = cause instanceof Error ? cause.message : "Unable to retry the follow-up";
+      markFollowUpFailed(optimisticFollowUp, message);
+      toast.error(message);
     }
-  }, [client]);
+  }, [client, markFollowUpFailed, rememberFollowUp]);
 
   const generateImage = React.useCallback(async (task: Task, prompt: string, appendUserMessage: boolean) => {
     const sessionId = task.activeSessionId;
@@ -1102,8 +1213,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onCommand={runSlashCommand}
               queuedFollowUps={activeTask.activeSessionId ? followUpsBySession[activeTask.activeSessionId] ?? [] : []}
               onQueuedFollowUp={rememberFollowUp}
+              onQueuedFollowUpFailed={markFollowUpFailed}
               onRemoveFollowUp={removeFollowUp}
               onRetryFollowUp={retryFollowUp}
+              onReorderFollowUps={reorderFollowUps}
+              onSteerFollowUp={steerFollowUp}
+              planProgress={planProgressFromConversation(messages, stream)}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
               runTurn={runTurn}
@@ -1128,25 +1243,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onEvent={updateSessionStream}
             />
           </section>
-          <TaskContextRail
-            workspaces={workspaces}
-            activeWorkspaceId={activeWorkspaceId}
-            activeTaskId={activeTask.id}
-            tasks={visibleTasks}
-            onSelectWorkspace={(workspaceId) => {
-              setActiveWorkspaceId(workspaceId);
-              const taskId = tasks.find((task) => task.workspaceId === workspaceId && !task.deletedAt && !task.archived)?.id;
-              if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
-              else if (!taskId) navigateHome();
-            }}
-            onOpenTask={(taskId) => {
-              const task = tasks.find((candidate) => candidate.id === taskId);
-              if (task) setActiveWorkspaceId(task.workspaceId);
-              navigateToTask(taskId);
-            }}
-            onNewTask={navigateHome}
-            onCreateProject={() => setCreatingProject(true)}
-          />
         </div>
         </>
         ) : shellLocation.kind === "task" ? (
@@ -1185,8 +1281,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onCommand={runSlashCommand}
                 queuedFollowUps={[]}
                 onQueuedFollowUp={rememberFollowUp}
+                onQueuedFollowUpFailed={markFollowUpFailed}
                 onRemoveFollowUp={removeFollowUp}
                 onRetryFollowUp={retryFollowUp}
+                onReorderFollowUps={reorderFollowUps}
+                onSteerFollowUp={steerFollowUp}
                 onCreateTask={createTask}
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}

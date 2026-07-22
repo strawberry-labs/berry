@@ -96,6 +96,10 @@ const SteerTurnRequestSchema = z.object({
   attachments: z.array(AttachmentInputSchema).max(100).optional(),
 }).strict();
 
+const ReorderFollowUpsRequestSchema = z.object({
+  followUpIds: z.array(z.string().min(1)).max(100),
+}).strict();
+
 const ImageGenerationRequestSchema = z.object({
   prompt: z.string().trim().min(1).max(8_000),
   size: z.enum(["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]).optional(),
@@ -120,6 +124,7 @@ const PreviewRequestSchema = z.object({ port: z.number().int().min(1).max(65_535
 @Controller("/v1")
 export class AgentApiController {
   readonly #projectionWrites = new Map<string, Promise<void>>();
+  readonly #followUpQueueWrites = new Map<string, Promise<void>>();
   readonly #startedAt = Date.now();
 
   constructor(
@@ -148,6 +153,48 @@ export class AgentApiController {
         if (this.#projectionWrites.get(sessionId) === next) this.#projectionWrites.delete(sessionId);
       });
     this.#projectionWrites.set(sessionId, next);
+  }
+
+  /**
+   * The queue is edited optimistically in the browser, so several queue
+   * mutations can reach the API in quick succession. Serialize runtime
+   * replacement per session: every pass reads the latest persisted order,
+   * rather than allowing two clear-and-rebuild operations to interleave.
+   */
+  async #synchronizeFollowUpQueue(httpRequest: AuthenticatedRequest, sessionId: string) {
+    const previous = this.#followUpQueueWrites.get(sessionId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => this.#synchronizeFollowUpQueueNow(httpRequest, sessionId));
+    const tracked = next.then(() => undefined, () => undefined);
+    this.#followUpQueueWrites.set(sessionId, tracked);
+    try {
+      return await next;
+    } finally {
+      if (this.#followUpQueueWrites.get(sessionId) === tracked) this.#followUpQueueWrites.delete(sessionId);
+    }
+  }
+
+  async #synchronizeFollowUpQueueNow(httpRequest: AuthenticatedRequest, sessionId: string) {
+    const session = await this.store.getSession(sessionId);
+    const followUps = await this.store.listFollowUps(sessionId, httpRequest.auth?.user.id ?? null);
+    const queued = followUps.filter((followUp) => followUp.status === "queued");
+    const runtimeFollowUps = await Promise.all(queued.map(async (followUp) => {
+      const attachments = await this.files.runtimeAttachments(
+        tenantIdFromRequest(httpRequest),
+        httpRequest.auth!.user.id,
+        followUp.attachments,
+        { taskId: session.taskId, sessionId },
+      );
+      const normalizedAttachments = normalizeAttachments(attachments);
+      return {
+        input: followUp.input,
+        images: imagesFromAttachments(attachments),
+        ...(normalizedAttachments ? { attachments: normalizedAttachments } : {}),
+      };
+    }));
+    await this.sessionHost.replaceFollowUpQueue(sessionId, runtimeFollowUps);
+    return followUps;
   }
 
   @Get("/models/catalog")
@@ -720,6 +767,14 @@ export class AgentApiController {
     return this.store.listFollowUps(sessionId, httpRequest.auth?.user.id ?? null);
   }
 
+  @Post("/sessions/:sessionId/follow-ups/reorder")
+  async reorderFollowUps(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
+    const request = parseBody(ReorderFollowUpsRequestSchema, body);
+    const reordered = await this.store.reorderFollowUps(sessionId, request.followUpIds, httpRequest.auth?.user.id ?? null);
+    if (this.sessionHost.turnState(sessionId).active) await this.#synchronizeFollowUpQueue(httpRequest, sessionId);
+    return reordered;
+  }
+
   @Post("/sessions/:sessionId/follow-ups")
   async followUpTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(SteerTurnRequestSchema, body);
@@ -734,7 +789,7 @@ export class AgentApiController {
       messageId: message.id,
     });
     try {
-      await this.sessionHost.followUp(sessionId, request.input, imagesFromAttachments(runtimeAttachments), normalizeAttachments(runtimeAttachments));
+      await this.#synchronizeFollowUpQueue(httpRequest, sessionId);
       return queued;
     } catch (cause) {
       await this.store.updateFollowUp(queued.id, { status: "failed", error: cause instanceof Error ? cause.message : "Unable to queue follow-up" }, httpRequest.auth?.user.id ?? null);
@@ -742,9 +797,33 @@ export class AgentApiController {
     }
   }
 
+  @Post("/follow-ups/:followUpId/steer")
+  async steerFollowUp(@Req() httpRequest: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
+    const followUp = await this.store.updateFollowUp(followUpId, { status: "removed" }, httpRequest.auth?.user.id ?? null);
+    try {
+      await this.#synchronizeFollowUpQueue(httpRequest, followUp.sessionId);
+      const session = await this.store.getSession(followUp.sessionId);
+      const attachments = await this.files.runtimeAttachments(
+        tenantIdFromRequest(httpRequest),
+        httpRequest.auth!.user.id,
+        followUp.attachments,
+        { taskId: session.taskId, sessionId: followUp.sessionId },
+      );
+      return this.sessionHost.steer(followUp.sessionId, followUp.input, imagesFromAttachments(attachments), normalizeAttachments(attachments));
+    } catch (cause) {
+      await this.store.updateFollowUp(followUp.id, { status: "queued", error: cause instanceof Error ? cause.message : "Unable to steer this queued prompt" }, httpRequest.auth?.user.id ?? null);
+      if (this.sessionHost.turnState(followUp.sessionId).active) {
+        await this.#synchronizeFollowUpQueue(httpRequest, followUp.sessionId).catch(() => undefined);
+      }
+      throw cause;
+    }
+  }
+
   @Delete("/follow-ups/:followUpId")
-  removeFollowUp(@Req() httpRequest: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
-    return this.store.updateFollowUp(followUpId, { status: "removed" }, httpRequest.auth?.user.id ?? null);
+  async removeFollowUp(@Req() httpRequest: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
+    const removed = await this.store.updateFollowUp(followUpId, { status: "removed" }, httpRequest.auth?.user.id ?? null);
+    if (this.sessionHost.turnState(removed.sessionId).active) await this.#synchronizeFollowUpQueue(httpRequest, removed.sessionId);
+    return removed;
   }
 
   @Get("/approvals")

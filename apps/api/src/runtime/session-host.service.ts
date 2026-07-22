@@ -30,6 +30,11 @@ export class SessionHostService implements SessionHost, OnApplicationShutdown {
   contextStats(sessionId: string, options?: RuntimeContextStatsOptions) { return this.#driver.contextStats(sessionId, options); }
   steer(sessionId: string, input: string, images?: Parameters<SessionHost["steer"]>[2], attachments?: Parameters<SessionHost["steer"]>[3]) { return this.#driver.steer(sessionId, input, images, attachments); }
   followUp(sessionId: string, input: string, images?: Parameters<SessionHost["followUp"]>[2], attachments?: Parameters<SessionHost["followUp"]>[3]) { return this.#driver.followUp(sessionId, input, images, attachments); }
+  replaceFollowUpQueue(sessionId: string, followUps: Parameters<NonNullable<SessionHost["replaceFollowUpQueue"]>>[1]) {
+    const replaceQueue = this.#driver.replaceFollowUpQueue;
+    if (!replaceQueue) throw new Error("This session host does not support live queue replacement");
+    return replaceQueue.call(this.#driver, sessionId, followUps);
+  }
   fork(sessionId: string, options?: Parameters<SessionHost["fork"]>[1]) { return this.#driver.fork(sessionId, options); }
   rewind(sessionId: string, entryId: string, options?: Parameters<SessionHost["rewind"]>[2]) { return this.#driver.rewind(sessionId, entryId, options); }
   rewindForEdit(sessionId: string, userOrdinal: number) { return this.#driver.rewindForEdit(sessionId, userOrdinal); }

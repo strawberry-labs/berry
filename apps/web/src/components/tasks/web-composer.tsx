@@ -8,11 +8,12 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { reduceStream } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, Ellipsis, FileText, GripVerticalIcon, Hash, ImagePlus, Queue01Icon, SlashSquare, Trash2 } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
+import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 
 interface PendingFileUpload {
   id: string;
@@ -48,8 +49,12 @@ export function Composer({
   onCommand,
   queuedFollowUps,
   onQueuedFollowUp,
+  onQueuedFollowUpFailed,
   onRemoveFollowUp,
   onRetryFollowUp,
+  onReorderFollowUps,
+  onSteerFollowUp,
+  planProgress,
 }: {
   config: WebConfig;
   activeTask: Task | null;
@@ -74,9 +79,13 @@ export function Composer({
   onReasoningChange: (level: ReasoningLevel) => void;
   onCommand: (name: string, args: string[]) => Promise<void>;
   queuedFollowUps: QueuedFollowUp[];
-  onQueuedFollowUp: (followUp: QueuedFollowUp) => void;
+  onQueuedFollowUp: (followUp: QueuedFollowUp, replaceId?: string) => void;
+  onQueuedFollowUpFailed: (followUp: QueuedFollowUp, error: string) => void;
   onRemoveFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onRetryFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
+  onReorderFollowUps: (sessionId: string, orderedIds: string[]) => void;
+  onSteerFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
+  planProgress?: PlanProgress | null;
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -130,18 +139,44 @@ export function Composer({
       return;
     }
     if (working && activeTask?.activeSessionId && client) {
+      const queueMessages = window.localStorage.getItem("berry.web.queueMessages") !== "false";
+      if (queueMessages) {
+        const now = new Date().toISOString();
+        const optimisticFollowUp: QueuedFollowUp = {
+          id: `local_follow_up_${globalThis.crypto.randomUUID()}`,
+          taskId: activeTask.id,
+          sessionId: activeTask.activeSessionId,
+          ordinal: queuedFollowUps.length,
+          input,
+          attachments,
+          status: "queued",
+          error: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        // The card is a local-first interaction. It appears before any
+        // network work begins, while the real queue entry is created in the
+        // background and replaces this temporary row once confirmed.
+        onQueuedFollowUp(optimisticFollowUp);
+        setText("");
+        editorRef.current?.clear();
+        setAttachments([]);
+        void client.followUpTurn(activeTask.activeSessionId, { input, attachments })
+          .then((followUp) => onQueuedFollowUp(followUp, optimisticFollowUp.id))
+          .catch((cause) => {
+            const message = cause instanceof Error ? cause.message : "Unable to save this queued message";
+            onQueuedFollowUpFailed({ ...optimisticFollowUp, status: "failed", error: message, updatedAt: new Date().toISOString() }, message);
+          });
+        return;
+      }
+
       try {
-        const queueMessages = window.localStorage.getItem("berry.web.queueMessages") !== "false";
-        if (queueMessages) {
-          const followUp = await client.followUpTurn(activeTask.activeSessionId, { input, attachments });
-          onQueuedFollowUp(followUp);
-        } else {
-          await client.steerTurn(activeTask.activeSessionId, { input, attachments });
-        }
+        await client.steerTurn(activeTask.activeSessionId, { input, attachments });
         const optimisticMessageId = onUserMessage(input, activeTask.activeSessionId, activeTask.id, attachments);
-        // Queue/steer endpoints persist the user message themselves. Confirm
-        // that exact row immediately so turn completion cannot leave both the
-        // local bubble and its database copy on screen.
+        // The steer endpoint persists the user message itself. Confirm that
+        // exact row immediately so completion cannot leave both the local
+        // bubble and its database copy on screen.
         if (optimisticMessageId) {
           const persisted = [...await client.listMessages(activeTask.activeSessionId)].reverse().find((message) => message.role === "user");
           if (persisted) onUserMessagePersisted(activeTask.activeSessionId, optimisticMessageId, persisted);
@@ -158,9 +193,8 @@ export function Composer({
       const sessionId = activeTask.activeSessionId;
       if (window.localStorage.getItem("berry.web.queueMessages") !== "false") {
         const now = new Date().toISOString();
-        onQueuedFollowUp({ id: `follow_up_${Date.now()}`, taskId: activeTask.id, sessionId, ordinal: queuedFollowUps.length, input, attachments, status: "queued", error: null, createdAt: now, updatedAt: now });
+        onQueuedFollowUp({ id: `local_follow_up_${globalThis.crypto.randomUUID()}`, taskId: activeTask.id, sessionId, ordinal: queuedFollowUps.length, input, attachments, status: "queued", error: null, createdAt: now, updatedAt: now });
       }
-      onUserMessage(input, sessionId, activeTask.id, attachments);
       setText("");
       editorRef.current?.clear();
       setAttachments([]);
@@ -206,7 +240,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, onAssistantMessage, onCommand, onCreateTask, onEvent, onQueuedFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, text, variant, working]);
+  }, [activeTask, attachments, client, onAssistantMessage, onCommand, onCreateTask, onEvent, onQueuedFollowUp, onQueuedFollowUpFailed, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length) return;
@@ -298,7 +332,21 @@ export function Composer({
           onDragLeave: handleDragLeave,
           onDrop: handleDrop,
         }}
-        before={<MentionMenu controller={mentions} />}
+        before={
+          <>
+            <MentionMenu controller={mentions} />
+            {variant === "thread" && queuedFollowUps.length > 0 ? (
+              <QueuedFollowUpStack
+                followUps={queuedFollowUps}
+                onRetry={onRetryFollowUp}
+                onRemove={onRemoveFollowUp}
+                onReorder={onReorderFollowUps}
+                onSteer={onSteerFollowUp}
+              />
+            ) : null}
+            {variant === "thread" && planProgress ? <PlanProgressPill plan={planProgress} /> : null}
+          </>
+        }
         header={
           <>
             {variant === "home" ? (
@@ -311,13 +359,6 @@ export function Composer({
                   className="berry-composer-project-switcher"
                 />
               </div>
-            ) : null}
-            {variant === "thread" && queuedFollowUps.length > 0 ? (
-              <QueuedFollowUpStack
-                followUps={queuedFollowUps}
-                onRetry={onRetryFollowUp}
-                onRemove={onRemoveFollowUp}
-              />
             ) : null}
           </>
         }
@@ -406,27 +447,127 @@ function QueuedFollowUpStack({
   followUps,
   onRetry,
   onRemove,
+  onReorder,
+  onSteer,
 }: {
   followUps: QueuedFollowUp[];
   onRetry: (followUp: QueuedFollowUp) => Promise<void>;
   onRemove: (followUp: QueuedFollowUp) => Promise<void>;
+  onReorder: (sessionId: string, orderedIds: string[]) => void;
+  onSteer: (followUp: QueuedFollowUp) => Promise<void>;
 }) {
+  const [draggingId, setDraggingId] = React.useState<string | null>(null);
+  const [dropTarget, setDropTarget] = React.useState<{ id: string; position: "before" | "after" } | null>(null);
+
+  const reorder = React.useCallback((sourceId: string, targetId: string, position: "before" | "after") => {
+    if (sourceId === targetId) return;
+    const sourceIndex = followUps.findIndex((followUp) => followUp.id === sourceId);
+    if (sourceIndex < 0) return;
+    const ordered = [...followUps];
+    const [moved] = ordered.splice(sourceIndex, 1);
+    if (!moved) return;
+    const targetIndex = ordered.findIndex((followUp) => followUp.id === targetId);
+    if (targetIndex < 0) return;
+    ordered.splice(position === "before" ? targetIndex : targetIndex + 1, 0, moved);
+    onReorder(moved.sessionId, ordered.map((followUp) => followUp.id));
+  }, [followUps, onReorder]);
+
   return (
-    <div className="berry-composer-queue" aria-label="Queued follow-ups">
-      <span className="berry-composer-queue-label">Queue</span>
+    <aside className="berry-composer-queue" aria-label="Queued follow-ups" aria-live="polite">
       <div className="berry-composer-queue-list">
-        {followUps.map((followUp) => (
-          <div key={followUp.id} className="berry-composer-queue-item">
-            <span className="min-w-0 flex-1 truncate">{followUp.input}</span>
-            <span className="berry-composer-queue-status">{followUp.status === "failed" ? "Needs retry" : "Queued"}</span>
-            {followUp.status === "failed" ? (
-              <Button variant="ghost" size="xs" onClick={() => void onRetry(followUp)}>Retry</Button>
-            ) : null}
-            <Button variant="ghost" size="icon-xs" aria-label="Remove queued message" onClick={() => void onRemove(followUp)}>×</Button>
-          </div>
-        ))}
+        {followUps.map((followUp) => {
+          const isSaving = followUp.id.startsWith("local_follow_up_") && followUp.status !== "failed";
+          const status = followUp.status === "failed" ? "Needs retry" : isSaving ? "Saving" : "Steer";
+          return (
+            <div
+              key={followUp.id}
+              className={`berry-composer-queue-item${draggingId === followUp.id ? " is-dragging" : ""}${dropTarget?.id === followUp.id ? ` is-drop-target is-drop-${dropTarget.position}` : ""}`}
+              onDragOver={(event) => {
+                if (!draggingId || draggingId === followUp.id) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "move";
+                const bounds = event.currentTarget.getBoundingClientRect();
+                // The queue is rendered in reverse so the item nearest the
+                // composer is first in execution order. A pointer above a
+                // card therefore means "after" it in that logical order.
+                const position = event.clientY < bounds.top + bounds.height / 2 ? "after" : "before";
+                if (dropTarget?.id !== followUp.id || dropTarget.position !== position) {
+                  setDropTarget({ id: followUp.id, position });
+                }
+              }}
+              onDragLeave={(event) => {
+                if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                if (dropTarget?.id === followUp.id) setDropTarget(null);
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                if (draggingId && dropTarget?.id === followUp.id) reorder(draggingId, followUp.id, dropTarget.position);
+                setDraggingId(null);
+                setDropTarget(null);
+              }}
+            >
+              <button
+                type="button"
+                className="berry-composer-queue-drag-handle"
+                draggable
+                aria-label={`Reorder ${followUp.input}`}
+                onDragStart={(event) => {
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData("text/plain", followUp.id);
+                  setDraggingId(followUp.id);
+                  setDropTarget(null);
+                }}
+                onDragEnd={() => {
+                  setDraggingId(null);
+                  setDropTarget(null);
+                }}
+              >
+                <Queue01Icon className="berry-composer-queue-icon" aria-hidden />
+                <GripVerticalIcon className="berry-composer-queue-grip" aria-hidden />
+              </button>
+              <p className="berry-composer-queue-prompt" title={followUp.input}>{followUp.input}</p>
+              {followUp.status === "failed" ? (
+                <span className="berry-composer-queue-status" data-status={followUp.status}>
+                  <span className="berry-composer-queue-status-error">{status}</span>
+                </span>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="berry-composer-queue-status"
+                  disabled={isSaving}
+                  aria-label={`Steer with ${followUp.input}`}
+                  onClick={() => void onSteer(followUp)}
+                >
+                  <Queue01Icon aria-hidden />
+                  {status}
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="berry-composer-queue-delete"
+                aria-label={`Remove ${followUp.input} from the queue`}
+                onClick={() => void onRemove(followUp)}
+              >
+                <Trash2 aria-hidden />
+              </Button>
+              <DropdownMenu modal={false}>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="icon-xs" className="berry-composer-queue-more" aria-label={`More options for ${followUp.input}`}>
+                    <Ellipsis aria-hidden />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="top" align="end" className="berry-composer-queue-menu">
+                  {followUp.status === "failed" ? <DropdownMenuItem onClick={() => void onRetry(followUp)}>Retry queueing</DropdownMenuItem> : null}
+                  <DropdownMenuItem onClick={() => void onRemove(followUp)}>Remove from queue</DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          );
+        })}
       </div>
-    </div>
+    </aside>
   );
 }
 

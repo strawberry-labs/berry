@@ -444,8 +444,8 @@ export class BerryApiClient {
   }
 
   async listPersonalSkills(): Promise<PersonalSkill[]> { return this.#request("/v1/me/skills", z.array(PersonalSkillSchema)); }
-  async reviewPersonalSkill(input: { name: string; description: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null }): Promise<PersonalSkillReview> { return this.#request("/v1/me/skills/review", PersonalSkillReviewSchema, { method: "POST", body: input }); }
-  async savePersonalSkill(input: { name: string; description: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; enabled?: boolean; trusted?: boolean; confirmedHash: string }): Promise<PersonalSkill> { return this.#request("/v1/me/skills", PersonalSkillSchema, { method: "POST", body: input }); }
+  async reviewPersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[] }): Promise<PersonalSkillReview> { return this.#request("/v1/me/skills/review", PersonalSkillReviewSchema, { method: "POST", body: input }); }
+  async savePersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[]; enabled?: boolean; trusted?: boolean; confirmedHash: string }): Promise<PersonalSkill> { return this.#request("/v1/me/skills", PersonalSkillSchema, { method: "POST", body: input }); }
   async updatePersonalSkill(id: string, input: { enabled?: boolean; trusted?: boolean }): Promise<PersonalSkill> { return this.#request(`/v1/me/skills/${encodeURIComponent(id)}`, PersonalSkillSchema, { method: "PATCH", body: input }); }
   async deletePersonalSkill(id: string): Promise<{ ok: boolean }> { return this.#request(`/v1/me/skills/${encodeURIComponent(id)}`, z.object({ ok: z.boolean() }), { method: "DELETE" }); }
 
@@ -460,6 +460,7 @@ export class BerryApiClient {
   async pollPersonalMcpOAuth(state: string): Promise<{ status: "pending" | "complete"; serverId: string | null }> { return this.#request("/v1/me/mcp/oauth/poll", z.object({ status: z.enum(["pending", "complete"]), serverId: z.string().nullable() }), { method: "POST", body: { state } }); }
   async listOrganizationCapabilities(tenantId: string): Promise<OrgCapability[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, z.array(OrgCapabilitySchema)); }
   async upsertOrganizationCapability(tenantId: string, input: { kind: "skill" | "mcp"; capabilityId: string; name: string; description?: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean; contentHash?: string | null; config?: Record<string, unknown> }): Promise<OrgCapability> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, OrgCapabilitySchema, { method: "POST", body: input }); }
+  async reviewOrganizationSkill(tenantId: string, input: { content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; packageFiles?: string[] }): Promise<PersonalSkillReview> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/review`, PersonalSkillReviewSchema, { method: "POST", body: input }); }
   async deleteOrganizationCapability(tenantId: string, id: string): Promise<{ ok: boolean }> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/${encodeURIComponent(id)}`, z.object({ ok: z.boolean() }), { method: "DELETE" }); }
   async effectiveCapabilities(tenantId: string): Promise<EffectiveCapability[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/effective/me`, z.array(EffectiveCapabilitySchema)); }
   async setCapabilityOverride(tenantId: string, kind: "skill" | "mcp", capabilityId: string, enabled: boolean): Promise<unknown> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/effective/me/${kind}/${encodeURIComponent(capabilityId)}`, z.unknown(), { method: "PATCH", body: { enabled } }); }
@@ -717,6 +718,19 @@ export class BerryApiClient {
 
   async followUpTurn(sessionId: string, input: { input: string; attachments?: AttachmentInput[] | undefined }): Promise<QueuedFollowUp> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups`, QueuedFollowUpSchema, { method: "POST", body: input });
+  }
+
+  async reorderFollowUps(sessionId: string, followUpIds: string[]): Promise<QueuedFollowUp[]> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups/reorder`, z.array(QueuedFollowUpSchema), {
+      method: "POST",
+      body: { followUpIds },
+    });
+  }
+
+  async steerFollowUp(followUpId: string): Promise<{ queued: true }> {
+    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}/steer`, z.object({ queued: z.literal(true) }), {
+      method: "POST",
+    });
   }
 
   async removeFollowUp(followUpId: string): Promise<QueuedFollowUp> {

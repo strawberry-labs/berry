@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import {
   createId,
   ConversationKindSchema,
@@ -68,6 +68,7 @@ export interface CloudTaskStore {
   restoreTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
   createFollowUp(input: { taskId: string; sessionId: string; input: string; attachments?: AttachmentInput[] }, ownerUserId?: string | null): Promise<QueuedFollowUp>;
   listFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
+  reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
   updateFollowUp(id: string, input: { status: QueuedFollowUp["status"]; error?: string | null }, ownerUserId?: string | null): Promise<QueuedFollowUp>;
   createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session>;
   getSession(sessionId: string): Promise<Session>;
@@ -261,6 +262,21 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     const session = await this.getSession(sessionId);
     await this.getTask(session.taskId, ownerUserId);
     return [...this.#followUps.values()].filter((item) => item.sessionId === sessionId && item.status !== "removed").sort((a, b) => a.ordinal - b.ordinal);
+  }
+
+  async reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    const current = await this.listFollowUps(sessionId, ownerUserId);
+    const expected = new Set(current.map((followUp) => followUp.id));
+    if (expected.size !== followUpIds.length || followUpIds.some((id) => !expected.delete(id))) {
+      throw new BadRequestException("The submitted follow-up order does not match this session queue");
+    }
+    const now = nowIso();
+    for (const [ordinal, id] of followUpIds.entries()) {
+      const followUp = this.#followUps.get(id);
+      if (!followUp) continue;
+      this.#followUps.set(id, QueuedFollowUpSchema.parse({ ...followUp, ordinal, updatedAt: now }));
+    }
+    return this.listFollowUps(sessionId, ownerUserId);
   }
 
   async updateFollowUp(id: string, input: { status: QueuedFollowUp["status"]; error?: string | null }, ownerUserId?: string | null): Promise<QueuedFollowUp> {
@@ -539,6 +555,35 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
         [this.tenantId, sessionId],
       );
       return rows.map(followUpFromRow);
+    });
+  }
+
+  async reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      const session = await this.getSessionInTenant(executor, sessionId);
+      await this.getTaskInTenant(executor, session.taskId, ownerUserId);
+      const current = await executor.query<QueuedFollowUpRow>(
+        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at
+         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status <> 'removed' ORDER BY ordinal`,
+        [this.tenantId, sessionId],
+      );
+      const expected = new Set(current.map((followUp) => followUp.id));
+      if (expected.size !== followUpIds.length || followUpIds.some((id) => !expected.delete(id))) {
+        throw new BadRequestException("The submitted follow-up order does not match this session queue");
+      }
+      const updatedAt = nowIso();
+      for (const [ordinal, id] of followUpIds.entries()) {
+        await executor.execute(
+          "UPDATE queued_follow_ups SET ordinal = $3, updated_at = $4 WHERE tenant_id = $1::uuid AND id = $2::uuid",
+          [this.tenantId, id, ordinal, updatedAt],
+        );
+      }
+      const reordered = await executor.query<QueuedFollowUpRow>(
+        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, created_at, updated_at
+         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status <> 'removed' ORDER BY ordinal`,
+        [this.tenantId, sessionId],
+      );
+      return reordered.map(followUpFromRow);
     });
   }
 

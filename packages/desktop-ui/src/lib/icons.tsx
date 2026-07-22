@@ -210,6 +210,10 @@ export const ShieldQuestion = make(SecurityIcon);
 export const ShieldCheck = make(SecurityCheckIcon);
 export const ChartColumn = make(BarChartIcon);
 export const Route = make(Route01Icon);
+// The queue treatment uses a named semantic alias so call sites describe the
+// action rather than the underlying glyph. Hugeicons' free set does not ship
+// a dedicated Queue01 asset; Route01 is its closest directional queue mark.
+export const Queue01Icon = make(Route01Icon);
 export const AtSign = make(AtIcon);
 export const Hand = make(HandIcon);
 export const Hash = make(HashIcon);

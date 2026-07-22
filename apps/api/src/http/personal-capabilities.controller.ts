@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { PERSONAL_CAPABILITIES, PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
 
-const SkillInputSchema = z.object({ name: z.string().trim().min(1).max(64), description: z.string().trim().min(1).max(1024), content: z.string().max(262_144).optional(), source: z.enum(["text", "upload", "git"]).default("text"), sourceUrl: z.string().url().nullable().optional(), version: z.string().max(64).nullable().optional(), enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict();
+const SkillInputSchema = z.object({ name: z.string().trim().max(64).optional(), description: z.string().trim().max(1024).optional(), content: z.string().max(262_144).optional(), source: z.enum(["text", "upload", "git"]).default("text"), sourceUrl: z.string().url().nullable().optional(), version: z.string().max(64).nullable().optional(), packageFiles: z.array(z.string().min(1).max(512)).max(500).optional(), enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict();
 const SkillSaveSchema = SkillInputSchema.extend({ confirmedHash: z.string().regex(/^[a-f0-9]{64}$/) });
 const ToggleSchema = z.object({ enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict().refine((input) => input.enabled !== undefined || input.trusted !== undefined);
 const McpInputSchema = z.object({ name: z.string().trim().min(1).max(100), url: z.string().url(), transport: z.enum(["http-sse", "streamable-http"]), auth: z.enum(["none", "bearer", "oauth"]), credential: z.string().min(1).max(16_384).optional(), enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict();

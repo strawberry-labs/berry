@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { BadRequestException } from "@nestjs/common";
 import type { AgentSkill, McpServerSpec } from "@berry/local-agent";
 import type { CapabilityUserOverride, EffectiveCapability, JsonValue, OrgCapability, OrgCapabilityAssignment } from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
+import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 import { PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
 
 export const ORGANIZATION_CAPABILITIES = Symbol("ORGANIZATION_CAPABILITIES");
@@ -20,11 +22,42 @@ export class OrganizationCapabilitiesService {
   }
   async upsert(tenantId: string, input: Upsert): Promise<OrgCapability> {
     const current = (await this.list(tenantId)).find((item) => item.kind === input.kind && item.capabilityId === input.capabilityId);
-    const now = new Date().toISOString(); const hash = input.contentHash ?? (input.kind === "skill" ? hashContent(input.config) : null);
-    const record: OrgCapability = { id: current?.id ?? `orgcap_${randomUUID()}`, tenantId, kind: input.kind, capabilityId: input.capabilityId, name: input.name, description: input.description ?? "", assignment: input.assignment, allowUserDisable: input.allowUserDisable ?? false, contentHash: hash, config: input.config ?? {}, createdAt: current?.createdAt ?? now, updatedAt: now };
+    const now = new Date().toISOString();
+    const config = input.config ?? current?.config ?? {};
+    if (input.kind === "skill" && input.config !== undefined) {
+      const content = object(config).content;
+      if (typeof content === "string" && content.trim()) {
+        const metadata = parseAgentSkillMarkdown(content);
+        if (metadata.name !== input.capabilityId) throw new BadRequestException(`Organization skill ID must match SKILL.md name (${metadata.name})`);
+      } else if (input.assignment !== "blocked") {
+        throw new BadRequestException("Organization skills require SKILL.md content");
+      }
+    }
+    const hash = input.contentHash !== undefined
+      ? input.contentHash
+      : input.config !== undefined && input.kind === "skill"
+        ? hashContent(config)
+        : current?.contentHash ?? (input.kind === "skill" ? hashContent(config) : null);
+    const record: OrgCapability = {
+      id: current?.id ?? `orgcap_${randomUUID()}`,
+      tenantId,
+      kind: input.kind,
+      capabilityId: input.capabilityId,
+      name: input.name,
+      description: input.description ?? current?.description ?? "",
+      assignment: input.assignment,
+      allowUserDisable: input.allowUserDisable ?? current?.allowUserDisable ?? false,
+      contentHash: hash,
+      config,
+      createdAt: current?.createdAt ?? now,
+      updatedAt: now,
+    };
     this.#records.set(record.id, record);
     if (this.database) await this.database.withTenant(tenantId, (db) => db.execute(`INSERT INTO organization_capabilities (id,tenant_id,kind,capability_id,name,description,assignment,allow_user_disable,content_hash,config,created_at,updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::timestamptz,$12::timestamptz) ON CONFLICT (tenant_id,kind,capability_id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,assignment=EXCLUDED.assignment,allow_user_disable=EXCLUDED.allow_user_disable,content_hash=EXCLUDED.content_hash,config=EXCLUDED.config,updated_at=EXCLUDED.updated_at`, [record.id,tenantId,record.kind,record.capabilityId,record.name,record.description,record.assignment,record.allowUserDisable,record.contentHash,JSON.stringify(record.config),record.createdAt,record.updatedAt]));
     return record;
+  }
+  async reviewSkill(input: { content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; packageFiles?: string[] | undefined }) {
+    return (await this.personal.previewSkill(input)).review;
   }
   async remove(tenantId: string, id: string) { const record = (await this.list(tenantId)).find((item) => item.id === id); if (!record) return { ok: false }; this.#records.delete(id); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM organization_capabilities WHERE id=$1", [id])); return { ok: true }; }
   async settings(tenantId: string) { if (!this.database) return this.#settings.get(tenantId) ?? { skills: true, mcp: true }; const rows = await this.database.withTenant(tenantId, (db) => db.query<{ allow_personal_skills: boolean; allow_personal_mcp: boolean }>("SELECT allow_personal_skills,allow_personal_mcp FROM organization_capability_settings")); return rows[0] ? { skills: rows[0].allow_personal_skills, mcp: rows[0].allow_personal_mcp } : { skills: true, mcp: true }; }
@@ -54,9 +87,10 @@ export class OrganizationCapabilitiesService {
     const rows: EffectiveCapability[] = []; const skills: AgentSkill[] = []; const mcpServers: McpServerSpec[] = [];
     for (const item of org) {
       const override = overrides.find((entry) => entry.kind === item.kind && entry.capabilityId === item.capabilityId);
-      const enabled = item.assignment === "required" || item.assignment === "default-on" && !(item.allowUserDisable && override?.enabled === false) || item.assignment === "available" && override?.enabled === true;
-      const reason: EffectiveCapability["reason"] = item.assignment === "blocked" ? "blocked" : item.assignment === "required" ? "required" : override?.enabled === false ? "user-disabled" : override?.enabled === true ? "user-enabled" : item.assignment === "default-on" ? "default" : "available";
-      rows.push({ kind:item.kind,capabilityId:item.capabilityId,name:item.name,enabled:enabled && item.assignment !== "blocked",locked:item.assignment === "required" || item.assignment === "blocked" || !item.allowUserDisable,assignment:item.assignment,provenance:"organization",reason,contentHash:item.contentHash });
+      const userCanChange = item.assignment === "available" || item.assignment === "default-on" && item.allowUserDisable;
+      const enabled = item.assignment === "required" || item.assignment === "default-on" && !(userCanChange && override?.enabled === false) || item.assignment === "available" && override?.enabled === true;
+      const reason: EffectiveCapability["reason"] = item.assignment === "blocked" ? "blocked" : item.assignment === "required" ? "required" : userCanChange && override?.enabled === false ? "user-disabled" : userCanChange && override?.enabled === true ? "user-enabled" : item.assignment === "default-on" ? "default" : "available";
+      rows.push({ kind:item.kind,capabilityId:item.capabilityId,name:item.name,enabled:enabled && item.assignment !== "blocked",locked:!userCanChange,assignment:item.assignment,provenance:"organization",reason,contentHash:item.contentHash });
       if (!enabled || item.assignment === "blocked") continue;
       if (item.kind === "skill") { const config = object(item.config); const content = typeof config.content === "string" ? config.content : ""; if (content) skills.push({ name:item.name,description:item.description,content,filePath:`/workspace/.berry/managed-skills/${item.capabilityId}/SKILL.md`,scope:"registered",disableModelInvocation:false,resources:[] }); }
       else { const config = object(item.config); if (typeof config.url === "string") mcpServers.push({ id:item.capabilityId,name:item.name,transport:config.transport === "http-sse" ? "http-sse" : "streamable-http",command:null,args:[],url:config.url,env:{},enabled:true,trusted:true,credentialKey:typeof config.credentialRef === "string" ? config.credentialRef : null }); }

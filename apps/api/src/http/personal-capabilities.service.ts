@@ -3,11 +3,12 @@ import { BadRequestException, NotFoundException } from "@nestjs/common";
 import type { AgentSkill, McpServerSpec } from "@berry/local-agent";
 import type { PersonalMcpServer, PersonalSkill, PersonalSkillReview } from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
+import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 
 export const PERSONAL_CAPABILITIES = Symbol("PERSONAL_CAPABILITIES");
 const MAX_SKILL_BYTES = 262_144;
 
-type SkillInput = { name: string; description: string; content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; version?: string | null | undefined; enabled?: boolean | undefined; trusted?: boolean | undefined };
+type SkillInput = { name?: string | undefined; description?: string | undefined; content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; version?: string | null | undefined; packageFiles?: string[] | undefined; enabled?: boolean | undefined; trusted?: boolean | undefined };
 type McpInput = { name: string; url: string; transport: "http-sse" | "streamable-http"; auth: "none" | "bearer" | "oauth"; credential?: string | undefined; enabled?: boolean | undefined; trusted?: boolean | undefined };
 type ToggleInput = { enabled?: boolean | undefined; trusted?: boolean | undefined };
 
@@ -26,8 +27,13 @@ export class PersonalCapabilitiesService {
     const source = input.source ?? "text";
     const content = source === "git" ? await fetchApprovedSkill(input.sourceUrl) : input.content ?? "";
     validateSkillContent(content);
+    const metadata = parseAgentSkillMarkdown(content);
+    if (input.name?.trim() && input.name.trim() !== metadata.name) throw new BadRequestException(`Skill name must match SKILL.md frontmatter (${metadata.name})`);
+    if (input.description?.trim() && input.description.trim() !== metadata.description) throw new BadRequestException("Skill description must match SKILL.md frontmatter");
+    const packageFiles = [...new Set(input.packageFiles ?? [])].sort();
     const warnings = [/ignore (all|previous) instructions/i, /curl\s+.*\|\s*(sh|bash)/i].filter((pattern) => pattern.test(content)).map(() => "Skill contains instructions that require careful trust review.");
-    return { content, review: { name: input.name.trim(), description: input.description.trim(), source, hash: sha256(content), bytes: Buffer.byteLength(content), warnings } };
+    if (packageFiles.some((path) => path.startsWith("scripts/"))) warnings.push("This skill package includes executable scripts. Review them before trusting the skill.");
+    return { content, review: { ...metadata, source, hash: sha256(content), bytes: Buffer.byteLength(content), warnings, resources: packageFiles.filter((path) => path !== "SKILL.md"), hasScripts: packageFiles.some((path) => path.startsWith("scripts/")) } };
   }
 
   async saveSkill(tenantId: string, userId: string, input: SkillInput & { id?: string; confirmedHash: string }): Promise<PersonalSkill> {
@@ -36,7 +42,7 @@ export class PersonalCapabilitiesService {
     if (preview.review.hash !== input.confirmedHash) throw new BadRequestException("Skill changed after review; review it again");
     const existing = input.id ? this.#skill(input.id, tenantId, userId) : null;
     const now = new Date().toISOString();
-    const skill: PersonalSkill = { id: existing?.id ?? `skill_${randomUUID()}`, tenantId, userId, name: preview.review.name, description: preview.review.description, content: preview.content, enabled: input.enabled ?? existing?.enabled ?? true, trusted: input.trusted ?? existing?.trusted ?? false, source: preview.review.source, sourceUrl: input.sourceUrl ?? null, version: input.version ?? null, hash: preview.review.hash, diagnostics: preview.review.warnings, createdAt: existing?.createdAt ?? now, updatedAt: now };
+    const skill: PersonalSkill = { id: existing?.id ?? `skill_${randomUUID()}`, tenantId, userId, name: preview.review.name, description: preview.review.description, content: preview.content, enabled: input.enabled ?? existing?.enabled ?? false, trusted: input.trusted ?? existing?.trusted ?? false, source: preview.review.source, sourceUrl: input.sourceUrl ?? null, version: input.version ?? preview.review.version, hash: preview.review.hash, diagnostics: preview.review.warnings, createdAt: existing?.createdAt ?? now, updatedAt: now };
     this.#skills.set(skill.id, skill); await this.#persistSkill(skill); return skill;
   }
 
@@ -112,7 +118,7 @@ function owns(item: { tenantId: string; userId: string }, tenantId: string, user
 function sha256(content: string) { return createHash("sha256").update(content).digest("hex"); }
 function validateSkillContent(content: string) { const bytes = Buffer.byteLength(content); if (!content.trim()) throw new BadRequestException("Skill content is required"); if (bytes > MAX_SKILL_BYTES) throw new BadRequestException("Skill packages are limited to 256 KB"); }
 function safeRemoteUrl(raw: string) { const url = new URL(raw); if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))) throw new BadRequestException("Remote MCP must use HTTPS"); return url.toString(); }
-async function fetchApprovedSkill(raw: string | null | undefined) { if (!raw) throw new BadRequestException("Git source URL is required"); const url = new URL(raw); if (!["github.com", "raw.githubusercontent.com"].includes(url.hostname) || url.protocol !== "https:") throw new BadRequestException("Git skill sources must be hosted on approved GitHub domains"); const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new BadRequestException(`Skill source returned HTTP ${response.status}`); const content = await response.text(); validateSkillContent(content); return content; }
+async function fetchApprovedSkill(raw: string | null | undefined) { if (!raw) throw new BadRequestException("Git source URL is required"); let url = new URL(raw); if (!["github.com", "raw.githubusercontent.com"].includes(url.hostname) || url.protocol !== "https:") throw new BadRequestException("Git skill sources must be hosted on approved GitHub domains"); if (url.hostname === "github.com") { const parts = url.pathname.split("/").filter(Boolean); if (parts[2] !== "blob" || parts.length < 5) throw new BadRequestException("GitHub skill URL must point to a SKILL.md file"); url = new URL(`https://raw.githubusercontent.com/${parts[0]}/${parts[1]}/${parts[3]}/${parts.slice(4).join("/")}`); } const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new BadRequestException(`Skill source returned HTTP ${response.status}`); const content = await response.text(); validateSkillContent(content); return content; }
 function value(row: Record<string, unknown>, key: string) { return row[key]; }
 function str(row: Record<string, unknown>, key: string) { return String(value(row, key) ?? ""); }
 function nullable(row: Record<string, unknown>, key: string) { const result = value(row, key); return result === null || result === undefined ? null : String(result); }

@@ -1,9 +1,10 @@
 import * as React from "react";
-import { Check, Copy, Download, Plus, Save } from "lucide-react";
-import { OrgPermissionSchema, type OrgPermission } from "@berry/shared";
+import { Check, Copy, Download, Plus, Save, ShieldCheck, Trash2, Upload, X } from "lucide-react";
+import { OrgPermissionSchema, type OrgCapabilityAssignment, type OrgPermission, type PersonalSkillReview } from "@berry/shared";
+import { readBrowserSkillImport } from "@/lib/skill-import";
 import {
   AsyncState, Button, Checkbox, DataTable, DefinitionList, DetailDrawer, FilterSelect, FormSelect, Input, ManagementPage, ManagementSwitch, MetricGrid,
-  PermissionDenied, SearchInput, Section, StatusPill, SuccessMessage, TabBar, Toolbar,
+  PermissionDenied, SearchInput, Section, StatusPill, SuccessMessage, TabBar, Textarea, Toolbar,
   formatDate, formatDateTime, formatNumber,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
@@ -214,13 +215,21 @@ function ModelsScreen({ client, config, tenantId, permissions }: ManagementScree
 
 /* ------------------------------------------------------------- skills & mcp */
 function SkillsMcpScreen({ client, tenantId, permissions }: ManagementScreenProps) {
-  const canWrite = permissions.includes("skills:write") || permissions.includes("mcp:write");
+  const canWriteSkills = permissions.includes("skills:write");
+  const canWriteMcp = permissions.includes("mcp:write");
+  const canWritePolicies = canWriteSkills && canWriteMcp;
   const r = useResource(`capabilities:${tenantId}`, async () => client ? client.listOrganizationCapabilities(tenantId) : [], [] as any[]);
+  const policy = useResource(`capability-policy:${tenantId}`, async () => client ? client.organizationCapabilitySettings(tenantId) : { skills: true, mcp: true }, { skills: true, mcp: true });
   const [tab, setTab] = React.useState("skill");
   const [query, setQuery] = React.useState("");
   const [assignment, setAssignment] = React.useState("all");
   const [active, setActive] = React.useState<number | null>(null);
   const [message, setMessage] = React.useState("");
+  const [adding, setAdding] = React.useState(false);
+  const [review, setReview] = React.useState<PersonalSkillReview | null>(null);
+  const [importError, setImportError] = React.useState("");
+  const [skillDraft, setSkillDraft] = React.useState({ content: "", packageFiles: [] as string[], fileName: "", assignment: "default-on" as OrgCapabilityAssignment, allowUserDisable: true });
+  const canWrite = tab === "skill" ? canWriteSkills : canWriteMcp;
   const scoped = r.data.filter((c: any) => c.kind === tab);
   const rows = scoped.filter((c: any) => `${c.name} ${c.capabilityId}`.toLowerCase().includes(query.toLowerCase()) && (assignment === "all" || c.assignment === assignment));
   const detail = active != null ? rows[active] : null;
@@ -236,7 +245,38 @@ function SkillsMcpScreen({ client, tenantId, permissions }: ManagementScreenProp
     r.setData(r.data.map((c: any) => c.id === capability.id ? { ...c, assignment: value } : c));
     setMessage("Capability assignment updated and recorded in the audit log.");
   };
-  return <ManagementPage title="Skills & MCP" description="Choose organization capabilities and how they are assigned to members." eyebrow="AI controls">
+  const reviewSkill = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!client) return;
+    setImportError("");
+    try { setReview(await client.reviewOrganizationSkill(tenantId, { content: skillDraft.content, source: skillDraft.fileName ? "upload" : "text", packageFiles: skillDraft.packageFiles })); }
+    catch (cause) { setImportError(cause instanceof Error ? cause.message : "Skill review failed"); }
+  };
+  const selectSkillFile = async (file: File | undefined) => {
+    if (!file) return;
+    setImportError(""); setReview(null);
+    try { const imported = await readBrowserSkillImport(file); setSkillDraft((current) => ({ ...current, content: imported.content, packageFiles: imported.packageFiles, fileName: imported.fileName })); }
+    catch (cause) { setImportError(cause instanceof Error ? cause.message : "Could not read this skill package"); }
+  };
+  const saveSkill = async () => {
+    if (!client || !review) return;
+    const saved = await client.upsertOrganizationCapability(tenantId, { kind: "skill", capabilityId: review.name, name: review.name, description: review.description, assignment: skillDraft.assignment, allowUserDisable: skillDraft.assignment === "required" || skillDraft.assignment === "blocked" ? false : skillDraft.allowUserDisable, contentHash: review.hash, config: { content: skillDraft.content } });
+    r.setData([saved, ...r.data.filter((item: any) => !(item.kind === saved.kind && item.capabilityId === saved.capabilityId))]);
+    setAdding(false); setReview(null); setSkillDraft({ content: "", packageFiles: [], fileName: "", assignment: "default-on", allowUserDisable: true });
+    setMessage(`$${saved.name} is now available to the organization.`);
+  };
+  const removeCapability = async (capability: any) => {
+    if (!client) return;
+    await client.deleteOrganizationCapability(tenantId, capability.id);
+    r.setData(r.data.filter((item: any) => item.id !== capability.id));
+    setActive(null); setMessage(`${capability.name} was removed from the organization catalog.`);
+  };
+  const updatePersonalPolicy = async (next: { skills: boolean; mcp: boolean }) => {
+    if (!client) return;
+    policy.setData(await client.updateOrganizationCapabilitySettings(tenantId, next));
+    setMessage("Personal capability policy saved.");
+  };
+  return <ManagementPage title="Skills & MCP" description="Choose organization capabilities and how they are assigned to members." eyebrow="AI controls" actions={tab === "skill" && canWriteSkills ? <Button onClick={() => { setAdding(true); setReview(null); setImportError(""); }}><Plus aria-hidden />Add organization skill</Button> : null}>
     <MetricGrid items={[
       { label: "Required", value: formatNumber(counts("required")), hint: "Cannot be disabled", status: "info" as any },
       { label: "Default on", value: formatNumber(counts("default-on")), hint: "Enabled by default", status: "good" },
@@ -244,6 +284,23 @@ function SkillsMcpScreen({ client, tenantId, permissions }: ManagementScreenProp
       { label: "Blocked", value: formatNumber(counts("blocked")), hint: "Not available", status: "danger" },
     ]} />
     <TabBar label="Capability kind" active={tab} onSelect={(id) => { setTab(id); setActive(null); }} tabs={[{ id: "skill", label: "Skills" }, { id: "mcp", label: "MCP servers" }]} />
+    {adding && tab === "skill" ? <Section title={review ? "Review organization skill" : "Add organization skill"} description="Import an Agent Skills package or paste SKILL.md, then choose how it is assigned.">
+      {!review ? <form className="mgmt-inline-form" onSubmit={reviewSkill}>
+        <label className="mgmt-skill-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void selectSkillFile(event.dataTransfer.files[0]); }}><input type="file" accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectSkillFile(event.currentTarget.files?.[0])} /><Upload aria-hidden /><span><b>{skillDraft.fileName || "Choose or drop a .skill package"}</b><small>.skill, .zip, or SKILL.md · up to 5 MB</small></span></label>
+        <label className="mgmt-field mgmt-field-wide">Or paste SKILL.md<Textarea className="mgmt-textarea" required value={skillDraft.content} onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [] })} /></label>
+        {importError ? <div className="mgmt-callout" role="alert">{importError}</div> : null}
+        <Button type="button" variant="secondary" onClick={() => setAdding(false)}><X aria-hidden />Cancel</Button><Button><ShieldCheck aria-hidden />Review</Button>
+      </form> : <div className="mgmt-review-flow">
+        <dl><div><dt>Skill</dt><dd>${review.name}</dd></div><div><dt>Description</dt><dd>{review.description}</dd></div><div><dt>Content hash</dt><dd><code>{review.hash}</code></dd></div><div><dt>Package</dt><dd>{review.resources.length ? `${review.resources.length + 1} files` : "SKILL.md only"}</dd></div></dl>
+        {review.warnings.length ? <div className="mgmt-callout" role="alert">{review.warnings.join(" · ")}</div> : <p className="mgmt-success"><Check aria-hidden />No review warnings found.</p>}
+        <label className="mgmt-field">Assignment<FormSelect value={skillDraft.assignment} onChange={(assignment) => setSkillDraft({ ...skillDraft, assignment: assignment as OrgCapabilityAssignment })} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} /></label>
+        <label className="mgmt-toggle-row"><span>Allow user disable<small>Members can turn off default-on skills.</small></span><ManagementSwitch checked={skillDraft.allowUserDisable} disabled={skillDraft.assignment === "required" || skillDraft.assignment === "blocked"} onCheckedChange={(allowUserDisable) => setSkillDraft({ ...skillDraft, allowUserDisable })} aria-label="Allow user disable" /></label>
+        <div className="mgmt-form-actions"><Button variant="secondary" onClick={() => setReview(null)}>Back</Button><Button onClick={() => void saveSkill()}><Check aria-hidden />Add to organization</Button></div>
+      </div>}
+    </Section> : null}
+    <Section title="Personal additions" description="Control whether members can add their own capabilities.">
+      <div className="mgmt-policy-list"><label className="mgmt-toggle-row"><span>Personal skills<small>Members can import and manage their own skills.</small></span><ManagementSwitch checked={policy.data.skills} disabled={!canWritePolicies} onCheckedChange={(skills) => void updatePersonalPolicy({ ...policy.data, skills })} aria-label="Allow personal skills" /></label><label className="mgmt-toggle-row"><span>Personal MCP servers<small>Members can add their own remote MCP servers.</small></span><ManagementSwitch checked={policy.data.mcp} disabled={!canWritePolicies} onCheckedChange={(mcp) => void updatePersonalPolicy({ ...policy.data, mcp })} aria-label="Allow personal MCP servers" /></label></div>
+    </Section>
     <Toolbar>
       <SearchInput label="Search capabilities" value={query} onChange={setQuery} placeholder="Search capabilities" />
       <FilterSelect label="Assignment" value={assignment} onChange={setAssignment} options={[{ value: "all", label: "All" }, { value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} />
@@ -270,6 +327,7 @@ function SkillsMcpScreen({ client, tenantId, permissions }: ManagementScreenProp
           <FilterSelect label="Assignment" value={detail.assignment} onChange={(v) => setAssignmentValue(detail, v)} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} />
         </fieldset>
         <label className="mgmt-toggle-row"><span>Allow user disable<small>Members can turn this off for themselves.</small></span><ManagementSwitch checked={Boolean(detail.allowUserDisable)} disabled={!canWrite || detail.assignment === "required"} onCheckedChange={(checked) => setAllowDisable(detail, checked)} aria-label="Allow user disable" /></label>
+        {canWrite ? <Button variant="secondary" onClick={() => void removeCapability(detail)}><Trash2 aria-hidden />Remove capability</Button> : null}
       </DetailDrawer> : null}
     </div>
   </ManagementPage>;

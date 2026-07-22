@@ -1,61 +1,96 @@
 import * as React from "react";
-import { Check, FlaskConical, Plus, Search, ShieldCheck, X } from "lucide-react";
-import type { PersonalMcpServer, PersonalSkill, PersonalSkillReview } from "@berry/shared";
-import { AsyncState, Button, DataTable, DetailDrawer, FormSelect, Input, ManagementPage, SearchInput, Section, StatusPill, SuccessMessage, Textarea, Toolbar } from "./management-primitives";
+import { Check, FlaskConical, Plus, ShieldCheck, Trash2, Upload, X } from "lucide-react";
+import type { EffectiveCapability, PersonalMcpServer, PersonalSkill, PersonalSkillReview } from "@berry/shared";
+import { readBrowserSkillImport } from "@/lib/skill-import";
+import { AsyncState, Button, DataTable, DetailDrawer, FormSelect, Input, ManagementPage, ManagementSwitch, SearchInput, Section, StatusPill, SuccessMessage, Textarea, Toolbar } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
-export function PersonalSkillsScreen({ client, config }: ManagementScreenProps) {
+type SkillCatalogRow = {
+  key: string;
+  capabilityId: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  locked: boolean;
+  provenance: "organization" | "personal" | "self-host-bootstrap";
+  assignment: EffectiveCapability["assignment"];
+  reason: EffectiveCapability["reason"] | "deployment";
+  personal?: PersonalSkill;
+};
+
+const emptySkillResource = { personal: [] as PersonalSkill[], effective: [] as EffectiveCapability[] };
+const emptyDraft = { content: "", sourceUrl: "", source: "upload" as "text" | "upload" | "git", packageFiles: [] as string[], fileName: "" };
+
+export function PersonalSkillsScreen({ client, config, tenantId }: ManagementScreenProps) {
   const [query, setQuery] = React.useState("");
   const [review, setReview] = React.useState<PersonalSkillReview | null>(null);
-  const [draft, setDraft] = React.useState({ name: "", description: "", content: "" });
+  const [draft, setDraft] = React.useState(emptyDraft);
   const [creating, setCreating] = React.useState(false);
-  const [selected, setSelected] = React.useState<PersonalSkill | null>(null);
+  const [selected, setSelected] = React.useState<SkillCatalogRow | null>(null);
   const [message, setMessage] = React.useState("");
+  const [importError, setImportError] = React.useState("");
   const resource = useResource(
-    "personal-skills",
+    `personal-skills:${tenantId}`,
     async () => client
-      ? client.listPersonalSkills()
-      : config.skills.map((skill) => ({
-          id: skill.id,
-          tenantId: "demo",
-          userId: "demo",
-          name: skill.name,
-          description: skill.description,
-          content: "",
-          enabled: skill.enabled,
-          trusted: true,
-          source: "text" as const,
-          sourceUrl: null,
-          version: null,
-          hash: "demo",
-          diagnostics: [],
-          createdAt: new Date(0).toISOString(),
-          updatedAt: new Date(0).toISOString(),
-        })),
-    [] as PersonalSkill[],
+      ? Promise.all([client.listPersonalSkills(), client.effectiveCapabilities(tenantId)]).then(([personal, effective]) => ({ personal, effective }))
+      : emptySkillResource,
+    emptySkillResource,
   );
-  const rows = resource.data.filter((skill) => `${skill.name} ${skill.description}`.toLowerCase().includes(query.toLowerCase()));
+  const rows = React.useMemo(() => buildSkillRows(resource.data.personal, resource.data.effective, config.skills)
+    .filter((skill) => `${skill.name} ${skill.description}`.toLowerCase().includes(query.toLowerCase())), [resource.data, config.skills, query]);
 
   async function preview(event: React.FormEvent) {
     event.preventDefault();
     if (!client) return;
-    setReview(await client.reviewPersonalSkill({ ...draft, source: "text" }));
+    setImportError("");
+    try {
+      setReview(await client.reviewPersonalSkill({ content: draft.content, source: draft.source, sourceUrl: draft.sourceUrl || null, packageFiles: draft.packageFiles }));
+    } catch (cause) {
+      setImportError(cause instanceof Error ? cause.message : "Skill review failed");
+    }
   }
 
   async function confirm() {
     if (!client || !review) return;
-    await client.savePersonalSkill({ ...draft, source: "text", enabled: true, trusted: true, confirmedHash: review.hash });
+    await client.savePersonalSkill({ content: draft.content, source: draft.source, sourceUrl: draft.sourceUrl || null, packageFiles: draft.packageFiles, enabled: false, trusted: false, confirmedHash: review.hash });
     setCreating(false);
     setReview(null);
-    setDraft({ name: "", description: "", content: "" });
-    setMessage("Skill reviewed and added to your personal catalog.");
+    setDraft(emptyDraft);
+    setMessage("Skill imported. Trust it, then turn it on when you are ready to use it.");
     resource.retry();
   }
 
-  async function toggle(skill: PersonalSkill) {
+  async function toggle(skill: SkillCatalogRow, enabled: boolean) {
     if (!client) return;
-    await client.updatePersonalSkill(skill.id, { enabled: !skill.enabled });
+    if (skill.personal) await client.updatePersonalSkill(skill.personal.id, { enabled });
+    else await client.setCapabilityOverride(tenantId, "skill", skill.capabilityId, enabled);
     resource.retry();
+  }
+
+  async function setTrusted(skill: PersonalSkill, trusted: boolean) {
+    if (!client) return;
+    await client.updatePersonalSkill(skill.id, { trusted, ...(trusted ? {} : { enabled: false }) });
+    setSelected(null);
+    resource.retry();
+  }
+
+  async function remove(skill: PersonalSkill) {
+    if (!client) return;
+    await client.deletePersonalSkill(skill.id);
+    setSelected(null);
+    resource.retry();
+  }
+
+  async function selectFile(file: File | undefined) {
+    if (!file) return;
+    setImportError("");
+    setReview(null);
+    try {
+      const imported = await readBrowserSkillImport(file);
+      setDraft({ content: imported.content, packageFiles: imported.packageFiles, fileName: imported.fileName, source: "upload", sourceUrl: "" });
+    } catch (cause) {
+      setImportError(cause instanceof Error ? cause.message : "Could not read this skill package");
+    }
   }
 
   return (
@@ -63,27 +98,31 @@ export function PersonalSkillsScreen({ client, config }: ManagementScreenProps) 
       title="Skills"
       description="Review personal and organization-provided capabilities before enabling them."
       eyebrow="Capabilities"
-      actions={<Button disabled={!client} onClick={() => setCreating(true)}><Plus />Import skill</Button>}
+      actions={<Button disabled={!client} onClick={() => { setCreating(true); setReview(null); setImportError(""); }}><Plus />Import skill</Button>}
     >
       <Toolbar>
         <SearchInput label="Search skills" value={query} onChange={setQuery} placeholder="Search skills" />
       </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
       {creating ? (
-        <Section title={review ? "Review import" : "Create or import skill"} description="Berry shows the normalized content and hash before anything is enabled.">
+        <Section title={review ? "Review skill" : "Import a skill"} description="Import an Agent Skills package, paste SKILL.md, or load a GitHub SKILL.md URL.">
           {!review ? (
             <form className="mgmt-inline-form" onSubmit={preview}>
-              <label className="mgmt-field">Name<Input required value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} /></label>
-              <label className="mgmt-field mgmt-field-wide">Description<Input required value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.currentTarget.value })} /></label>
-              <label className="mgmt-field mgmt-field-wide">Skill content<Textarea className="mgmt-textarea" required value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.currentTarget.value })} /></label>
-              <Button type="button" variant="secondary" onClick={() => setCreating(false)}><X />Cancel</Button>
+              <label className="mgmt-field">Source<FormSelect value={draft.source} onChange={(source) => { setReview(null); setImportError(""); setDraft({ ...emptyDraft, source: source as typeof draft.source }); }} options={[{ value: "upload", label: "Skill package" }, { value: "text", label: "Paste SKILL.md" }, { value: "git", label: "GitHub URL" }]} /></label>
+              {draft.source === "upload" ? <label className="mgmt-skill-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void selectFile(event.dataTransfer.files[0]); }}><input type="file" accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectFile(event.currentTarget.files?.[0])} /><Upload aria-hidden /><span><b>{draft.fileName || "Choose or drop a .skill package"}</b><small>.skill, .zip, or SKILL.md · up to 5 MB</small></span></label> : null}
+              {draft.source === "text" ? <label className="mgmt-field mgmt-field-wide">SKILL.md<Textarea className="mgmt-textarea" required value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.currentTarget.value })} placeholder={'---\nname: my-skill\ndescription: What this skill does and when to use it\n---\n\nInstructions…'} /></label> : null}
+              {draft.source === "git" ? <label className="mgmt-field mgmt-field-wide">GitHub SKILL.md URL<Input type="url" required value={draft.sourceUrl} onChange={(event) => setDraft({ ...draft, sourceUrl: event.currentTarget.value })} placeholder="https://github.com/org/repo/blob/main/skill/SKILL.md" /></label> : null}
+              {importError ? <div className="mgmt-callout" role="alert">{importError}</div> : null}
+              <Button type="button" variant="secondary" onClick={() => { setCreating(false); setDraft(emptyDraft); setImportError(""); }}><X />Cancel</Button>
               <Button><ShieldCheck />Review</Button>
             </form>
           ) : (
             <div className="mgmt-review-flow">
-              <dl><div><dt>Name</dt><dd>{review.name}</dd></div><div><dt>Content hash</dt><dd><code>{review.hash}</code></dd></div><div><dt>Source</dt><dd>{review.source}</dd></div></dl>
+              <dl><div><dt>Skill</dt><dd>${review.name}</dd></div><div><dt>Description</dt><dd>{review.description}</dd></div><div><dt>Version</dt><dd>{review.version ?? "Not specified"}</dd></div><div><dt>Package</dt><dd>{review.resources.length ? `${review.resources.length + 1} files` : "SKILL.md only"}</dd></div><div><dt>Content hash</dt><dd><code>{review.hash}</code></dd></div></dl>
+              {review.compatibility ? <p className="mgmt-muted">Compatibility: {review.compatibility}</p> : null}
+              {review.resources.length ? <div className="mgmt-skill-files"><b>Included resources</b><span>{review.resources.slice(0, 8).join(" · ")}{review.resources.length > 8 ? ` · +${review.resources.length - 8} more` : ""}</span></div> : null}
               {review.warnings.length ? <div className="mgmt-callout" role="alert">{review.warnings.join(" · ")}</div> : <p className="mgmt-success"><Check />No review warnings found.</p>}
-              <div className="mgmt-form-actions"><Button variant="secondary" onClick={() => setReview(null)}>Back</Button><Button onClick={confirm}><Check />Confirm import</Button></div>
+              <div className="mgmt-form-actions"><Button variant="secondary" onClick={() => setReview(null)}>Back</Button><Button onClick={confirm}><Check />Import disabled</Button></div>
             </div>
           )}
         </Section>
@@ -91,19 +130,34 @@ export function PersonalSkillsScreen({ client, config }: ManagementScreenProps) 
       <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} empty={rows.length === 0}>
         <DataTable
           label="Skills"
-          columns={["Skill", "Source", "Trust", "Assignment", "Action"]}
+          columns={["Skill", "Provided by", "Policy", "Status"]}
           rows={rows.map((skill) => [
             <Button variant="ghost" className="mgmt-table-link" onClick={() => setSelected(skill)}><b>{skill.name.startsWith("$") ? skill.name : `$${skill.name}`}</b><small>{skill.description}</small></Button>,
-            skill.source,
-            <StatusPill tone={skill.trusted ? "good" : "warning"}>{skill.trusted ? "Reviewed" : "Needs review"}</StatusPill>,
-            skill.enabled ? <StatusPill tone="info">Enabled</StatusPill> : "Available",
-            <Button variant="secondary" disabled={!client} onClick={() => toggle(skill)}>{skill.enabled ? "Disable" : "Enable"}</Button>,
+            skill.provenance === "organization" ? "Organization" : skill.provenance === "personal" ? "You" : "Deployment",
+            skill.personal && !skill.personal.trusted ? <StatusPill tone="warning">Trust required</StatusPill> : <StatusPill tone={skill.locked ? "neutral" : "info"}>{skill.assignment ? skill.assignment.replace("-", " ") : skill.reason}</StatusPill>,
+            <span className="mgmt-skill-switch"><ManagementSwitch checked={skill.enabled} disabled={!client || skill.locked || Boolean(skill.personal && !skill.personal.trusted)} onCheckedChange={(enabled) => void toggle(skill, enabled)} aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`} /><small>{skill.enabled ? "On" : "Off"}</small></span>,
           ])}
         />
       </AsyncState>
-      {selected ? <Detail title={selected.name} onClose={() => setSelected(null)}><p>{selected.description}</p><dl><div><dt>Version</dt><dd>{selected.version ?? "Unversioned"}</dd></div><div><dt>Hash</dt><dd><code>{selected.hash}</code></dd></div><div><dt>Trust</dt><dd>{selected.trusted ? "Reviewed" : "Review required"}</dd></div></dl></Detail> : null}
+      {selected ? <Detail title={`$${selected.name}`} onClose={() => setSelected(null)}><p>{selected.description}</p><dl><div><dt>Provided by</dt><dd>{selected.provenance === "organization" ? "Organization" : selected.provenance === "personal" ? "You" : "Deployment"}</dd></div><div><dt>Assignment</dt><dd>{selected.assignment ?? selected.reason}</dd></div>{selected.personal ? <><div><dt>Version</dt><dd>{selected.personal.version ?? "Unversioned"}</dd></div><div><dt>Hash</dt><dd><code>{selected.personal.hash}</code></dd></div></> : null}</dl>{selected.personal ? <><label className="mgmt-toggle-row"><span>Trust this skill<small>Trusted skills can run when enabled.</small></span><ManagementSwitch checked={selected.personal.trusted} onCheckedChange={(trusted) => void setTrusted(selected.personal!, trusted)} aria-label="Trust this skill" /></label><Button variant="secondary" onClick={() => void remove(selected.personal!)}><Trash2 aria-hidden />Delete skill</Button></> : null}</Detail> : null}
     </ManagementPage>
   );
+}
+
+function buildSkillRows(personal: PersonalSkill[], effective: EffectiveCapability[], deployed: Array<{ id: string; name: string; description: string; enabled: boolean }>): SkillCatalogRow[] {
+  const rows = new Map<string, SkillCatalogRow>();
+  const deployedByName = new Map(deployed.map((item) => [item.name.replace(/^\$/, "").toLowerCase(), item]));
+  for (const item of effective.filter((entry) => entry.kind === "skill" && entry.provenance === "organization")) {
+    rows.set(item.name.toLowerCase(), { key: `organization:${item.capabilityId}`, capabilityId: item.capabilityId, name: item.name, description: deployedByName.get(item.name.toLowerCase())?.description ?? "Managed by your organization", enabled: item.enabled, locked: item.locked, provenance: "organization", assignment: item.assignment, reason: item.reason });
+  }
+  for (const item of personal) {
+    rows.set(item.name.toLowerCase(), { key: `personal:${item.id}`, capabilityId: item.id, name: item.name, description: item.description, enabled: item.enabled && item.trusted, locked: false, provenance: "personal", assignment: null, reason: "personal", personal: item });
+  }
+  for (const item of deployed) {
+    const key = item.name.replace(/^\$/, "").toLowerCase();
+    if (!rows.has(key)) rows.set(key, { key: `deployment:${item.id}`, capabilityId: item.id, name: item.name.replace(/^\$/, ""), description: item.description, enabled: item.enabled, locked: true, provenance: "self-host-bootstrap", assignment: null, reason: "deployment" });
+  }
+  return [...rows.values()].sort((a, b) => a.provenance.localeCompare(b.provenance) || a.name.localeCompare(b.name));
 }
 
 export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {

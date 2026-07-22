@@ -2351,6 +2351,8 @@ export type PersonalSkill = z.infer<typeof PersonalSkillSchema>;
 export const PersonalSkillReviewSchema = z.object({
   name: z.string(), description: z.string(), source: z.enum(["text", "upload", "git"]),
   hash: z.string(), bytes: z.number().int().nonnegative(), warnings: z.array(z.string()),
+  version: z.string().nullable(), license: z.string().nullable(), compatibility: z.string().nullable(), allowedTools: z.string().nullable(),
+  resources: z.array(z.string()).default([]), hasScripts: z.boolean().default(false),
 });
 export type PersonalSkillReview = z.infer<typeof PersonalSkillReviewSchema>;
 

@@ -838,6 +838,18 @@ export class AgentHarness<
 		await this.emitQueueUpdate();
 	}
 
+	/**
+	 * Atomically replace pending follow-ups while a turn is still active.
+	 * The web queue uses this when the user reorders, removes, or promotes a
+	 * prompt, so observers only receive the final queue rather than a series
+	 * of transient empty/intermediate states.
+	 */
+	async replaceFollowUpQueue(messages: Array<{ text: string; images?: ImageContent[] }>): Promise<void> {
+		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot replace follow-ups while idle");
+		this.followUpQueue = messages.map((message) => createUserMessage(message.text, message.images));
+		await this.emitQueueUpdate();
+	}
+
 	async nextTurn(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		this.nextTurnQueue.push(createUserMessage(text, options?.images));
 		await this.emitQueueUpdate();
