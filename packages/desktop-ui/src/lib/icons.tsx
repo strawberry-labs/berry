@@ -75,7 +75,8 @@ import {
   MoreHorizontalIcon,
   NoteEditIcon,
   PaintBoardIcon,
-  Pin02Icon,
+  PencilEdit02Icon as HugePencilEdit02Icon,
+  PinIcon as HugePinIcon,
   PinOffIcon,
   Plug01Icon,
   PlusSignCircleIcon,
@@ -184,13 +185,11 @@ export const Copy = make(Copy01Icon);
 export const GaugeIcon = make(DashboardSpeed02Icon);
 export const GitBranch = make(GitBranchIcon);
 export const GitFork = make(GitForkIcon);
-export const Pin = make(Pin02Icon);
+export const Pin = make(HugePinIcon);
 export const PinOff = make(PinOffIcon);
 export const Pencil = make(Edit02Icon);
 export const PencilLine = make(Edit02Icon);
-// Keep the product-facing name available at call sites. The Hugeicons free
-// package exposes this glyph as Edit02Icon.
-export const PencilEdit02Icon = make(Edit02Icon);
+export const PencilEdit02Icon = make(HugePencilEdit02Icon);
 export const Trash2 = make(Delete02Icon);
 export const BookOpen = make(BookOpen01Icon);
 export const FileDown = make(Download01Icon);
