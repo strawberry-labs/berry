@@ -1237,25 +1237,33 @@ code, pre {
   align-items: center;
   gap: 6px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 0;
   background: transparent;
   color: var(--berry-text-primary);
-  padding: 6px 8px;
+  padding: 6px 8px 6px 4px;
   font-size: 15px;
   font-weight: 650;
   line-height: 1;
-  transition-property: background-color, color, transform;
+  transition-property: color, transform;
   transition-duration: 120ms;
   transition-timing-function: var(--ease-smooth-out);
 }
 
-.berry-web-home-link:hover,
+.berry-web-home-link:hover {
+  background: transparent;
+  color: var(--foreground);
+}
+
 .berry-web-header-icon:hover {
   background: color-mix(in srgb, var(--foreground) 9%, transparent);
   color: var(--foreground);
 }
 
-.berry-web-home-link:active,
+.berry-web-home-link:active {
+  background: transparent;
+  transform: scale(0.96);
+}
+
 .berry-web-header-icon:active {
   background: color-mix(in srgb, var(--foreground) 14%, transparent);
   transform: scale(0.96);
