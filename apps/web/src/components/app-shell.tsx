@@ -45,6 +45,7 @@ import { Thread } from "./tasks/web-task-view";
 import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { replaceTenantValue, settledValue } from "@/lib/management/config-refresh";
+import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
 import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sidebar";
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
@@ -411,10 +412,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   React.useEffect(() => {
     setHydrated(true);
-    const theme = window.localStorage.getItem("berry.web.theme") ?? "dark";
-    document.documentElement.classList.toggle("dark", theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches));
+    applyDocumentTheme();
     const language = window.localStorage.getItem("berry.web.language") ?? "system";
     document.documentElement.lang = language === "system" ? navigator.language : language;
+    return watchSystemTheme();
   }, []);
 
   React.useEffect(() => {

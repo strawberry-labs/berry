@@ -6,6 +6,7 @@ import { FileDown, FileText, X } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { PhotoProvider, PhotoView } from "react-photo-view";
 import "react-photo-view/dist/react-photo-view.css";
+import { currentDocumentTheme } from "@/lib/theme";
 import { isImageFile } from "./file-thumbnail";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
 
@@ -83,7 +84,7 @@ export function FileViewerModal({ file, onOpenChange }: { file: StoredFile | nul
                       type={viewerType(file)}
                       size={file.size}
                       options={{
-                        theme: "light",
+                        theme: currentDocumentTheme(),
                         styleIsolation: "shadow",
                         toolbar: { theme: false, download: false, position: "top-center" },
                       }}
@@ -109,7 +110,7 @@ function FlyfishFallback({ file }: { file: StoredFile }) {
           filename={file.name}
           type={viewerType(file)}
           size={file.size}
-          options={{ theme: "light", styleIsolation: "shadow", toolbar: { theme: false, download: false, position: "top-center" } }}
+          options={{ theme: currentDocumentTheme(), styleIsolation: "shadow", toolbar: { theme: false, download: false, position: "top-center" } }}
         />
       </ViewerErrorBoundary>
     </React.Suspense>

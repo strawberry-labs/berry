@@ -6,6 +6,7 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import { ShieldCheck } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 import type { WebConfig } from "@/lib/config";
+import { applyDocumentTheme, DEFAULT_BERRY_THEME, normalizeThemePreference } from "@/lib/theme";
 import { WEB_SETTINGS_NAV, type SettingsTab } from "../shell/web-sidebar";
 import { InheritedMcpSettings, OrganizationCapabilitiesSettings, PersonalMcpSettings, PersonalSkillsSettings } from "./personal-capabilities";
 
@@ -30,7 +31,7 @@ export function SettingsPanel({
 }) {
   const [customInstructions, setCustomInstructions] = useStoredSetting("berry.web.customInstructions", "");
   const [reviewPrompt, setReviewPrompt] = useStoredSetting("berry.web.reviewPrompt", "Review this change for correctness, regressions, and missing tests.");
-  const [theme, setTheme] = useStoredSetting("berry.web.theme", "dark");
+  const [theme, setTheme] = useStoredSetting("berry.web.theme", DEFAULT_BERRY_THEME);
   const [language, setLanguage] = useStoredSetting("berry.web.language", "system");
   const [queueMessages, setQueueMessages] = useStoredSetting("berry.web.queueMessages", "true");
   const [showReasoning, setShowReasoning] = useStoredSetting("berry.web.showReasoning", "false");
@@ -73,7 +74,7 @@ export function SettingsPanel({
         {error ? <div className="composer-error" role="alert">{error} <Button size="sm" variant="ghost" onClick={() => void onAdminChanged()}>Retry</Button></div> : null}
         <div className="berry-settings-card">
           <label><span><strong>Organization</strong><small>Choose the cloud organization whose policy and usage settings are shown.</small></span><select aria-label="Organization" value={activeOrganizationId} onChange={(event) => onOrganizationChange(event.currentTarget.value)}>{config.organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label>
-          <label><span><strong>App theme</strong><small>Choose how Berry appears in this browser.</small></span><select value={theme} onChange={(event) => { const value = event.currentTarget.value; setTheme(value); document.documentElement.classList.toggle("dark", value === "dark" || (value === "system" && matchMedia("(prefers-color-scheme: dark)").matches)); }}><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></label>
+          <label><span><strong>App theme</strong><small>Choose how Berry appears in this browser.</small></span><select value={theme} onChange={(event) => { const value = event.currentTarget.value; setTheme(value); applyDocumentTheme(normalizeThemePreference(value)); }}><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></label>
           <label><span><strong>Language</strong><small>Choose the display language used by the interface.</small></span><select value={language} onChange={(event) => { setLanguage(event.currentTarget.value); document.documentElement.lang = event.currentTarget.value === "system" ? navigator.language : event.currentTarget.value; }}><option value="system">System default</option><option value="en">English</option></select></label>
         </div>
         <div className="berry-settings-card">

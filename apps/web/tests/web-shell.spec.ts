@@ -76,6 +76,58 @@ test("dark mode uses the approved surfaces and neutral menu highlights", async (
   await expect(fullAccess).toHaveCSS("background-color", "rgba(255, 255, 255, 0.05)");
 });
 
+test("hard refresh applies dark, light, and system themes before hydration", async ({ page }) => {
+  const assertTheme = async (
+    preference: "dark" | "light" | "system",
+    expected: { dark: boolean; background: string; foreground: string },
+  ) => {
+    await page.evaluate((value) => localStorage.setItem("berry.web.theme", value), preference);
+    await page.reload();
+    await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+
+    const appearance = await page.evaluate(() => ({
+      dark: document.documentElement.classList.contains("dark"),
+      scheme: document.documentElement.style.colorScheme,
+      background: getComputedStyle(document.body).backgroundColor,
+      foreground: getComputedStyle(document.body).color,
+      stylesheets: [...document.styleSheets].map((sheet) => sheet.href).filter(Boolean),
+    }));
+
+    expect(appearance).toMatchObject({
+      dark: expected.dark,
+      scheme: expected.dark ? "dark" : "light",
+      background: expected.background,
+      foreground: expected.foreground,
+    });
+    expect(new Set(appearance.stylesheets).size).toBe(appearance.stylesheets.length);
+  };
+
+  await page.goto("/");
+  await assertTheme("dark", {
+    dark: true,
+    background: "rgb(24, 24, 24)",
+    foreground: "rgb(252, 252, 252)",
+  });
+  await assertTheme("light", {
+    dark: false,
+    background: "rgb(255, 255, 255)",
+    foreground: "rgb(13, 13, 13)",
+  });
+
+  await page.emulateMedia({ colorScheme: "dark" });
+  await assertTheme("system", {
+    dark: true,
+    background: "rgb(24, 24, 24)",
+    foreground: "rgb(252, 252, 252)",
+  });
+  await page.emulateMedia({ colorScheme: "light" });
+  await assertTheme("system", {
+    dark: false,
+    background: "rgb(255, 255, 255)",
+    foreground: "rgb(13, 13, 13)",
+  });
+});
+
 test("shared sidebar filters Chat and Code without replacing the active task", async ({ page }) => {
   await openTask(page);
   await expect(page.getByRole("button", { name: "Code", exact: true })).toHaveAttribute("aria-pressed", "true");

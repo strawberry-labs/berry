@@ -6,31 +6,23 @@
 @source "../../../packages/desktop-ui/src";
 
 :root {
-  color-scheme: dark;
-  --berry-main-bg: #181818;
-  --berry-sidebar-bg: #242424;
-  --berry-control-bg: #2d2d2d;
-  --berry-card-bg: #212121;
-  --berry-vibrancy-fallback: #1f1f1f;
-  --berry-text: #fcfcfc;
-  --berry-sidebar-text: #dfdfdf;
-  --berry-tertiary: #949494;
-  --berry-accent: #339cff;
+  color-scheme: light;
+  --berry-vibrancy-fallback: var(--berry-surface-under);
+  --berry-text: var(--berry-text-primary);
+  --berry-sidebar-text: var(--berry-text-secondary);
+  --berry-tertiary: var(--berry-text-tertiary);
   --berry-focus: #0169cc;
-  --berry-danger: #ef6b63;
-  --berry-warning: #e1a84f;
+  --berry-danger: var(--destructive);
+  --berry-warning: var(--berry-mode-full);
   --berry-preview-paper: #ffffff;
   --berry-preview-ink: #0d0d0d;
   --berry-preview-muted: #6b7280;
   --berry-preview-line: #d9dde3;
   --berry-preview-header: #f5f6f7;
   --berry-spreadsheet-accent: #18864b;
-  --berry-border: rgba(255, 255, 255, 0.09);
-  --berry-border-strong: rgba(255, 255, 255, 0.16);
-  --berry-accent-soft: rgba(51, 156, 255, 0.14);
-  --berry-danger-soft: rgba(239, 107, 99, 0.11);
-  --berry-hover: #ffffff0d;
-  --berry-selected: #ffffff1a;
+  --berry-border-strong: var(--berry-border-hover);
+  --berry-accent-soft: color-mix(in srgb, var(--berry-accent) 14%, transparent);
+  --berry-danger-soft: color-mix(in srgb, var(--berry-danger) 11%, transparent);
   --bg: var(--berry-main-bg);
   --surface: var(--berry-card-bg);
   --surface-strong: var(--berry-control-bg);
@@ -61,6 +53,21 @@
   --toggle-ov2: 0px;
   --toggle-track: 0ms;
   --toggle-ease: cubic-bezier(0.34, 1.35, 0.64, 1);
+}
+
+.dark {
+  color-scheme: dark;
+  --berry-vibrancy-fallback: #1f1f1f;
+  --berry-text: #fcfcfc;
+  --berry-sidebar-text: #dfdfdf;
+  --berry-tertiary: #949494;
+  --berry-accent: #339cff;
+  --berry-focus: #0169cc;
+  --berry-danger: #ef6b63;
+  --berry-warning: #e1a84f;
+  --berry-border-strong: rgba(255, 255, 255, 0.16);
+  --berry-accent-soft: rgba(51, 156, 255, 0.14);
+  --berry-danger-soft: rgba(239, 107, 99, 0.11);
 }
 
 * { box-sizing: border-box; }

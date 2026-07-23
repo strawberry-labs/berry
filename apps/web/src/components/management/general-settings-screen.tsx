@@ -1,10 +1,11 @@
 import * as React from "react";
 import { Save } from "lucide-react";
 import { Button, FormSelect, ManagementPage, ManagementSwitch, Section, SuccessMessage, Textarea } from "./management-primitives";
+import { applyDocumentTheme, DEFAULT_BERRY_THEME, normalizeThemePreference } from "@/lib/theme";
 import { useLocalSetting } from "./management-context";
 
 export function GeneralSettingsScreen() {
-  const [theme, setTheme] = useLocalSetting("berry.web.theme", "system");
+  const [theme, setTheme] = useLocalSetting("berry.web.theme", DEFAULT_BERRY_THEME);
   const [language, setLanguage] = useLocalSetting("berry.web.language", "system");
   const [instructions, setInstructions] = useLocalSetting("berry.web.customInstructions", "");
   const [sendBehavior, setSendBehavior] = useLocalSetting("berry.web.sendBehavior", "enter");
@@ -15,14 +16,13 @@ export function GeneralSettingsScreen() {
 
   React.useEffect(() => { if (!dirty) setDraft(instructions); }, [dirty, instructions]);
   React.useEffect(() => {
-    const dark = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-    document.documentElement.classList.toggle("dark", dark);
+    applyDocumentTheme(normalizeThemePreference(theme));
   }, [theme]);
   React.useEffect(() => { document.documentElement.lang = language === "system" ? navigator.language.split("-")[0] || "en" : language; }, [language]);
 
   return <ManagementPage title="General" description="Browser appearance, conversation behavior, and instructions used for new tasks." eyebrow="Personal settings">
     <Section title="Appearance" description="These preferences are stored in this browser."><div className="mgmt-setting-list">
-      <label><span><b>Theme</b><small>Use Berry’s light, dark, or system appearance.</small></span><FormSelect value={theme} onChange={(next) => { setTheme(next); document.documentElement.classList.toggle("dark", next === "dark"); }} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></label>
+      <label><span><b>Theme</b><small>Use Berry’s light, dark, or system appearance.</small></span><FormSelect value={theme} onChange={setTheme} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></label>
       <label><span><b>Language</b><small>Controls dates, numbers, and screen-reader pronunciation.</small></span><FormSelect value={language} onChange={setLanguage} options={[{ value: "system", label: "System default" }, { value: "en", label: "English" }]} /></label>
     </div></Section>
     <Section title="Conversation behavior"><div className="mgmt-setting-list">

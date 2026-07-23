@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
 import { AppShell, loadFixtureShellData } from "@/components/app-shell";
 import { loadWebBootstrap } from "@/lib/config.functions";
+import { BERRY_THEME_BOOTSTRAP_SCRIPT } from "@/lib/theme";
 import appCss from "../styles.css?url";
 
 export const Route = createRootRoute({
@@ -34,8 +35,9 @@ function RootComponent() {
 
 function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className="dark" suppressHydrationWarning>
       <head>
+        <script dangerouslySetInnerHTML={{ __html: BERRY_THEME_BOOTSTRAP_SCRIPT }} />
         <HeadContent />
       </head>
       <body>
