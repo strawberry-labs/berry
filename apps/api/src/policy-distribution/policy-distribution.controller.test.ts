@@ -7,6 +7,7 @@ import type { SessionHost } from "@berry/local-agent";
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
+import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
 import { InMemoryEnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { Ed25519PolicySigner, InMemoryPolicyDistributionRepository, PolicyDistributionService } from "./policy-distribution.service.ts";
@@ -109,7 +110,10 @@ async function createApp(service: PolicyDistributionService): Promise<INestAppli
       identity: { repository: { useValue: new InMemoryEnterpriseIdentityRepository() } },
       policyDistribution: { service: { useValue: service } },
     })],
-  }).compile();
+  })
+    .overrideProvider(FilePlatformService)
+    .useValue({})
+    .compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
   return nestApp;

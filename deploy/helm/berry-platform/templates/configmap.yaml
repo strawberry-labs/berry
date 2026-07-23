@@ -9,6 +9,8 @@ data:
   BERRY_AUTH_MODE: {{ .Values.auth.mode | quote }}
   BERRY_AUTH_BASE_URL: {{ .Values.auth.baseUrl | quote }}
   BERRY_AUTH_TRUSTED_ORIGINS: {{ .Values.auth.trustedOrigins | quote }}
+  BERRY_AUTH_SIGNUP_ENABLED: {{ .Values.auth.signupEnabled | quote }}
+  BERRY_SETUP_OWNER_EMAIL: {{ .Values.auth.setupOwnerEmail | quote }}
   BERRY_API_MODEL_MODE: "live"
   BERRY_BUDGETS_ENABLED: "true"
   BERRY_BUDGET_FAIL_CLOSED: "true"

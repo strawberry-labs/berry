@@ -633,6 +633,15 @@ describe("AgentApiController", () => {
     }).expect(200).expect(({ text }) => {
       expect(JSON.parse(text)).toEqual({ ok: true });
     });
+    await request(app.getHttpServer()).post("/v1/auth/setup").send({
+      organizationName: "Acme",
+      name: "Owner",
+      email: "owner@example.test",
+      password: "test-password",
+      setupToken: "test-setup-token",
+    }).expect(201).expect(({ body }) => {
+      expect(body).toMatchObject({ ok: true, user: { email: "owner@example.test" } });
+    });
   });
 });
 
@@ -685,9 +694,19 @@ function fakeAuthRuntime(): BerryAuthRuntime {
     describe: () => ({
       basePath: "/v1/auth",
       emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+      signupEnabled: false,
+      setup: { required: false, available: false, ownerEmail: null, missingConfiguration: [] },
       socialProviders: ["github"],
       storage: "memory",
     }),
+    setupOwner: async (input) => {
+      const body = input as { name: string; email: string };
+      return {
+        ok: true,
+        user: { id: "user_owner", email: body.email, name: body.name },
+        organization: { id: "org_1", name: "Acme" },
+      };
+    },
     getSession,
     requireSession: async (headers) => {
       const session = await getSession(headers);

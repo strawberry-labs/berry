@@ -35,7 +35,7 @@ git clone YOUR_REPOSITORY_URL /opt/berry
 cd /opt/berry
 cp deploy/.env.production.example deploy/.env.production
 chmod 600 deploy/.env.production
-# Run the hex command three times for Postgres, MinIO, and usage signing.
+# Run the hex command four times for Postgres, MinIO, usage signing, and setup.
 openssl rand -hex 32
 openssl rand -base64 36
 ./deploy/production-up.sh
@@ -43,9 +43,11 @@ openssl rand -base64 36
 
 Fill every `REPLACE_WITH` value before running the script. The API runs additive Postgres migrations before listening. Caddy obtains and renews the certificate after DNS resolves and ports 80/443 are reachable.
 
-Use URL-safe hexadecimal values for the Postgres, MinIO, and usage-webhook secrets because the Postgres password is interpolated into a connection URL. Use a separate 36-byte base64 value for `BETTER_AUTH_SECRET`. The launcher also refuses to start while the sample `@example.com` account allow-list remains.
+Use URL-safe hexadecimal values for the Postgres, MinIO, setup, and usage-webhook secrets because the Postgres password is interpolated into a connection URL and the setup key is printed in a URL fragment. Use a separate 36-byte base64 value for `BETTER_AUTH_SECRET`. The launcher refuses to start while any `REPLACE_WITH` placeholder remains.
 
-Create the owner account using the first allow-listed email. The first account automatically becomes owner and receives the configured $15 monthly user limit; the organization receives a $100 monthly hard limit. Then set `BERRY_AUTH_SIGNUP_ENABLED=false`. Owners and admins can create later email/password accounts and set each user's limit from Settings → Governance without reopening public signup.
+The launcher prints a one-time URL containing the setup key in the URL fragment, which is not sent in HTTP requests. Open it and create the configured owner account. Berry creates the owner, organization membership, default workspace ownership, and initial budgets in one locked database transaction. The database then reports setup complete, so the endpoint cannot create another owner even if the key is reused.
+
+`BERRY_AUTH_SIGNUP_ENABLED=false` should remain the default. Owners and admins can create later email/password accounts and set each user's limit from Settings → Governance without reopening self-service signup. After verifying owner sign-in, clear both `BERRY_SETUP_OWNER_EMAIL` and `BERRY_SETUP_TOKEN` from the environment and restart the API; the completed database state remains authoritative.
 
 ## Go-live verification
 

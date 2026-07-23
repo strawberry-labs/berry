@@ -6,6 +6,7 @@ import type { SessionHost } from "@berry/local-agent";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
+import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
 import { InMemoryEnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { BillingService, InMemoryBillingRepository, NoopBillingProvider, StripeBillingProvider } from "./billing.service.ts";
@@ -114,7 +115,10 @@ async function createApp(service: BillingService): Promise<INestApplication> {
       identity: { repository: { useValue: identity } },
       billing: { service: { useValue: service } },
     })],
-  }).compile();
+  })
+    .overrideProvider(FilePlatformService)
+    .useValue({})
+    .compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
   return nestApp;

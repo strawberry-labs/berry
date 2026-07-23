@@ -1,4 +1,4 @@
-import { All, Controller, Get, Inject, Req, Res } from "@nestjs/common";
+import { All, Body, Controller, Get, Inject, Post, Req, Res } from "@nestjs/common";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { PublicAuth } from "./auth.decorators.ts";
 import { BerryAuthService } from "./auth-runtime.ts";
@@ -11,6 +11,11 @@ export class BerryAuthController {
   @Get("/config")
   config() {
     return this.auth.describe();
+  }
+
+  @Post("/setup")
+  setup(@Body() body: unknown) {
+    return this.auth.setupOwner(body);
   }
 
   @All()

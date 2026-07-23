@@ -42,9 +42,7 @@
   --shadow: 0 10px 32px rgba(0, 0, 0, 0.34);
   /* ChatGPT-style native UI stack: SF on Apple platforms, Segoe UI on
      Windows, and the browser's system sans everywhere else. */
-  --font-sans: -apple-system-body, ui-sans-serif, -apple-system, system-ui,
-    "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif,
-    "Segoe UI Emoji", "Segoe UI Symbol";
+  --font-sans: -apple-system, system-ui, "Segoe UI", sans-serif;
   --font-serif: "Source Serif 4", Georgia, serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
   --toggle-dur: 350ms;
@@ -82,7 +80,7 @@ body {
   color: var(--ink);
   font-family: var(--font-sans);
   font-size: 14px;
-  font-weight: 400;
+  font-weight: 445;
   font-feature-settings: normal;
   font-variation-settings: normal;
   font-synthesis: none;
@@ -159,9 +157,21 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .mgmt-skill-dropzo
 }
 
 .brand-mark {
-  font-family: var(--font-serif);
-  font-size: 24px;
+  display: inline-flex;
+  width: max-content;
+  align-items: center;
+  gap: 8px;
+  justify-self: center;
+  font-family: inherit;
+  font-size: 20px;
   font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.01em;
+}
+
+.auth-brand-logo {
+  width: 16px;
+  height: 24px;
 }
 
 .new-task {
@@ -1004,7 +1014,7 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .mgmt-skill-dropzo
 .auth-shell {
   min-height: 100vh;
   padding: 28px;
-  background: var(--berry-main-bg);
+  background: #000000;
   display: grid;
   place-items: center;
 }
@@ -1031,6 +1041,10 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .mgmt-skill-dropzo
   line-height: 1.45;
 }
 
+.auth-setup-intro {
+  text-align: center;
+}
+
 .auth-card label {
   display: grid;
   gap: 7px;
@@ -1045,6 +1059,23 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .mgmt-skill-dropzo
   background: var(--berry-control-bg);
   color: var(--ink);
   padding: 0 11px;
+}
+
+.auth-card input:read-only {
+  color: var(--muted);
+}
+
+.auth-setup-notice {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--berry-control-bg);
+  padding: 12px;
+  color: var(--berry-sidebar-text);
+  font-size: 12px;
+}
+
+.auth-setup-notice p {
+  margin-top: 6px;
 }
 
 .primary-button {
@@ -1199,6 +1230,63 @@ code, pre {
   height: 100svh;
 }
 
+/* Codex-derived type scale. Scope these overrides to the web surface so the
+   shared desktop primitives retain their own product defaults. */
+.berry-web-shell .berry-user-message {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 445;
+  line-height: 21px;
+}
+
+.berry-web-shell .berry-assistant-message > div {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 445;
+  line-height: 22px;
+  letter-spacing: normal;
+}
+
+.berry-web-shell .berry-sidebar-header {
+  gap: 8px;
+  padding-inline: 8px;
+  padding-bottom: 1px;
+}
+
+.berry-web-shell .berry-app-sidebar [data-sidebar="content"] { gap: 16px; }
+.berry-web-shell .berry-app-sidebar [data-sidebar="menu-button"] {
+  height: 30px;
+  min-height: 30px;
+  border-radius: 10px;
+  padding: 5px 8px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 445;
+  line-height: 21px;
+}
+.berry-web-shell .berry-app-sidebar .berry-sidebar-task-row { padding: 5px 4px 5px 8px; line-height: 20px; }
+.berry-web-shell .berry-sidebar-task-row.pl-8 { padding-left: 32px; }
+.berry-web-shell .berry-sidebar-task-list,
+.berry-web-shell .berry-sidebar-tree { gap: 1px; }
+.berry-web-shell .berry-sidebar-section-heading {
+  display: flex;
+  height: 25px;
+  align-items: center;
+  padding: 0 2px 0 8px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 21px;
+}
+.berry-web-shell .berry-sidebar-footer {
+  min-height: 46px;
+  gap: 8px;
+  padding-inline: 8px;
+}
+.berry-web-shell .berry-connect-button { height: 29px; }
+.berry-web-shell .berry-connect-avatar { width: 24px; height: 24px; }
+.berry-web-shell .berry-sidebar-mini-control { width: 24px; height: 24px; border-radius: 10px; }
+
 .berry-web-main,
 .berry-web-main > .workspace {
   min-height: 0;
@@ -1351,66 +1439,65 @@ code, pre {
   color: var(--berry-danger);
 }
 
-.berry-composer-queue {
-  position: absolute;
-  right: 18px;
-  bottom: calc(100% - 18px);
-  left: 18px;
-  z-index: 0;
-  max-height: min(224px, 34dvh);
-  min-width: 0;
-  overflow: auto;
-  padding-top: 8px;
-  pointer-events: none;
-}
-
-.berry-composer-queue-list {
-  display: flex;
-  flex-direction: column-reverse;
-  gap: 3px;
-}
-
 .berry-composer-root > .berry-composer-shell {
   position: relative;
   z-index: 1;
 }
 
-/* Pending prompts deliberately sit behind the composer: the card nearest the
-   input is next to run, while later prompts stack upward. */
 .berry-queued-message-list {
   position: absolute;
-  right: 18px;
-  bottom: calc(100% - 18px);
-  left: 18px;
+  right: 13px;
+  bottom: calc(100% - 1px);
+  left: 13px;
   z-index: 0;
-  max-height: min(30dvh, 260px);
-  overflow: hidden;
-  border: 1px solid var(--berry-border);
-  border-radius: 22px 22px 0 0;
-  background: var(--berry-card-bg);
-  box-shadow: var(--berry-shadow-md), inset 0 1px 0 var(--berry-border);
+  min-width: 0;
+  overflow: clip;
+  border: 0;
+  border-top: 1px solid color-mix(in oklab, var(--berry-border-strong) 80%, transparent);
+  border-inline: 1px solid color-mix(in oklab, var(--berry-border-strong) 80%, transparent);
+  border-radius: 20px 20px 0 0;
+  background: color-mix(in oklab, var(--berry-control-bg) 70%, transparent);
+  backdrop-filter: blur(8px);
   pointer-events: auto;
 }
 
 .berry-queued-message-scroll {
   display: flex;
-  max-height: min(30dvh, 260px);
-  flex-direction: column-reverse;
-  gap: 2px;
-  overflow: auto;
-  padding: 8px 8px 22px;
+  max-height: 30dvh;
+  flex-direction: column;
+  gap: 1px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 5px 12px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.berry-queued-message-scroll::-webkit-scrollbar { display: none; }
+.berry-queued-message-scroll[data-scroll-top-fade="true"] {
+  mask-image: linear-gradient(to bottom, transparent 0, black 16px, black 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 16px, black 100%);
+}
+.berry-queued-message-scroll[data-scroll-bottom-fade="true"] {
+  mask-image: linear-gradient(to bottom, black 0, black calc(100% - 16px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 0, black calc(100% - 16px), transparent 100%);
+}
+.berry-queued-message-scroll[data-scroll-top-fade="true"][data-scroll-bottom-fade="true"] {
+  mask-image: linear-gradient(to bottom, transparent 0, black 16px, black calc(100% - 16px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 16px, black calc(100% - 16px), transparent 100%);
 }
 
 .berry-queued-message-paused {
   display: flex;
-  min-height: 34px;
+  min-height: 28px;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  border-bottom: 1px solid var(--berry-border);
-  padding: 5px 9px 4px 12px;
+  padding: 5px 12px 4px;
   color: var(--berry-text-secondary);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 445;
+  line-height: 18px;
 }
 
 .berry-queued-message-paused span,
@@ -1422,57 +1509,124 @@ code, pre {
 
 .berry-queued-message-paused svg { width: 14px; height: 14px; }
 
-.berry-queued-message-row {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: 28px minmax(0, 1fr) max-content max-content 26px 26px;
-  align-items: center;
-  gap: 5px;
-  min-height: 46px;
-  border: 1px solid transparent;
-  border-radius: 15px;
-  padding: 6px 5px 6px 7px;
-  color: var(--berry-text-secondary);
-  transition: border-color 120ms ease-out, background-color 120ms ease-out, box-shadow 120ms ease-out, margin 120ms ease-out, opacity 120ms ease-out, transform 120ms ease-out;
+.berry-queued-message-presence { min-height: 0; flex: none; overflow: visible; }
+.berry-queued-message-presence[data-presence="entering"] { animation: berry-queued-message-enter 180ms both; }
+.berry-queued-message-presence[data-presence="exiting"] { overflow: hidden; pointer-events: none; animation: berry-queued-message-exit 180ms both; }
+
+@keyframes berry-queued-message-enter {
+  from { height: 0; opacity: 0; }
+  to { height: 28px; opacity: 1; }
 }
 
-.berry-queued-message-row:hover,
-.berry-queued-message-row:focus-within { background: var(--berry-selected); border-color: var(--berry-border); }
-.berry-queued-message-row.is-dragging { opacity: .82; transform: translateY(-2px) scale(1.01); box-shadow: var(--berry-shadow-md); }
-.berry-queued-message-row.is-drop-before { margin-bottom: 12px; box-shadow: 0 6px 0 -5px var(--berry-accent); }
-.berry-queued-message-row.is-drop-after { margin-top: 12px; box-shadow: 0 -6px 0 -5px var(--berry-accent); }
+@keyframes berry-queued-message-exit {
+  from { height: 28px; opacity: 1; }
+  to { height: 0; opacity: 0; }
+}
+
+.berry-queued-message-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 2px 0;
+  color: var(--berry-text-secondary);
+  transition: opacity 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.berry-queued-message-row.is-dragging { opacity: .62; }
+.berry-queued-message-row.is-drop-before { box-shadow: inset 0 1px 0 var(--berry-accent); }
+.berry-queued-message-row.is-drop-after { box-shadow: inset 0 -1px 0 var(--berry-accent); }
 
 .berry-queued-message-drag {
   position: relative;
-  display: grid;
-  width: 28px;
-  height: 30px;
-  place-items: center;
+  width: 22px;
+  height: 24px;
+  flex: 0 0 22px;
   border: 0;
-  border-radius: 8px;
   padding: 0;
   background: transparent;
   color: var(--berry-text-tertiary);
   cursor: grab;
 }
 .berry-queued-message-drag:active { cursor: grabbing; }
-.berry-queued-message-drag svg { position: absolute; width: 16px; height: 16px; transition: opacity 100ms ease-out, transform 100ms ease-out; }
-.berry-queued-message-grip { opacity: 0; transform: scale(.85); }
-.berry-queued-message-row:hover .berry-queued-message-queue-icon,
-.berry-queued-message-row:focus-within .berry-queued-message-queue-icon { opacity: 0; transform: scale(.85); }
+.berry-queued-message-drag svg { position: absolute; top: 5px; width: 14px; height: 14px; }
+.berry-queued-message-queue-icon { right: 0; }
+.berry-queued-message-grip { left: -3px; opacity: 0; transition: opacity 150ms cubic-bezier(0.4, 0, 0.2, 1); }
 .berry-queued-message-row:hover .berry-queued-message-grip,
-.berry-queued-message-row:focus-within .berry-queued-message-grip { opacity: 1; transform: scale(1); }
+.berry-queued-message-row:focus-within .berry-queued-message-grip,
+.berry-queued-message-row.is-dragging .berry-queued-message-grip { opacity: 1; }
 
-.berry-queued-message-text { overflow: hidden; margin: 0; color: var(--berry-text); font-size: 13px; line-height: 18px; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
-.berry-queued-message-attachments { overflow: hidden; margin: 1px 0 0; color: var(--berry-text-tertiary); font-size: 11px; line-height: 14px; text-overflow: ellipsis; white-space: nowrap; }
-.berry-queued-message-state { display: flex; align-items: center; gap: 4px; margin: 2px 0 0; color: var(--berry-text-tertiary); font-size: 11px; line-height: 14px; }
-.berry-queued-message-state[data-state="failed"] { color: var(--berry-danger); }
-.berry-queued-message-state svg { width: 12px; height: 12px; }
-.berry-queued-message-status { color: var(--berry-text-tertiary); font-size: 11px; white-space: nowrap; }
-.berry-queued-message-action { min-height: 26px; padding-inline: 6px; color: var(--berry-text-secondary); font-size: 12px; }
-.berry-queued-message-action svg { width: 13px; height: 13px; }
-.berry-queued-message-delete { color: var(--berry-text-tertiary); }
-.berry-queued-message-edit { width: 100%; height: 27px; border: 1px solid var(--berry-border-strong); border-radius: 8px; background: var(--berry-control-bg); padding: 0 7px; color: var(--berry-text); font-size: 13px; outline: none; }
+.berry-queued-message-text {
+  display: -webkit-box;
+  max-height: 16px;
+  overflow: hidden;
+  margin: 0;
+  color: var(--berry-text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 445;
+  line-height: 16px;
+  letter-spacing: normal;
+  text-overflow: ellipsis;
+  user-select: none;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+}
+.berry-queued-message-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }
+.berry-queued-message-action {
+  min-height: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+  padding: 2px 8px;
+  color: var(--berry-text-tertiary);
+  font-size: 13px;
+  font-weight: 445;
+  line-height: 18px;
+}
+.berry-queued-message-action svg { width: 14px; height: 14px; }
+.berry-queued-message-action:hover,
+.berry-queued-message-action:focus-visible,
+.berry-queued-message-delete:hover,
+.berry-queued-message-delete:focus-visible,
+.berry-queued-message-more:hover,
+.berry-queued-message-more:focus-visible { background: var(--berry-hover); color: var(--berry-text); }
+.berry-queued-message-delete,
+.berry-queued-message-more {
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 4px;
+  color: var(--berry-text-tertiary);
+}
+.berry-queued-message-delete svg,
+.berry-queued-message-more svg { width: 14px; height: 14px; }
+.berry-queued-message-edit { width: 100%; height: 24px; border: 1px solid var(--berry-border-strong); border-radius: 8px; background: var(--berry-control-bg); padding: 0 7px; color: var(--berry-text); font-size: 14px; font-weight: 445; line-height: 16px; outline: none; }
+
+.berry-queued-message-menu {
+  width: max-content;
+  min-width: 0;
+  border: 0;
+  border-radius: 15px;
+  padding: 4px;
+  background: color-mix(in oklab, var(--berry-card-bg) 90%, transparent);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 0 0 0.5px var(--berry-border-strong), 0 8px 16px -4px rgb(0 0 0 / 12%);
+}
+.berry-queued-message-menu [data-slot="dropdown-menu-item"] {
+  min-height: 28px;
+  border-radius: 12.5px;
+  padding: 5px 8px;
+  color: var(--berry-text-secondary);
+  font-size: 13px;
+  font-weight: 445;
+  line-height: 18.57px;
+}
+.berry-queued-message-menu [data-slot="dropdown-menu-item"]:focus { background: var(--berry-hover); color: var(--berry-text); }
+.berry-queued-message-menu [data-slot="dropdown-menu-item"] svg { width: 16px; height: 16px; color: var(--berry-text-tertiary); }
 
 .berry-composer-context-row {
   min-height: 38px;
@@ -1498,16 +1652,15 @@ code, pre {
 .berry-follow-up-mode svg { width: 14px; height: 14px; }
 
 @media (max-width: 640px) {
-  .berry-queued-message-list { right: 8px; bottom: calc(100% - 12px); left: 8px; }
-  .berry-queued-message-scroll { max-height: min(38dvh, 300px); padding: 7px 6px 16px; }
-  .berry-queued-message-row { grid-template-columns: 28px minmax(0, 1fr) max-content 26px 26px; }
-  .berry-queued-message-status { display: none; }
-  .berry-queued-message-action { padding-inline: 4px; }
+  .berry-queued-message-list { right: 8px; left: 8px; }
+  .berry-queued-message-scroll { padding-inline: 8px; }
+  .berry-queued-message-action { padding-inline: 6px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .berry-queued-message-row,
-  .berry-queued-message-drag svg { transition: none; }
+  .berry-queued-message-drag svg,
+  .berry-queued-message-presence { transition: none; animation: none; }
 }
 
 /* A pending ask_user_question owns the composer surface. The actual text

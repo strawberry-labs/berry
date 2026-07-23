@@ -41,11 +41,13 @@ describe("CloudDatabaseService", () => {
     expect(executor.calls.map((call) => call.sql)).toEqual(
       expect.arrayContaining([
         expect.stringContaining("CREATE TABLE IF NOT EXISTS schema_migrations"),
+        expect.stringContaining("pg_advisory_xact_lock"),
         "SELECT id FROM schema_migrations",
         CLOUD_INITIAL_MIGRATION,
         "INSERT INTO schema_migrations (id, name) VALUES ($1, $2)",
       ]),
     );
+    expect(executor.transactionCount).toBe(1);
   });
 
   it("skips already-applied migrations", async () => {

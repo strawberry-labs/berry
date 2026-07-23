@@ -6,6 +6,7 @@ import { SELF_HOST_TENANT_ID } from "@berry/db";
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
+import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
 import { InMemoryEnterpriseIdentityRepository } from "./identity.repository.ts";
 
@@ -302,7 +303,10 @@ async function createApp(): Promise<INestApplication> {
         scimBearerToken: "berry-scim-test",
       },
     })],
-  }).compile();
+  })
+    .overrideProvider(FilePlatformService)
+    .useValue({})
+    .compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
   return nestApp;

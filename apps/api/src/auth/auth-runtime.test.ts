@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
+import { SELF_HOST_WORKSPACE_ID } from "@berry/db";
 import { describe, expect, it, vi } from "vitest";
-import { createBetterAuthOptions } from "./auth-runtime.ts";
+import { createBetterAuthOptions, RealBetterAuthRuntime, type BerryAuthDescription } from "./auth-runtime.ts";
 
 describe("Better Auth runtime config", () => {
   it("enables email/password and maps Better Auth storage onto cloud tables", () => {
@@ -10,6 +11,12 @@ describe("Better Auth runtime config", () => {
       basePath: "/v1/auth",
       emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
       signupEnabled: true,
+      setup: {
+        required: false,
+        available: false,
+        ownerEmail: null,
+        missingConfiguration: [],
+      },
       socialProviders: [],
       storage: "memory",
     });
@@ -65,10 +72,8 @@ describe("Better Auth runtime config", () => {
     } })).toThrow("BERRY_AUTH_ALLOWED_EMAILS");
   });
 
-  it("replaces the zero-value seed budget for the first owner", async () => {
-    const query = vi.fn(async (sql: string) => sql.includes("role = 'owner'")
-      ? { rows: [{ count: "0" }] }
-      : { rows: [] });
+  it("creates ordinary self-service signups as members after owner setup", async () => {
+    const query = vi.fn(async (_sql: string, _params?: readonly unknown[]) => ({ rows: [] }));
     const pool = {
       connect: vi.fn(async () => ({ query, release: vi.fn() })),
     } as unknown as Pool;
@@ -94,9 +99,126 @@ describe("Better Auth runtime config", () => {
     const membershipSql = query.mock.calls
       .map(([sql]) => sql)
       .find((sql) => sql.includes("INSERT INTO tenant_memberships"));
-    expect(membershipSql).toContain("'manual'");
-    expect(membershipSql).not.toContain("'signup'");
-    expect(orgBudgetSql).toContain("DO UPDATE SET");
-    expect(orgBudgetSql).toContain("hard_limit_micros = EXCLUDED.hard_limit_micros");
+    expect(membershipSql).toContain("'member'");
+    expect(membershipSql).toContain("'signup'");
+    expect(query.mock.calls.some(([sql]) => sql.includes("UPDATE workspaces"))).toBe(false);
+    expect(orgBudgetSql).toContain("DO NOTHING");
+  });
+
+  it("creates the first owner, claims the default workspace, and closes setup in one transaction", async () => {
+    const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.includes("SELECT EXISTS")) return { rows: [{ exists: false }] };
+      if (sql.includes("INSERT INTO users")) return { rows: [{ id: "00000000-0000-7000-8000-000000000111" }] };
+      if (sql.includes("UPDATE tenants") || sql.includes("UPDATE workspaces")) return { rows: [], rowCount: 1 };
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const pool = {
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool;
+    const runtime = new RealBetterAuthRuntime(
+      { handler: vi.fn() } as never,
+      baseDescription(),
+      pool,
+      {
+        BERRY_SETUP_OWNER_EMAIL: "owner@example.test",
+        BERRY_SETUP_TOKEN: "setup-token-with-at-least-thirty-two-characters",
+        BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS: "100000000",
+        BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS: "15000000",
+      },
+    );
+
+    await expect(runtime.setupOwner({
+      organizationName: "Acme",
+      name: "Owner",
+      email: "OWNER@example.test",
+      password: "correct-horse-battery-staple",
+      setupToken: "setup-token-with-at-least-thirty-two-characters",
+    })).resolves.toMatchObject({
+      ok: true,
+      user: { id: "00000000-0000-7000-8000-000000000111", email: "owner@example.test" },
+      organization: { name: "Acme" },
+    });
+
+    expect(query.mock.calls.some(([sql]) => sql.includes("pg_advisory_xact_lock"))).toBe(true);
+    expect(query.mock.calls.find(([sql]) => sql.includes("INSERT INTO tenant_memberships"))?.[0]).toContain("'owner', 'setup'");
+    expect(query.mock.calls.find(([sql]) => sql.includes("UPDATE workspaces"))?.[1]).toEqual([
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000111",
+      SELF_HOST_WORKSPACE_ID,
+    ]);
+    expect(query.mock.calls.at(-1)?.[0]).toBe("COMMIT");
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("does not touch Postgres when the setup key is wrong", async () => {
+    const pool = { connect: vi.fn() } as unknown as Pool;
+    const runtime = new RealBetterAuthRuntime(
+      { handler: vi.fn() } as never,
+      baseDescription(),
+      pool,
+      {
+        BERRY_SETUP_OWNER_EMAIL: "owner@example.test",
+        BERRY_SETUP_TOKEN: "setup-token-with-at-least-thirty-two-characters",
+      },
+    );
+
+    await expect(runtime.setupOwner({
+      organizationName: "Acme",
+      name: "Owner",
+      email: "owner@example.test",
+      password: "correct-horse-battery-staple",
+      setupToken: "wrong",
+    })).rejects.toMatchObject({ status: 403 });
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("rolls back without creating a second owner when setup is replayed", async () => {
+    const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.includes("SELECT EXISTS")) return { rows: [{ exists: true }] };
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const pool = {
+      connect: vi.fn(async () => ({ query, release })),
+    } as unknown as Pool;
+    const runtime = new RealBetterAuthRuntime(
+      { handler: vi.fn() } as never,
+      baseDescription(),
+      pool,
+      {
+        BERRY_SETUP_OWNER_EMAIL: "owner@example.test",
+        BERRY_SETUP_TOKEN: "setup-token-with-at-least-thirty-two-characters",
+      },
+    );
+
+    await expect(runtime.setupOwner({
+      organizationName: "Acme",
+      name: "Second Owner",
+      email: "owner@example.test",
+      password: "another-correct-horse-battery-staple",
+      setupToken: "setup-token-with-at-least-thirty-two-characters",
+    })).rejects.toMatchObject({ status: 409 });
+
+    expect(query.mock.calls.some(([sql]) => sql.includes("pg_advisory_xact_lock"))).toBe(true);
+    expect(query.mock.calls.some(([sql]) => sql.includes("INSERT INTO users"))).toBe(false);
+    expect(query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK");
+    expect(release).toHaveBeenCalledOnce();
   });
 });
+
+function baseDescription(): BerryAuthDescription {
+  return {
+    basePath: "/v1/auth",
+    emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+    signupEnabled: false,
+    setup: {
+      required: true,
+      available: true,
+      ownerEmail: "owner@example.test",
+      missingConfiguration: [],
+    },
+    socialProviders: [],
+    storage: "postgres",
+  };
+}

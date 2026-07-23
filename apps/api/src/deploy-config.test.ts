@@ -14,6 +14,7 @@ const helmWorker = readFileSync(resolve(root, "deploy/helm/berry-platform/templa
 const helmHpa = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/hpa.yaml"), "utf8");
 const runbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md"), "utf8");
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
+const deploymentLauncher = readFileSync(resolve(root, "deploy/up.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
 
 describe("self-host compose deployment", () => {
@@ -55,7 +56,13 @@ describe("self-host compose deployment", () => {
     expect(dockerfile).toContain("corepack pnpm --filter @berry/web... build");
     expect(dockerfile).toContain("corepack pnpm --filter @berry/worker... build");
     expect(dockerfile).toContain("docker.io");
-    expect(envExample).toContain("BERRY_AUTH_MODE=single-user");
+    expect(envExample).toContain("BERRY_AUTH_MODE=better-auth");
+    expect(envExample).toContain("BERRY_SETUP_OWNER_EMAIL=founder@local.test");
+    expect(envExample).toContain("BERRY_SETUP_TOKEN=");
+    expect(compose).toContain("BERRY_SETUP_OWNER_EMAIL:");
+    expect(compose).toContain("BERRY_SETUP_TOKEN:");
+    expect(deploymentLauncher).toContain('BERRY_AUTH_MODE must be better-auth');
+    expect(deploymentLauncher).toContain("One-time setup URL:");
     expect(envExample).toContain("DEPLOYMENT_MODE=self-hosted");
     expect(envExample).toContain("BERRY_SCIM_BEARER_TOKEN=");
     expect(envExample).toContain("BERRY_BUDGETS_ENABLED=true");
@@ -85,6 +92,8 @@ describe("self-host compose deployment", () => {
     expect(helmValues).toContain("existingSecret: berry-s3");
     expect(helmValues).toContain("existingSecret: berry-billing");
     expect(helmValues).toContain("provider: none");
+    expect(helmValues).toContain("setupTokenKey: BERRY_SETUP_TOKEN");
+    expect(helmApi).toContain("BERRY_SETUP_TOKEN");
     expect(helmApi).toContain("command: [\"node\", \"apps/api/dist/main.js\"]");
     expect(helmApi).toContain("BERRY_DATABASE_URL");
     expect(helmApi).toContain("BERRY_REDIS_URL");

@@ -23,14 +23,22 @@ export class CloudDatabaseService {
         applied_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    const applied = new Set(
-      (await this.executor.query<{ id: number }>("SELECT id FROM schema_migrations")).map((row) => row.id),
-    );
-    for (const migration of cloudMigrations) {
-      if (applied.has(migration.id)) continue;
-      await this.executor.execute(migration.sql);
-      await this.executor.execute("INSERT INTO schema_migrations (id, name) VALUES ($1, $2)", [migration.id, migration.name]);
+    const applyPending = async (executor: SqlExecutor): Promise<void> => {
+      await executor.execute("SELECT pg_advisory_xact_lock(hashtextextended('berry-cloud-migrations', 0))");
+      const applied = new Set(
+        (await executor.query<{ id: number }>("SELECT id FROM schema_migrations")).map((row) => row.id),
+      );
+      for (const migration of cloudMigrations) {
+        if (applied.has(migration.id)) continue;
+        await executor.execute(migration.sql);
+        await executor.execute("INSERT INTO schema_migrations (id, name) VALUES ($1, $2)", [migration.id, migration.name]);
+      }
+    };
+    if (this.executor.transaction) {
+      await this.executor.transaction(applyPending);
+      return;
     }
+    await applyPending(this.executor);
   }
 
   async withTenant<T>(tenantId: string, callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {

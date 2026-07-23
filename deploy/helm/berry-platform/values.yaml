@@ -60,8 +60,11 @@ auth:
   mode: better-auth
   baseUrl: ""
   trustedOrigins: ""
+  signupEnabled: "false"
+  setupOwnerEmail: ""
   existingSecret: berry-auth
   betterAuthSecretKey: BETTER_AUTH_SECRET
+  setupTokenKey: BERRY_SETUP_TOKEN
   scimBearerTokenKey: BERRY_SCIM_BEARER_TOKEN
 
 policy:

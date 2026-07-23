@@ -10,7 +10,7 @@
     "start": "node dist/main.js",
     "lint": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest --run"
+    "test": "vitest --run src"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1085.0",

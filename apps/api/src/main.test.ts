@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { BERRY_AUTH_PUBLIC } from "./auth/auth.decorators.ts";
 import { FilePlatformController } from "./files/file-platform.controller.ts";
 import { FilePlatformService } from "./files/file-platform.service.ts";
-import { createApiMainModule, HealthController } from "./main.ts";
+import { createApiMainModule, createAuthRuntime, HealthController } from "./main.ts";
 
 describe("API health probes", () => {
   it("starts direct execution only after runtime class declarations are initialized", () => {
@@ -26,7 +26,8 @@ describe("API health probes", () => {
           BERRY_DATABASE_URL: "postgres://berry:berry@127.0.0.1:5432/berry",
           BERRY_API_MODEL_MODE: "fixture",
           BERRY_SANDBOX_PROVIDER: "fixture",
-          BERRY_AUTH_MODE: "single-user",
+          BERRY_AUTH_MODE: "better-auth",
+          BETTER_AUTH_SECRET: "test-only-auth-secret-with-at-least-thirty-two-characters",
           BERRY_RUNTIME_DB_PATH: join(directory, "runtime.sqlite"),
         })],
       }).compile();
@@ -49,5 +50,13 @@ describe("API health probes", () => {
     expect(controller.health()).toMatchObject({ ok: true, service: "berry-api" });
     await expect(controller.ready()).resolves.toEqual({ ok: true, service: "berry-api", ready: true });
     expect(ping).toHaveBeenCalledOnce();
+  });
+
+  it("uses the same database-backed auth flow in local and production deployments", () => {
+    expect(createAuthRuntime({
+      NODE_ENV: "test",
+      BERRY_AUTH_MODE: "better-auth",
+    }).describe()).toBeInstanceOf(Promise);
+    expect(() => createAuthRuntime({ BERRY_AUTH_MODE: "single-user" })).toThrow("Unsupported BERRY_AUTH_MODE");
   });
 });

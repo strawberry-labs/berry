@@ -55,7 +55,7 @@ import { createPolicySignerFromEnv, PolicyDistributionService, PostgresPolicyDis
 import { PostgresUsageRepository } from "./usage/usage.repository.ts";
 import { createUsageEventVerifierFromEnv } from "./usage/usage.signing.ts";
 import { deploymentRuntimeDescription } from "./deployment-mode.ts";
-import type { BerryAuthRuntime } from "./auth/auth-runtime.ts";
+import { createBerryAuthRuntime, type BerryAuthRuntime } from "./auth/auth-runtime.ts";
 import { PublicAuth } from "./auth/auth.decorators.ts";
 
 @Controller()
@@ -264,7 +264,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
           },
           dispatcher: { useValue: createAuditExportDispatcherFromEnv(env) },
         },
-        ...(auth ? { auth: { useValue: auth } } : {}),
+        auth: { useValue: auth },
       }),
     ],
     controllers: [HealthController, ArtifactController],
@@ -519,26 +519,12 @@ class DockerCliExecutor implements DockerCommandExecutor {
   }
 }
 
-function createAuthRuntime(env: NodeJS.ProcessEnv): BerryAuthRuntime | null {
-  if ((env.BERRY_AUTH_MODE ?? "single-user") !== "single-user") {
-    return null;
+export function createAuthRuntime(env: NodeJS.ProcessEnv): BerryAuthRuntime {
+  const mode = env.BERRY_AUTH_MODE ?? "better-auth";
+  if (mode !== "better-auth") {
+    throw new Error(`Unsupported BERRY_AUTH_MODE "${mode}". Berry now uses the same better-auth owner setup flow in local and production deployments.`);
   }
-  return {
-    describe: () => ({
-      basePath: "/v1/auth",
-      emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
-      signupEnabled: false,
-      socialProviders: [],
-      storage: "memory",
-    }),
-    getSession: async () => singleUserSession(env),
-    requireSession: async () => singleUserSession(env),
-    handleNodeRequest: async (_req, res) => {
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ ok: true, mode: "single-user" }));
-    },
-  };
+  return createBerryAuthRuntime({ env });
 }
 
 function runProcess(command: string, args: readonly string[], options: { stdin?: string | Buffer | undefined; signal?: AbortSignal | undefined } = {}): Promise<DockerCommandResult> {
@@ -559,18 +545,6 @@ function runProcess(command: string, args: readonly string[], options: { stdin?:
     if (options.stdin) child.stdin.end(options.stdin);
     else child.stdin.end();
   });
-}
-
-function singleUserSession(env: NodeJS.ProcessEnv) {
-  return {
-    session: { id: "self-host-session", userId: "self-host-user" },
-    user: {
-      id: "self-host-user",
-      email: env.BERRY_AUTH_SINGLE_USER_EMAIL ?? "self-host@berry.local",
-      name: env.BERRY_AUTH_SINGLE_USER_NAME ?? "Self Host",
-      emailVerified: true,
-    },
-  };
 }
 
 function corsConfig(env: NodeJS.ProcessEnv) {

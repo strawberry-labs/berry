@@ -7,6 +7,7 @@ import type { CloudAuditExportConfig, CloudAuditEvent } from "@berry/shared";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
+import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
 import { InMemoryEnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { AuditService, InMemoryAuditRepository, type AuditExportDispatcher } from "./audit.service.ts";
@@ -135,7 +136,10 @@ async function createApp(service = new AuditService(new InMemoryAuditRepository(
       identity: { repository: { useValue: identity } },
       audit: { service: { useValue: service } },
     })],
-  }).compile();
+  })
+    .overrideProvider(FilePlatformService)
+    .useValue({})
+    .compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
   return nestApp;

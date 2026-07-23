@@ -45,6 +45,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.betterAuthSecretKey }}
+            - name: BERRY_SETUP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.setupTokenKey }}
+                  optional: true
             - name: BERRY_SCIM_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:

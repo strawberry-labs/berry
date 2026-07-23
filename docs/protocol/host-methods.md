@@ -1183,6 +1183,37 @@ Result:
                   "multi": {
                     "type": "boolean",
                     "default": false
+                  },
+                  "questions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "question": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 2000
+                        },
+                        "options": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/definitions/agent.turnState.result/properties/bufferedEvents/items/anyOf/8/properties/options/items"
+                          },
+                          "maxItems": 12,
+                          "default": []
+                        },
+                        "multi": {
+                          "type": "boolean",
+                          "default": false
+                        }
+                      },
+                      "required": [
+                        "question"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "minItems": 1,
+                    "maxItems": 5
                   }
                 },
                 "required": [
@@ -13893,6 +13924,37 @@ Result:
             "type": "boolean",
             "default": false
           },
+          "questions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2000
+                },
+                "options": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/question.list.result/items/properties/options/items"
+                  },
+                  "maxItems": 12,
+                  "default": []
+                },
+                "multi": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "required": [
+                "question"
+              ],
+              "additionalProperties": false
+            },
+            "minItems": 1,
+            "maxItems": 5
+          },
           "answer": {
             "anyOf": [
               {
@@ -16688,6 +16750,10 @@ Params:
             "properties": {
               "id": {
                 "type": "string"
+              },
+              "fileId": {
+                "type": "string",
+                "format": "uuid"
               },
               "name": {
                 "type": "string"
