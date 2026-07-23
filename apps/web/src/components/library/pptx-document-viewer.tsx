@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { StoredFile } from "@berry/shared";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { PptxViewer, RECOMMENDED_ZIP_LIMITS } from "@aiden0z/pptx-renderer/browser";
 
 export default function PptxDocumentViewer({ file }: { file: StoredFile }) {
@@ -71,5 +72,5 @@ export default function PptxDocumentViewer({ file }: { file: StoredFile }) {
 }
 
 function DocumentLoading({ label }: { label: string }) {
-  return <div className="berry-office-loading" role="status"><span className="berry-document-spinner" />{label}</div>;
+  return <div className="berry-office-loading"><CircularActivitySpinner size={18} className="text-[var(--berry-preview-muted)]" label={label} />{label}</div>;
 }

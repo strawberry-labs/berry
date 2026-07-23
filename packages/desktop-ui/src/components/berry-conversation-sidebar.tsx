@@ -11,7 +11,7 @@ import {
   SidebarMenuItem,
 } from "@berry/desktop-ui/components/ui/sidebar";
 import { Button } from "@berry/desktop-ui/components/ui/button";
-import { Spinner } from "@berry/desktop-ui/components/ui/spinner";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Archive, ChevronDown, CircleIcon, CodeXml, Folder, Folder02, GitBranch, ListCollapse, MessageSquare, Pencil, Pin, PinOff } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
@@ -285,7 +285,7 @@ function KindButton({ kind, selected, pending, disabled, onSelect }: {
       disabled={disabled}
       onClick={() => onSelect(kind)}
     >
-      {pending ? <Spinner className="size-3.5" /> : <Icon className="size-3.5" />}
+      {pending ? <CircularActivitySpinner size={14} label={`${label} is saving`} /> : <Icon className="size-3.5" />}
       <span>{label}</span>
     </button>
   );
@@ -340,7 +340,7 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
                     <GitBranch className="size-3 text-sidebar-foreground/50" aria-label={`Worktree ${task.worktreeBranch}`} />
                   </span>
                 ) : null}
-                {working ? <Spinner className="size-3.5 shrink-0 text-sidebar-foreground/60" aria-label={task.status === "waiting-for-approval" ? "Waiting for approval" : "Running"} /> : <span className="shrink-0 text-xs text-sidebar-foreground/50">{formatAge(task.updatedAt)}</span>}
+                {working ? <CircularActivitySpinner size={14} className="text-sidebar-foreground/60" label={task.status === "waiting-for-approval" ? "Waiting for approval" : "Running"} /> : <span className="shrink-0 text-xs text-sidebar-foreground/50">{formatAge(task.updatedAt)}</span>}
               </span>
             </SidebarMenuButton>
             {onTogglePinned ? (
@@ -392,7 +392,7 @@ function ShowMoreRow({ count, onClick, indented = false }: { count: number; onCl
 function SidebarStatus({ label, loading = false, error = false, indented = false }: { label: string; loading?: boolean; error?: boolean; indented?: boolean }) {
   return (
     <p className={cn("berry-sidebar-empty flex items-center gap-2 px-2 py-1.5 text-xs text-sidebar-foreground/55", indented && "pl-8", error && "text-destructive")} role={error ? "alert" : "status"}>
-      {loading ? <Spinner className="size-3.5" /> : null}
+      {loading ? <CircularActivitySpinner size={14} label={label} /> : null}
       <span>{label}</span>
     </p>
   );

@@ -13,7 +13,7 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "@berry/desktop-ui/
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@berry/desktop-ui/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@berry/desktop-ui/components/ui/sheet";
 import { Skeleton } from "@berry/desktop-ui/components/ui/skeleton";
-import { Spinner } from "@berry/desktop-ui/components/ui/spinner";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Switch } from "@berry/desktop-ui/components/ui/switch";
 import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from "@berry/desktop-ui/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@berry/desktop-ui/components/ui/tabs";
@@ -26,7 +26,7 @@ export function ManagementPage({ title, description, eyebrow, actions, children,
 }
 
 export function AsyncState({ loading, error, onRetry, children, empty = false, emptyTitle = "Nothing here yet", emptyText = "New records will appear here when they are available." }: { loading: boolean; error: string | null; onRetry: () => void; children: ReactNode; empty?: boolean; emptyTitle?: string; emptyText?: string }) {
-  if (loading) return <div className="mgmt-state" role="status" aria-live="polite"><Skeleton className="mgmt-loading-mark" /><Spinner /><strong>Loading</strong><span>Fetching the latest organization data…</span></div>;
+  if (loading) return <div className="mgmt-state" role="status" aria-live="polite"><Skeleton className="mgmt-loading-mark" /><CircularActivitySpinner size={16} label="Loading organization data" /><strong>Loading</strong><span>Fetching the latest organization data…</span></div>;
   if (error) return <div className="mgmt-state mgmt-state-error" role="alert"><AlertCircle /><strong>Couldn’t load this screen</strong><span>{error}</span><Button variant="outline" onClick={onRetry}><RefreshCw />Retry</Button></div>;
   if (empty) return <Empty className="mgmt-state"><EmptyHeader><EmptyMedia variant="icon"><span className="mgmt-empty-mark" /></EmptyMedia><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyText}</EmptyDescription></EmptyHeader></Empty>;
   return <>{children}</>;

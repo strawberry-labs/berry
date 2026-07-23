@@ -5,6 +5,7 @@ import { FileDown, Plug, Plus, RefreshCw, Search } from "@berry/desktop-ui/lib/i
 import type { McpImportCandidate, McpServerConfig } from "@berry/shared";
 import { Badge } from "@berry/desktop-ui/components/ui/badge";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Checkbox } from "@berry/desktop-ui/components/ui/checkbox";
 import {
   Dialog,
@@ -380,7 +381,7 @@ function ServerRow({ server }: { server: McpServerConfig }) {
           <Button size="sm" variant="outline" onClick={() => connectOAuth.mutate()} disabled={connectOAuth.isPending}>Authorize</Button>
         ) : null}
         <Button size="icon-sm" variant="ghost" aria-label={`Reconnect ${server.name}`} title="Reconnect" onClick={() => reconnect.mutate()} disabled={reconnect.isPending || server.source === "organization"}>
-          <RefreshCw className={reconnect.isPending ? "animate-spin" : ""} />
+          {reconnect.isPending ? <CircularActivitySpinner size={16} label={`Reconnecting ${server.name}`} /> : <RefreshCw />}
         </Button>
         <label className="flex items-center gap-2 text-xs text-muted-foreground">
           Trust

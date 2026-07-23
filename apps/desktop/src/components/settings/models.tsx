@@ -26,6 +26,7 @@ import {
 } from "@berry/shared";
 import { Badge } from "@berry/desktop-ui/components/ui/badge";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@berry/desktop-ui/components/ui/collapsible";
 import {
   Dialog,
@@ -552,7 +553,7 @@ function ModelsSection({ provider }: { provider: ModelProvider }) {
             title={provider.modelsPath === null ? "This provider has no model list endpoint" : "Fetch models from the endpoint"}
             onClick={() => fetchModels.mutate()}
           >
-            <RefreshCw className={cn("size-3.5", fetchModels.isPending && "animate-spin")} />
+            {fetchModels.isPending ? <CircularActivitySpinner size={14} label="Fetching models" /> : <RefreshCw className="size-3.5" />}
             Fetch
           </Button>
           <Button

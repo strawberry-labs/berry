@@ -2,7 +2,8 @@ import * as React from "react";
 import type { Message } from "@berry/shared";
 import type { StreamState, ToolEntry } from "@berry/desktop-ui/components/thread-stream";
 import { Popover, PopoverContent, PopoverTrigger } from "@berry/desktop-ui/components/ui/popover";
-import { CircleCheckIcon, CircleHollow, Loader2Icon, OctagonXIcon } from "@berry/desktop-ui/lib/icons";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
+import { CircleCheckIcon, CircleHollow, OctagonXIcon } from "@berry/desktop-ui/lib/icons";
 
 export type PlanItemStatus = "pending" | "in_progress" | "completed" | "failed";
 
@@ -118,15 +119,21 @@ export function planProgressFromConversation(messages: Message[], stream: Stream
 
 const STATUS_ICON = {
   pending: CircleHollow,
-  in_progress: Loader2Icon,
   completed: CircleCheckIcon,
   failed: OctagonXIcon,
-} satisfies Record<PlanItemStatus, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>>;
+} satisfies Record<Exclude<PlanItemStatus, "in_progress">, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>>;
+
+function PlanStatusIcon({ status, className }: { status: PlanItemStatus; className?: string }) {
+  if (status === "in_progress") {
+    return <CircularActivitySpinner size={16} label="Step in progress" className={className} />;
+  }
+
+  const Icon = STATUS_ICON[status];
+  return <Icon className={className} aria-hidden />;
+}
 
 export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
   const [open, setOpen] = React.useState(false);
-  const PillIcon = STATUS_ICON[plan.status];
-
   return (
     <div className="berry-plan-progress-anchor">
       <Popover open={open} onOpenChange={setOpen}>
@@ -137,7 +144,7 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
             aria-label={`View plan progress: step ${plan.current} of ${plan.total}`}
             aria-expanded={open}
           >
-            <PillIcon className={`berry-plan-progress-status is-${plan.status}`} aria-hidden />
+            <PlanStatusIcon status={plan.status} className={`berry-plan-progress-status is-${plan.status}`} />
             <span>Step {plan.current} / {plan.total}</span>
           </button>
         </PopoverTrigger>
@@ -150,7 +157,6 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
         >
           <ol className="berry-plan-progress-list" aria-label="Plan steps">
             {plan.items.map((item, index) => {
-              const Icon = STATUS_ICON[item.status];
               const active = index + 1 === plan.current && plan.status !== "completed";
               return (
                 <li
@@ -158,7 +164,7 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
                   className={`berry-plan-progress-step is-${item.status}${active ? " is-active" : ""}`}
                   {...(active ? { "aria-current": "step" as const } : {})}
                 >
-                  <Icon className={`berry-plan-progress-status is-${item.status}`} aria-hidden />
+                  <PlanStatusIcon status={item.status} className={`berry-plan-progress-status is-${item.status}`} />
                   <span>{item.content}</span>
                 </li>
               );

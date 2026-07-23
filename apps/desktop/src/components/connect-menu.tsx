@@ -4,6 +4,7 @@ import { useTheme } from "next-themes";
 import type { RouterAccount, RouterContractStatus } from "@berry/shared";
 import { Globe, Palette, Plug, RefreshCw, Route, ZoomIn } from "@berry/desktop-ui/lib/icons";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import {
   Dialog,
   DialogClose,
@@ -252,7 +253,7 @@ export function ConnectMenu({ children }: { children: ReactNode }) {
             <div className="grid gap-4">
               {routerContract.data?.oauthAvailable ? (
                 <Button onClick={() => void startOAuth()} disabled={signingIn}>
-                  {signingIn ? <RefreshCw className="animate-spin" /> : <Plug />}
+                  {signingIn ? <CircularActivitySpinner size={16} label="Signing in" /> : <Plug />}
                   Sign in with Berry Router
                 </Button>
               ) : null}

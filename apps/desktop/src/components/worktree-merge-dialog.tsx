@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { Badge } from "@berry/desktop-ui/components/ui/badge";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import {
   Dialog,
   DialogContent,
@@ -100,7 +101,7 @@ export function WorktreeMergeDialog({
             {preview?.applicable ? <Badge variant="outline">Applies cleanly</Badge> : null}
             {preview && !preview.applicable ? <Badge variant="destructive">Conflict detected</Badge> : null}
             <Button variant="ghost" size="icon-sm" className="ml-auto size-10" aria-label="Refresh worktree preview" onClick={() => void previewQuery.refetch()} disabled={previewQuery.isFetching || Boolean(busy)}>
-              <RefreshCw className={previewQuery.isFetching ? "animate-spin" : undefined} />
+              {previewQuery.isFetching ? <CircularActivitySpinner size={16} label="Refreshing worktree preview" /> : <RefreshCw />}
             </Button>
           </div>
 

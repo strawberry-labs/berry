@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { UsageEvent } from "@berry/shared";
 import { ChartColumn, RefreshCw } from "@berry/desktop-ui/lib/icons";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Card } from "@berry/desktop-ui/components/ui/card";
 import {
   Empty,
@@ -288,7 +289,7 @@ export function UsageSettings() {
             variant="outline"
             onClick={refreshUsage}
           >
-            <RefreshCw className={cn(summary.isFetching && "animate-spin")} />
+            {summary.isFetching ? <CircularActivitySpinner size={16} label="Refreshing usage" /> : <RefreshCw />}
             Refresh
           </Button>
         }

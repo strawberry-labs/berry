@@ -19,7 +19,7 @@ import {
   Wrench,
 } from "@berry/desktop-ui/lib/icons";
 
-import { Spinner } from "@berry/desktop-ui/components/ui/spinner";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { Markdown } from "@berry/desktop-ui/components/berry-markdown";
@@ -1669,7 +1669,7 @@ export function ThoughtRow({
         aria-expanded={effectiveOpen}
       >
         <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground/70">
-          {thinking ? <Spinner className="size-3.5" /> : <Brain className="size-4" />}
+          {thinking ? <CircularActivitySpinner size={14} label="Thinking" /> : <Brain className="size-4" />}
         </span>
         <span className={cn("font-medium", active ? "berry-shimmer" : "text-muted-foreground/70")}>
           {active ? "Thinking" : "Thought"}

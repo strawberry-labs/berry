@@ -1,16 +1,8 @@
-import { Loader2Icon } from "@berry/desktop-ui/lib/icons"
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner"
 
-import { cn } from "@berry/desktop-ui/lib/utils"
-
-function Spinner({ className, ...props }: React.ComponentProps<"svg">) {
-  return (
-    <Loader2Icon
-      role="status"
-      aria-label="Loading"
-      className={cn("size-4 animate-spin", className)}
-      {...props}
-    />
-  )
+/** @deprecated Use CircularActivitySpinner for new loading states. */
+function Spinner(props: React.ComponentProps<typeof CircularActivitySpinner>) {
+  return <CircularActivitySpinner label="Loading" {...props} />
 }
 
 export { Spinner }

@@ -26,6 +26,7 @@ import {
 
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
+import { CircularProgressIndicator } from "@berry/desktop-ui/components/ui/circular-progress-indicator";
 import { Toggle } from "@berry/desktop-ui/components/ui/toggle";
 import {
   DropdownMenu,
@@ -862,10 +863,7 @@ export function ComposerAttachmentList({
 }
 
 function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
-  const radius = 8;
-  const circumference = 2 * Math.PI * radius;
   const percent = stats?.percentUsed ?? null;
-  const clamped = percent === null ? 0 : Math.max(0, Math.min(100, percent));
   const used = stats ? formatTokens(stats.usedTokens) : null;
   const total = stats?.contextWindow ? formatTokens(stats.contextWindow) : null;
   const leftPercent = percent === null ? null : Math.max(0, 100 - percent);
@@ -884,16 +882,14 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
           className="berry-context-ring"
           data-state={stats?.thresholdState ?? "unknown"}
         >
-          <svg viewBox="0 0 20 20" aria-hidden="true">
-            <circle cx="10" cy="10" r={radius} className="berry-context-ring-track" />
-            <circle
-              cx="10"
-              cy="10"
-              r={radius}
-              className="berry-context-ring-value"
-              strokeDasharray={`${(clamped / 100) * circumference} ${circumference}`}
-            />
-          </svg>
+          <CircularProgressIndicator
+            value={percent ?? 0}
+            size={20}
+            strokeWidth={2.4}
+            label="Context window usage"
+            trackClassName="opacity-30"
+            formatValueText={(percentage) => `${Math.round(percentage)}% of context used`}
+          />
         </button>
       </TooltipTrigger>
       <TooltipContent className="rounded-[16px] border border-white/10 bg-[#2b2b2d] px-7 py-3 text-center text-[15px] leading-snug text-white shadow-[0_14px_32px_rgba(0,0,0,0.28)] text-nowrap [&_svg]:bg-[#2b2b2d] [&_svg]:fill-[#2b2b2d]">

@@ -5,6 +5,7 @@ import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularProgressIndicator } from "@berry/desktop-ui/components/ui/circular-progress-indicator";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
@@ -475,12 +476,14 @@ export function Composer({
 }
 
 function UploadProgressRing({ ratio }: { ratio: number }) {
-  const progress = Math.max(0, Math.min(1, ratio));
   return (
-    <svg className="pointer-events-none absolute inset-1.5 size-7 -rotate-90 text-muted-foreground" viewBox="0 0 36 36" role="progressbar" aria-label="Uploading" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress * 100)}>
-      <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeOpacity="0.18" strokeWidth="2.5" />
-      <circle cx="18" cy="18" r="16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" pathLength="100" strokeDasharray="100" strokeDashoffset={100 - progress * 100} className="transition-[stroke-dashoffset] duration-150" />
-    </svg>
+    <CircularProgressIndicator
+      value={ratio * 100}
+      size={28}
+      className="pointer-events-none absolute inset-1.5 text-muted-foreground"
+      label="Uploading"
+      formatValueText={(percentage) => `${Math.round(percentage)}% uploaded`}
+    />
   );
 }
 

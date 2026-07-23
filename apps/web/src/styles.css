@@ -1341,7 +1341,6 @@ code, pre {
 
 .berry-plan-progress-status.is-in_progress {
   color: var(--berry-accent);
-  animation: berry-plan-progress-spin 900ms linear infinite;
 }
 
 .berry-plan-progress-status.is-completed {
@@ -1350,10 +1349,6 @@ code, pre {
 
 .berry-plan-progress-status.is-failed {
   color: var(--berry-danger);
-}
-
-@keyframes berry-plan-progress-spin {
-  to { transform: rotate(360deg); }
 }
 
 .berry-composer-queue {
@@ -2346,8 +2341,6 @@ code, pre {
   font-size: 13px;
 }
 .berry-document-loading { display: flex; height: 100%; min-height: 220px; align-items: center; justify-content: center; gap: 10px; color: var(--berry-text-tertiary); font-size: 13px; }
-.berry-document-spinner { width: 18px; height: 18px; border: 2px solid var(--berry-border-strong); border-top-color: var(--berry-text-primary); border-radius: 999px; animation: berry-document-spin 800ms linear infinite; }
-@keyframes berry-document-spin { to { transform: rotate(360deg); } }
 .berry-spreadsheet-viewer {
   display: grid;
   width: 100%;
@@ -2401,7 +2394,6 @@ code, pre {
   background: var(--berry-preview-paper);
   font-size: 13px;
 }
-.berry-spreadsheet-loading .berry-document-spinner { border-color: var(--berry-preview-line); border-top-color: var(--berry-spreadsheet-accent); }
 .berry-spreadsheet-footer {
   display: flex;
   min-width: 0;

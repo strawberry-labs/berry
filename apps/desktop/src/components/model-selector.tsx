@@ -2,9 +2,10 @@ import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { HostPushEvent, ModelProvider, RemoteModel } from "@berry/shared";
-import { Check, ChevronDown, CirclePlus, FileDown, Loader2Icon, Settings, Square, X } from "@berry/desktop-ui/lib/icons";
+import { Check, ChevronDown, CirclePlus, FileDown, Settings, Square, X } from "@berry/desktop-ui/lib/icons";
 
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import {
   Command,
   CommandEmpty,
@@ -324,7 +325,7 @@ export function ModelSelector({
                     disabled={!pull.model.trim() || pull.starting}
                     onClick={() => void startPull()}
                   >
-                    {pull.starting ? <Loader2Icon className="animate-spin" /> : <FileDown />}
+                    {pull.starting ? <CircularActivitySpinner size={16} label="Starting model pull" /> : <FileDown />}
                   </Button>
                 )}
               </div>
@@ -404,7 +405,7 @@ export function ModelSelector({
                               className="size-6 shrink-0"
                             >
                               {busyModel === `${provider.id}:${modelId}` ? (
-                                <Loader2Icon className="animate-spin" />
+                                <CircularActivitySpinner size={16} label={`Updating ${modelId}`} />
                               ) : metadata.loaded ? (
                                 <X />
                               ) : (

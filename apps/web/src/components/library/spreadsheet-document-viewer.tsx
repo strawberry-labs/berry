@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { StoredFile } from "@berry/shared";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { DataGrid, type Column } from "react-data-grid";
 import "react-data-grid/lib/styles.css";
 import type { SpreadsheetSheet, SpreadsheetWorkerRequest, SpreadsheetWorkerResponse } from "./spreadsheet-types";
@@ -128,7 +129,7 @@ export default function SpreadsheetDocumentViewer({ file }: { file: StoredFile }
             }}
           />
         ) : null}
-        {loading ? <div className="berry-spreadsheet-loading" role="status"><span className="berry-document-spinner" />Opening workbook…</div> : null}
+        {loading ? <div className="berry-spreadsheet-loading"><CircularActivitySpinner size={18} className="text-[var(--berry-spreadsheet-accent)]" label="Opening workbook" />Opening workbook…</div> : null}
       </div>
       <footer className="berry-spreadsheet-footer">
         <span className="berry-spreadsheet-status">Ready</span>

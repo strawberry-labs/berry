@@ -924,25 +924,8 @@
     transform: scale(0.96);
   }
 
-  .berry-context-ring svg {
-    width: 20px;
-    height: 20px;
-    transform: rotate(-90deg);
-  }
-
-  .berry-context-ring-track,
-  .berry-context-ring-value {
-    fill: none;
-    stroke-width: 2;
-  }
-
-  .berry-context-ring-track {
-    stroke: var(--border);
-  }
-
-  .berry-context-ring-value {
-    stroke: currentColor;
-    stroke-linecap: round;
+  .berry-context-ring [role="progressbar"] {
+    color: inherit;
   }
 
   .berry-context-ring[data-state="normal"] {
