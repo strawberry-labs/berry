@@ -25,6 +25,7 @@ import {
   BUDGET_LEDGER_MIGRATION,
   BUDGET_LEDGER_TABLES,
   BUDGET_LEDGER_TENANT_SCOPED_TABLES,
+  CAPABILITY_PERMISSION_DEFAULTS_MIGRATION,
   CLOUD_INITIAL_MIGRATION,
   CONVERSATION_KIND_AND_GENERAL_WORKSPACES_MIGRATION,
   CLOUD_SCHEMA_SQL,
@@ -158,7 +159,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {
@@ -228,6 +229,15 @@ describe("cloud postgres schema", () => {
     expect(ENTERPRISE_RBAC_MIGRATION).toContain('"policy:write"');
     expect(ENTERPRISE_RBAC_MIGRATION).not.toContain("DROP TABLE");
     expect(ENTERPRISE_RBAC_MIGRATION).not.toContain("ALTER TABLE tenants");
+  });
+
+  it("backfills Skills and MCP permissions using the application role defaults", () => {
+    expect(CAPABILITY_PERMISSION_DEFAULTS_MIGRATION).toContain(`'{owner}'`);
+    expect(CAPABILITY_PERMISSION_DEFAULTS_MIGRATION).toContain(`'{admin}'`);
+    expect(CAPABILITY_PERMISSION_DEFAULTS_MIGRATION).toContain(`'{member}'`);
+    expect(CAPABILITY_PERMISSION_DEFAULTS_MIGRATION).toContain('"skills:write"');
+    expect(CAPABILITY_PERMISSION_DEFAULTS_MIGRATION).toContain('"mcp:write"');
+    expect(CAPABILITY_PERMISSION_DEFAULTS_MIGRATION).not.toContain("DROP TABLE");
   });
 
   it("protects enterprise RBAC tenant-owned tables with additive RLS policies", () => {

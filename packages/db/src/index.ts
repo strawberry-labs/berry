@@ -2528,6 +2528,24 @@ DROP POLICY IF EXISTS file_derivatives_tenant_isolation ON file_derivatives;
 CREATE POLICY file_derivatives_tenant_isolation ON file_derivatives USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+export const CAPABILITY_PERMISSION_DEFAULTS_MIGRATION = `
+UPDATE feature_flags
+SET role_defaults = jsonb_set(
+  jsonb_set(
+    jsonb_set(
+      role_defaults,
+      '{owner}',
+      coalesce(role_defaults->'owner', '[]'::jsonb) || '["skills:read","skills:write","mcp:read","mcp:write"]'::jsonb
+    ),
+    '{admin}',
+    coalesce(role_defaults->'admin', '[]'::jsonb) || '["skills:read","skills:write","mcp:read","mcp:write"]'::jsonb
+  ),
+  '{member}',
+  coalesce(role_defaults->'member', '[]'::jsonb) || '["skills:read","mcp:read"]'::jsonb
+)
+WHERE flag = 'enterprise-governance';
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -2615,4 +2633,5 @@ export const cloudMigrations = [
   { id: 20, name: "message_attachments_v1", sql: MESSAGE_ATTACHMENTS_MIGRATION },
   { id: 21, name: "file_platform_v1", sql: FILE_PLATFORM_MIGRATION },
   { id: 22, name: "queued_follow_ups_state_v2", sql: QUEUED_FOLLOW_UPS_STATE_V2_MIGRATION },
+  { id: 23, name: "capability_permission_defaults_v1", sql: CAPABILITY_PERMISSION_DEFAULTS_MIGRATION },
 ] as const;
