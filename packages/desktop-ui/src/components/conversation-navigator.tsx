@@ -15,6 +15,7 @@ const PREVIEW_DELAY_MS = 500;
 const PREVIEW_WIDTH_PX = 288;
 const PREVIEW_FALLBACK_HEIGHT_PX = 172;
 const VIEWPORT_GUTTER_PX = 12;
+const PREVIEW_RAIL_GAP_PX = 4;
 
 type PreviewPosition = { left: number; top: number };
 
@@ -108,7 +109,7 @@ export function ConversationNavigator({
     const previewHeight = previewRef.current?.offsetHeight ?? PREVIEW_FALLBACK_HEIGHT_PX;
     const left = Math.min(
       window.innerWidth - PREVIEW_WIDTH_PX - VIEWPORT_GUTTER_PX,
-      railRect.right + VIEWPORT_GUTTER_PX,
+      railRect.right + PREVIEW_RAIL_GAP_PX,
     );
     const top = Math.max(
       VIEWPORT_GUTTER_PX,
@@ -181,15 +182,17 @@ export function ConversationNavigator({
   const previewResources = previewItem?.resources ?? [];
   const visibleResources = previewResources.slice(0, 3);
   const hiddenResourceCount = Math.max(0, previewResources.length - visibleResources.length);
+  const focusId = hoveredId ?? activeId;
+  const focusIndex = focusId ? items.findIndex((item) => item.id === focusId) : -1;
 
   return (
     <nav
       aria-label="User messages"
-      className="berry-convo-rail absolute top-1/2 left-1.5 z-20 hidden -translate-y-1/2 md:block"
+      className="berry-convo-rail absolute inset-y-0 left-1.5 z-20 hidden items-center md:flex"
     >
       <div
         ref={railRef}
-        className="h-[min(70vh,32rem)] max-h-[32rem] w-16 overflow-y-auto overscroll-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="h-[min(70vh,32rem)] max-h-[32rem] w-14 overflow-y-auto overscroll-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         onPointerEnter={(event) => {
           pointerInsideRef.current = true;
           updateHoveredMarker(markerIdFromTarget(event.target));
@@ -205,42 +208,46 @@ export function ConversationNavigator({
         onPointerMove={(event) => updateHoveredMarker(markerIdFromTarget(event.target))}
         onPointerLeave={closePreview}
       >
-        {items.map((item, index) => {
-          const active = activeId === item.id;
-          const hovered = hoveredId === item.id;
-          const baseWidth = markerWidth(item, index);
-          const width = active ? 52 : hovered ? Math.max(baseWidth, 32) : baseWidth;
-          return (
-            <button
-              key={item.id}
-              ref={(node) => setMarkerRowRef(rowRefs.current, item.id, node)}
-              type="button"
-              data-conversation-marker={item.id}
-              onClick={() => scrollTo(item.id)}
-              onPointerEnter={() => updateHoveredMarker(item.id)}
-              onFocus={() => {
-                clearHoverTimer();
-                updateHoveredMarker(item.id);
-                setPreviewId(item.id);
-              }}
-              onBlur={(event) => {
-                if (!railRef.current?.contains(event.relatedTarget)) closePreview();
-              }}
-              aria-current={active ? "true" : undefined}
-              aria-label={`Jump to message ${index + 1}`}
-              className="flex h-2 w-full shrink-0 cursor-pointer items-center px-1 text-left outline-none focus-visible:bg-muted/60"
-            >
-              <span
-                className={cn(
-                  "h-0.5 rounded-full transition-[width,opacity] duration-[90ms] ease-out motion-reduce:transition-none",
-                  active ? "bg-foreground opacity-100" : "bg-muted-foreground/60 opacity-60",
-                  !active && hovered && "opacity-90",
-                )}
-                style={{ width }}
-              />
-            </button>
-          );
-        })}
+        <div className="flex min-h-full flex-col justify-center">
+          {items.map((item, index) => {
+            const active = activeId === item.id;
+            const focused = focusIndex === index;
+            const width = conversationMarkerWidth(item, index, focusIndex);
+            return (
+              <button
+                key={item.id}
+                ref={(node) => setMarkerRowRef(rowRefs.current, item.id, node)}
+                type="button"
+                data-conversation-marker={item.id}
+                onClick={() => scrollTo(item.id)}
+                onPointerEnter={() => updateHoveredMarker(item.id)}
+                onFocus={() => {
+                  clearHoverTimer();
+                  updateHoveredMarker(item.id);
+                  setPreviewId(item.id);
+                }}
+                onBlur={(event) => {
+                  if (!railRef.current?.contains(event.relatedTarget)) closePreview();
+                }}
+                aria-current={active ? "true" : undefined}
+                aria-label={`Jump to message ${index + 1}`}
+                className="flex h-2 w-full shrink-0 cursor-pointer items-center px-1 text-left outline-none focus-visible:bg-muted/60"
+              >
+                <span
+                  className={cn(
+                    "h-0.5 rounded-full transition-[width,opacity] duration-[90ms] ease-out motion-reduce:transition-none",
+                    focused
+                      ? "bg-foreground opacity-100"
+                      : active
+                        ? "bg-foreground opacity-85"
+                        : "bg-muted-foreground/60 opacity-60",
+                  )}
+                  style={{ width }}
+                />
+              </button>
+            );
+          })}
+        </div>
       </div>
       {previewItem && previewPosition ? (
         <aside
@@ -278,7 +285,13 @@ function setMarkerRowRef(rows: Map<string, HTMLButtonElement>, id: string, node:
   else rows.delete(id);
 }
 
-function markerWidth(item: NavigatorItem, index: number): number {
-  if ((item.resources?.length ?? 0) > 0 || (item.preview?.length ?? 0) > 280) return 40;
-  return index % 7 === 0 ? 22 : 12;
+export function conversationMarkerWidth(item: NavigatorItem, index: number, focusIndex: number): number {
+  const distance = focusIndex < 0 ? Number.POSITIVE_INFINITY : Math.abs(index - focusIndex);
+  if (distance === 0) return 42;
+  if (distance === 1) return 32;
+  if (distance === 2) return 24;
+  if (distance === 3) return 16;
+  if ((item.resources?.length ?? 0) > 0 || index % 12 === 0) return 32;
+  if (item.label.length > 160 || index % 5 === 0) return 20;
+  return 10;
 }

@@ -1464,9 +1464,9 @@ code, pre {
 
 .berry-queued-message-list {
   position: absolute;
-  right: 13px;
+  right: calc(var(--berry-composer-radius) + 6px);
   bottom: calc(100% - 1px);
-  left: 13px;
+  left: calc(var(--berry-composer-radius) + 6px);
   z-index: 0;
   min-width: 0;
   overflow: clip;
@@ -1679,7 +1679,6 @@ code, pre {
 .berry-follow-up-mode svg { width: 14px; height: 14px; }
 
 @media (max-width: 640px) {
-  .berry-queued-message-list { right: 8px; left: 8px; }
   .berry-queued-message-scroll { padding-inline: 8px; }
   .berry-queued-message-action { padding-inline: 6px; }
 }
