@@ -8,7 +8,7 @@ import { Input } from "@berry/desktop-ui/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@berry/desktop-ui/components/ui/tabs";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { Download, Ellipsis, Eye, RefreshCw, Search, X } from "lucide-react";
-import { FileViewerModal } from "./file-viewer-modal";
+import { DocumentPreviewModal } from "./document-preview-modal";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
 import { FileThumbnail, isImageFile } from "./file-thumbnail";
 
@@ -128,7 +128,7 @@ export function TaskFileLibraryDialog({
               </div>
             ) : null}
           </div>
-          <FileViewerModal file={selected} onOpenChange={(nextOpen) => { if (!nextOpen) setSelected(null); }} />
+          <DocumentPreviewModal file={selected} onOpenChange={(nextOpen) => { if (!nextOpen) setSelected(null); }} />
         </DialogContent>
       </Dialog>
     </>

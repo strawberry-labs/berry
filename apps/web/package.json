@@ -18,10 +18,10 @@
     "@berry/desktop-ui": "workspace:*",
     "@berry/shared": "workspace:*",
     "@berry/thread-ui": "workspace:*",
-    "@file-viewer/react-full": "2.2.3",
     "@fontsource/jetbrains-mono": "^5.0.21",
     "@fontsource/source-serif-4": "^5.0.19",
     "@lexical/react": "0.46.0",
+    "@monaco-editor/react": "4.7.0",
     "@tanstack/react-query": "^5.51.15",
     "@tanstack/react-router": "^1.170.17",
     "@tanstack/react-start": "^1.168.27",
@@ -31,6 +31,7 @@
     "jszip": "3.10.1",
     "lexical": "0.46.0",
     "lucide-react": "^0.468.0",
+    "monaco-editor": "0.56.0",
     "next-themes": "0.4.6",
     "react": "^19.0.0",
     "react-data-grid": "7.0.0-beta.61",
@@ -43,7 +44,6 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@file-viewer/vite-plugin": "2.2.3",
     "@playwright/test": "1.61.1",
     "@tailwindcss/vite": "^4.3.2",
     "@types/react": "^19.0.0",

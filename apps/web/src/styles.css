@@ -1969,7 +1969,7 @@ code, pre {
 .berry-workspace-file-row { width: 100%; display: flex; align-items: center; gap: 6px; padding: 5px 9px; color: var(--berry-sidebar-text); font-size: 12px; text-align: left; }
 .berry-workspace-file-row svg { width: 13px; height: 13px; flex: none; }
 .berry-workspace-file-row:hover, .berry-workspace-file-row[aria-current="page"] { background: var(--berry-hover); color: var(--berry-text); }
-.berry-workspace-editor textarea { flex: 1; min-height: 0; resize: none; border: 0; outline: 0; padding: 12px; background: var(--berry-surface); color: var(--berry-text); font: 12px/1.65 var(--font-mono); tab-size: 2; }
+.berry-workspace-monaco { flex: 1; min-height: 0; }
 .berry-workspace-empty { padding: 12px; color: var(--berry-text-tertiary); font-size: 12px; }
 .berry-workspace-empty-state { flex: 1; min-height: 120px; display: grid; place-content: center; justify-items: center; gap: 10px; padding: 24px; color: var(--berry-text-tertiary); text-align: center; font-size: 12px; }
 .berry-workspace-terminal pre, .berry-git-status, .berry-git-diff { margin: 0; white-space: pre-wrap; overflow: auto; color: var(--berry-text-secondary); font: 12px/1.6 var(--font-mono); }
@@ -2290,7 +2290,7 @@ code, pre {
 .berry-library-status strong { color: var(--berry-text-primary); font-size: 14px; font-weight: 560; }
 .berry-library-status p { max-width: 380px; margin: 6px 0 14px; font-size: 13px; line-height: 1.5; }
 
-.berry-file-viewer-dialog {
+.berry-document-preview-dialog {
   display: flex;
   flex-direction: column;
   width: 80vw !important;
@@ -2298,12 +2298,12 @@ code, pre {
   height: 85vh !important;
   box-shadow: var(--berry-shadow-lg);
 }
-.berry-file-viewer-header {
+.berry-document-preview-header {
   margin: 0;
   border-bottom: 1px solid var(--berry-border);
   background: var(--berry-control-bg);
 }
-.berry-file-viewer-icon {
+.berry-document-preview-icon {
   display: grid;
   width: 38px;
   height: 38px;
@@ -2314,11 +2314,11 @@ code, pre {
   background: var(--berry-card-bg);
   box-shadow: var(--berry-shadow-sm);
 }
-.berry-file-viewer-icon svg { width: 18px; height: 18px; }
-.berry-file-viewer-action { min-width: 40px; min-height: 40px; transition-property: background-color, opacity, scale; transition-duration: 150ms; }
-.berry-file-viewer-action:active { scale: .96; }
-.berry-file-viewer-stage { overflow: hidden; background: var(--berry-main-bg); }
-.berry-file-viewer-stage > * { height: 100%; }
+.berry-document-preview-icon svg { width: 18px; height: 18px; }
+.berry-document-preview-action { min-width: 40px; min-height: 40px; transition-property: background-color, opacity, scale; transition-duration: 150ms; }
+.berry-document-preview-action:active { scale: .96; }
+.berry-document-preview-stage { overflow: hidden; background: var(--berry-main-bg); }
+.berry-document-preview-stage > * { height: 100%; }
 .berry-native-pdf-viewer { display: block; width: 100%; height: 100%; border: 0; background: var(--berry-main-bg); }
 .berry-docx-viewer,
 .berry-pptx-viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: var(--berry-vibrancy-fallback); }
@@ -2341,6 +2341,8 @@ code, pre {
   font-size: 13px;
 }
 .berry-document-loading { display: flex; height: 100%; min-height: 220px; align-items: center; justify-content: center; gap: 10px; color: var(--berry-text-tertiary); font-size: 13px; }
+.berry-file-code-editor { width: 100%; height: 100%; }
+.berry-code-editor-loading { display: flex; width: 100%; height: 100%; min-height: 220px; align-items: center; justify-content: center; color: var(--berry-text-tertiary); background: var(--berry-main-bg); font-size: 13px; }
 .berry-spreadsheet-viewer {
   display: grid;
   width: 100%;
@@ -2420,13 +2422,13 @@ code, pre {
 .berry-spreadsheet-dimensions { display: flex; flex: 0 0 auto; align-items: center; padding: 0 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 @media (max-width: 760px) {
-  .berry-file-viewer-dialog { width: 96vw !important; max-width: 96vw !important; height: 90vh !important; }
+  .berry-document-preview-dialog { width: 96vw !important; max-width: 96vw !important; height: 90vh !important; }
   .berry-spreadsheet-dimensions { display: none; }
 }
-.berry-file-viewer-loading { display: grid; height: 100%; place-items: center; align-content: center; gap: 8px; color: var(--berry-text-tertiary); text-align: center; }
-.berry-file-viewer-loading svg { width: 28px; height: 28px; margin-bottom: 4px; }
-.berry-file-viewer-loading strong { color: var(--berry-text-primary); font-size: 14px; font-weight: 560; }
-.berry-file-viewer-loading span { font-size: 12px; }
+.berry-document-preview-loading { display: grid; height: 100%; place-items: center; align-content: center; gap: 8px; color: var(--berry-text-tertiary); text-align: center; }
+.berry-document-preview-loading svg { width: 28px; height: 28px; margin-bottom: 4px; }
+.berry-document-preview-loading strong { color: var(--berry-text-primary); font-size: 14px; font-weight: 560; }
+.berry-document-preview-loading span { font-size: 12px; }
 .composer-upload-progress { margin: 5px 12px 0; color: var(--berry-text-tertiary); font-size: 11px; font-variant-numeric: tabular-nums; }
 .berry-task-files { width: min(100%, 1160px); margin: 4px auto 28px; padding: 0 24px; }
 .berry-task-file-grid { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -2468,7 +2470,7 @@ code, pre {
   .berry-task-files { padding: 0 14px; }
   .berry-task-file-grid { display: grid; grid-template-columns: 1fr; }
   .berry-task-file-card { width: 100%; max-width: none; }
-  .berry-file-viewer-dialog { width: 96vw; max-width: 96vw; height: 92vh; }
+  .berry-document-preview-dialog { width: 96vw; max-width: 96vw; height: 92vh; }
 }
 
 @media (max-width: 680px) {

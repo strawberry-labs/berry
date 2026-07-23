@@ -5,7 +5,7 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import { FileImage, FileText, FolderOpen, RefreshCw } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import type { ArtifactLibraryTab } from "@/lib/cloud-shell-state";
-import { FileViewerModal } from "./file-viewer-modal";
+import { DocumentPreviewModal } from "./document-preview-modal";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
 
 export function ArtifactLibrary({ client, tab, onTabChange }: {
@@ -100,7 +100,7 @@ export function ArtifactLibrary({ client, tab, onTabChange }: {
         </div>
       ) : null}
       {state === "ready" && nextCursor ? <Button className="berry-library-load-more" variant="outline" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more files"}</Button> : null}
-      <FileViewerModal file={selected} onOpenChange={(open) => { if (!open) setSelected(null); }} />
+      <DocumentPreviewModal file={selected} onOpenChange={(open) => { if (!open) setSelected(null); }} />
     </section>
   );
 }

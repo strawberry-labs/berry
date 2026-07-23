@@ -4,6 +4,7 @@ import type { CloudGitState, CloudPreview, CloudTerminalEvent, CloudTerminalSess
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { FileText, Files, GitBranch, Globe, RefreshCw, SquareTerminal, X } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
+import { languageForPath, MonacoCodeEditor } from "@/components/code-editor";
 
 type Tab = "files" | "terminal" | "changes" | "preview";
 const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
@@ -80,7 +81,7 @@ function FilesPanel({ taskId, client }: { taskId: string; client: BerryApiClient
       {files.length ? files.map((file) => <button type="button" key={file.path} className="berry-workspace-file-row" aria-current={path === file.path ? "page" : undefined} onClick={() => file.type === "file" && void open(file.path)}><FileText /><span>{file.path.replace(/^\/workspace\//, "")}</span></button>) : <p className="berry-workspace-empty">No files yet.</p>}
     </nav>
     <section className="berry-workspace-editor" aria-label="File editor">
-      {path ? <><div className="berry-workspace-panel-heading"><span className="truncate">{path.replace(/^\/workspace\//, "")}{dirty ? " •" : ""}</span><Button size="sm" disabled={!dirty} onClick={() => void save()}>Save</Button></div><textarea aria-label="File contents" spellCheck={false} value={content} onChange={(event) => { setContent(event.target.value); setDirty(true); }} /></> : <WorkspaceState text="Select a file to edit" />}
+      {path ? <><div className="berry-workspace-panel-heading"><span className="truncate">{path.replace(/^\/workspace\//, "")}{dirty ? " •" : ""}</span><Button size="sm" disabled={!dirty} onClick={() => void save()}>Save</Button></div><MonacoCodeEditor className="berry-workspace-monaco" language={languageForPath(path)} onChange={(next) => { setContent(next); setDirty(true); }} path={`workspace://${taskId}${path}`} value={content} /></> : <WorkspaceState text="Select a file to edit" />}
     </section>
   </div>;
 }

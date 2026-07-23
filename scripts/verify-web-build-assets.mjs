@@ -1,21 +1,18 @@
 #!/usr/bin/env node
 
-import { access, copyFile, cp, readdir, readFile } from "node:fs/promises";
+import { access, copyFile, readdir, readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 
 const webDist = resolve(import.meta.dirname, "../apps/web/dist");
 const serverDir = resolve(webDist, "server");
 const clientDir = resolve(webDist, "client");
-const serverFileViewerDir = resolve(serverDir, "file-viewer");
-const clientFileViewerDir = resolve(clientDir, "file-viewer");
 const cssReferencePattern = /\/assets\/styles-[A-Za-z0-9_-]+\.css/g;
 const rootJavascriptBudget = {
   rawBytes: 1_500_000,
   gzipBytes: 450_000,
 };
 const forbiddenRootPreloadPrefixes = [
-  "file-viewer-",
   "management-experience-",
   "management-primitives-",
 ];
@@ -55,10 +52,6 @@ for (const reference of references) {
   }
   await access(referencedPath);
 }
-
-await cp(serverFileViewerDir, clientFileViewerDir, { recursive: true, force: true });
-await access(resolve(clientFileViewerDir, "flyfish-viewer-manifest.json"));
-console.log("[web-build] published file-viewer runtime assets to the client output");
 
 const serverAssetsDir = resolve(serverDir, "assets");
 const startManifestName = (await readdir(serverAssetsDir))
