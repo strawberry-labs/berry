@@ -966,16 +966,18 @@ function createDevelopmentHostClient(): HostClient {
           },
         ];
         write(state);
-        emit({
-          type: "agent.event",
-          taskId,
-          sessionId,
-          event: {
-            kind: "session.note",
-            note: method === "agent.followUp" ? "followed-up" : "steered",
-            detail: method === "agent.followUp" ? "Queued follow-up" : "Steered current turn",
-          },
-        });
+        if (method === "agent.followUp") {
+          emit({
+            type: "agent.event",
+            taskId,
+            sessionId,
+            event: {
+              kind: "session.note",
+              note: "followed-up",
+              detail: "Queued follow-up",
+            },
+          });
+        }
         return { queued: true } as T;
       }
       if (method === "agent.cancel") {

@@ -664,7 +664,8 @@ test.describe("turn activity accordion", () => {
     await page.keyboard.press("Enter");
 
     await expect(page.getByTestId("queued-followups")).toHaveCount(0);
-    await expect(page.locator('[data-session-note="steered"]')).toContainText("Steered current turn");
+    await expect(page.getByText("Focus on the WebKit checks", { exact: true })).toBeVisible();
+    await expect(page.locator('[data-session-note="steered"]')).toHaveCount(0);
   });
 
   test("assistant message fork opens a boundary-limited fork", async ({ page }) => {

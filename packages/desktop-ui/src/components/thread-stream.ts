@@ -280,6 +280,10 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
     case "question.answered":
       return state.question?.questionId === event.questionId ? { ...state, question: null } : state;
     case "session.note":
+      // A steering request is represented by its normal user prompt in the
+      // transcript. Older runtimes can still send this marker, but rendering
+      // it duplicates the same action as a decorative divider.
+      if (event.note === "steered") return state;
       return { ...state, timeline: [...state.timeline, { kind: "note", note: event.note, text: event.detail ?? event.note }] };
     case "mode.changed":
       // Legacy streams remain decodable, but presentation changes are user-driven.

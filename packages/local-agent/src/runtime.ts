@@ -1744,7 +1744,6 @@ export class BerryAgentRuntime {
     const promptInput = promptWithAttachments(input, preparedAttachments);
     const automaticSkill = automaticAttachmentSkillInvocation(state.skills, preparedAttachments, promptInput);
     await state.harness.steer(automaticSkill?.instructions ?? promptInput, images && images.length > 0 ? { images } : undefined);
-    this.#emit(active, { kind: "session.note", note: "steered", detail: `Steered: ${input.slice(0, 120)}` });
     return { queued: true };
   }
 

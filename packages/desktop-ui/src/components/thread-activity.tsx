@@ -1706,7 +1706,7 @@ export function ActivityNote({
   children: string;
   note?: SessionNoteKind;
 }) {
-  const active = note === "steered" || note === "followed-up";
+  const active = note === "followed-up";
   return (
     <div data-session-note={note} className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
       <span className={cn("h-px min-w-0 flex-1", active ? "bg-primary/30" : "bg-border/70")} />

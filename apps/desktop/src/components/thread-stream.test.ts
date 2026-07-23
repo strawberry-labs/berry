@@ -184,18 +184,16 @@ describe("reduceStream", () => {
     ]);
   });
 
-  it("keeps session note kind for distinct steering and follow-up markers", () => {
+  it("keeps queued follow-up markers but ignores legacy steering markers", () => {
     const state = play([
       turnStart,
       { kind: "session.note", note: "steered", detail: "Steered: focus on tests" },
       { kind: "session.note", note: "followed-up", detail: "Queued follow-up: update docs" },
     ]);
     expect(state.timeline).toEqual([
-      { kind: "note", note: "steered", text: "Steered: focus on tests" },
       { kind: "note", note: "followed-up", text: "Queued follow-up: update docs" },
     ]);
     expect(groupLiveTimeline(state.timeline)).toEqual([
-      { kind: "note", note: "steered", text: "Steered: focus on tests" },
       { kind: "note", note: "followed-up", text: "Queued follow-up: update docs" },
     ]);
   });
