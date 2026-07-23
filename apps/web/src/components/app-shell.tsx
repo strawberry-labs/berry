@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type PermissionMode, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -118,6 +118,10 @@ export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks"
     : { tasks: [], messages: [] };
 }
 
+export function shouldRefreshAdministration(permissions: readonly OrgPermission[]): boolean {
+  return permissions.includes("org:admin");
+}
+
 export function AppShell({ initial }: { initial: ShellData }) {
   if (initial.config.demoMode) return <CloudShell initial={initial} user={null} />;
   return (
@@ -184,10 +188,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [creatingProject, setCreatingProject] = React.useState(false);
   const [activeOrganizationId, setActiveOrganizationId] = React.useState(initial.config.activeOrganizationId);
   const activeOrganization = config.organizations.find((org) => org.id === activeOrganizationId) ?? config.organizations[0] ?? null;
-  const effectiveOrgPermissions = React.useMemo(
+  const fallbackOrgPermissions = React.useMemo(
     () => config.rolePermissions.find((entry) => entry.tenantId === activeOrganizationId && entry.role === activeOrganization?.role)?.permissions ?? [],
     [activeOrganization?.role, activeOrganizationId, config.rolePermissions],
   );
+  const [effectiveOrgPermissions, setEffectiveOrgPermissions] = React.useState<OrgPermission[]>(fallbackOrgPermissions);
   const defaultProvider = initial.config.providers.find((provider) => provider.enabled) ?? initial.config.providers[0];
   const [providerId, setProviderId] = React.useState(defaultProvider?.id ?? "router");
   const [modelOptions, setModelOptions] = React.useState(defaultProvider?.models ?? []);
@@ -205,6 +210,21 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
     ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
     : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
+  React.useEffect(() => {
+    if (!client || !activeOrganizationId) {
+      setEffectiveOrgPermissions(fallbackOrgPermissions);
+      return;
+    }
+    let cancelled = false;
+    void client.effectivePermissions(activeOrganizationId)
+      .then((result) => {
+        if (!cancelled) setEffectiveOrgPermissions(result.permissions);
+      })
+      .catch(() => {
+        if (!cancelled) setEffectiveOrgPermissions(fallbackOrgPermissions);
+      });
+    return () => { cancelled = true; };
+  }, [activeOrganizationId, client, fallbackOrgPermissions]);
   // A queued item can be triggered from its card, keyboard shortcut, or a
   // reconciliation refresh. Keep one browser-side lock per item so those
   // paths cannot start two turns for the same prompt.
@@ -468,6 +488,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const refreshAdmin = React.useCallback(async () => {
     if (!client || !activeOrganizationId) return;
+    if (!shouldRefreshAdministration(effectiveOrgPermissions)) {
+      setResourceError("settings", "");
+      return;
+    }
     const [budgets, usage, billing, policies, defaults, roles, departments, flags, acls, sso, policyVersions, auditSettings, auditEvents, auditExports] = await Promise.allSettled([
       client.listBudgetLimits(activeOrganizationId),
       client.usageDashboard(activeOrganizationId),
@@ -506,7 +530,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       auditEvents: settledValue(auditEvents, current.auditEvents),
       auditExports: settledValue(auditExports, current.auditExports),
     }));
-  }, [activeOrganizationId, client]);
+  }, [activeOrganizationId, client, effectiveOrgPermissions, setResourceError]);
 
   React.useEffect(() => {
     void refreshAdmin().catch((cause) => setResourceError("settings", cause instanceof Error ? cause.message : "Unable to load administration data"));

@@ -1,5 +1,6 @@
 import * as React from "react";
 import { Check, FlaskConical, Plus, ShieldCheck, Trash2, Upload, X } from "lucide-react";
+import { BerryApiError, type BerryApiClient } from "@berry/api-client";
 import type { EffectiveCapability, PersonalMcpServer, PersonalSkill, PersonalSkillReview } from "@berry/shared";
 import { readBrowserSkillImport } from "@/lib/skill-import";
 import { AsyncState, Button, DataTable, DetailDrawer, FormSelect, Input, ManagementPage, ManagementSwitch, SearchInput, Section, StatusPill, SuccessMessage, Textarea, Toolbar } from "./management-primitives";
@@ -21,6 +22,20 @@ type SkillCatalogRow = {
 const emptySkillResource = { personal: [] as PersonalSkill[], effective: [] as EffectiveCapability[] };
 const emptyDraft = { content: "", sourceUrl: "", source: "upload" as "text" | "upload" | "git", packageFiles: [] as string[], fileName: "" };
 
+export async function loadPersonalSkillResource(
+  client: Pick<BerryApiClient, "listPersonalSkills" | "effectiveCapabilities">,
+  tenantId: string,
+): Promise<typeof emptySkillResource> {
+  const [personal, effective] = await Promise.all([
+    client.listPersonalSkills(),
+    client.effectiveCapabilities(tenantId).catch((cause) => {
+      if (cause instanceof BerryApiError && cause.status === 403) return [];
+      throw cause;
+    }),
+  ]);
+  return { personal, effective };
+}
+
 export function PersonalSkillsScreen({ client, config, tenantId }: ManagementScreenProps) {
   const [query, setQuery] = React.useState("");
   const [review, setReview] = React.useState<PersonalSkillReview | null>(null);
@@ -32,7 +47,7 @@ export function PersonalSkillsScreen({ client, config, tenantId }: ManagementScr
   const resource = useResource(
     `personal-skills:${tenantId}`,
     async () => client
-      ? Promise.all([client.listPersonalSkills(), client.effectiveCapabilities(tenantId)]).then(([personal, effective]) => ({ personal, effective }))
+      ? loadPersonalSkillResource(client, tenantId)
       : emptySkillResource,
     emptySkillResource,
   );

@@ -158,7 +158,8 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
 
   async listWorkspaces(filter: { ownerUserId?: string | null; includeGeneral?: boolean } = {}): Promise<Workspace[]> {
     return [...this.#workspaces.values()]
-      .filter((workspace) => workspace.workspaceKind === "project" || (filter.includeGeneral === true && workspace.ownerUserId === filter.ownerUserId))
+      .filter((workspace) => workspace.ownerUserId === filter.ownerUserId)
+      .filter((workspace) => workspace.workspaceKind === "project" || filter.includeGeneral === true)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
@@ -169,7 +170,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       : this.#workspaces.get(input.workspaceId ?? "");
     const workspaceId = workspace?.id ?? input.workspaceId;
     if (!workspaceId) throw new NotFoundException("Task workspace not found");
-    if (workspace?.workspaceKind === "general" && workspace.ownerUserId !== input.ownerUserId) throw new NotFoundException("Task workspace not found");
+    if (workspace && workspace.ownerUserId !== input.ownerUserId) throw new NotFoundException("Task workspace not found");
     const task = TaskSchema.parse({
       id: createId("task"),
       workspaceId,
@@ -210,8 +211,9 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       .filter((task) => {
         const workspace = this.#workspaces.get(task.workspaceId);
         if (filter.workspaceKind && workspace?.workspaceKind !== filter.workspaceKind) return false;
-        return workspace?.workspaceKind !== "general" || workspace.ownerUserId === filter.ownerUserId;
+        return workspace?.ownerUserId === undefined || workspace.ownerUserId === filter.ownerUserId;
       })
+      .filter((task) => filter.ownerUserId === undefined || this.#taskOwners.get(task.id) === filter.ownerUserId)
       .filter((task) => filter.includeDeleted === true || task.deletedAt === null)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
       .slice(offset, offset + limit);
@@ -222,7 +224,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     if (!task) throw new NotFoundException(`Task not found: ${taskId}`);
     const workspace = this.#workspaces.get(task.workspaceId);
     const taskOwner = this.#taskOwners.get(taskId) ?? null;
-    if (ownerUserId !== undefined && ((taskOwner !== null && taskOwner !== ownerUserId) || (workspace?.workspaceKind === "general" && workspace.ownerUserId !== ownerUserId))) {
+    if (ownerUserId !== undefined && (taskOwner !== ownerUserId || (workspace && workspace.ownerUserId !== ownerUserId))) {
       throw new NotFoundException(`Task not found: ${taskId}`);
     }
     return task;
@@ -443,7 +445,8 @@ RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_a
 SELECT id, owner_id, workspace_kind, name, trust_state, created_at, updated_at
 FROM workspaces
 WHERE tenant_id = $1::uuid AND deleted_at IS NULL
-  AND (workspace_kind = 'project' OR ($2::boolean = true AND owner_id = $3::uuid))
+  AND owner_id = $3::uuid
+  AND (workspace_kind = 'project' OR $2::boolean = true)
 ORDER BY updated_at DESC
         `.trim(),
         [this.tenantId, filter.includeGeneral === true, filter.ownerUserId ?? null],
@@ -462,7 +465,7 @@ ORDER BY updated_at DESC
       const [workspace] = await executor.query<{ id: string }>(
         `SELECT id FROM workspaces
          WHERE tenant_id = $1::uuid AND id = $2::uuid AND deleted_at IS NULL
-           AND (workspace_kind = 'project' OR owner_id = $3::uuid)`,
+           AND owner_id = $3::uuid`,
         [this.tenantId, workspaceId, input.ownerUserId ?? null],
       );
       if (!workspace) throw new NotFoundException(`Workspace not found: ${workspaceId}`);
@@ -503,8 +506,8 @@ WHERE t.tenant_id = $1::uuid
   AND ($2::uuid IS NULL OR t.workspace_id = $2::uuid)
   AND ($3::boolean = true OR t.deleted_at IS NULL)
   AND ($4::workspace_kind IS NULL OR w.workspace_kind = $4::workspace_kind)
-  AND (w.workspace_kind = 'project' OR ($5::uuid IS NOT NULL AND w.owner_id = $5::uuid))
-  AND ($5::uuid IS NULL OR t.user_id IS NULL OR t.user_id = $5::uuid)
+  AND w.owner_id = $5::uuid
+  AND t.user_id = $5::uuid
 ORDER BY t.updated_at DESC, t.id ASC
 LIMIT $6 OFFSET $7
         `.trim(),
@@ -743,8 +746,7 @@ SELECT t.id, t.workspace_id, t.title, t.status, t.active_session_id, t.conversat
 FROM tasks t
 JOIN workspaces w ON w.id = t.workspace_id AND w.tenant_id = t.tenant_id
 WHERE t.tenant_id = $1::uuid AND t.id = $2::uuid
-  AND ($3::uuid IS NULL OR t.user_id IS NULL OR t.user_id = $3::uuid)
-  AND (w.workspace_kind = 'project' OR ($3::uuid IS NOT NULL AND w.owner_id = $3::uuid))
+  AND ($3::uuid IS NULL OR (t.user_id = $3::uuid AND w.owner_id = $3::uuid))
       `.trim(),
       [this.tenantId, taskId, ownerUserId ?? null],
     );

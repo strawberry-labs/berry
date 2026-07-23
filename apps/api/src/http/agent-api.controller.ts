@@ -477,7 +477,8 @@ export class AgentApiController {
   }
 
   @Post("/tasks/:taskId/sessions")
-  async createSession(@Param("taskId") taskId: string, @Body() body: unknown) {
+  async createSession(@Req() httpRequest: AuthenticatedRequest, @Param("taskId") taskId: string, @Body() body: unknown) {
+    await this.store.getTask(taskId, httpRequest.auth?.user.id ?? null);
     const request = parseBody(CreateSessionRequestSchema, body ?? {});
     return this.store.createSession({
       taskId,
@@ -487,13 +488,15 @@ export class AgentApiController {
   }
 
   @Get("/sessions/:sessionId/messages")
-  async listMessages(@Param("sessionId") sessionId: string) {
+  async listMessages(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    await this.ownedSession(httpRequest, sessionId);
     await this.#projectionWrites.get(sessionId);
     return this.store.listMessages(sessionId);
   }
 
   @Post("/sessions/:sessionId/messages")
   async appendMessage(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
+    await this.ownedSession(request, sessionId);
     const input = parseBody(AppendMessageRequestSchema, body);
     const message = await this.store.appendMessage(sessionId, input);
     if (input.role === "user") {
@@ -513,8 +516,7 @@ export class AgentApiController {
   @Post("/sessions/:sessionId/turns")
   async startTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(StartTurnRequestSchema, body);
-    const session = await this.store.getSession(sessionId);
-    const task = await this.store.getTask(session.taskId);
+    const { session, task } = await this.ownedSession(httpRequest, sessionId);
     const tenantId = tenantIdFromRequest(httpRequest);
     const requestId = `model_${randomUUID()}`;
     const baseRuntime = this.runtimeConfig.resolve(request);
@@ -769,18 +771,21 @@ export class AgentApiController {
   }
 
   @Sse("/sessions/:sessionId/events")
-  streamEvents(@Param("sessionId") sessionId: string): Observable<MessageEvent<AgentStreamEvent>> {
+  async streamEvents(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string): Promise<Observable<MessageEvent<AgentStreamEvent>>> {
+    await this.ownedSession(httpRequest, sessionId);
     const state = this.sessionHost.turnState(sessionId);
     return this.events.stream(sessionId, state.bufferedEvents);
   }
 
   @Get("/sessions/:sessionId/turn-state")
-  turnState(@Param("sessionId") sessionId: string) {
+  async turnState(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    await this.ownedSession(httpRequest, sessionId);
     return TurnStateSchema.parse(this.sessionHost.turnState(sessionId));
   }
 
   @Post("/sessions/:sessionId/cancel")
   async cancelTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    await this.ownedSession(httpRequest, sessionId);
     const ok = await this.sessionHost.cancel(sessionId);
     if (ok) await this.store.pauseFollowUps(sessionId, "You interrupted the active run.", httpRequest.auth?.user.id ?? null);
     return { ok };
@@ -789,7 +794,7 @@ export class AgentApiController {
   @Post("/sessions/:sessionId/steer")
   async steerTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(SteerTurnRequestSchema, body);
-    const session = await this.store.getSession(sessionId);
+    const { session } = await this.ownedSession(httpRequest, sessionId);
     const runtimeAttachments = await this.files.runtimeAttachments(tenantIdFromRequest(httpRequest), httpRequest.auth!.user.id, request.attachments ?? [], { taskId: session.taskId, sessionId });
     // Only persist the user message after the active runtime accepts it. That
     // keeps a rejected steer recoverable instead of leaving a phantom message
@@ -828,7 +833,7 @@ export class AgentApiController {
   @Post("/sessions/:sessionId/follow-ups")
   async followUpTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(SteerTurnRequestSchema, body);
-    const session = await this.store.getSession(sessionId);
+    const { session } = await this.ownedSession(httpRequest, sessionId);
     const runtimeAttachments = await this.files.runtimeAttachments(tenantIdFromRequest(httpRequest), httpRequest.auth!.user.id, request.attachments ?? [], { taskId: session.taskId, sessionId });
     const queued = await this.store.createFollowUp({ taskId: session.taskId, sessionId, input: request.input, ...(request.attachments ? { attachments: request.attachments } : {}) }, httpRequest.auth?.user.id ?? null);
     const message = await this.store.appendMessage(sessionId, { role: "user", parts: userMessageParts(request.input, request.attachments) });
@@ -847,6 +852,12 @@ export class AgentApiController {
       // optimistic entry after a transport-level error.
       return this.store.updateFollowUp(queued.id, { status: "failed", error: cause instanceof Error ? cause.message : "Unable to queue follow-up" }, httpRequest.auth?.user.id ?? null);
     }
+  }
+
+  private async ownedSession(httpRequest: AuthenticatedRequest, sessionId: string) {
+    const session = await this.store.getSession(sessionId);
+    const task = await this.store.getTask(session.taskId, httpRequest.auth?.user.id ?? null);
+    return { session, task };
   }
 
   @Patch("/follow-ups/:followUpId")

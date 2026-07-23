@@ -100,6 +100,49 @@ describe("AgentApiController", () => {
     expect(other.body.task.workspaceId).not.toBe(workspaceId);
   });
 
+  it("isolates project workspaces, tasks, and messages by user", async () => {
+    app = await createApp(fakeSessionHost());
+    const workspace = await request(app.getHttpServer())
+      .post("/v1/workspaces")
+      .set(authHeader())
+      .send({ name: "Private project" })
+      .expect(201);
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: workspace.body.id, title: "Private task" })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/messages`)
+      .set(authHeader())
+      .send({ role: "user", parts: [{ kind: "text", content: "private" }] })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .get("/v1/workspaces?includeGeneral=true")
+      .set(authHeader("berry-other-session"))
+      .expect(200)
+      .expect(({ body }) => expect(body).not.toContainEqual(expect.objectContaining({ id: workspace.body.id })));
+    await request(app.getHttpServer())
+      .get("/v1/tasks")
+      .set(authHeader("berry-other-session"))
+      .expect(200)
+      .expect([]);
+    await request(app.getHttpServer())
+      .get(`/v1/tasks/${created.body.task.id}`)
+      .set(authHeader("berry-other-session"))
+      .expect(404);
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${created.body.session.id}/messages`)
+      .set(authHeader("berry-other-session"))
+      .expect(404);
+    await request(app.getHttpServer())
+      .post(`/v1/tasks/${created.body.task.id}/sessions`)
+      .set(authHeader("berry-other-session"))
+      .send({})
+      .expect(404);
+  });
+
   it("starts turns through SessionHost and publishes shared stream events", async () => {
     const startTurn = vi.fn((options: StartTurnOptions) => {
       options.onEvent({ kind: "turn.start", turnId: "turn_http_1" });
@@ -433,7 +476,7 @@ describe("AgentApiController", () => {
 
   it("settles stale running tasks after the API process restarts", async () => {
     const taskStore = new InMemoryCloudTaskStore();
-    const created = await taskStore.createTask({ workspaceId: "workspace_cloud", title: "Interrupted task" });
+    const created = await taskStore.createTask({ workspaceId: "workspace_cloud", title: "Interrupted task", ownerUserId: "user_1" });
     await taskStore.appendMessage(created.session.id, {
       role: "assistant",
       parts: [{ kind: "error", content: "Provider stream ended before completion" }],
