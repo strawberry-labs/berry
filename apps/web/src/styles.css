@@ -1714,7 +1714,16 @@ code, pre {
 
 .berry-composer-context-row {
   min-height: 38px;
+  /* The project context is a tab behind the composer. Inset it to the point
+     where the composer's curved shoulders meet its straight top edge. */
+  margin-inline: var(--berry-composer-radius);
+  border-radius: var(--berry-composer-radius) var(--berry-composer-radius) 0 0;
+  background: var(--berry-composer-strip);
   padding-bottom: 7px;
+}
+
+.berry-composer-shell:has(> .berry-composer-context-row) {
+  background: transparent;
 }
 
 .berry-composer-context-value {
