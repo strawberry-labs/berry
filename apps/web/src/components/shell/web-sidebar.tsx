@@ -140,6 +140,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
         onRenameConversation={onRenameConversation}
         onShareConversation={onShareConversation}
         onCreateProject={onCreateProject}
+        onNewProjectConversation={(workspace) => onSelectWorkspace(workspace.id)}
         onAfterNavigate={() => { if (isMobile) setOpenMobile(false); }}
         formatAge={timeAgo}
         renderProjectAction={(workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveChats={onArchiveProjectChats} onRemove={onRemoveProject} onReveal={onRevealProject} />}

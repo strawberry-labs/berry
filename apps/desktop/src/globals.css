@@ -355,13 +355,17 @@
   }
 
   .berry-sidebar-workspace-action {
-    color: var(--berry-text-tertiary);
-    border-radius: 8px;
+    top: 3px !important;
+    width: 24px !important;
+    height: 24px !important;
+    background: transparent !important;
+    color: var(--berry-text-tertiary) !important;
+    border-radius: 0;
   }
 
-  .berry-sidebar-workspace-action:hover {
-    background: var(--berry-hover);
-    color: var(--foreground);
+  .berry-sidebar-workspace-action:is(:hover, :focus-visible),
+  .berry-sidebar-workspace-menu-action[data-state="open"] {
+    color: var(--foreground) !important;
   }
 
   .berry-sidebar-workspace-action:active,
@@ -370,20 +374,22 @@
   }
 
   .berry-sidebar-task-action {
-    width: 24px;
-    height: 24px;
-    top: 4px;
-    color: var(--berry-text-tertiary);
-    border-radius: 8px;
+    top: 50% !important;
+    width: 24px !important;
+    height: 24px !important;
+    translate: 0 -50%;
+    background: transparent !important;
+    color: var(--berry-text-tertiary) !important;
+    border-radius: 0;
     transition-property: background-color, color, opacity, transform;
     transition-duration: var(--duration-quick);
     transition-timing-function: var(--ease-smooth-out);
     opacity: 0;
   }
 
-  .berry-sidebar-task-action:hover {
-    background: color-mix(in srgb, var(--foreground) 10%, transparent);
-    color: var(--foreground);
+  .berry-sidebar-task-action:is(:hover, :focus-visible),
+  .berry-sidebar-task-menu-trigger[data-state="open"] {
+    color: var(--foreground) !important;
   }
 
   .berry-sidebar-task-action:disabled {
@@ -584,12 +590,12 @@
     opacity: 1;
   }
 
-  .berry-sidebar-workspace-menu-action { right: 28px; }
+  .berry-sidebar-workspace-menu-action { right: 28px !important; }
 
-  .berry-sidebar-workspace-new-chat-action { right: 2px; }
+  .berry-sidebar-workspace-new-chat-action { right: 2px !important; }
 
   .berry-sidebar-workspace-item:has(> .berry-sidebar-workspace-menu-action[data-state="open"]) > .berry-sidebar-workspace-action {
-    opacity: 1;
+    opacity: 1 !important;
   }
 
   .berry-sidebar-task-list {
@@ -611,9 +617,9 @@
   /* Conversation rows reserve a quiet actions lane. Both controls reveal as a
      pair for row hover/focus, and the open menu keeps them present after the
      pointer moves into its portalled content. */
-  .berry-sidebar-task-pin-action { right: 28px; }
+  .berry-sidebar-task-pin-action { right: 28px !important; }
 
-  .berry-sidebar-task-menu-trigger { right: 2px; }
+  .berry-sidebar-task-menu-trigger { right: 2px !important; }
 
   .berry-sidebar-task-item:hover > .berry-sidebar-task-action,
   .berry-sidebar-task-item:focus-within > .berry-sidebar-task-action,
@@ -638,7 +644,6 @@
   }
 
   .berry-sidebar-task-action:active:not(:disabled) {
-    background: color-mix(in srgb, var(--foreground) 16%, transparent);
     transform: scale(0.96);
   }
 
@@ -646,11 +651,12 @@
     min-width: 212px;
     max-height: var(--radix-dropdown-menu-content-available-height);
     overflow-y: auto;
-    border: 0;
-    border-radius: 16px;
+    border: 0 !important;
+    outline: 0 !important;
+    border-radius: 16px !important;
     padding: 6px;
     background: var(--berry-control-bg);
-    box-shadow: var(--berry-shadow-floating);
+    box-shadow: var(--berry-shadow-floating) !important;
     color: var(--berry-text-primary);
   }
 

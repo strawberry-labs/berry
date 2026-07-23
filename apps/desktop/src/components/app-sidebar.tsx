@@ -161,7 +161,7 @@ export function AppSidebar({ className, ...props }: React.ComponentProps<typeof 
             <WorkspaceRowActions
               workspace={workspace}
               tasks={taskQueries[projectWorkspaces.findIndex((candidate) => candidate.id === workspace.id)]?.data ?? []}
-              trigger={<SidebarMenuAction aria-label={`Actions for ${workspace.name}`} className="berry-sidebar-workspace-action berry-sidebar-workspace-menu-action text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"><Ellipsis /></SidebarMenuAction>}
+              trigger={<SidebarMenuAction aria-label={`Actions for ${workspace.name}`} className="berry-sidebar-workspace-action berry-sidebar-workspace-menu-action md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"><Ellipsis /></SidebarMenuAction>}
             />
           )}
           commands={(

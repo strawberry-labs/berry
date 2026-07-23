@@ -1318,6 +1318,7 @@ code, pre {
   line-height: 21px;
 }
 .berry-web-shell .berry-app-sidebar .berry-sidebar-task-row { padding: 5px 4px 5px 8px; line-height: 20px; }
+.berry-web-shell .berry-app-sidebar .berry-sidebar-workspace-action { top: 3px !important; }
 .berry-web-shell .berry-sidebar-task-row.pl-8 { padding-left: 32px; }
 .berry-web-shell .berry-sidebar-show-more.berry-sidebar-show-more-indented { padding-left: 32px; }
 .berry-web-shell .berry-sidebar-task-list,

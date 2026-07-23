@@ -252,7 +252,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
                   {props.onNewProjectConversation ? (
                     <SidebarMenuAction
                       type="button"
-                      className="berry-sidebar-workspace-action berry-sidebar-workspace-new-chat-action text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
+                      className="berry-sidebar-workspace-action berry-sidebar-workspace-new-chat-action md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
                       aria-label={`New ${optimisticKind === "code" ? "code chat" : "chat"} in ${project.workspace.name}`}
                       title={`New ${optimisticKind === "code" ? "code chat" : "chat"}`}
                       onClick={(event) => {
