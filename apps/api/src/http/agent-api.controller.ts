@@ -56,6 +56,11 @@ const CreateWorkspaceRequestSchema = z.object({
   name: z.string().trim().min(1).max(120),
 }).strict();
 
+const UpdateWorkspaceRequestSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  pinned: z.boolean().optional(),
+}).strict();
+
 const UpdateTaskRequestSchema = z.object({
   title: z.string().trim().min(1).optional(),
   status: TaskStatusSchema.optional(),
@@ -227,6 +232,16 @@ export class AgentApiController {
   @Get("/workspaces")
   async listWorkspaces(@Req() httpRequest: AuthenticatedRequest, @Query("includeGeneral") includeGeneral?: string) {
     return this.store.listWorkspaces({ ownerUserId: httpRequest.auth?.user.id ?? null, includeGeneral: includeGeneral === "true" });
+  }
+
+  @Patch("/workspaces/:workspaceId")
+  async updateWorkspace(@Req() httpRequest: AuthenticatedRequest, @Param("workspaceId") workspaceId: string, @Body() body: unknown) {
+    return this.store.updateWorkspace(workspaceId, parseBody(UpdateWorkspaceRequestSchema, body), httpRequest.auth?.user.id ?? null);
+  }
+
+  @Delete("/workspaces/:workspaceId")
+  async deleteWorkspace(@Req() httpRequest: AuthenticatedRequest, @Param("workspaceId") workspaceId: string) {
+    return this.store.removeWorkspace(workspaceId, httpRequest.auth?.user.id ?? null);
   }
 
   @Post("/tasks")

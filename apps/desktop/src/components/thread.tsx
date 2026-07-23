@@ -241,6 +241,7 @@ function ThreadView({ sessionId, taskId, stream, density, autoScroll }: { sessio
       autoScroll={autoScroll}
       showReasoning={showReasoning}
       showTodos={showTodos}
+      navigatorInset={16}
       adapter={adapter}
     />
   );

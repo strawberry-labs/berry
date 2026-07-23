@@ -56,6 +56,28 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("updates and removes a user-owned project", async () => {
+    app = await createApp(fakeSessionHost());
+    const project = await request(app.getHttpServer())
+      .post("/v1/workspaces")
+      .set(authHeader())
+      .send({ name: "Sidebar project" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .patch(`/v1/workspaces/${project.body.id}`)
+      .set(authHeader())
+      .send({ name: "Pinned sidebar project", pinned: true })
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({ name: "Pinned sidebar project", pinned: true }));
+
+    await request(app.getHttpServer())
+      .delete(`/v1/workspaces/${project.body.id}`)
+      .set(authHeader())
+      .expect(200)
+      .expect({ removed: true });
+  });
+
   it("deduplicates retries by message id without deduplicating identical prompt text", async () => {
     app = await createApp(fakeSessionHost());
     const created = await request(app.getHttpServer())

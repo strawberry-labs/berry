@@ -115,6 +115,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [connectionState, setConnectionState] = React.useState<"online" | "offline" | "reconnecting">("online");
   const [tasks, setTasks] = React.useState(bootstrapContent.tasks);
   const [followUpsBySession, setFollowUpsBySession] = React.useState<Record<string, QueuedFollowUp[]>>({});
+  const [threadScrollRequest, setThreadScrollRequest] = React.useState<{ sessionId: string; id: number } | null>(null);
   const followUpsBySessionRef = React.useRef(followUpsBySession);
   const queuePersistenceErrorShownRef = React.useRef(false);
   const editingFollowUpIdsRef = React.useRef(new Map<string, string>());
@@ -134,6 +135,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       queuePersistenceErrorShownRef.current = false;
     }
     setFollowUpsBySession((current) => ({ ...current, [sessionId]: followUps }));
+  }, []);
+  const requestThreadBottom = React.useCallback((sessionId: string) => {
+    setThreadScrollRequest((current) => ({ sessionId, id: (current?.id ?? 0) + 1 }));
   }, []);
   const [activeTaskId, setActiveTaskId] = React.useState(shellLocation.kind === "task" ? shellLocation.taskId : "");
   const fixtureWorkspace = React.useMemo<Workspace>(() => ({
@@ -806,6 +810,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       return parsed.success ? [parsed.data] : [];
     });
     const attachments = [...imageAttachments, ...fileAttachments];
+    requestThreadBottom(sessionId);
     replaceSessionMessages(sessionId, (current) => {
       const index = current.findIndex((item) => item.id === target.id);
       const kept = index === -1 ? current : current.slice(0, index);
@@ -817,7 +822,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       replaceFromMessageId: target.id,
     });
     await refreshSessionMessages(sessionId);
-  }, [activeTask, refreshSessionMessages, replaceSessionMessages, runTurn]);
+  }, [activeTask, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const createProject = React.useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -859,20 +864,42 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     }
   }, [activeTask, client]);
 
-  const toggleTaskPinned = React.useCallback(async () => {
-    if (!activeTask) return;
-    const pinned = !activeTask.pinned;
-    setTasks((current) => current.map((task) => task.id === activeTask.id ? { ...task, pinned } : task));
+  const toggleTaskPinned = React.useCallback(async (task: Task) => {
+    const pinned = !task.pinned;
+    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, pinned } : item));
     if (client) {
       try {
-        const updated = await client.updateTask(activeTask.id, { pinned });
-        setTasks((current) => current.map((task) => task.id === updated.id ? updated : task));
+        const updated = await client.updateTask(task.id, { pinned });
+        setTasks((current) => current.map((item) => item.id === updated.id ? updated : item));
       } catch (cause) {
-        setTasks((current) => current.map((task) => task.id === activeTask.id ? activeTask : task));
+        setTasks((current) => current.map((item) => item.id === task.id ? task : item));
         toast.error(cause instanceof Error ? cause.message : "Unable to update the task");
       }
     }
-  }, [activeTask, client]);
+  }, [client]);
+
+  const renameTask = React.useCallback(async (task: Task) => {
+    const title = window.prompt("Rename chat", task.title)?.trim();
+    if (!title || title === task.title) return;
+    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, title } : item));
+    if (!client) return;
+    try {
+      const updated = await client.updateTask(task.id, { title });
+      setTasks((current) => current.map((item) => item.id === updated.id ? updated : item));
+    } catch (cause) {
+      setTasks((current) => current.map((item) => item.id === task.id ? task : item));
+      toast.error(cause instanceof Error ? cause.message : "Unable to rename the task");
+    }
+  }, [client]);
+
+  const shareTask = React.useCallback(async (task: Task) => {
+    try {
+      await navigator.clipboard.writeText(new URL(`/tasks/${task.id}`, window.location.origin).toString());
+      toast.success("Chat link copied");
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Unable to copy the chat link");
+    }
+  }, []);
 
   const deleteTask = React.useCallback(async (task: Task) => {
     const previous = task;
@@ -903,6 +930,64 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       throw cause;
     }
   }, [client, navigateHome, shellLocation]);
+
+  const toggleProjectPinned = React.useCallback(async (workspace: Workspace) => {
+    const pinned = !workspace.pinned;
+    setWorkspaces((current) => current.map((item) => item.id === workspace.id ? { ...item, pinned } : item));
+    try {
+      const updated = client ? await client.updateWorkspace(workspace.id, { pinned }) : { ...workspace, pinned };
+      setWorkspaces((current) => current.map((item) => item.id === updated.id ? updated : item));
+    } catch (cause) {
+      setWorkspaces((current) => current.map((item) => item.id === workspace.id ? workspace : item));
+      toast.error(cause instanceof Error ? cause.message : "Unable to update the project");
+    }
+  }, [client]);
+
+  const renameProject = React.useCallback(async (workspace: Workspace, name: string) => {
+    if (!name || name === workspace.name) return;
+    setWorkspaces((current) => current.map((item) => item.id === workspace.id ? { ...item, name } : item));
+    try {
+      const updated = client ? await client.updateWorkspace(workspace.id, { name }) : { ...workspace, name };
+      setWorkspaces((current) => current.map((item) => item.id === updated.id ? updated : item));
+      toast.success("Project renamed");
+    } catch (cause) {
+      setWorkspaces((current) => current.map((item) => item.id === workspace.id ? workspace : item));
+      toast.error(cause instanceof Error ? cause.message : "Unable to rename the project");
+    }
+  }, [client]);
+
+  const archiveProjectChats = React.useCallback(async (workspace: Workspace, projectTasks: Task[]) => {
+    try {
+      await Promise.all(projectTasks.map((task) => archiveTask(task, true)));
+      toast.success(`Archived ${projectTasks.length} chat${projectTasks.length === 1 ? "" : "s"}`);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Unable to archive the project chats");
+    }
+  }, [archiveTask]);
+
+  const removeProject = React.useCallback(async (workspace: Workspace) => {
+    const previousWorkspaces = workspaces;
+    const previousTasks = tasks;
+    setWorkspaces((current) => current.filter((item) => item.id !== workspace.id));
+    setTasks((current) => current.map((task) => task.workspaceId === workspace.id ? { ...task, deletedAt: new Date().toISOString() } : task));
+    if (activeWorkspaceId === workspace.id) {
+      const fallback = workspaces.find((item) => item.id !== workspace.id && item.workspaceKind === "general") ?? workspaces.find((item) => item.id !== workspace.id);
+      if (fallback) setActiveWorkspaceId(fallback.id);
+      navigateHome();
+    }
+    try {
+      if (client) await client.deleteWorkspace(workspace.id);
+      toast.success(`Removed ${workspace.name}`);
+    } catch (cause) {
+      setWorkspaces(previousWorkspaces);
+      setTasks(previousTasks);
+      toast.error(cause instanceof Error ? cause.message : "Unable to remove the project");
+    }
+  }, [activeWorkspaceId, client, navigateHome, tasks, workspaces]);
+
+  const revealProject = React.useCallback((workspace: Workspace) => {
+    toast.message(`Reveal in Finder is available in the desktop app for ${workspace.name}.`);
+  }, []);
 
   const restoreTask = React.useCallback(async (task: Task) => {
     const previous = task;
@@ -1131,6 +1216,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
     const optimistic = optimisticUserMessage(sessionId, input, attachments);
     const messageId = crypto.randomUUID();
+    requestThreadBottom(sessionId);
     replaceSessionMessages(sessionId, (current) => [...current, optimistic]);
     try {
       const result = await client.steerTurn(sessionId, { messageId, input, attachments });
@@ -1147,7 +1233,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       replaceSessionMessages(sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
       throw cause;
     }
-  }, [client, replaceSessionMessages]);
+  }, [client, replaceSessionMessages, requestThreadBottom]);
 
   const generateImage = React.useCallback(async (task: Task, prompt: string, appendUserMessage: boolean) => {
     const sessionId = task.activeSessionId;
@@ -1250,10 +1336,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         sidebarWidth="min(20vw, 18rem)"
         chrome={
           <WebWindowChrome
-            canGoBack={shellLocation.kind !== "home"}
-            canGoForward={hydrated}
-            onBack={() => window.history.back()}
-            onForward={() => window.history.forward()}
+            onHome={navigateHome}
+            onSearch={() => {
+              searchReturnFocusRef.current = document.querySelector<HTMLElement>("[data-web-search-trigger]");
+              setSearchOpen(true);
+            }}
           />
         }
         sidebar={surface === "settings" ? (
@@ -1285,6 +1372,16 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               if (task && workspaces.some((workspace) => workspace.id === task.workspaceId)) setActiveWorkspaceId(task.workspaceId);
               navigateToTask(id);
             }}
+            onToggleConversationPinned={toggleTaskPinned}
+            onArchiveConversation={(task) => archiveTask(task, true)}
+            onDeleteConversation={deleteTask}
+            onRenameConversation={renameTask}
+            onShareConversation={shareTask}
+            onToggleProjectPinned={toggleProjectPinned}
+            onRenameProject={renameProject}
+            onArchiveProjectChats={archiveProjectChats}
+            onRemoveProject={removeProject}
+            onRevealProject={revealProject}
             onSelectChats={() => {
               if (generalWorkspace) setActiveWorkspaceId(generalWorkspace.id);
               navigateHome();
@@ -1293,10 +1390,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             librarySelected={surface === "library"}
             onSkills={() => navigateToSettings("skills")}
             onLibrary={() => navigateToLibrary("images")}
-            onSearch={() => {
-              searchReturnFocusRef.current = document.querySelector<HTMLElement>("[data-web-search-trigger]");
-              setSearchOpen(true);
-            }}
             onSettings={() => navigateToSettings("general")}
             onSignOut={() => void signOut()}
           />
@@ -1363,7 +1456,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start">
                   <DropdownMenuItem onClick={() => setEditingTitle(true)}>Rename task</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => void toggleTaskPinned()}>{activeTask?.pinned ? <PinOff /> : <Pin />} {activeTask?.pinned ? "Unpin task" : "Pin task"}</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => { if (activeTask) void toggleTaskPinned(activeTask); }}>{activeTask?.pinned ? <PinOff /> : <Pin />} {activeTask?.pinned ? "Unpin task" : "Pin task"}</DropdownMenuItem>
                   <DropdownMenuItem onClick={() => void archiveTask(activeTask, true)}>Archive task</DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => navigator.clipboard?.writeText(activeTask?.id ?? "")}>Copy task ID</DropdownMenuItem>
@@ -1395,7 +1488,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 size="icon-sm"
                 aria-label={activeTask?.pinned ? "Unpin task" : "Pin task"}
                 aria-pressed={activeTask?.pinned ?? false}
-                onClick={() => void toggleTaskPinned()}
+                onClick={() => { if (activeTask) void toggleTaskPinned(activeTask); }}
                 className="berry-titlebar-control"
               >
                 {activeTask?.pinned ? <PinOff /> : <Pin />}
@@ -1420,6 +1513,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               editTurn={activeTask.activeSessionId ? editTurn : undefined}
               cancelTurn={cancelTurn}
               onViewTaskFiles={() => setTaskFilesOpen(true)}
+              scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
             />
             <Composer
               config={config}
@@ -1461,6 +1555,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onUserMessage={(text, sessionId, taskId, attachments) => {
                 const user = optimisticUserMessage(sessionId, text, attachments);
                 const nextTitle = text.trim().slice(0, 42);
+                requestThreadBottom(sessionId);
                 replaceSessionMessages(sessionId, (current) => [...current, user]);
                 setTasks((current) => current.map((task) => task.id === taskId ? { ...task, title: task.title === "New cloud task" ? nextTitle || task.title : task.title } : task));
                 if (client && activeTask.title === "New cloud task" && nextTitle) {

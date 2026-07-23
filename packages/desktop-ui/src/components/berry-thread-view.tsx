@@ -102,6 +102,8 @@ export interface BerryThreadViewProps {
   showQuestions?: boolean;
   /** Show the elapsed turn clock before the provider emits its first work item. */
   showPendingTurnActivity?: boolean;
+  /** Native desktop keeps the rail 16px from its window edge; web uses 12px. */
+  navigatorInset?: number;
   adapter?: BerryThreadAdapter;
 }
 
@@ -122,6 +124,7 @@ export function BerryThreadView({
   showTodos = true,
   showQuestions = true,
   showPendingTurnActivity = false,
+  navigatorInset = 12,
   adapter = {},
 }: BerryThreadViewProps) {
   const now = useNow(stream.turnActive);
@@ -238,7 +241,7 @@ export function BerryThreadView({
   return (
     <MessageScrollerProvider autoScroll={autoScroll} scrollEdgeThreshold={96}>
       <div ref={navContainerRef} className="relative flex min-h-0 flex-1 flex-col">
-        <ConversationNavigator containerRef={navContainerRef} items={navigatorItems} />
+        <ConversationNavigator containerRef={navContainerRef} items={navigatorItems} inset={navigatorInset} />
         <MessageScroller className="flex-1">
         <MessageScrollerViewport className="px-6">
           <MessageScrollerContent data-density={density} className="berry-thread-content mx-auto w-full gap-5 py-10">
@@ -664,6 +667,7 @@ export function BerryUserMessageBubble({ children }: { children: React.ReactNode
   return (
     <div
       ref={ref}
+      data-user-message-bubble-surface
       className="berry-user-message ml-auto flex max-w-[775px] flex-col gap-2 rounded-[18px] bg-secondary px-4 py-3 font-sans text-[16px] leading-6 text-secondary-foreground shadow-[inset_0_0_0_1px_rgb(255_255_255/0.08)]"
     >
       {children}

@@ -370,15 +370,19 @@
   }
 
   .berry-sidebar-task-action {
+    width: 24px;
+    height: 24px;
+    top: 4px;
     color: var(--berry-text-tertiary);
     border-radius: 8px;
     transition-property: background-color, color, opacity, transform;
     transition-duration: var(--duration-quick);
     transition-timing-function: var(--ease-smooth-out);
+    opacity: 0;
   }
 
   .berry-sidebar-task-action:hover {
-    background: var(--berry-hover);
+    background: color-mix(in srgb, var(--foreground) 10%, transparent);
     color: var(--foreground);
   }
 
@@ -443,7 +447,27 @@
   }
 
   .berry-sidebar-project-group {
-    padding: 0 12px;
+    padding: 0;
+  }
+
+  .berry-sidebar-project-heading {
+    min-height: 28px;
+    padding: 0 10px;
+  }
+
+  .berry-sidebar-project-heading .berry-sidebar-section-heading {
+    padding: 0;
+  }
+
+  .berry-sidebar-project-header-control {
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+  }
+
+  .berry-sidebar-project-header-control svg {
+    width: 14px;
+    height: 14px;
   }
 
   .berry-sidebar-segment-row {
@@ -560,6 +584,14 @@
     opacity: 1;
   }
 
+  .berry-sidebar-workspace-menu-action { right: 28px; }
+
+  .berry-sidebar-workspace-new-chat-action { right: 2px; }
+
+  .berry-sidebar-workspace-item:has(> .berry-sidebar-workspace-menu-action[data-state="open"]) > .berry-sidebar-workspace-action {
+    opacity: 1;
+  }
+
   .berry-sidebar-task-list {
     margin: 6px 0 8px;
   }
@@ -574,6 +606,100 @@
   .berry-sidebar-task-row:hover {
     background: var(--berry-hover);
     color: var(--foreground);
+  }
+
+  /* Conversation rows reserve a quiet actions lane. Both controls reveal as a
+     pair for row hover/focus, and the open menu keeps them present after the
+     pointer moves into its portalled content. */
+  .berry-sidebar-task-pin-action { right: 28px; }
+
+  .berry-sidebar-task-menu-trigger { right: 2px; }
+
+  .berry-sidebar-task-item:hover > .berry-sidebar-task-action,
+  .berry-sidebar-task-item:focus-within > .berry-sidebar-task-action,
+  .berry-sidebar-task-item:has(> .berry-sidebar-task-menu-trigger[data-state="open"]) > .berry-sidebar-task-action {
+    opacity: 1;
+  }
+
+  .berry-sidebar-task-item:hover > .berry-sidebar-task-row,
+  .berry-sidebar-task-item:focus-within > .berry-sidebar-task-row,
+  .berry-sidebar-task-item:has(> .berry-sidebar-task-menu-trigger[data-state="open"]) > .berry-sidebar-task-row {
+    background: color-mix(in srgb, var(--foreground) 9%, transparent);
+    color: var(--foreground);
+  }
+
+  .berry-sidebar-task-row .berry-sidebar-row-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    -webkit-mask-image: linear-gradient(to right, black calc(100% - 20px), transparent);
+    mask-image: linear-gradient(to right, black calc(100% - 20px), transparent);
+  }
+
+  .berry-sidebar-task-action:active:not(:disabled) {
+    background: color-mix(in srgb, var(--foreground) 16%, transparent);
+    transform: scale(0.96);
+  }
+
+  .berry-chat-actions-menu {
+    min-width: 212px;
+    max-height: var(--radix-dropdown-menu-content-available-height);
+    overflow-y: auto;
+    border: 0;
+    border-radius: 16px;
+    padding: 6px;
+    background: var(--berry-control-bg);
+    box-shadow: var(--berry-shadow-floating);
+    color: var(--berry-text-primary);
+  }
+
+  .berry-project-sort-menu {
+    min-width: 168px;
+    border: 0;
+    border-radius: 14px;
+    padding: 6px;
+    background: var(--berry-control-bg);
+    box-shadow: var(--berry-shadow-floating);
+    color: var(--berry-text-primary);
+  }
+
+  .berry-project-sort-menu [data-slot="dropdown-menu-label"] {
+    padding: 6px 10px 4px;
+    color: var(--berry-text-tertiary);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .berry-project-sort-menu [data-slot="dropdown-menu-radio-item"] {
+    min-height: 32px;
+    border-radius: 9px;
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-project-sort-menu [data-slot="dropdown-menu-radio-item"]:is(:hover, :focus) {
+    background: color-mix(in srgb, var(--foreground) 9%, transparent);
+    color: var(--foreground);
+  }
+
+  .berry-chat-actions-menu [data-slot="dropdown-menu-item"],
+  .berry-chat-actions-menu [data-slot="dropdown-menu-sub-trigger"] {
+    min-height: 34px;
+    border-radius: 10px;
+    padding-inline: 10px;
+    color: var(--berry-text-secondary);
+  }
+
+  .berry-chat-actions-menu [data-slot="dropdown-menu-item"]:is(:hover, :focus),
+  .berry-chat-actions-menu [data-slot="dropdown-menu-sub-trigger"]:is(:hover, :focus),
+  .berry-chat-actions-menu [data-slot="dropdown-menu-sub-trigger"][data-state="open"] {
+    background: color-mix(in srgb, var(--foreground) 9%, transparent);
+    color: var(--foreground);
+  }
+
+  .berry-chat-actions-menu [data-variant="destructive"]:is(:hover, :focus) {
+    background: color-mix(in srgb, var(--destructive) 12%, transparent);
+    color: var(--destructive);
   }
 
   /* Action buttons are siblings of their row button. Keep the row's hover

@@ -56,6 +56,8 @@ export interface AppendMessageInput {
 
 export interface CloudTaskStore {
   createWorkspace(input: { name: string; ownerUserId?: string | null }): Promise<Workspace>;
+  updateWorkspace(id: string, input: { name?: string | undefined; pinned?: boolean | undefined }, ownerUserId?: string | null): Promise<Workspace>;
+  removeWorkspace(id: string, ownerUserId?: string | null): Promise<{ removed: boolean }>;
   ensureGeneralWorkspace(ownerUserId: string): Promise<Workspace>;
   listWorkspaces(filter?: { ownerUserId?: string | null; includeGeneral?: boolean }): Promise<Workspace[]>;
   createTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }>;
@@ -116,6 +118,24 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     });
     this.#workspaces.set(workspace.id, workspace);
     return workspace;
+  }
+
+  async updateWorkspace(id: string, input: { name?: string | undefined; pinned?: boolean | undefined }, ownerUserId?: string | null): Promise<Workspace> {
+    const workspace = this.#workspaces.get(id);
+    if (!workspace || workspace.workspaceKind !== "project" || workspace.ownerUserId !== (ownerUserId ?? null)) throw new NotFoundException(`Workspace not found: ${id}`);
+    const updated = WorkspaceSchema.parse({ ...workspace, ...input, updatedAt: nowIso() });
+    this.#workspaces.set(id, updated);
+    return updated;
+  }
+
+  async removeWorkspace(id: string, ownerUserId?: string | null): Promise<{ removed: boolean }> {
+    const workspace = this.#workspaces.get(id);
+    if (!workspace || workspace.workspaceKind !== "project" || workspace.ownerUserId !== (ownerUserId ?? null)) throw new NotFoundException(`Workspace not found: ${id}`);
+    this.#workspaces.delete(id);
+    for (const [taskId, task] of this.#tasks) {
+      if (task.workspaceId === id) this.#tasks.delete(taskId);
+    }
+    return { removed: true };
   }
 
   async ensureGeneralWorkspace(ownerUserId: string): Promise<Workspace> {
@@ -338,6 +358,44 @@ RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_a
     });
   }
 
+  async updateWorkspace(id: string, input: { name?: string | undefined; pinned?: boolean | undefined }, ownerUserId?: string | null): Promise<Workspace> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      const rows = await executor.query<WorkspaceRow>(
+        `
+UPDATE workspaces
+SET name = COALESCE($4, name),
+    settings = CASE WHEN $5::boolean IS NULL THEN settings ELSE jsonb_set(settings, '{pinned}', to_jsonb($5::boolean), true) END,
+    updated_at = now()
+WHERE tenant_id = $1::uuid AND id = $2::uuid AND owner_id = $3::uuid
+  AND workspace_kind = 'project' AND deleted_at IS NULL
+RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_at,
+          COALESCE((settings ->> 'pinned')::boolean, false) AS pinned
+        `.trim(),
+        [this.tenantId, id, ownerUserId ?? null, input.name, input.pinned],
+      );
+      if (!rows[0]) throw new NotFoundException(`Workspace not found: ${id}`);
+      return workspaceFromRow(rows[0]);
+    });
+  }
+
+  async removeWorkspace(id: string, ownerUserId?: string | null): Promise<{ removed: boolean }> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      const rows = await executor.query<{ id: string }>(
+        `UPDATE workspaces SET deleted_at = now(), updated_at = now()
+         WHERE tenant_id = $1::uuid AND id = $2::uuid AND owner_id = $3::uuid
+           AND workspace_kind = 'project' AND deleted_at IS NULL
+         RETURNING id`,
+        [this.tenantId, id, ownerUserId ?? null],
+      );
+      if (!rows[0]) throw new NotFoundException(`Workspace not found: ${id}`);
+      await executor.execute(
+        "UPDATE tasks SET deleted_at = now(), updated_at = now() WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND user_id = $3::uuid AND deleted_at IS NULL",
+        [this.tenantId, id, ownerUserId ?? null],
+      );
+      return { removed: true };
+    });
+  }
+
   async ensureGeneralWorkspace(ownerUserId: string): Promise<Workspace> {
     return this.database.withTenant(this.tenantId, async (executor) => {
       const existing = await executor.query<WorkspaceRow>(
@@ -372,7 +430,8 @@ RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_a
     return this.database.withTenant(this.tenantId, async (executor) => {
       const rows = await executor.query<WorkspaceRow>(
         `
-SELECT id, owner_id, workspace_kind, name, trust_state, created_at, updated_at
+SELECT id, owner_id, workspace_kind, name, trust_state, created_at, updated_at,
+       COALESCE((settings ->> 'pinned')::boolean, false) AS pinned
 FROM workspaces
 WHERE tenant_id = $1::uuid AND deleted_at IS NULL
   AND owner_id = $3::uuid
@@ -694,6 +753,7 @@ interface WorkspaceRow {
   trust_state: string;
   created_at: Date | string;
   updated_at: Date | string;
+  pinned?: boolean;
 }
 
 interface SessionRow {

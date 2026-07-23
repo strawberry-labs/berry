@@ -188,6 +188,9 @@ export const Pin = make(Pin02Icon);
 export const PinOff = make(PinOffIcon);
 export const Pencil = make(Edit02Icon);
 export const PencilLine = make(Edit02Icon);
+// Keep the product-facing name available at call sites. The Hugeicons free
+// package exposes this glyph as Edit02Icon.
+export const PencilEdit02Icon = make(Edit02Icon);
 export const Trash2 = make(Delete02Icon);
 export const BookOpen = make(BookOpen01Icon);
 export const FileDown = make(Download01Icon);

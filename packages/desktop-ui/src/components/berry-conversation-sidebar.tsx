@@ -10,9 +10,21 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@berry/desktop-ui/components/ui/sidebar";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
-import { Archive, ChevronDown, CircleIcon, CodeXml, Folder, Folder02, GitBranch, ListCollapse, MessageSquare, Pencil, Pin, PinOff } from "@berry/desktop-ui/lib/icons";
+import { Archive, ChevronDown, CodeXml, Ellipsis, Folder, Folder02, ListCollapse, MessageSquare, Pencil, PencilEdit02Icon, Pin, PinOff, Plus, Trash2, Users } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
 const INITIAL_CONVERSATION_COUNT = 5;
@@ -46,8 +58,12 @@ export interface BerryConversationSidebarContentProps {
   formatAge: (iso: string) => string;
   renderProjectAction?: (workspace: Workspace) => React.ReactNode;
   onNewProjectConversation?: (workspace: Workspace) => void;
+  onCreateProject?: () => void;
   onToggleConversationPinned?: (task: Task) => void | Promise<void>;
   onArchiveConversation?: (task: Task) => void | Promise<void>;
+  onDeleteConversation?: (task: Task) => void | Promise<void>;
+  onRenameConversation?: (task: Task) => void | Promise<void>;
+  onShareConversation?: (task: Task) => void | Promise<void>;
 }
 
 export interface ConversationSectionState {
@@ -118,6 +134,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
   const [pendingKind, setPendingKind] = React.useState<ConversationKind | null>(null);
   const [failedKind, setFailedKind] = React.useState<ConversationKind | null>(null);
   const [kindError, setKindError] = React.useState<string | null>(null);
+  const [projectSort, setProjectSort] = React.useState<"priority" | "last-updated" | "manual">("last-updated");
 
   React.useEffect(() => {
     if (!pendingKind) setOptimisticKind(props.selectedKind);
@@ -143,7 +160,14 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
   const pinned = conversationsForKind(props.pinnedConversations, optimisticKind);
   const pinnedIds = new Set(pinned.map((task) => task.id));
   const chats = conversationsForKind(props.generalConversations, optimisticKind, pinnedIds);
-  const projectIds = props.projects.map((project) => project.workspace.id);
+  const projects = React.useMemo(() => {
+    if (projectSort === "manual") return props.projects;
+    return [...props.projects].sort((left, right) => {
+      if (projectSort === "priority" && left.workspace.pinned !== right.workspace.pinned) return Number(right.workspace.pinned) - Number(left.workspace.pinned);
+      return right.workspace.updatedAt.localeCompare(left.workspace.updatedAt) || left.workspace.name.localeCompare(right.workspace.name);
+    });
+  }, [projectSort, props.projects]);
+  const projectIds = projects.map((project) => project.workspace.id);
   const openConversation = (taskId: string) => {
     props.onOpenConversation(taskId);
     props.onAfterNavigate?.();
@@ -168,28 +192,42 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
       </SidebarHeader>
       <SidebarContent className="scroll-fade">
         <ConversationSection title="Pinned" open>
-          <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} />
+          <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
         </ConversationSection>
 
         <SidebarGroup className="berry-sidebar-project-group">
-          <div className="flex items-center gap-2 px-2 pb-1">
+          <div className="berry-sidebar-project-heading flex items-center pb-1">
             <h2 className="berry-sidebar-section-heading flex-1 text-xs font-medium text-sidebar-foreground/60">Projects</h2>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" variant="ghost" size="icon-sm" className="berry-sidebar-mini-control berry-sidebar-project-header-control" aria-label="Sort projects" title="Sort projects"><Ellipsis /></Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" side="bottom" sideOffset={6} className="berry-project-sort-menu">
+                <DropdownMenuLabel>Sort by</DropdownMenuLabel>
+                <DropdownMenuRadioGroup value={projectSort} onValueChange={(value) => setProjectSort(value as typeof projectSort)}>
+                  <DropdownMenuRadioItem value="priority">Priority</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="last-updated">Last updated</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="manual">Manual order</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Button
               type="button"
               variant="ghost"
               size="icon-sm"
-              className="berry-sidebar-mini-control"
+              className="berry-sidebar-mini-control berry-sidebar-project-header-control"
               aria-label={sectionState.allCollapsed ? "Expand all projects" : "Collapse all projects"}
               onClick={() => dispatch({ type: "toggle-all", projectIds })}
             >
               <ListCollapse />
             </Button>
+            {props.onCreateProject ? <Button type="button" variant="ghost" size="icon-sm" className="berry-sidebar-mini-control berry-sidebar-project-header-control" aria-label="Create project" title="Create project" onClick={props.onCreateProject}><Plus /></Button> : null}
           </div>
           {props.projectsLoading ? <SidebarStatus label="Loading projects" loading /> : null}
           {props.projectsError ? <SidebarStatus label={props.projectsError} error /> : null}
           {!props.projectsLoading && !props.projectsError && props.projects.length === 0 ? <SidebarStatus label="No projects" /> : null}
           <SidebarMenu className="berry-sidebar-tree">
-            {props.projects.map((project) => {
+            {projects.map((project) => {
               const id = project.workspace.id;
               const open = !sectionState.collapsedProjects.has(id);
               const projectTasks = conversationsForKind(project.conversations, optimisticKind, pinnedIds);
@@ -198,7 +236,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
                 <SidebarMenuItem key={id} className="berry-sidebar-workspace-item">
                   <SidebarMenuButton
                     type="button"
-                    className={cn("berry-sidebar-workspace-row", (props.onNewProjectConversation || props.renderProjectAction) && "pr-2.5! hover:pr-16! focus-visible:pr-16!")}
+                    className={cn("berry-sidebar-workspace-row", (props.onNewProjectConversation || props.renderProjectAction) && "pr-16!")}
                     aria-current={id === props.activeWorkspaceId ? "true" : undefined}
                     aria-expanded={open}
                     onClick={() => {
@@ -210,10 +248,11 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
                     <span className="berry-sidebar-row-title min-w-0 flex-1 overflow-hidden whitespace-nowrap">{project.workspace.name}</span>
                     {project.workspace.pinned ? <Pin className="berry-sidebar-project-pin ml-auto size-3" aria-label="Pinned project" /> : null}
                   </SidebarMenuButton>
+                  {props.renderProjectAction?.(project.workspace)}
                   {props.onNewProjectConversation ? (
                     <SidebarMenuAction
                       type="button"
-                      className="berry-sidebar-workspace-action right-7 text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
+                      className="berry-sidebar-workspace-action berry-sidebar-workspace-new-chat-action text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
                       aria-label={`New ${optimisticKind === "code" ? "code chat" : "chat"} in ${project.workspace.name}`}
                       title={`New ${optimisticKind === "code" ? "code chat" : "chat"}`}
                       onClick={(event) => {
@@ -221,16 +260,15 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
                         props.onNewProjectConversation?.(project.workspace);
                       }}
                     >
-                      <Pencil />
+                      <PencilEdit02Icon />
                     </SidebarMenuAction>
                   ) : null}
-                  {props.renderProjectAction?.(project.workspace)}
                   <AnimatedCollapse open={open}>
                     {project.loading ? <SidebarStatus label={`Loading ${project.workspace.name}`} loading indented /> : null}
                     {project.error ? <SidebarStatus label={project.error} error indented /> : null}
                     {!project.loading && !project.error ? (
                       <SidebarMenu className="berry-sidebar-task-list my-0 gap-0 pt-0.5 pb-2">
-                        <ConversationRows tasks={visible} emptyLabel="No conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} indented />
+                        <ConversationRows tasks={visible} emptyLabel="No conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} indented />
                         {hiddenCount > 0 ? <ShowMoreRow count={hiddenCount} onClick={() => dispatch({ type: "show-project", projectId: id })} indented /> : null}
                       </SidebarMenu>
                     ) : null}
@@ -256,7 +294,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
             const { visible, hiddenCount } = visibleConversationSlice(chats, sectionState.chatsExpanded);
             return (
               <SidebarMenu className="berry-sidebar-task-list my-0 gap-0 pt-0.5 pb-2">
-                <ConversationRows tasks={visible} emptyLabel="No chats yet" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} />
+                <ConversationRows tasks={visible} emptyLabel="No chats yet" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
                 {hiddenCount > 0 ? <ShowMoreRow count={hiddenCount} onClick={() => dispatch({ type: "show-chats" })} /> : null}
               </SidebarMenu>
             );
@@ -313,7 +351,7 @@ function ConversationSection({ title, open, selected = false, onToggle, children
   );
 }
 
-function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, onTogglePinned, onArchive, indented = false }: {
+function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, onTogglePinned, onArchive, onDelete, onRename, onShare, indented = false }: {
   tasks: Task[];
   emptyLabel: string;
   activeTaskId: string | null;
@@ -321,57 +359,21 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
   formatAge: (iso: string) => string;
   onTogglePinned?: ((task: Task) => void | Promise<void>) | undefined;
   onArchive?: ((task: Task) => void | Promise<void>) | undefined;
+  onDelete?: ((task: Task) => void | Promise<void>) | undefined;
+  onRename?: ((task: Task) => void | Promise<void>) | undefined;
+  onShare?: ((task: Task) => void | Promise<void>) | undefined;
   indented?: boolean;
 }) {
   if (tasks.length === 0) return <SidebarStatus label={emptyLabel} indented={indented} />;
   return (
     <>
       {tasks.map((task) => {
-        const working = task.status === "running" || task.status === "waiting-for-approval";
         return (
           <SidebarMenuItem key={task.id} className="berry-sidebar-task-item">
-            <SidebarMenuButton type="button" isActive={task.id === activeTaskId} onClick={() => onOpen(task.id)} className={cn("berry-sidebar-task-row", (onTogglePinned || onArchive) && "pr-2.5! hover:pr-16! focus-visible:pr-16!", indented && "pl-8")}>
-              <span className="berry-sidebar-row-title min-w-0 flex-1 overflow-hidden whitespace-nowrap">{task.title}</span>
-              <span className="berry-sidebar-task-meta flex shrink-0 items-center gap-1.5 transition-[opacity]">
-                {task.unreadAt ? <CircleIcon className="size-2 shrink-0 text-primary" aria-label="Unread" /> : null}
-                {task.pinned ? <Pin className="berry-pin-badge size-3 shrink-0" aria-label="Pinned" /> : null}
-                {task.worktreeBranch ? (
-                  <span className="shrink-0" title={`Worktree: ${task.worktreeBranch}`}>
-                    <GitBranch className="size-3 text-sidebar-foreground/50" aria-label={`Worktree ${task.worktreeBranch}`} />
-                  </span>
-                ) : null}
-                {working ? <CircularActivitySpinner size={14} className="text-sidebar-foreground/60" label={task.status === "waiting-for-approval" ? "Waiting for approval" : "Running"} /> : <span className="shrink-0 text-xs text-sidebar-foreground/50">{formatAge(task.updatedAt)}</span>}
-              </span>
+            <SidebarMenuButton type="button" isActive={task.id === activeTaskId} onClick={() => onOpen(task.id)} className={cn("berry-sidebar-task-row pr-14!", indented && "pl-8")}>
+              <span className="berry-sidebar-row-title min-w-0 flex-1" title={task.title}>{task.title}</span>
             </SidebarMenuButton>
-            {onTogglePinned ? (
-              <SidebarMenuAction
-                type="button"
-                className="berry-sidebar-task-action right-7 text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
-                aria-label={task.pinned ? `Unpin ${task.title}` : `Pin ${task.title}`}
-                title={task.pinned ? "Unpin chat" : "Pin chat"}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void onTogglePinned(task);
-                }}
-              >
-                {task.pinned ? <PinOff /> : <Pin />}
-              </SidebarMenuAction>
-            ) : null}
-            {onArchive ? (
-              <SidebarMenuAction
-                type="button"
-                className="berry-sidebar-task-action text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
-                aria-label={`Archive ${task.title}`}
-                title={working ? "Stop the chat before archiving" : "Archive chat"}
-                disabled={working}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void onArchive(task);
-                }}
-              >
-                <Archive />
-              </SidebarMenuAction>
-            ) : null}
+            <ConversationActions task={task} onTogglePinned={onTogglePinned} onArchive={onArchive} onDelete={onDelete} onRename={onRename} onShare={onShare} />
           </SidebarMenuItem>
         );
       })}
@@ -379,10 +381,60 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
   );
 }
 
+function ConversationActions({ task, onTogglePinned, onArchive, onDelete, onRename, onShare }: {
+  task: Task;
+  onTogglePinned?: ((task: Task) => void | Promise<void>) | undefined;
+  onArchive?: ((task: Task) => void | Promise<void>) | undefined;
+  onDelete?: ((task: Task) => void | Promise<void>) | undefined;
+  onRename?: ((task: Task) => void | Promise<void>) | undefined;
+  onShare?: ((task: Task) => void | Promise<void>) | undefined;
+}) {
+  return (
+    <>
+      <SidebarMenuAction
+        type="button"
+        className="berry-sidebar-task-action berry-sidebar-task-pin-action"
+        aria-label={task.pinned ? `Unpin ${task.title}` : `Pin ${task.title}`}
+        title={task.pinned ? "Unpin chat" : "Pin chat"}
+        onClick={(event) => {
+          event.stopPropagation();
+          void onTogglePinned?.(task);
+        }}
+      >
+        {task.pinned ? <PinOff /> : <Pin />}
+      </SidebarMenuAction>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <SidebarMenuAction
+            type="button"
+            className="berry-sidebar-task-action berry-sidebar-task-menu-trigger"
+            aria-label={`Actions for ${task.title}`}
+            title="Chat actions"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <Ellipsis />
+          </SidebarMenuAction>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent side="top" align="start" sideOffset={8} collisionPadding={12} className="berry-chat-actions-menu">
+          <DropdownMenuItem onSelect={() => void onShare?.(task)}><Users />Share</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void onRename?.(task)}><Pencil />Rename</DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger><Folder />Move to project</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="berry-chat-actions-menu"><DropdownMenuItem disabled>No projects available</DropdownMenuItem></DropdownMenuSubContent>
+          </DropdownMenuSub>
+          <DropdownMenuItem onSelect={() => void onTogglePinned?.(task)}>{task.pinned ? <PinOff /> : <Pin />}{task.pinned ? "Unpin chat" : "Pin chat"}</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void onArchive?.(task)}><Archive />Archive</DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" onSelect={() => void onDelete?.(task)}><Trash2 />Delete</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
+  );
+}
+
 function ShowMoreRow({ count, onClick, indented = false }: { count: number; onClick: () => void; indented?: boolean }) {
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton type="button" className={cn("berry-sidebar-show-more text-sidebar-foreground/60", indented && "pl-8")} aria-label={`Show ${count} more conversations`} onClick={onClick}>
+      <SidebarMenuButton type="button" className={cn("berry-sidebar-show-more text-sidebar-foreground/60", indented && "berry-sidebar-show-more-indented")} aria-label={`Show ${count} more conversations`} onClick={onClick}>
         <span>Show {count} more</span>
       </SidebarMenuButton>
     </SidebarMenuItem>

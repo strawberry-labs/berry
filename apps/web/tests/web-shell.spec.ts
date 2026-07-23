@@ -472,17 +472,18 @@ test("user message hover actions expose edit and resubmit on web", async ({ page
   await expect(page.getByText("Run a sandboxed task and summarize the result.")).toHaveCount(0);
 });
 
-test("web task chrome keeps desktop navigation, title editing, and action menus", async ({ page }) => {
+test("web task chrome keeps Home branding, title editing, and action menus", async ({ page }) => {
   await openTask(page);
   await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.getByRole("button", { name: /Launch plan review/ })).toBeVisible();
   await page.getByRole("button", { name: /Launch plan review/ }).click();
   await expect(page.getByRole("heading", { name: "Launch plan review" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Back" })).toBeEnabled();
-  await page.getByRole("button", { name: "Back" }).click();
-  await expect(page.getByRole("heading", { name: "Cloud sandbox smoke" })).toBeVisible();
-  await page.getByRole("button", { name: "Forward" }).click();
-  await expect(page.getByRole("heading", { name: "Launch plan review" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Forward" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Berry home" }).click();
+  await expect(page).toHaveURL("/");
+
+  await openTask(page, "task_chat", "Launch plan review");
 
   await page.getByRole("button", { name: "More actions" }).click();
   await expect(page.getByRole("menuitem", { name: "Rename task" })).toBeVisible();
@@ -491,6 +492,22 @@ test("web task chrome keeps desktop navigation, title editing, and action menus"
   await page.getByRole("textbox", { name: "Rename task" }).fill("Launch plan polished");
   await page.getByRole("textbox", { name: "Rename task" }).press("Enter");
   await expect(page.getByRole("heading", { name: "Launch plan polished" })).toBeVisible();
+});
+
+test("chat row actions stay visible while their upward menu is open", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
+  const chatRow = page.locator(".berry-sidebar-task-row").filter({ hasText: "Cloud sandbox smoke" });
+  await chatRow.hover();
+  const actions = page.getByRole("button", { name: "Actions for Cloud sandbox smoke" });
+  await expect(actions).toBeVisible();
+  await actions.click();
+  await expect(page.getByRole("menuitem", { name: "Share" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Pin chat" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Archive" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Delete" })).toBeVisible();
+  await expect(actions).toBeVisible();
 });
 
 test("archived and deleted conversations can be restored", async ({ page }) => {

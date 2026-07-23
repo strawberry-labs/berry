@@ -1226,6 +1226,59 @@ code, pre {
   --berry-task-header-control-lane: 36px;
 }
 
+.berry-web-window-header {
+  height: 100%;
+  padding: 0 10px 0 12px;
+}
+
+.berry-web-home-link {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--berry-text-primary);
+  padding: 6px 8px;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1;
+  transition-property: background-color, color, transform;
+  transition-duration: 120ms;
+  transition-timing-function: var(--ease-smooth-out);
+}
+
+.berry-web-home-link:hover,
+.berry-web-header-icon:hover {
+  background: color-mix(in srgb, var(--foreground) 9%, transparent);
+  color: var(--foreground);
+}
+
+.berry-web-home-link:active,
+.berry-web-header-icon:active {
+  background: color-mix(in srgb, var(--foreground) 14%, transparent);
+  transform: scale(0.96);
+}
+
+.berry-web-window-actions { gap: 0; }
+
+.berry-web-header-icon {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--berry-text-tertiary);
+  transition-property: background-color, color, transform;
+  transition-duration: 120ms;
+  transition-timing-function: var(--ease-smooth-out);
+}
+
+.berry-web-header-icon svg { width: 17px; height: 17px; }
+.berry-web-sidebar-toggle { cursor: ew-resize; }
+
 .berry-web-shell-frame {
   height: 100svh;
 }
@@ -1266,6 +1319,7 @@ code, pre {
 }
 .berry-web-shell .berry-app-sidebar .berry-sidebar-task-row { padding: 5px 4px 5px 8px; line-height: 20px; }
 .berry-web-shell .berry-sidebar-task-row.pl-8 { padding-left: 32px; }
+.berry-web-shell .berry-sidebar-show-more.berry-sidebar-show-more-indented { padding-left: 32px; }
 .berry-web-shell .berry-sidebar-task-list,
 .berry-web-shell .berry-sidebar-tree { gap: 1px; }
 .berry-web-shell .berry-sidebar-section-heading {
@@ -1341,11 +1395,8 @@ code, pre {
 }
 
 .berry-plan-progress-anchor {
-  position: absolute;
-  bottom: calc(100% + 10px);
-  left: 50%;
-  z-index: 2;
-  transform: translateX(-50%);
+  display: flex;
+  justify-content: center;
   pointer-events: auto;
 }
 
@@ -1462,12 +1513,15 @@ code, pre {
   z-index: 1;
 }
 
+.berry-thread-composer-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
 .berry-queued-message-list {
-  position: absolute;
-  right: calc(var(--berry-composer-radius) + 6px);
-  bottom: calc(100% - 1px);
-  left: calc(var(--berry-composer-radius) + 6px);
-  z-index: 0;
+  position: relative;
   min-width: 0;
   overflow: clip;
   border: 0;

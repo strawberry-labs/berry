@@ -433,6 +433,19 @@ export class BerryApiClient {
     });
   }
 
+  async updateWorkspace(id: string, input: { name?: string; pinned?: boolean }): Promise<Workspace> {
+    return this.#request(`/v1/workspaces/${encodeURIComponent(id)}`, WorkspaceSchema, {
+      method: "PATCH",
+      body: input,
+    });
+  }
+
+  async deleteWorkspace(id: string): Promise<{ removed: boolean }> {
+    return this.#request(`/v1/workspaces/${encodeURIComponent(id)}`, z.object({ removed: z.boolean() }), {
+      method: "DELETE",
+    });
+  }
+
   async listWorkspaces(options: { includeGeneral?: boolean } = {}): Promise<Workspace[]> {
     return this.#request(`/v1/workspaces${options.includeGeneral ? "?includeGeneral=true" : ""}`, z.array(WorkspaceSchema));
   }

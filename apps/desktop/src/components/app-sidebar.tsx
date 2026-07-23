@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ConversationKind, Task } from "@berry/shared";
-import { CirclePlus, Ellipsis, Search, Settings, Wand2 } from "@berry/desktop-ui/lib/icons";
+import { Ellipsis, PencilEdit02Icon, Search, Settings, Wand2 } from "@berry/desktop-ui/lib/icons";
 import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import {
   Sidebar,
@@ -161,14 +161,14 @@ export function AppSidebar({ className, ...props }: React.ComponentProps<typeof 
             <WorkspaceRowActions
               workspace={workspace}
               tasks={taskQueries[projectWorkspaces.findIndex((candidate) => candidate.id === workspace.id)]?.data ?? []}
-              trigger={<SidebarMenuAction aria-label={`Actions for ${workspace.name}`} className="berry-sidebar-workspace-action text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"><Ellipsis /></SidebarMenuAction>}
+              trigger={<SidebarMenuAction aria-label={`Actions for ${workspace.name}`} className="berry-sidebar-workspace-action berry-sidebar-workspace-menu-action text-[var(--berry-text-tertiary)]! hover:text-[var(--berry-text-secondary)]! md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"><Ellipsis /></SidebarMenuAction>}
             />
           )}
           commands={(
             <SidebarMenu className="berry-sidebar-commands">
               <SidebarMenuItem>
                 <SidebarMenuButton onClick={() => { setSelectedConversationKind(displayedKind); openHome(); }} className="berry-sidebar-command berry-sidebar-command-primary font-medium">
-                  <CirclePlus />
+                  <PencilEdit02Icon />
                   <span>{displayedKind === "code" ? "New code chat" : "New chat"}</span>
                   <Kbd className="ml-auto" aria-hidden>⌘N</Kbd>
                 </SidebarMenuButton>

@@ -404,19 +404,23 @@ export function Composer({
           <>
             <MentionMenu controller={mentions} />
             {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} /> : null}
-            {variant === "thread" && queuedFollowUps.length > 0 ? (
-              <QueuedMessageList
-                followUps={editingFollowUp ? queuedFollowUps.filter((followUp) => followUp.id !== editingFollowUp.id) : queuedFollowUps}
-                active={working}
-                onRetry={onRetryFollowUp}
-                onRemove={onRemoveFollowUp}
-                onReorder={reorderQueuedFollowUps}
-                onSendNow={onSteerFollowUp}
-                onEdit={editQueuedFollowUp}
-                onResume={onResumeFollowUps}
-              />
+            {variant === "thread" && (planProgress || queuedFollowUps.length > 0) ? (
+              <div className="berry-thread-composer-stack">
+                {planProgress ? <PlanProgressPill plan={planProgress} /> : null}
+                {queuedFollowUps.length > 0 ? (
+                  <QueuedMessageList
+                    followUps={editingFollowUp ? queuedFollowUps.filter((followUp) => followUp.id !== editingFollowUp.id) : queuedFollowUps}
+                    active={working}
+                    onRetry={onRetryFollowUp}
+                    onRemove={onRemoveFollowUp}
+                    onReorder={reorderQueuedFollowUps}
+                    onSendNow={onSteerFollowUp}
+                    onEdit={editQueuedFollowUp}
+                    onResume={onResumeFollowUps}
+                  />
+                ) : null}
+              </div>
             ) : null}
-            {variant === "thread" && planProgress ? <PlanProgressPill plan={planProgress} /> : null}
           </>
         }
         header={

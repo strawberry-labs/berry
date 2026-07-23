@@ -18,7 +18,7 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, editTurn, cancelTurn, onViewTaskFiles }: {
+export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, editTurn, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -32,9 +32,21 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
   editTurn?: ((message: Message, text: string) => Promise<void>) | undefined;
   cancelTurn: () => Promise<void>;
   onViewTaskFiles?: (() => void) | undefined;
+  scrollRequest?: number;
 }) {
   const [showReasoning, setShowReasoning] = React.useState(false);
   const [selectedAttachment, setSelectedAttachment] = React.useState<StoredFile | null>(null);
+  const threadRef = React.useRef<HTMLDivElement>(null);
+  React.useLayoutEffect(() => {
+    if (scrollRequest === 0) return;
+    let nextFrame = window.requestAnimationFrame(() => {
+      const viewport = threadRef.current?.querySelector<HTMLElement>('[data-slot="message-scroller-viewport"]');
+      if (!viewport) return;
+      viewport.scrollTop = viewport.scrollHeight;
+      nextFrame = window.requestAnimationFrame(() => { viewport.scrollTop = viewport.scrollHeight; });
+    });
+    return () => window.cancelAnimationFrame(nextFrame);
+  }, [scrollRequest]);
   React.useEffect(() => {
     setShowReasoning(window.localStorage.getItem("berry.web.showReasoning") === "true");
     const onSetting = (event: Event) => {
@@ -103,7 +115,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
       : null);
 
   return (
-    <div className="berry-web-thread contents" data-testid="web-thread" data-mode={mode}>
+    <div ref={threadRef} className="berry-web-thread contents" data-testid="web-thread" data-mode={mode}>
       <BerryThreadView
         sessionId={sessionId}
         taskId={taskId}
