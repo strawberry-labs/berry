@@ -24,7 +24,7 @@ import {
 } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
-import { Archive, ChevronDown, CodeXml, Ellipsis, Folder, Folder02, ListCollapse, MessageSquare, Pencil, PencilEdit02Icon, Pin, PinOff, Plus, Trash2, Users } from "@berry/desktop-ui/lib/icons";
+import { Archive, ChevronDown, CodeXml, Ellipsis, Folder, Folder02, MenuCollapseIcon, MessageSquare, Pencil, PencilEdit02Icon, Pin, PinOff, Plus, Trash2, Users } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
 const INITIAL_CONVERSATION_COUNT = 5;
@@ -219,7 +219,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
               aria-label={sectionState.allCollapsed ? "Expand all projects" : "Collapse all projects"}
               onClick={() => dispatch({ type: "toggle-all", projectIds })}
             >
-              <ListCollapse />
+              <MenuCollapseIcon />
             </Button>
             {props.onCreateProject ? <Button type="button" variant="ghost" size="icon-sm" className="berry-sidebar-mini-control berry-sidebar-project-header-control" aria-label="Create project" title="Create project" onClick={props.onCreateProject}><Plus /></Button> : null}
           </div>

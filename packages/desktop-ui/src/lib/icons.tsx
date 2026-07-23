@@ -70,6 +70,7 @@ import {
   ListViewIcon,
   Loading03Icon,
   MagicWand01Icon,
+  MenuCollapseIcon as HugeMenuCollapseIcon,
   Message01Icon,
   Moon02Icon,
   MoreHorizontalIcon,
@@ -200,6 +201,7 @@ export const Brain = make(AiBrain01Icon);
 export const Bot = make(BotIcon);
 export const Wrench = make(Wrench01Icon);
 export const ListCollapse = make(ListViewIcon);
+export const MenuCollapseIcon = make(HugeMenuCollapseIcon);
 export const LayoutList = make(ListViewIcon);
 export const Settings = make(Settings01Icon);
 export const Wand2 = make(MagicWand01Icon);
