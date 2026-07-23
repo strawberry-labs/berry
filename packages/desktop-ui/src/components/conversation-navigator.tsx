@@ -12,8 +12,13 @@ const VIEWPORT_SELECTOR = '[data-slot="message-scroller-viewport"]';
 const MIN_ITEMS = 4;
 const RAIL_MIN_LEFT_SPACE_PX = 48;
 const SCRUB_START_DISTANCE_PX = 3;
+const PREVIEW_DELAY_MS = 500;
+const PREVIEW_WIDTH_PX = 288;
+const PREVIEW_FALLBACK_HEIGHT_PX = 172;
+const VIEWPORT_GUTTER_PX = 12;
 
 type VisibleRange = { first: number; last: number } | null;
+type PreviewPosition = { left: number; top: number };
 
 /**
  * A compact, proximity-weighted index of user prompts. It stays in the empty
@@ -36,12 +41,17 @@ export function ConversationNavigator({
   const [scrubbing, setScrubbing] = React.useState(false);
   const [hasLeftSpace, setHasLeftSpace] = React.useState(false);
   const [railVisible, setRailVisible] = React.useState(false);
+  const [previewId, setPreviewId] = React.useState<string | null>(null);
+  const [previewPosition, setPreviewPosition] = React.useState<PreviewPosition | null>(null);
   const railRef = React.useRef<HTMLDivElement>(null);
+  const previewRef = React.useRef<HTMLElement>(null);
   const rowRefs = React.useRef(new Map<string, HTMLButtonElement>());
   const scrubPointerRef = React.useRef<{ id: number; x: number; y: number } | null>(null);
   const scrubbingRef = React.useRef(false);
   const scrubbedIdRef = React.useRef<string | null>(null);
   const suppressClickRef = React.useRef(false);
+  const hoveredIdRef = React.useRef<string | null>(null);
+  const previewTimerRef = React.useRef<number | null>(null);
   const idsKey = items.map((item) => item.id).join("|");
   const shouldRender = items.length >= MIN_ITEMS && hasLeftSpace;
 
@@ -140,7 +150,69 @@ export function ConversationNavigator({
     node.scrollIntoView({ behavior, block: "start" });
   }, [containerRef]);
 
-  const updateHovered = React.useCallback((id: string | null) => setHoveredId(id), []);
+  const clearPreviewTimer = React.useCallback(() => {
+    if (previewTimerRef.current === null) return;
+    window.clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = null;
+  }, []);
+  const updatePreviewPosition = React.useCallback((id: string) => {
+    const rail = railRef.current;
+    const row = rowRefs.current.get(id);
+    if (!rail || !row) return;
+    const railRect = rail.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const previewHeight = previewRef.current?.offsetHeight ?? PREVIEW_FALLBACK_HEIGHT_PX;
+    const left = Math.min(
+      window.innerWidth - PREVIEW_WIDTH_PX - VIEWPORT_GUTTER_PX,
+      railRect.right + VIEWPORT_GUTTER_PX,
+    );
+    const top = Math.max(
+      VIEWPORT_GUTTER_PX,
+      Math.min(
+        rowRect.top + rowRect.height / 2 - previewHeight / 2,
+        window.innerHeight - previewHeight - VIEWPORT_GUTTER_PX,
+      ),
+    );
+    setPreviewPosition({ left: Math.max(VIEWPORT_GUTTER_PX, left), top });
+  }, []);
+  const closePreview = React.useCallback(() => {
+    clearPreviewTimer();
+    setPreviewId(null);
+    setPreviewPosition(null);
+  }, [clearPreviewTimer]);
+  const updateHovered = React.useCallback((id: string | null) => {
+    if (hoveredIdRef.current === id) return;
+    hoveredIdRef.current = id;
+    setHoveredId(id);
+    if (!id) {
+      closePreview();
+      return;
+    }
+    if (previewId) {
+      setPreviewId(id);
+      window.requestAnimationFrame(() => updatePreviewPosition(id));
+    }
+  }, [closePreview, previewId, updatePreviewPosition]);
+  const startPreview = React.useCallback((id: string | null, immediate = false) => {
+    clearPreviewTimer();
+    if (!id) return;
+    if (immediate) {
+      setPreviewId(id);
+      window.requestAnimationFrame(() => updatePreviewPosition(id));
+      return;
+    }
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      if (hoveredIdRef.current !== id) return;
+      setPreviewId(id);
+      window.requestAnimationFrame(() => updatePreviewPosition(id));
+    }, PREVIEW_DELAY_MS);
+  }, [clearPreviewTimer, updatePreviewPosition]);
+  React.useEffect(() => () => clearPreviewTimer(), [clearPreviewTimer]);
+  React.useLayoutEffect(() => {
+    if (previewId) updatePreviewPosition(previewId);
+  }, [previewId, updatePreviewPosition]);
+
   const updateScrub = React.useCallback((clientX: number, clientY: number) => {
     const id = markerIdFromTarget(document.elementFromPoint(clientX, clientY));
     if (!id || scrubbedIdRef.current === id) return;
@@ -148,6 +220,7 @@ export function ConversationNavigator({
     setScrubbedId(id);
     scrollTo(id, "auto");
     setHoveredId(id);
+    hoveredIdRef.current = id;
   }, [scrollTo]);
 
   if (!shouldRender) return null;
@@ -155,6 +228,10 @@ export function ConversationNavigator({
   const targetId = scrubbedId ?? hoveredId ?? focusedId;
   const targetIndex = targetId ? items.findIndex((item) => item.id === targetId) : -1;
   const railHovered = hoveredId !== null;
+  const previewItem = previewId ? items.find((item) => item.id === previewId) ?? null : null;
+  const previewResources = previewItem?.resources ?? [];
+  const visibleResources = previewResources.slice(0, 3);
+  const hiddenResourceCount = Math.max(0, previewResources.length - visibleResources.length);
 
   return (
     <nav
@@ -169,7 +246,11 @@ export function ConversationNavigator({
         ref={railRef}
         data-scrubbing={scrubbing || undefined}
         className="h-[min(70vh,640px)] w-9 overflow-y-auto overscroll-contain [mask-image:linear-gradient(to_bottom,transparent,black_16px,black_calc(100%_-_16px),transparent)] [scrollbar-width:none] [-webkit-mask-image:linear-gradient(to_bottom,transparent,black_16px,black_calc(100%_-_16px),transparent)] [&::-webkit-scrollbar]:hidden"
-        onPointerEnter={(event) => updateHovered(markerIdFromTarget(event.target))}
+        onPointerEnter={(event) => {
+          const id = markerIdFromTarget(event.target);
+          updateHovered(id);
+          startPreview(id);
+        }}
         onPointerMove={(event) => {
           const pointer = scrubPointerRef.current;
           if (!pointer || pointer.id !== event.pointerId) {
@@ -180,6 +261,7 @@ export function ConversationNavigator({
           if (!scrubbingRef.current) {
             scrubbingRef.current = true;
             setScrubbing(true);
+            closePreview();
           }
           updateScrub(event.clientX, event.clientY);
         }}
@@ -208,31 +290,50 @@ export function ConversationNavigator({
                   event.currentTarget.setPointerCapture(event.pointerId);
                 }}
                 onPointerUp={(event) => {
-                  if (scrubPointerRef.current?.id === event.pointerId && scrubbingRef.current) suppressClickRef.current = true;
+                  const wasScrubbing = scrubPointerRef.current?.id === event.pointerId && scrubbingRef.current;
+                  if (wasScrubbing) suppressClickRef.current = true;
                   scrubPointerRef.current = null;
                   scrubbingRef.current = false;
                   scrubbedIdRef.current = null;
                   setScrubbing(false);
                   setScrubbedId(null);
+                  if (wasScrubbing) {
+                    event.currentTarget.blur();
+                    updateHovered(markerIdFromTarget(document.elementFromPoint(event.clientX, event.clientY)));
+                  }
                   if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
                 }}
-                onPointerCancel={() => {
+                onPointerCancel={(event) => {
                   scrubPointerRef.current = null;
                   scrubbingRef.current = false;
                   scrubbedIdRef.current = null;
                   setScrubbing(false);
                   setScrubbedId(null);
+                  event.currentTarget.blur();
+                  updateHovered(null);
                 }}
-                onClick={() => {
+                onClick={(event) => {
                   if (suppressClickRef.current) {
                     suppressClickRef.current = false;
                     return;
                   }
                   scrollTo(item.id, "smooth");
+                  // Keep actual keyboard focus for accessibility, but release mouse focus
+                  // immediately so a clicked marker does not remain visually selected.
+                  if (event.detail !== 0) event.currentTarget.blur();
                 }}
-                onPointerEnter={() => updateHovered(item.id)}
-                onFocus={() => setFocusedId(item.id)}
-                onBlur={() => setFocusedId(null)}
+                onPointerEnter={() => {
+                  updateHovered(item.id);
+                  startPreview(item.id);
+                }}
+                onFocus={() => {
+                  setFocusedId(item.id);
+                  startPreview(item.id, true);
+                }}
+                onBlur={() => {
+                  setFocusedId(null);
+                  if (!hoveredIdRef.current) closePreview();
+                }}
                 aria-current={visibleRange?.first === index ? "true" : undefined}
                 aria-label={`Jump to message ${index + 1}`}
                 className="flex h-2.5 w-9 shrink-0 cursor-pointer items-center p-0 text-left outline-none focus-visible:bg-muted/60"
@@ -247,6 +348,28 @@ export function ConversationNavigator({
           })}
         </div>
       </div>
+      {previewItem && previewPosition ? (
+        <aside
+          ref={previewRef}
+          data-conversation-preview
+          aria-live="polite"
+          className="pointer-events-none fixed z-50 w-72 overflow-hidden rounded-2xl border border-[var(--berry-border)] bg-[var(--berry-control-bg)] p-3 text-[var(--berry-text-primary)] shadow-[var(--berry-shadow-floating)]"
+          style={previewPosition}
+        >
+          <p className="line-clamp-2 text-sm font-medium leading-5" title={previewItem.label || "(no content)"}>
+            {previewItem.label || "(no content)"}
+          </p>
+          <p className="mt-1 line-clamp-3 text-xs leading-4 text-[var(--berry-text-secondary)]" title={previewItem.preview || "No assistant response yet."}>
+            {previewItem.preview || "No assistant response yet."}
+          </p>
+          {visibleResources.length > 0 ? (
+            <footer className="mt-3 flex min-w-0 items-center gap-1 border-t border-[var(--berry-border)] pt-2 text-[11px] text-[var(--berry-text-secondary)]">
+              {visibleResources.map((resource) => <span key={resource} className="min-w-0 truncate rounded bg-[var(--berry-hover)] px-1.5 py-0.5" title={resource}>{resource}</span>)}
+              {hiddenResourceCount > 0 ? <span className="shrink-0">+{hiddenResourceCount}</span> : null}
+            </footer>
+          ) : null}
+        </aside>
+      ) : null}
     </nav>
   );
 }
