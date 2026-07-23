@@ -1,11 +1,14 @@
 import type { ReactNode } from "react";
 import { createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
 import { AppShell, loadFixtureShellData } from "@/components/app-shell";
-import { loadWebConfig } from "@/lib/config.functions";
+import { loadWebBootstrap } from "@/lib/config.functions";
 import appCss from "../styles.css?url";
 
 export const Route = createRootRoute({
-  loader: async () => loadFixtureShellData(await loadWebConfig()),
+  loader: async () => {
+    const bootstrap = await loadWebBootstrap();
+    return loadFixtureShellData(bootstrap.config, bootstrap.user, bootstrap.sessionResolved);
+  },
   head: () => ({
     meta: [
       { charSet: "utf-8" },

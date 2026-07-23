@@ -8,7 +8,8 @@ import { Input } from "@berry/desktop-ui/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@berry/desktop-ui/components/ui/tabs";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { Download, Ellipsis, Eye, RefreshCw, Search, X } from "lucide-react";
-import { FileViewerModal, fileTypeLabel, formatBytes } from "./file-viewer-modal";
+import { FileViewerModal } from "./file-viewer-modal";
+import { fileTypeLabel, formatBytes } from "./file-metadata";
 import { FileThumbnail, isImageFile } from "./file-thumbnail";
 
 type Scope = "task" | "project";

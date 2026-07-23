@@ -5,7 +5,8 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import { FileImage, FileText, FolderOpen, RefreshCw } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import type { ArtifactLibraryTab } from "@/lib/cloud-shell-state";
-import { FileViewerModal, fileTypeLabel, formatBytes } from "./file-viewer-modal";
+import { FileViewerModal } from "./file-viewer-modal";
+import { fileTypeLabel, formatBytes } from "./file-metadata";
 
 export function ArtifactLibrary({ client, tab, onTabChange }: {
   client: BerryApiClient | null;

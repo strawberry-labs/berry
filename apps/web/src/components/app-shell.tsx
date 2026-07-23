@@ -46,18 +46,29 @@ import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { replaceTenantValue, settledValue } from "@/lib/management/config-refresh";
 import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sidebar";
-import { ManagementSidebar } from "./management/management-sidebar";
-import { ManagementRouteProvider } from "./management/management-route-context";
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
 import { WebHelpMenu } from "./shell/web-help-menu";
-import { ArtifactLibrary } from "./library/artifact-library";
-import { TaskFileLibraryDialog } from "./library/task-file-library-dialog";
+
+const ManagementSidebar = React.lazy(async () => ({
+  default: (await import("./management/management-sidebar")).ManagementSidebar,
+}));
+const ManagementRouteProvider = React.lazy(async () => ({
+  default: (await import("./management/management-route-context")).ManagementRouteProvider,
+}));
+const ArtifactLibrary = React.lazy(async () => ({
+  default: (await import("./library/artifact-library")).ArtifactLibrary,
+}));
+const TaskFileLibraryDialog = React.lazy(async () => ({
+  default: (await import("./library/task-file-library-dialog")).TaskFileLibraryDialog,
+}));
 
 export interface ShellData {
   config: WebConfig;
   tasks: Task[];
   messages: Message[];
+  user: SignedInUser | null;
+  sessionResolved: boolean;
 }
 
 const LOCAL_FOLLOW_UP_PREFIX = "local_follow_up_";
@@ -125,7 +136,11 @@ export function shouldRefreshAdministration(permissions: readonly OrgPermission[
 export function AppShell({ initial }: { initial: ShellData }) {
   if (initial.config.demoMode) return <CloudShell initial={initial} user={null} />;
   return (
-    <AuthBoundary baseUrl={initial.config.apiBaseUrl ?? ""}>
+    <AuthBoundary
+      baseUrl={initial.config.apiBaseUrl ?? ""}
+      initialUser={initial.user}
+      sessionResolved={initial.sessionResolved}
+    >
       {(user, onSignedOut) => <CloudShell initial={initial} user={user} onSignedOut={onSignedOut} />}
     </AuthBoundary>
   );
@@ -415,8 +430,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client) return;
     let cancelled = false;
     setTasksLoaded(false);
-    void Promise.all([client.listWorkspaces({ includeGeneral: true }), client.listTasks({ includeDeleted: true }), client.modelCatalog(), client.listOrganizations()])
-      .then(async ([nextWorkspaces, nextTasks, catalog, organizations]) => {
+    void Promise.all([client.listWorkspaces({ includeGeneral: true }), client.listTasks({ includeDeleted: true })])
+      .then(async ([nextWorkspaces, nextTasks]) => {
         if (cancelled) return;
         const liveWorkspaces = nextWorkspaces.length > 0
           ? nextWorkspaces
@@ -425,11 +440,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         setWorkspaces(liveWorkspaces);
         setActiveWorkspaceId((current) => liveWorkspaces.some((workspace) => workspace.id === current) ? current : liveWorkspaces[0]!.id);
         setTasks(nextTasks);
-        if (organizations.length > 0) {
+      })
+      .catch((cause) => setResourceError("tasks", cause instanceof Error ? cause.message : "Unable to load this deployment"))
+      .finally(() => { if (!cancelled) setTasksLoaded(true); });
+    return () => { cancelled = true; };
+  }, [client, fixtureWorkspace]);
+
+  React.useEffect(() => {
+    if (!client || !tasksLoaded) return;
+    let cancelled = false;
+    void Promise.allSettled([client.modelCatalog(), client.listOrganizations()])
+      .then(([catalogResult, organizationsResult]) => {
+        if (cancelled) return;
+        if (organizationsResult.status === "fulfilled" && organizationsResult.value.length > 0) {
+          const organizations = organizationsResult.value;
           setConfig((current) => WebConfigSchema.parse({ ...current, organizations }));
           setActiveOrganizationId((current) => organizations.some((organization) => organization.id === current) ? current : organizations[0]!.id);
         }
-        if (catalog) {
+        if (catalogResult.status === "fulfilled" && catalogResult.value) {
+          const catalog = catalogResult.value;
           setProviderId(catalog.providerId);
           setModelOptions(catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id })));
           setModel((current) => catalog.models.some((item) => item.id === current) ? current : catalog.defaultModel);
@@ -447,11 +476,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             mcpServers: catalog.mcpServers,
           }));
         }
-      })
-      .catch((cause) => setResourceError("tasks", cause instanceof Error ? cause.message : "Unable to load this deployment"))
-      .finally(() => { if (!cancelled) setTasksLoaded(true); });
+        const errors = [catalogResult, organizationsResult]
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map((result) => result.reason instanceof Error ? result.reason.message : "Unable to load deployment metadata");
+        if (errors.length > 0) setResourceError("tasks", errors.join(". "));
+      });
     return () => { cancelled = true; };
-  }, [client, fixtureWorkspace]);
+  }, [client, tasksLoaded]);
 
   React.useEffect(() => {
     if (shellLocation.kind !== "task") {
@@ -488,6 +519,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const refreshAdmin = React.useCallback(async () => {
     if (!client || !activeOrganizationId) return;
+    if (shellLocation.kind !== "admin") return;
     if (!shouldRefreshAdministration(effectiveOrgPermissions)) {
       setResourceError("settings", "");
       return;
@@ -530,7 +562,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       auditEvents: settledValue(auditEvents, current.auditEvents),
       auditExports: settledValue(auditExports, current.auditExports),
     }));
-  }, [activeOrganizationId, client, effectiveOrgPermissions, setResourceError]);
+  }, [activeOrganizationId, client, effectiveOrgPermissions, setResourceError, shellLocation.kind]);
 
   React.useEffect(() => {
     void refreshAdmin().catch((cause) => setResourceError("settings", cause instanceof Error ? cause.message : "Unable to load administration data"));
@@ -1138,7 +1170,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           />
         }
         sidebar={surface === "settings" ? (
-          <ManagementSidebar kind={managementKind} tab={managementTab} organizations={config.organizations as never} activeOrganizationId={activeOrganizationId} permissions={effectiveOrgPermissions} platformAuthorized={config.platformAuthorized} onNavigate={navigateManagement} onOrganizationChange={setActiveOrganizationId} onBack={navigateBackToWorkspace} />
+          <React.Suspense fallback={null}>
+            <ManagementSidebar kind={managementKind} tab={managementTab} organizations={config.organizations as never} activeOrganizationId={activeOrganizationId} permissions={effectiveOrgPermissions} platformAuthorized={config.platformAuthorized} onNavigate={navigateManagement} onOrganizationChange={setActiveOrganizationId} onBack={navigateBackToWorkspace} />
+          </React.Suspense>
         ) : (
           <WebSidebar
             workspaces={projectWorkspaces}
@@ -1422,13 +1456,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         )}
         </div>
         {surface === "settings" ? (
-          <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask, onUsePrompt: (prompt) => { window.localStorage.setItem("berry.web.pendingPrompt", prompt); navigateHome(); } }}>
-            <Outlet />
-          </ManagementRouteProvider>
+          <React.Suspense fallback={<LazySurfaceFallback title="Loading settings…" />}>
+            <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask, onUsePrompt: (prompt) => { window.localStorage.setItem("berry.web.pendingPrompt", prompt); navigateHome(); } }}>
+              <Outlet />
+            </ManagementRouteProvider>
+          </React.Suspense>
         ) : null}
         {surface === "library" ? (
           <div className="min-h-0 flex-1 overflow-auto">
-            <ArtifactLibrary client={client} tab={shellLocation.kind === "library" ? shellLocation.tab : "images"} onTabChange={navigateToLibrary} />
+            <React.Suspense fallback={<LazySurfaceFallback title="Loading your library…" />}>
+              <ArtifactLibrary client={client} tab={shellLocation.kind === "library" ? shellLocation.tab : "images"} onTabChange={navigateToLibrary} />
+            </React.Suspense>
           </div>
         ) : null}
       </main>
@@ -1445,15 +1483,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         onSettings={() => navigateToSettings("general")}
         onHelp={() => toast.info("Berry help and diagnostics are available from the ? button.")}
       />
-      {activeTask ? (
-        <TaskFileLibraryDialog
-          open={taskFilesOpen}
-          onOpenChange={setTaskFilesOpen}
-          client={client}
-          taskId={activeTask.id}
-          projectTaskIds={tasks.filter((task) => task.workspaceId === activeTask.workspaceId).map((task) => task.id)}
-          projectName={workspaces.find((workspace) => workspace.id === activeTask.workspaceId)?.name ?? "this project"}
-        />
+      {activeTask && taskFilesOpen ? (
+        <React.Suspense fallback={null}>
+          <TaskFileLibraryDialog
+            open
+            onOpenChange={setTaskFilesOpen}
+            client={client}
+            taskId={activeTask.id}
+            projectTaskIds={tasks.filter((task) => task.workspaceId === activeTask.workspaceId).map((task) => task.id)}
+            projectName={workspaces.find((workspace) => workspace.id === activeTask.workspaceId)?.name ?? "this project"}
+          />
+        </React.Suspense>
       ) : null}
       {connectionState !== "online" ? <div className="fixed bottom-3 right-3 z-[80] rounded-full bg-popover px-3 py-1.5 text-xs text-popover-foreground shadow-lg" role="status">{connectionState === "offline" ? "Offline" : "Reconnecting…"}</div> : null}
     </div>
@@ -1493,7 +1533,25 @@ function greeting(): string {
   return "Good evening";
 }
 
-export function loadFixtureShellData(config: WebConfig): ShellData {
+function LazySurfaceFallback({ title }: { title: string }) {
+  return (
+    <section className="berry-route-state" aria-live="polite" aria-busy="true">
+      <h1>{title}</h1>
+    </section>
+  );
+}
+
+export function loadFixtureShellData(
+  config: WebConfig,
+  user: SignedInUser | null = null,
+  sessionResolved = config.demoMode,
+): ShellData {
   const tasks = fixtureTasks();
-  return { config, tasks, messages: fixtureMessages(tasks[0]?.activeSessionId ?? "session_cloud") };
+  return {
+    config,
+    tasks,
+    messages: fixtureMessages(tasks[0]?.activeSessionId ?? "session_cloud"),
+    user,
+    sessionResolved,
+  };
 }

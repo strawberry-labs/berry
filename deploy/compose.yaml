@@ -231,6 +231,7 @@ services:
       PORT: 3108
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-self-hosted}
       BERRY_WEB_API_BASE_URL: ${BERRY_WEB_API_BASE_URL:-https://aesg-v2.berry.me}
+      BERRY_WEB_API_INTERNAL_URL: http://api:3000
       BERRY_WEB_DEMO_MODE: "false"
       BERRY_WEB_WORKSPACE_ID: ${BERRY_WEB_WORKSPACE_ID:-self-host}
       BERRY_WEB_WORKSPACE_PATH: ${BERRY_WEB_WORKSPACE_PATH:-/workspace}

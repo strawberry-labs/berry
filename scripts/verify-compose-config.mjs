@@ -55,6 +55,7 @@ const requiredComposeSnippets = [
   "BERRY_ARTIFACT_S3_ENDPOINT:",
   "BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT:",
   "BERRY_FILE_MAX_UPLOAD_BYTES:",
+  "BERRY_WEB_API_INTERNAL_URL: http://api:3000",
   "mc mb --ignore-existing",
   "127.0.0.1:${BERRY_API_PORT:-3001}:3000",
 ];
@@ -82,6 +83,7 @@ const requiredEnvSnippets = [
   "BERRY_SANDBOX_PROVIDER=fixture",
   "BERRY_ROUTER_SERVICE_TOKEN=",
   "BERRY_WEB_API_BASE_URL=http://localhost:3001",
+  "BERRY_WEB_API_INTERNAL_URL=http://localhost:3001",
   "BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT=http://127.0.0.1:9000",
   "DEPLOYMENT_MODE=self-hosted",
 ];
@@ -110,6 +112,7 @@ const requiredHelmTemplateSnippets = [
   "STRIPE_BILLING_METER_EVENT_NAME",
   "BERRY_ARTIFACT_S3_ENDPOINT",
   "BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT",
+  "BERRY_WEB_API_INTERNAL_URL",
   "BERRY_AUDIT_S3_BUCKET",
   "node\", \"apps/api/dist/main.js",
   "apps/web/node_modules/.bin/srvx\", \"--prod\", \"-s\", \"../client\", \"apps/web/dist/server/server.js",
@@ -126,8 +129,8 @@ assertContains("deploy/.env.example", envExample, requiredEnvSnippets);
 assertContains("deploy/helm/berry-platform/values.yaml", helmValues, requiredHelmSnippets);
 assertContains("deploy/helm/berry-platform/templates/*", `${helmConfig}\n${helmApi}\n${helmWeb}\n${helmWorker}\n${helmHpa}`, requiredHelmTemplateSnippets);
 assertContains("deploy/dedicated-instance-runbook.md", dedicatedRunbook, ["DEPLOYMENT_MODE=dedicated", "helm upgrade --install berry", "kubectl -n berry-acme create secret generic berry-postgres", "kubectl -n berry-acme create secret generic berry-billing", "kubectl -n berry-acme create secret generic berry-e2b"]);
-assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy @api api:3000", "reverse_proxy web:3108"]);
-assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY="]);
+assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy @api api:3000", "reverse_proxy web:3108", "header @immutable_assets Cache-Control \"public, max-age=31536000, immutable\""]);
+assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY="]);
 assertContains("deploy/PRODUCTION.md", productionRunbook, ["aesg-v2.berry.me", "pause/reconnect", "deploy/backup.sh"]);
 
 console.log("[compose] self-host deployment config OK");

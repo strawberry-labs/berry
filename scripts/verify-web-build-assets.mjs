@@ -2,6 +2,7 @@
 
 import { access, copyFile, cp, readdir, readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
+import { gzipSync } from "node:zlib";
 
 const webDist = resolve(import.meta.dirname, "../apps/web/dist");
 const serverDir = resolve(webDist, "server");
@@ -9,6 +10,15 @@ const clientDir = resolve(webDist, "client");
 const serverFileViewerDir = resolve(serverDir, "file-viewer");
 const clientFileViewerDir = resolve(clientDir, "file-viewer");
 const cssReferencePattern = /\/assets\/styles-[A-Za-z0-9_-]+\.css/g;
+const rootJavascriptBudget = {
+  rawBytes: 1_500_000,
+  gzipBytes: 450_000,
+};
+const forbiddenRootPreloadPrefixes = [
+  "file-viewer-",
+  "management-experience-",
+  "management-primitives-",
+];
 
 async function javascriptFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -50,4 +60,50 @@ await cp(serverFileViewerDir, clientFileViewerDir, { recursive: true, force: tru
 await access(resolve(clientFileViewerDir, "flyfish-viewer-manifest.json"));
 console.log("[web-build] published file-viewer runtime assets to the client output");
 
+const serverAssetsDir = resolve(serverDir, "assets");
+const startManifestName = (await readdir(serverAssetsDir))
+  .find((name) => name.startsWith("_tanstack-start-manifest_v-") && name.endsWith(".js"));
+if (!startManifestName) {
+  throw new Error("Web server build did not contain a TanStack Start manifest.");
+}
+
+const startManifest = await readFile(resolve(serverAssetsDir, startManifestName), "utf8");
+const rootPreloadsSource = startManifest.match(
+  /__root__:\s*\{[\s\S]*?preloads:\s*\[([\s\S]*?)\],\s*scripts:/,
+)?.[1];
+if (!rootPreloadsSource) {
+  throw new Error("TanStack Start manifest did not contain root preloads.");
+}
+
+const rootJavascript = [...rootPreloadsSource.matchAll(/"\/assets\/([^"]+\.js)"/g)]
+  .map((match) => match[1]);
+if (rootJavascript.length === 0) {
+  throw new Error("TanStack Start manifest did not contain root JavaScript.");
+}
+
+for (const prefix of forbiddenRootPreloadPrefixes) {
+  const match = rootJavascript.find((name) => name.startsWith(prefix));
+  if (match) {
+    throw new Error(`Optional chunk ${match} must not be preloaded by the root route.`);
+  }
+}
+
+let rootRawBytes = 0;
+let rootGzipBytes = 0;
+for (const name of rootJavascript) {
+  const source = await readFile(resolve(clientDir, "assets", name));
+  rootRawBytes += source.byteLength;
+  rootGzipBytes += gzipSync(source).byteLength;
+}
+
+if (rootRawBytes > rootJavascriptBudget.rawBytes) {
+  throw new Error(`Root JavaScript is ${rootRawBytes} bytes; budget is ${rootJavascriptBudget.rawBytes}.`);
+}
+if (rootGzipBytes > rootJavascriptBudget.gzipBytes) {
+  throw new Error(`Root JavaScript is ${rootGzipBytes} gzip bytes; budget is ${rootJavascriptBudget.gzipBytes}.`);
+}
+
+console.log(
+  `[web-build] root JavaScript ${rootJavascript.length} files, ${rootRawBytes} bytes raw, ${rootGzipBytes} bytes gzip`,
+);
 console.log(`[web-build] verified ${references.size} server stylesheet reference${references.size === 1 ? "" : "s"}`);

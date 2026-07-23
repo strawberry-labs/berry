@@ -7,6 +7,7 @@ import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { PhotoProvider, PhotoView } from "react-photo-view";
 import "react-photo-view/dist/react-photo-view.css";
 import { isImageFile } from "./file-thumbnail";
+import { fileTypeLabel, formatBytes } from "./file-metadata";
 
 const DocxDocumentViewer = React.lazy(() => import("./docx-document-viewer"));
 const PdfDocumentViewer = React.lazy(() => import("./pdf-document-viewer"));
@@ -134,21 +135,6 @@ class ViewerErrorBoundary extends React.Component<{ file: StoredFile; children: 
 
 function FileViewerLoading({ name }: { name: string }) {
   return <div className="berry-file-viewer-loading" role="status"><FileText /><strong>Opening {name}</strong><span>Loading the matching document renderer…</span></div>;
-}
-
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
-}
-
-export function fileTypeLabel(file: Pick<StoredFile, "name" | "mediaType">): string {
-  const extension = file.name.split(".").at(-1)?.toUpperCase();
-  if (extension && extension.length <= 8) return extension;
-  if (file.mediaType.startsWith("image/")) return "Image";
-  if (file.mediaType.startsWith("text/")) return "Text";
-  return "File";
 }
 
 function viewerType(file: Pick<StoredFile, "name" | "mediaType">): string {

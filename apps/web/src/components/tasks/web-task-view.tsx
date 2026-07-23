@@ -12,7 +12,11 @@ import { toast } from "sonner";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
-import { FileViewerModal, fileTypeLabel, formatBytes } from "../library/file-viewer-modal";
+import { fileTypeLabel, formatBytes } from "../library/file-metadata";
+
+const FileViewerModal = React.lazy(async () => ({
+  default: (await import("../library/file-viewer-modal")).FileViewerModal,
+}));
 
 export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, editTurn, cancelTurn, onViewTaskFiles }: {
   sessionId: string;
@@ -119,7 +123,11 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
           onRetry={() => onRetryImage?.(visibleGeneration.prompt)}
         />
       ) : null}
-      <FileViewerModal file={selectedAttachment} onOpenChange={(open) => { if (!open) setSelectedAttachment(null); }} />
+      {selectedAttachment ? (
+        <React.Suspense fallback={null}>
+          <FileViewerModal file={selectedAttachment} onOpenChange={(open) => { if (!open) setSelectedAttachment(null); }} />
+        </React.Suspense>
+      ) : null}
     </div>
   );
 }

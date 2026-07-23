@@ -36,5 +36,6 @@ data:
   BERRY_FILE_MULTIPART_PART_SIZE: {{ .Values.files.multipartPartSize | quote }}
   BERRY_FILE_PRESIGN_SECONDS: {{ .Values.files.presignSeconds | quote }}
   BERRY_WEB_API_BASE_URL: {{ printf "https://%s" .Values.ingress.apiHost | quote }}
+  BERRY_WEB_API_INTERNAL_URL: {{ printf "http://%s-api:%v" (include "berry-platform.name" .) .Values.api.port | quote }}
   BERRY_WEB_DEMO_MODE: "false"
   BERRY_WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}

@@ -2,12 +2,14 @@ import * as React from "react";
 
 export type SignedInUser = { id: string; email: string; name?: string | null };
 
-export function AuthBoundary({ baseUrl, children }: {
+export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }: {
   baseUrl: string;
+  initialUser: SignedInUser | null;
+  sessionResolved: boolean;
   children: (user: SignedInUser, onSignedOut: () => void) => React.ReactNode;
 }) {
-  const [user, setUser] = React.useState<SignedInUser | null>(null);
-  const [loading, setLoading] = React.useState(true);
+  const [user, setUser] = React.useState<SignedInUser | null>(initialUser);
+  const [loading, setLoading] = React.useState(!sessionResolved);
 
   const refreshSession = React.useCallback(async () => {
     setLoading(true);
@@ -27,8 +29,9 @@ export function AuthBoundary({ baseUrl, children }: {
   }, [baseUrl]);
 
   React.useEffect(() => {
+    if (sessionResolved) return;
     void refreshSession();
-  }, [refreshSession]);
+  }, [refreshSession, sessionResolved]);
 
   if (loading) {
     return <div className="auth-shell"><div className="auth-card"><div className="brand-mark">Berry</div><p>Loading your workspace…</p></div></div>;
