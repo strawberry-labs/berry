@@ -34,28 +34,20 @@ import { useHotkeys } from "react-hotkeys-hook";
 import { detectTrigger, type DetectedTrigger, type MentionTrigger } from "@/lib/mentions";
 
 export type MentionCategory = "files" | "folders" | "commands" | "skills" | "subagents" | "sessions";
-export type PromptSendBehavior = "enter" | "modifier";
-
-export function readPromptSendBehavior(storage?: Pick<Storage, "getItem">): PromptSendBehavior {
-  const value = storage?.getItem("berry.web.sendBehavior")
-    ?? (typeof window === "undefined" ? null : window.localStorage.getItem("berry.web.sendBehavior"));
-  return value === "modifier" ? "modifier" : "enter";
-}
 
 export function shouldSubmitPromptOnEnter(
   event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "isComposing" | "metaKey" | "repeat" | "shiftKey"> | null,
-  behavior: PromptSendBehavior,
 ): boolean {
-  if (!event) return behavior === "enter";
+  if (!event) return true;
   if (event.isComposing || event.repeat) return false;
   if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
-  return behavior === "enter";
+  return true;
 }
 
 export function shouldSubmitPromptOnModifierEnter(
   event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "isComposing" | "metaKey" | "repeat" | "shiftKey"> | null,
 ): boolean {
-  if (!event || event.isComposing || event.repeat || event.altKey) return false;
+  if (!event || event.isComposing || event.repeat || event.altKey || event.shiftKey) return false;
   return event.metaKey || event.ctrlKey;
 }
 
@@ -244,19 +236,17 @@ function EscapePlugin({ onEscape }: { onEscape: () => void }) {
   return null;
 }
 
-function SubmitPlugin({ behavior, onSubmit }: { behavior: PromptSendBehavior; onSubmit: (event: KeyboardEvent | null) => void }) {
+function SubmitPlugin({ onSubmit }: { onSubmit: (event: KeyboardEvent | null) => void }) {
   const [editor] = useLexicalComposerContext();
   const submitRef = React.useRef(onSubmit);
-  const behaviorRef = React.useRef(behavior);
   submitRef.current = onSubmit;
-  behaviorRef.current = behavior;
   React.useEffect(() => editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
     if (shouldSubmitPromptOnModifierEnter(event)) {
       event?.preventDefault();
       submitRef.current(event ?? null);
       return true;
     }
-    if (!shouldSubmitPromptOnEnter(event, behaviorRef.current)) return false;
+    if (!shouldSubmitPromptOnEnter(event)) return false;
     event?.preventDefault();
     submitRef.current(event ?? null);
     return true;
@@ -329,7 +319,6 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
     onSubmit,
     onEscape,
     onPasteEvent,
-    sendBehavior,
     testId = "composer-input",
   }: {
     placeholder: string;
@@ -340,7 +329,6 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
     onSubmit: (event: KeyboardEvent | null) => void;
     onEscape?: (() => void) | undefined;
     onPasteEvent?: ((event: ClipboardEvent) => boolean) | undefined;
-    sendBehavior?: PromptSendBehavior | undefined;
     testId?: string;
   },
   ref: React.Ref<PromptEditorHandle>,
@@ -348,21 +336,10 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
   const editorBox = React.useRef<{ editor: LexicalEditor | null }>({ editor: null });
   const mentionsRef = React.useRef<PromptEditorMentions | null>(mentions ?? null);
   mentionsRef.current = mentions ?? null;
-  const [storedSendBehavior, setStoredSendBehavior] = React.useState<PromptSendBehavior>("enter");
-  React.useEffect(() => {
-    if (sendBehavior) return;
-    const sync = () => setStoredSendBehavior(readPromptSendBehavior());
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === "berry.web.sendBehavior") sync();
-    };
-    sync();
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, [sendBehavior]);
-  const resolvedSendBehavior = sendBehavior ?? storedSendBehavior;
   useHotkeys<HTMLElement>(
-    ["meta+enter", "ctrl+enter", "meta+shift+enter", "ctrl+shift+enter"],
+    ["meta+enter", "ctrl+enter"],
     (event) => {
+      event.preventDefault();
       event.stopImmediatePropagation();
       onSubmit(event);
     },
@@ -426,9 +403,7 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
               className="berry-prompt-editor"
               data-testid={testId}
               aria-label={placeholder}
-              aria-keyshortcuts={resolvedSendBehavior === "enter"
-                ? "Enter Meta+Enter Control+Enter"
-                : "Meta+Enter Control+Enter"}
+              aria-keyshortcuts="Enter Meta+Enter Control+Enter"
               aria-placeholder={placeholder}
               placeholder={<div className="berry-prompt-placeholder pointer-events-none absolute select-none">{placeholder}</div>}
             />
@@ -443,7 +418,7 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
         <HandlePlugin handleRef={editorBox} autoFocus={autoFocus} initialText={initialText} />
         {mentions ? <MentionDetectPlugin mentionsRef={mentionsRef} /> : null}
         {mentions ? <MentionKeysPlugin mentionsRef={mentionsRef} /> : null}
-        <SubmitPlugin behavior={resolvedSendBehavior} onSubmit={onSubmit} />
+        <SubmitPlugin onSubmit={onSubmit} />
         {onEscape ? <EscapePlugin onEscape={onEscape} /> : null}
         <PastePlugin onPaste={onPasteEvent} />
       </div>

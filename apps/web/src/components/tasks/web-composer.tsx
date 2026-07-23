@@ -9,7 +9,7 @@ import { CircularProgressIndicator } from "@berry/desktop-ui/components/ui/circu
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, Queue01Icon, SlashSquare } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
@@ -17,8 +17,8 @@ import { ProjectSwitcher } from "../projects/project-switcher";
 import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, type ComposerQuestionAnswer } from "./composer-question-overlay";
 import { QueuedMessageList } from "./queued-message-list";
-import { readFollowUpMode, saveFollowUpMode, type FollowUpMode } from "@/lib/follow-up-mode";
 import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
+import { resolveComposerSubmitIntent } from "@/lib/composer-submit-intent";
 
 interface PendingFileUpload {
   id: string;
@@ -104,7 +104,6 @@ export function Composer({
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const [followUpMode, setFollowUpMode] = React.useState<FollowUpMode>(() => readFollowUpMode());
   const working = busy || streaming;
   const [attachments, setAttachments] = React.useState<AttachmentInput[]>([]);
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
@@ -224,7 +223,9 @@ export function Composer({
       }
       return;
     }
-    const command = parseSlashCommand(input);
+    const submitIntent = resolveComposerSubmitIntent(working, event);
+    if (submitIntent === "ignore") return;
+    const command = submitIntent === "send" ? parseSlashCommand(input) : null;
     if (command) {
       setUploadError("");
       try {
@@ -237,10 +238,7 @@ export function Composer({
       return;
     }
     if (working && activeTask?.activeSessionId) {
-      const mode = event?.shiftKey && (event.metaKey || event.ctrlKey)
-        ? (followUpMode === "queue" ? "steer" : "queue")
-        : followUpMode;
-      if (mode === "queue") {
+      if (submitIntent === "queue") {
         onQueuedFollowUp(createQueuedFollowUp({
           taskId: activeTask.id,
           sessionId: activeTask.activeSessionId,
@@ -310,7 +308,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, editingFollowUp, followUpMode, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
+  }, [activeTask, attachments, client, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length) return;
@@ -489,7 +487,6 @@ export function Composer({
         <div className="berry-composer-controls flex min-w-0 flex-nowrap items-center gap-1">
           <input ref={fileInputRef} className="visually-hidden" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => void addFiles(event.currentTarget.files)} />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-60"><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
-          {working && variant === "thread" ? <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-follow-up-mode"><Queue01Icon aria-hidden /> {followUpMode === "queue" ? "Queue" : "Steer"}<ChevronDown aria-hidden /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-52"><DropdownMenuItem onClick={() => { setFollowUpMode("queue"); saveFollowUpMode("queue"); }}><Queue01Icon /> Queue after this response{followUpMode === "queue" ? <Check className="ml-auto" /> : null}</DropdownMenuItem><DropdownMenuItem onClick={() => { setFollowUpMode("steer"); saveFollowUpMode("steer"); }}><ArrowUp /> Steer the current response{followUpMode === "steer" ? <Check className="ml-auto" /> : null}</DropdownMenuItem></DropdownMenuContent></DropdownMenu> : null}
           <span className="min-w-0 flex-1" />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{composerModels.find((item) => item.id === model)?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-64"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => onModelChange(item.id)}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoning[0]!.toUpperCase() + reasoning.slice(1)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-64"><DropdownMenuLabel>Reasoning</DropdownMenuLabel>{(["off", "low", "medium", "high"] as const).map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span className="capitalize">{level}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>

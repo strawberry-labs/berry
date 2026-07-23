@@ -8,7 +8,6 @@ export function GeneralSettingsScreen() {
   const [theme, setTheme] = useLocalSetting("berry.web.theme", DEFAULT_BERRY_THEME);
   const [language, setLanguage] = useLocalSetting("berry.web.language", "system");
   const [instructions, setInstructions] = useLocalSetting("berry.web.customInstructions", "");
-  const [sendBehavior, setSendBehavior] = useLocalSetting("berry.web.sendBehavior", "enter");
   const [followUps, setFollowUps] = useLocalSetting("berry.web.followUps", "on");
   const [draft, setDraft] = React.useState("");
   const [dirty, setDirty] = React.useState(false);
@@ -26,7 +25,6 @@ export function GeneralSettingsScreen() {
       <label><span><b>Language</b><small>Controls dates, numbers, and screen-reader pronunciation.</small></span><FormSelect value={language} onChange={setLanguage} options={[{ value: "system", label: "System default" }, { value: "en", label: "English" }]} /></label>
     </div></Section>
     <Section title="Conversation behavior"><div className="mgmt-setting-list">
-      <label><span><b>Send messages</b><small>Choose whether Enter sends or inserts a new line.</small></span><FormSelect value={sendBehavior} onChange={setSendBehavior} options={[{ value: "enter", label: "Enter sends" }, { value: "modifier", label: "⌘/Ctrl + Enter sends" }]} /></label>
       <label><span><b>Queued follow-ups</b><small>Keep follow-up messages ready while a turn is running.</small></span><ManagementSwitch checked={followUps === "on"} onCheckedChange={(checked) => setFollowUps(checked ? "on" : "off")} aria-label="Queued follow-ups" /></label>
     </div></Section>
     <Section title="Custom instructions" description="Applied to new conversations; existing task history is unchanged.">

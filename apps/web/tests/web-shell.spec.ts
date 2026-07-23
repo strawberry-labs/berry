@@ -325,10 +325,8 @@ test("home route opens the centered new-chat composer without creating a thread"
   expect(centered).toBeLessThan(2);
 });
 
-test("composer keyboard: Enter submits in Enter mode", async ({ page }) => {
+test("composer keyboard: Enter submits while idle", async ({ page }) => {
   await page.goto("/");
-  await page.evaluate(() => localStorage.setItem("berry.web.sendBehavior", "enter"));
-  await page.reload();
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   const prompt = `Enter shortcut ${Date.now()}`;
 
@@ -340,22 +338,16 @@ test("composer keyboard: Enter submits in Enter mode", async ({ page }) => {
 });
 
 for (const shortcut of ["Meta+Enter", "Control+Enter"] as const) {
-  test(`composer keyboard: ${shortcut} submits in modifier mode`, async ({ page }) => {
+  test(`composer keyboard: ${shortcut} does not submit while idle`, async ({ page }) => {
     await page.goto("/");
-    await page.evaluate(() => localStorage.setItem("berry.web.sendBehavior", "modifier"));
-    await page.reload();
     await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
     const prompt = `${shortcut} shortcut ${Date.now()}`;
     const editor = page.getByTestId("composer-input");
 
     await editor.fill(prompt);
-    await page.keyboard.press("Enter");
+    await page.keyboard.press(shortcut);
     await expect(page).toHaveURL(/\/$/);
     await expect(editor).toContainText(prompt);
-
-    await page.keyboard.press(shortcut);
-    await expect(page).toHaveURL(/\/tasks\//);
-    await expect(page.getByTestId("web-thread").getByText(prompt, { exact: true })).toBeVisible();
   });
 }
 
