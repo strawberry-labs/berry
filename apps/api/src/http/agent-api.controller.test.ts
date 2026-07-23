@@ -232,6 +232,53 @@ describe("AgentApiController", () => {
     expect(cancel).toHaveBeenCalledWith(created.body.session.id);
   });
 
+  it("persists an interrupted assistant boundary before the next steered user message", async () => {
+    const cancel = vi.fn(async () => true);
+    const bufferedEvents: AgentStreamEvent[] = [
+      { kind: "turn.start", turnId: "turn_interrupted" },
+      { kind: "message.start", messageId: "message_interrupted", role: "assistant" },
+      { kind: "message.delta", messageId: "message_interrupted", channel: "reasoning", delta: "Researching the data center figures." },
+    ];
+    app = await createApp(fakeSessionHost({
+      cancel,
+      turnState: () => ({ active: true, turnId: "turn_interrupted", bufferedEvents }),
+    }));
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Interrupted task" })
+      .expect(201);
+    const sessionId = created.body.session.id as string;
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${sessionId}/messages`)
+      .set(authHeader())
+      .send({ role: "user", parts: [{ kind: "text", content: "Start researching" }] })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${sessionId}/cancel`)
+      .set(authHeader())
+      .expect(201)
+      .expect({ ok: true });
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${sessionId}/messages`)
+      .set(authHeader())
+      .send({ role: "user", parts: [{ kind: "text", content: "Steer the research" }] })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.map((message: { role: string }) => message.role)).toEqual(["user", "assistant", "user"]);
+        expect(body[1]).toMatchObject({
+          status: "cancelled",
+          parts: [expect.objectContaining({ kind: "reasoning", content: "Researching the data center figures." })],
+        });
+      });
+  });
+
   it("queues steering input while a session turn is active", async () => {
     const steer = vi.fn(async () => ({ queued: true as const }));
     app = await createApp(fakeSessionHost({ steer }));
@@ -538,7 +585,11 @@ describe("AgentApiController", () => {
     }).expect(201);
 
     await request(app.getHttpServer()).get(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).expect(200).expect(({ body }) => {
-      expect(body.at(-1)).toMatchObject({ role: "assistant", parts: [expect.objectContaining({ kind: "error", content: "Provider stream ended before completion" })] });
+      expect(body.at(-1)).toMatchObject({
+        role: "assistant",
+        status: "failed",
+        parts: [expect.objectContaining({ kind: "error", content: "Provider stream ended before completion" })],
+      });
       expect(body.filter((message: { parts: Array<{ kind: string }> }) => message.parts.some((part) => part.kind === "error"))).toHaveLength(1);
     });
   });

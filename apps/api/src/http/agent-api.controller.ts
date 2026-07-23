@@ -83,6 +83,23 @@ const AppendMessageRequestSchema = z.object({
   })).min(1),
 }).strict();
 
+function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "text" | "reasoning"; content: string }> {
+  let text = "";
+  let reasoning = "";
+  for (const event of events) {
+    if (event.kind !== "message.delta") continue;
+    if (event.channel === "reasoning") reasoning += event.delta;
+    else text += event.delta;
+  }
+  const parts: Array<{ kind: "text" | "reasoning"; content: string }> = [];
+  if (reasoning.trim()) parts.push({ kind: "reasoning", content: reasoning });
+  if (text.trim()) parts.push({ kind: "text", content: text });
+  // Some providers do not send a partial message before acknowledging abort.
+  // Keep an assistant boundary in the transcript even in that case.
+  if (parts.length === 0) parts.push({ kind: "reasoning", content: "Response interrupted." });
+  return parts;
+}
+
 const StartTurnRequestSchema = z.object({
   input: z.string().min(1),
   workspacePath: z.string().min(1),
@@ -551,6 +568,10 @@ export class AgentApiController {
           this.#queueProjectionWrite(sessionId, () => this.store.appendMessage(sessionId, {
             role: "assistant",
             parts: parts.map((part) => ({ kind: part.kind, content: part.content })),
+            status: message.status,
+            inputTokens: message.usage?.inputTokens ?? 0,
+            outputTokens: message.usage?.outputTokens ?? 0,
+            generationMs: message.generationMs ?? 0,
           }));
         },
         // Persist settled tool metadata (status/output/duration/children) as
@@ -617,6 +638,7 @@ export class AgentApiController {
             assistantErrorPersisted = true;
             this.#queueProjectionWrite(sessionId, () => this.store.appendMessage(sessionId, {
               role: "assistant",
+              status: "failed",
               parts: [{ kind: "error", content: parsed.message }],
             }));
           }
@@ -728,7 +750,34 @@ export class AgentApiController {
   @Post("/sessions/:sessionId/cancel")
   async cancelTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
     await this.ownedSession(httpRequest, sessionId);
+    const turn = this.sessionHost.turnState(sessionId);
     const ok = await this.sessionHost.cancel(sessionId);
+    await this.#projectionWrites.get(sessionId);
+    if (ok && turn.active) {
+      const messages = await this.store.listMessages(sessionId);
+      let latestUserIndex = -1;
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index]?.role !== "user") continue;
+        latestUserIndex = index;
+        break;
+      }
+      const interruptedAssistants = latestUserIndex === -1
+        ? []
+        : messages.slice(latestUserIndex + 1).filter((message) => message.role === "assistant");
+      // A provider can abort without producing a final assistant message.
+      // Persist a cancelled boundary before the next user prompt. If earlier
+      // assistant/tool projections exist, the boundary also marks their whole
+      // turn as cancelled in the settled UI.
+      if (latestUserIndex !== -1 && !interruptedAssistants.some((message) => message.status === "cancelled")) {
+        await this.store.appendMessage(sessionId, {
+          role: "assistant",
+          status: "cancelled",
+          parts: interruptedAssistants.length === 0
+            ? interruptedAssistantParts(turn.bufferedEvents)
+            : [{ kind: "reasoning", content: "Response interrupted." }],
+        });
+      }
+    }
     return { ok };
   }
 

@@ -414,6 +414,7 @@ export const sessions = pgTable("sessions", {
 
 export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().defaultRandom(),
+  sequenceId: bigint("sequence_id", { mode: "number" }).generatedAlwaysAsIdentity(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
   taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
@@ -428,7 +429,7 @@ export const messages = pgTable("messages", {
   createdAt,
   updatedAt,
 }, (table) => [
-  index("messages_tenant_session_created_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("messages_tenant_session_sequence_idx").on(table.tenantId, table.sessionId, table.sequenceId),
   index("messages_tenant_task_created_idx").on(table.tenantId, table.taskId, table.createdAt),
 ]);
 
@@ -1259,6 +1260,7 @@ CREATE INDEX sessions_tenant_parent_idx ON sessions (tenant_id, parent_session_i
 
 CREATE TABLE messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sequence_id bigint GENERATED ALWAYS AS IDENTITY,
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1273,7 +1275,7 @@ CREATE TABLE messages (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX messages_tenant_session_created_idx ON messages (tenant_id, session_id, created_at);
+CREATE INDEX messages_tenant_session_sequence_idx ON messages (tenant_id, session_id, sequence_id);
 CREATE INDEX messages_tenant_task_created_idx ON messages (tenant_id, task_id, created_at);
 
 CREATE TABLE message_parts (
@@ -2127,6 +2129,13 @@ DROP TABLE IF EXISTS queued_follow_ups;
 DELETE FROM schema_migrations WHERE id IN (14, 22);
 `.trim();
 
+export const MESSAGE_SEQUENCE_MIGRATION = `
+ALTER TABLE messages
+  ADD COLUMN IF NOT EXISTS sequence_id bigint GENERATED ALWAYS AS IDENTITY;
+CREATE INDEX IF NOT EXISTS messages_tenant_session_sequence_idx
+  ON messages (tenant_id, session_id, sequence_id);
+`.trim();
+
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -2595,4 +2604,5 @@ export const cloudMigrations = [
   { id: 21, name: "file_platform_v1", sql: FILE_PLATFORM_MIGRATION },
   { id: 23, name: "capability_permission_defaults_v1", sql: CAPABILITY_PERMISSION_DEFAULTS_MIGRATION },
   { id: 24, name: "remove_queued_follow_ups_v1", sql: REMOVE_QUEUED_FOLLOW_UPS_MIGRATION },
+  { id: 25, name: "message_sequence_v1", sql: MESSAGE_SEQUENCE_MIGRATION },
 ] as const;

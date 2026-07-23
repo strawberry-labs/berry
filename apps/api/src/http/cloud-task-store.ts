@@ -52,6 +52,10 @@ export interface AppendMessageInput {
   id?: string | undefined;
   role: MessageRole;
   parts: Array<{ kind: MessagePartKind; content: JsonValue }>;
+  status?: Message["status"] | undefined;
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  generationMs?: number | undefined;
 }
 
 export interface CloudTaskStore {
@@ -311,11 +315,11 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       id: messageId,
       sessionId,
       role: MessageRoleSchema.parse(input.role),
-      status: "complete",
+      status: input.status ?? "complete",
       parts,
-      inputTokens: 0,
-      outputTokens: 0,
-      generationMs: 0,
+      inputTokens: input.inputTokens ?? 0,
+      outputTokens: input.outputTokens ?? 0,
+      generationMs: input.generationMs ?? 0,
       createdAt: now,
       updatedAt: now,
     });
@@ -575,11 +579,22 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
       const inserted = await executor.query<{ id: string }>(
         `
 INSERT INTO messages (id, tenant_id, session_id, task_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at)
-VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::message_role, 'complete', 0, 0, 0, $6, $6)
+VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::message_role, $6::message_status, $7, $8, $9, $10, $10)
 ON CONFLICT (id) DO NOTHING
 RETURNING id
         `.trim(),
-        [messageId, this.tenantId, sessionId, session.taskId, MessageRoleSchema.parse(input.role), now],
+        [
+          messageId,
+          this.tenantId,
+          sessionId,
+          session.taskId,
+          MessageRoleSchema.parse(input.role),
+          input.status ?? "complete",
+          input.inputTokens ?? 0,
+          input.outputTokens ?? 0,
+          input.generationMs ?? 0,
+          now,
+        ],
       );
       if (inserted.length === 0) {
         const existing = await this.getMessageInTenant(executor, messageId);
@@ -607,7 +622,7 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::message_part_kind, $5::jsonb, $6, $7)
 SELECT id, session_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid
-ORDER BY created_at ASC
+ORDER BY sequence_id ASC
         `.trim(),
         [this.tenantId, sessionId],
       );
@@ -618,14 +633,14 @@ ORDER BY created_at ASC
   async deleteMessagesFrom(sessionId: string, messageId: string): Promise<void> {
     await this.database.withTenant(this.tenantId, async (executor) => {
       await this.getSessionInTenant(executor, sessionId);
-      // Messages carry no monotonic sequence column, so order by creation time
-      // with the id as tie-break — matching listMessages' ORDER BY created_at.
+      // sequence_id is the canonical insertion order, including messages
+      // written within the same timestamp millisecond.
       await executor.execute(
         `
 DELETE FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid
-  AND (created_at, id) >= (
-    SELECT created_at, id FROM messages
+  AND sequence_id >= (
+    SELECT sequence_id FROM messages
     WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND id = $3::uuid
   )
         `.trim(),
