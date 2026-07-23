@@ -228,7 +228,12 @@ export function BerryThreadView({
   const navContainerRef = React.useRef<HTMLDivElement>(null);
   const navigatorItems: NavigatorItem[] = renderedTurnGroups
     .filter((group): group is typeof group & { user: Message } => Boolean(group.user))
-    .map((group) => ({ id: group.user.id, label: userMessageText(group.user) }));
+    .map((group) => ({
+      id: group.user.id,
+      label: userMessageText(group.user),
+      preview: assistantMessageText(group.assistants),
+      resources: messageAttachmentNames([...group.user.parts, ...group.assistants.flatMap((assistant) => assistant.parts)]),
+    }));
 
   return (
     <MessageScrollerProvider autoScroll={autoScroll} scrollEdgeThreshold={96}>
@@ -335,6 +340,27 @@ function userMessageText(message: Message): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 160);
+}
+
+function assistantMessageText(messages: Message[]): string {
+  return messages
+    .flatMap((message) => message.parts)
+    .filter((part) => part.kind === "text")
+    .map((part) => String(part.content))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 360);
+}
+
+function messageAttachmentNames(parts: MessagePart[]): string[] {
+  const names = new Set<string>();
+  for (const part of parts) {
+    if (part.kind !== "attachment") continue;
+    const attachment = MessageAttachmentContentSchema.safeParse(part.content);
+    if (attachment.success) names.add(attachment.data.name);
+  }
+  return [...names];
 }
 
 /** "3:02 AM" for today, "May 7, 2:07 PM" for any other day. */

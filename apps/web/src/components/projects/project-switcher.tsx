@@ -30,30 +30,47 @@ export function ProjectSwitcher({
   align?: "start" | "center" | "end" | undefined;
 }) {
   const [open, setOpen] = React.useState(false);
+  const hostRef = React.useRef<HTMLDivElement>(null);
+  const [composerPopoverWidth, setComposerPopoverWidth] = React.useState<number | null>(null);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? workspaces[0] ?? null;
   const projects = workspaces.filter((workspace) => workspace.workspaceKind === "project");
   const chats = workspaces.filter((workspace) => workspace.workspaceKind === "general");
 
+  React.useEffect(() => {
+    const composer = hostRef.current?.closest<HTMLElement>(".berry-composer-root");
+    if (!composer) return;
+    const updateWidth = () => setComposerPopoverWidth(Math.max(0, composer.getBoundingClientRect().width - 26));
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(composer);
+    return () => observer.disconnect();
+  }, []);
+
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <BerryTaskPill
-          interactive
-          aria-label="Choose project"
-          aria-haspopup="listbox"
-          aria-expanded={open}
-          className={cn("berry-project-switcher", className)}
-          title={activeWorkspace?.name ?? "Choose project"}
+    <div ref={hostRef} className="contents">
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <BerryTaskPill
+            interactive
+            aria-label="Choose project"
+            aria-haspopup="listbox"
+            aria-expanded={open}
+            className={cn("berry-project-switcher", className)}
+            title={activeWorkspace?.name ?? "Choose project"}
+          >
+            <Folder />
+            <span className="min-w-0 truncate">{activeWorkspace?.name ?? "Choose project"}</span>
+            <ChevronDown className="berry-task-pill-caret shrink-0" />
+          </BerryTaskPill>
+        </PopoverTrigger>
+        <PopoverContent
+          align={align}
+          className="berry-project-switcher-popover w-[min(328px,calc(100vw-26px))] p-0"
+          style={composerPopoverWidth ? { width: `${composerPopoverWidth}px`, maxWidth: "calc(100vw - 26px)" } : undefined}
         >
-          <Folder />
-          <span className="min-w-0 truncate">{activeWorkspace?.name ?? "Choose project"}</span>
-          <ChevronDown className="berry-task-pill-caret shrink-0" />
-        </BerryTaskPill>
-      </PopoverTrigger>
-      <PopoverContent align={align} className="berry-project-switcher-popover w-[min(328px,calc(100vw-32px))] p-0">
-        <Command>
-          <CommandInput placeholder="Search projects…" />
-          <CommandList>
+          <Command>
+            <CommandInput placeholder="Search projects…" />
+            <CommandList>
             <CommandEmpty>No projects found.</CommandEmpty>
             {projects.length > 0 ? (
               <CommandGroup heading="Projects">
@@ -111,9 +128,10 @@ export function ProjectSwitcher({
                 </CommandGroup>
               </>
             ) : null}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
+            </CommandList>
+          </Command>
+        </PopoverContent>
+      </Popover>
+    </div>
   );
 }

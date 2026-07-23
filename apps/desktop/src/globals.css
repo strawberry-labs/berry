@@ -685,14 +685,13 @@
     background: var(--berry-composer-strip);
   }
 
-  /* The prompt box card. Plain border-radius (not the squircle) so the inset
-     Codex elevation stroke (0.5px, foreground at 20%) hugs the corners exactly
-     — an inset ring can't follow a clip-path and artifacts on the edges. */
+  /* The prompt box card. The hairline inset ring reuses the queue panel's
+     border token without changing the composer's footprint. */
   .berry-composer-card {
     background: var(--berry-control-bg);
-    /* Fallback radius; the squircle clip + SVG ring (useSquircle ring option)
-       shape the real corners. */
+    /* Fallback radius; the squircle clip shapes the real corners. */
     border-radius: 22px 22px var(--berry-composer-radius) var(--berry-composer-radius);
+    box-shadow: inset 0 0 0 0.5px color-mix(in oklab, var(--berry-border-strong) 80%, transparent);
     overflow: hidden;
   }
 

@@ -1764,32 +1764,6 @@ export class BerryAgentRuntime {
     return { queued: true };
   }
 
-  /**
-   * Keep the runtime queue in the same order as the persisted web queue.
-   * The browser can therefore reorder or promote pending prompts without
-   * waiting for the current model turn to finish.
-   */
-  async replaceFollowUpQueue(sessionId: string, followUps: Array<{ input: string; images?: ImageContent[]; attachments?: RuntimeAttachment[] }>): Promise<void> {
-    const state = this.#sessions.get(sessionId);
-    const active = state?.active;
-    if (!state || !active) throw new Error(`Session ${sessionId} is not running a turn`);
-    const queued: Array<{ text: string; images?: ImageContent[] }> = [];
-    for (const followUp of followUps) {
-      if ((followUp.images?.length ?? 0) > 0 && !state.supportsImageInput) {
-        throw new Error("The active model does not support image input. Remove the image or choose a vision-capable model.");
-      }
-      const preparedAttachments = await this.#materializeAttachments(state.sandboxSession, followUp.attachments ?? []);
-      this.#registerAttachedFiles(sessionId, preparedAttachments);
-      const promptInput = promptWithAttachments(followUp.input, preparedAttachments);
-      const automaticSkill = automaticAttachmentSkillInvocation(state.skills, preparedAttachments, promptInput);
-      queued.push({
-        text: automaticSkill?.instructions ?? promptInput,
-        ...(followUp.images && followUp.images.length > 0 ? { images: followUp.images } : {}),
-      });
-    }
-    await state.harness.replaceFollowUpQueue(queued);
-  }
-
   async fork(
     sessionId: string,
     options: { entryId?: string; newSessionId?: string; onEvent?: (event: AgentStreamEvent) => void } = {},

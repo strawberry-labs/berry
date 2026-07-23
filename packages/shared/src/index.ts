@@ -2292,22 +2292,6 @@ export const MultipartUploadPartUrlSchema = z.object({
 export const MultipartUploadPartUrlsSchema = z.object({ parts: z.array(MultipartUploadPartUrlSchema) });
 export type MultipartUploadPartUrl = z.infer<typeof MultipartUploadPartUrlSchema>;
 
-export const QueuedFollowUpStatusSchema = z.enum(["queued", "sending", "paused", "delivered", "failed", "removed"]);
-export const QueuedFollowUpSchema = z.object({
-  id: z.string(),
-  taskId: z.string(),
-  sessionId: z.string(),
-  ordinal: z.number().int().nonnegative(),
-  input: z.string(),
-  attachments: z.array(AttachmentInputSchema).default([]),
-  status: QueuedFollowUpStatusSchema,
-  error: z.string().nullable().default(null),
-  pausedReason: z.string().nullable().default(null),
-  createdAt: ISODateSchema,
-  updatedAt: ISODateSchema,
-});
-export type QueuedFollowUp = z.infer<typeof QueuedFollowUpSchema>;
-
 export const CloudWorkspaceStateSchema = z.object({
   taskId: z.string().min(1),
   sandboxId: z.string().min(1),

@@ -98,7 +98,6 @@ import {
   SsoStartResponseSchema,
   SessionSchema,
   TaskSchema,
-  QueuedFollowUpSchema,
   TurnStateSchema,
   WorkspaceSchema,
   type AgentStreamEvent,
@@ -198,7 +197,6 @@ import {
   type SsoConnection,
   type SsoStartResponse,
   type Task,
-  type QueuedFollowUp,
   type TurnState,
   type Workspace,
   type AttachmentInput,
@@ -241,8 +239,6 @@ export interface StartTurnRequest {
   attachments?: AttachmentInput[] | undefined;
   /** Edit-and-resubmit: rewind to before this user message and replace it. */
   replaceFromMessageId?: string | undefined;
-  /** Start this turn by promoting a queued follow-up and drain later queue entries after it. */
-  drainQueuedFollowUps?: boolean | undefined;
 }
 
 export const ManagedModelCatalogSchema = z.object({
@@ -687,7 +683,7 @@ export class BerryApiClient {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turn-state`, TurnStateSchema);
   }
 
-  async appendMessage(sessionId: string, input: { role?: "system" | "user" | "assistant" | "tool" | undefined; parts: Array<{ kind: string; content: unknown }> }): Promise<Message> {
+  async appendMessage(sessionId: string, input: { messageId?: string | undefined; role?: "system" | "user" | "assistant" | "tool" | undefined; parts: Array<{ kind: string; content: unknown }> }): Promise<Message> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, MessageSchema, {
       method: "POST",
       body: input,
@@ -707,44 +703,11 @@ export class BerryApiClient {
     });
   }
 
-  async steerTurn(sessionId: string, input: { input: string; attachments?: AttachmentInput[] | undefined }): Promise<{ queued: true }> {
-    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/steer`, z.object({ queued: z.literal(true) }), {
+  async steerTurn(sessionId: string, input: { messageId: string; input: string; attachments?: AttachmentInput[] | undefined }): Promise<{ queued: true; message: Message }> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/steer`, z.object({ queued: z.literal(true), message: MessageSchema }), {
       method: "POST",
       body: input,
     });
-  }
-
-  async listFollowUps(sessionId: string): Promise<QueuedFollowUp[]> {
-    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups`, z.array(QueuedFollowUpSchema));
-  }
-
-  async followUpTurn(sessionId: string, input: { input: string; attachments?: AttachmentInput[] | undefined }): Promise<QueuedFollowUp> {
-    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups`, QueuedFollowUpSchema, { method: "POST", body: input });
-  }
-
-  async reorderFollowUps(sessionId: string, followUpIds: string[]): Promise<QueuedFollowUp[]> {
-    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups/reorder`, z.array(QueuedFollowUpSchema), {
-      method: "POST",
-      body: { followUpIds },
-    });
-  }
-
-  async resumeFollowUps(sessionId: string): Promise<QueuedFollowUp[]> {
-    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups/resume`, z.array(QueuedFollowUpSchema), { method: "POST" });
-  }
-
-  async updateFollowUp(followUpId: string, input: Partial<Pick<QueuedFollowUp, "input" | "attachments" | "status" | "error" | "pausedReason">>): Promise<QueuedFollowUp> {
-    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}`, QueuedFollowUpSchema, { method: "PATCH", body: input });
-  }
-
-  async steerFollowUp(followUpId: string): Promise<{ queued: true }> {
-    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}/steer`, z.object({ queued: z.literal(true) }), {
-      method: "POST",
-    });
-  }
-
-  async removeFollowUp(followUpId: string): Promise<QueuedFollowUp> {
-    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}`, QueuedFollowUpSchema, { method: "DELETE" });
   }
 
   async answerQuestion(

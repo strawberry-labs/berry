@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import {
   createId,
   ConversationKindSchema,
@@ -7,7 +7,6 @@ import {
   MessageSchema,
   nowIso,
   PermissionModeSchema,
-  QueuedFollowUpSchema,
   SessionStatusSchema,
   SessionSchema,
   TaskSchema,
@@ -18,8 +17,6 @@ import {
   type MessagePartKind,
   type MessageRole,
   type PermissionMode,
-  type AttachmentInput,
-  type QueuedFollowUp,
   type ConversationKind,
   type Session,
   type Task,
@@ -52,6 +49,7 @@ export interface UpdateTaskInput {
 }
 
 export interface AppendMessageInput {
+  id?: string | undefined;
   role: MessageRole;
   parts: Array<{ kind: MessagePartKind; content: JsonValue }>;
 }
@@ -66,13 +64,6 @@ export interface CloudTaskStore {
   updateTask(taskId: string, input: UpdateTaskInput, ownerUserId?: string | null): Promise<Task>;
   deleteTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
   restoreTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
-  createFollowUp(input: { taskId: string; sessionId: string; input: string; attachments?: AttachmentInput[] }, ownerUserId?: string | null): Promise<QueuedFollowUp>;
-  listFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
-  reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
-  updateFollowUp(id: string, input: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp>;
-  pauseFollowUps(sessionId: string, reason: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
-  resumeFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
-  deliverFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]>;
   createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session>;
   getSession(sessionId: string): Promise<Session>;
   appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message>;
@@ -85,14 +76,6 @@ export interface CloudTaskStore {
   deleteMessagesFrom(sessionId: string, messageId: string): Promise<void>;
 }
 
-export interface FollowUpUpdateInput {
-  input?: string;
-  attachments?: AttachmentInput[];
-  status?: QueuedFollowUp["status"];
-  error?: string | null;
-  pausedReason?: string | null;
-}
-
 @Injectable()
 export class InMemoryCloudTaskStore implements CloudTaskStore {
   readonly #workspaces = new Map<string, Workspace>();
@@ -100,7 +83,6 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   readonly #sessions = new Map<string, Session>();
   readonly #messages = new Map<string, Message[]>();
   readonly #taskOwners = new Map<string, string | null>();
-  readonly #followUps = new Map<string, QueuedFollowUp>();
 
   constructor() {
     const now = nowIso();
@@ -260,65 +242,6 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     this.#tasks.set(taskId, next);
     return next;
   }
-
-
-  async createFollowUp(input: { taskId: string; sessionId: string; input: string; attachments?: AttachmentInput[] }, ownerUserId?: string | null): Promise<QueuedFollowUp> {
-    await this.getTask(input.taskId, ownerUserId);
-    const now = nowIso();
-    const ordinal = [...this.#followUps.values()].filter((item) => item.sessionId === input.sessionId).length;
-    const followUp = QueuedFollowUpSchema.parse({ id: randomUuid(), ...input, attachments: input.attachments ?? [], ordinal, status: "queued", error: null, pausedReason: null, createdAt: now, updatedAt: now });
-    this.#followUps.set(followUp.id, followUp);
-    return followUp;
-  }
-
-  async listFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    const session = await this.getSession(sessionId);
-    await this.getTask(session.taskId, ownerUserId);
-    return [...this.#followUps.values()].filter((item) => item.sessionId === sessionId && !["removed", "delivered"].includes(item.status)).sort((a, b) => a.ordinal - b.ordinal);
-  }
-
-  async reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    const current = await this.listFollowUps(sessionId, ownerUserId);
-    const expected = new Set(current.map((followUp) => followUp.id));
-    if (expected.size !== followUpIds.length || followUpIds.some((id) => !expected.delete(id))) {
-      throw new BadRequestException("The submitted follow-up order does not match this session queue");
-    }
-    const now = nowIso();
-    for (const [ordinal, id] of followUpIds.entries()) {
-      const followUp = this.#followUps.get(id);
-      if (!followUp) continue;
-      this.#followUps.set(id, QueuedFollowUpSchema.parse({ ...followUp, ordinal, updatedAt: now }));
-    }
-    return this.listFollowUps(sessionId, ownerUserId);
-  }
-
-  async updateFollowUp(id: string, input: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp> {
-    const current = this.#followUps.get(id);
-    if (!current) throw new NotFoundException(`Queued follow-up not found: ${id}`);
-    await this.getTask(current.taskId, ownerUserId);
-    const next = QueuedFollowUpSchema.parse({ ...current, ...input, updatedAt: nowIso() });
-    this.#followUps.set(id, next);
-    return next;
-  }
-
-  async pauseFollowUps(sessionId: string, reason: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    const current = await this.listFollowUps(sessionId, ownerUserId);
-    await Promise.all(current.filter((item) => item.status === "queued" || item.status === "sending").map((item) => this.updateFollowUp(item.id, { status: "paused", error: null, pausedReason: reason }, ownerUserId)));
-    return this.listFollowUps(sessionId, ownerUserId);
-  }
-
-  async resumeFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    const current = await this.listFollowUps(sessionId, ownerUserId);
-    await Promise.all(current.filter((item) => item.status === "paused").map((item) => this.updateFollowUp(item.id, { status: "queued", error: null, pausedReason: null }, ownerUserId)));
-    return this.listFollowUps(sessionId, ownerUserId);
-  }
-
-  async deliverFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    const current = await this.listFollowUps(sessionId, ownerUserId);
-    await Promise.all(current.filter((item) => item.status === "queued" || item.status === "sending").map((item) => this.updateFollowUp(item.id, { status: "delivered", error: null, pausedReason: null }, ownerUserId)));
-    return this.listFollowUps(sessionId, ownerUserId);
-  }
-
   async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session> {
     const task = await this.getTask(input.taskId);
     const now = nowIso();
@@ -347,8 +270,15 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
 
   async appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message> {
     await this.getSession(sessionId);
+    const existing = input.id
+      ? [...this.#messages.values()].flat().find((message) => message.id === input.id)
+      : undefined;
+    if (existing) {
+      if (existing.sessionId !== sessionId) throw new ConflictException(`Message id already belongs to another session: ${input.id}`);
+      return existing;
+    }
     const now = nowIso();
-    const messageId = createId("msg");
+    const messageId = input.id ?? createId("msg");
     const parts: MessagePart[] = input.parts.map((part, position) => ({
       id: createId("part"),
       messageId,
@@ -563,105 +493,6 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
     });
   }
 
-  async createFollowUp(input: { taskId: string; sessionId: string; input: string; attachments?: AttachmentInput[] }, ownerUserId?: string | null): Promise<QueuedFollowUp> {
-    return this.database.withTenant(this.tenantId, async (executor) => {
-      await this.getTaskInTenant(executor, input.taskId, ownerUserId);
-      const rows = await executor.query<QueuedFollowUpRow>(
-        `INSERT INTO queued_follow_ups (tenant_id, task_id, session_id, ordinal, input, attachments, status, created_at, updated_at)
-         SELECT $1::uuid, $2::uuid, $3::uuid, COALESCE(MAX(ordinal) + 1, 0), $4, $5::jsonb, 'queued', $6, $6
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $3::uuid
-         RETURNING id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at`,
-        [this.tenantId, input.taskId, input.sessionId, input.input, JSON.stringify(input.attachments ?? []), nowIso()],
-      );
-      return followUpFromRow(rows[0]!);
-    });
-  }
-
-  async listFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    return this.database.withTenant(this.tenantId, async (executor) => {
-      const session = await this.getSessionInTenant(executor, sessionId);
-      await this.getTaskInTenant(executor, session.taskId, ownerUserId);
-      const rows = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status NOT IN ('removed', 'delivered') ORDER BY ordinal`,
-        [this.tenantId, sessionId],
-      );
-      return rows.map(followUpFromRow);
-    });
-  }
-
-  async reorderFollowUps(sessionId: string, followUpIds: string[], ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    return this.database.withTenant(this.tenantId, async (executor) => {
-      const session = await this.getSessionInTenant(executor, sessionId);
-      await this.getTaskInTenant(executor, session.taskId, ownerUserId);
-      const current = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status NOT IN ('removed', 'delivered') ORDER BY ordinal`,
-        [this.tenantId, sessionId],
-      );
-      const expected = new Set(current.map((followUp) => followUp.id));
-      if (expected.size !== followUpIds.length || followUpIds.some((id) => !expected.delete(id))) {
-        throw new BadRequestException("The submitted follow-up order does not match this session queue");
-      }
-      const updatedAt = nowIso();
-      for (const [ordinal, id] of followUpIds.entries()) {
-        await executor.execute(
-          "UPDATE queued_follow_ups SET ordinal = $3, updated_at = $4 WHERE tenant_id = $1::uuid AND id = $2::uuid",
-          [this.tenantId, id, ordinal, updatedAt],
-        );
-      }
-      const reordered = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at
-         FROM queued_follow_ups WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND status NOT IN ('removed', 'delivered') ORDER BY ordinal`,
-        [this.tenantId, sessionId],
-      );
-      return reordered.map(followUpFromRow);
-    });
-  }
-
-  async updateFollowUp(id: string, input: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp> {
-    return this.database.withTenant(this.tenantId, async (executor) => {
-      const existing = await executor.query<QueuedFollowUpRow>(
-        `SELECT id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at FROM queued_follow_ups WHERE tenant_id = $1::uuid AND id = $2::uuid`,
-        [this.tenantId, id],
-      );
-      if (!existing[0]) throw new NotFoundException(`Queued follow-up not found: ${id}`);
-      await this.getTaskInTenant(executor, existing[0].task_id, ownerUserId);
-      const current = followUpFromRow(existing[0]!);
-      const next = QueuedFollowUpSchema.parse({
-        ...current,
-        ...input,
-        updatedAt: nowIso(),
-      });
-      const rows = await executor.query<QueuedFollowUpRow>(
-        `UPDATE queued_follow_ups
-         SET input = $3, attachments = $4::jsonb, status = $5, error = $6, paused_reason = $7, updated_at = $8
-         WHERE tenant_id = $1::uuid AND id = $2::uuid
-         RETURNING id, task_id, session_id, ordinal, input, attachments, status, error, paused_reason, created_at, updated_at`,
-        [this.tenantId, id, next.input, JSON.stringify(next.attachments), next.status, next.error, next.pausedReason, next.updatedAt],
-      );
-      return followUpFromRow(rows[0]!);
-    });
-  }
-
-  async pauseFollowUps(sessionId: string, reason: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    return this.#transitionFollowUps(sessionId, ["queued", "sending"], { status: "paused", error: null, pausedReason: reason }, ownerUserId);
-  }
-
-  async resumeFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    return this.#transitionFollowUps(sessionId, ["paused"], { status: "queued", error: null, pausedReason: null }, ownerUserId);
-  }
-
-  async deliverFollowUps(sessionId: string, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    return this.#transitionFollowUps(sessionId, ["queued", "sending"], { status: "delivered", error: null, pausedReason: null }, ownerUserId);
-  }
-
-  async #transitionFollowUps(sessionId: string, from: QueuedFollowUp["status"][], patch: FollowUpUpdateInput, ownerUserId?: string | null): Promise<QueuedFollowUp[]> {
-    const current = await this.listFollowUps(sessionId, ownerUserId);
-    await Promise.all(current.filter((item) => from.includes(item.status)).map((item) => this.updateFollowUp(item.id, patch, ownerUserId)));
-    return this.listFollowUps(sessionId, ownerUserId);
-  }
-
   async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session> {
     return this.database.withTenant(this.tenantId, async (executor) => {
       const session = await this.createSessionInTenant(executor, input);
@@ -681,14 +512,21 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
     return this.database.withTenant(this.tenantId, async (executor) => {
       const session = await this.getSessionInTenant(executor, sessionId);
       const now = nowIso();
-      const messageId = randomUuid();
-      await executor.execute(
+      const messageId = input.id ?? randomUuid();
+      const inserted = await executor.query<{ id: string }>(
         `
 INSERT INTO messages (id, tenant_id, session_id, task_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at)
 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::message_role, 'complete', 0, 0, 0, $6, $6)
+ON CONFLICT (id) DO NOTHING
+RETURNING id
         `.trim(),
         [messageId, this.tenantId, sessionId, session.taskId, MessageRoleSchema.parse(input.role), now],
       );
+      if (inserted.length === 0) {
+        const existing = await this.getMessageInTenant(executor, messageId);
+        if (existing.sessionId !== sessionId) throw new ConflictException(`Message id already belongs to another session: ${messageId}`);
+        return existing;
+      }
       for (const [position, part] of input.parts.entries()) {
         await executor.execute(
           `
@@ -889,36 +727,6 @@ interface MessagePartRow {
   content: unknown;
   ordinal: number;
   created_at: Date | string;
-}
-
-interface QueuedFollowUpRow {
-  id: string;
-  task_id: string;
-  session_id: string;
-  ordinal: number;
-  input: string;
-  attachments: unknown;
-  status: string;
-  error: string | null;
-  paused_reason: string | null;
-  created_at: Date | string;
-  updated_at: Date | string;
-}
-
-function followUpFromRow(row: QueuedFollowUpRow): QueuedFollowUp {
-  return QueuedFollowUpSchema.parse({
-    id: row.id,
-    taskId: row.task_id,
-    sessionId: row.session_id,
-    ordinal: row.ordinal,
-    input: row.input,
-    attachments: row.attachments,
-    status: row.status,
-    error: row.error,
-    pausedReason: row.paused_reason,
-    createdAt: iso(row.created_at),
-    updatedAt: iso(row.updated_at),
-  });
 }
 
 function taskFromRow(row: TaskRow): Task {

@@ -129,13 +129,26 @@ describe("BerryApiClient", () => {
   });
 
   it("queues steering input for an active turn", async () => {
-    const fetchImpl = vi.fn(async () => json({ queued: true }));
+    const messageId = "46df263a-3453-4d22-9b65-fb585ba71c9b";
+    const message = {
+      id: messageId,
+      sessionId: "session_1",
+      role: "user",
+      status: "complete",
+      parts: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      generationMs: 0,
+      createdAt: "2026-07-23T00:00:00.000Z",
+      updatedAt: "2026-07-23T00:00:00.000Z",
+    };
+    const fetchImpl = vi.fn(async () => json({ queued: true, message }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
-    await expect(client.steerTurn("session_1", { input: "Use the existing component" })).resolves.toEqual({ queued: true });
+    await expect(client.steerTurn("session_1", { messageId, input: "Use the existing component" })).resolves.toEqual({ queued: true, message });
     expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/steer", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ input: "Use the existing component" }),
+      body: JSON.stringify({ messageId, input: "Use the existing component" }),
     }));
   });
 

@@ -2122,43 +2122,9 @@ CREATE POLICY model_conversation_kind_defaults_tenant_isolation ON model_convers
   WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
-export const QUEUED_FOLLOW_UPS_MIGRATION = `
-CREATE TABLE IF NOT EXISTS queued_follow_ups (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  ordinal integer NOT NULL,
-  input text NOT NULL,
-  attachments jsonb NOT NULL DEFAULT '[]'::jsonb,
-  status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'delivered', 'failed', 'removed')),
-  error text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (tenant_id, session_id, ordinal)
-);
-CREATE INDEX IF NOT EXISTS queued_follow_ups_tenant_session_status_idx
-  ON queued_follow_ups (tenant_id, session_id, status, ordinal);
-
-ALTER TABLE queued_follow_ups ENABLE ROW LEVEL SECURITY;
-ALTER TABLE queued_follow_ups FORCE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS queued_follow_ups_tenant_isolation ON queued_follow_ups;
-CREATE POLICY queued_follow_ups_tenant_isolation ON queued_follow_ups
-  USING (tenant_id = berry_current_tenant_id())
-  WITH CHECK (tenant_id = berry_current_tenant_id());
-`.trim();
-
-/**
- * Queue entries are durable user intent.  A cancelled runtime must not drop
- * them, so this migration adds a recoverable paused state without changing
- * the original migration used by already-running installations.
- */
-export const QUEUED_FOLLOW_UPS_STATE_V2_MIGRATION = `
-ALTER TABLE queued_follow_ups ADD COLUMN IF NOT EXISTS paused_reason text;
-ALTER TABLE queued_follow_ups DROP CONSTRAINT IF EXISTS queued_follow_ups_status_check;
-ALTER TABLE queued_follow_ups
-  ADD CONSTRAINT queued_follow_ups_status_check
-  CHECK (status IN ('queued', 'sending', 'paused', 'delivered', 'failed', 'removed'));
+export const REMOVE_QUEUED_FOLLOW_UPS_MIGRATION = `
+DROP TABLE IF EXISTS queued_follow_ups;
+DELETE FROM schema_migrations WHERE id IN (14, 22);
 `.trim();
 
 export const SANDBOX_WORKSPACES_MIGRATION = `
@@ -2613,11 +2579,6 @@ export const cloudMigrations = [
     sql: CONVERSATION_KIND_AND_GENERAL_WORKSPACES_MIGRATION,
   },
   {
-    id: 14,
-    name: "queued_follow_ups_v1",
-    sql: QUEUED_FOLLOW_UPS_MIGRATION,
-  },
-  {
     id: 15,
     name: "sandbox_workspaces_v1",
     sql: SANDBOX_WORKSPACES_MIGRATION,
@@ -2632,6 +2593,6 @@ export const cloudMigrations = [
   { id: 19, name: "settings_administration_v1", sql: MANAGEMENT_ADMIN_MIGRATION },
   { id: 20, name: "message_attachments_v1", sql: MESSAGE_ATTACHMENTS_MIGRATION },
   { id: 21, name: "file_platform_v1", sql: FILE_PLATFORM_MIGRATION },
-  { id: 22, name: "queued_follow_ups_state_v2", sql: QUEUED_FOLLOW_UPS_STATE_V2_MIGRATION },
   { id: 23, name: "capability_permission_defaults_v1", sql: CAPABILITY_PERMISSION_DEFAULTS_MIGRATION },
+  { id: 24, name: "remove_queued_follow_ups_v1", sql: REMOVE_QUEUED_FOLLOW_UPS_MIGRATION },
 ] as const;

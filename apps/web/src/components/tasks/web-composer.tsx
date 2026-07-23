@@ -1,7 +1,7 @@
 import * as React from "react";
-import { ArrowUp, GitBranch, Plus, Square } from "lucide-react";
+import { ArrowUp, Plus, Square } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
-import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type Message, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type Message, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -18,6 +18,7 @@ import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, type ComposerQuestionAnswer } from "./composer-question-overlay";
 import { QueuedMessageList } from "./queued-message-list";
 import { readFollowUpMode, saveFollowUpMode, type FollowUpMode } from "@/lib/follow-up-mode";
+import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
 
 interface PendingFileUpload {
   id: string;
@@ -53,16 +54,17 @@ export function Composer({
   onCommand,
   queuedFollowUps,
   onQueuedFollowUp,
-  onQueuedFollowUpFailed,
   onRemoveFollowUp,
   onRetryFollowUp,
   onReorderFollowUps,
   onSteerFollowUp,
   onUpdateFollowUp,
   onResumeFollowUps,
+  onEditingFollowUpChange,
   onSteerMessage,
   planProgress,
   question,
+  showProjectSwitcher,
 }: {
   config: WebConfig;
   activeTask: Task | null;
@@ -78,7 +80,7 @@ export function Composer({
   onUserMessagePersisted: (sessionId: string, optimisticMessageId: string, message: Message) => void;
   onAssistantMessage: (text: string, sessionId: string, taskId: string) => void;
   onEvent: (sessionId: string, event: Parameters<typeof reduceStream>[1]) => void;
-  runTurn: (task: Task, params: { input: string; attachments?: AttachmentInput[] | undefined; drainQueuedFollowUps?: boolean | undefined }) => Promise<void>;
+  runTurn: (task: Task, params: { input: string; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
   onCancel: () => void;
   variant: "home" | "thread";
   onCreateTask: (options?: { title?: string }) => Promise<Task | null>;
@@ -87,17 +89,18 @@ export function Composer({
   onReasoningChange: (level: ReasoningLevel) => void;
   onCommand: (name: string, args: string[]) => Promise<void>;
   queuedFollowUps: QueuedFollowUp[];
-  onQueuedFollowUp: (followUp: QueuedFollowUp, replaceId?: string) => void;
-  onQueuedFollowUpFailed: (followUp: QueuedFollowUp, error: string) => void;
+  onQueuedFollowUp: (followUp: QueuedFollowUp) => void;
   onRemoveFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onRetryFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onReorderFollowUps: (sessionId: string, orderedIds: string[]) => void;
   onSteerFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
-  onUpdateFollowUp: (followUp: QueuedFollowUp, input: string) => Promise<void>;
+  onUpdateFollowUp: (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "attachments">) => Promise<void>;
   onResumeFollowUps: (sessionId: string) => Promise<void>;
+  onEditingFollowUpChange: (followUp: QueuedFollowUp | null) => boolean;
   onSteerMessage: (task: Task, input: string, attachments: AttachmentInput[]) => Promise<void>;
   planProgress?: PlanProgress | null;
   question?: QuestionPrompt | null;
+  showProjectSwitcher: boolean;
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -107,9 +110,14 @@ export function Composer({
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
   const [uploadError, setUploadError] = React.useState("");
   const [fileDragActive, setFileDragActive] = React.useState(false);
+  const [editingFollowUp, setEditingFollowUp] = React.useState<QueuedFollowUp | null>(null);
+  const [savingQueuedEdit, setSavingQueuedEdit] = React.useState(false);
   const fileDragDepthRef = React.useRef(0);
   const editorRef = React.useRef<PromptEditorHandle>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[] } | null>(null);
+  const queueEditIndexRef = React.useRef<number | null>(null);
+  const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
   const onMentionSelected = React.useCallback((item: { id: string; value: string; label: string }) => {
     if (!item.id.startsWith("file:")) return;
     const reference: AttachmentInput = {
@@ -135,6 +143,45 @@ export function Composer({
     [config.providers],
   );
 
+  const editQueuedFollowUp = React.useCallback((followUp: QueuedFollowUp) => {
+    if (savingQueuedEdit || editingFollowUp) return;
+    if (!onEditingFollowUpChange(followUp)) return;
+    queueEditDraftRef.current = { text, attachments };
+    queueEditIndexRef.current = queuedFollowUps.findIndex((item) => item.id === followUp.id);
+    editingFollowUpRef.current = followUp;
+    setEditingFollowUp(followUp);
+    setText(followUp.input);
+    setAttachments(followUp.attachments);
+    window.requestAnimationFrame(() => editorRef.current?.setText(followUp.input));
+  }, [attachments, editingFollowUp, onEditingFollowUpChange, queuedFollowUps, savingQueuedEdit, text]);
+
+  const cancelQueuedEdit = React.useCallback(() => {
+    const draft = queueEditDraftRef.current;
+    queueEditDraftRef.current = null;
+    queueEditIndexRef.current = null;
+    editingFollowUpRef.current = null;
+    onEditingFollowUpChange(null);
+    setEditingFollowUp(null);
+    setText(draft?.text ?? "");
+    setAttachments(draft?.attachments ?? []);
+    editorRef.current?.setText(draft?.text ?? "");
+  }, [onEditingFollowUpChange]);
+
+  React.useEffect(() => () => {
+    if (editingFollowUpRef.current) onEditingFollowUpChange(null);
+  }, [onEditingFollowUpChange]);
+
+  const reorderQueuedFollowUps = React.useCallback((sessionId: string, orderedIds: string[]) => {
+    if (!editingFollowUp || editingFollowUp.sessionId !== sessionId) {
+      onReorderFollowUps(sessionId, orderedIds);
+      return;
+    }
+    const restored = [...orderedIds];
+    const index = Math.max(0, Math.min(queueEditIndexRef.current ?? restored.length, restored.length));
+    restored.splice(index, 0, editingFollowUp.id);
+    onReorderFollowUps(sessionId, restored);
+  }, [editingFollowUp, onReorderFollowUps]);
+
   const answerQuestion = React.useCallback(async (answers: ComposerQuestionAnswer[]) => {
     if (!question || !activeTask?.activeSessionId || !client) throw new Error("This question is no longer available. Refresh and try again.");
     const sessionId = activeTask.activeSessionId;
@@ -153,9 +200,30 @@ export function Composer({
   }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
 
   const submit = React.useCallback(async (event?: KeyboardEvent | null) => {
-    if (pendingUploads.some((upload) => upload.state === "uploading")) return;
+    if (savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading")) return;
     const input = text.trim() || (attachments.length > 0 ? "Review the attached files." : "");
     if (!input) return;
+    if (editingFollowUp) {
+      setSavingQueuedEdit(true);
+      setUploadError("");
+      try {
+        const draft = queueEditDraftRef.current;
+        await onUpdateFollowUp(editingFollowUp, { input, attachments });
+        queueEditDraftRef.current = null;
+        queueEditIndexRef.current = null;
+        editingFollowUpRef.current = null;
+        onEditingFollowUpChange(null);
+        setEditingFollowUp(null);
+        setText(draft?.text ?? "");
+        setAttachments(draft?.attachments ?? []);
+        editorRef.current?.setText(draft?.text ?? "");
+      } catch (cause) {
+        setUploadError(cause instanceof Error ? cause.message : "Unable to update the queued prompt");
+      } finally {
+        setSavingQueuedEdit(false);
+      }
+      return;
+    }
     const command = parseSlashCommand(input);
     if (command) {
       setUploadError("");
@@ -168,42 +236,30 @@ export function Composer({
       }
       return;
     }
-    if (working && activeTask?.activeSessionId && client) {
+    if (working && activeTask?.activeSessionId) {
       const mode = event?.shiftKey && (event.metaKey || event.ctrlKey)
         ? (followUpMode === "queue" ? "steer" : "queue")
         : followUpMode;
       if (mode === "queue") {
-        const now = new Date().toISOString();
-        const optimisticFollowUp: QueuedFollowUp = {
-          id: `local_follow_up_${globalThis.crypto.randomUUID()}`,
+        onQueuedFollowUp(createQueuedFollowUp({
           taskId: activeTask.id,
           sessionId: activeTask.activeSessionId,
           ordinal: queuedFollowUps.length,
           input,
           attachments,
-          status: "queued",
-          error: null,
-          pausedReason: null,
-          createdAt: now,
-          updatedAt: now,
-        };
-
-        // The card is a local-first interaction. It appears before any
-        // network work begins, while the real queue entry is created in the
-        // background and replaces this temporary row once confirmed.
-        onQueuedFollowUp(optimisticFollowUp);
+        }));
         setText("");
         editorRef.current?.clear();
         setAttachments([]);
-        void client.followUpTurn(activeTask.activeSessionId, { input, attachments })
-          .then((followUp) => onQueuedFollowUp(followUp, optimisticFollowUp.id))
-          .catch((cause) => {
-            const message = cause instanceof Error ? cause.message : "Unable to save this queued message";
-            onQueuedFollowUpFailed({ ...optimisticFollowUp, status: "failed", error: message, updatedAt: new Date().toISOString() }, message);
-          });
         return;
       }
 
+      if (!client) {
+        setText("");
+        editorRef.current?.clear();
+        setAttachments([]);
+        return;
+      }
       try {
         await onSteerMessage(activeTask, input, attachments);
         setText("");
@@ -212,17 +268,6 @@ export function Composer({
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : "Unable to steer the running task");
       }
-      return;
-    }
-    if (working && activeTask?.activeSessionId && !client) {
-      const sessionId = activeTask.activeSessionId;
-      if (followUpMode === "queue") {
-        const now = new Date().toISOString();
-        onQueuedFollowUp({ id: `local_follow_up_${globalThis.crypto.randomUUID()}`, taskId: activeTask.id, sessionId, ordinal: queuedFollowUps.length, input, attachments, status: "queued", error: null, pausedReason: null, createdAt: now, updatedAt: now });
-      }
-      setText("");
-      editorRef.current?.clear();
-      setAttachments([]);
       return;
     }
     if (working) return;
@@ -265,7 +310,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, followUpMode, onAssistantMessage, onCommand, onCreateTask, onEvent, onQueuedFollowUp, onQueuedFollowUpFailed, onSteerMessage, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, text, variant, working]);
+  }, [activeTask, attachments, client, editingFollowUp, followUpMode, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length) return;
@@ -363,13 +408,13 @@ export function Composer({
             {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} /> : null}
             {variant === "thread" && queuedFollowUps.length > 0 ? (
               <QueuedMessageList
-                followUps={queuedFollowUps}
+                followUps={editingFollowUp ? queuedFollowUps.filter((followUp) => followUp.id !== editingFollowUp.id) : queuedFollowUps}
                 active={working}
                 onRetry={onRetryFollowUp}
                 onRemove={onRemoveFollowUp}
-                onReorder={onReorderFollowUps}
+                onReorder={reorderQueuedFollowUps}
                 onSendNow={onSteerFollowUp}
-                onUpdate={onUpdateFollowUp}
+                onEdit={editQueuedFollowUp}
                 onResume={onResumeFollowUps}
               />
             ) : null}
@@ -377,21 +422,17 @@ export function Composer({
           </>
         }
         header={
-          <>
-            {variant === "home" || variant === "thread" ? (
-              <div className="berry-composer-meta berry-composer-context-row flex min-w-0 items-center gap-2 px-2 pt-2">
-                <ProjectSwitcher
-                  workspaces={workspaces}
-                  activeWorkspaceId={activeWorkspaceId}
-                  onSelectWorkspace={onSelectWorkspace}
-                  onCreateProject={onCreateProject}
-                  className="berry-composer-project-switcher"
-                />
-                {variant === "thread" ? <span className="berry-composer-context-value" title={workspaces.find((workspace) => workspace.id === activeTask?.workspaceId)?.path ?? config.workspacePath}><FileText aria-hidden /> Sandbox</span> : null}
-                {variant === "thread" && activeTask?.worktreeBranch ? <span className="berry-composer-context-value"><GitBranch aria-hidden /> {activeTask.worktreeBranch}</span> : null}
-              </div>
-            ) : null}
-          </>
+          showProjectSwitcher ? (
+            <div className="berry-composer-meta berry-composer-context-row flex min-w-0 items-center gap-2 px-2 pt-2">
+              <ProjectSwitcher
+                workspaces={workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                onSelectWorkspace={onSelectWorkspace}
+                onCreateProject={onCreateProject}
+                className="berry-composer-project-switcher"
+              />
+            </div>
+          ) : null
         }
       >
         {fileDragActive ? (
@@ -401,6 +442,12 @@ export function Composer({
           </div>
         ) : null}
         <div className="berry-composer-input flex min-h-[96px] flex-1 flex-col">
+        {editingFollowUp ? (
+          <div className="flex items-center justify-between gap-3 px-3 pt-2 text-xs text-muted-foreground">
+            <span>Editing queued message</span>
+            <Button variant="ghost" size="xs" disabled={savingQueuedEdit} onClick={cancelQueuedEdit}>Cancel</Button>
+          </div>
+        ) : null}
         {attachments.length > 0 || pendingUploads.length > 0 ? (
           <AttachmentGroup className="px-3 pt-2">
             {pendingUploads.map((upload) => (
@@ -430,12 +477,13 @@ export function Composer({
         <div className="berry-composer-editor relative flex-1">
           <PromptEditor
             ref={editorRef}
-            placeholder={variant === "home" ? "Ask Berry anything, @ for files or folders, / for commands, # for related conversations" : "Ask for follow-up changes"}
+            placeholder={editingFollowUp ? "Edit queued prompt" : variant === "home" ? "Ask Berry anything, @ for files or folders, / for commands, # for related conversations" : "Ask for follow-up changes"}
             autoFocus
             mentions={mentions}
             onPasteEvent={handlePaste}
             onChange={setText}
             onSubmit={(event) => void submit(event)}
+            onEscape={editingFollowUp ? cancelQueuedEdit : undefined}
           />
         </div>
         <div className="berry-composer-controls flex min-w-0 flex-nowrap items-center gap-1">
@@ -445,7 +493,7 @@ export function Composer({
           <span className="min-w-0 flex-1" />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{composerModels.find((item) => item.id === model)?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-64"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => onModelChange(item.id)}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoning[0]!.toUpperCase() + reasoning.slice(1)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-64"><DropdownMenuLabel>Reasoning</DropdownMenuLabel>{(["off", "low", "medium", "high"] as const).map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span className="capitalize">{level}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
-          {working ? (
+          {working && !editingFollowUp ? (
             <Button
               size="icon-lg"
               variant="secondary"
@@ -459,9 +507,9 @@ export function Composer({
             <Button
               size="icon-lg"
               variant="secondary"
-              disabled={pendingUploads.some((upload) => upload.state === "uploading") || (!text.trim() && attachments.length === 0)}
+              disabled={savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading") || (!text.trim() && attachments.length === 0)}
               onClick={() => void submit()}
-              aria-label="Send"
+              aria-label={editingFollowUp ? "Save queued message" : "Send"}
               className="berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45"
             >
               <ArrowUp size={18} aria-hidden />

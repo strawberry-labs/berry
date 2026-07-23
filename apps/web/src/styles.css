@@ -1300,6 +1300,7 @@ code, pre {
 }
 
 .berry-project-switcher-popover {
+  margin-left: 5px;
   border-color: var(--berry-border-strong);
   background: var(--berry-control-bg);
   box-shadow: var(--berry-shadow-floating);
@@ -1319,7 +1320,24 @@ code, pre {
 
 .berry-composer-project-switcher {
   max-width: min(260px, 100%);
+  border: 0;
   background: transparent;
+  box-shadow: none;
+  transition: none;
+}
+
+.berry-composer-project-switcher.berry-task-pill--interactive:hover,
+.berry-composer-project-switcher.berry-task-pill--interactive:active {
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+.berry-composer-project-switcher.berry-task-pill--interactive:focus-visible {
+  background: transparent;
+  box-shadow: none;
+  outline: 1px solid var(--berry-border-strong);
+  outline-offset: 2px;
 }
 
 .berry-plan-progress-anchor {
@@ -1510,8 +1528,10 @@ code, pre {
 .berry-queued-message-paused svg { width: 14px; height: 14px; }
 
 .berry-queued-message-presence { min-height: 0; flex: none; overflow: visible; }
+.berry-queued-message-presence[data-presence="entering"],
+.berry-queued-message-presence[data-presence="exiting"] { overflow: hidden; }
 .berry-queued-message-presence[data-presence="entering"] { animation: berry-queued-message-enter 180ms both; }
-.berry-queued-message-presence[data-presence="exiting"] { overflow: hidden; pointer-events: none; animation: berry-queued-message-exit 180ms both; }
+.berry-queued-message-presence[data-presence="exiting"] { pointer-events: none; animation: berry-queued-message-exit 180ms both; }
 
 @keyframes berry-queued-message-enter {
   from { height: 0; opacity: 0; }
@@ -1550,12 +1570,22 @@ code, pre {
   cursor: grab;
 }
 .berry-queued-message-drag:active { cursor: grabbing; }
-.berry-queued-message-drag svg { position: absolute; top: 5px; width: 14px; height: 14px; }
-.berry-queued-message-queue-icon { right: 0; }
-.berry-queued-message-grip { left: -3px; opacity: 0; transition: opacity 150ms cubic-bezier(0.4, 0, 0.2, 1); }
+.berry-queued-message-drag svg {
+  position: absolute;
+  top: 5px;
+  left: 4px;
+  width: 14px;
+  height: 14px;
+  transition: opacity 120ms cubic-bezier(0.2, 0, 0, 1), transform 120ms cubic-bezier(0.2, 0, 0, 1), filter 120ms cubic-bezier(0.2, 0, 0, 1);
+}
+.berry-queued-message-queue-icon { opacity: 1; transform: scale(1); filter: blur(0); }
+.berry-queued-message-grip { opacity: 0; transform: scale(.25); filter: blur(4px); }
 .berry-queued-message-row:hover .berry-queued-message-grip,
 .berry-queued-message-row:focus-within .berry-queued-message-grip,
-.berry-queued-message-row.is-dragging .berry-queued-message-grip { opacity: 1; }
+.berry-queued-message-row.is-dragging .berry-queued-message-grip { opacity: 1; transform: scale(1); filter: blur(0); }
+.berry-queued-message-row:hover .berry-queued-message-queue-icon,
+.berry-queued-message-row:focus-within .berry-queued-message-queue-icon,
+.berry-queued-message-row.is-dragging .berry-queued-message-queue-icon { opacity: 0; transform: scale(.25); filter: blur(4px); }
 
 .berry-queued-message-text {
   display: -webkit-box;
@@ -1604,8 +1634,6 @@ code, pre {
 }
 .berry-queued-message-delete svg,
 .berry-queued-message-more svg { width: 14px; height: 14px; }
-.berry-queued-message-edit { width: 100%; height: 24px; border: 1px solid var(--berry-border-strong); border-radius: 8px; background: var(--berry-control-bg); padding: 0 7px; color: var(--berry-text); font-size: 14px; font-weight: 445; line-height: 16px; outline: none; }
-
 .berry-queued-message-menu {
   width: max-content;
   min-width: 0;
@@ -1630,7 +1658,6 @@ code, pre {
 
 .berry-composer-context-row {
   min-height: 38px;
-  border-bottom: 1px solid var(--berry-border);
   padding-bottom: 7px;
 }
 

@@ -49,7 +49,7 @@ import {
   POLICY_DISTRIBUTION_MIGRATION,
   POLICY_DISTRIBUTION_TABLES,
   POLICY_DISTRIBUTION_TENANT_SCOPED_TABLES,
-  QUEUED_FOLLOW_UPS_MIGRATION,
+  REMOVE_QUEUED_FOLLOW_UPS_MIGRATION,
   SANDBOX_WORKSPACES_MIGRATION,
   PERSONAL_CAPABILITIES_MIGRATION,
   ORG_CAPABILITIES_MIGRATION,
@@ -159,7 +159,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24]);
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {
@@ -173,11 +173,10 @@ describe("cloud postgres schema", () => {
     expect(FILE_PLATFORM_MIGRATION).not.toContain("DROP TABLE");
   });
 
-  it("adds tenant-scoped queued follow-ups without changing legacy task tables", () => {
-    expect(QUEUED_FOLLOW_UPS_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS queued_follow_ups");
-    expect(QUEUED_FOLLOW_UPS_MIGRATION).toContain("UNIQUE (tenant_id, session_id, ordinal)");
-    expect(QUEUED_FOLLOW_UPS_MIGRATION).toContain("queued_follow_ups_tenant_isolation");
-    expect(QUEUED_FOLLOW_UPS_MIGRATION).not.toContain("DROP TABLE");
+  it("removes obsolete server-side queued follow-up storage", () => {
+    expect(REMOVE_QUEUED_FOLLOW_UPS_MIGRATION).toContain("DROP TABLE IF EXISTS queued_follow_ups;");
+    expect(REMOVE_QUEUED_FOLLOW_UPS_MIGRATION).toContain("DELETE FROM schema_migrations WHERE id IN (14, 22);");
+    expect(cloudMigrations.at(-1)).toMatchObject({ id: 24, name: "remove_queued_follow_ups_v1" });
     expect(SANDBOX_WORKSPACES_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS sandbox_workspaces");
     expect(SANDBOX_WORKSPACES_MIGRATION).toContain("sandbox_workspaces_tenant_isolation");
     expect(PERSONAL_CAPABILITIES_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS personal_skills");

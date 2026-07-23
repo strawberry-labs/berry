@@ -30,9 +30,34 @@ import { HistoryPlugin } from "@lexical/react/LexicalHistoryPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
+import { useHotkeys } from "react-hotkeys-hook";
 import { detectTrigger, type DetectedTrigger, type MentionTrigger } from "@/lib/mentions";
 
 export type MentionCategory = "files" | "folders" | "commands" | "skills" | "subagents" | "sessions";
+export type PromptSendBehavior = "enter" | "modifier";
+
+export function readPromptSendBehavior(storage?: Pick<Storage, "getItem">): PromptSendBehavior {
+  const value = storage?.getItem("berry.web.sendBehavior")
+    ?? (typeof window === "undefined" ? null : window.localStorage.getItem("berry.web.sendBehavior"));
+  return value === "modifier" ? "modifier" : "enter";
+}
+
+export function shouldSubmitPromptOnEnter(
+  event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "isComposing" | "metaKey" | "repeat" | "shiftKey"> | null,
+  behavior: PromptSendBehavior,
+): boolean {
+  if (!event) return behavior === "enter";
+  if (event.isComposing || event.repeat) return false;
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+  return behavior === "enter";
+}
+
+export function shouldSubmitPromptOnModifierEnter(
+  event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "isComposing" | "metaKey" | "repeat" | "shiftKey"> | null,
+): boolean {
+  if (!event || event.isComposing || event.repeat || event.altKey) return false;
+  return event.metaKey || event.ctrlKey;
+}
 
 export interface PromptMentionConfig {
   id: string;
@@ -131,8 +156,23 @@ export interface PromptEditorMentions {
 export interface PromptEditorHandle {
   focus: () => void;
   clear: () => void;
+  setText: (text: string) => void;
   insertText: (text: string) => void;
   insertMention: (config: PromptMentionConfig, trigger: MentionTrigger) => void;
+}
+
+function replaceEditorText(editor: LexicalEditor, text: string): void {
+  editor.update(() => {
+    const root = $getRoot();
+    root.clear();
+    const paragraph = $createParagraphNode();
+    text.split("\n").forEach((line, index) => {
+      if (index > 0) paragraph.append($createLineBreakNode());
+      if (line) paragraph.append($createTextNode(line));
+    });
+    root.append(paragraph);
+    paragraph.selectEnd();
+  });
 }
 
 function MentionDetectPlugin({ mentionsRef }: { mentionsRef: React.RefObject<PromptEditorMentions | null> }) {
@@ -204,12 +244,19 @@ function EscapePlugin({ onEscape }: { onEscape: () => void }) {
   return null;
 }
 
-function SubmitPlugin({ onSubmit }: { onSubmit: (event: KeyboardEvent | null) => void }) {
+function SubmitPlugin({ behavior, onSubmit }: { behavior: PromptSendBehavior; onSubmit: (event: KeyboardEvent | null) => void }) {
   const [editor] = useLexicalComposerContext();
   const submitRef = React.useRef(onSubmit);
+  const behaviorRef = React.useRef(behavior);
   submitRef.current = onSubmit;
+  behaviorRef.current = behavior;
   React.useEffect(() => editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
-    if (event?.shiftKey) return false;
+    if (shouldSubmitPromptOnModifierEnter(event)) {
+      event?.preventDefault();
+      submitRef.current(event ?? null);
+      return true;
+    }
+    if (!shouldSubmitPromptOnEnter(event, behaviorRef.current)) return false;
     event?.preventDefault();
     submitRef.current(event ?? null);
     return true;
@@ -243,17 +290,7 @@ function HandlePlugin({
   React.useEffect(() => {
     if (initialText && !seededRef.current) {
       seededRef.current = true;
-      editor.update(() => {
-        const root = $getRoot();
-        root.clear();
-        const paragraph = $createParagraphNode();
-        initialText.split("\n").forEach((line, index) => {
-          if (index > 0) paragraph.append($createLineBreakNode());
-          if (line) paragraph.append($createTextNode(line));
-        });
-        root.append(paragraph);
-        paragraph.selectEnd();
-      });
+      replaceEditorText(editor, initialText);
     }
     if (autoFocus) editor.focus();
   }, [autoFocus, editor, initialText]);
@@ -292,6 +329,7 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
     onSubmit,
     onEscape,
     onPasteEvent,
+    sendBehavior,
     testId = "composer-input",
   }: {
     placeholder: string;
@@ -299,9 +337,10 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
     initialText?: string | undefined;
     mentions?: PromptEditorMentions | undefined;
     onChange: (text: string) => void;
-  onSubmit: (event: KeyboardEvent | null) => void;
+    onSubmit: (event: KeyboardEvent | null) => void;
     onEscape?: (() => void) | undefined;
     onPasteEvent?: ((event: ClipboardEvent) => boolean) | undefined;
+    sendBehavior?: PromptSendBehavior | undefined;
     testId?: string;
   },
   ref: React.Ref<PromptEditorHandle>,
@@ -309,10 +348,48 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
   const editorBox = React.useRef<{ editor: LexicalEditor | null }>({ editor: null });
   const mentionsRef = React.useRef<PromptEditorMentions | null>(mentions ?? null);
   mentionsRef.current = mentions ?? null;
+  const [storedSendBehavior, setStoredSendBehavior] = React.useState<PromptSendBehavior>("enter");
+  React.useEffect(() => {
+    if (sendBehavior) return;
+    const sync = () => setStoredSendBehavior(readPromptSendBehavior());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === "berry.web.sendBehavior") sync();
+    };
+    sync();
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [sendBehavior]);
+  const resolvedSendBehavior = sendBehavior ?? storedSendBehavior;
+  useHotkeys<HTMLElement>(
+    ["meta+enter", "ctrl+enter", "meta+shift+enter", "ctrl+shift+enter"],
+    (event) => {
+      event.stopImmediatePropagation();
+      onSubmit(event);
+    },
+    {
+      enableOnContentEditable: true,
+      enabled: (event) => {
+        const root = editorBox.current.editor?.getRootElement();
+        return !event.isComposing
+          && !event.repeat
+          && event.target instanceof Node
+          && Boolean(root?.contains(event.target));
+      },
+      ignoreEventWhen: (event) => event.defaultPrevented,
+      preventDefault: false,
+    },
+    [onSubmit],
+  );
 
   React.useImperativeHandle(ref, () => ({
     focus: () => editorBox.current.editor?.focus(),
     clear: () => editorBox.current.editor?.update(() => $getRoot().clear()),
+    setText: (text: string) => {
+      const editor = editorBox.current.editor;
+      if (!editor) return;
+      replaceEditorText(editor, text);
+      editor.focus();
+    },
     insertText: (text: string) => {
       const editor = editorBox.current.editor;
       if (!editor) return;
@@ -349,6 +426,9 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
               className="berry-prompt-editor"
               data-testid={testId}
               aria-label={placeholder}
+              aria-keyshortcuts={resolvedSendBehavior === "enter"
+                ? "Enter Meta+Enter Control+Enter"
+                : "Meta+Enter Control+Enter"}
               aria-placeholder={placeholder}
               placeholder={<div className="berry-prompt-placeholder pointer-events-none absolute select-none">{placeholder}</div>}
             />
@@ -363,7 +443,7 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
         <HandlePlugin handleRef={editorBox} autoFocus={autoFocus} initialText={initialText} />
         {mentions ? <MentionDetectPlugin mentionsRef={mentionsRef} /> : null}
         {mentions ? <MentionKeysPlugin mentionsRef={mentionsRef} /> : null}
-        <SubmitPlugin onSubmit={onSubmit} />
+        <SubmitPlugin behavior={resolvedSendBehavior} onSubmit={onSubmit} />
         {onEscape ? <EscapePlugin onEscape={onEscape} /> : null}
         <PastePlugin onPaste={onPasteEvent} />
       </div>

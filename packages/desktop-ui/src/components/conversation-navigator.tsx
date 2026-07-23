@@ -1,21 +1,22 @@
 import * as React from "react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry/desktop-ui/components/ui/tooltip";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
 export interface NavigatorItem {
   id: string;
   label: string;
+  preview?: string;
+  resources?: string[];
 }
 
 const VIEWPORT_SELECTOR = '[data-slot="message-scroller-viewport"]';
 /** Codex only shows the rail once a conversation has enough turns to navigate. */
 const MIN_ITEMS = 4;
+const PREVIEW_DELAY_MS = 500;
+const PREVIEW_WIDTH_PX = 288;
+const PREVIEW_FALLBACK_HEIGHT_PX = 172;
+const VIEWPORT_GUTTER_PX = 12;
 
-function sameSet(a: Set<string>, b: Set<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const value of a) if (!b.has(value)) return false;
-  return true;
-}
+type PreviewPosition = { left: number; top: number };
 
 /** Flash the just-scrolled-to message so the eye lands on it (Codex's Ne). */
 function flashHighlight(node: HTMLElement): void {
@@ -31,10 +32,9 @@ function flashHighlight(node: HTMLElement): void {
 
 /**
  * Codex's conversation navigator: a vertical rail of thin ticks, one per user
- * message, sitting at the left edge of the thread. The tick for every on-screen
- * message brightens (contiguous visible run, tracked with an IntersectionObserver
- * rooted on the scroll viewport); hovering a tick previews the message and
- * clicking smooth-scrolls to it with a highlight flash.
+ * message, sitting at the left edge of the thread. The active message is tracked
+ * against the transcript viewport with an IntersectionObserver; hovering the
+ * rail previews a turn and clicking a marker scrolls to its user-message anchor.
  */
 export function ConversationNavigator({
   containerRef,
@@ -43,7 +43,16 @@ export function ConversationNavigator({
   containerRef: React.RefObject<HTMLElement | null>;
   items: NavigatorItem[];
 }) {
-  const [activeIds, setActiveIds] = React.useState<Set<string>>(() => new Set());
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [hoveredId, setHoveredId] = React.useState<string | null>(null);
+  const [previewId, setPreviewId] = React.useState<string | null>(null);
+  const [previewPosition, setPreviewPosition] = React.useState<PreviewPosition | null>(null);
+  const railRef = React.useRef<HTMLDivElement>(null);
+  const previewRef = React.useRef<HTMLElement>(null);
+  const rowRefs = React.useRef(new Map<string, HTMLButtonElement>());
+  const hoveredIdRef = React.useRef<string | null>(null);
+  const hoverTimerRef = React.useRef<number | null>(null);
+  const pointerInsideRef = React.useRef(false);
   // Re-run the observer when the set of messages changes, not on every render.
   const idsKey = items.map((item) => item.id).join("|");
 
@@ -54,20 +63,8 @@ export function ConversationNavigator({
     const visible = new Set<string>();
 
     const recompute = () => {
-      const first = order.findIndex((id) => visible.has(id));
-      if (first === -1) {
-        setActiveIds((prev) => (prev.size ? new Set() : prev));
-        return;
-      }
-      let last = first;
-      for (let i = order.length - 1; i > first; i--) {
-        if (visible.has(order[i]!)) {
-          last = i;
-          break;
-        }
-      }
-      const next = new Set(order.slice(first, last + 1));
-      setActiveIds((prev) => (sameSet(prev, next) ? prev : next));
+      const next = order.find((id) => visible.has(id)) ?? null;
+      setActiveId((current) => current === next ? current : next);
     };
 
     const observer = new IntersectionObserver(
@@ -101,6 +98,72 @@ export function ConversationNavigator({
     };
   }, [containerRef, idsKey, items.length]);
 
+  const updatePreviewPosition = React.useCallback((id: string) => {
+    const rail = railRef.current;
+    const row = rowRefs.current.get(id);
+    if (!rail || !row) return;
+
+    const railRect = rail.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const previewHeight = previewRef.current?.offsetHeight ?? PREVIEW_FALLBACK_HEIGHT_PX;
+    const left = Math.min(
+      window.innerWidth - PREVIEW_WIDTH_PX - VIEWPORT_GUTTER_PX,
+      railRect.right + VIEWPORT_GUTTER_PX,
+    );
+    const top = Math.max(
+      VIEWPORT_GUTTER_PX,
+      Math.min(
+        rowRect.top + rowRect.height / 2 - previewHeight / 2,
+        window.innerHeight - previewHeight - VIEWPORT_GUTTER_PX,
+      ),
+    );
+    setPreviewPosition({ left: Math.max(VIEWPORT_GUTTER_PX, left), top });
+  }, []);
+
+  const clearHoverTimer = React.useCallback(() => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  }, []);
+
+  const closePreview = React.useCallback(() => {
+    clearHoverTimer();
+    pointerInsideRef.current = false;
+    hoveredIdRef.current = null;
+    setHoveredId(null);
+    setPreviewId(null);
+    setPreviewPosition(null);
+  }, [clearHoverTimer]);
+
+  const updateHoveredMarker = React.useCallback((id: string | null) => {
+    if (!id || hoveredIdRef.current === id) return;
+    hoveredIdRef.current = id;
+    setHoveredId(id);
+    if (previewId) {
+      setPreviewId(id);
+      window.requestAnimationFrame(() => updatePreviewPosition(id));
+    }
+  }, [previewId, updatePreviewPosition]);
+
+  React.useEffect(() => () => clearHoverTimer(), [clearHoverTimer]);
+
+  React.useLayoutEffect(() => {
+    if (!previewId) return;
+    updatePreviewPosition(previewId);
+  }, [previewId, updatePreviewPosition]);
+
+  React.useLayoutEffect(() => {
+    if (!activeId) return;
+    const rail = railRef.current;
+    const row = rowRefs.current.get(activeId);
+    if (!rail || !row) return;
+    const railRect = rail.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.top < railRect.top) rail.scrollTop += rowRect.top - railRect.top;
+    else if (rowRect.bottom > railRect.bottom) rail.scrollTop += rowRect.bottom - railRect.bottom;
+  }, [activeId]);
+
   const scrollTo = React.useCallback(
     (id: string) => {
       const scrollEl = containerRef.current?.querySelector<HTMLElement>(VIEWPORT_SELECTOR);
@@ -114,44 +177,108 @@ export function ConversationNavigator({
 
   if (items.length < MIN_ITEMS) return null;
 
+  const previewItem = previewId ? items.find((item) => item.id === previewId) ?? null : null;
+  const previewResources = previewItem?.resources ?? [];
+  const visibleResources = previewResources.slice(0, 3);
+  const hiddenResourceCount = Math.max(0, previewResources.length - visibleResources.length);
+
   return (
     <nav
       aria-label="User messages"
       className="berry-convo-rail absolute top-1/2 left-1.5 z-20 hidden -translate-y-1/2 md:block"
     >
-      {/* delayDuration 0 for an instant preview; the tooltip portals to <body>
-          so it escapes the rail's overflow clip (the old inline pill was
-          clipped by the scroll container's forced overflow-x). */}
-      <TooltipProvider delayDuration={0}>
-        <div className="group/rail flex max-h-[min(70vh,32rem)] flex-col overflow-y-auto overscroll-contain py-1 pr-2.5 pl-1 opacity-30 transition-opacity duration-150 [scrollbar-width:none] group-hover/rail:opacity-100 hover:opacity-100 focus-within:opacity-100">
-          {items.map((item, index) => {
-            const active = activeIds.has(item.id);
-            return (
-              <Tooltip key={item.id}>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={() => scrollTo(item.id)}
-                    aria-current={active ? "true" : undefined}
-                    aria-label={`Jump to message ${index + 1}`}
-                    className="group/row relative flex h-2 w-8 shrink-0 cursor-pointer items-center"
-                  >
-                    <span
-                      className={cn(
-                        "h-0.5 rounded-full transition-[width,background-color] duration-300 group-hover/row:w-6",
-                        active ? "w-6 bg-foreground" : "w-4 bg-muted-foreground/60",
-                      )}
-                    />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right" className="max-w-80 truncate">
-                  {item.label || "(no content)"}
-                </TooltipContent>
-              </Tooltip>
-            );
-          })}
-        </div>
-      </TooltipProvider>
+      <div
+        ref={railRef}
+        className="h-[min(70vh,32rem)] max-h-[32rem] w-16 overflow-y-auto overscroll-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        onPointerEnter={(event) => {
+          pointerInsideRef.current = true;
+          updateHoveredMarker(markerIdFromTarget(event.target));
+          clearHoverTimer();
+          hoverTimerRef.current = window.setTimeout(() => {
+            hoverTimerRef.current = null;
+            const id = hoveredIdRef.current;
+            if (!pointerInsideRef.current || !id) return;
+            setPreviewId(id);
+            window.requestAnimationFrame(() => updatePreviewPosition(id));
+          }, PREVIEW_DELAY_MS);
+        }}
+        onPointerMove={(event) => updateHoveredMarker(markerIdFromTarget(event.target))}
+        onPointerLeave={closePreview}
+      >
+        {items.map((item, index) => {
+          const active = activeId === item.id;
+          const hovered = hoveredId === item.id;
+          const baseWidth = markerWidth(item, index);
+          const width = active ? 52 : hovered ? Math.max(baseWidth, 32) : baseWidth;
+          return (
+            <button
+              key={item.id}
+              ref={(node) => setMarkerRowRef(rowRefs.current, item.id, node)}
+              type="button"
+              data-conversation-marker={item.id}
+              onClick={() => scrollTo(item.id)}
+              onPointerEnter={() => updateHoveredMarker(item.id)}
+              onFocus={() => {
+                clearHoverTimer();
+                updateHoveredMarker(item.id);
+                setPreviewId(item.id);
+              }}
+              onBlur={(event) => {
+                if (!railRef.current?.contains(event.relatedTarget)) closePreview();
+              }}
+              aria-current={active ? "true" : undefined}
+              aria-label={`Jump to message ${index + 1}`}
+              className="flex h-2 w-full shrink-0 cursor-pointer items-center px-1 text-left outline-none focus-visible:bg-muted/60"
+            >
+              <span
+                className={cn(
+                  "h-0.5 rounded-full transition-[width,opacity] duration-[90ms] ease-out motion-reduce:transition-none",
+                  active ? "bg-foreground opacity-100" : "bg-muted-foreground/60 opacity-60",
+                  !active && hovered && "opacity-90",
+                )}
+                style={{ width }}
+              />
+            </button>
+          );
+        })}
+      </div>
+      {previewItem && previewPosition ? (
+        <aside
+          ref={previewRef}
+          data-conversation-preview
+          aria-live="polite"
+          className="pointer-events-none fixed z-50 w-72 overflow-hidden rounded-2xl border border-border/70 bg-popover p-3 text-popover-foreground shadow-[0_14px_32px_rgb(0_0_0_/_0.28),0_3px_10px_rgb(0_0_0_/_0.18)]"
+          style={previewPosition}
+        >
+          <p className="line-clamp-2 text-sm font-medium leading-5" title={previewItem.label || "(no content)"}>
+            {previewItem.label || "(no content)"}
+          </p>
+          <p className="mt-1 line-clamp-3 text-xs leading-4 text-muted-foreground" title={previewItem.preview || "No assistant response yet."}>
+            {previewItem.preview || "No assistant response yet."}
+          </p>
+          {visibleResources.length > 0 ? (
+            <footer className="mt-3 flex min-w-0 items-center gap-1 border-t border-border/70 pt-2 text-[11px] text-muted-foreground">
+              {visibleResources.map((resource) => <span key={resource} className="min-w-0 truncate rounded bg-muted px-1.5 py-0.5" title={resource}>{resource}</span>)}
+              {hiddenResourceCount > 0 ? <span className="shrink-0">+{hiddenResourceCount}</span> : null}
+            </footer>
+          ) : null}
+        </aside>
+      ) : null}
     </nav>
   );
+}
+
+function markerIdFromTarget(target: EventTarget | null): string | null {
+  if (!(target instanceof Element)) return null;
+  return target.closest<HTMLElement>("[data-conversation-marker]")?.dataset.conversationMarker ?? null;
+}
+
+function setMarkerRowRef(rows: Map<string, HTMLButtonElement>, id: string, node: HTMLButtonElement | null): void {
+  if (node) rows.set(id, node);
+  else rows.delete(id);
+}
+
+function markerWidth(item: NavigatorItem, index: number): number {
+  if ((item.resources?.length ?? 0) > 0 || (item.preview?.length ?? 0) > 280) return 40;
+  return index % 7 === 0 ? 22 : 12;
 }

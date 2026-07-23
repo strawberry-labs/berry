@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type QueuedFollowUp, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -12,7 +12,6 @@ import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, Att
 import {
   BerryThreadView,
   BerryUserEditorFrame,
-  fullUserText,
   isImageMessagePart,
   type BerryThreadAdapter,
 } from "@berry/desktop-ui/components/berry-thread-view";
@@ -50,6 +49,14 @@ import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sideb
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
 import { WebHelpMenu } from "./shell/web-help-menu";
+import {
+  QUEUED_FOLLOW_UP_STORAGE_PREFIX,
+  commitQueuedFollowUps,
+  nextQueuedFollowUp,
+  readQueuedFollowUps,
+  reconcileInterruptedQueuedFollowUps,
+  type QueuedFollowUp,
+} from "@/lib/queued-follow-ups";
 
 const ManagementSidebar = React.lazy(async () => ({
   default: (await import("./management/management-sidebar")).ManagementSidebar,
@@ -70,58 +77,6 @@ export interface ShellData {
   messages: Message[];
   user: SignedInUser | null;
   sessionResolved: boolean;
-}
-
-const LOCAL_FOLLOW_UP_PREFIX = "local_follow_up_";
-
-function isLocalFollowUp(followUp: QueuedFollowUp): boolean {
-  return followUp.id.startsWith(LOCAL_FOLLOW_UP_PREFIX);
-}
-
-function followUpOrderStorageKey(sessionId: string): string {
-  return `berry.web.followUpOrder:${sessionId}`;
-}
-
-function savedFollowUpOrder(sessionId: string): string[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const value = JSON.parse(window.localStorage.getItem(followUpOrderStorageKey(sessionId)) ?? "[]");
-    return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveFollowUpOrder(sessionId: string, orderedIds: string[]): void {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(followUpOrderStorageKey(sessionId), JSON.stringify(orderedIds));
-}
-
-function orderFollowUps(sessionId: string, followUps: QueuedFollowUp[]): QueuedFollowUp[] {
-  const fallback = [...followUps].sort((left, right) => left.ordinal - right.ordinal);
-  const saved = savedFollowUpOrder(sessionId);
-  if (saved.length === 0) return fallback;
-  const position = new Map(saved.map((id, index) => [id, index]));
-  return fallback.sort((left, right) => {
-    const leftPosition = position.get(left.id);
-    const rightPosition = position.get(right.id);
-    if (leftPosition === undefined && rightPosition === undefined) return left.ordinal - right.ordinal;
-    if (leftPosition === undefined) return 1;
-    if (rightPosition === undefined) return -1;
-    return leftPosition - rightPosition;
-  });
-}
-
-function replaceFollowUpOrderId(sessionId: string, oldId: string, newId: string): void {
-  const saved = savedFollowUpOrder(sessionId);
-  if (!saved.includes(oldId)) return;
-  saveFollowUpOrder(sessionId, saved.map((id) => id === oldId ? newId : id));
-}
-
-function removeFollowUpOrderId(sessionId: string, followUpId: string): void {
-  const saved = savedFollowUpOrder(sessionId);
-  if (!saved.includes(followUpId)) return;
-  saveFollowUpOrder(sessionId, saved.filter((id) => id !== followUpId));
 }
 
 export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks" | "messages"> {
@@ -160,6 +115,26 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [connectionState, setConnectionState] = React.useState<"online" | "offline" | "reconnecting">("online");
   const [tasks, setTasks] = React.useState(bootstrapContent.tasks);
   const [followUpsBySession, setFollowUpsBySession] = React.useState<Record<string, QueuedFollowUp[]>>({});
+  const followUpsBySessionRef = React.useRef(followUpsBySession);
+  const queuePersistenceErrorShownRef = React.useRef(false);
+  const editingFollowUpIdsRef = React.useRef(new Map<string, string>());
+  const updateSessionFollowUps = React.useCallback((
+    sessionId: string,
+    update: (current: QueuedFollowUp[]) => QueuedFollowUp[],
+  ) => {
+    const { followUps, persisted } = commitQueuedFollowUps(
+      followUpsBySessionRef.current,
+      sessionId,
+      update,
+    );
+    if (!persisted && !queuePersistenceErrorShownRef.current) {
+      queuePersistenceErrorShownRef.current = true;
+      toast.error("This queue could not be saved in this browser. Keep this tab open or remove large attachments.");
+    } else if (persisted) {
+      queuePersistenceErrorShownRef.current = false;
+    }
+    setFollowUpsBySession((current) => ({ ...current, [sessionId]: followUps }));
+  }, []);
   const [activeTaskId, setActiveTaskId] = React.useState(shellLocation.kind === "task" ? shellLocation.taskId : "");
   const fixtureWorkspace = React.useMemo<Workspace>(() => ({
     id: initial.config.workspaceId,
@@ -197,7 +172,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [startingSessions, setStartingSessions] = React.useState<Set<string>>(() => new Set());
   const permissionMode = "full-access" satisfies PermissionMode;
   const [reasoning, setReasoning] = React.useState<ReasoningLevel>("medium");
-  const [resourceErrors, setResourceErrors] = React.useState<Record<"workspaces" | "tasks" | "messages" | "stream" | "followUps" | "settings", string>>({ workspaces: "", tasks: "", messages: "", stream: "", followUps: "", settings: "" });
+  const [resourceErrors, setResourceErrors] = React.useState<Record<"workspaces" | "tasks" | "messages" | "stream" | "settings", string>>({ workspaces: "", tasks: "", messages: "", stream: "", settings: "" });
   const setResourceError = React.useCallback((resource: keyof typeof resourceErrors, message: string) => setResourceErrors((current) => ({ ...current, [resource]: message })), []);
   const [tasksLoaded, setTasksLoaded] = React.useState(initial.config.demoMode);
   const [taskRouteError, setTaskRouteError] = React.useState<"not-found" | "forbidden" | "failed" | null>(null);
@@ -245,6 +220,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // reconciliation refresh. Keep one browser-side lock per item so those
   // paths cannot start two turns for the same prompt.
   const followUpSendInFlightRef = React.useRef(new Set<string>());
+  const activeSessionsRef = React.useRef(new Set<string>());
   const activeSessionId = activeTask?.activeSessionId ?? null;
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
   const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
@@ -366,20 +342,32 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (activeTask) setActiveWorkspaceId(activeTask.workspaceId);
   }, [activeTask]);
 
-  const refreshFollowUps = React.useCallback(async (sessionId: string) => {
-    if (!client) return;
-    const items = await client.listFollowUps(sessionId);
-    setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, items) }));
-  }, [client]);
-
   React.useEffect(() => {
     const sessionId = activeTask?.activeSessionId;
-    if (!client || !sessionId) return;
-    void refreshFollowUps(sessionId)
-      .then(() => undefined)
-      .catch((cause) => setResourceError("followUps", cause instanceof Error ? cause.message : "Unable to load queued follow-ups"));
-    return undefined;
-  }, [activeTask?.activeSessionId, client, refreshFollowUps]);
+    if (!sessionId) return;
+    setFollowUpsBySession((current) => {
+      if (sessionId in current) return current;
+      const result = { ...current, [sessionId]: readQueuedFollowUps(sessionId) };
+      followUpsBySessionRef.current = result;
+      return result;
+    });
+  }, [activeTask?.activeSessionId]);
+
+  React.useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (!event.key?.startsWith(QUEUED_FOLLOW_UP_STORAGE_PREFIX)) return;
+      const sessionId = event.key.slice(QUEUED_FOLLOW_UP_STORAGE_PREFIX.length);
+      if (!sessionId) return;
+      const next = readQueuedFollowUps(sessionId);
+      setFollowUpsBySession((current) => {
+        const result = { ...current, [sessionId]: next };
+        followUpsBySessionRef.current = result;
+        return result;
+      });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   React.useEffect(() => {
     const openSearch = () => {
@@ -623,6 +611,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // is visible; it never owns or cancels server-side execution.
   const trackedSessionsRef = React.useRef(new Set<string>());
   const sessionConnectionsRef = React.useRef(new Map<string, { source: EventSource; reconnectTimer: number | null; attempts: number }>());
+  const handleQueueTurnEndRef = React.useRef<(sessionId: string, status: string) => void>(() => undefined);
+  const reconcileQueueWithTurnStateRef = React.useRef<(sessionId: string, active: boolean, messages: Message[]) => void>(() => undefined);
+  const sendNextQueuedFollowUpRef = React.useRef<(sessionId: string) => void>(() => undefined);
 
   const refreshSessionMessages = React.useCallback(async (sessionId: string) => {
     if (!client) return;
@@ -660,12 +651,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           if (event.kind !== "turn.end") return;
           setTasks((current) => current.map((task) => task.activeSessionId === sessionId ? { ...task, status: event.status } : task));
           terminal = true;
+          activeSessionsRef.current.delete(sessionId);
           stopSessionConnection(sessionId);
           void refreshSessionMessages(sessionId)
-            .then(() => resetSessionStream(sessionId))
-            .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"));
-          void refreshFollowUps(sessionId)
-            .catch((cause) => setResourceError("followUps", cause instanceof Error ? cause.message : "Unable to refresh queued follow-ups"));
+            .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"))
+            .finally(() => {
+              resetSessionStream(sessionId);
+              handleQueueTurnEndRef.current(sessionId, event.status);
+            });
           void refreshAdmin();
         },
         onError: () => {
@@ -684,7 +677,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     };
 
     connect(0);
-  }, [client, refreshAdmin, refreshFollowUps, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionStream]);
+  }, [client, refreshAdmin, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionStream]);
 
   React.useEffect(() => () => {
     for (const sessionId of [...trackedSessionsRef.current]) stopSessionConnection(sessionId);
@@ -704,6 +697,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       .then(([items, state]) => {
         if (cancelled) return;
         replaceSessionMessages(sessionId, (current) => reconcileFetchedSessionMessages(items, current));
+        if (state.active) activeSessionsRef.current.add(sessionId);
+        else activeSessionsRef.current.delete(sessionId);
+        reconcileQueueWithTurnStateRef.current(sessionId, state.active, items);
         if (state.active) attachSessionStream(sessionId);
         else resetSessionStream(sessionId);
       })
@@ -715,13 +711,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const runTurn = React.useCallback(async (
     task: Task,
-    params: { input: string; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined; drainQueuedFollowUps?: boolean | undefined },
+    params: { input: string; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined },
   ) => {
     if (!client || !task.activeSessionId) return;
     const sessionId = task.activeSessionId;
     const taskWorkspacePath = workspaces.find((workspace) => workspace.id === task.workspaceId)?.path ?? initial.config.workspacePath;
     setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
     setStartingSessions((current) => new Set(current).add(sessionId));
+    activeSessionsRef.current.add(sessionId);
     updateSessionStream(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
     // Listen before submitting so early deltas render live instead of being
     // delivered together from the server's replay buffer.
@@ -737,9 +734,22 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         reasoning,
         ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
         ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
-        ...(params.drainQueuedFollowUps ? { drainQueuedFollowUps: true } : {}),
       });
     } catch (cause) {
+      if (!(cause instanceof BerryApiError)) {
+        try {
+          const state = await client.turnState(sessionId);
+          if (state.active) {
+            activeSessionsRef.current.add(sessionId);
+            attachSessionStream(sessionId);
+            return;
+          }
+        } catch {
+          // Fall through to the original start error when acceptance cannot
+          // be confirmed.
+        }
+      }
+      activeSessionsRef.current.delete(sessionId);
       stopSessionConnection(sessionId);
       const error = cause instanceof Error ? cause : new Error("Unable to start the turn");
       updateSessionStream(sessionId, { kind: "error", message: error.message });
@@ -763,13 +773,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (!result.ok) throw new Error("The active turn could not be cancelled.");
       }
       stopSessionConnection(sessionId);
+      activeSessionsRef.current.delete(sessionId);
       updateSessionStream(sessionId, { kind: "turn.end", turnId: streamsBySession[sessionId]?.turnId ?? `cancelled_${Date.now()}`, status: "cancelled" });
       await refreshSessionMessages(sessionId);
-      await refreshFollowUps(sessionId);
+      handleQueueTurnEndRef.current(sessionId, "cancelled");
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "Unable to stop the active turn");
     }
-  }, [activeTask?.activeSessionId, client, refreshFollowUps, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
+  }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
 
   // Edit-and-resubmit: optimistically truncate the local thread at the edited
   // message, then rerun the turn from that point (the API rewinds + persists).
@@ -908,156 +919,231 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [client]);
 
   const removeFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
-    const previousOrder = savedFollowUpOrder(followUp.sessionId);
-    setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: (current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id) }));
-    removeFollowUpOrderId(followUp.sessionId, followUp.id);
-    if (!client || isLocalFollowUp(followUp)) return;
-    try {
-      await client.removeFollowUp(followUp.id);
-    } catch (cause) {
-      if (previousOrder.length > 0) saveFollowUpOrder(followUp.sessionId, previousOrder);
-      setFollowUpsBySession((current) => ({ ...current, [followUp.sessionId]: orderFollowUps(followUp.sessionId, [...(current[followUp.sessionId] ?? []), followUp]) }));
-      toast.error(cause instanceof Error ? cause.message : "Unable to remove the follow-up");
-    }
-  }, [client]);
+    const current = (followUpsBySessionRef.current[followUp.sessionId] ?? []).find((item) => item.id === followUp.id);
+    if (current?.status === "sending") return;
+    updateSessionFollowUps(followUp.sessionId, (current) => current.filter((item) => item.id !== followUp.id));
+  }, [updateSessionFollowUps]);
 
-  const rememberFollowUp = React.useCallback((followUp: QueuedFollowUp, replaceId?: string) => {
-    if (replaceId) replaceFollowUpOrderId(followUp.sessionId, replaceId, followUp.id);
-    setFollowUpsBySession((current) => ({
-      ...current,
-      [followUp.sessionId]: orderFollowUps(followUp.sessionId, [
-        ...(current[followUp.sessionId] ?? []).filter((item) => item.id !== followUp.id && item.id !== replaceId),
-        followUp,
-      ]),
-    }));
-  }, []);
-
-  const markFollowUpFailed = React.useCallback((followUp: QueuedFollowUp, error: string) => {
-    rememberFollowUp({ ...followUp, status: "failed", error, updatedAt: new Date().toISOString() });
-  }, [rememberFollowUp]);
+  const rememberFollowUp = React.useCallback((followUp: QueuedFollowUp) => {
+    updateSessionFollowUps(followUp.sessionId, (current) => [
+      ...current.filter((item) => item.id !== followUp.id),
+      followUp,
+    ].sort((left, right) => left.ordinal - right.ordinal));
+  }, [updateSessionFollowUps]);
 
   const reorderFollowUps = React.useCallback((sessionId: string, orderedIds: string[]) => {
-    saveFollowUpOrder(sessionId, orderedIds);
-    setFollowUpsBySession((current) => ({
-      ...current,
-      [sessionId]: orderFollowUps(sessionId, current[sessionId] ?? []),
-    }));
-    const hasLocalFollowUp = orderedIds.some((id) => id.startsWith(LOCAL_FOLLOW_UP_PREFIX));
-    if (!client || hasLocalFollowUp) return;
-    void client.reorderFollowUps(sessionId, orderedIds)
-      .then((followUps) => setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, followUps) })))
-      .catch((cause) => toast.error(cause instanceof Error ? cause.message : "Unable to save the queue order"));
-  }, [client]);
+    updateSessionFollowUps(sessionId, (current) => {
+      const byId = new Map(current.map((followUp) => [followUp.id, followUp]));
+      const ordered = orderedIds.flatMap((id) => {
+        const followUp = byId.get(id);
+        if (!followUp) return [];
+        byId.delete(id);
+        return [followUp];
+      });
+      return [...ordered, ...byId.values()];
+    });
+  }, [updateSessionFollowUps]);
 
-  const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
-    if (!isLocalFollowUp(followUp)) {
-      const previous = followUp;
-      const optimistic = { ...followUp, status: "queued" as const, error: null, pausedReason: null, updatedAt: new Date().toISOString() };
-      rememberFollowUp(optimistic);
-      if (!client) return;
-      try {
-        rememberFollowUp(await client.updateFollowUp(followUp.id, { status: "queued", error: null, pausedReason: null }));
-      } catch (cause) {
-        rememberFollowUp(previous);
-        const message = cause instanceof Error ? cause.message : "Unable to retry the follow-up";
-        toast.error(message);
-        throw cause;
-      }
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const optimisticFollowUp: QueuedFollowUp = {
+  const updateFollowUp = React.useCallback(async (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "attachments">) => {
+    rememberFollowUp({
       ...followUp,
-      id: `${LOCAL_FOLLOW_UP_PREFIX}${globalThis.crypto.randomUUID()}`,
-      status: "queued",
+      ...update,
+      status: followUp.status === "failed" ? "queued" : followUp.status,
+      messageId: null,
+      deliveryMode: null,
       error: null,
-      updatedAt: now,
-    };
-    rememberFollowUp(optimisticFollowUp, followUp.id);
-    if (!client) return;
-    try {
-      const retried = await client.followUpTurn(followUp.sessionId, { input: followUp.input, attachments: followUp.attachments });
-      rememberFollowUp(retried, optimisticFollowUp.id);
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : "Unable to retry the follow-up";
-      markFollowUpFailed(optimisticFollowUp, message);
-      toast.error(message);
-    }
-  }, [client, markFollowUpFailed, rememberFollowUp]);
-
-  const updateFollowUp = React.useCallback(async (followUp: QueuedFollowUp, input: string) => {
-    const previous = followUp;
-    const optimistic = { ...followUp, input, error: null, updatedAt: new Date().toISOString() };
-    rememberFollowUp(optimistic);
-    if (!client || isLocalFollowUp(followUp)) return;
-    try {
-      rememberFollowUp(await client.updateFollowUp(followUp.id, { input }));
-    } catch (cause) {
-      rememberFollowUp(previous);
-      toast.error(cause instanceof Error ? cause.message : "Unable to update the queued prompt");
-      throw cause;
-    }
-  }, [client, rememberFollowUp]);
+      updatedAt: new Date().toISOString(),
+    });
+  }, [rememberFollowUp]);
 
   const resumeFollowUps = React.useCallback(async (sessionId: string) => {
-    if (!client) return;
-    try {
-      const resumed = await client.resumeFollowUps(sessionId);
-      setFollowUpsBySession((current) => ({ ...current, [sessionId]: orderFollowUps(sessionId, resumed) }));
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to resume the queue");
-      throw cause;
-    }
-  }, [client]);
+    updateSessionFollowUps(sessionId, (current) => current.map((followUp) => followUp.status === "paused"
+      ? { ...followUp, status: "queued", pausedReason: null, error: null, updatedAt: new Date().toISOString() }
+      : followUp));
+    window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
+  }, [updateSessionFollowUps]);
 
-  const sendFollowUpNow = React.useCallback(async (followUp: QueuedFollowUp) => {
-    if (!client || isLocalFollowUp(followUp)) return;
+  const deliverFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    if (!client) return;
     if (followUpSendInFlightRef.current.has(followUp.id)) return;
     const task = tasks.find((item) => item.id === followUp.taskId);
     if (!task?.activeSessionId) throw new Error("This queued prompt no longer belongs to an active conversation.");
-    const currentlyActive = streamsBySession[followUp.sessionId]?.turnActive || startingSessions.has(followUp.sessionId);
-    const previous = followUp;
+    const currentlyActive = activeSessionsRef.current.has(followUp.sessionId);
+    let messageId = followUp.messageId ?? crypto.randomUUID();
+    let deliveryMode = followUp.deliveryMode ?? (currentlyActive ? "steer" : "turn");
     followUpSendInFlightRef.current.add(followUp.id);
-    rememberFollowUp({ ...followUp, status: "sending", error: null, pausedReason: null, updatedAt: new Date().toISOString() });
+    rememberFollowUp({ ...followUp, status: "sending", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
     try {
-      if (currentlyActive) {
-        await client.steerFollowUp(followUp.id);
+      if (deliveryMode === "steer" && !currentlyActive) {
+        const acceptedMessage = (await client.listMessages(followUp.sessionId)).find((message) => message.id === messageId);
+        if (acceptedMessage) {
+          updateSessionFollowUps(followUp.sessionId, (current) => current.filter((item) => item.id !== followUp.id));
+          return;
+        }
+        deliveryMode = "turn";
+        rememberFollowUp({ ...followUp, status: "sending", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
+      }
+
+      if (deliveryMode === "steer") {
+        const optimistic = optimisticUserMessage(followUp.sessionId, followUp.input, followUp.attachments);
+        replaceSessionMessages(followUp.sessionId, (current) => [...current, optimistic]);
+        try {
+          const result = await client.steerTurn(followUp.sessionId, { messageId, input: followUp.input, attachments: followUp.attachments });
+          replaceSessionMessages(followUp.sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, result.message));
+        } catch (cause) {
+          const recovered = !(cause instanceof BerryApiError)
+            ? (await client.listMessages(followUp.sessionId).catch(() => []))
+              .find((message) => message.id === messageId)
+            : undefined;
+          if (!recovered) {
+            replaceSessionMessages(followUp.sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
+            throw cause;
+          }
+          replaceSessionMessages(followUp.sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, recovered));
+        }
       } else {
-        await client.updateFollowUp(followUp.id, { status: "sending", error: null, pausedReason: null });
+        if (currentlyActive) {
+          rememberFollowUp({ ...followUp, status: "queued", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
+          return;
+        }
+        const existingMessage = followUp.messageId
+          ? (await client.listMessages(followUp.sessionId)).find((message) => message.id === messageId)
+          : undefined;
+        if (!existingMessage) {
+          const optimistic = optimisticUserMessage(followUp.sessionId, followUp.input, followUp.attachments);
+          replaceSessionMessages(followUp.sessionId, (current) => [...current, optimistic]);
+          try {
+            const persisted = await client.appendMessage(followUp.sessionId, {
+              messageId,
+              role: "user",
+              parts: [
+                { kind: "text", content: followUp.input },
+                ...followUp.attachments.map((attachment) => ({ kind: "attachment" as const, content: messageAttachmentContent(attachment) })),
+              ],
+            });
+            messageId = persisted.id;
+            replaceSessionMessages(followUp.sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, persisted));
+            rememberFollowUp({ ...followUp, status: "sending", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
+          } catch (cause) {
+            const recovered = !(cause instanceof BerryApiError)
+              ? (await client.listMessages(followUp.sessionId).catch(() => []))
+                .find((message) => message.id === messageId)
+              : undefined;
+            if (!recovered) {
+              replaceSessionMessages(followUp.sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
+              throw cause;
+            }
+            messageId = recovered.id;
+            replaceSessionMessages(followUp.sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, recovered));
+            rememberFollowUp({ ...followUp, status: "sending", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
+          }
+        }
         await runTurn(task, {
           input: followUp.input,
           ...(followUp.attachments.length > 0 ? { attachments: followUp.attachments } : {}),
-          drainQueuedFollowUps: true,
         });
       }
-      await refreshFollowUps(followUp.sessionId);
+      updateSessionFollowUps(followUp.sessionId, (current) => current.filter((item) => item.id !== followUp.id));
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Unable to send the queued prompt";
-      if (currentlyActive) {
-        rememberFollowUp({ ...previous, status: "failed", error: message, updatedAt: new Date().toISOString() });
-      } else {
-        try { rememberFollowUp(await client.updateFollowUp(followUp.id, { status: "failed", error: message })); }
-        catch { rememberFollowUp({ ...previous, status: "failed", error: message, updatedAt: new Date().toISOString() }); }
-      }
+      rememberFollowUp({ ...followUp, status: "failed", messageId, deliveryMode, error: message, pausedReason: null, updatedAt: new Date().toISOString() });
       toast.error(message);
       throw cause;
     } finally {
       followUpSendInFlightRef.current.delete(followUp.id);
     }
-  }, [client, refreshFollowUps, rememberFollowUp, runTurn, startingSessions, streamsBySession, tasks]);
+  }, [client, rememberFollowUp, replaceSessionMessages, runTurn, tasks, updateSessionFollowUps]);
+
+  const sendFollowUpNow = React.useCallback(async (requestedFollowUp: QueuedFollowUp) => {
+    const deliverCurrent = async () => {
+      const cached = followUpsBySessionRef.current[requestedFollowUp.sessionId] ?? readQueuedFollowUps(requestedFollowUp.sessionId);
+      const stored = readQueuedFollowUps(requestedFollowUp.sessionId);
+      const current = queuePersistenceErrorShownRef.current
+        ? cached.find((followUp) => followUp.id === requestedFollowUp.id)
+        : stored.find((followUp) => followUp.id === requestedFollowUp.id);
+      if (!current || current.status === "sending") {
+        if (!current) updateSessionFollowUps(requestedFollowUp.sessionId, (followUps) => followUps.filter((followUp) => followUp.id !== requestedFollowUp.id));
+        return;
+      }
+      await deliverFollowUp(current);
+    };
+
+    const locks = globalThis.navigator?.locks;
+    if (!locks) {
+      await deliverCurrent();
+      return;
+    }
+    await locks.request(`berry.web.queueDelivery:${requestedFollowUp.sessionId}`, { mode: "exclusive" }, deliverCurrent);
+  }, [deliverFollowUp, updateSessionFollowUps]);
+
+  const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    const queued = { ...followUp, status: "queued" as const, error: null, pausedReason: null, updatedAt: new Date().toISOString() };
+    rememberFollowUp(queued);
+    await sendFollowUpNow(queued);
+  }, [rememberFollowUp, sendFollowUpNow]);
+
+  const sendNextQueuedFollowUp = React.useCallback((sessionId: string) => {
+    const queue = followUpsBySessionRef.current[sessionId] ?? readQueuedFollowUps(sessionId);
+    const next = nextQueuedFollowUp(queue, editingFollowUpIdsRef.current.get(sessionId) ?? null);
+    if (!next) return;
+    void sendFollowUpNow(next).catch(() => undefined);
+  }, [sendFollowUpNow]);
+  sendNextQueuedFollowUpRef.current = sendNextQueuedFollowUp;
+
+  handleQueueTurnEndRef.current = (sessionId, status) => {
+    if (status === "completed") {
+      window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
+      return;
+    }
+    const pausedReason = status === "cancelled"
+      ? "Queue paused because you interrupted the current response."
+      : "Queue paused because the current response did not complete.";
+    updateSessionFollowUps(sessionId, (current) => current.map((followUp) => followUp.status === "queued" || followUp.status === "sending"
+      ? { ...followUp, status: "paused", error: null, pausedReason, updatedAt: new Date().toISOString() }
+      : followUp));
+  };
+
+  reconcileQueueWithTurnStateRef.current = (sessionId, active, messages) => {
+    const persistedMessageIds = new Set(messages.map((message) => message.id));
+    updateSessionFollowUps(sessionId, (current) => reconcileInterruptedQueuedFollowUps(current, active, persistedMessageIds));
+    if (!active) window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
+  };
+
+  const setEditingFollowUp = React.useCallback((followUp: QueuedFollowUp | null) => {
+    if (followUp) {
+      const current = (followUpsBySessionRef.current[followUp.sessionId] ?? []).find((item) => item.id === followUp.id);
+      if (!current || current.status === "sending") return false;
+      editingFollowUpIdsRef.current.set(followUp.sessionId, followUp.id);
+      return true;
+    }
+    const sessionIds = [...editingFollowUpIdsRef.current.keys()];
+    editingFollowUpIdsRef.current.clear();
+    for (const sessionId of sessionIds) {
+      if (!activeSessionsRef.current.has(sessionId)) {
+        window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
+      }
+    }
+    return true;
+  }, []);
 
   const steerActiveTurn = React.useCallback(async (task: Task, input: string, attachments: AttachmentInput[]) => {
     const sessionId = task.activeSessionId;
     if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
     const optimistic = optimisticUserMessage(sessionId, input, attachments);
+    const messageId = crypto.randomUUID();
     replaceSessionMessages(sessionId, (current) => [...current, optimistic]);
     try {
-      await client.steerTurn(sessionId, { input, attachments });
-      const persisted = [...await client.listMessages(sessionId)].reverse().find((message) => message.role === "user" && fullUserText(message) === input);
-      if (!persisted) throw new Error("The running task did not accept this steering message.");
-      replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, persisted));
+      const result = await client.steerTurn(sessionId, { messageId, input, attachments });
+      replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, result.message));
     } catch (cause) {
+      const recovered = !(cause instanceof BerryApiError)
+        ? (await client.listMessages(sessionId).catch(() => []))
+          .find((message) => message.id === messageId)
+        : undefined;
+      if (recovered) {
+        replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, recovered));
+        return;
+      }
       replaceSessionMessages(sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
       throw cause;
     }
@@ -1358,16 +1444,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onCommand={runSlashCommand}
               queuedFollowUps={activeTask.activeSessionId ? followUpsBySession[activeTask.activeSessionId] ?? [] : []}
               onQueuedFollowUp={rememberFollowUp}
-              onQueuedFollowUpFailed={markFollowUpFailed}
               onRemoveFollowUp={removeFollowUp}
               onRetryFollowUp={retryFollowUp}
               onReorderFollowUps={reorderFollowUps}
               onSteerFollowUp={sendFollowUpNow}
               onUpdateFollowUp={updateFollowUp}
               onResumeFollowUps={resumeFollowUps}
+              onEditingFollowUpChange={setEditingFollowUp}
               onSteerMessage={steerActiveTurn}
               planProgress={planProgressFromConversation(messages, stream)}
               question={stream.question}
+              showProjectSwitcher={!messages.some((message) => message.role === "user")}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
               runTurn={runTurn}
@@ -1430,14 +1517,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onCommand={runSlashCommand}
                 queuedFollowUps={[]}
                 onQueuedFollowUp={rememberFollowUp}
-                onQueuedFollowUpFailed={markFollowUpFailed}
                 onRemoveFollowUp={removeFollowUp}
                 onRetryFollowUp={retryFollowUp}
                 onReorderFollowUps={reorderFollowUps}
                 onSteerFollowUp={sendFollowUpNow}
                 onUpdateFollowUp={updateFollowUp}
                 onResumeFollowUps={resumeFollowUps}
+                onEditingFollowUpChange={setEditingFollowUp}
                 onSteerMessage={steerActiveTurn}
+                showProjectSwitcher
                 onCreateTask={createTask}
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}

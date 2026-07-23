@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { QueuedFollowUp } from "@berry/shared";
+import type { QueuedFollowUp } from "@/lib/queued-follow-ups";
 import {
   QUEUE_ROW_PRESENCE_MS,
   mergeQueuePresentationRows,
@@ -18,6 +18,8 @@ function followUp(id: string): QueuedFollowUp {
     status: "queued",
     error: null,
     pausedReason: null,
+    messageId: null,
+    deliveryMode: null,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   };

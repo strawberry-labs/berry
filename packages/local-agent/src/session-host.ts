@@ -13,12 +13,6 @@ import {
 import type { AgentSkill } from "./skills.ts";
 import type { AskUserQuestionAnswer } from "./tools.ts";
 
-export interface QueuedRuntimeFollowUp {
-  input: string;
-  images?: ImageContent[];
-  attachments?: RuntimeAttachment[];
-}
-
 export interface SessionHost {
   startTurn(options: StartTurnOptions): { turnId: string };
   resolveQuestion(questionId: string, answer: AskUserQuestionAnswer): boolean;
@@ -32,8 +26,6 @@ export interface SessionHost {
   contextStats(sessionId: string, options?: RuntimeContextStatsOptions): Promise<RuntimeContextStats>;
   steer(sessionId: string, input: string, images?: ImageContent[], attachments?: RuntimeAttachment[]): Promise<{ queued: true }>;
   followUp(sessionId: string, input: string, images?: ImageContent[], attachments?: RuntimeAttachment[]): Promise<{ queued: true }>;
-  /** Runtime hosts that support editing a live follow-up queue expose this. */
-  replaceFollowUpQueue?(sessionId: string, followUps: QueuedRuntimeFollowUp[]): Promise<void>;
   fork(sessionId: string, options?: { entryId?: string; newSessionId?: string; onEvent?: (event: AgentStreamEvent) => void }): Promise<{ sessionId: string }>;
   rewind(sessionId: string, entryId: string, options?: { onEvent?: (event: AgentStreamEvent) => void }): Promise<void>;
   rewindForEdit(sessionId: string, userOrdinal: number): Promise<void>;
@@ -65,7 +57,6 @@ export class RuntimeSessionHost implements SessionHost {
   contextStats(sessionId: string, options?: RuntimeContextStatsOptions) { return this.#runtime.contextStats(sessionId, options); }
   steer(sessionId: string, input: string, images?: ImageContent[], attachments?: RuntimeAttachment[]) { return this.#runtime.steer(sessionId, input, images, attachments); }
   followUp(sessionId: string, input: string, images?: ImageContent[], attachments?: RuntimeAttachment[]) { return this.#runtime.followUp(sessionId, input, images, attachments); }
-  replaceFollowUpQueue(sessionId: string, followUps: QueuedRuntimeFollowUp[]) { return this.#runtime.replaceFollowUpQueue(sessionId, followUps); }
   fork(sessionId: string, options?: { entryId?: string; newSessionId?: string; onEvent?: (event: AgentStreamEvent) => void }) { return this.#runtime.fork(sessionId, options); }
   rewind(sessionId: string, entryId: string, options?: { onEvent?: (event: AgentStreamEvent) => void }) { return this.#runtime.rewind(sessionId, entryId, options); }
   rewindForEdit(sessionId: string, userOrdinal: number) { return this.#runtime.rewindForEdit(sessionId, userOrdinal); }

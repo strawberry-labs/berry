@@ -56,6 +56,35 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("deduplicates retries by message id without deduplicating identical prompt text", async () => {
+    app = await createApp(fakeSessionHost());
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Message identity task" })
+      .expect(201);
+    const sessionId = created.body.session.id as string;
+    const firstId = "e6e39930-cc25-47ca-a42d-2bd38f0ff573";
+    const secondId = "75d7b975-24ae-42d9-af3c-2e1507e865b8";
+    const messageBody = (messageId: string) => ({
+      messageId,
+      role: "user",
+      parts: [{ kind: "text", content: "Run the same prompt again" }],
+    });
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/messages`).set(authHeader()).send(messageBody(firstId)).expect(201);
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/messages`).set(authHeader()).send(messageBody(firstId)).expect(201);
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/messages`).set(authHeader()).send(messageBody(secondId)).expect(201);
+
+    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/messages`).set(authHeader()).expect(200).expect(({ body }) => {
+      expect(body.map((message: { id: string }) => message.id)).toEqual([firstId, secondId]);
+      expect(body.map((message: { parts: Array<{ content: unknown }> }) => message.parts[0]?.content)).toEqual([
+        "Run the same prompt again",
+        "Run the same prompt again",
+      ]);
+    });
+  });
+
   it("isolates General chats by user and publishes one canonical kind update", async () => {
     app = await createApp(fakeSessionHost());
     const first = await request(app.getHttpServer())
@@ -185,76 +214,49 @@ describe("AgentApiController", () => {
     const steer = vi.fn(async () => ({ queued: true as const }));
     app = await createApp(fakeSessionHost({ steer }));
     const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Steer task" }).expect(201);
-
-    await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/steer`).set(authHeader()).send({
+    const messageId = "46df263a-3453-4d22-9b65-fb585ba71c9b";
+    const steeringRequest = {
+      messageId,
       input: "Use the existing component",
       attachments: [{ id: "attachment_1", name: "very-long-project-brief.pdf", mediaType: "application/pdf", size: 151552, sourceKind: "web-upload" }],
-    }).expect(201).expect({ queued: true });
+    };
+
+    const sendSteeringRequest = () => request(app!.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/steer`)
+      .set(authHeader())
+      .send(steeringRequest)
+      .expect(201);
+    const concurrentResponses = await Promise.all([sendSteeringRequest(), sendSteeringRequest()]);
+    for (const response of concurrentResponses) {
+      expect(response.body).toMatchObject({ queued: true, message: { id: messageId, role: "user" } });
+    }
+    await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/steer`).set(authHeader()).send(steeringRequest)
+      .expect(201)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({ queued: true, message: { id: messageId, role: "user" } });
+      });
     expect(steer).toHaveBeenCalledWith(created.body.session.id, "Use the existing component", [], [expect.objectContaining({ id: "attachment_1", name: "very-long-project-brief.pdf" })]);
+    expect(steer).toHaveBeenCalledTimes(1);
     await request(app.getHttpServer()).get(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).expect(200).expect(({ body }) => {
-      expect(body.at(-1)).toMatchObject({
+      expect(body.filter((message: { id: string }) => message.id === messageId)).toEqual([expect.objectContaining({
+        id: messageId,
         role: "user",
         parts: [
           expect.objectContaining({ kind: "text", content: "Use the existing component" }),
           expect.objectContaining({ kind: "attachment", content: expect.objectContaining({ name: "very-long-project-brief.pdf", mediaType: "application/pdf", size: 151552 }) }),
         ],
-      });
+      })]);
     });
   });
 
-  it("persists queued follow-ups separately from steering", async () => {
-    const replaceFollowUpQueue = vi.fn(async () => undefined);
-    app = await createApp(fakeSessionHost({ replaceFollowUpQueue }));
-    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Queue task" }).expect(201);
+  it("does not expose server-side queued follow-up persistence", async () => {
+    app = await createApp(fakeSessionHost());
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Local queue task" }).expect(201);
     const sessionId = created.body.session.id as string;
 
-    const queued = await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Run this next" }).expect(201);
-    expect(queued.body).toMatchObject({ taskId: created.body.task.id, sessionId, ordinal: 0, input: "Run this next", status: "queued" });
-    expect(replaceFollowUpQueue).toHaveBeenCalledWith(sessionId, [expect.objectContaining({ input: "Run this next" })]);
-    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(200).expect(({ body }) => {
-      expect(body).toEqual([expect.objectContaining({ id: queued.body.id, status: "queued" })]);
-    });
-    await request(app.getHttpServer()).delete(`/v1/follow-ups/${queued.body.id}`).set(authHeader()).expect(200).expect(({ body }) => {
-      expect(body.status).toBe("removed");
-    });
-    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(200).expect([]);
-  });
-
-  it("pauses interrupted follow-ups and lets the user resume them", async () => {
-    const cancel = vi.fn(async () => true);
-    app = await createApp(fakeSessionHost({ cancel }));
-    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Recover queued work" }).expect(201);
-    const sessionId = created.body.session.id as string;
-
-    const queued = await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Keep this for later" }).expect(201);
-    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/cancel`).set(authHeader()).expect(201).expect({ ok: true });
-    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(200).expect(({ body }) => {
-      expect(body).toEqual([expect.objectContaining({ id: queued.body.id, status: "paused", pausedReason: "You interrupted the active run." })]);
-    });
-
-    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups/resume`).set(authHeader()).expect(201).expect(({ body }) => {
-      expect(body).toEqual([expect.objectContaining({ id: queued.body.id, status: "queued", pausedReason: null })]);
-    });
-  });
-
-  it("loads later queued follow-ups when an idle queued prompt is sent now", async () => {
-    const replaceFollowUpQueue = vi.fn(async () => undefined);
-    app = await createApp(fakeSessionHost({ replaceFollowUpQueue }));
-    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Drain queued work" }).expect(201);
-    const sessionId = created.body.session.id as string;
-    const first = await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "First queued prompt" }).expect(201);
-    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Second queued prompt" }).expect(201);
-    await request(app.getHttpServer()).patch(`/v1/follow-ups/${first.body.id}`).set(authHeader()).send({ status: "sending" }).expect(200);
-    replaceFollowUpQueue.mockClear();
-
-    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/turns`).set(authHeader()).send({
-      input: "First queued prompt",
-      workspacePath: "/workspace",
-      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
-      drainQueuedFollowUps: true,
-    }).expect(201);
-
-    expect(replaceFollowUpQueue).toHaveBeenCalledWith(sessionId, [expect.objectContaining({ input: "Second queued prompt" })]);
+    await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).expect(404);
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/follow-ups`).set(authHeader()).send({ input: "Keep this in the browser" }).expect(404);
+    await request(app.getHttpServer()).patch("/v1/follow-ups/queue_item").set(authHeader()).send({ status: "queued" }).expect(404);
   });
 
   it("owns a bounded browser-safe sandbox workspace per task", async () => {
@@ -733,7 +735,6 @@ function fakeSessionHost(overrides: Partial<SessionHost> = {}): SessionHost {
     contextStats: async () => ({ usedTokens: 0, source: "unknown" }),
     steer: async () => ({ queued: true }),
     followUp: async () => ({ queued: true }),
-    replaceFollowUpQueue: async () => undefined,
     fork: async () => ({ sessionId: "session_fork" }),
     rewind: async () => {},
     rewindForEdit: async () => {},

@@ -411,7 +411,6 @@ class FixtureStreamSessionHost implements SessionHost {
   contextStats(...args: Parameters<SessionHost["contextStats"]>) { return this.delegate.contextStats(...args); }
   steer(...args: Parameters<SessionHost["steer"]>) { return this.delegate.steer(...args); }
   followUp(...args: Parameters<SessionHost["followUp"]>) { return this.delegate.followUp(...args); }
-  replaceFollowUpQueue(...args: Parameters<NonNullable<SessionHost["replaceFollowUpQueue"]>>) { return this.delegate.replaceFollowUpQueue!(...args); }
   fork(...args: Parameters<SessionHost["fork"]>) { return this.delegate.fork(...args); }
   rewind(...args: Parameters<SessionHost["rewind"]>) { return this.delegate.rewind(...args); }
   rewindForEdit(...args: Parameters<SessionHost["rewindForEdit"]>) { return this.delegate.rewindForEdit(...args); }
