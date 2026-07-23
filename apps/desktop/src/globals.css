@@ -458,7 +458,7 @@
 
   .berry-sidebar-project-heading {
     min-height: 28px;
-    padding: 0 10px;
+    padding-inline: 0 2px;
   }
 
   .berry-sidebar-project-heading .berry-sidebar-section-heading {
