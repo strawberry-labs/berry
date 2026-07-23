@@ -1048,6 +1048,65 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
   }, [updateSessionFollowUps]);
 
+  /**
+   * A steer is an interruption, not an inline instruction to the old turn.
+   * Let the active harness finish cancellation and projection writes first,
+   * then append the prompt and begin a new turn so message order remains
+   * assistant → user → assistant.
+   */
+  const interruptAndStartTurn = React.useCallback(async (
+    task: Task,
+    input: string,
+    attachments: AttachmentInput[],
+    messageId: string = crypto.randomUUID(),
+  ): Promise<Message> => {
+    const sessionId = task.activeSessionId;
+    if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
+
+    requestThreadBottom(sessionId);
+    const cancelled = await client.cancelTurn(sessionId);
+    if (!cancelled.ok) throw new Error("The active turn could not be interrupted.");
+
+    // The cancelled turn must no longer own the live tail before rendering the
+    // next user prompt. listMessages waits for server-side projection writes.
+    stopSessionConnection(sessionId);
+    activeSessionsRef.current.delete(sessionId);
+    resetSessionStream(sessionId);
+    await refreshSessionMessages(sessionId);
+
+    const optimistic = optimisticUserMessage(sessionId, input, attachments);
+    replaceSessionMessages(sessionId, (current) => [...current, optimistic]);
+    let persisted: Message;
+    try {
+      persisted = await client.appendMessage(sessionId, {
+        messageId,
+        role: "user",
+        parts: [
+          { kind: "text", content: input },
+          ...attachments.map((attachment) => ({ kind: "attachment" as const, content: messageAttachmentContent(attachment) })),
+        ],
+      });
+    } catch (cause) {
+      const recovered = !(cause instanceof BerryApiError)
+        ? (await client.listMessages(sessionId).catch(() => []))
+          .find((message) => message.id === messageId)
+        : undefined;
+      if (!recovered) {
+        replaceSessionMessages(sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
+        throw cause;
+      }
+      persisted = recovered;
+    }
+    replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, persisted));
+    requestThreadBottom(sessionId);
+    await runTurn(task, {
+      input,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    });
+    requestThreadBottom(sessionId);
+    return persisted;
+  }, [client, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, resetSessionStream, runTurn, stopSessionConnection]);
+
   const deliverFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
     if (!client) return;
     if (followUpSendInFlightRef.current.has(followUp.id)) return;
@@ -1070,22 +1129,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       }
 
       if (deliveryMode === "steer") {
-        const optimistic = optimisticUserMessage(followUp.sessionId, followUp.input, followUp.attachments);
-        replaceSessionMessages(followUp.sessionId, (current) => [...current, optimistic]);
-        try {
-          const result = await client.steerTurn(followUp.sessionId, { messageId, input: followUp.input, attachments: followUp.attachments });
-          replaceSessionMessages(followUp.sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, result.message));
-        } catch (cause) {
-          const recovered = !(cause instanceof BerryApiError)
-            ? (await client.listMessages(followUp.sessionId).catch(() => []))
-              .find((message) => message.id === messageId)
-            : undefined;
-          if (!recovered) {
-            replaceSessionMessages(followUp.sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
-            throw cause;
-          }
-          replaceSessionMessages(followUp.sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, recovered));
-        }
+        const message = await interruptAndStartTurn(task, followUp.input, followUp.attachments, messageId);
+        messageId = message.id;
       } else {
         if (currentlyActive) {
           rememberFollowUp({ ...followUp, status: "queued", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
@@ -1137,7 +1182,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     } finally {
       followUpSendInFlightRef.current.delete(followUp.id);
     }
-  }, [client, rememberFollowUp, replaceSessionMessages, runTurn, tasks, updateSessionFollowUps]);
+  }, [client, interruptAndStartTurn, rememberFollowUp, replaceSessionMessages, runTurn, tasks, updateSessionFollowUps]);
 
   const sendFollowUpNow = React.useCallback(async (requestedFollowUp: QueuedFollowUp) => {
     const deliverCurrent = async () => {
@@ -1212,28 +1257,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, []);
 
   const steerActiveTurn = React.useCallback(async (task: Task, input: string, attachments: AttachmentInput[]) => {
-    const sessionId = task.activeSessionId;
-    if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
-    const optimistic = optimisticUserMessage(sessionId, input, attachments);
-    const messageId = crypto.randomUUID();
-    requestThreadBottom(sessionId);
-    replaceSessionMessages(sessionId, (current) => [...current, optimistic]);
-    try {
-      const result = await client.steerTurn(sessionId, { messageId, input, attachments });
-      replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, result.message));
-    } catch (cause) {
-      const recovered = !(cause instanceof BerryApiError)
-        ? (await client.listMessages(sessionId).catch(() => []))
-          .find((message) => message.id === messageId)
-        : undefined;
-      if (recovered) {
-        replaceSessionMessages(sessionId, (current) => confirmOptimisticMessage(current, optimistic.id, recovered));
-        return;
-      }
-      replaceSessionMessages(sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
-      throw cause;
-    }
-  }, [client, replaceSessionMessages, requestThreadBottom]);
+    await interruptAndStartTurn(task, input, attachments);
+  }, [interruptAndStartTurn]);
 
   const generateImage = React.useCallback(async (task: Task, prompt: string, appendUserMessage: boolean) => {
     const sessionId = task.activeSessionId;
