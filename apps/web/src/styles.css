@@ -1517,7 +1517,9 @@ code, pre {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  margin: 0 0 8px;
+  /* The queue meets the composer's straight top edge, not its outer curved
+     shoulders. This makes the two surfaces read as one bottom stack. */
+  margin: 0 var(--berry-composer-radius);
 }
 
 .berry-queued-message-list {
