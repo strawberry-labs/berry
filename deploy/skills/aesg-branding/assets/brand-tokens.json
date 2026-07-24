@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 3,
+  "brand": "AESG",
+  "sourceManual": "AESG Brand Guidelines, January 2022",
+  "colors": {
+    "green": "#008C95",
+    "gray": "#343741",
+    "white": "#FFFFFF",
+    "purple": "#6D2077",
+    "red": "#DA291C",
+    "yellow": "#FFC72C",
+    "letterheadGray": "#53565A",
+    "letterheadTitleGreen": "#00686F"
+  },
+  "typography": {
+    "office": "Verdana",
+    "externalMarketing": "Ubuntu",
+    "arabicMarketing": "Tahoma"
+  },
+  "logo": {
+    "aspectRatio": 3.4674556213,
+    "widthPx": 586,
+    "heightPx": 169
+  },
+  "docx": {
+    "pageSize": "A4",
+    "widthDxa": 11900,
+    "heightDxa": 16840,
+    "marginsDxa": {
+      "top": 2410,
+      "right": 1268,
+      "bottom": 2127,
+      "left": 1560
+    },
+    "headerDxa": 708,
+    "footerDxa": 878
+  },
+  "xlsx": {
+    "titleRowHeightPt": 30,
+    "headerRowHeightPt": 24.75,
+    "bodyRowHeightPt": 19.5,
+    "chartSeries": ["#008C95", "#343741", "#6D2077", "#DA291C", "#FFC72C"]
+  },
+  "pptx": {
+    "standard": "16:9",
+    "template": "AESG_Presentation_16x9.pptx"
+  }
+}

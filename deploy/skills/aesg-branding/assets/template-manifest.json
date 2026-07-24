@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "generated": "2026-07-24",
+  "sources": [
+    {
+      "path": "templates/AESG_Letterhead_Dubai.docx",
+      "sha256": "652b1cc1b8c16bca1203c5925bc56a994a7720fd20ece1e12f040c48dec8b40e",
+      "purpose": "Retained A4 letterhead and report page system"
+    },
+    {
+      "path": "templates/AESG_Excel_Template_2023.xlsx",
+      "sha256": "bb80b24dc6dc1b43bb4d2ca78390adf32dd46afcd7866e5df2bc5c1064caccaa",
+      "purpose": "Sanitized one-sheet style reference; original hidden employee sheet removed"
+    },
+    {
+      "path": "templates/AESG_Presentation_16x9.pptx",
+      "sha256": "bf91eb1b7525a48c240d7899f6d4f7adec23da119c83d21caff2575b467ea327",
+      "purpose": "Retained standard 16:9 slide master, layouts, artwork, and layout library"
+    },
+    {
+      "path": "extracted/aesg-logo-primary.jpg",
+      "sha256": "b25ad7fd1fff98cd2b574778643995c6901420eb089b408abeb9dfe5ae4ca589",
+      "purpose": "Primary logo extracted from the sanitized AESG workbook"
+    },
+    {
+      "path": "extracted/letterhead-first-page-background.jpg",
+      "sha256": "80d785f4d68f748da85a0d9049601ea42f2daecf78576334b1df10860a92048e",
+      "purpose": "First-page letterhead artwork reference"
+    },
+    {
+      "path": "extracted/letterhead-continuation-overlay.png",
+      "sha256": "67f1024d39698b9a33d81847267b0e72afaa4ea8035581173334401dbdc1e48f",
+      "purpose": "Continuation-page letterhead artwork reference"
+    }
+  ],
+  "excludedForPrivacyOrSize": [
+    "Original AESG Excel Template 2023.xlsx with hidden Joiners employee records",
+    "AESG Bid Template Buildings 2.docx with live proposal content",
+    "Landscape and portrait bid PPTX files with live people, client, project, and award content",
+    "The landscape bid PPTX also fails ZIP CRC validation at ppt/media/image5.jpeg"
+  ]
+}

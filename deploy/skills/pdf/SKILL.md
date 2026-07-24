@@ -5,6 +5,11 @@ description: Create, read, extract, merge, split, rotate, OCR, secure, or fill P
 
 # PDF workflow
 
+For AESG output, activate `aesg-branding`, read
+`aesg-branding/references/brand-system.md`, and use the retained Word
+letterhead route below. Office/report PDFs inherit exact Verdana styles and
+page furniture from the approved DOCX template.
+
 ## Workspace contract
 
 - Work from `/workspace`.
@@ -14,7 +19,27 @@ description: Create, read, extract, merge, split, rotate, OCR, secure, or fill P
 - Do not publish the same file twice. The runtime will skip its automatic copy after a successful manual publication.
 - Never place helper `.py`, `.js`, or shell files in `/workspace/outputs`.
 
-## Fast path for a new PDF
+## AESG golden path
+
+Use the same JSON schema as the `docx` skill:
+
+```bash
+mkdir -p /workspace/tmp/pdfs /workspace/outputs
+python /workspace/.berry/managed-skills/pdf/scripts/create_aesg_pdf.py \
+  --spec /workspace/tmp/pdfs/spec.json \
+  --output /workspace/outputs/aesg-report.pdf
+python /workspace/.berry/managed-skills/aesg-branding/scripts/validate_artifact.py \
+  /workspace/outputs/aesg-report.pdf
+python /workspace/.berry/managed-skills/aesg-branding/scripts/render_artifact.py \
+  /workspace/outputs/aesg-report.pdf \
+  --output-dir /workspace/tmp/pdfs/rendered
+```
+
+This generates the AESG DOCX under `/workspace/tmp/pdfs`, converts it with
+LibreOffice, checks the PDF, and leaves only the final PDF in
+`/workspace/outputs`. Publish once with `media_type: application/pdf`.
+
+## Fast path for a non-AESG PDF
 
 For one straightforward report, brief, summary, or letter:
 
@@ -42,5 +67,6 @@ Do not search for or install dependencies before the first attempt. The prepared
 - Use consistent type, margins, spacing, headings, page numbers, and readable link text.
 - Keep source URLs human-readable and verify that every factual citation appears in the final PDF.
 - Avoid clipped text, overlaps, black-box glyphs, blank pages, and rasterized body text.
-- For AESG-branded work, activate `aesg-branding` and follow its PDF and asset rules before generating.
+- For AESG reports, use the bundled DOCX-to-PDF generator; direct ReportLab is
+  only for true marketing collateral or an explicit direct-PDF request.
 - In the final response, link the published PDF. Do not present helper files or internal workspace paths as deliverables.

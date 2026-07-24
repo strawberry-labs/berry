@@ -1,0 +1,13 @@
+{
+  "name": "berry-aesg-e2b-template",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsx build.ts",
+    "smoke": "tsx smoke.ts"
+  },
+  "dependencies": {
+    "e2b": "2.31.0",
+    "tsx": "4.20.3"
+  }
+}
