@@ -53,7 +53,7 @@ export const template = Template({
   )
   .copy("requirements.lock", "/opt/aesg/requirements.lock")
   .runCmd(
-    "python3 -m venv /opt/aesg/venv && /opt/aesg/venv/bin/pip install --no-cache-dir --upgrade pip==25.1.1 && /opt/aesg/venv/bin/pip install --no-cache-dir -r /opt/aesg/requirements.lock && ln -sfn /opt/aesg/venv/bin/python /usr/local/bin/python && ln -sfn /opt/aesg/venv/bin/pip /usr/local/bin/pip",
+    "python3 -m venv /opt/aesg/venv && /opt/aesg/venv/bin/pip install --no-cache-dir --upgrade pip==25.1.1 && /opt/aesg/venv/bin/pip install --no-cache-dir -r /opt/aesg/requirements.lock && printf '%s\\n' '#!/bin/sh' 'exec /opt/aesg/venv/bin/python \"$@\"' > /usr/local/bin/python && cp /usr/local/bin/python /usr/local/bin/python3 && printf '%s\\n' '#!/bin/sh' 'exec /opt/aesg/venv/bin/pip \"$@\"' > /usr/local/bin/pip && chmod 0755 /usr/local/bin/python /usr/local/bin/python3 /usr/local/bin/pip",
     { user: "root" },
   )
   .copy("skills", "/opt/aesg/skills")
