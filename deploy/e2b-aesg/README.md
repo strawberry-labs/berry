@@ -5,6 +5,10 @@ contains the five managed skills under `deploy/skills`, retained sanitized
 templates, deterministic generators, Office/PDF renderers, and exact licensed
 Verdana files supplied at build time.
 
+`build.ts` creates an ignored, minimal `.build-context` containing only those
+skills, the dependency lock, and the four font files. The E2B uploader never
+receives the wider `deploy` directory or any `.env` file.
+
 ## Licensed font handling
 
 Verdana files are intentionally not committed. Before a production build,

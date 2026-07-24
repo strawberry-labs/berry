@@ -5,3 +5,4 @@ fonts/**/*.TTF
 build-result.json
 smoke-output/
 tmp/
+.build-context/

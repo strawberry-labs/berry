@@ -1,4 +1,7 @@
 import { Template } from "e2b";
+import { fileURLToPath } from "node:url";
+
+const fileContextPath = fileURLToPath(new URL("./.build-context/", import.meta.url));
 
 const aptPackages = [
   "ca-certificates",
@@ -39,15 +42,7 @@ const aptPackages = [
 ];
 
 export const template = Template({
-  fileContextPath: "deploy",
-  fileIgnorePatterns: [
-    ".env",
-    ".env.*",
-    "helm",
-    "backups",
-    "e2b-aesg/node_modules",
-    "e2b-aesg/smoke-output",
-  ],
+  fileContextPath,
 })
   .fromUbuntuImage("24.04")
   .aptInstall(aptPackages)
@@ -56,13 +51,13 @@ export const template = Template({
     "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*",
     { user: "root" },
   )
-  .copy("e2b-aesg/requirements.lock", "/opt/aesg/requirements.lock")
+  .copy("requirements.lock", "/opt/aesg/requirements.lock")
   .runCmd(
     "python3 -m venv /opt/aesg/venv && /opt/aesg/venv/bin/pip install --no-cache-dir --upgrade pip==25.1.1 && /opt/aesg/venv/bin/pip install --no-cache-dir -r /opt/aesg/requirements.lock",
     { user: "root" },
   )
   .copy("skills", "/opt/aesg/skills")
-  .copy("e2b-aesg/fonts", "/usr/local/share/fonts/aesg")
+  .copy("fonts", "/usr/local/share/fonts/aesg")
   .runCmd(
     "fc-cache -f && test \"$(fc-match -f '%{family}' Verdana)\" = Verdana",
     { user: "root" },
