@@ -11,14 +11,23 @@ The retained Office templates override generic design advice.
 ## Prepared Berry runtime
 
 - Work from `/workspace`.
-- Write working JSON, scripts, conversions, and previews under `/workspace/tmp`.
+- Write working JSON, source data, conversions, and previews under
+  `/workspace/tmp`.
 - Put only final deliverables in `/workspace/outputs`.
-- This skill is at `/workspace/.berry/managed-skills/aesg-branding`.
+- Use `/managed-skills` in every shell command. It is the safe, read-only
+  command mount for bundled skills.
+- Never reference `/workspace/.berry` in a shell command. The platform treats
+  `/.berry` as protected configuration and rejects the command.
 - Templates are in `assets/templates`; scripts are in `scripts`.
 - Verdana, Ubuntu, LibreOffice, Poppler, qpdf, Python packages, and Node
   packages are preinstalled. Do not run package installation or dependency
   discovery unless the first canonical command fails.
 - Use the format skill's bundled generator before writing a one-off generator.
+
+If a command is rejected for mentioning a protected `/.berry` path, replace
+only the skill-root prefix with `/managed-skills` and rerun it. Do not copy the
+bundled generator, write a replacement generator, or bypass the guard
+indirectly.
 
 ## Exact identity
 
@@ -53,9 +62,10 @@ content and are deliberately not packaged in production.
 
 Run the format generator, then:
 
-1. Run `python scripts/validate_artifact.py <final-file>`.
+1. Run
+   `python /managed-skills/aesg-branding/scripts/validate_artifact.py <final-file>`.
 2. Render branded or layout-sensitive output with
-   `python scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
+   `python /managed-skills/aesg-branding/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
 3. Inspect every rendered page/slide or every relevant sheet.
 4. Confirm no Lorem Ipsum, sample names, template prompts, hidden employee
    data, or generator files remain.

@@ -9,11 +9,11 @@ const sandbox = await Sandbox.create(templateId, { timeoutMs: 180_000 });
 try {
   const dependencyCheck = [
     "set -eu",
-    "test -d /workspace/.berry/managed-skills/aesg-branding",
-    "test -f /workspace/.berry/managed-skills/docx/scripts/create_aesg_docx.py",
-    "test -f /workspace/.berry/managed-skills/pdf/scripts/create_aesg_pdf.py",
-    "test -f /workspace/.berry/managed-skills/xlsx/scripts/create_aesg_xlsx.py",
-    "test -f /workspace/.berry/managed-skills/pptx/scripts/create_aesg_pptx.py",
+    "test -d /managed-skills/aesg-branding",
+    "test -f /managed-skills/docx/scripts/create_aesg_docx.py",
+    "test -f /managed-skills/pdf/scripts/create_aesg_pdf.py",
+    "test -f /managed-skills/xlsx/scripts/create_aesg_xlsx.py",
+    "test -f /managed-skills/pptx/scripts/create_aesg_pptx.py",
     "test \"$(fc-match -f '%{family}' Verdana)\" = Verdana",
     "python -c \"import docx,pptx,openpyxl,reportlab,pypdf\"",
     "soffice --version",
@@ -100,7 +100,7 @@ try {
     ),
   );
 
-  const skillRoot = "/workspace/.berry/managed-skills";
+  const skillRoot = "/managed-skills";
   const generationCheck = [
     "set -eu",
     `python ${skillRoot}/docx/scripts/create_aesg_docx.py --spec /workspace/tmp/smoke/docx.json --output /workspace/outputs/aesg-smoke.docx`,

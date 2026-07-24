@@ -10,6 +10,11 @@ retained AESG 16:9 deck and the bundled clone-and-fill generator.
 
 ## Golden path
 
+Use `/managed-skills` for bundled scripts. Never use
+`/workspace/.berry/managed-skills` in a command; `/.berry` is protected. If a
+path is rejected, correct the prefix and rerun. Do not copy or rewrite the
+generator.
+
 Create `/workspace/tmp/pptx/spec.json`:
 
 ```json
@@ -43,12 +48,12 @@ Run:
 
 ```bash
 mkdir -p /workspace/tmp/pptx /workspace/outputs
-python /workspace/.berry/managed-skills/pptx/scripts/create_aesg_pptx.py \
+python /managed-skills/pptx/scripts/create_aesg_pptx.py \
   --spec /workspace/tmp/pptx/spec.json \
   --output /workspace/outputs/sustainability-update.pptx
-python /workspace/.berry/managed-skills/aesg-branding/scripts/validate_artifact.py \
+python /managed-skills/aesg-branding/scripts/validate_artifact.py \
   /workspace/outputs/sustainability-update.pptx
-python /workspace/.berry/managed-skills/aesg-branding/scripts/render_artifact.py \
+python /managed-skills/aesg-branding/scripts/render_artifact.py \
   /workspace/outputs/sustainability-update.pptx \
   --output-dir /workspace/tmp/pptx/rendered
 ```

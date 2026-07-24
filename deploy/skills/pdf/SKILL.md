@@ -14,7 +14,8 @@ page furniture from the approved DOCX template.
 
 - Work from `/workspace`.
 - Put only finished PDF deliverables in `/workspace/outputs`, with descriptive names ending in `.pdf`.
-- Put generator scripts, source Markdown, extracted images, and rendered previews in `/workspace/tmp/pdfs`.
+- Put source Markdown, extracted images, and rendered previews in `/workspace/tmp/pdfs`.
+- AESG reports do not need a helper script: use the bundled generator directly.
 - After validation, call `persist_artifact` once so the exact artifact link is available before the final response. Pass a name ending in `.pdf` and `media_type: application/pdf`.
 - Do not publish the same file twice. The runtime will skip its automatic copy after a successful manual publication.
 - Never place helper `.py`, `.js`, or shell files in `/workspace/outputs`.
@@ -23,14 +24,19 @@ page furniture from the approved DOCX template.
 
 Use the same JSON schema as the `docx` skill:
 
+Use `/managed-skills` for bundled scripts. Never use
+`/workspace/.berry/managed-skills` in a command; `/.berry` is protected. If a
+path is rejected, correct the prefix and rerun. Do not copy or rewrite the
+generator.
+
 ```bash
 mkdir -p /workspace/tmp/pdfs /workspace/outputs
-python /workspace/.berry/managed-skills/pdf/scripts/create_aesg_pdf.py \
+python /managed-skills/pdf/scripts/create_aesg_pdf.py \
   --spec /workspace/tmp/pdfs/spec.json \
   --output /workspace/outputs/aesg-report.pdf
-python /workspace/.berry/managed-skills/aesg-branding/scripts/validate_artifact.py \
+python /managed-skills/aesg-branding/scripts/validate_artifact.py \
   /workspace/outputs/aesg-report.pdf
-python /workspace/.berry/managed-skills/aesg-branding/scripts/render_artifact.py \
+python /managed-skills/aesg-branding/scripts/render_artifact.py \
   /workspace/outputs/aesg-report.pdf \
   --output-dir /workspace/tmp/pdfs/rendered
 ```

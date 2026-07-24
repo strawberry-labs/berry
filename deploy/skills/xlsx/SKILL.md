@@ -10,6 +10,11 @@ bundled generator before writing custom workbook code.
 
 ## Golden path
 
+Use `/managed-skills` for bundled scripts. Never use
+`/workspace/.berry/managed-skills` in a command; `/.berry` is protected. If a
+path is rejected, correct the prefix and rerun. Do not copy or rewrite the
+generator.
+
 Create `/workspace/tmp/xlsx/spec.json`:
 
 ```json
@@ -34,12 +39,12 @@ Run:
 
 ```bash
 mkdir -p /workspace/tmp/xlsx /workspace/outputs
-python /workspace/.berry/managed-skills/xlsx/scripts/create_aesg_xlsx.py \
+python /managed-skills/xlsx/scripts/create_aesg_xlsx.py \
   --spec /workspace/tmp/xlsx/spec.json \
   --output /workspace/outputs/project-status.xlsx
-python /workspace/.berry/managed-skills/aesg-branding/scripts/validate_artifact.py \
+python /managed-skills/aesg-branding/scripts/validate_artifact.py \
   /workspace/outputs/project-status.xlsx
-python /workspace/.berry/managed-skills/aesg-branding/scripts/render_artifact.py \
+python /managed-skills/aesg-branding/scripts/render_artifact.py \
   /workspace/outputs/project-status.xlsx \
   --output-dir /workspace/tmp/xlsx/rendered
 ```
