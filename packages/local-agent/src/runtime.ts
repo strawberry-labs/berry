@@ -25,6 +25,7 @@ import { OpenAIResponsesClient } from "@berry/router-client";
 import { createId, networkPolicyForSandbox, resolveModelCapabilities, sandboxPolicyForPermission, type AgentStreamEvent, type ApprovalKind, type ConversationKind, type JsonValue, type NetworkPolicy, type PermissionMode, type ReasoningLevel, type SandboxPolicy, type SandboxStatus } from "@berry/shared";
 import type { AssistantMessage, Context, ImageContent, ToolCall } from "@earendil-works/pi-ai";
 import type { BerryAssistantMessage } from "./model.ts";
+import { artifactMediaType, isAutoPublishableArtifact } from "./artifacts.ts";
 import { approvalKindForRisk, GrantStore, ToolGuard, type ApprovalDecisionKind, type ToolDecisionTraceStep, type ToolGuardRequest } from "./guard.ts";
 import { HookRunner, loadHookConfiguration } from "./hooks.ts";
 import { McpToolSource, type McpServerHealth, type McpServerSpec } from "./mcp.ts";
@@ -380,7 +381,8 @@ export function buildDefaultSystemPrompt(options: DefaultSystemPromptOptions): s
     "- When runtime-extracted PDF text is present, answer from it directly. Do not call `read_attachment`, `read_file`, or `bash` merely to reopen or re-extract the PDF.",
     "- For PDF and Office attachments, the runtime may activate the matching `pdf`, `xlsx`, `docx`, or `pptx` skill automatically. Do not call `activate_skill` again when the prompt says it is already active.",
     "- Use `read_attachment` only for UTF-8 text attachments. It is not a PDF or Office parser.",
-    "- Put finished user deliverables in /workspace/outputs. Files in that directory are published to the task automatically at the end of the turn.",
+    "- Put only finished user deliverables in /workspace/outputs. Keep helper scripts, source material, and rendered previews under /workspace/tmp.",
+    "- Finished document, media, archive, and data files in /workspace/outputs are published to the task automatically at the end of the turn. Source-code files are not auto-published; use persist_artifact only when source code is itself the requested deliverable.",
     "- Use persist_artifact only when a deliverable must be published before the turn ends; do not publish the same file both ways.",
     "- Render or OCR a PDF from its safe local path only when extracted text is empty or the user's request depends on visual layout, diagrams, or scanned pages.",
     "",
@@ -759,6 +761,7 @@ export class BerryAgentRuntime {
     }
     let manifestChanged = false;
     for (const file of files) {
+      if (!isAutoPublishableArtifact(file.name)) continue;
       if (active.publishedArtifactNames.has(file.name)) {
         manifest[file.path] = file.signature;
         manifestChanged = true;
@@ -1943,29 +1946,6 @@ function attachmentSkillName(attachment: RuntimeAttachment): "pdf" | "xlsx" | "d
   if ([".docx", ".doc"].includes(extension) || /wordprocessingml|msword/i.test(attachment.mediaType)) return "docx";
   if ([".pptx", ".ppt"].includes(extension) || /presentationml|powerpoint/i.test(attachment.mediaType)) return "pptx";
   return null;
-}
-
-function artifactMediaType(name: string): string {
-  const extension = extname(name).toLowerCase();
-  return ({
-    ".pdf": "application/pdf",
-    ".doc": "application/msword",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xls": "application/vnd.ms-excel",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".ppt": "application/vnd.ms-powerpoint",
-    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ".csv": "text/csv",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-    ".json": "application/json",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".svg": "image/svg+xml",
-    ".zip": "application/zip",
-  } as Record<string, string>)[extension] ?? "application/octet-stream";
 }
 
 function automaticAttachmentSkillInvocation(skills: AgentSkill[], attachments: RuntimeAttachment[], promptInput: string): { name: string; instructions: string } | undefined {

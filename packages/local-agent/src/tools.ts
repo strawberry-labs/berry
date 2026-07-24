@@ -11,6 +11,7 @@ import { NodeExecutionEnv } from "@berry/harness/node";
 import type { JsonValue } from "@berry/shared";
 import { Type, type TSchema } from "typebox";
 import { applyPatchWithEnv } from "./apply-patch.ts";
+import { artifactDisplayName, artifactMediaType } from "./artifacts.ts";
 import type { ArtifactStore } from "./cloud-sandbox.ts";
 import { assertShellWritePolicy } from "./sandbox.ts";
 import { assertWritableWorkspacePath, safeWorkspacePath } from "./workspace-path.ts";
@@ -717,13 +718,16 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
         "Promote a generated sandbox file to durable artifact storage so it can render in the thread.",
         Type.Object({
           path: Type.String({ description: "Path to a file inside the workspace or sandbox" }),
-          name: Type.Optional(Type.String({ description: "Display name for the artifact" })),
-          media_type: Type.Optional(Type.String({ description: "MIME type, defaults to application/octet-stream" })),
+          name: Type.Optional(Type.String({ description: "Display name for the artifact; the source extension is appended when omitted" })),
+          media_type: Type.Optional(Type.String({ description: "MIME type; inferred from the source filename when omitted" })),
         }),
         async (_id, params) => {
           const target = safeWorkspacePath(toolWorkspacePath, String(params.path));
-          const name = typeof params.name === "string" && params.name.trim() ? params.name.trim() : target.split(/[\\/]/).at(-1) ?? "artifact";
-          const mediaType = typeof params.media_type === "string" && params.media_type.trim() ? params.media_type.trim() : "application/octet-stream";
+          const requestedName = typeof params.name === "string" ? params.name : undefined;
+          const name = artifactDisplayName(target, requestedName);
+          const mediaType = typeof params.media_type === "string" && params.media_type.trim()
+            ? params.media_type.trim()
+            : artifactMediaType(target);
           const stored = await options.artifactStore!.persistFile({
             env,
             path: target,

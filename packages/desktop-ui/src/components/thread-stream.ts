@@ -329,8 +329,9 @@ export type MessageSegment =
  * Codex `LO`/`BO`: split a settled turn into the collapsible activity and the
  * always-visible final response. Everything up to and including the last
  * tool/thought segment is activity — intermediate prose included, matching the
- * live view — and only the trailing text is the final answer. Errors always
- * render in the body.
+ * live view — and only the trailing text is the final answer. Automatic
+ * output publication can happen after that text, so it does not move the
+ * final-answer boundary. Errors always render in the body.
  */
 export function classifyTurnSegments(segments: MessageSegment[]): {
   activity: MessageSegment[];
@@ -339,7 +340,7 @@ export function classifyTurnSegments(segments: MessageSegment[]): {
 } {
   let lastActivity = -1;
   segments.forEach((segment, index) => {
-    if (segment.kind === "tools" || segment.kind === "thought") lastActivity = index;
+    if (segment.kind === "thought" || (segment.kind === "tools" && !isAutomaticArtifactPublish(segment))) lastActivity = index;
   });
   const activity: MessageSegment[] = [];
   const body: MessageSegment[] = [];
@@ -349,4 +350,10 @@ export function classifyTurnSegments(segments: MessageSegment[]): {
     else activity.push(segment);
   });
   return { activity, body, hasFinalText: body.some((segment) => segment.kind === "text") };
+}
+
+function isAutomaticArtifactPublish(segment: Extract<MessageSegment, { kind: "tools" }>): boolean {
+  return segment.tools.length > 0 && segment.tools.every(
+    (tool) => tool.name === "persist_artifact" && tool.args?.automatic === true,
+  );
 }

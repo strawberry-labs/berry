@@ -121,6 +121,44 @@ describe("CloudSandboxProvider", () => {
     });
   });
 
+  it("infers PDF metadata and keeps the extension when the display name omits it", async () => {
+    const { session } = await sandboxTools();
+    await session.env.writeFile("/workspace/latest_news.pdf", Buffer.from("%PDF-1.7"));
+    const puts: Array<{ key: string; contentType: string }> = [];
+    const artifactStore = new S3CompatibleArtifactStore({
+      bucket: "berry-artifacts",
+      client: {
+        async putObject(input) {
+          puts.push({ key: input.key, contentType: input.contentType });
+          return { url: `https://objects.example.test/${input.key}` };
+        },
+      },
+    });
+    const tools = new Map(createBerryTools({
+      workspacePath: "/unused",
+      env: session.env,
+      artifactStore,
+    }).map((tool) => [tool.name, tool]));
+
+    const result = await tools.get("persist_artifact")!.execute(
+      "call_pdf",
+      { path: "latest_news.pdf", name: "Latest News Summary" } as never,
+      undefined,
+      undefined,
+    );
+
+    expect(puts).toEqual([{
+      key: expect.stringMatching(/^artifacts\/.+-Latest-News-Summary\.pdf$/),
+      contentType: "application/pdf",
+    }]);
+    expect(result.details).toMatchObject({
+      artifact: {
+        name: "Latest News Summary.pdf",
+        mediaType: "application/pdf",
+      },
+    });
+  });
+
   it("streams large sandbox outputs to a presigned object URL instead of buffering them through the API", async () => {
     const { session } = await sandboxTools();
     await session.env.writeFile("/workspace/large.pdf", Buffer.from("pdf-payload"));

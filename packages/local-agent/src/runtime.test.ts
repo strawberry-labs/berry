@@ -576,6 +576,53 @@ describe("BerryAgentRuntime", () => {
     db.close();
   });
 
+  it("auto-publishes finished outputs without persisting helper source files", async () => {
+    const { db, workspace } = setup();
+    const outputDirectory = join(workspace, "outputs");
+    mkdirSync(outputDirectory, { recursive: true });
+    writeFileSync(join(outputDirectory, "report.pdf"), "%PDF-1.7");
+    writeFileSync(join(outputDirectory, "create_report.py"), "print('helper')");
+    const persistFile = vi.fn(async (input: { name?: string; mediaType: string }) => ({
+      key: `artifacts/${input.name}`,
+      url: `/v1/artifacts/artifacts/${input.name}`,
+      storage: "s3://berry-artifacts",
+      size: 8,
+    }));
+    const runtime = new BerryAgentRuntime({
+      db,
+      artifactStore: { persistFile: persistFile as never },
+    });
+    const collector = turnCollector();
+    const toolCalls: Array<{ toolName: string; input: unknown }> = [];
+
+    runtime.startTurn({
+      sessionId: "session_output_filter",
+      taskId: "task_output_filter",
+      workspacePath: workspace,
+      input: "create the PDF",
+      permissionMode: "full-access",
+      provider,
+      apiKey: "test-key",
+      streamFn: textStreamFn("The PDF is ready."),
+      onEvent: collector.onEvent,
+      onToolCall: (call) => toolCalls.push({ toolName: call.toolName, input: call.input }),
+    });
+
+    await collector.done;
+    expect(persistFile).toHaveBeenCalledTimes(1);
+    expect(persistFile).toHaveBeenCalledWith(expect.objectContaining({
+      path: join(outputDirectory, "report.pdf"),
+      name: "report.pdf",
+      mediaType: "application/pdf",
+    }));
+    expect(toolCalls).toEqual([{
+      toolName: "persist_artifact",
+      input: { path: join(outputDirectory, "report.pdf"), automatic: true },
+    }]);
+    await runtime.dispose();
+    db.close();
+  });
+
   it("blocks on ask_user_question and resumes with the user's answer", async () => {
     const { db, workspace } = setup();
     const workspaceRow = db.workspaces().open(workspace, "ws", true);

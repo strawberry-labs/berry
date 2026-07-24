@@ -204,6 +204,16 @@ describe("classifyTurnSegments", () => {
     kind: "tools",
     tools: [{ toolCallId: id, name: "bash", status: "completed", startedAt: 0 }],
   });
+  const automaticArtifactPublish = (id: string): MessageSegment => ({
+    kind: "tools",
+    tools: [{
+      toolCallId: id,
+      name: "persist_artifact",
+      args: { path: "/workspace/outputs/report.pdf", automatic: true },
+      status: "completed",
+      startedAt: 0,
+    }],
+  });
   const text = (id: string, value: string): MessageSegment => ({ kind: "text", id, text: value });
   const thought = (id: string): MessageSegment => ({ kind: "thought", id, text: "hmm" });
   const error = (id: string): MessageSegment => ({ kind: "error", id, text: "boom" });
@@ -226,6 +236,21 @@ describe("classifyTurnSegments", () => {
     const { body, hasFinalText } = classifyTurnSegments([thought("th1"), tool("a")]);
     expect(body).toEqual([]);
     expect(hasFinalText).toBe(false);
+  });
+
+  it("keeps final prose visible when automatic output publication follows it", () => {
+    const final = text("t1", "The PDF is ready.");
+    const automatic = automaticArtifactPublish("publish-1");
+    const { activity, body, hasFinalText } = classifyTurnSegments([
+      thought("th1"),
+      tool("a"),
+      final,
+      automatic,
+      artifact("file-1"),
+    ]);
+    expect(activity).toEqual([thought("th1"), tool("a"), automatic]);
+    expect(body).toEqual([final, artifact("file-1")]);
+    expect(hasFinalText).toBe(true);
   });
 
   it("always routes errors to the body", () => {
