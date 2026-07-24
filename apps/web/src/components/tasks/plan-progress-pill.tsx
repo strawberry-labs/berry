@@ -4,6 +4,7 @@ import type { StreamState, ToolEntry } from "@berry/desktop-ui/components/thread
 import { Popover, PopoverContent, PopoverTrigger } from "@berry/desktop-ui/components/ui/popover";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { CircleCheckIcon, CircleHollow, OctagonXIcon } from "@berry/desktop-ui/lib/icons";
+import { Squircle } from "@berry/desktop-ui/lib/squircle";
 
 export type PlanItemStatus = "pending" | "in_progress" | "completed" | "failed";
 
@@ -134,27 +135,81 @@ function PlanStatusIcon({ status, className }: { status: PlanItemStatus; classNa
 
 export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
   const [open, setOpen] = React.useState(false);
+  const openTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearTimers = React.useCallback(() => {
+    if (openTimer.current) clearTimeout(openTimer.current);
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    openTimer.current = null;
+    closeTimer.current = null;
+  }, []);
+
+  const openImmediately = React.useCallback(() => {
+    clearTimers();
+    setOpen(true);
+  }, [clearTimers]);
+
+  const openOnHover = React.useCallback(() => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+    if (open || openTimer.current) return;
+    openTimer.current = setTimeout(() => {
+      openTimer.current = null;
+      setOpen(true);
+    }, 80);
+  }, [open]);
+
+  const closeAfterPointerExit = React.useCallback(() => {
+    if (openTimer.current) clearTimeout(openTimer.current);
+    openTimer.current = null;
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    // Keeps the 8px visual gap traversable without making dismissal feel delayed.
+    closeTimer.current = setTimeout(() => {
+      closeTimer.current = null;
+      setOpen(false);
+    }, 50);
+  }, []);
+
+  React.useEffect(() => clearTimers, [clearTimers]);
+
   return (
-    <div className="berry-plan-progress-anchor">
-      <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(nextOpen) => {
+        clearTimers();
+        setOpen(nextOpen);
+      }}
+    >
+      <div
+        className="berry-plan-progress-anchor"
+        onPointerEnter={openOnHover}
+        onPointerLeave={closeAfterPointerExit}
+      >
         <PopoverTrigger asChild>
           <button
             type="button"
             className="berry-plan-progress-pill"
             aria-label={`View plan progress: step ${plan.current} of ${plan.total}`}
             aria-expanded={open}
+            onFocus={openImmediately}
+            onBlur={closeAfterPointerExit}
           >
             <PlanStatusIcon status={plan.status} className={`berry-plan-progress-status is-${plan.status}`} />
             <span>Step {plan.current} / {plan.total}</span>
           </button>
         </PopoverTrigger>
-        <PopoverContent
-          side="top"
-          align="center"
-          sideOffset={10}
-          collisionPadding={16}
-          className="berry-plan-progress-popover"
-        >
+      </div>
+      <PopoverContent
+        side="top"
+        align="center"
+        sideOffset={8}
+        collisionPadding={16}
+        className="berry-plan-progress-popover-shell"
+        onPointerEnter={openImmediately}
+        onPointerLeave={closeAfterPointerExit}
+      >
+        <Squircle cornerRadius={20} className="berry-plan-progress-popover">
           <ol className="berry-plan-progress-list" aria-label="Plan steps">
             {plan.items.map((item, index) => {
               const active = index + 1 === plan.current && plan.status !== "completed";
@@ -170,8 +225,8 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
               );
             })}
           </ol>
-        </PopoverContent>
-      </Popover>
-    </div>
+        </Squircle>
+      </PopoverContent>
+    </Popover>
   );
 }
