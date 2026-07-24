@@ -15,8 +15,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -24,10 +22,15 @@ import {
 } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
-import { Archive, ChevronDown, CodeXml, Ellipsis, Folder, Folder02, MenuCollapseIcon, MessageSquare, Pencil, PencilEdit02Icon, Pin, PinOff, Plus, Trash2, Users } from "@berry/desktop-ui/lib/icons";
+import { Archive, Check, ChevronDown, CodeXml, Ellipsis, Folder, Folder02, MenuCollapseIcon, MessageSquare, Pencil, PencilEdit02Icon, Pin, PinOff, Plus, Trash2, Users } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
 const INITIAL_CONVERSATION_COUNT = 5;
+const PROJECT_SORT_OPTIONS = [
+  { value: "priority", label: "Priority" },
+  { value: "last-updated", label: "Last updated" },
+  { value: "manual", label: "Manual order" },
+] as const;
 
 export interface BerryConversationProject {
   workspace: Workspace;
@@ -67,6 +70,7 @@ export interface BerryConversationSidebarContentProps {
 }
 
 export interface ConversationSectionState {
+  projectsCollapsed: boolean;
   collapsedProjects: ReadonlySet<string>;
   expandedProjects: ReadonlySet<string>;
   chatsCollapsed: boolean;
@@ -75,6 +79,7 @@ export interface ConversationSectionState {
 }
 
 export type ConversationSectionAction =
+  | { type: "toggle-projects" }
   | { type: "toggle-project"; projectId: string }
   | { type: "show-project"; projectId: string }
   | { type: "toggle-chats" }
@@ -82,6 +87,7 @@ export type ConversationSectionAction =
   | { type: "toggle-all"; projectIds: string[] };
 
 export const INITIAL_CONVERSATION_SECTION_STATE: ConversationSectionState = {
+  projectsCollapsed: false,
   collapsedProjects: new Set(),
   expandedProjects: new Set(),
   chatsCollapsed: false,
@@ -90,6 +96,7 @@ export const INITIAL_CONVERSATION_SECTION_STATE: ConversationSectionState = {
 };
 
 export function conversationSectionReducer(state: ConversationSectionState, action: ConversationSectionAction): ConversationSectionState {
+  if (action.type === "toggle-projects") return { ...state, projectsCollapsed: !state.projectsCollapsed };
   if (action.type === "toggle-project") {
     const collapsedProjects = new Set(state.collapsedProjects);
     const expandedProjects = new Set(state.expandedProjects);
@@ -98,10 +105,10 @@ export function conversationSectionReducer(state: ConversationSectionState, acti
       collapsedProjects.add(action.projectId);
       expandedProjects.delete(action.projectId);
     }
-    return { ...state, collapsedProjects, expandedProjects, allCollapsed: false };
+    return { ...state, projectsCollapsed: false, collapsedProjects, expandedProjects, allCollapsed: false };
   }
   if (action.type === "show-project") {
-    return { ...state, expandedProjects: new Set([...state.expandedProjects, action.projectId]) };
+    return { ...state, projectsCollapsed: false, expandedProjects: new Set([...state.expandedProjects, action.projectId]) };
   }
   if (action.type === "toggle-chats") {
     return { ...state, chatsCollapsed: !state.chatsCollapsed, chatsExpanded: false, allCollapsed: false };
@@ -109,6 +116,7 @@ export function conversationSectionReducer(state: ConversationSectionState, acti
   if (action.type === "show-chats") return { ...state, chatsExpanded: true };
   const nextCollapsed = !state.allCollapsed;
   return {
+    projectsCollapsed: false,
     collapsedProjects: nextCollapsed ? new Set(action.projectIds) : new Set(),
     expandedProjects: new Set(),
     chatsCollapsed: nextCollapsed,
@@ -134,7 +142,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
   const [pendingKind, setPendingKind] = React.useState<ConversationKind | null>(null);
   const [failedKind, setFailedKind] = React.useState<ConversationKind | null>(null);
   const [kindError, setKindError] = React.useState<string | null>(null);
-  const [projectSort, setProjectSort] = React.useState<"priority" | "last-updated" | "manual">("last-updated");
+  const [projectSort, setProjectSort] = React.useState<(typeof PROJECT_SORT_OPTIONS)[number]["value"]>("last-updated");
 
   React.useEffect(() => {
     if (!pendingKind) setOptimisticKind(props.selectedKind);
@@ -197,18 +205,22 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
 
         <SidebarGroup className="berry-sidebar-project-group">
           <div className="berry-sidebar-project-heading flex items-center pb-1">
-            <h2 className="berry-sidebar-section-heading flex-1 text-xs font-medium text-sidebar-foreground/60">Projects</h2>
+            <button type="button" className="berry-sidebar-section-heading berry-sidebar-section-toggle flex min-w-0 flex-1 items-center gap-1.5 text-left text-xs font-medium text-sidebar-foreground/60" aria-expanded={!sectionState.projectsCollapsed} onClick={() => dispatch({ type: "toggle-projects" })}>
+              <span>Projects</span>
+              <ChevronDown className={cn("berry-sidebar-section-chevron size-3.5", sectionState.projectsCollapsed && "-rotate-90")} />
+            </button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button type="button" variant="ghost" size="icon-sm" className="berry-sidebar-mini-control berry-sidebar-project-header-control" aria-label="Sort projects" title="Sort projects"><Ellipsis /></Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" side="bottom" sideOffset={6} className="berry-project-sort-menu">
+              <DropdownMenuContent align="end" side="bottom" sideOffset={6} className="berry-compact-selector-surface w-52">
                 <DropdownMenuLabel>Sort by</DropdownMenuLabel>
-                <DropdownMenuRadioGroup value={projectSort} onValueChange={(value) => setProjectSort(value as typeof projectSort)}>
-                  <DropdownMenuRadioItem value="priority">Priority</DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem value="last-updated">Last updated</DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem value="manual">Manual order</DropdownMenuRadioItem>
-                </DropdownMenuRadioGroup>
+                {PROJECT_SORT_OPTIONS.map((option) => (
+                  <DropdownMenuItem key={option.value} onSelect={() => setProjectSort(option.value)}>
+                    <span>{option.label}</span>
+                    {option.value === projectSort ? <Check className="ml-auto" /> : null}
+                  </DropdownMenuItem>
+                ))}
               </DropdownMenuContent>
             </DropdownMenu>
             <Button
@@ -223,6 +235,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
             </Button>
             {props.onCreateProject ? <Button type="button" variant="ghost" size="icon-sm" className="berry-sidebar-mini-control berry-sidebar-project-header-control" aria-label="Create project" title="Create project" onClick={props.onCreateProject}><Plus /></Button> : null}
           </div>
+          <AnimatedCollapse open={!sectionState.projectsCollapsed}>
           {props.projectsLoading ? <SidebarStatus label="Loading projects" loading /> : null}
           {props.projectsError ? <SidebarStatus label={props.projectsError} error /> : null}
           {!props.projectsLoading && !props.projectsError && props.projects.length === 0 ? <SidebarStatus label="No projects" /> : null}
@@ -277,6 +290,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
               );
             })}
           </SidebarMenu>
+          </AnimatedCollapse>
         </SidebarGroup>
 
         <ConversationSection
@@ -339,9 +353,9 @@ function ConversationSection({ title, open, selected = false, onToggle, children
   return (
     <SidebarGroup className="berry-sidebar-conversation-section">
       {onToggle ? (
-        <button type="button" className="berry-sidebar-section-heading flex w-full items-center gap-2 px-2 pb-1 text-left text-xs font-medium text-sidebar-foreground/60" aria-expanded={open} aria-current={selected ? "true" : undefined} onClick={onToggle}>
-          <span className="flex-1">{title}</span>
-          <ChevronDown className={cn("size-3.5 transition-transform", !open && "-rotate-90")} />
+        <button type="button" className="berry-sidebar-section-heading berry-sidebar-section-toggle flex w-full items-center gap-1.5 px-2 pb-1 text-left text-xs font-medium text-sidebar-foreground/60" aria-expanded={open} aria-current={selected ? "true" : undefined} onClick={onToggle}>
+          <span>{title}</span>
+          <ChevronDown className={cn("berry-sidebar-section-chevron size-3.5", !open && "-rotate-90")} />
         </button>
       ) : <h2 className="berry-sidebar-section-heading px-2 pb-1 text-xs font-medium text-sidebar-foreground/60">{title}</h2>}
       <AnimatedCollapse open={open}>

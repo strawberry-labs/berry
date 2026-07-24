@@ -30,24 +30,12 @@ export function ProjectSwitcher({
   align?: "start" | "center" | "end" | undefined;
 }) {
   const [open, setOpen] = React.useState(false);
-  const hostRef = React.useRef<HTMLDivElement>(null);
-  const [composerPopoverWidth, setComposerPopoverWidth] = React.useState<number | null>(null);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? workspaces[0] ?? null;
   const projects = workspaces.filter((workspace) => workspace.workspaceKind === "project");
   const chats = workspaces.filter((workspace) => workspace.workspaceKind === "general");
 
-  React.useEffect(() => {
-    const composer = hostRef.current?.closest<HTMLElement>(".berry-composer-root");
-    if (!composer) return;
-    const updateWidth = () => setComposerPopoverWidth(Math.max(0, composer.getBoundingClientRect().width - 26));
-    updateWidth();
-    const observer = new ResizeObserver(updateWidth);
-    observer.observe(composer);
-    return () => observer.disconnect();
-  }, []);
-
   return (
-    <div ref={hostRef} className="contents">
+    <div className="contents">
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <BerryTaskPill
@@ -63,11 +51,10 @@ export function ProjectSwitcher({
             <ChevronDown className="berry-task-pill-caret shrink-0" />
           </BerryTaskPill>
         </PopoverTrigger>
-        <PopoverContent
-          align={align}
-          className="berry-project-switcher-popover w-[min(328px,calc(100vw-26px))] p-0"
-          style={composerPopoverWidth ? { width: `${composerPopoverWidth}px`, maxWidth: "calc(100vw - 26px)" } : undefined}
-        >
+          <PopoverContent
+            align={align}
+          className="berry-project-switcher-popover berry-compact-selector-surface w-[min(320px,calc(100vw-26px))] p-0"
+          >
           <Command>
             <CommandInput placeholder="Search projects…" />
             <CommandList>

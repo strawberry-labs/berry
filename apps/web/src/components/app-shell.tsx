@@ -20,6 +20,8 @@ import { Toaster } from "@berry/desktop-ui/components/ui/sonner";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import type { ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
+import { Input } from "@berry/desktop-ui/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry/desktop-ui/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -181,6 +183,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [tasksLoaded, setTasksLoaded] = React.useState(initial.config.demoMode);
   const [taskRouteError, setTaskRouteError] = React.useState<"not-found" | "forbidden" | "failed" | null>(null);
   const [creatingProject, setCreatingProject] = React.useState(false);
+  const mainPanelRef = React.useRef<HTMLElement>(null);
   const [activeOrganizationId, setActiveOrganizationId] = React.useState(initial.config.activeOrganizationId);
   const activeOrganization = config.organizations.find((org) => org.id === activeOrganizationId) ?? config.organizations[0] ?? null;
   const fallbackOrgPermissions = React.useMemo(
@@ -1379,15 +1382,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             generalTasks={generalTasks}
             activeWorkspaceId={activeWorkspaceId}
             activeTaskId={activeTask?.id ?? null}
-            creatingProject={creatingProject}
             loadError={resourceErrors.workspaces || resourceErrors.tasks}
             user={user}
             onNewTask={() => {
               navigateHome();
             }}
             onCreateProject={() => setCreatingProject(true)}
-            onCancelProject={() => setCreatingProject(false)}
-            onSubmitProject={(event) => void createProject(event)}
             onSelectWorkspace={(id) => {
               setActiveWorkspaceId(id);
               navigateHome();
@@ -1420,7 +1420,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           />
         )}
       >
-      <main className="berry-web-main flex h-full min-h-0 flex-col">
+      <main ref={mainPanelRef} className="berry-web-main flex h-full min-h-0 flex-col">
         <div className={surface === "task" ? "contents" : "hidden"}>
         {activeTask && !activeTask.deletedAt ? (
         <>
@@ -1679,6 +1679,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           </div>
         ) : null}
       </main>
+      <ProjectCreationDialog
+        container={mainPanelRef.current}
+        open={creatingProject}
+        onOpenChange={setCreatingProject}
+        onSubmit={createProject}
+      />
       </BerryShellFrame>
       <WebCommandPalette
         open={searchOpen}
@@ -1706,6 +1712,39 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       ) : null}
       {connectionState !== "online" ? <div className="fixed bottom-3 right-3 z-[80] rounded-full bg-popover px-3 py-1.5 text-xs text-popover-foreground shadow-lg" role="status">{connectionState === "offline" ? "Offline" : "Reconnecting…"}</div> : null}
     </div>
+  );
+}
+
+function ProjectCreationDialog({
+  container,
+  open,
+  onOpenChange,
+  onSubmit,
+}: {
+  container: HTMLElement | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent container={container} className="w-[calc(100%-2rem)] gap-5 sm:max-w-[24rem]" aria-describedby="create-project-description">
+        <DialogHeader className="gap-1.5">
+          <DialogTitle>Create project</DialogTitle>
+          <DialogDescription id="create-project-description">Group related chats and files in one place.</DialogDescription>
+        </DialogHeader>
+        <form className="space-y-5" onSubmit={(event) => void onSubmit(event)}>
+          <div className="space-y-2">
+            <label htmlFor="project-name" className="text-sm font-medium">Project name</label>
+            <Input id="project-name" name="projectName" placeholder="e.g. Product launch" autoFocus required maxLength={120} />
+          </div>
+          <DialogFooter>
+            <DialogClose asChild><Button type="button" variant="outline">Cancel</Button></DialogClose>
+            <Button type="submit">Create project</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
   );
 }
 

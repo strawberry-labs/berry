@@ -594,6 +594,37 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("persists a usable generation duration when a provider omits one", async () => {
+    const startTurn = vi.fn((options: StartTurnOptions) => {
+      options.onAssistantMessage?.({
+        parts: [{ kind: "text", content: "Completed response." }],
+        status: "complete",
+        model: "gpt-test",
+        usage: { inputTokens: 10, outputTokens: 5 },
+        generationMs: 0,
+      });
+      options.onEvent({ kind: "turn.end", turnId: "turn_duration_fallback", status: "completed" });
+      return { turnId: "turn_duration_fallback" };
+    });
+    app = await createApp(fakeSessionHost({ startTurn }));
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud" }).expect(201);
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader()).send({
+      input: "run",
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+    }).expect(201);
+
+    await request(app.getHttpServer()).get(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).expect(200).expect(({ body }) => {
+      expect(body.at(-1)).toMatchObject({
+        role: "assistant",
+        outputTokens: 5,
+        generationMs: expect.any(Number),
+      });
+      expect(body.at(-1).generationMs).toBeGreaterThan(0);
+    });
+  });
+
   it("routes approval decisions through the shared decision schema", async () => {
     const resolveApproval = vi.fn(() => true);
     app = await createApp(fakeSessionHost({ resolveApproval }));

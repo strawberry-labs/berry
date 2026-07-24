@@ -571,7 +571,12 @@ export class AgentApiController {
             status: message.status,
             inputTokens: message.usage?.inputTokens ?? 0,
             outputTokens: message.usage?.outputTokens ?? 0,
-            generationMs: message.generationMs ?? 0,
+            // Older or non-streaming providers can omit a decode duration.
+            // Preserve their end-to-end turn duration so the thread can still
+            // render a useful rate after the projection is reloaded.
+            generationMs: message.generationMs && message.generationMs > 0
+              ? message.generationMs
+              : Math.max(1, Date.now() - startedAt),
           }));
         },
         // Persist settled tool metadata (status/output/duration/children) as

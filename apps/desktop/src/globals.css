@@ -465,6 +465,13 @@
     padding: 0;
   }
 
+  .berry-sidebar-section-chevron {
+    flex: none;
+    transition-property: opacity, transform;
+    transition-duration: var(--duration-quick);
+    transition-timing-function: var(--ease-smooth-out);
+  }
+
   .berry-sidebar-project-header-control {
     width: 26px;
     height: 26px;
@@ -474,6 +481,30 @@
   .berry-sidebar-project-header-control svg {
     width: 14px;
     height: 14px;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .berry-sidebar-section-chevron {
+      opacity: 0;
+    }
+
+    .berry-sidebar-section-toggle:is(:hover, :focus-visible) .berry-sidebar-section-chevron {
+      opacity: 1;
+    }
+
+    .berry-sidebar-project-header-control {
+      pointer-events: none;
+      opacity: 0;
+      transition-property: opacity;
+      transition-duration: var(--duration-quick);
+      transition-timing-function: var(--ease-smooth-out);
+    }
+
+    .berry-sidebar-project-heading:is(:hover, :focus-within) .berry-sidebar-project-header-control,
+    .berry-sidebar-project-header-control[data-state="open"] {
+      pointer-events: auto;
+      opacity: 1;
+    }
   }
 
   .berry-sidebar-segment-row {
@@ -594,7 +625,7 @@
 
   .berry-sidebar-workspace-new-chat-action { right: 2px !important; }
 
-  .berry-sidebar-workspace-item:has(> .berry-sidebar-workspace-menu-action[data-state="open"]) > .berry-sidebar-workspace-action {
+  .berry-sidebar-workspace-item:has(> .berry-sidebar-workspace-action:hover, > .berry-sidebar-workspace-action:focus-visible, > .berry-sidebar-workspace-menu-action[data-state="open"]) > .berry-sidebar-workspace-action {
     opacity: 1 !important;
   }
 
@@ -658,34 +689,6 @@
     background: var(--berry-control-bg);
     box-shadow: var(--berry-shadow-floating) !important;
     color: var(--berry-text-primary);
-  }
-
-  .berry-project-sort-menu {
-    min-width: 168px;
-    border: 0;
-    border-radius: 14px;
-    padding: 6px;
-    background: var(--berry-control-bg);
-    box-shadow: var(--berry-shadow-floating);
-    color: var(--berry-text-primary);
-  }
-
-  .berry-project-sort-menu [data-slot="dropdown-menu-label"] {
-    padding: 6px 10px 4px;
-    color: var(--berry-text-tertiary);
-    font-size: 11px;
-    font-weight: 600;
-  }
-
-  .berry-project-sort-menu [data-slot="dropdown-menu-radio-item"] {
-    min-height: 32px;
-    border-radius: 9px;
-    color: var(--berry-text-secondary);
-  }
-
-  .berry-project-sort-menu [data-slot="dropdown-menu-radio-item"]:is(:hover, :focus) {
-    background: color-mix(in srgb, var(--foreground) 9%, transparent);
-    color: var(--foreground);
   }
 
   .berry-chat-actions-menu [data-slot="dropdown-menu-item"],

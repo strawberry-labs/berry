@@ -366,17 +366,11 @@ function messageAttachmentNames(parts: MessagePart[]): string[] {
   return [...names];
 }
 
-/** "3:02 AM" for today, "May 7, 2:07 PM" for any other day. */
+/** "May 7, 2:07 PM" for every message so a thread remains legible in captures and history. */
 export function formatMessageTime(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "";
-  const now = new Date();
   const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  const sameDay =
-    date.getFullYear() === now.getFullYear() &&
-    date.getMonth() === now.getMonth() &&
-    date.getDate() === now.getDate();
-  if (sameDay) return time;
   return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${time}`;
 }
 
@@ -522,10 +516,16 @@ function BerryAssistantTurnGroup({
     totalMs > 0 ? totalMs : undefined,
   ].filter((value): value is number => value !== undefined);
   const elapsedMs = elapsedCandidates.length > 0 ? Math.max(...elapsedCandidates) : undefined;
+  // Historical cloud messages created before generation duration was persisted
+  // can still report a useful, clearly-labelled turn-average rate.
+  const tokenRateDurationMs = generationMs > 0 ? generationMs : elapsedMs;
+  const tokenRateIsEstimated = generationMs <= 0 && tokenRateDurationMs != null;
   const tokensPerSecond =
-    totalOutputTokens > 0 && generationMs > 0 ? totalOutputTokens / (generationMs / 1000) : undefined;
+    totalOutputTokens > 0 && tokenRateDurationMs != null && tokenRateDurationMs > 0
+      ? totalOutputTokens / (tokenRateDurationMs / 1000)
+      : undefined;
 
-  // When the turn's reply landed. Shown as time-only for today, "May 7, 2:07 PM" otherwise.
+  // When the turn's reply landed.
   const turnTimestamp = last?.createdAt ?? first?.createdAt;
 
   // Split the turn into collapsible activity (reasoning + tool rows +
@@ -614,9 +614,13 @@ function BerryAssistantTurnGroup({
             <span
               className="inline-flex select-none items-center gap-1 px-2 tabular-nums"
               title={
-                reportedOutputTokens > 0
-                  ? "Inference decode speed (output tokens ÷ generation time)"
-                  : "Inference decode speed (output tokens estimated from length ÷ generation time)"
+                tokenRateIsEstimated
+                  ? reportedOutputTokens > 0
+                    ? "Estimated turn rate (output tokens ÷ available turn duration)"
+                    : "Estimated turn rate (output tokens estimated from length ÷ available turn duration)"
+                  : reportedOutputTokens > 0
+                    ? "Inference decode speed (output tokens ÷ generation time)"
+                    : "Inference decode speed (output tokens estimated from length ÷ generation time)"
               }
             >
               <GaugeIcon className="size-3.5" />

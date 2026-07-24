@@ -1,5 +1,5 @@
 import * as React from "react";
-import { LogOut, X } from "lucide-react";
+import { LogOut } from "lucide-react";
 import type { Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
@@ -30,7 +30,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@berry/desktop-ui/components/ui/sidebar";
-import { Archive, ArrowLeft02, CirclePlus, Ellipsis, FolderOpen, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
+import { Archive, ArrowLeft02, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
 import type { SignedInUser } from "./auth-boundary";
 
 export type SettingsTab = "general" | "prompts" | "providers" | "mcp" | "skills" | "privacy" | "usage" | "archived" | "governance" | "platform";
@@ -67,23 +67,38 @@ export function WebWindowChrome({ onHome, onSearch }: {
   onHome: () => void;
   onSearch: () => void;
 }) {
+  const { state, toggleSidebar } = useSidebar();
+  const sidebarCollapsed = state === "collapsed";
+
   return (
-    <div className="pointer-events-none absolute top-0 left-0 z-50 flex h-[var(--berry-titlebar-height)] w-full items-center">
+    <div
+      className="berry-web-window-chrome pointer-events-none absolute top-0 left-0 z-50 flex h-[var(--berry-titlebar-height)] items-center"
+      data-sidebar-state={state}
+    >
       <div className="berry-web-window-header pointer-events-auto flex w-full items-center justify-between">
-        <button type="button" className="berry-web-home-link" onClick={onHome} aria-label="Berry home">
-          <BerryLogo className="size-5" alt="" />
-          <span>Berry</span>
+        <button
+          type="button"
+          className="berry-web-home-link"
+          onClick={sidebarCollapsed ? toggleSidebar : onHome}
+          aria-label={sidebarCollapsed ? "Expand sidebar" : "Berry home"}
+          title={sidebarCollapsed ? "Expand sidebar" : undefined}
+        >
+          <BerryLogo className="berry-web-home-logo size-5" alt="" />
+          <LayoutAlignLeft className="berry-web-sidebar-expand-icon" aria-hidden="true" />
+          <span className="berry-web-home-label">Berry</span>
         </button>
-        <div className="berry-web-window-actions flex items-center">
-          <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button>
-          <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" className="berry-web-header-icon berry-web-sidebar-toggle" />
-        </div>
+        {!sidebarCollapsed ? (
+          <div className="berry-web-window-actions flex items-center">
+            <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button>
+            <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" className="berry-web-header-icon berry-web-sidebar-toggle" />
+          </div>
+        ) : null}
       </div>
     </div>
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, creatingProject, loadError, user, onNewTask, onCreateProject, onCancelProject, onSubmitProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onSettings, onSignOut }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, loadError, user, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onSettings, onSignOut }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -91,13 +106,10 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   activeTaskId: string | null;
   chatsSelected: boolean;
   librarySelected: boolean;
-  creatingProject: boolean;
   loadError: string;
   user: SignedInUser | null;
   onNewTask: () => void;
   onCreateProject: () => void;
-  onCancelProject: () => void;
-  onSubmitProject: (event: React.FormEvent<HTMLFormElement>) => void;
   onSelectWorkspace: (id: string) => void;
   onSelectChats: () => void;
   onOpenTask: (id: string) => void;
@@ -151,7 +163,6 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
               <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem>
             </SidebarMenu>
-            {creatingProject ? <form className="new-project-form" onSubmit={onSubmitProject}><input name="projectName" placeholder="Project name" autoFocus required maxLength={120} /><button type="submit">Create</button><button type="button" aria-label="Cancel project" onClick={onCancelProject}><X size={14} /></button></form> : null}
           </>
         )}
       />
@@ -186,7 +197,7 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <SidebarMenuAction type="button" className="berry-sidebar-workspace-action berry-sidebar-workspace-menu-action" aria-label={`Actions for ${workspace.name}`} title="Project actions" onClick={(event) => event.stopPropagation()}>
+          <SidebarMenuAction type="button" className="berry-sidebar-workspace-action berry-sidebar-workspace-menu-action md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100" aria-label={`Actions for ${workspace.name}`} title="Project actions" onClick={(event) => event.stopPropagation()}>
             <Ellipsis />
           </SidebarMenuAction>
         </DropdownMenuTrigger>

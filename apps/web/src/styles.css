@@ -1231,6 +1231,10 @@ code, pre {
   padding: 0 10px 0 12px;
 }
 
+.berry-web-window-chrome {
+  width: var(--sidebar-width);
+}
+
 .berry-web-home-link {
   display: inline-flex;
   min-width: 0;
@@ -1286,6 +1290,77 @@ code, pre {
 
 .berry-web-header-icon svg { width: 17px; height: 17px; }
 .berry-web-sidebar-toggle { cursor: ew-resize; }
+
+.berry-web-sidebar-expand-icon {
+  display: none;
+}
+
+@media (min-width: 769px) {
+  /* Keep the thread controls aligned with the original 56px sidebar titlebar. */
+  .berry-web-shell .berry-task-header {
+    height: var(--berry-titlebar-height);
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] {
+    width: 48px;
+  }
+
+  .berry-web-shell:has(.berry-web-window-chrome[data-sidebar-state="collapsed"]) .berry-task-header {
+    padding-left: 56px;
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-window-header {
+    justify-content: flex-start;
+    padding: 0 6px;
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-link {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-label {
+    display: none;
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-logo,
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-sidebar-expand-icon {
+    transition:
+      opacity 150ms cubic-bezier(0.22, 1, 0.36, 1),
+      transform 150ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-sidebar-expand-icon {
+    display: block;
+    position: absolute;
+    width: 17px;
+    height: 17px;
+    opacity: 0;
+    transform: scale(0.9);
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-link:hover .berry-web-home-logo,
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-link:focus-visible .berry-web-home-logo {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-link:hover .berry-web-sidebar-expand-icon,
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-link:focus-visible .berry-web-sidebar-expand-icon {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-home-logo,
+  .berry-web-window-chrome[data-sidebar-state="collapsed"] .berry-web-sidebar-expand-icon {
+    transition: none;
+  }
+}
 
 .berry-web-shell-frame {
   height: 100svh;
@@ -1367,6 +1442,26 @@ code, pre {
   border-color: var(--berry-border-strong);
   background: var(--berry-control-bg);
   box-shadow: var(--berry-shadow-floating);
+}
+
+.berry-compact-selector-surface[data-state="open"] {
+  --tw-enter-scale: var(--scale-medium) !important;
+  --tw-enter-translate-x: 0px !important;
+  --tw-enter-translate-y: 0px !important;
+  animation-duration: var(--duration-fast);
+  animation-timing-function: var(--ease-smooth-out);
+}
+
+.berry-compact-selector-surface[data-state="closed"] {
+  --tw-exit-scale: var(--scale-tiny) !important;
+  --tw-exit-translate-x: 0px !important;
+  --tw-exit-translate-y: 0px !important;
+  animation-duration: var(--duration-quick);
+  animation-timing-function: var(--ease-smooth-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .berry-compact-selector-surface { animation: none !important; }
 }
 
 .berry-project-switcher-popover [data-slot="command"] {
@@ -2415,6 +2510,8 @@ code, pre {
   .berry-web-shell {
     --berry-task-header-control-lane: 0px;
   }
+
+  .berry-web-window-chrome { width: 100%; }
 
   .berry-web-main .workspace,
   .berry-web-main .workspace[data-mode="code"] {
