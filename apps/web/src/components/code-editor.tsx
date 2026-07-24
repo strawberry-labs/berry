@@ -1,6 +1,7 @@
 import * as React from "react";
 import Editor, { loader } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import editorWorker from "monaco-editor/editor/editor.worker?worker";
 import cssWorker from "monaco-editor/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/language/html/html.worker?worker";
@@ -43,7 +44,7 @@ export function MonacoCodeEditor({
       {...(className ? { className } : {})}
       height="100%"
       language={language}
-      loading={<div className="berry-code-editor-loading">Loading editor…</div>}
+      loading={<div className="berry-code-editor-loading" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading editor" /></div>}
       onChange={(next) => onChange?.(next ?? "")}
       options={{
         automaticLayout: true,

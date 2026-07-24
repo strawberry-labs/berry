@@ -1,0 +1,99 @@
+import "reflect-metadata";
+import { UnauthorizedException, type INestApplication } from "@nestjs/common";
+import { Test } from "@nestjs/testing";
+import { SELF_HOST_TENANT_ID } from "@berry/db";
+import request from "supertest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BerryAuthModule } from "../auth/auth.module.ts";
+import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
+import { FilePlatformController } from "./file-platform.controller.ts";
+import { FilePlatformService } from "./file-platform.service.ts";
+
+const USER_ID = "00000000-0000-7000-8000-000000000201";
+
+describe("FilePlatformController", () => {
+  let app: INestApplication | null = null;
+
+  afterEach(async () => {
+    await app?.close();
+    app = null;
+  });
+
+  it("requires a signed-in user and forwards a bounded search only for that user", async () => {
+    const files = { list: vi.fn(async () => ({ items: [], nextCursor: null })) };
+    app = await createApp(files);
+
+    await request(app.getHttpServer())
+      .get("/v1/files?search=annual%20report&category=documents&limit=25")
+      .expect(401);
+    expect(files.list).not.toHaveBeenCalled();
+
+    await request(app.getHttpServer())
+      .get("/v1/files?search=annual%20report&category=documents&limit=25")
+      .set(authHeader())
+      .expect(200);
+    expect(files.list).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, USER_ID, {
+      search: "annual report",
+      category: "documents",
+      limit: 25,
+    });
+  });
+
+  it("rejects unrecognized or oversized search parameters before they reach the file service", async () => {
+    const files = { list: vi.fn(async () => ({ items: [], nextCursor: null })) };
+    app = await createApp(files);
+
+    await request(app.getHttpServer())
+      .get(`/v1/files?search=${"a".repeat(201)}`)
+      .set(authHeader())
+      .expect(400);
+    await request(app.getHttpServer())
+      .get("/v1/files?search=report&includeDeleted=true")
+      .set(authHeader())
+      .expect(400);
+    expect(files.list).not.toHaveBeenCalled();
+  });
+});
+
+async function createApp(files: Pick<FilePlatformService, "list">): Promise<INestApplication> {
+  const moduleRef = await Test.createTestingModule({
+    imports: [BerryAuthModule.register({ runtime: { useValue: fakeAuthRuntime() } })],
+    controllers: [FilePlatformController],
+    providers: [{ provide: FilePlatformService, useValue: files }],
+  }).compile();
+  const nestApp = moduleRef.createNestApplication();
+  await nestApp.init();
+  return nestApp;
+}
+
+function authHeader() {
+  return { Authorization: "Bearer berry-test-session" };
+}
+
+function fakeAuthRuntime(): BerryAuthRuntime {
+  const getSession: BerryAuthRuntime["getSession"] = async (headers) => {
+    if (headers.authorization !== "Bearer berry-test-session") return null;
+    return {
+      session: { id: "auth_session_1", userId: USER_ID },
+      user: { id: USER_ID, email: "test@example.test", name: "Test User", emailVerified: true },
+    };
+  };
+  return {
+    describe: () => ({
+      basePath: "/v1/auth",
+      emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+      socialProviders: [],
+      storage: "memory",
+    }),
+    getSession,
+    requireSession: async (headers) => {
+      const session = await getSession(headers);
+      if (!session) throw new UnauthorizedException("Authentication required");
+      return session;
+    },
+    handleNodeRequest: async (_req, response) => {
+      response.statusCode = 200;
+      response.end(JSON.stringify({ ok: true }));
+    },
+  };
+}

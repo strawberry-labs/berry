@@ -2521,6 +2521,14 @@ SET role_defaults = jsonb_set(
 WHERE flag = 'enterprise-governance';
 `.trim();
 
+export const FILE_LIBRARY_SEARCH_MIGRATION = `
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX IF NOT EXISTS files_display_name_original_name_trgm_idx
+  ON files USING gin (display_name gin_trgm_ops, original_name gin_trgm_ops)
+  WHERE deleted_at IS NULL AND status IN ('available', 'processing');
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -2605,4 +2613,5 @@ export const cloudMigrations = [
   { id: 23, name: "capability_permission_defaults_v1", sql: CAPABILITY_PERMISSION_DEFAULTS_MIGRATION },
   { id: 24, name: "remove_queued_follow_ups_v1", sql: REMOVE_QUEUED_FOLLOW_UPS_MIGRATION },
   { id: 25, name: "message_sequence_v1", sql: MESSAGE_SEQUENCE_MIGRATION },
+  { id: 26, name: "file_library_search_v1", sql: FILE_LIBRARY_SEARCH_MIGRATION },
 ] as const;

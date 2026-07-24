@@ -598,8 +598,8 @@ export class BerryApiClient {
     });
   }
 
-  async listFiles(input: { taskId?: string; category?: "images" | "documents"; search?: string; cursor?: string; limit?: number } = {}): Promise<StoredFilePage> {
-    const page = await this.#request(`/v1/files${usageQuery(input)}`, StoredFilePageSchema);
+  async listFiles(input: { taskId?: string; category?: "images" | "documents"; search?: string; cursor?: string; limit?: number } = {}, options: { signal?: AbortSignal } = {}): Promise<StoredFilePage> {
+    const page = await this.#request(`/v1/files${usageQuery(input)}`, StoredFilePageSchema, options);
     return { ...page, items: page.items.map((file) => this.#resolveFileUrls(file)) };
   }
 
@@ -1141,7 +1141,7 @@ export class BerryApiClient {
     return source;
   }
 
-  async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown } = {}): Promise<z.output<TSchema>> {
+  async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
     const { response, body } = await this.#rawRequest(path, init);
     if (!response.ok) {
       throw new BerryApiError(`Berry API request failed with ${response.status}`, response.status, body);
@@ -1167,10 +1167,10 @@ export class BerryApiClient {
     return typeof body === "string" ? body : JSON.stringify(body);
   }
 
-  async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown } = {}): Promise<{ response: Response; body: unknown }> {
+  async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
     const headers = new Headers(this.#headers);
     headers.set("Accept", "application/json");
-    const request: RequestInit = { method: init.method ?? "GET", headers, credentials: "include" };
+    const request: RequestInit = { method: init.method ?? "GET", headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
     if (init.body !== undefined) {
       headers.set("Content-Type", "application/json");
       request.body = JSON.stringify(init.body);

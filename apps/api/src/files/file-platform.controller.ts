@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Post, Query, Req, Res } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Post, Query, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { ServerResponse } from "node:http";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import { z } from "zod";
@@ -20,6 +20,13 @@ const PartNumbersSchema = z.object({ partNumbers: z.array(z.number().int().posit
 const CompleteSchema = z.object({
   parts: z.array(z.object({ partNumber: z.number().int().positive(), etag: z.string().min(1) }).strict()).min(1).max(10_000),
 }).strict();
+const ListSchema = z.object({
+  taskId: z.string().uuid().optional(),
+  category: z.enum(["images", "documents"]).optional(),
+  search: z.string().trim().max(200).optional(),
+  cursor: z.string().max(1000).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+}).strict();
 
 @Controller("/v1/files")
 export class FilePlatformController {
@@ -27,13 +34,7 @@ export class FilePlatformController {
 
   @Get()
   list(@Req() request: AuthenticatedRequest, @Query() query: Record<string, unknown>) {
-    const parsed = z.object({
-      taskId: z.string().uuid().optional(),
-      category: z.enum(["images", "documents"]).optional(),
-      search: z.string().max(200).optional(),
-      cursor: z.string().max(1000).optional(),
-      limit: z.coerce.number().int().min(1).max(100).optional(),
-    }).passthrough().parse(query);
+    const parsed = parse(ListSchema, query);
     return this.files.list(tenant(), user(request), {
       ...(parsed.taskId ? { taskId: parsed.taskId } : {}),
       ...(parsed.category ? { category: parsed.category } : {}),
@@ -111,7 +112,7 @@ function tenant(): string {
 
 function user(request: AuthenticatedRequest): string {
   const id = request.auth?.user.id;
-  if (!id) throw new BadRequestException("Authenticated user is required");
+  if (!id) throw new UnauthorizedException("Authentication required");
   return id;
 }
 

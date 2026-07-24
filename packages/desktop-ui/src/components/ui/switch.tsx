@@ -6,18 +6,35 @@ import { cn } from "@berry/desktop-ui/lib/utils"
 function Switch({
   className,
   size = "default",
+  checked,
+  defaultChecked,
+  onCheckedChange,
   ...props
 }: React.ComponentProps<typeof SwitchPrimitive.Root> & {
   size?: "sm" | "default"
 }) {
+  const [initialized, setInitialized] = React.useState(false)
+  const [uncontrolledChecked, setUncontrolledChecked] = React.useState(Boolean(defaultChecked))
+  const isControlled = checked !== undefined
+  const isOn = isControlled ? checked : uncontrolledChecked
+
   return (
     <SwitchPrimitive.Root
       data-slot="switch"
       data-size={size}
+      data-on={isOn ? "true" : "false"}
       className={cn(
-        "peer group/switch inline-flex shrink-0 items-center rounded-full border border-transparent shadow-xs transition-[background-color,border-color,box-shadow] outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 data-[size=default]:h-[1.15rem] data-[size=default]:w-8 data-[size=sm]:h-3.5 data-[size=sm]:w-6 data-[state=checked]:bg-primary data-[state=unchecked]:bg-input dark:data-[state=unchecked]:bg-input/80",
+        "t-toggle peer group/switch inline-flex shrink-0 items-center rounded-full border border-transparent shadow-xs transition-[background-color,border-color,box-shadow] outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 data-[size=default]:h-[1.15rem] data-[size=default]:w-8 data-[size=sm]:h-3.5 data-[size=sm]:w-6 data-[state=checked]:bg-primary data-[state=unchecked]:bg-input dark:data-[state=unchecked]:bg-input/80",
+        initialized && "is-init",
         className
       )}
+      {...(checked === undefined ? {} : { checked })}
+      {...(defaultChecked === undefined ? {} : { defaultChecked })}
+      onCheckedChange={(next) => {
+        setInitialized(true)
+        if (!isControlled) setUncontrolledChecked(next)
+        onCheckedChange?.(next)
+      }}
       {...props}
     >
       <SwitchPrimitive.Thumb

@@ -1,5 +1,6 @@
 import * as React from "react";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 
 export type SignedInUser = { id: string; email: string; name?: string | null };
 
@@ -35,7 +36,7 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
   }, [refreshSession, sessionResolved]);
 
   if (loading) {
-    return <div className="auth-shell"><div className="auth-card"><AuthBrand /><p>Loading your workspace…</p></div></div>;
+    return <div className="auth-shell" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading workspace" /></div>;
   }
   if (!user) return <AuthScreen baseUrl={baseUrl} onAuthenticated={refreshSession} />;
   return children(user, () => setUser(null));
@@ -98,7 +99,7 @@ function AuthScreen({ baseUrl, onAuthenticated }: { baseUrl: string; onAuthentic
     <div className="auth-shell">
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
         <AuthBrand />
-        {configLoading ? <div><h1>Checking this deployment…</h1><p>Berry is reading its first-run state.</p></div> : settingUp ? (
+        {configLoading ? <div className="flex min-h-24 items-center justify-center" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading deployment configuration" /></div> : settingUp ? (
           <>
             <div className="auth-setup-intro">
               <h1>Set up your organization</h1>

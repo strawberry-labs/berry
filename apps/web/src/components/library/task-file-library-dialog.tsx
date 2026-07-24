@@ -2,6 +2,7 @@ import * as React from "react";
 import type { BerryApiClient } from "@berry/api-client";
 import type { StoredFile } from "@berry/shared";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { Input } from "@berry/desktop-ui/components/ui/input";
@@ -102,7 +103,7 @@ export function TaskFileLibraryDialog({
           </DialogHeader>
 
           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 sm:px-6">
-            {state === "loading" ? <FileLibraryStatus>Loading files…</FileLibraryStatus> : null}
+            {state === "loading" ? <FileLibraryStatus><CircularActivitySpinner size={28} label="Loading files" /></FileLibraryStatus> : null}
             {state === "error" ? <FileLibraryStatus>{error}</FileLibraryStatus> : null}
             {state === "ready" && visible.length === 0 ? <FileLibraryStatus>No files in this {scope} yet.</FileLibraryStatus> : null}
             {state === "ready" && visible.length > 0 ? (

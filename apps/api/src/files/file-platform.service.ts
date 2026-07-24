@@ -86,8 +86,8 @@ export class FilePlatformService {
       if (filters.category === "images") where.push("f.media_type LIKE 'image/%'");
       if (filters.category === "documents") where.push("f.media_type NOT LIKE 'image/%'");
       if (filters.search?.trim()) {
-        values.push(`%${filters.search.trim()}%`);
-        where.push(`f.display_name ILIKE $${values.length}`);
+        values.push(`%${escapeLikePattern(filters.search.trim())}%`);
+        where.push(`(f.display_name ILIKE $${values.length} ESCAPE '\\' OR f.original_name ILIKE $${values.length} ESCAPE '\\')`);
       }
       if (filters.cursor) {
         const [createdAt, id] = decodeCursor(filters.cursor);
@@ -345,6 +345,10 @@ export class FilePlatformService {
     if (!row) throw new NotFoundException("File not found");
     return row;
   }
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[%_\\]/g, "\\$&");
 }
 
 function fileDto(row: FileRow) {

@@ -20,6 +20,7 @@ import { Toaster } from "@berry/desktop-ui/components/ui/sonner";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import type { ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
 import { Input } from "@berry/desktop-ui/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry/desktop-ui/components/ui/tooltip";
@@ -385,12 +386,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       setSearchOpen(true);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      if (!(event.metaKey || event.ctrlKey)) return;
       const key = event.key.toLowerCase();
-      if (key === "n") {
-        event.preventDefault();
-        navigateHome();
-      } else if (event.key === ",") {
+      if (event.shiftKey) {
+        if (!event.altKey && key === "o") {
+          event.preventDefault();
+          navigateHome();
+        }
+        return;
+      }
+      if (event.altKey) return;
+      if (event.key === ",") {
         event.preventDefault();
         navigateToSettings("general");
       } else if (key === "b") {
@@ -1373,7 +1379,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         }
         sidebar={surface === "settings" ? (
           <React.Suspense fallback={null}>
-            <ManagementSidebar kind={managementKind} tab={managementTab} organizations={config.organizations as never} activeOrganizationId={activeOrganizationId} permissions={effectiveOrgPermissions} platformAuthorized={config.platformAuthorized} onNavigate={navigateManagement} onOrganizationChange={setActiveOrganizationId} onBack={navigateBackToWorkspace} />
+            <ManagementSidebar kind={managementKind} tab={managementTab} permissions={effectiveOrgPermissions} platformAuthorized={config.platformAuthorized} onNavigate={navigateManagement} onBack={navigateBackToWorkspace} />
           </React.Suspense>
         ) : (
           <WebSidebar
@@ -1414,7 +1420,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             chatsSelected={!activeTask && Boolean(generalWorkspace && activeWorkspaceId === generalWorkspace.id)}
             librarySelected={surface === "library"}
             onSkills={() => navigateToSettings("skills")}
-            onLibrary={() => navigateToLibrary("images")}
+            onLibrary={() => navigateToLibrary("all")}
             onSettings={() => navigateToSettings("general")}
             onSignOut={() => void signOut()}
           />
@@ -1665,7 +1671,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         )}
         </div>
         {surface === "settings" ? (
-          <React.Suspense fallback={<LazySurfaceFallback title="Loading settings…" />}>
+          <React.Suspense fallback={<LazySurfaceFallback label="Loading settings" />}>
             <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask, onUsePrompt: (prompt) => { window.localStorage.setItem("berry.web.pendingPrompt", prompt); navigateHome(); } }}>
               <Outlet />
             </ManagementRouteProvider>
@@ -1673,8 +1679,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         ) : null}
         {surface === "library" ? (
           <div className="min-h-0 flex-1 overflow-auto">
-            <React.Suspense fallback={<LazySurfaceFallback title="Loading your library…" />}>
-              <ArtifactLibrary client={client} tab={shellLocation.kind === "library" ? shellLocation.tab : "images"} onTabChange={navigateToLibrary} />
+            <React.Suspense fallback={<LazySurfaceFallback label="Loading library" />}>
+              <ArtifactLibrary client={client} tab={shellLocation.kind === "library" ? shellLocation.tab : "all"} onTabChange={navigateToLibrary} />
             </React.Suspense>
           </div>
         ) : null}
@@ -1781,10 +1787,10 @@ function greeting(): string {
   return "Good evening";
 }
 
-function LazySurfaceFallback({ title }: { title: string }) {
+function LazySurfaceFallback({ label }: { label: string }) {
   return (
-    <section className="berry-route-state" aria-live="polite" aria-busy="true">
-      <h1>{title}</h1>
+    <section className="berry-route-state flex flex-1 items-center justify-center" aria-live="polite" aria-busy="true">
+      <CircularActivitySpinner size={28} label={label} />
     </section>
   );
 }

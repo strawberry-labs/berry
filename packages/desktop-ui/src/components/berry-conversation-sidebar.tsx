@@ -131,6 +131,12 @@ export function conversationsForKind(tasks: Task[], kind: ConversationKind, excl
     .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
 }
 
+function allConversations(tasks: Task[], excludedIds: ReadonlySet<string> = new Set()): Task[] {
+  return tasks
+    .filter((task) => !excludedIds.has(task.id))
+    .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+}
+
 export function visibleConversationSlice(tasks: Task[], expanded: boolean): { visible: Task[]; hiddenCount: number } {
   if (expanded || tasks.length <= INITIAL_CONVERSATION_COUNT) return { visible: tasks, hiddenCount: 0 };
   return { visible: tasks.slice(0, INITIAL_CONVERSATION_COUNT), hiddenCount: tasks.length - INITIAL_CONVERSATION_COUNT };
@@ -165,9 +171,12 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
     }
   }, [optimisticKind, pendingKind, props]);
 
-  const pinned = conversationsForKind(props.pinnedConversations, optimisticKind);
+  const visibleConversations = props.showKindControl === false
+    ? allConversations
+    : (tasks: Task[], excludedIds?: ReadonlySet<string>) => conversationsForKind(tasks, optimisticKind, excludedIds);
+  const pinned = visibleConversations(props.pinnedConversations);
   const pinnedIds = new Set(pinned.map((task) => task.id));
-  const chats = conversationsForKind(props.generalConversations, optimisticKind, pinnedIds);
+  const chats = visibleConversations(props.generalConversations, pinnedIds);
   const projects = React.useMemo(() => {
     if (projectSort === "manual") return props.projects;
     return [...props.projects].sort((left, right) => {
@@ -199,9 +208,11 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
         {props.commands}
       </SidebarHeader>
       <SidebarContent className="scroll-fade">
-        <ConversationSection title="Pinned" open>
-          <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
-        </ConversationSection>
+        {pinned.length > 0 ? (
+          <ConversationSection title="Pinned" open>
+            <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
+          </ConversationSection>
+        ) : null}
 
         <SidebarGroup className="berry-sidebar-project-group">
           <div className="berry-sidebar-project-heading flex items-center pb-1">
@@ -243,7 +254,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
             {projects.map((project) => {
               const id = project.workspace.id;
               const open = !sectionState.collapsedProjects.has(id);
-              const projectTasks = conversationsForKind(project.conversations, optimisticKind, pinnedIds);
+              const projectTasks = visibleConversations(project.conversations, pinnedIds);
               const { visible, hiddenCount } = visibleConversationSlice(projectTasks, sectionState.expandedProjects.has(id));
               return (
                 <SidebarMenuItem key={id} className="berry-sidebar-workspace-item">

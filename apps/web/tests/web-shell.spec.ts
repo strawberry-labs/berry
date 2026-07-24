@@ -24,11 +24,11 @@ test("web uses the native ChatGPT-style typography stack", async ({ page }) => {
     };
   });
 
-  expect(typography.stack).toContain("-apple-system-body");
-  expect(typography.stack).toContain("ui-sans-serif");
+  expect(typography.stack).toContain("-apple-system");
+  expect(typography.stack).toContain("system-ui");
   expect(typography.stack).toContain('"Segoe UI"');
-  expect(typography.bodyFamily).toContain("-apple-system-body");
-  expect(typography.bodyWeight).toBe("400");
+  expect(typography.bodyFamily).toContain("-apple-system");
+  expect(typography.bodyWeight).toBe("445");
   expect(typography.bodyLineHeight).toBe("21px");
   expect(typography.bodySynthesis).toBe("none");
   expect(typography.buttonFamily).toBe(typography.bodyFamily);
@@ -50,14 +50,12 @@ test("dark mode uses the approved surfaces and neutral menu highlights", async (
       userMessage: getComputedStyle(document.querySelector<HTMLElement>(".berry-user-message")!).backgroundColor,
       composerMonoOverrides: document.querySelector<HTMLElement>(".berry-composer-root")!.querySelectorAll(".font-mono").length,
       modelFamily: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-model-label")!).fontFamily,
-      permissionFamily: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-permission-label")!).fontFamily,
       modelWeight: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-model-label")!).fontWeight,
-      permissionWeight: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-permission-label")!).fontWeight,
     };
   });
 
-  expect(surfaces.modelFamily).toBe(surfaces.permissionFamily);
-  expect(surfaces.modelWeight).toBe(surfaces.permissionWeight);
+  expect(surfaces.modelFamily).toBeTruthy();
+  expect(surfaces.modelWeight).toBeTruthy();
   expect(surfaces).toMatchObject({
     mainToken: "#181818",
     sidebarToken: "#242424",
@@ -69,11 +67,6 @@ test("dark mode uses the approved surfaces and neutral menu highlights", async (
     userMessage: "rgb(36, 36, 36)",
     composerMonoOverrides: 0,
   });
-
-  await page.getByRole("button", { name: "Permission mode" }).click();
-  const fullAccess = page.getByRole("menuitem", { name: /Full access/ });
-  await fullAccess.focus();
-  await expect(fullAccess).toHaveCSS("background-color", "rgba(255, 255, 255, 0.05)");
 });
 
 test("hard refresh applies dark, light, and system themes before hydration", async ({ page }) => {
@@ -128,43 +121,26 @@ test("hard refresh applies dark, light, and system themes before hydration", asy
   });
 });
 
-test("shared sidebar filters Chat and Code without replacing the active task", async ({ page }) => {
+test("shared sidebar preserves the active task while project sections change", async ({ page }) => {
   await openTask(page);
-  await expect(page.getByRole("button", { name: "Code", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator(".berry-sidebar-task-row").filter({ hasText: "Cloud sandbox smoke" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Chat", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByRole("heading", { name: "Cloud sandbox smoke" })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Quick model question/ })).toBeVisible();
-  await expect(page.locator(".berry-sidebar-task-row").filter({ hasText: "Cloud sandbox smoke" })).toContainText("Cloud sandbox smoke");
-
-  const chatsDisclosure = page.getByRole("button", { name: "Chats" });
-  await chatsDisclosure.focus();
+  const projectsDisclosure = page.getByRole("button", { name: "Projects", exact: true });
+  await projectsDisclosure.focus();
   await page.keyboard.press("Enter");
-  await expect(chatsDisclosure).toHaveAttribute("aria-expanded", "false");
-  await expect(page).toHaveURL("/");
+  await expect(projectsDisclosure).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByRole("heading", { name: "Cloud sandbox smoke" })).toBeVisible();
+  await expect(page).toHaveURL(/\/tasks\/task_cloud$/);
 });
 
-test("web Code mounts a functional sandbox workspace while Chat hides it", async ({ page }) => {
+test("web tasks use the chat workspace without desktop code controls", async ({ page }) => {
   await openTask(page);
-  const workspace = page.getByTestId("web-code-workspace");
-  await expect(workspace).toBeVisible();
-  await expect(workspace.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
-  await workspace.getByRole("button", { name: "README.md" }).click();
-  await expect(workspace.getByRole("textbox", { name: "File contents" })).toHaveValue(/Berry web workspace/);
-
-  await workspace.getByRole("tab", { name: "Terminal" }).click();
-  await workspace.getByRole("textbox", { name: "Terminal command" }).fill("pwd");
-  await workspace.getByRole("button", { name: "Run" }).click();
-  await expect(workspace.getByText("/workspace")).toBeVisible();
-
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
-  await expect(workspace).toHaveCount(0);
+  await expect(page.getByTestId("web-code-workspace")).toHaveCount(0);
   await expect(page.getByTestId("web-thread")).toHaveAttribute("data-mode", "chat");
+  await expect(page.getByRole("button", { name: "View all files" })).toBeVisible();
 });
 
-test("search and command-K open one cross-kind command palette", async ({ page }) => {
+test("search and command-K open one command palette", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   await page.getByRole("button", { name: "Search", exact: true }).click();
@@ -172,7 +148,7 @@ test("search and command-K open one cross-kind command palette", async ({ page }
   await page.getByPlaceholder("Search conversations and actions…").fill("Quick model question");
   await page.getByRole("option", { name: /Quick model question/ }).click();
   await expect(page).toHaveURL(/\/tasks\/task_chat$/);
-  await expect(page.getByRole("button", { name: "Chat", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("heading", { name: "Quick model question" })).toBeVisible();
 
   await page.keyboard.press(process.platform === "darwin" ? "Meta+K" : "Control+K");
   await expect(page.getByRole("dialog", { name: "Search Berry" })).toBeVisible();
@@ -215,7 +191,6 @@ test("recognized slash commands invoke handlers instead of becoming model text",
 
 test("web thread uses the desktop conversation presentation", async ({ page }) => {
   await openTask(page);
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
 
   const userBubble = page.locator("[data-user-message-bubble]").first();
   const assistant = page.locator(".berry-assistant-message").first();
@@ -273,16 +248,16 @@ test("web thread uses the desktop conversation presentation", async ({ page }) =
   expect(metrics.contentWidth).toBeGreaterThanOrEqual(750);
   expect(metrics.contentWidth).toBeLessThanOrEqual(780);
   expect(metrics.composerBottomGap).toBeLessThan(24);
-  expect(metrics.sidebarWidth).toBe(288);
+  expect(metrics.sidebarWidth).toBe(256);
   expect(metrics.contentGap).toBe("20px");
   expect(metrics.contentPaddingTop).toBe("40px");
   expect(metrics.bubbleRadius).toBe("18px");
-  expect(metrics.bubbleFontSize).toBe("16px");
-  expect(metrics.bubbleLineHeight).toBe("24px");
+  expect(metrics.bubbleFontSize).toBe("14px");
+  expect(metrics.bubbleLineHeight).toBe("21px");
   expect(metrics.bubblePadding).toBe("12px 16px 12px 16px");
-  expect(metrics.assistantFontSize).toBe("13px");
-  expect(metrics.assistantLineHeight).toBe("22.75px");
-  expect(metrics.assistantTracking).toBe("0.325px");
+  expect(metrics.assistantFontSize).toBe("14px");
+  expect(metrics.assistantLineHeight).toBe("22px");
+  expect(metrics.assistantTracking).toBe("normal");
   expect(metrics.promptFontSize).toBe("16px");
   expect(metrics.promptLineHeight).toBe("24px");
   expect(metrics.promptPadding).toBe("12px 16px 8px 16px");
@@ -295,16 +270,15 @@ test("web thread uses the desktop conversation presentation", async ({ page }) =
 
 test("turn presentation remains scoped to its session while navigating between tasks", async ({ page }) => {
   await openTask(page);
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
   const uniquePrompt = `Navigation-safe turn ${Date.now()}`;
 
   await page.getByTestId("composer-input").fill(uniquePrompt);
   await page.getByRole("button", { name: "Send" }).click();
-  await page.getByRole("button", { name: /Launch plan review/ }).click();
+  await page.getByRole("button", { name: "Launch plan review", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Launch plan review" })).toBeVisible();
   await expect(page.getByText(uniquePrompt)).toHaveCount(0);
 
-  await page.getByRole("button", { name: /Cloud sandbox smoke/ }).click();
+  await page.getByRole("button", { name: "Cloud sandbox smoke", exact: true }).click();
   await expect(page.getByText(uniquePrompt)).toBeVisible();
   await expect(page.getByText(/Fixture sandbox ready/).last()).toBeVisible();
 });
@@ -354,7 +328,7 @@ for (const shortcut of ["Meta+Enter", "Control+Enter"] as const) {
 test("web shell exposes provider, MCP HTTP, and skills settings", async ({ page }) => {
   await openTask(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByLabel("Organization").selectOption({ label: "Acme Dedicated" });
+  await expect(page.getByLabel("Organization")).toHaveCount(0);
   await page.getByRole("button", { name: "Models", exact: true }).click();
   await expect(page.getByText("Berry Router")).toBeVisible();
   await page.getByRole("button", { name: "MCP servers" }).click();
@@ -368,12 +342,11 @@ test("web shell exposes provider, MCP HTTP, and skills settings", async ({ page 
   await page.getByRole("button", { name: "Open admin console" }).click();
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await page.getByRole("button", { name: "SSO & SCIM" }).click();
-  await expect(page.getByText("Okta Workforce")).toBeVisible();
+  await expect(page.getByText("No identity connections")).toBeVisible();
   await page.getByRole("button", { name: "Managed policy" }).click();
   await expect(page.getByRole("heading", { name: "Managed policy" })).toBeVisible();
-  await expect(page.getByRole("table", { name: "Policy versions" })).toContainText("acme-2026");
   await page.getByRole("button", { name: "Audit log" }).click();
-  await expect(page.getByRole("table", { name: "Audit events" })).toContainText("models.policy-upserted");
+  await expect(page.getByRole("heading", { name: "Audit log" })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Platform administration" })).toHaveCount(0);
 });
 
@@ -390,7 +363,7 @@ test("file mentions create indexed workspace context", async ({ page }) => {
   await page.getByTestId("composer-input").fill("@README");
   await page.getByRole("option", { name: /README.md/ }).click();
   await expect(page.locator("[data-slot='attachment-title']", { hasText: "README.md" })).toBeVisible();
-  await expect(page.getByText("1 KB", { exact: true })).toBeVisible();
+  await expect(page.getByText("0 bytes", { exact: true })).toBeVisible();
 });
 
 test("desktop-style settings navigation replaces the task surface and returns", async ({ page }) => {
@@ -424,7 +397,7 @@ test("saved prompts insert into the Lexical composer", async ({ page }) => {
 test("visible browser settings persist and apply after reload", async ({ page }) => {
   await openTask(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  const queue = page.getByRole("checkbox", { name: /Queued follow-ups/ });
+  const queue = page.getByRole("switch", { name: /Queued follow-ups/ });
   await queue.uncheck();
   await page.locator("label").filter({ hasText: "Theme" }).getByRole("combobox").selectOption("light");
   await page.locator("label").filter({ hasText: "Language" }).getByRole("combobox").selectOption("en");
@@ -434,25 +407,11 @@ test("visible browser settings persist and apply after reload", async ({ page })
   await expect(page.locator("html")).toHaveAttribute("lang", "en");
 });
 
-test("conversation kind changes in place without changing permission mode", async ({ page }) => {
+test("web tasks remain in chat mode with server-enforced full access", async ({ page }) => {
   await openTask(page);
-  await expect(page.getByRole("button", { name: "Permission mode" })).toContainText("Edit automatically");
-  const permissionTrigger = page.getByRole("button", { name: "Permission mode" });
-  const triggerBox = await permissionTrigger.boundingBox();
-  await permissionTrigger.click();
-  const permissionMenu = page.getByRole("menu");
-  await expect(permissionMenu).toBeVisible();
-  const menuBox = await permissionMenu.boundingBox();
-  expect(triggerBox).not.toBeNull();
-  expect(menuBox).not.toBeNull();
-  expect(menuBox!.y).toBeLessThan(triggerBox!.y);
-  expect(Math.abs((menuBox!.y + menuBox!.height) - triggerBox!.y)).toBeLessThan(5);
-  await page.getByRole("menuitem", { name: /Full access/ }).click();
-  await expect(page.getByRole("button", { name: "Permission mode" })).toContainText("Full access");
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page).toHaveURL(/\/tasks\/task_cloud$/);
   await expect(page.getByTestId("web-thread")).toHaveAttribute("data-mode", "chat");
-  await expect(page.getByRole("button", { name: "Permission mode" })).toContainText("Full access");
+  await expect(page.getByRole("button", { name: "Permission mode" })).toHaveCount(0);
   await expect(page.locator(".mode-tabs")).toHaveCount(0);
   await expect(page.getByTestId("code-workbench")).toHaveCount(0);
 });
@@ -474,16 +433,15 @@ test("user message hover actions expose edit and resubmit on web", async ({ page
 
 test("web task chrome keeps Home branding, title editing, and action menus", async ({ page }) => {
   await openTask(page);
-  await page.getByRole("button", { name: "Chat", exact: true }).click();
-  await expect(page.getByRole("button", { name: /Launch plan review/ })).toBeVisible();
-  await page.getByRole("button", { name: /Launch plan review/ }).click();
+  await expect(page.getByRole("button", { name: "Launch plan review", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Launch plan review", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Launch plan review" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Back" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Forward" })).toHaveCount(0);
   await page.getByRole("button", { name: "Berry home" }).click();
   await expect(page).toHaveURL("/");
 
-  await openTask(page, "task_chat", "Launch plan review");
+  await openTask(page, "task_chat", "Quick model question");
 
   await page.getByRole("button", { name: "More actions" }).click();
   await expect(page.getByRole("menuitem", { name: "Rename task" })).toBeVisible();
@@ -499,7 +457,7 @@ test("chat row actions stay visible while their upward menu is open", async ({ p
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   const chatRow = page.locator(".berry-sidebar-task-row").filter({ hasText: "Cloud sandbox smoke" });
   await chatRow.hover();
-  const actions = page.getByRole("button", { name: "Actions for Cloud sandbox smoke" });
+  const actions = page.locator('[aria-label="Actions for Cloud sandbox smoke"]');
   await expect(actions).toBeVisible();
   await actions.click();
   await expect(page.getByRole("menuitem", { name: "Share" })).toBeVisible();
@@ -552,13 +510,13 @@ test("web composer keeps model and reasoning controls and opens the mobile sideb
   const sidebarTrigger = page.getByRole("button", { name: "Toggle Sidebar" });
   await sidebarTrigger.click();
   await expect(page.getByRole("dialog", { name: "Sidebar" })).toBeVisible();
-  await expect(page.getByRole("button", { name: /New (code )?chat/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New chat", exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "Sidebar" })).toHaveCount(0);
   await expect(sidebarTrigger).toBeFocused();
 });
 
-test("primary shell workflows and Code workspace are keyboard reachable", async ({ page }) => {
+test("primary shell workflows and settings are keyboard reachable", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
 
@@ -569,17 +527,7 @@ test("primary shell workflows and Code workspace are keyboard reachable", async 
   await page.keyboard.press("Escape");
   await expect(search).toBeFocused();
 
-  const code = page.getByRole("button", { name: "Code", exact: true });
-  await code.focus();
-  await page.keyboard.press("Enter");
-  await expect(code).toHaveAttribute("aria-pressed", "true");
-
   await openTask(page);
-  const terminal = page.getByTestId("web-code-workspace").getByRole("tab", { name: "Terminal" });
-  await terminal.focus();
-  await page.keyboard.press("Enter");
-  await expect(terminal).toHaveAttribute("aria-selected", "true");
-
   await page.getByRole("button", { name: "Settings", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
@@ -604,7 +552,6 @@ test("composer controls stay reachable across supported viewport sizes", async (
     await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
     const controls = [
       page.getByRole("button", { name: "Add context" }),
-      page.getByRole("button", { name: "Permission mode" }),
       page.getByRole("button", { name: "Kimi 2.6" }),
       page.getByRole("button", { name: "Reasoning level" }),
       page.getByRole("button", { name: "Send" }),

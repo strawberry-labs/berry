@@ -2,6 +2,7 @@ import * as React from "react";
 import type { BerryApiClient } from "@berry/api-client";
 import type { CloudGitState, CloudPreview, CloudTerminalEvent, CloudTerminalSession, CloudWorkspaceFileEntry, CloudWorkspaceState } from "@berry/shared";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { FileText, Files, GitBranch, Globe, RefreshCw, SquareTerminal, X } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 import { languageForPath, MonacoCodeEditor } from "@/components/code-editor";
@@ -45,7 +46,7 @@ export function WebCodeWorkspace({ taskId, client }: { taskId: string; client: B
         <Button className="berry-code-workspace-mobile-close" variant="ghost" size="icon-xs" aria-label="Close code workspace" onClick={() => setMobileOpen(false)}><X /></Button>
       </div>
       <div className="berry-code-workspace-body">
-        {loading ? <WorkspaceState text="Attaching sandbox…" /> : error ? <WorkspaceState text={error} action="Retry" onAction={() => window.location.reload()} /> : state ? (
+        {loading ? <WorkspaceLoading label="Attaching sandbox" /> : error ? <WorkspaceState text={error} action="Retry" onAction={() => window.location.reload()} /> : state ? (
           <>
             {tab === "files" ? <FilesPanel taskId={taskId} client={client} /> : null}
             {tab === "terminal" ? <TerminalPanel taskId={taskId} client={client} /> : null}
@@ -117,7 +118,7 @@ function ChangesPanel({ taskId, client }: { taskId: string; client: BerryApiClie
   const [git, setGit] = React.useState<CloudGitState | null>(null);
   const load = React.useCallback(() => (client ? client.workspaceGit(taskId) : Promise.resolve(demoGit())).then(setGit), [client, taskId]);
   React.useEffect(() => { void load().catch((cause) => toast.error(message(cause))); }, [load]);
-  return <div className="berry-workspace-changes"><div className="berry-workspace-panel-heading"><span>{git?.branch ?? "Changes / Review"}</span><Button variant="ghost" size="icon-xs" aria-label="Refresh changes" onClick={() => void load()}><RefreshCw /></Button></div>{git ? <>{git.clean ? <WorkspaceState text="Working tree clean" /> : <><pre className="berry-git-status">{git.status}</pre><pre className="berry-git-diff">{git.diff || "No unstaged diff."}</pre></>}</> : <WorkspaceState text="Loading changes…" />}</div>;
+  return <div className="berry-workspace-changes"><div className="berry-workspace-panel-heading"><span>{git?.branch ?? "Changes / Review"}</span><Button variant="ghost" size="icon-xs" aria-label="Refresh changes" onClick={() => void load()}><RefreshCw /></Button></div>{git ? <>{git.clean ? <WorkspaceState text="Working tree clean" /> : <><pre className="berry-git-status">{git.status}</pre><pre className="berry-git-diff">{git.diff || "No unstaged diff."}</pre></>}</> : <WorkspaceLoading label="Loading changes" />}</div>;
 }
 
 function PreviewPanel({ taskId, client }: { taskId: string; client: BerryApiClient | null }) {
@@ -135,6 +136,7 @@ function PreviewPanel({ taskId, client }: { taskId: string; client: BerryApiClie
 }
 
 function WorkspaceState({ text, action, onAction }: { text: string; action?: string; onAction?: () => void }) { return <div className="berry-workspace-empty-state"><p>{text}</p>{action ? <Button size="sm" onClick={onAction}>{action}</Button> : null}</div>; }
+function WorkspaceLoading({ label }: { label: string }) { return <div className="berry-workspace-empty-state" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label={label} /></div>; }
 function message(cause: unknown) { return cause instanceof Error ? cause.message : "Workspace operation failed"; }
 function demoState(taskId: string): CloudWorkspaceState { return { taskId, sandboxId: `demo_${taskId}`, status: "running", root: "/workspace", provider: "fixture", expiresAt: null, updatedAt: new Date().toISOString() }; }
 function demoFiles(): CloudWorkspaceFileEntry[] { return [{ path: "/workspace/README.md", type: "file", sizeBytes: 72, mtime: null }, { path: "/workspace/src/index.ts", type: "file", sizeBytes: 27, mtime: null }]; }

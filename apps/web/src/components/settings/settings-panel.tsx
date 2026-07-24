@@ -3,6 +3,7 @@ import { CreditCard, Settings } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
 import type { OrgMembership, OrgPermission } from "@berry/shared";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { ShieldCheck } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 import type { WebConfig } from "@/lib/config";
@@ -541,7 +542,7 @@ function CloudAdminControls({ config, client, tenantId, permissions, onSaved }: 
       </form> : null}
       {permissions.includes("org:read") ? <div className="admin-edit-form admin-member-panel">
         <strong>Users and monthly limits</strong>
-        {membersLoading ? <span>Loading users…</span> : members.length === 0 ? <span>No users found.</span> : members.map((member) => {
+        {membersLoading ? <span className="inline-flex min-h-8 items-center justify-center" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={20} label="Loading users" /></span> : members.length === 0 ? <span>No users found.</span> : members.map((member) => {
           const limit = config.budgetLimits.find((entry) => entry.tenantId === tenantId && entry.scopeType === "user" && entry.scopeId === member.userId && entry.period === "month");
           const dollars = limit ? Number(BigInt(limit.hardLimitMicros) / 1_000_000n) : 15;
           return (

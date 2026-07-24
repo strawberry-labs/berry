@@ -63,5 +63,5 @@ export default function DocxDocumentViewer({ file }: { file: StoredFile }) {
 }
 
 function DocumentLoading({ label }: { label: string }) {
-  return <div className="berry-office-loading"><CircularActivitySpinner size={18} className="text-[var(--berry-preview-muted)]" label={label} />{label}</div>;
+  return <div className="berry-office-loading" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} className="text-[var(--berry-preview-muted)]" label={label} /></div>;
 }

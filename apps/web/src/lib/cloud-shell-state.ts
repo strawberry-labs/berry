@@ -1,6 +1,6 @@
 export const USER_SETTINGS_TABS = ["general", "providers", "skills", "mcp", "prompts", "privacy", "usage", "archived"] as const;
 export type UserSettingsTab = (typeof USER_SETTINGS_TABS)[number];
-export const ARTIFACT_LIBRARY_TABS = ["images", "documents"] as const;
+export const ARTIFACT_LIBRARY_TABS = ["all", "images", "documents"] as const;
 export type ArtifactLibraryTab = (typeof ARTIFACT_LIBRARY_TABS)[number];
 export const ADMIN_TABS=["overview","members","departments","roles","resource-access","models","skills-mcp","feature-access","execution-network","analytics","spend-limits","credits-billing","reports-alerts","sso-scim","managed-policy","authentication","data-governance","service-accounts","audit-log","profile-domains"]as const;
 export const PLATFORM_TABS=["overview","organizations","router-health","billing-operations","feature-rollout"]as const;
@@ -21,7 +21,7 @@ export function parseCloudShellLocation(pathname: string): CloudShellLocation {
     return { kind: "settings", tab };
   }
   if (parts[0] === "library") {
-    const tab = ARTIFACT_LIBRARY_TABS.find((candidate) => candidate === parts[1]) ?? "images";
+    const tab = ARTIFACT_LIBRARY_TABS.find((candidate) => candidate === parts[1]) ?? "all";
     return { kind: "library", tab };
   }
   if (parts[0] === "admin") return { kind: "admin", tab: ADMIN_TABS.find((candidate)=>candidate===parts[1]) ?? "overview" };

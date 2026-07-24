@@ -3,6 +3,19 @@ import type { ManagedPolicyBundle } from "@berry/shared";
 import { BerryApiClient, BerryApiError } from "./index.ts";
 
 describe("BerryApiClient", () => {
+  it("passes library searches and cancellation through to the file API", async () => {
+    const fetchImpl = vi.fn(async () => json({ items: [], nextCursor: null }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const controller = new AbortController();
+
+    await client.listFiles({ category: "documents", search: "annual report", limit: 50 }, { signal: controller.signal });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/files?category=documents&search=annual+report&limit=50",
+      expect.objectContaining({ method: "GET", signal: controller.signal }),
+    );
+  });
+
   it("calls browser-style fetch implementations without a class receiver", async () => {
     let receiver: unknown = "not-called";
     const fetchImpl = async function(this: unknown) {

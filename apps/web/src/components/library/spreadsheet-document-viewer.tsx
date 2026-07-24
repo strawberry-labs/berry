@@ -129,7 +129,7 @@ export default function SpreadsheetDocumentViewer({ file }: { file: StoredFile }
             }}
           />
         ) : null}
-        {loading ? <div className="berry-spreadsheet-loading"><CircularActivitySpinner size={18} className="text-[var(--berry-spreadsheet-accent)]" label="Opening workbook" />Opening workbook…</div> : null}
+        {loading ? <div className="berry-spreadsheet-loading" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} className="text-[var(--berry-spreadsheet-accent)]" label="Opening workbook" /></div> : null}
       </div>
       <footer className="berry-spreadsheet-footer">
         <span className="berry-spreadsheet-status">Ready</span>

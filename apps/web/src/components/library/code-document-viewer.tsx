@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { StoredFile } from "@berry/shared";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { MonacoCodeEditor, languageForPath } from "@/components/code-editor";
 
 const MAX_CODE_PREVIEW_BYTES = 2 * 1024 * 1024;
@@ -34,7 +35,7 @@ export default function CodeDocumentViewer({ file }: { file: StoredFile }) {
   }, [file.id, file.previewUrl, file.size]);
 
   if (error) throw error;
-  if (content === null) return <div className="berry-code-editor-loading">Opening {file.name}…</div>;
+  if (content === null) return <div className="berry-code-editor-loading" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label={`Opening ${file.name}`} /></div>;
 
   return <MonacoCodeEditor className="berry-file-code-editor" language={languageForPath(file.name)} path={`file://${file.id}/${file.name}`} readOnly value={content} />;
 }

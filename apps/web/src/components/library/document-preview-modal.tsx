@@ -1,6 +1,7 @@
 import * as React from "react";
 import type { StoredFile } from "@berry/shared";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
 import { FileDown, FileText, X } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
@@ -94,7 +95,7 @@ class ViewerErrorBoundary extends React.Component<{ file: StoredFile; children: 
 }
 
 function DocumentPreviewLoading({ name }: { name: string }) {
-  return <div className="berry-document-preview-loading" role="status"><FileText /><strong>Opening {name}</strong><span>Loading the matching document renderer…</span></div>;
+  return <div className="berry-document-preview-loading" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label={`Opening ${name}`} /></div>;
 }
 
 function isPdf(file: Pick<StoredFile, "name" | "mediaType">): boolean {

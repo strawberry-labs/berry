@@ -20,9 +20,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { Input } from "@berry/desktop-ui/components/ui/input";
 import {
   Sidebar,
-  SidebarContent,
   SidebarFooter,
-  SidebarHeader,
   SidebarMenu,
   SidebarMenuAction,
   SidebarMenuButton,
@@ -30,7 +28,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@berry/desktop-ui/components/ui/sidebar";
-import { Archive, ArrowLeft02, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
+import { Archive, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
 import type { SignedInUser } from "./auth-boundary";
 
 export type SettingsTab = "general" | "prompts" | "providers" | "mcp" | "skills" | "privacy" | "usage" | "archived" | "governance" | "platform";
@@ -47,21 +45,6 @@ export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "governance", label: "Organization administration" },
   { id: "platform", label: "Platform administration" },
 ];
-
-export function WebSettingsSidebar({ tab, onTabChange, onBack, allowPlatform }: { tab: SettingsTab; onTabChange: (tab: SettingsTab) => void; onBack: () => void; allowPlatform: boolean }) {
-  return (
-    <Sidebar variant="inset" className="berry-app-sidebar berry-settings-sidebar">
-      <SidebarHeader className="berry-sidebar-header pt-[var(--berry-titlebar-height)]">
-        <Button variant="ghost" className="w-full justify-start gap-2" onClick={onBack}><ArrowLeft02 /> Back to workspace</Button>
-      </SidebarHeader>
-      <SidebarContent className="px-2 pt-4">
-        <SidebarMenu>
-          {WEB_SETTINGS_NAV.filter((item) => item.id !== "platform" || allowPlatform).map((item) => <SidebarMenuItem key={item.id}><SidebarMenuButton isActive={tab === item.id} onClick={() => onTabChange(item.id)}><SettingsIcon /><span>{item.label}</span></SidebarMenuButton></SidebarMenuItem>)}
-        </SidebarMenu>
-      </SidebarContent>
-    </Sidebar>
-  );
-}
 
 export function WebWindowChrome({ onHome, onSearch }: {
   onHome: () => void;
@@ -87,12 +70,10 @@ export function WebWindowChrome({ onHome, onSearch }: {
           <LayoutAlignLeft className="berry-web-sidebar-expand-icon" aria-hidden="true" />
           <span className="berry-web-home-label">Berry</span>
         </button>
-        {!sidebarCollapsed ? (
-          <div className="berry-web-window-actions flex items-center">
-            <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button>
-            <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" className="berry-web-header-icon berry-web-sidebar-toggle" />
-          </div>
-        ) : null}
+        <div className="berry-web-window-actions flex items-center">
+          {!sidebarCollapsed ? <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button> : null}
+          {!sidebarCollapsed ? <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" className="berry-web-header-icon berry-web-sidebar-toggle" /> : null}
+        </div>
       </div>
     </div>
   );
@@ -159,7 +140,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
         commands={(
           <>
             <SidebarMenu className="berry-sidebar-commands">
-              <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New chat</span><Kbd className="ml-auto" aria-hidden>⌘N</Kbd></SidebarMenuButton></SidebarMenuItem>
+              <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New chat</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem>
             </SidebarMenu>
@@ -169,7 +150,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
       <SidebarFooter className="berry-sidebar-footer">
         <div className="flex items-center gap-2">
           <div className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2"><span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><BerryLogo className="size-full" alt="" /></span><span className="min-w-0 truncate text-sm font-semibold">{user?.name || user?.email || "Berry Cloud"}</span></div>
-          <Button variant="ghost" size="icon-sm" onClick={onSettings} aria-label="Settings" className="berry-sidebar-mini-control"><SettingsIcon /></Button>
+          <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button>
           {user ? <Button variant="ghost" size="icon-sm" onClick={onSignOut} aria-label="Sign out" className="berry-sidebar-mini-control"><LogOut size={15} /></Button> : null}
         </div>
       </SidebarFooter>

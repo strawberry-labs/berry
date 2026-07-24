@@ -12,7 +12,6 @@ import { Input } from "@berry/desktop-ui/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@berry/desktop-ui/components/ui/input-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@berry/desktop-ui/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@berry/desktop-ui/components/ui/sheet";
-import { Skeleton } from "@berry/desktop-ui/components/ui/skeleton";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Switch } from "@berry/desktop-ui/components/ui/switch";
 import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from "@berry/desktop-ui/components/ui/table";
@@ -26,7 +25,7 @@ export function ManagementPage({ title, description, eyebrow, actions, children,
 }
 
 export function AsyncState({ loading, error, onRetry, children, empty = false, emptyTitle = "Nothing here yet", emptyText = "New records will appear here when they are available." }: { loading: boolean; error: string | null; onRetry: () => void; children: ReactNode; empty?: boolean; emptyTitle?: string; emptyText?: string }) {
-  if (loading) return <div className="mgmt-state" role="status" aria-live="polite"><Skeleton className="mgmt-loading-mark" /><CircularActivitySpinner size={16} label="Loading organization data" /><strong>Loading</strong><span>Fetching the latest organization data…</span></div>;
+  if (loading) return <div className="mgmt-state" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading organization data" /></div>;
   if (error) return <div className="mgmt-state mgmt-state-error" role="alert"><AlertCircle /><strong>Couldn’t load this screen</strong><span>{error}</span><Button variant="outline" onClick={onRetry}><RefreshCw />Retry</Button></div>;
   if (empty) return <Empty className="mgmt-state"><EmptyHeader><EmptyMedia variant="icon"><span className="mgmt-empty-mark" /></EmptyMedia><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyText}</EmptyDescription></EmptyHeader></Empty>;
   return <>{children}</>;
@@ -98,8 +97,7 @@ export function FilterSelect({ label, value, onChange, options }: { label: strin
 }
 
 export function ManagementSwitch({ checked, onCheckedChange, disabled, "aria-label": ariaLabel }: { checked: boolean; onCheckedChange: (checked: boolean) => void; disabled?: boolean; "aria-label"?: string }) {
-  const [initialized, setInitialized] = React.useState(false);
-  return <Switch role="checkbox" checked={checked} disabled={disabled} aria-label={ariaLabel} data-on={String(checked)} className={initialized ? "t-toggle is-init" : "t-toggle"} onCheckedChange={(next) => { setInitialized(true); onCheckedChange(next); }} />;
+  return <Switch checked={checked} disabled={disabled} aria-label={ariaLabel} onCheckedChange={onCheckedChange} />;
 }
 
 export function DetailDrawer({ title, subtitle, badge, onClose, children, footer }: { title: string; subtitle?: ReactNode; badge?: ReactNode; onClose: () => void; children: ReactNode; footer?: ReactNode }) {
