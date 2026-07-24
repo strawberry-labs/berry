@@ -1,7 +1,7 @@
 import * as React from "react";
 import type { Message } from "@berry/shared";
 import type { StreamState, ToolEntry } from "@berry/desktop-ui/components/thread-stream";
-import { Popover, PopoverContent, PopoverTrigger } from "@berry/desktop-ui/components/ui/popover";
+import { Popover, PopoverAnchor, PopoverContent } from "@berry/desktop-ui/components/ui/popover";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { CircleCheckIcon, CircleHollow, OctagonXIcon } from "@berry/desktop-ui/lib/icons";
 import { Squircle } from "@berry/desktop-ui/lib/squircle";
@@ -136,13 +136,10 @@ function PlanStatusIcon({ status, className }: { status: PlanItemStatus; classNa
 export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
   const [open, setOpen] = React.useState(false);
   const openTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-  const closeTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearTimers = React.useCallback(() => {
     if (openTimer.current) clearTimeout(openTimer.current);
-    if (closeTimer.current) clearTimeout(closeTimer.current);
     openTimer.current = null;
-    closeTimer.current = null;
   }, []);
 
   const openImmediately = React.useCallback(() => {
@@ -151,8 +148,6 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
   }, [clearTimers]);
 
   const openOnHover = React.useCallback(() => {
-    if (closeTimer.current) clearTimeout(closeTimer.current);
-    closeTimer.current = null;
     if (open || openTimer.current) return;
     openTimer.current = setTimeout(() => {
       openTimer.current = null;
@@ -160,15 +155,10 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
     }, 80);
   }, [open]);
 
-  const closeAfterPointerExit = React.useCallback(() => {
+  const closeImmediately = React.useCallback(() => {
     if (openTimer.current) clearTimeout(openTimer.current);
     openTimer.current = null;
-    if (closeTimer.current) clearTimeout(closeTimer.current);
-    // Keeps the 8px visual gap traversable without making dismissal feel delayed.
-    closeTimer.current = setTimeout(() => {
-      closeTimer.current = null;
-      setOpen(false);
-    }, 50);
+    setOpen(false);
   }, []);
 
   React.useEffect(() => clearTimers, [clearTimers]);
@@ -184,21 +174,22 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
       <div
         className="berry-plan-progress-anchor"
         onPointerEnter={openOnHover}
-        onPointerLeave={closeAfterPointerExit}
+        onPointerLeave={closeImmediately}
       >
-        <PopoverTrigger asChild>
+        <PopoverAnchor asChild>
           <button
             type="button"
             className="berry-plan-progress-pill"
             aria-label={`View plan progress: step ${plan.current} of ${plan.total}`}
+            aria-haspopup="dialog"
             aria-expanded={open}
             onFocus={openImmediately}
-            onBlur={closeAfterPointerExit}
+            onBlur={closeImmediately}
           >
             <PlanStatusIcon status={plan.status} className={`berry-plan-progress-status is-${plan.status}`} />
             <span>Step {plan.current} / {plan.total}</span>
           </button>
-        </PopoverTrigger>
+        </PopoverAnchor>
       </div>
       <PopoverContent
         side="top"
@@ -206,8 +197,8 @@ export function PlanProgressPill({ plan }: { plan: PlanProgress }) {
         sideOffset={8}
         collisionPadding={16}
         className="berry-plan-progress-popover-shell"
-        onPointerEnter={openImmediately}
-        onPointerLeave={closeAfterPointerExit}
+        onOpenAutoFocus={(event) => event.preventDefault()}
+        onCloseAutoFocus={(event) => event.preventDefault()}
       >
         <Squircle cornerRadius={20} className="berry-plan-progress-popover">
           <ol className="berry-plan-progress-list" aria-label="Plan steps">
