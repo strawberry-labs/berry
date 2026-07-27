@@ -21,6 +21,7 @@ import {
   AiBrain01Icon,
   ArrowUp01Icon,
   ArrowUp02Icon,
+  ArrowUpRight01Icon as HugeArrowUpRight01Icon,
   AtIcon,
   Attachment01Icon,
   BarChartIcon,
@@ -159,6 +160,7 @@ export const ArrowUp02 = make(ArrowUp02Icon);
 export const ArrowLeft = make(ArrowLeft01Icon);
 export const ArrowLeft02 = make(ArrowLeft02Icon);
 export const ArrowRight02 = make(ArrowRight02Icon);
+export const ArrowUpRight01Icon = make(HugeArrowUpRight01Icon);
 export const ListTodo = make(CheckListIcon);
 export const CircleHollow = make(HugeCircleIcon);
 export const LayoutAlignLeft = make(LayoutAlignLeftIcon);

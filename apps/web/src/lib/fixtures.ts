@@ -11,6 +11,7 @@ export function fixtureTasks(): Task[] {
 }
 
 export function fixtureMessages(sessionId: string): Message[] {
+  if (sessionId === "session_launch") return writingBlockFixtureMessages(sessionId);
   const assistant = message(
     "msg_assistant_1",
     sessionId,
@@ -47,6 +48,88 @@ export function fixtureMessages(sessionId: string): Message[] {
   assistant.generationMs = 2_740;
   return [
     message("msg_user_1", sessionId, "user", "Run a sandboxed task and summarize the result."),
+    assistant,
+  ];
+}
+
+function writingBlockFixtureMessages(sessionId: string): Message[] {
+  const assistant = message("msg_assistant_draft", sessionId, "assistant", "");
+  const draft = {
+    id: "launch-update-email",
+    kind: "email" as const,
+    summaryTitle: "Project update",
+    variants: [
+      {
+        label: "Professional",
+        subject: "Project update",
+        body: [
+          "Hi team,",
+          "",
+          "I’m writing to share a brief update on the launch. We’ve completed the infrastructure review, and the team is now working through the final rollout checklist.",
+          "",
+          "The project remains on track for Friday. The one item requiring attention is the production access review; please confirm the final approver by Wednesday so we can keep the timeline intact.",
+          "",
+          "Best,",
+          "Chirag",
+        ].join("\n"),
+        active: true,
+      },
+      {
+        label: "Warm",
+        subject: "A quick launch update",
+        body: [
+          "Hi team,",
+          "",
+          "A quick update: the infrastructure review is complete, and we’re down to the final rollout checklist.",
+          "",
+          "We’re still on track for Friday. Could you help confirm the production access approver by Wednesday?",
+          "",
+          "Thanks,",
+          "Chirag",
+        ].join("\n"),
+      },
+      {
+        label: "Executive",
+        subject: "Launch status: on track",
+        body: [
+          "Team,",
+          "",
+          "Status: On track for Friday.",
+          "",
+          "Complete: Infrastructure review.",
+          "In progress: Final rollout checklist.",
+          "Decision needed: Confirm the production access approver by Wednesday.",
+          "",
+          "Chirag",
+        ].join("\n"),
+      },
+    ],
+  };
+  assistant.parts = [
+    {
+      id: "msg_assistant_draft_call",
+      messageId: assistant.id,
+      kind: "tool-call",
+      content: { toolCallId: "compose_launch_update", name: "compose_message", arguments: draft },
+      position: 0,
+      createdAt: FIXED_NOW,
+    },
+    {
+      id: "msg_assistant_draft_result",
+      messageId: assistant.id,
+      kind: "tool-result",
+      content: {
+        toolCallId: "compose_launch_update",
+        name: "compose_message",
+        status: "completed",
+        output: { text: "Prepared 3 email drafts in an editable writing block.", draft },
+      },
+      position: 1,
+      createdAt: FIXED_NOW,
+    },
+  ];
+  return [
+    message("msg_user_draft", sessionId, "user", "Draft a project update email with professional, warm, and executive options."),
     assistant,
   ];
 }

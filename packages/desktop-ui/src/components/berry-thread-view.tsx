@@ -1,5 +1,5 @@
 import * as React from "react";
-import { MessageAttachmentContentSchema, type Message, type MessageAttachmentContent, type MessagePart } from "@berry/shared";
+import { MessageAttachmentContentSchema, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
 import { CircleHelp, Copy, GaugeIcon, GitFork, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 
@@ -45,6 +45,10 @@ import {
   type StreamState,
   type ToolEntry,
 } from "@berry/desktop-ui/components/thread-stream";
+import {
+  WritingBlockController,
+  messageDraftFromToolResult,
+} from "@berry/desktop-ui/components/writing-block";
 
 export type ApprovalDecision = "approved_once" | "approved_for_session" | "approved_rule" | "denied" | "abort";
 
@@ -168,6 +172,10 @@ export function BerryThreadView({
   // live → persisted render-path handoff, so disclosure state never resets.
   const liveTurnIndex = latestTurn?.user ? turnGroups.length - 1 : turnGroups.length;
   const liveTurnKey = `${sessionId}:turn-${liveTurnIndex}`;
+  const writingBlockParts = React.useMemo(
+    () => collectLatestMessageDraftParts(settled),
+    [settled],
+  );
 
   React.useEffect(() => {
     if (!stream.endStatus || !stream.turnStartedAt) return;
@@ -242,7 +250,7 @@ export function BerryThreadView({
 
   return (
     <MessageScrollerProvider autoScroll={autoScroll} scrollEdgeThreshold={96}>
-      <div ref={navContainerRef} className="relative flex min-h-0 flex-1 flex-col">
+      <div ref={navContainerRef} className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         <ConversationNavigator containerRef={navContainerRef} items={navigatorItems} inset={navigatorInset} />
         <MessageScroller className="flex-1">
         <MessageScrollerViewport className="px-6">
@@ -265,6 +273,7 @@ export function BerryThreadView({
                       showTodos={showTodos}
                       density={density}
                       adapter={adapter}
+                      writingBlockParts={writingBlockParts}
                       canContinue={
                         groupIndex === renderedTurnGroups.length - 1
                         && !stream.turnActive
@@ -473,6 +482,7 @@ function BerryAssistantTurnGroup({
   density,
   adapter,
   canContinue,
+  writingBlockParts,
 }: {
   messages: Message[];
   turnKey: string;
@@ -481,6 +491,7 @@ function BerryAssistantTurnGroup({
   density: "full" | "compact";
   adapter: BerryThreadAdapter;
   canContinue: boolean;
+  writingBlockParts: Map<string, MessageDraftPartResolution>;
 }) {
   const allParts = messages.flatMap((message) => message.parts);
   const imageParts = allParts.filter(isImageMessagePart);
@@ -490,7 +501,7 @@ function BerryAssistantTurnGroup({
     .map((part) => String(part.content))
     .join("\n");
 
-  const { segments, totalMs } = partitionAssistantParts(allParts);
+  const { segments, totalMs } = partitionAssistantParts(allParts, writingBlockParts);
   // Merge tool runs that were split across adjacent assistant messages.
   const merged: typeof segments = [];
   for (const segment of segments) {
@@ -560,6 +571,8 @@ function BerryAssistantTurnGroup({
       <BerryAssistantErrorBlock key={segment.id}>{segment.text}</BerryAssistantErrorBlock>
     ) : segment.kind === "artifact" ? (
       <BerryArtifactCard key={segment.id} artifact={segment} onOpen={adapter.onOpenArtifact} />
+    ) : segment.kind === "writing-block" ? (
+      <WritingBlockController key={segment.id} draft={segment.draft} />
     ) : (
       <BerryAssistantMarkdownBlock key={segment.id}>{segment.text}</BerryAssistantMarkdownBlock>
     );
@@ -601,17 +614,19 @@ function BerryAssistantTurnGroup({
           <BerryContinueInterruptedTurn onContinue={adapter.onContinueInterruptedTurn} />
         ) : null}
         <MessageFooter className="gap-1 opacity-0 transition-[opacity] group-hover:opacity-100">
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Copy message"
-            onClick={() => {
-              void navigator.clipboard.writeText(textContent);
-              toast.success("Copied");
-            }}
-          >
-            <Copy />
-          </Button>
+          {textContent ? (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Copy message"
+              onClick={() => {
+                void navigator.clipboard.writeText(textContent);
+                toast.success("Copied");
+              }}
+            >
+              <Copy />
+            </Button>
+          ) : null}
           {adapter.onFork ? (
             <Button
               variant="ghost"
@@ -841,7 +856,10 @@ export function BerryActivityStackBlock({ children }: { children: React.ReactNod
  * renders inline as a "Thought" row. Tool-call/tool-result parts sharing a
  * call id collapse to one entry with the final status/output.
  */
-export function partitionAssistantParts(parts: MessagePart[]): {
+export function partitionAssistantParts(
+  parts: MessagePart[],
+  writingBlockParts: Map<string, MessageDraftPartResolution> = new Map(),
+): {
   segments: MessageSegment[];
   totalMs: number;
   hadTools: boolean;
@@ -913,6 +931,16 @@ export function partitionAssistantParts(parts: MessagePart[]): {
           ? (part.content as Record<string, unknown>)
           : {};
       const id = typeof meta.toolCallId === "string" ? meta.toolCallId : part.id;
+      if (meta.name === "compose_message") {
+        if (part.kind === "tool-result") {
+          const resolved = writingBlockParts.get(part.id);
+          const draft = resolved?.draft ?? messageDraftFromToolResult(part.content);
+          if (draft && (resolved?.render ?? true)) {
+            segments.push({ kind: "writing-block", id: `writing-block-${draft.id}`, draft });
+          }
+        }
+        continue;
+      }
       upsertTool(id, meta, part.kind === "tool-result");
       if (part.kind === "tool-result" && meta.name === "persist_artifact") {
         const result = meta.output && typeof meta.output === "object" && !Array.isArray(meta.output)
@@ -949,6 +977,41 @@ export function partitionAssistantParts(parts: MessagePart[]): {
   const tools = [...toolMap.values()];
   const totalMs = tools.reduce((sum, tool) => sum + (tool.durationMs ?? 0), 0);
   return { segments, totalMs, hadTools: tools.length > 0 };
+}
+
+export interface MessageDraftPartResolution {
+  draft: MessageDraft;
+  render: boolean;
+}
+
+/**
+ * Repeated compose_message calls with the same stable draft id update the
+ * original card. Later tool-result rows are suppressed so a follow-up edit
+ * does not create a second card farther down the thread.
+ */
+export function collectLatestMessageDraftParts(messages: Message[]): Map<string, MessageDraftPartResolution> {
+  const drafts = new Map<string, { firstPartId: string; latest: MessageDraft; partIds: string[] }>();
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.kind !== "tool-result") continue;
+      const draft = messageDraftFromToolResult(part.content);
+      if (!draft) continue;
+      const existing = drafts.get(draft.id);
+      if (existing) {
+        existing.latest = draft;
+        existing.partIds.push(part.id);
+      } else {
+        drafts.set(draft.id, { firstPartId: part.id, latest: draft, partIds: [part.id] });
+      }
+    }
+  }
+  const resolved = new Map<string, MessageDraftPartResolution>();
+  for (const entry of drafts.values()) {
+    for (const partId of entry.partIds) {
+      resolved.set(partId, { draft: entry.latest, render: partId === entry.firstPartId });
+    }
+  }
+  return resolved;
 }
 
 export function BerryApprovalAccordion({ approval, adapter }: { approval: ApprovalPrompt; adapter: BerryThreadAdapter }) {

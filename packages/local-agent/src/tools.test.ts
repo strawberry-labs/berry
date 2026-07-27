@@ -43,6 +43,7 @@ describe("createBerryTools", () => {
     expect(riskForToolName("read_file")).toBe("read");
     expect(riskForToolName("activate_skill")).toBe("read");
     expect(riskForToolName("ask_user_question")).toBe("read");
+    expect(riskForToolName("compose_message")).toBe("read");
     expect(riskForToolName("write_file")).toBe("file-edit");
     expect(riskForToolName("bash")).toBe("shell");
     expect(riskForToolName("mcp__server__tool")).toBe("mcp");
@@ -51,6 +52,36 @@ describe("createBerryTools", () => {
     expect(riskForToolName("fetch_url")).toBe("browser");
     expect(riskForToolName("image_generation")).toBe("read");
     expect(riskForToolName("tool_search")).toBe("read");
+  });
+
+  it("returns validated structured message drafts for the thread renderer", async () => {
+    const { tools } = workspace();
+    const compose = tools.get("compose_message");
+    expect(compose).toBeDefined();
+    const result = await compose!.execute("call_compose", {
+      id: "project-update",
+      kind: "email",
+      summaryTitle: "Project update",
+      variants: [
+        { label: "Professional", subject: "Project update", body: "Hello team," },
+        { label: "Warm", subject: "A quick update", body: "Hi everyone,", active: true },
+      ],
+    } as never);
+    expect(result.details).toMatchObject({
+      draft: {
+        id: "project-update",
+        kind: "email",
+        variants: [
+          { label: "Professional", subject: "Project update" },
+          { label: "Warm", active: true },
+        ],
+      },
+    });
+    await expect(compose!.execute("call_invalid_compose", {
+      id: "invalid",
+      kind: "textMessage",
+      variants: [{ label: "Direct", subject: "Not valid", body: "Hello" }],
+    } as never)).rejects.toThrow("subject is only valid for email drafts");
   });
 
   it("exposes image generation as a model-invocable tool when the host bridge is available", async () => {

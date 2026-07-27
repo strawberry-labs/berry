@@ -176,6 +176,42 @@ test("web shell sends a fixture-backed chat turn", async ({ page }) => {
   await expect(page.getByText(/run it through the Phase 8 API\/SSE surface/)).toBeVisible();
 });
 
+test("writing blocks preserve per-variant edits and expose safe channel actions", async ({ page }) => {
+  await openTask(page, "task_launch", "Launch plan review");
+
+  const block = page.locator('[data-writing-block="launch-update-email"]');
+  await expect(block).toBeVisible();
+  await expect(block.getByRole("tab", { name: /Professional/ })).toHaveAttribute("aria-selected", "true");
+  await expect(block.getByRole("tab", { name: /Warm/ })).toBeVisible();
+  await expect(block.getByRole("tab", { name: /Executive/ })).toBeVisible();
+  await expect(block.getByRole("textbox", { name: "Email subject" })).toHaveValue("Project update");
+  await expect(block.getByText("Email draft", { exact: false })).toHaveCount(0);
+  await expect(block.getByRole("button", { name: "Edit with AI" })).toHaveCount(0);
+  const subjectEdges = await block.evaluate((element) => {
+    const subject = element.querySelector<HTMLElement>("[data-writing-block-subject]")!;
+    const blockRect = element.getBoundingClientRect();
+    const subjectRect = subject.getBoundingClientRect();
+    return {
+      left: subjectRect.left - blockRect.left,
+      right: blockRect.right - subjectRect.right,
+    };
+  });
+  expect(subjectEdges.left).toBeLessThanOrEqual(1);
+  expect(subjectEdges.right).toBeLessThanOrEqual(1);
+
+  const professionalBody = block.getByRole("textbox", { name: "Professional message body" });
+  await professionalBody.fill("Manual professional edit");
+  await block.getByRole("tab", { name: /Warm/ }).click();
+  await expect(block.getByRole("textbox", { name: "Warm message body" })).toHaveValue(/A quick update/);
+  await block.getByRole("tab", { name: /Professional/ }).click();
+  await expect(professionalBody).toHaveValue("Manual professional edit");
+
+  const mailLink = block.getByRole("link", { name: "Open in Mail" });
+  await expect(mailLink).toHaveAttribute("href", /subject=Project%20update/);
+  await block.getByRole("button", { name: "Copy message" }).click();
+  await expect(block.getByRole("button", { name: "Copied" })).toBeVisible();
+});
+
 test("recognized slash commands invoke handlers instead of becoming model text", async ({ page }) => {
   await openTask(page);
   await page.getByTestId("composer-input").fill("/compact");

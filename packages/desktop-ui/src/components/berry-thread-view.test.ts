@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@berry/shared";
-import { isContinuableAssistantTurn } from "./berry-thread-view";
+import { collectLatestMessageDraftParts, isContinuableAssistantTurn, partitionAssistantParts } from "./berry-thread-view";
 
 function assistant(status: Message["status"], id: string): Message {
   const createdAt = "2026-07-27T05:20:55.000Z";
@@ -38,5 +38,58 @@ describe("failed assistant turn recovery", () => {
       assistant("failed", "assistant_failure"),
       assistant("complete", "assistant_recovered"),
     ])).toBe(false);
+  });
+});
+
+describe("structured writing block projection", () => {
+  it("updates the first card when later tool results reuse the same draft id", () => {
+    const first = assistant("complete", "assistant_draft_1");
+    first.parts = [{
+      ...first.parts[0]!,
+      id: "draft_part_1",
+      kind: "tool-result",
+      content: {
+        name: "compose_message",
+        status: "completed",
+        output: {
+          draft: {
+            id: "project-update",
+            kind: "email",
+            variants: [{ label: "Professional", subject: "Original", body: "Original body" }],
+          },
+        },
+      },
+    }];
+    const second = assistant("complete", "assistant_draft_2");
+    second.parts = [{
+      ...second.parts[0]!,
+      id: "draft_part_2",
+      kind: "tool-result",
+      content: {
+        name: "compose_message",
+        status: "completed",
+        output: {
+          draft: {
+            id: "project-update",
+            kind: "email",
+            variants: [{ label: "Professional", subject: "Revised", body: "Revised body" }],
+          },
+        },
+      },
+    }];
+
+    const resolutions = collectLatestMessageDraftParts([first, second]);
+    expect(resolutions.get("draft_part_1")).toMatchObject({
+      render: true,
+      draft: { variants: [{ subject: "Revised", body: "Revised body" }] },
+    });
+    expect(resolutions.get("draft_part_2")).toMatchObject({ render: false });
+    expect(partitionAssistantParts(first.parts, resolutions).segments).toEqual([
+      expect.objectContaining({
+        kind: "writing-block",
+        draft: expect.objectContaining({ id: "project-update" }),
+      }),
+    ]);
+    expect(partitionAssistantParts(second.parts, resolutions).segments).toEqual([]);
   });
 });

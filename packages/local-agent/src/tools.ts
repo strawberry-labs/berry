@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, extname, join, relative } from "node:path";
 import { executeShellWithCapture, formatSkillInvocation, type AgentTool, type AgentToolResult, type ExecutionEnv, type FileInfo, type Skill } from "@berry/harness";
 import { NodeExecutionEnv } from "@berry/harness/node";
-import type { JsonValue } from "@berry/shared";
+import { MessageDraftSchema, type JsonValue } from "@berry/shared";
 import { Type, type TSchema } from "typebox";
 import { applyPatchWithEnv } from "./apply-patch.ts";
 import { artifactDisplayName, artifactMediaType } from "./artifacts.ts";
@@ -176,6 +176,7 @@ const TOOL_RISKS: Record<string, BerryToolRisk> = {
   glob: "read",
   grep: "read",
   todo_write: "read",
+  compose_message: "read",
   persist_artifact: "read",
   git_status: "read",
   git_diff: "read",
@@ -395,6 +396,37 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
         },
       )
     : undefined;
+
+  const composeMessage = defineTool(
+    "compose_message",
+    "Compose message",
+    "Render an email, SMS, Slack/LinkedIn-style message, or other drafted text as an editable writing block in the conversation. Use a stable id and reuse it when revising the same draft. Offer distinct variants only when they represent genuinely different communication strategies.",
+    Type.Object({
+      id: Type.String({ minLength: 1, maxLength: 128, description: "Stable artifact id; reuse this exact id for follow-up revisions" }),
+      kind: Type.Union([
+        Type.Literal("email"),
+        Type.Literal("textMessage"),
+        Type.Literal("other"),
+      ], { description: "Message channel; controls subject and launch actions" }),
+      summaryTitle: Type.Optional(Type.String({ minLength: 1, maxLength: 120, description: "Short title for the draft" })),
+      variants: Type.Array(
+        Type.Object({
+          label: Type.String({ minLength: 1, maxLength: 80, description: "A concise, goal-oriented 2–4 word label" }),
+          body: Type.String({ maxLength: 100_000, description: "Complete message body" }),
+          subject: Type.Optional(Type.String({ maxLength: 1_000, description: "Email subject; omit for non-email drafts" })),
+          active: Type.Optional(Type.Boolean({ description: "Select this variant initially" })),
+        }),
+        { minItems: 1, maxItems: 6 },
+      ),
+    }),
+    async (_id, params) => {
+      const draft = MessageDraftSchema.parse(params);
+      return textResult(
+        `Prepared ${draft.variants.length} ${draft.kind === "email" ? "email" : "message"} ${draft.variants.length === 1 ? "draft" : "drafts"} in an editable writing block.`,
+        { draft },
+      );
+    },
+  );
 
   const readFile = defineTool(
     "read_file",
@@ -1054,7 +1086,7 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
     );
   }
 
-  const tools = [readFile, readAttachment, skillTool, askUserQuestion, imageGeneration, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
+  const tools = [readFile, readAttachment, skillTool, askUserQuestion, composeMessage, imageGeneration, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
   if (persistArtifact) tools.push(persistArtifact);
   tools.push(...browserTools);
   tools.push(...webTools);

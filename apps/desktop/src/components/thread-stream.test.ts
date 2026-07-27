@@ -218,6 +218,11 @@ describe("classifyTurnSegments", () => {
   const thought = (id: string): MessageSegment => ({ kind: "thought", id, text: "hmm" });
   const error = (id: string): MessageSegment => ({ kind: "error", id, text: "boom" });
   const artifact = (id: string): MessageSegment => ({ kind: "artifact", id, name: "report.pdf", path: "/v1/artifacts/report.pdf" });
+  const writingBlock = (id: string): MessageSegment => ({
+    kind: "writing-block",
+    id,
+    draft: { id, kind: "email", variants: [{ label: "Direct", subject: "Hello", body: "Hi" }] },
+  });
 
   it("keeps intermediate prose inside the activity and only trailing text in the body (Codex LO/BO)", () => {
     const { activity, body, hasFinalText } = classifyTurnSegments([
@@ -269,6 +274,14 @@ describe("classifyTurnSegments", () => {
     const { activity, body, hasFinalText } = classifyTurnSegments([text("t1", "plain answer")]);
     expect(activity).toEqual([]);
     expect(body).toEqual([text("t1", "plain answer")]);
+    expect(hasFinalText).toBe(true);
+  });
+
+  it("treats a structured writing block as visible final output", () => {
+    const block = writingBlock("draft-1");
+    const { activity, body, hasFinalText } = classifyTurnSegments([thought("th1"), block]);
+    expect(activity).toEqual([thought("th1")]);
+    expect(body).toEqual([block]);
     expect(hasFinalText).toBe(true);
   });
 });

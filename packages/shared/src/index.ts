@@ -62,6 +62,45 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+export const MessageDraftKindSchema = z.enum(["email", "textMessage", "other"]);
+export type MessageDraftKind = z.infer<typeof MessageDraftKindSchema>;
+
+export const MessageVariantSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  body: z.string().max(100_000),
+  subject: z.string().max(1_000).optional(),
+  active: z.boolean().optional(),
+}).strict();
+export type MessageVariant = z.infer<typeof MessageVariantSchema>;
+
+/**
+ * Structured model → UI contract for editable message drafts. The
+ * `compose_message` tool validates this before the payload is persisted.
+ */
+export const MessageDraftSchema = z.object({
+  id: z.string().trim().min(1).max(128),
+  kind: MessageDraftKindSchema,
+  summaryTitle: z.string().trim().min(1).max(120).optional(),
+  variants: z.array(MessageVariantSchema).min(1).max(6),
+}).strict().superRefine((draft, context) => {
+  if (draft.kind === "email") return;
+  draft.variants.forEach((variant, index) => {
+    if (variant.subject !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["variants", index, "subject"],
+        message: "subject is only valid for email drafts",
+      });
+    }
+  });
+});
+export type MessageDraft = z.infer<typeof MessageDraftSchema>;
+
+export function activeMessageDraftVariantIndex(draft: MessageDraft): number {
+  const activeIndex = draft.variants.findIndex((variant) => variant.active === true);
+  return activeIndex === -1 ? 0 : activeIndex;
+}
+
 export const PermissionModeSchema = z.enum(["ask", "auto-edit", "plan", "full-access"]);
 export type PermissionMode = z.infer<typeof PermissionModeSchema>;
 

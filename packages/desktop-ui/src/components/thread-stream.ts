@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, ApprovalKind, QuestionOption, SessionNoteKind } from "@berry/shared";
+import type { AgentStreamEvent, ApprovalKind, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
 import type { ActivityTool } from "@berry/desktop-ui/components/thread-activity";
 
 /* ------------------------------------------------------------------------ */
@@ -323,6 +323,7 @@ export type MessageSegment =
   | { kind: "tools"; tools: ActivityTool[] }
   | { kind: "thought"; id: string; text: string }
   | { kind: "artifact"; id: string; name: string; path: string; mediaType?: string; size?: number }
+  | { kind: "writing-block"; id: string; draft: MessageDraft }
   | { kind: "text" | "error"; id: string; text: string };
 
 /**
@@ -345,11 +346,11 @@ export function classifyTurnSegments(segments: MessageSegment[]): {
   const activity: MessageSegment[] = [];
   const body: MessageSegment[] = [];
   segments.forEach((segment, index) => {
-    if (segment.kind === "error" || segment.kind === "artifact") body.push(segment);
+    if (segment.kind === "error" || segment.kind === "artifact" || segment.kind === "writing-block") body.push(segment);
     else if (segment.kind === "text" && index > lastActivity) body.push(segment);
     else activity.push(segment);
   });
-  return { activity, body, hasFinalText: body.some((segment) => segment.kind === "text") };
+  return { activity, body, hasFinalText: body.some((segment) => segment.kind === "text" || segment.kind === "writing-block") };
 }
 
 function isAutomaticArtifactPublish(segment: Extract<MessageSegment, { kind: "tools" }>): boolean {

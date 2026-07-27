@@ -7,6 +7,7 @@ import {
   HostPushEventSchema,
   MobileDeviceRegistrationCreateSchema,
   MobileDeviceRegistrationSchema,
+  MessageDraftSchema,
   AlertRuleCreateSchema,
   ArchivedChatsSearchSchema,
   BulkLimitMutationSchema,
@@ -28,6 +29,7 @@ import {
   networkDomainAllowed,
   networkPolicyForSandbox,
   parseNetworkDomainAllowlist,
+  activeMessageDraftVariantIndex,
   type AgentStreamEvent,
 } from "./index.ts";
 import { renderHostProtocolDocs } from "./protocol-docs.ts";
@@ -79,6 +81,36 @@ describe("AgentStreamEventSchema", () => {
     expect(() =>
       AgentStreamEventSchema.parse({ kind: "tool.end", toolCallId: "tc", status: "exploded" }),
     ).toThrow();
+  });
+});
+
+describe("MessageDraftSchema", () => {
+  it("validates structured drafts and selects the first explicitly active variant", () => {
+    const draft = MessageDraftSchema.parse({
+      id: "project-update",
+      kind: "email",
+      summaryTitle: "Project update",
+      variants: [
+        { label: "Professional", subject: "Project update", body: "Hello" },
+        { label: "Warm", subject: "A quick update", body: "Hi there", active: true },
+      ],
+    });
+    expect(activeMessageDraftVariantIndex(draft)).toBe(1);
+  });
+
+  it("falls back to the first variant and rejects email-only subjects on other channels", () => {
+    const text = MessageDraftSchema.parse({
+      id: "check-in",
+      kind: "textMessage",
+      variants: [{ label: "Direct", body: "Can we talk today?" }],
+    });
+    expect(activeMessageDraftVariantIndex(text)).toBe(0);
+    expect(() => MessageDraftSchema.parse({
+      id: "invalid",
+      kind: "other",
+      variants: [{ label: "Direct", subject: "Not supported", body: "Hello" }],
+    })).toThrow("subject is only valid for email drafts");
+    expect(() => MessageDraftSchema.parse({ id: "empty", kind: "email", variants: [] })).toThrow();
   });
 });
 

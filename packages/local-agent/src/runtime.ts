@@ -386,6 +386,12 @@ export function buildDefaultSystemPrompt(options: DefaultSystemPromptOptions): s
     "- Use persist_artifact only when a deliverable must be published before the turn ends; do not publish the same file both ways.",
     "- Render or OCR a PDF from its safe local path only when extracted text is empty or the user's request depends on visual layout, diagrams, or scanned pages.",
     "",
+    "# Drafted Messages",
+    "- When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call `compose_message` so the result renders as an editable writing block.",
+    "- Use one variant for a straightforward request. Use two or three concise, goal-oriented variants only when different strategies are genuinely useful.",
+    "- Reuse the same draft `id` for follow-up revisions. Preserve the requested channel, and omit `subject` unless the kind is `email`.",
+    "- After calling `compose_message`, do not repeat the draft bodies in Markdown. Add only a short note when the user needs context outside the writing block.",
+    "",
     "# Security",
     "- Help with defensive security, authorized audits, CTFs, toy examples, and local vulnerability analysis.",
     "- Refuse requests to deploy malware, steal credentials or secrets, evade detection, persist unauthorized access, target third parties at scale, or cause denial of service.",
@@ -1561,7 +1567,7 @@ export class BerryAgentRuntime {
     });
     const children = toolName === "task" ? this.#subagentChildren.get(toolCallId) : undefined;
     if (toolName === "task") this.#subagentChildren.delete(toolCallId);
-    const persistedOutput = (toolName === "browser_screenshot" || toolName === "persist_artifact" || toolName === "image_generation") && toolResult?.details
+    const persistedOutput = (toolName === "browser_screenshot" || toolName === "persist_artifact" || toolName === "image_generation" || toolName === "compose_message") && toolResult?.details
       ? { text: outputText, ...toolResult.details } as JsonValue
       : outputText || null;
     active.onToolCall?.({
