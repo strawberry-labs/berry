@@ -65,9 +65,18 @@ function writingBlockFixtureMessages(sessionId: string): Message[] {
         body: [
           "Hi team,",
           "",
-          "I’m writing to share a brief update on the launch. We’ve completed the infrastructure review, and the team is now working through the final rollout checklist.",
+          "**Current status**",
           "",
-          "The project remains on track for Friday. The one item requiring attention is the production access review; please confirm the final approver by Wednesday so we can keep the timeline intact.",
+          "The project remains **on track for Friday**.",
+          "",
+          "**Recent accomplishments**",
+          "",
+          "- Infrastructure review completed",
+          "- Final rollout checklist started",
+          "",
+          "**Decision needed**",
+          "",
+          "Please confirm the production access approver by Wednesday so we can keep the timeline intact.",
           "",
           "Best,",
           "Chirag",
@@ -105,6 +114,40 @@ function writingBlockFixtureMessages(sessionId: string): Message[] {
       },
     ],
   };
+  const revisedDraft = {
+    ...draft,
+    summaryTitle: "Shorter project update",
+    variants: [
+      {
+        label: "Professional",
+        subject: "Project update — condensed",
+        body: [
+          "Hi team,",
+          "",
+          "**Status:** On track for Friday.",
+          "",
+          "- Infrastructure review: complete",
+          "- Rollout checklist: in progress",
+          "- Needed by Wednesday: production access approver",
+          "",
+          "Best,",
+          "Chirag",
+        ].join("\n"),
+        active: true,
+      },
+      {
+        label: "Warm",
+        subject: "Quick launch update",
+        body: "Hi team,\n\nWe’re **on track for Friday**. Please confirm the production access approver by Wednesday.\n\nThanks,\nChirag",
+      },
+      {
+        label: "Executive",
+        subject: "Launch status: on track",
+        body: "**On track for Friday.**\n\nDecision needed by Wednesday: confirm the production access approver.",
+      },
+    ],
+  };
+  const revisedAssistant = message("msg_assistant_draft_revision", sessionId, "assistant", "");
   assistant.parts = [
     {
       id: "msg_assistant_draft_call",
@@ -128,9 +171,34 @@ function writingBlockFixtureMessages(sessionId: string): Message[] {
       createdAt: FIXED_NOW,
     },
   ];
+  revisedAssistant.parts = [
+    {
+      id: "msg_assistant_draft_revision_call",
+      messageId: revisedAssistant.id,
+      kind: "tool-call",
+      content: { toolCallId: "compose_launch_update_revision", name: "compose_message", arguments: revisedDraft },
+      position: 0,
+      createdAt: FIXED_NOW,
+    },
+    {
+      id: "msg_assistant_draft_revision_result",
+      messageId: revisedAssistant.id,
+      kind: "tool-result",
+      content: {
+        toolCallId: "compose_launch_update_revision",
+        name: "compose_message",
+        status: "completed",
+        output: { text: "Prepared a shorter revision in a new writing block.", draft: revisedDraft },
+      },
+      position: 1,
+      createdAt: FIXED_NOW,
+    },
+  ];
   return [
     message("msg_user_draft", sessionId, "user", "Draft a project update email with professional, warm, and executive options."),
     assistant,
+    message("msg_user_draft_revision", sessionId, "user", "Make it shorter and easier to scan."),
+    revisedAssistant,
   ];
 }
 

@@ -6,6 +6,7 @@ import {
   type MessageVariant,
 } from "@berry/shared";
 import { ArrowUpRight01Icon, Check, Copy, Pencil } from "@berry/desktop-ui/lib/icons";
+import { Markdown } from "@berry/desktop-ui/components/berry-markdown";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@berry/desktop-ui/components/ui/tabs";
 import { cn } from "@berry/desktop-ui/lib/utils";
@@ -134,6 +135,7 @@ export function WritingBlock({
   onCopy,
 }: WritingBlockProps) {
   const [copied, setCopied] = React.useState(false);
+  const [isEditing, setIsEditing] = React.useState(false);
   const copyTimerRef = React.useRef<number | null>(null);
   const active = data.variants[data.activeIndex] ?? data.variants[0];
 
@@ -165,12 +167,21 @@ export function WritingBlock({
       className="w-full max-w-[1150px] overflow-hidden rounded-[22px] border border-[var(--berry-border)] bg-[var(--berry-card-bg)] text-[var(--berry-text-primary)] shadow-[var(--berry-shadow-sm)]"
     >
       <header className="flex min-h-14 items-center gap-2 border-b border-[var(--berry-border)] px-3 py-2">
-        <span
-          className="grid size-9 shrink-0 place-items-center rounded-full border border-[var(--berry-border)] text-[var(--berry-text-secondary)]"
-          aria-hidden="true"
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={isEditing ? "Preview message" : "Edit message"}
+          aria-pressed={isEditing}
+          title={isEditing ? "Preview message" : "Edit message"}
+          className={cn(
+            "size-10 shrink-0 rounded-full border border-[var(--berry-border)] text-[var(--berry-text-secondary)] transition-[background-color,color,transform] hover:bg-[var(--berry-hover)] hover:text-[var(--berry-text-primary)] active:scale-[0.96]",
+            isEditing && "bg-[var(--berry-selected)] text-[var(--berry-text-primary)]",
+          )}
+          onClick={() => setIsEditing((current) => !current)}
         >
           <Pencil className="size-4" />
-        </span>
+        </Button>
         <OptionTabs variants={data.variants} activeIndex={data.activeIndex} onChange={onVariantChange} />
         {data.variants.length === 1 ? (
           <span className="min-w-0 flex-1 truncate px-1 text-[13px] font-medium">{active.label}</span>
@@ -192,29 +203,53 @@ export function WritingBlock({
 
       <div className={cn("px-4", data.kind === "textMessage" ? "py-4" : "")}>
         {data.kind === "email" ? (
-          <label
+          <div
             data-writing-block-subject
             className="-mx-4 grid grid-cols-[58px_minmax(0,1fr)] items-center border-b border-[var(--berry-border)] px-4 py-2"
           >
             <span className="text-[12px] text-[var(--berry-text-tertiary)]">Subject</span>
-            <input
-              value={active.subject ?? ""}
-              aria-label="Email subject"
-              placeholder="Add a subject"
-              className="min-w-0 border-0 bg-transparent p-0 text-[14px] text-[var(--berry-text-primary)] placeholder:text-[var(--berry-text-tertiary)] focus:outline-none"
-              onChange={(event) => onSubjectEdit(data.activeIndex, event.target.value)}
-            />
-          </label>
+            {isEditing ? (
+              <input
+                value={active.subject ?? ""}
+                aria-label="Email subject"
+                placeholder="Add a subject"
+                className="min-w-0 border-0 bg-transparent p-0 text-base text-[var(--berry-text-primary)] placeholder:text-[var(--berry-text-tertiary)] focus:outline-none sm:text-[14px]"
+                onChange={(event) => onSubjectEdit(data.activeIndex, event.target.value)}
+              />
+            ) : (
+              <span className="min-w-0 truncate text-[14px] text-[var(--berry-text-primary)]">
+                {active.subject?.trim() || "No subject"}
+              </span>
+            )}
+          </div>
         ) : null}
-        <AutosizeTextarea
-          value={active.body}
-          aria-label={`${active.label} message body`}
-          onChange={(event) => onBodyEdit(data.activeIndex, event.target.value)}
-          className={cn(
-            "block w-full resize-none overflow-hidden border-0 bg-transparent text-[15px] leading-[1.65] text-[var(--berry-text-primary)] outline-none placeholder:text-[var(--berry-text-tertiary)]",
-            data.kind === "email" ? "min-h-52 px-0 py-4" : "min-h-28 rounded-[18px] bg-[var(--berry-control-bg)] px-4 py-3",
-          )}
-        />
+        {isEditing ? (
+          <AutosizeTextarea
+            value={active.body}
+            aria-label={`${active.label} message body`}
+            onChange={(event) => onBodyEdit(data.activeIndex, event.target.value)}
+            className={cn(
+              "block w-full resize-none overflow-hidden border-0 bg-transparent text-base leading-[1.65] text-[var(--berry-text-primary)] outline-none placeholder:text-[var(--berry-text-tertiary)] sm:text-[15px]",
+              data.kind === "email" ? "min-h-52 px-0 py-4" : "min-h-28 rounded-[18px] bg-[var(--berry-control-bg)] px-4 py-3",
+            )}
+          />
+        ) : (
+          <div
+            data-writing-block-body
+            className={cn(
+              "min-h-28 text-[var(--berry-text-primary)]",
+              data.kind === "email" ? "py-4" : "rounded-[18px] bg-[var(--berry-control-bg)] px-4 py-3",
+            )}
+          >
+            {active.body.trim() ? (
+              <Markdown className="text-[15px] leading-[1.65] tracking-normal [&>p]:my-4 [&_p]:whitespace-pre-wrap [&_strong]:font-semibold">
+                {active.body}
+              </Markdown>
+            ) : (
+              <p className="text-[15px] text-[var(--berry-text-tertiary)]">No message content</p>
+            )}
+          </div>
+        )}
       </div>
     </section>
   );

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@berry/shared";
-import { collectLatestMessageDraftParts, isContinuableAssistantTurn, partitionAssistantParts } from "./berry-thread-view";
+import { collectMessageDraftParts, isContinuableAssistantTurn, partitionAssistantParts } from "./berry-thread-view";
 
 function assistant(status: Message["status"], id: string): Message {
   const createdAt = "2026-07-27T05:20:55.000Z";
@@ -42,7 +42,7 @@ describe("failed assistant turn recovery", () => {
 });
 
 describe("structured writing block projection", () => {
-  it("updates the first card when later tool results reuse the same draft id", () => {
+  it("keeps every card when later tool results reuse the same draft id", () => {
     const first = assistant("complete", "assistant_draft_1");
     first.parts = [{
       ...first.parts[0]!,
@@ -78,18 +78,29 @@ describe("structured writing block projection", () => {
       },
     }];
 
-    const resolutions = collectLatestMessageDraftParts([first, second]);
+    const resolutions = collectMessageDraftParts([first, second]);
     expect(resolutions.get("draft_part_1")).toMatchObject({
-      render: true,
+      draft: { variants: [{ subject: "Original", body: "Original body" }] },
+    });
+    expect(resolutions.get("draft_part_2")).toMatchObject({
       draft: { variants: [{ subject: "Revised", body: "Revised body" }] },
     });
-    expect(resolutions.get("draft_part_2")).toMatchObject({ render: false });
     expect(partitionAssistantParts(first.parts, resolutions).segments).toEqual([
       expect.objectContaining({
         kind: "writing-block",
+        id: "writing-block-draft_part_1",
         draft: expect.objectContaining({ id: "project-update" }),
       }),
     ]);
-    expect(partitionAssistantParts(second.parts, resolutions).segments).toEqual([]);
+    expect(partitionAssistantParts(second.parts, resolutions).segments).toEqual([
+      expect.objectContaining({
+        kind: "writing-block",
+        id: "writing-block-draft_part_2",
+        draft: expect.objectContaining({
+          id: "project-update",
+          variants: [{ label: "Professional", subject: "Revised", body: "Revised body" }],
+        }),
+      }),
+    ]);
   });
 });

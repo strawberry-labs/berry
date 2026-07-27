@@ -179,11 +179,21 @@ test("web shell sends a fixture-backed chat turn", async ({ page }) => {
 test("writing blocks preserve per-variant edits and expose safe channel actions", async ({ page }) => {
   await openTask(page, "task_launch", "Launch plan review");
 
-  const block = page.locator('[data-writing-block="launch-update-email"]');
+  const blocks = page.locator('[data-writing-block="launch-update-email"]');
+  await expect(blocks).toHaveCount(2);
+  const block = blocks.first();
+  const revision = blocks.nth(1);
   await expect(block).toBeVisible();
+  await expect(revision).toBeVisible();
+  await expect(block.locator("strong").filter({ hasText: "Current status" })).toBeVisible();
+  await expect(block.getByRole("listitem")).toHaveCount(2);
+  await expect(revision.locator("strong").filter({ hasText: "Status:" })).toBeVisible();
+  await expect(revision.getByText("Project update — condensed", { exact: true })).toBeVisible();
   await expect(block.getByRole("tab", { name: /Professional/ })).toHaveAttribute("aria-selected", "true");
   await expect(block.getByRole("tab", { name: /Warm/ })).toBeVisible();
   await expect(block.getByRole("tab", { name: /Executive/ })).toBeVisible();
+  await expect(block.getByRole("textbox", { name: "Email subject" })).toHaveCount(0);
+  await block.getByRole("button", { name: "Edit message" }).click();
   await expect(block.getByRole("textbox", { name: "Email subject" })).toHaveValue("Project update");
   await expect(block.getByText("Email draft", { exact: false })).toHaveCount(0);
   await expect(block.getByRole("button", { name: "Edit with AI" })).toHaveCount(0);
@@ -205,6 +215,9 @@ test("writing blocks preserve per-variant edits and expose safe channel actions"
   await expect(block.getByRole("textbox", { name: "Warm message body" })).toHaveValue(/A quick update/);
   await block.getByRole("tab", { name: /Professional/ }).click();
   await expect(professionalBody).toHaveValue("Manual professional edit");
+  await block.getByRole("button", { name: "Preview message" }).click();
+  await expect(block.getByText("Manual professional edit", { exact: true })).toBeVisible();
+  await expect(block.getByRole("textbox", { name: "Professional message body" })).toHaveCount(0);
 
   const mailLink = block.getByRole("link", { name: "Open in Mail" });
   await expect(mailLink).toHaveAttribute("href", /subject=Project%20update/);

@@ -173,7 +173,7 @@ export function BerryThreadView({
   const liveTurnIndex = latestTurn?.user ? turnGroups.length - 1 : turnGroups.length;
   const liveTurnKey = `${sessionId}:turn-${liveTurnIndex}`;
   const writingBlockParts = React.useMemo(
-    () => collectLatestMessageDraftParts(settled),
+    () => collectMessageDraftParts(settled),
     [settled],
   );
 
@@ -935,8 +935,8 @@ export function partitionAssistantParts(
         if (part.kind === "tool-result") {
           const resolved = writingBlockParts.get(part.id);
           const draft = resolved?.draft ?? messageDraftFromToolResult(part.content);
-          if (draft && (resolved?.render ?? true)) {
-            segments.push({ kind: "writing-block", id: `writing-block-${draft.id}`, draft });
+          if (draft) {
+            segments.push({ kind: "writing-block", id: `writing-block-${part.id}`, draft });
           }
         }
         continue;
@@ -981,34 +981,21 @@ export function partitionAssistantParts(
 
 export interface MessageDraftPartResolution {
   draft: MessageDraft;
-  render: boolean;
 }
 
 /**
- * Repeated compose_message calls with the same stable draft id update the
- * original card. Later tool-result rows are suppressed so a follow-up edit
- * does not create a second card farther down the thread.
+ * Every completed compose_message result remains attached to its own timeline
+ * part. The stable draft id still identifies the logical artifact for model
+ * follow-ups, while the part id preserves each revision as a separate card.
  */
-export function collectLatestMessageDraftParts(messages: Message[]): Map<string, MessageDraftPartResolution> {
-  const drafts = new Map<string, { firstPartId: string; latest: MessageDraft; partIds: string[] }>();
+export function collectMessageDraftParts(messages: Message[]): Map<string, MessageDraftPartResolution> {
+  const resolved = new Map<string, MessageDraftPartResolution>();
   for (const message of messages) {
     for (const part of message.parts) {
       if (part.kind !== "tool-result") continue;
       const draft = messageDraftFromToolResult(part.content);
       if (!draft) continue;
-      const existing = drafts.get(draft.id);
-      if (existing) {
-        existing.latest = draft;
-        existing.partIds.push(part.id);
-      } else {
-        drafts.set(draft.id, { firstPartId: part.id, latest: draft, partIds: [part.id] });
-      }
-    }
-  }
-  const resolved = new Map<string, MessageDraftPartResolution>();
-  for (const entry of drafts.values()) {
-    for (const partId of entry.partIds) {
-      resolved.set(partId, { draft: entry.latest, render: partId === entry.firstPartId });
+      resolved.set(part.id, { draft });
     }
   }
   return resolved;
