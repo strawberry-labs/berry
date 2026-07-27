@@ -81,7 +81,7 @@ runtime can prove that the model never sees a tool outside the app allowlist.
   built-in tool names and risk classes. Exact names include `read_file`,
   `read_attachment`, `write_file`, `edit_file`, `apply_patch`, `bash`,
   `persist_artifact`, browser tools, `web_search`, `fetch_url`,
-  `image_generation`, `tool_search`, and `task`. MCP names begin `mcp__`.
+  `create_image`, `tool_search`, and `task`. MCP names begin `mcp__`.
 
 - `apps/api/src/http/agent-api.controller.ts:453-680` currently owns the
   complete turn orchestration: ownership checks, organization capabilities,
@@ -91,7 +91,7 @@ runtime can prove that the model never sees a tool outside the app allowlist.
 
 - `apps/api/src/http/agent-api.controller.ts:168-224` owns image generation
   budget and usage handling, while the turn method calls
-  `this.generateImage(...)` to construct the `image_generation` bridge. This
+  `this.generateImage(...)` to construct the `create_image` bridge. This
   coupling must be removed when turn logic becomes a service.
 
 - `apps/api/src/http/agent-api.module.ts:69-79` wires the controller and runtime
@@ -201,7 +201,7 @@ An explicitly invoked skill does not require `activate_skill`, because
 Before starting the model, fail with a stable `tool_unavailable` error listing
 any requested exact tool that is not present in the assembled runtime. This is
 especially important for optional `persist_artifact` and
-`image_generation`. Do not leak credentials or MCP configuration in the
+`create_image`. Do not leak credentials or MCP configuration in the
 error.
 
 Add tests for:

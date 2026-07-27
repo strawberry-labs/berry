@@ -28,6 +28,22 @@ export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   ]),
 );
 
+export const ImageAspectRatioSchema = z.enum(["1:1", "3:4", "4:3", "9:16", "16:9"]);
+export type ImageAspectRatio = z.infer<typeof ImageAspectRatioSchema>;
+
+export const IMAGE_ASPECT_RATIO_DIMENSIONS: Record<ImageAspectRatio, { width: number; height: number }> = {
+  "1:1": { width: 1024, height: 1024 },
+  "3:4": { width: 1024, height: 1536 },
+  "4:3": { width: 1536, height: 1024 },
+  "9:16": { width: 1024, height: 1536 },
+  "16:9": { width: 1536, height: 1024 },
+};
+
+export function imageSizeForAspectRatio(aspectRatio: ImageAspectRatio): string {
+  const dimensions = IMAGE_ASPECT_RATIO_DIMENSIONS[aspectRatio];
+  return `${dimensions.width}x${dimensions.height}`;
+}
+
 export const ImageGenerationRequestSchema = z.object({
   providerId: z.string().min(1).optional(),
   credentialRef: z.string().min(1).optional(),
@@ -35,6 +51,11 @@ export const ImageGenerationRequestSchema = z.object({
   prompt: z.string().min(1),
   model: z.string().min(1).optional(),
   size: z.string().min(1).optional(),
+  aspectRatio: ImageAspectRatioSchema.optional(),
+  transparentBackground: z.boolean().optional(),
+  referenceImageUrls: z.array(z.string().min(1)).max(16).optional(),
+  stream: z.boolean().optional(),
+  partialImages: z.number().int().min(0).max(3).optional(),
 });
 export type ImageGenerationRequest = z.infer<typeof ImageGenerationRequestSchema>;
 
@@ -53,6 +74,24 @@ export const ImageGenerationResponseSchema = z.object({
   ),
 }).passthrough();
 export type ImageGenerationResponse = z.infer<typeof ImageGenerationResponseSchema>;
+
+export const GeneratedImageContentSchema = z.object({
+  src: z.string().min(1),
+  fileId: z.string().uuid().optional(),
+  title: z.string().trim().min(1).max(160).default("Generated image"),
+  prompt: z.string().max(32_000).optional(),
+  revisedPrompt: z.string().max(32_000).optional(),
+  aspectRatio: ImageAspectRatioSchema.default("1:1"),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  mimeType: z.string().min(1).default("image/png"),
+  sizeBytes: z.number().int().nonnegative().optional(),
+  transparentBackground: z.boolean().default(false),
+  generationId: z.string().min(1).optional(),
+  parentGenerationId: z.string().min(1).nullable().optional(),
+  downloadUrl: z.string().min(1).optional(),
+}).strict();
+export type GeneratedImageContent = z.infer<typeof GeneratedImageContentSchema>;
 
 export type JsonValue =
   | string
@@ -1999,6 +2038,16 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     parentToolCallId: z.string().optional(),
   }),
   z.object({ kind: z.literal("tool.update"), toolCallId: z.string(), detail: z.string().optional(), parentToolCallId: z.string().optional() }),
+  z.object({
+    kind: z.literal("image.partial"),
+    toolCallId: z.string(),
+    requestIndex: z.number().int().nonnegative(),
+    index: z.number().int().nonnegative(),
+    percentComplete: z.number().min(0).max(1),
+    b64: z.string().min(1),
+    mimeType: z.string().min(1).default("image/png"),
+    aspectRatio: ImageAspectRatioSchema.default("1:1"),
+  }),
   z.object({
     kind: z.literal("tool.end"),
     toolCallId: z.string(),

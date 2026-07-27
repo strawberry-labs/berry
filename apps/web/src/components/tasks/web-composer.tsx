@@ -9,7 +9,7 @@ import { CircularProgressIndicator } from "@berry/desktop-ui/components/ui/circu
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare, X } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
@@ -109,6 +109,7 @@ export function Composer({
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
   const [uploadError, setUploadError] = React.useState("");
   const [fileDragActive, setFileDragActive] = React.useState(false);
+  const [createImageMode, setCreateImageMode] = React.useState(false);
   const [editingFollowUp, setEditingFollowUp] = React.useState<QueuedFollowUp | null>(null);
   const [savingQueuedEdit, setSavingQueuedEdit] = React.useState(false);
   const fileDragDepthRef = React.useRef(0);
@@ -200,7 +201,8 @@ export function Composer({
 
   const submit = React.useCallback(async (event?: KeyboardEvent | null) => {
     if (savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading")) return;
-    const input = text.trim() || (attachments.length > 0 ? "Review the attached files." : "");
+    const plainInput = text.trim() || (attachments.length > 0 ? "Review the attached files." : "");
+    const input = createImageMode ? `Create image\n${plainInput}` : plainInput;
     if (!input) return;
     if (editingFollowUp) {
       setSavingQueuedEdit(true);
@@ -231,6 +233,7 @@ export function Composer({
       try {
         await onCommand(command.name, command.args);
         setText("");
+        setCreateImageMode(false);
         editorRef.current?.clear();
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : `Unable to run /${command.name}`);
@@ -247,6 +250,7 @@ export function Composer({
           attachments,
         }));
         setText("");
+        setCreateImageMode(false);
         editorRef.current?.clear();
         setAttachments([]);
         return;
@@ -254,6 +258,7 @@ export function Composer({
 
       if (!client) {
         setText("");
+        setCreateImageMode(false);
         editorRef.current?.clear();
         setAttachments([]);
         return;
@@ -261,6 +266,7 @@ export function Composer({
       try {
         await onSteerMessage(activeTask, input, attachments);
         setText("");
+        setCreateImageMode(false);
         editorRef.current?.clear();
         setAttachments([]);
       } catch (cause) {
@@ -278,6 +284,7 @@ export function Composer({
     setUploadError("");
     const optimisticMessageId = onUserMessage(input, sessionId, task.id, attachments);
     setText("");
+    setCreateImageMode(false);
     editorRef.current?.clear();
     try {
       if (client) {
@@ -308,7 +315,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
+  }, [activeTask, attachments, client, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length) return;
@@ -477,6 +484,18 @@ export function Composer({
           </AttachmentGroup>
         ) : null}
         <div className="berry-composer-editor relative flex-1">
+          {createImageMode ? (
+            <button
+              type="button"
+              className="berry-create-image-chip"
+              onClick={() => setCreateImageMode(false)}
+              aria-label="Remove Create image"
+            >
+              <ImagePlus />
+              <span>Create image</span>
+              <X />
+            </button>
+          ) : null}
           <PromptEditor
             ref={editorRef}
             placeholder={editingFollowUp ? "Edit queued prompt" : variant === "home" ? "Ask Berry anything, @ for files or folders, / for commands, # for related conversations" : "Ask for follow-up changes"}
@@ -490,7 +509,7 @@ export function Composer({
         </div>
         <div className="berry-composer-controls flex min-w-0 flex-nowrap items-center gap-1">
           <input ref={fileInputRef} className="visually-hidden" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => void addFiles(event.currentTarget.files)} />
-          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-60"><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem onClick={() => { setCreateImageMode(true); window.requestAnimationFrame(() => editorRef.current?.focus()); }}><ImagePlus /><span className="flex flex-col"><strong className="text-[13px] font-medium">Create image</strong><small className="text-[11px] text-muted-foreground">Visualize anything</small></span></DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           <span className="min-w-0 flex-1" />
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{composerModels.find((item) => item.id === model)?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => onModelChange(item.id)}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoning[0]!.toUpperCase() + reasoning.slice(1)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Reasoning</DropdownMenuLabel>{(["off", "low", "medium", "high"] as const).map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span className="capitalize">{level}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>

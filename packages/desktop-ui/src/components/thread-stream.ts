@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, ApprovalKind, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
+import type { AgentStreamEvent, ApprovalKind, ImageAspectRatio, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
 import type { ActivityTool } from "@berry/desktop-ui/components/thread-activity";
 
 /* ------------------------------------------------------------------------ */
@@ -20,6 +20,13 @@ export interface ToolEntry {
   startedAt: number;
   /** Live child tool calls when this is a `task` (sub-agent) dispatch. */
   children?: ToolEntry[] | undefined;
+  imageProgress?: Array<{
+    requestIndex: number;
+    index: number;
+    percentComplete: number;
+    src: string;
+    aspectRatio: ImageAspectRatio;
+  }> | undefined;
 }
 
 export interface NoteEntry {
@@ -233,6 +240,26 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
           ...entry,
           output: event.detail ?? entry.output,
         })),
+      };
+    case "image.partial":
+      return {
+        ...state,
+        timeline: mapToolEntry(state.timeline, event.toolCallId, undefined, (entry) => {
+          const next = {
+            requestIndex: event.requestIndex,
+            index: event.index,
+            percentComplete: event.percentComplete,
+            src: `data:${event.mimeType};base64,${event.b64}`,
+            aspectRatio: event.aspectRatio,
+          };
+          return {
+            ...entry,
+            imageProgress: [
+              ...(entry.imageProgress ?? []).filter((item) => item.requestIndex !== event.requestIndex),
+              next,
+            ].sort((left, right) => left.requestIndex - right.requestIndex),
+          };
+        }),
       };
     case "tool.end":
       return {

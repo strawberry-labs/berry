@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { createCloudRuntimeConfigFromEnv } from "./cloud-runtime-config.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CloudRuntimeConfigService, createCloudRuntimeConfigFromEnv } from "./cloud-runtime-config.ts";
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("cloud runtime configuration", () => {
   it("builds a server-owned Berry Router provider, E2B-compatible MCP tools, and skills", () => {
@@ -43,6 +45,7 @@ describe("cloud runtime configuration", () => {
     expect(config.providerMaxOutputTokens).toBe(16_384);
     expect(config.imageGeneration).toEqual({
       endpoint: "https://router.example.test/v1/images/generations",
+      editsEndpoint: "https://router.example.test/v1/images/edits",
       model: "berry-image-1",
       responseFormat: "b64_json",
       costMicros: "15000",
@@ -94,5 +97,68 @@ describe("cloud runtime configuration", () => {
       BERRY_ROUTER_DEFAULT_MODEL: "glm-5.2",
       BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS: "0",
     })).toThrow("between 1 and 32000");
+  });
+
+  it("relays real Image API partials and returns the completed frame", async () => {
+    let requestBody: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response([
+        'event: image_generation.partial_image\ndata: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json":"cGFydGlhbA=="}',
+        'event: image_generation.completed\ndata: {"type":"image_generation.completed","b64_json":"ZmluYWw="}',
+        "",
+      ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
+    }));
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "berry/auto",
+      BERRY_ROUTER_IMAGE_MODEL: "gpt-image-2",
+      BERRY_ROUTER_IMAGE_COST_MICROS: "0",
+    });
+    const partials: Array<{ index: number; b64: string }> = [];
+    await expect(service.generateImage({
+      prompt: "A berry floating over Dubai",
+      aspectRatio: "16:9",
+      stream: true,
+      partialImages: 3,
+    }, (partial) => partials.push(partial))).resolves.toMatchObject({
+      model: "gpt-image-2",
+      data: [{ b64_json: "ZmluYWw=" }],
+    });
+    expect(partials).toEqual([{ index: 0, b64: "cGFydGlhbA==", mimeType: "image/png" }]);
+    expect(requestBody).toMatchObject({ size: "1536x1024", stream: true, partial_images: 3 });
+    expect(requestBody).not.toHaveProperty("response_format");
+  });
+
+  it("uses the edit endpoint for attached reference images", async () => {
+    let requestUrl = "";
+    let requestBody: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input);
+      requestBody = JSON.parse(String(init?.body));
+      return new Response([
+        'event: image_edit.partial_image\ndata: {"type":"image_edit.partial_image","partial_image_index":0,"b64_json":"cGFydGlhbA=="}',
+        'event: image_edit.completed\ndata: {"type":"image_edit.completed","b64_json":"ZWRpdGVk"}',
+        "",
+      ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
+    }));
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "berry/auto",
+      BERRY_ROUTER_IMAGE_MODEL: "gpt-image-2",
+      BERRY_ROUTER_IMAGE_COST_MICROS: "0",
+    });
+    await expect(service.generateImage({
+      prompt: "Remove the product label",
+      referenceImageUrls: ["data:image/png;base64,c291cmNl"],
+      stream: true,
+    }, () => undefined)).resolves.toMatchObject({
+      data: [{ b64_json: "ZWRpdGVk" }],
+    });
+    expect(requestUrl).toBe("https://router.example.test/v1/images/edits");
+    expect(requestBody).toMatchObject({
+      images: [{ image_url: "data:image/png;base64,c291cmNl" }],
+    });
+    expect(requestBody).not.toHaveProperty("input_fidelity");
   });
 });

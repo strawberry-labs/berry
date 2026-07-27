@@ -111,6 +111,59 @@ textarea:not([data-slot="textarea"]):focus-visible,
   outline: none;
 }
 
+.berry-composer-editor {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.berry-composer-editor .berry-prompt-editor-wrap {
+  min-width: 0;
+  flex: 1;
+}
+
+.berry-create-image-chip {
+  display: inline-flex;
+  min-height: 28px;
+  max-width: 16rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  margin-top: 1px;
+  padding: 0 7px;
+  border: 1px solid var(--berry-border);
+  border-radius: 9px;
+  color: var(--berry-text-primary);
+  background: var(--berry-control-bg);
+  font-size: 12px;
+  font-weight: 560;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.berry-create-image-chip:hover {
+  border-color: var(--berry-border-strong);
+  background: var(--berry-hover);
+}
+
+.berry-create-image-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.berry-create-image-chip svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+.berry-create-image-chip svg:last-child {
+  width: 12px;
+  height: 12px;
+  color: var(--berry-text-tertiary);
+}
+
 /* Berry's web surface stays visually quiet on focus. Popovers and dialogs are
    portalled beside `.berry-web-shell`, so this must be document-scoped rather
    than shell-scoped. Shared shadcn primitives add ring utilities individually;

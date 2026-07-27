@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -19,6 +19,7 @@ import { IDLE, reduceStream, reduceStreamDeltas, type StreamState } from "@berry
 import { Toaster } from "@berry/desktop-ui/components/ui/sonner";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import type { ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
+import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
@@ -48,6 +49,16 @@ import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { replaceTenantValue, settledValue } from "@/lib/management/config-refresh";
 import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
+
+function generatedImageTitle(prompt: string): string {
+  const title = prompt
+    .replace(/^(?:create|generate|draw|render|make)\s+(?:an?\s+)?/i, "")
+    .split(/[.!?\n]/, 1)[0]
+    ?.replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return title ? title.charAt(0).toUpperCase() + title.slice(1) : "Generated image";
+}
 import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sidebar";
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
@@ -1303,11 +1314,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       const generated = result.data[0];
       let content = generated?.b64_json ? `data:image/png;base64,${generated.b64_json}` : generated?.url;
       if (!content) throw new Error("The image provider returned no image data");
+      let storedImage: Awaited<ReturnType<BerryApiClient["getFile"]>> | null = null;
       if (generated?.b64_json) {
         try {
           const blob = await (await fetch(content)).blob();
           const stored = await client.uploadFile(new File([blob], `generated-${Date.now()}.png`, { type: "image/png" }), { taskId: task.id, sessionId, origin: "image_generation", associationRole: "output" });
           content = stored.previewUrl;
+          storedImage = stored;
         } catch {
           // The generated image still belongs in the conversation when the
           // optional artifact-library copy is temporarily unavailable.
@@ -1315,7 +1328,21 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       }
       const assistantMessage = await client.appendMessage(sessionId, {
         role: "assistant",
-        parts: [{ kind: "image", content }],
+        parts: [{
+          kind: "image",
+          content: {
+            src: content,
+            ...(storedImage ? { fileId: storedImage.id, downloadUrl: storedImage.downloadUrl, sizeBytes: storedImage.size } : {}),
+            title: generatedImageTitle(trimmedPrompt),
+            prompt: trimmedPrompt,
+            ...(generated?.revised_prompt ? { revisedPrompt: generated.revised_prompt } : {}),
+            aspectRatio: "1:1",
+            width: 1024,
+            height: 1024,
+            mimeType: "image/png",
+            transparentBackground: false,
+          },
+        }],
       });
       replaceSessionMessages(sessionId, (current) => [...current, assistantMessage]);
       setImageGenerationBySession((current) => ({ ...current, [sessionId]: null }));
@@ -1330,6 +1357,148 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       }));
     }
   }, [client, replaceSessionMessages]);
+
+  const generatedImageAttachment = React.useCallback(async (task: Task, image: GeneratedImageView): Promise<AttachmentInput> => {
+    if (!client) throw new Error("Image editing requires the live Berry API");
+    if (image.fileId) {
+      const stored = await client.getFile(image.fileId);
+      return {
+        id: stored.id,
+        fileId: stored.id,
+        name: stored.name,
+        mediaType: stored.mediaType,
+        size: stored.size,
+        sourceKind: "generated-image-reference",
+      };
+    }
+    const response = await fetch(image.src);
+    if (!response.ok) throw new Error("The source image could not be loaded");
+    const blob = await response.blob();
+    const stored = await client.uploadFile(new File([blob], `${image.title || "generated-image"}.png`, { type: image.mimeType }), {
+      taskId: task.id,
+      ...(task.activeSessionId ? { sessionId: task.activeSessionId } : {}),
+      origin: "image_generation",
+      associationRole: "reference",
+    });
+    return {
+      id: stored.id,
+      fileId: stored.id,
+      name: stored.name,
+      mediaType: stored.mediaType,
+      size: stored.size,
+      sourceKind: "generated-image-reference",
+    };
+  }, [client]);
+
+  const appendDemoGeneratedImageIteration = React.useCallback((
+    task: Task,
+    image: GeneratedImageView,
+    input: string,
+    aspectRatio: ImageAspectRatio,
+    titleSuffix: string,
+  ) => {
+    if (!task.activeSessionId) return;
+    const sessionId = task.activeSessionId;
+    const marker = Date.now().toString(36);
+    const now = new Date().toISOString();
+    const userMessage = message(`msg_demo_image_request_${marker}`, sessionId, "user", input);
+    userMessage.createdAt = now;
+    userMessage.updatedAt = now;
+    userMessage.parts.push({
+      id: `msg_demo_image_reference_${marker}`,
+      messageId: userMessage.id,
+      kind: "attachment",
+      content: {
+        id: `demo_reference_${marker}`,
+        name: `${image.title || "generated-image"}.png`,
+        mediaType: image.mimeType,
+        size: image.sizeBytes ?? 0,
+        sourceKind: "generated-image-reference",
+      },
+      position: 1,
+      createdAt: now,
+    });
+    const dimensions = IMAGE_ASPECT_RATIO_DIMENSIONS[aspectRatio];
+    const assistantMessage = message(`msg_demo_image_iteration_${marker}`, sessionId, "assistant", "");
+    assistantMessage.createdAt = now;
+    assistantMessage.updatedAt = now;
+    assistantMessage.parts = [{
+      id: `msg_demo_image_iteration_part_${marker}`,
+      messageId: assistantMessage.id,
+      kind: "image",
+      content: {
+        src: image.src,
+        title: `${image.title} — ${titleSuffix}`,
+        prompt: input,
+        aspectRatio,
+        width: dimensions.width,
+        height: dimensions.height,
+        mimeType: image.mimeType,
+        sizeBytes: image.sizeBytes ?? 0,
+        transparentBackground: image.transparentBackground,
+        generationId: `demo_generation_${marker}`,
+        parentGenerationId: image.generationId ?? null,
+      },
+      position: 0,
+      createdAt: now,
+    }];
+    replaceSessionMessages(sessionId, (current) => [...current, userMessage, assistantMessage]);
+    requestThreadBottom(sessionId);
+  }, [replaceSessionMessages, requestThreadBottom]);
+
+  const editGeneratedImage = React.useCallback(async (
+    image: GeneratedImageView,
+    instruction: string,
+    annotations: ImageEditAnnotation[],
+  ) => {
+    if (!activeTask?.activeSessionId) return;
+    const regionInstructions = annotations.map((annotation) =>
+      `${annotation.index}. At ${annotation.xPct.toFixed(1)}% from the left and ${annotation.yPct.toFixed(1)}% from the top: ${annotation.text.trim()}`,
+    );
+    const input = [
+      `Edit the attached generated image${instruction ? `: ${instruction}` : "."}`,
+      ...(regionInstructions.length > 0 ? ["Region comments:", ...regionInstructions] : []),
+      "Create a new image iteration and keep the original visible in the conversation.",
+    ].join("\n");
+    if (!client) {
+      appendDemoGeneratedImageIteration(activeTask, image, input, image.aspectRatio, "edited");
+      return;
+    }
+    const attachment = await generatedImageAttachment(activeTask, image);
+    const userMessage = await client.appendMessage(activeTask.activeSessionId, {
+      role: "user",
+      parts: [
+        { kind: "text", content: input },
+        { kind: "attachment", content: messageAttachmentContent(attachment) },
+      ],
+    });
+    replaceSessionMessages(activeTask.activeSessionId, (current) => [...current, userMessage]);
+    requestThreadBottom(activeTask.activeSessionId);
+    await runTurn(activeTask, { input, attachments: [attachment] });
+  }, [activeTask, appendDemoGeneratedImageIteration, client, generatedImageAttachment, replaceSessionMessages, requestThreadBottom, runTurn]);
+
+  const regenerateGeneratedImage = React.useCallback(async (
+    image: GeneratedImageView,
+    aspectRatio: ImageAspectRatio,
+  ) => {
+    if (!activeTask?.activeSessionId) return;
+    const input = `Create a new ${aspectRatio} iteration of the attached generated image. Preserve the subject and visual direction. Keep the original visible in the conversation.`;
+    if (!client) {
+      appendDemoGeneratedImageIteration(activeTask, image, input, aspectRatio, aspectRatio);
+      return;
+    }
+    const attachment = await generatedImageAttachment(activeTask, image);
+    const userMessage = await client.appendMessage(activeTask.activeSessionId, {
+      role: "user",
+      parts: [
+        { kind: "text", content: input },
+        { kind: "attachment", content: messageAttachmentContent(attachment) },
+      ],
+    });
+    replaceSessionMessages(activeTask.activeSessionId, (current) => [...current, userMessage]);
+    requestThreadBottom(activeTask.activeSessionId);
+    await runTurn(activeTask, { input, attachments: [attachment] });
+  }, [activeTask, appendDemoGeneratedImageIteration, client, generatedImageAttachment, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const runSlashCommand = React.useCallback(async (name: string, args: string[]) => {
     if (name === "clear") return;
@@ -1554,6 +1723,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               taskTitles={tasks.map((task) => task.title)}
               imageGeneration={imageGenerationBySession[activeTask.activeSessionId ?? activeTask.id] ?? null}
               onRetryImage={(prompt) => void generateImage(activeTask, prompt, false)}
+              onEditGeneratedImage={editGeneratedImage}
+              onRegenerateGeneratedImage={regenerateGeneratedImage}
               editTurn={activeTask.activeSessionId ? editTurn : undefined}
               continueTurn={activeTask.activeSessionId ? continueTurn : undefined}
               cancelTurn={cancelTurn}

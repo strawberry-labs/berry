@@ -1,6 +1,6 @@
 import * as React from "react";
-import { MessageAttachmentContentSchema, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
-import { CircleHelp, Copy, GaugeIcon, GitFork, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
+import { MessageAttachmentContentSchema, type ImageAspectRatio, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
+import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 
 import {
@@ -49,6 +49,12 @@ import {
   WritingBlockController,
   messageDraftFromToolResult,
 } from "@berry/desktop-ui/components/writing-block";
+import {
+  GeneratedImageGallery,
+  generatedImageFromPart,
+  type GeneratedImageView,
+  type ImageEditAnnotation,
+} from "@berry/desktop-ui/components/generated-image-gallery";
 
 export type ApprovalDecision = "approved_once" | "approved_for_session" | "approved_rule" | "denied" | "abort";
 
@@ -76,6 +82,10 @@ export interface BerryThreadAdapter {
   onViewTaskFiles?: () => void;
   /** Continue the latest failed assistant turn without appending another user message. */
   onContinueInterruptedTurn?: () => void | Promise<void>;
+  /** Post a new user turn that semantically edits a generated image. */
+  onEditGeneratedImage?: (image: GeneratedImageView, instruction: string, annotations: ImageEditAnnotation[]) => void | Promise<void>;
+  /** Recreate a generated image at a new aspect ratio. */
+  onRegenerateGeneratedImage?: (image: GeneratedImageView, aspectRatio: ImageAspectRatio) => void | Promise<void>;
 }
 
 const rememberedTurnElapsed = new Map<string, number>();
@@ -176,6 +186,10 @@ export function BerryThreadView({
     () => collectMessageDraftParts(settled),
     [settled],
   );
+  const conversationImageParts = React.useMemo(
+    () => settled.filter((message) => message.role === "assistant").flatMap((message) => message.parts).filter(isImageMessagePart),
+    [settled],
+  );
 
   React.useEffect(() => {
     if (!stream.endStatus || !stream.turnStartedAt) return;
@@ -274,6 +288,7 @@ export function BerryThreadView({
                       density={density}
                       adapter={adapter}
                       writingBlockParts={writingBlockParts}
+                      conversationImageParts={conversationImageParts}
                       canContinue={
                         groupIndex === renderedTurnGroups.length - 1
                         && !stream.turnActive
@@ -483,6 +498,7 @@ function BerryAssistantTurnGroup({
   adapter,
   canContinue,
   writingBlockParts,
+  conversationImageParts,
 }: {
   messages: Message[];
   turnKey: string;
@@ -492,6 +508,7 @@ function BerryAssistantTurnGroup({
   adapter: BerryThreadAdapter;
   canContinue: boolean;
   writingBlockParts: Map<string, MessageDraftPartResolution>;
+  conversationImageParts: MessagePart[];
 }) {
   const allParts = messages.flatMap((message) => message.parts);
   const imageParts = allParts.filter(isImageMessagePart);
@@ -602,9 +619,12 @@ function BerryAssistantTurnGroup({
           </BerryActivityStackBlock>
         ) : null}
         {imageParts.length > 0 ? (
-          <div className="flex max-w-[775px] flex-wrap gap-2">
-            {imageParts.map((part) => <BerryMessagePartBody key={part.id} part={part} />)}
-          </div>
+          <GeneratedImageGallery
+            parts={imageParts}
+            conversationParts={conversationImageParts}
+            {...(adapter.onEditGeneratedImage ? { onEdit: adapter.onEditGeneratedImage } : {})}
+            {...(adapter.onRegenerateGeneratedImage ? { onRegenerate: adapter.onRegenerateGeneratedImage } : {})}
+          />
         ) : null}
         {bodyNodes}
         {artifacts.length > 0 ? (
@@ -749,6 +769,23 @@ function BerryUserAttachmentCard({ part, adapter }: { part: MessagePart; adapter
   const parsed = MessageAttachmentContentSchema.safeParse(part.content);
   if (!parsed.success) return null;
   const attachment = parsed.data;
+  if (attachment.sourceKind === "generated-image-reference") {
+    return (
+      <button
+        type="button"
+        className="me-1 inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-[var(--berry-text-tertiary)] transition-[background-color,color] hover:bg-[var(--berry-hover)] hover:text-[var(--berry-text-primary)]"
+        onClick={() => void adapter.onOpenAttachment?.(attachment)}
+        disabled={!attachment.fileId || !adapter.onOpenAttachment}
+        aria-label={`Open source image ${attachment.name}`}
+      >
+        <ArrowRight02 className="size-3.5" />
+        <span className="grid size-7 place-items-center rounded-md bg-[var(--berry-control-bg)] opacity-70">
+          <FileImage className="size-4" />
+        </span>
+        <span>Edited image</span>
+      </button>
+    );
+  }
   return (
     <Attachment
       size="default"
@@ -1142,13 +1179,25 @@ export function BerryQuestionAccordion({ question, adapter }: { question: Questi
 export function BerryMessagePartBody({ part, plain = false }: { part: MessagePart; plain?: boolean }) {
   const content = String(part.content ?? "");
   if (isImageMessagePart(part)) {
+    const image = generatedImageFromPart(part);
     return (
       <img
         data-user-attachment-image
-        src={content}
-        alt="attachment"
+        src={image?.src ?? content}
+        alt={image?.title ?? "attachment"}
         className="aspect-square w-36 max-w-[min(42vw,180px)] rounded-[14px] object-cover outline outline-1 -outline-offset-1 outline-black/10 dark:outline-white/10 sm:w-44"
       />
+    );
+  }
+  if (plain && content.startsWith("Create image\n")) {
+    return (
+      <span className="flex flex-col gap-1.5">
+        <span className="inline-flex w-fit max-w-64 items-center gap-1.5 rounded-lg border border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-2 py-1 text-xs font-medium">
+          <ImagePlus className="size-3.5 shrink-0" />
+          <span className="truncate">Create image</span>
+        </span>
+        <span className="whitespace-pre-wrap">{content.slice("Create image\n".length)}</span>
+      </span>
     );
   }
   if (plain) return <span className="whitespace-pre-wrap">{content}</span>;
@@ -1156,8 +1205,11 @@ export function BerryMessagePartBody({ part, plain = false }: { part: MessagePar
 }
 
 export function isImageMessagePart(part: MessagePart): boolean {
-  const source = String(part.content ?? "");
-  return part.kind === "image" && (source.startsWith("data:") || source.startsWith("https://") || source.startsWith("http://"));
+  if (part.kind !== "image") return false;
+  if (typeof part.content === "string") {
+    return part.content.startsWith("data:") || part.content.startsWith("https://") || part.content.startsWith("http://") || part.content.startsWith("/");
+  }
+  return Boolean(part.content && typeof part.content === "object" && !Array.isArray(part.content) && typeof part.content.src === "string");
 }
 
 function toolStatusFromMeta(value: unknown): ToolEntry["status"] {

@@ -43,6 +43,7 @@ import {
 } from "@berry/local-agent";
 import {
   createId,
+  imageSizeForAspectRatio,
   isProtocolCompatible,
   nowIso,
   MODEL_PROVIDER_PRESETS,
@@ -1603,7 +1604,12 @@ export class BerryHostService {
       }).generate({
         prompt: requiredString(input.prompt, "prompt"),
         ...(typeof input.model === "string" ? { model: input.model } : {}),
-        ...(typeof input.size === "string" ? { size: input.size } : {}),
+        ...(typeof input.size === "string"
+          ? { size: input.size }
+          : typeof input.aspectRatio === "string" && ["1:1", "3:4", "4:3", "9:16", "16:9"].includes(input.aspectRatio)
+            ? { size: imageSizeForAspectRatio(input.aspectRatio as "1:1" | "3:4" | "4:3" | "9:16" | "16:9") }
+            : {}),
+        ...(input.transparentBackground === true ? { background: "transparent", outputFormat: "png" } : {}),
         responseFormat: "b64_json",
         n: 1,
         signal: AbortSignal.timeout(120_000),
@@ -3517,7 +3523,7 @@ export class BerryHostService {
       },
       web: this.#webToolBridge(input, workspace, permissionMode),
       imageGeneration: {
-        generate: async ({ prompt, model: imageModel, size, signal }) => {
+        generate: async ({ prompt, model: imageModel, size, transparentBackground, referenceImagePaths, referencedImageIds, onPartial, signal }) => {
           const routerProvider = this.#routerProvider({ providerId: "berry-router" });
           let routerApiKey: string | undefined;
           try {
@@ -3533,10 +3539,19 @@ export class BerryHostService {
             fetchImpl: this.#fetchImpl,
           }).generate({
             prompt,
+            ...(referenceImagePaths?.length || referencedImageIds?.length
+              ? { referenceImageUrls: desktopImageReferenceUrls(attachments, referenceImagePaths ?? [], referencedImageIds ?? []) }
+              : {}),
             ...(imageModel ? { model: imageModel } : {}),
             ...(size ? { size } : {}),
+            ...(transparentBackground ? { background: "transparent", outputFormat: "png" } : { background: "auto" }),
             responseFormat: "b64_json",
             n: 1,
+            stream: Boolean(onPartial),
+            partialImages: 3,
+            ...(onPartial ? {
+              onPartial: (partial) => onPartial({ index: partial.index, b64: partial.b64_json, mimeType: "image/png" }),
+            } : {}),
             ...(signal ? { signal } : {}),
           });
           return {
@@ -3627,11 +3642,33 @@ export class BerryHostService {
           );
       },
       onToolCall: (call) => {
-        if (call.toolName === "image_generation" && call.status === "completed") {
-          const image = asRecord(asRecord(call.output).image);
-          const data = typeof image.data === "string" ? image.data : "";
-          const mimeType = typeof image.mimeType === "string" ? image.mimeType : "image/png";
-          if (data) this.#db.tasks().addMessage(sessionId, "assistant", [{ kind: "image", content: `data:${mimeType};base64,${data}` }]);
+        if (call.toolName === "create_image" && call.status === "completed") {
+          const output = asRecord(call.output);
+          const generated = Array.isArray(output.images) ? output.images : [];
+          const parts = generated.flatMap((value, index) => {
+            const item = asRecord(value);
+            const image = asRecord(item.image);
+            const data = typeof image.data === "string" ? image.data : "";
+            if (!data) return [];
+            const mimeType = typeof image.mimeType === "string" ? image.mimeType : "image/png";
+            const aspectRatio = item.aspectRatio === "3:4" || item.aspectRatio === "4:3" || item.aspectRatio === "9:16" || item.aspectRatio === "16:9"
+              ? item.aspectRatio
+              : "1:1";
+            return [{
+              kind: "image" as const,
+              content: {
+                src: `data:${mimeType};base64,${data}`,
+                title: typeof item.title === "string" ? item.title : `image-gen-${index + 1}`,
+                prompt: typeof item.prompt === "string" ? item.prompt : "",
+                aspectRatio,
+                width: typeof image.width === "number" ? image.width : 1024,
+                height: typeof image.height === "number" ? image.height : 1024,
+                mimeType,
+                transparentBackground: item.transparentBackground === true,
+              } as JsonValue,
+            }];
+          });
+          if (parts.length > 0) this.#db.tasks().addMessage(sessionId, "assistant", parts);
         }
         this.#db.db
           .prepare(
@@ -8438,6 +8475,7 @@ function attachmentsFrom(value: JsonValue | undefined): TurnAttachment[] {
 }
 
 const INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
+const IMAGE_EDIT_REFERENCE_BYTES = 20 * 1024 * 1024;
 const INLINE_TEXT_CHARS = 64 * 1024;
 const TEXT_ATTACHMENT_EXTENSIONS = new Set([
   ".cjs",
@@ -8492,6 +8530,56 @@ function prepareAttachmentsForTurn(attachments: TurnAttachment[]): TurnAttachmen
       return { ...attachment, localPath };
     }
   });
+}
+
+function desktopImageReferenceUrls(
+  attachments: TurnAttachment[],
+  referencePaths: string[],
+  referenceIds: string[],
+): string[] {
+  if (referencePaths.length === 0 && referenceIds.length === 0) return [];
+  const urls: string[] = [];
+  const ids = new Set(referenceIds.map((id) => id.toLowerCase()));
+  const pathHints = referencePaths.map((path) => resolve(path));
+  const imageAttachments = attachments.filter((attachment) => attachment.mediaType.startsWith("image/"));
+  const matchingAttachments = imageAttachments.filter((attachment) =>
+    ids.has(attachment.id.toLowerCase())
+    || pathHints.some((path) => path === attachment.localPath || path.includes(attachment.id) || basename(path) === attachment.name),
+  );
+  const selectedAttachments = matchingAttachments.length > 0
+    ? matchingAttachments
+    : imageAttachments.length === 1
+      ? imageAttachments
+      : [];
+  for (const attachment of selectedAttachments) {
+    if (attachment.dataUrl?.startsWith("data:image/")) {
+      urls.push(attachment.dataUrl);
+      continue;
+    }
+    if (!attachment.localPath) continue;
+    const path = resolve(attachment.localPath);
+    try {
+      const stat = statSync(path);
+      if (!stat.isFile() || stat.size > IMAGE_EDIT_REFERENCE_BYTES) continue;
+      urls.push(`data:${attachment.mediaType};base64,${readFileSync(path).toString("base64")}`);
+    } catch {
+      // The direct path pass below reports a useful error when no references remain.
+    }
+  }
+  for (const path of pathHints) {
+    if (selectedAttachments.some((attachment) => attachment.localPath && resolve(attachment.localPath) === path)) continue;
+    try {
+      const stat = statSync(path);
+      const mediaType = inferAttachmentMediaType(path);
+      if (!stat.isFile() || stat.size > IMAGE_EDIT_REFERENCE_BYTES || !mediaType.startsWith("image/")) continue;
+      urls.push(`data:${mediaType};base64,${readFileSync(path).toString("base64")}`);
+    } catch {
+      // Safe workspace validation happens before this bridge; unavailable files are rejected below.
+    }
+  }
+  const unique = [...new Set(urls)].slice(0, 16);
+  if (unique.length === 0) throw new Error("The referenced image is unavailable or larger than 20 MB");
+  return unique;
 }
 
 function isTextAttachment(name: string, mediaType: string): boolean {

@@ -58,6 +58,32 @@ import { WorktreeMergeDialog } from "@/components/worktree-merge-dialog";
 import { WorkPane, type WorkPaneTab } from "@/components/work-pane";
 import { ImageGeneration, ImageGenerationError } from "@berry/desktop-ui/components/image-generation";
 
+function imageToolBatch(tool: ToolEntry): Record<string, unknown>[] {
+  return Array.isArray(tool.args?.batch_requests)
+    ? tool.args.batch_requests.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+function imageToolPrimaryArgs(tool: ToolEntry): Record<string, unknown> {
+  return imageToolBatch(tool)[0] ?? tool.args ?? {};
+}
+
+function generatedImageTitle(prompt: string): string {
+  const normalized = prompt.trim().replace(/\s+/g, " ");
+  if (!normalized) return "Generated image";
+  return normalized.length > 80 ? `${normalized.slice(0, 77).trimEnd()}…` : normalized;
+}
+
+function imageToolPrompt(tool: ToolEntry): string {
+  const prompt = imageToolPrimaryArgs(tool).prompt;
+  return typeof prompt === "string" ? prompt : "requested image";
+}
+
+function imageToolAspectRatio(tool: ToolEntry): "1:1" | "3:4" | "4:3" | "9:16" | "16:9" {
+  const ratio = imageToolPrimaryArgs(tool).aspect_ratio;
+  return ratio === "3:4" || ratio === "4:3" || ratio === "9:16" || ratio === "16:9" ? ratio : "1:1";
+}
+
 const TerminalPane = React.lazy(() => import("@/components/terminal-pane").then((module) => ({ default: module.TerminalPane })));
 
 interface CommandOutput {
@@ -122,7 +148,7 @@ export function TaskView({ taskId }: { taskId: string }) {
 
   const stream = useThreadStream(sessionId);
   const activeImageTool = [...stream.timeline].reverse().find(
-    (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "image_generation" && entry.status === "running",
+    (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "create_image" && entry.status === "running",
   );
   const conversationKind = task?.conversationKind ?? "chat";
   const workbenchMode = conversationKind === "code";
@@ -407,12 +433,24 @@ export function TaskView({ taskId }: { taskId: string }) {
         size: "1024x1024",
       });
       const image = result.data?.[0];
-      const content = image?.b64_json ? `data:image/png;base64,${image.b64_json}` : image?.url;
-      if (!content) throw new Error("The image provider returned no image data");
+      const src = image?.b64_json ? `data:image/png;base64,${image.b64_json}` : image?.url;
+      if (!src) throw new Error("The image provider returned no image data");
       await host.call("session.appendMessage", {
         sessionId,
         role: "assistant",
-        parts: [{ kind: "image", content }],
+        parts: [{
+          kind: "image",
+          content: {
+            src,
+            title: generatedImageTitle(trimmedPrompt),
+            prompt: trimmedPrompt,
+            aspectRatio: "1:1",
+            width: 1024,
+            height: 1024,
+            mimeType: "image/png",
+            transparentBackground: false,
+          },
+        }],
       });
       setImageGeneration(null);
       await queryClient.refetchQueries({ queryKey: ["session.messages", sessionId] });
@@ -574,7 +612,10 @@ export function TaskView({ taskId }: { taskId: string }) {
       />
       {activeImageTool && imageGeneration === null ? (
         <ImageGeneration
-          prompt={typeof activeImageTool.args?.prompt === "string" ? activeImageTool.args.prompt : undefined}
+          prompt={imageToolPrompt(activeImageTool)}
+          aspectRatio={imageToolAspectRatio(activeImageTool)}
+          batchCount={imageToolBatch(activeImageTool).length || 1}
+          partials={activeImageTool.imageProgress ?? []}
         />
       ) : null}
       {imageGeneration?.status === "generating" ? <ImageGeneration prompt={imageGeneration.prompt} /> : null}

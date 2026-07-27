@@ -12,6 +12,7 @@ export function fixtureTasks(): Task[] {
 
 export function fixtureMessages(sessionId: string): Message[] {
   if (sessionId === "session_launch") return writingBlockFixtureMessages(sessionId);
+  if (sessionId === "session_chat") return imageGenerationFixtureMessages(sessionId);
   const assistant = message(
     "msg_assistant_1",
     sessionId,
@@ -200,6 +201,77 @@ function writingBlockFixtureMessages(sessionId: string): Message[] {
     message("msg_user_draft_revision", sessionId, "user", "Make it shorter and easier to scan."),
     revisedAssistant,
   ];
+}
+
+function imageGenerationFixtureMessages(sessionId: string): Message[] {
+  const assistant = message("msg_assistant_images", sessionId, "assistant", "");
+  const images = [
+    {
+      title: "Berry orchard at dusk",
+      prompt: "A cinematic berry orchard at blue hour with glowing rows of fruit and distant mountains.",
+      aspectRatio: "16:9" as const,
+      width: 1536,
+      height: 864,
+      src: fixtureImageSvg("1536", "864", "#251044", "#ff4f91", "BERRY ORCHARD", "BLUE HOUR"),
+    },
+    {
+      title: "Berry greenhouse study",
+      prompt: "An editorial greenhouse study with saturated berry leaves, soft daylight, and glass reflections.",
+      aspectRatio: "4:3" as const,
+      width: 1280,
+      height: 960,
+      src: fixtureImageSvg("1280", "960", "#0f382e", "#e9ff78", "GREENHOUSE", "DAYLIGHT STUDY"),
+    },
+  ];
+  assistant.parts = images.map((image, index) => ({
+    id: `msg_assistant_images_${index + 1}`,
+    messageId: assistant.id,
+    kind: "image" as const,
+    content: {
+      ...image,
+      mimeType: "image/png" as const,
+      sizeBytes: 0,
+      transparentBackground: false,
+      generationId: `demo_generation_${index + 1}`,
+      parentGenerationId: null,
+    },
+    position: index,
+    createdAt: FIXED_NOW,
+  }));
+  return [
+    message("msg_user_images", sessionId, "user", "Create image\nA cinematic berry orchard at dusk, with two distinct compositions."),
+    assistant,
+  ];
+}
+
+function fixtureImageSvg(
+  width: string,
+  height: string,
+  background: string,
+  accent: string,
+  title: string,
+  subtitle: string,
+): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    <defs>
+      <radialGradient id="glow" cx="70%" cy="20%" r="75%">
+        <stop offset="0" stop-color="${accent}" stop-opacity=".9"/>
+        <stop offset=".48" stop-color="${background}" stop-opacity=".32"/>
+        <stop offset="1" stop-color="${background}"/>
+      </radialGradient>
+      <filter id="blur"><feGaussianBlur stdDeviation="42"/></filter>
+    </defs>
+    <rect width="100%" height="100%" fill="url(#glow)"/>
+    <circle cx="76%" cy="18%" r="19%" fill="${accent}" opacity=".42" filter="url(#blur)"/>
+    <path d="M0 ${Number(height) * 0.72} Q ${Number(width) * 0.22} ${Number(height) * 0.5}, ${Number(width) * 0.5} ${Number(height) * 0.7} T ${width} ${Number(height) * 0.6} V ${height} H0Z" fill="#050508" opacity=".72"/>
+    <g fill="none" stroke="${accent}" stroke-width="10" opacity=".72">
+      <path d="M0 ${Number(height) * 0.9} L ${Number(width) * 0.42} ${Number(height) * 0.58}"/>
+      <path d="M${width} ${Number(height) * 0.94} L ${Number(width) * 0.58} ${Number(height) * 0.57}"/>
+    </g>
+    <text x="7%" y="78%" fill="white" font-family="ui-sans-serif, system-ui" font-size="${Number(height) * 0.075}" font-weight="700" letter-spacing="8">${title}</text>
+    <text x="7%" y="86%" fill="white" fill-opacity=".7" font-family="ui-sans-serif, system-ui" font-size="${Number(height) * 0.026}" letter-spacing="5">${subtitle}</text>
+  </svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
 function task(id: string, title: string, status: Task["status"], activeSessionId: string, conversationKind: ConversationKind): Task {

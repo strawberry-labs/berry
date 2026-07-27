@@ -8,7 +8,13 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, extname, join, relative } from "node:path";
 import { executeShellWithCapture, formatSkillInvocation, type AgentTool, type AgentToolResult, type ExecutionEnv, type FileInfo, type Skill } from "@berry/harness";
 import { NodeExecutionEnv } from "@berry/harness/node";
-import { MessageDraftSchema, type JsonValue } from "@berry/shared";
+import {
+  IMAGE_ASPECT_RATIO_DIMENSIONS,
+  MessageDraftSchema,
+  imageSizeForAspectRatio,
+  type ImageAspectRatio,
+  type JsonValue,
+} from "@berry/shared";
 import { Type, type TSchema } from "typebox";
 import { applyPatchWithEnv } from "./apply-patch.ts";
 import { artifactDisplayName, artifactMediaType } from "./artifacts.ts";
@@ -90,11 +96,23 @@ export interface ImageGenerationToolBridge {
     prompt: string;
     model?: string;
     size?: string;
+    aspectRatio?: ImageAspectRatio;
+    transparentBackground?: boolean;
+    referenceImagePaths?: string[];
+    referencedImageIds?: string[];
+    onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void;
     signal?: AbortSignal;
   }): Promise<{
     model?: string;
     revisedPrompt?: string;
-    data: { data: string; mimeType: string }[];
+    data: Array<{
+      data: string;
+      mimeType: string;
+      width?: number;
+      height?: number;
+      sizeBytes?: number;
+      generationId?: string;
+    }>;
   }>;
 }
 
@@ -194,7 +212,7 @@ const TOOL_RISKS: Record<string, BerryToolRisk> = {
   browser_fill: "browser",
   web_search: "browser",
   fetch_url: "browser",
-  image_generation: "read",
+  create_image: "read",
   tool_search: "read",
   // Dispatching a sub-agent is itself low-risk; the child's own tool calls are
   // gated individually through the same guard.
@@ -357,40 +375,111 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
   const modelInvocableSkills = (options.skills ?? []).filter((skill) => !skill.disableModelInvocation);
   const activatedSkills = options.activatedSkills ?? new Set<string>();
 
-  const imageGeneration = options.imageGeneration
+  const imageRequestShape = {
+    prompt: Type.String({
+      minLength: 1,
+      maxLength: 32_000,
+      description: "A complete visual brief covering subject, composition, viewpoint, lighting, materials, background, style, required text, and exclusions",
+    }),
+    aspect_ratio: Type.Optional(Type.Union([
+      Type.Literal("1:1"),
+      Type.Literal("3:4"),
+      Type.Literal("4:3"),
+      Type.Literal("9:16"),
+      Type.Literal("16:9"),
+    ], { default: "1:1" })),
+    transparent_background: Type.Optional(Type.Boolean({ default: false })),
+    reference_image_paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 4 })),
+    referenced_image_ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 4 })),
+  };
+  const createImage = options.imageGeneration
     ? defineTool(
-        "image_generation",
-        "Generate image",
-        "Generate an image from a natural-language prompt using the configured OpenAI-compatible image model. Use this when the user asks to create, draw, illustrate, or visualize an image.",
+        "create_image",
+        "Create image",
+        "Create or edit up to four images. Rewrite the user's request into a rich visual brief before calling: specify subject, composition, camera or viewpoint, lighting, materials, background, style, exact text, and exclusions. Use batch_requests only for multiple distinct images. Reuse only reference image paths or ids already present in the conversation; never invent them.",
         Type.Object({
-          prompt: Type.String({ description: "A detailed natural-language description of the image to generate" }),
-          model: Type.Optional(Type.String({ description: "Optional image model override" })),
-          size: Type.Optional(Type.String({ description: "Optional output size such as 1024x1024" })),
+          ...imageRequestShape,
+          prompt: Type.Optional(imageRequestShape.prompt),
+          batch_requests: Type.Optional(Type.Array(Type.Object(imageRequestShape), { minItems: 1, maxItems: 4 })),
         }),
-        async (_id, params, signal) => {
-          const prompt = String(params.prompt ?? "").trim();
-          if (!prompt) throw new Error("Image prompt cannot be empty");
-          const result = await options.imageGeneration!.generate({
-            prompt,
-            ...(typeof params.model === "string" && params.model.trim() ? { model: params.model.trim() } : {}),
-            ...(typeof params.size === "string" && params.size.trim() ? { size: params.size.trim() } : {}),
-            ...(signal ? { signal } : {}),
+        async (_id, params, signal, onUpdate) => {
+          const batch = Array.isArray(params.batch_requests) ? params.batch_requests : null;
+          if (batch && params.prompt) throw new Error("Use either prompt or batch_requests, not both");
+          const requests = (batch ?? [params]).map((value, requestIndex) => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Image request ${requestIndex + 1} is invalid`);
+            const request = value as Record<string, unknown>;
+            const prompt = String(request.prompt ?? "").trim();
+            if (!prompt) throw new Error(`Image request ${requestIndex + 1} has no prompt`);
+            const aspectRatio = typeof request.aspect_ratio === "string" && ["1:1", "3:4", "4:3", "9:16", "16:9"].includes(request.aspect_ratio)
+              ? request.aspect_ratio as ImageAspectRatio
+              : "1:1";
+            return {
+              prompt,
+              aspectRatio,
+              transparentBackground: request.transparent_background === true,
+              referenceImagePaths: Array.isArray(request.reference_image_paths)
+                ? request.reference_image_paths.map((path) => safeWorkspacePath(toolWorkspacePath, String(path)))
+                : [],
+              referencedImageIds: Array.isArray(request.referenced_image_ids)
+                ? request.referenced_image_ids.map(String).filter(Boolean)
+                : [],
+            };
           });
-          const image = result.data[0];
-          if (!image) throw new Error("The image provider returned no image data");
+          const results = await Promise.all(requests.map(async (request, requestIndex) => {
+            const result = await options.imageGeneration!.generate({
+              prompt: request.prompt,
+              size: imageSizeForAspectRatio(request.aspectRatio),
+              aspectRatio: request.aspectRatio,
+              transparentBackground: request.transparentBackground,
+              ...(request.referenceImagePaths.length > 0 ? { referenceImagePaths: request.referenceImagePaths } : {}),
+              ...(request.referencedImageIds.length > 0 ? { referencedImageIds: request.referencedImageIds } : {}),
+              onPartial: (partial) => {
+                onUpdate?.({
+                  content: [{ type: "text", text: `Generating image ${requestIndex + 1} of ${requests.length}` }],
+                  details: {
+                    imagePartial: {
+                      requestIndex,
+                      index: partial.index,
+                      percentComplete: Math.min(0.9, (partial.index + 1) / 4),
+                      b64: partial.b64,
+                      mimeType: partial.mimeType,
+                      aspectRatio: request.aspectRatio,
+                    },
+                  },
+                });
+              },
+              ...(signal ? { signal } : {}),
+            });
+            const image = result.data[0];
+            if (!image) throw new Error(`The image provider returned no data for request ${requestIndex + 1}`);
+            const dimensions = IMAGE_ASPECT_RATIO_DIMENSIONS[request.aspectRatio];
+            return {
+              requestIndex,
+              prompt: request.prompt,
+              aspectRatio: request.aspectRatio,
+              transparentBackground: request.transparentBackground,
+              title: imageTitleFromPrompt(request.prompt, requestIndex),
+              model: result.model,
+              revisedPrompt: result.revisedPrompt,
+              image: {
+                ...image,
+                width: image.width ?? dimensions.width,
+                height: image.height ?? dimensions.height,
+              },
+            };
+          }));
+          const receipt = [
+            `Generated ${results.length} image${results.length === 1 ? "" : "s"} from the last create_image call.`,
+            ...results.map((item) => `- ${item.title} (${item.image.width} × ${item.image.height}, ${item.aspectRatio})`),
+            "The generated images are available directly in the tool result.",
+          ].join("\n");
           return {
             content: [
-              {
-                type: "text",
-                text: `Generated an image for: ${prompt}${result.revisedPrompt ? `\nRevised prompt: ${result.revisedPrompt}` : ""}`,
-              },
-              { type: "image", data: image.data, mimeType: image.mimeType },
+              { type: "text", text: receipt },
+              ...results.map((item) => ({ type: "image" as const, data: item.image.data, mimeType: item.image.mimeType })),
             ],
             details: {
-              prompt,
-              ...(result.model ? { model: result.model } : {}),
-              ...(result.revisedPrompt ? { revisedPrompt: result.revisedPrompt } : {}),
-              image: { data: image.data, mimeType: image.mimeType },
+              images: results,
             },
           };
         },
@@ -1086,7 +1175,7 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
     );
   }
 
-  const tools = [readFile, readAttachment, skillTool, askUserQuestion, composeMessage, imageGeneration, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
+  const tools = [readFile, readAttachment, skillTool, askUserQuestion, composeMessage, createImage, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
   if (persistArtifact) tools.push(persistArtifact);
   tools.push(...browserTools);
   tools.push(...webTools);
@@ -1129,4 +1218,15 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
 
 export function workspaceFileExists(workspacePath: string, requestedPath: string): boolean {
   return existsSync(safeWorkspacePath(workspacePath, requestedPath));
+}
+
+function imageTitleFromPrompt(prompt: string, index: number): string {
+  const sentence = prompt
+    .replace(/^(?:create|generate|draw|render|make)\s+(?:an?\s+)?/i, "")
+    .split(/[.!?\n]/, 1)[0]
+    ?.replace(/\s+/g, " ")
+    .trim();
+  if (!sentence) return `image-gen-${index + 1}`;
+  const clipped = sentence.slice(0, 80).trim();
+  return clipped.charAt(0).toUpperCase() + clipped.slice(1);
 }

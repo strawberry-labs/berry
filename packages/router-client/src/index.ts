@@ -142,7 +142,13 @@ export interface ImageGenerationOptions {
   size?: string;
   quality?: string;
   responseFormat?: "url" | "b64_json";
+  outputFormat?: "png" | "jpeg" | "webp";
+  background?: "auto" | "opaque" | "transparent";
+  referenceImageUrls?: string[];
   n?: number;
+  stream?: boolean;
+  partialImages?: number;
+  onPartial?: (partial: { index: number; b64_json: string }) => void;
   signal?: AbortSignal;
 }
 
@@ -321,14 +327,23 @@ export class OpenAIImageGenerationClient {
   }
 
   async generate(options: ImageGenerationOptions): Promise<ImageGenerationResult> {
-    const url = requestUrl(this.#provider, "/images/generations");
+    const isEdit = Boolean(options.referenceImageUrls?.length);
+    const url = requestUrl(this.#provider, isEdit ? "/images/edits" : "/images/generations");
+    const model = options.model ?? this.#provider.defaultModel;
     const body = {
-      model: options.model ?? this.#provider.defaultModel,
+      model,
       prompt: options.prompt,
+      ...(isEdit ? {
+        images: options.referenceImageUrls!.map((imageUrl) => ({ image_url: imageUrl })),
+        ...(!model.startsWith("gpt-image-2") ? { input_fidelity: "high" } : {}),
+      } : {}),
       n: options.n ?? 1,
       size: options.size ?? "1024x1024",
-      response_format: options.responseFormat ?? "b64_json",
+      ...(!model.startsWith("gpt-image-") ? { response_format: options.responseFormat ?? "b64_json" } : {}),
+      ...(options.outputFormat ? { output_format: options.outputFormat } : {}),
+      ...(options.background ? { background: options.background } : {}),
       ...(options.quality ? { quality: options.quality } : {}),
+      ...(options.stream ? { stream: true, partial_images: Math.max(0, Math.min(3, options.partialImages ?? 3)) } : {}),
     };
     const response = await this.#fetch(url, {
       method: "POST",
@@ -337,7 +352,34 @@ export class OpenAIImageGenerationClient {
       ...(options.signal ? { signal: options.signal } : {}),
     });
     if (!response.ok) {
+      if (options.stream && [400, 404, 415, 422].includes(response.status)) {
+        const { stream: _stream, partialImages: _partialImages, onPartial: _onPartial, ...fallback } = options;
+        return this.generate(fallback);
+      }
       throw new RouterClientError(`Image provider request failed with ${response.status}`, response.status, await response.text());
+    }
+    if (options.stream && response.headers.get("content-type")?.includes("text/event-stream")) {
+      let finalImage: string | undefined;
+      for await (const data of parseSse(response)) {
+        if (data === "[DONE]") break;
+        let event: unknown;
+        try {
+          event = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        if (!isRecord(event) || typeof event.type !== "string" || typeof event.b64_json !== "string") continue;
+        if (event.type === "image_generation.partial_image" || event.type === "image_edit.partial_image") {
+          const index = typeof event.partial_image_index === "number" ? event.partial_image_index : 0;
+          options.onPartial?.({ index, b64_json: event.b64_json });
+        } else if (event.type === "image_generation.completed" || event.type === "image_edit.completed") {
+          finalImage = event.b64_json;
+        }
+      }
+      if (!finalImage) {
+        throw new RouterClientError("Image provider stream ended without a completed image", response.status);
+      }
+      return { model, data: [{ b64_json: finalImage }] };
     }
     const payload = await response.json() as unknown;
     if (!isRecord(payload) || !Array.isArray(payload.data)) {

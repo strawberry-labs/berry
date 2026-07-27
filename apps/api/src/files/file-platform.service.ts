@@ -5,6 +5,7 @@ import {
   CreateMultipartUploadCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  PutObjectCommand,
   S3Client,
   UploadPartCommand,
   type CompletedPart,
@@ -290,6 +291,50 @@ export class FilePlatformService {
       `, [tenantId, userId, input.name, input.mediaType, Number(head.ContentLength ?? input.size ?? 0), config.bucket, input.key, cleanEtag(head.ETag), input.origin ?? "sandbox_output"]);
       const file = rows[0]!;
       await associate(executor, { tenantId, fileId: file.id, taskId: input.taskId, sessionId: input.sessionId, ...(input.turnId ? { turnId: input.turnId } : {}), role: "output", userId });
+      return fileDto({ ...file, task_ids: [input.taskId], roles: ["output"] });
+    });
+  }
+
+  async persistGeneratedImage(tenantId: string, userId: string, input: {
+    name: string;
+    mediaType: string;
+    data: string;
+    taskId: string;
+    sessionId: string;
+    turnId?: string;
+  }) {
+    const config = this.requireConfig();
+    const name = safeFileName(input.name);
+    const bytes = Buffer.from(input.data, "base64");
+    if (bytes.length === 0 || bytes.length > config.maxUploadBytes) {
+      throw new BadRequestException(`Generated images are limited to ${config.maxUploadBytes} bytes`);
+    }
+    const fileId = randomUUID();
+    const objectKey = `${config.prefix}/tenants/${tenantId}/users/${userId}/files/${fileId}/original/${name}`;
+    const stored = await config.client.send(new PutObjectCommand({
+      Bucket: config.bucket,
+      Key: objectKey,
+      Body: bytes,
+      ContentType: input.mediaType,
+      Metadata: { "file-id": fileId, "original-name": encodeURIComponent(name), source: "image-generation" },
+    }));
+    return this.database.withTenant(tenantId, async (executor) => {
+      await requireTask(executor, tenantId, input.taskId);
+      const rows = await executor.query<FileRow>(`
+        INSERT INTO files (id, tenant_id, owner_user_id, original_name, display_name, media_type, size_bytes, bucket, object_key, etag, origin, status)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4, $5, $6, $7, $8, $9, 'image_generation', 'available')
+        RETURNING *
+      `, [fileId, tenantId, userId, name, input.mediaType, bytes.length, config.bucket, objectKey, cleanEtag(stored.ETag)]);
+      const file = rows[0]!;
+      await associate(executor, {
+        tenantId,
+        fileId,
+        taskId: input.taskId,
+        sessionId: input.sessionId,
+        ...(input.turnId ? { turnId: input.turnId } : {}),
+        role: "output",
+        userId,
+      });
       return fileDto({ ...file, task_ids: [input.taskId], roles: ["output"] });
     });
   }

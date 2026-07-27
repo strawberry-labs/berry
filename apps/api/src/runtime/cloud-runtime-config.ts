@@ -1,6 +1,13 @@
 import { BadGatewayException, Injectable, ServiceUnavailableException } from "@nestjs/common";
 import type { AgentSkill, BerryModelProviderInfo, McpServerSpec, StartTurnOptions } from "@berry/local-agent";
-import { NetworkPolicySchema, RemoteModelSchema, type NetworkPolicy, type RemoteModel } from "@berry/shared";
+import {
+  NetworkPolicySchema,
+  RemoteModelSchema,
+  imageSizeForAspectRatio,
+  type ImageGenerationRequest,
+  type NetworkPolicy,
+  type RemoteModel,
+} from "@berry/shared";
 import { z } from "zod";
 
 const RequestProviderSchema = z.object({
@@ -61,6 +68,7 @@ const ImageGenerationResponseSchema = z.object({
 
 interface CloudImageGenerationConfig {
   endpoint: string;
+  editsEndpoint: string;
   model: string;
   responseFormat: "url" | "b64_json";
   costMicros: string;
@@ -133,34 +141,82 @@ export class CloudRuntimeConfigService {
     };
   }
 
-  async generateImage(input: { prompt: string; size?: string | undefined }) {
+  async generateImage(
+    input: ImageGenerationRequest,
+    onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void,
+  ) {
     const image = this.config.imageGeneration;
     if (!image) {
       throw new ServiceUnavailableException("Image generation is not configured on this deployment");
     }
-    const response = await fetch(image.endpoint, {
+    const size = input.size ?? (input.aspectRatio ? imageSizeForAspectRatio(input.aspectRatio) : "1024x1024");
+    const stream = input.stream === true && Boolean(onPartial);
+    const referenceImageUrls = input.referenceImageUrls?.filter(Boolean).slice(0, 16) ?? [];
+    const endpoint = referenceImageUrls.length > 0 ? image.editsEndpoint : image.endpoint;
+    const requestBody = {
+      model: image.model,
+      prompt: input.prompt,
+      ...(referenceImageUrls.length > 0
+        ? {
+            images: referenceImageUrls.map((imageUrl) => ({ image_url: imageUrl })),
+            ...(!image.model.startsWith("gpt-image-2") ? { input_fidelity: "high" } : {}),
+          }
+        : {}),
+      n: 1,
+      size,
+      ...(!image.model.startsWith("gpt-image-") ? { response_format: image.responseFormat } : {}),
+      ...(input.transparentBackground ? { background: "transparent", output_format: "png" } : { background: "auto" }),
+      ...(stream ? { stream: true, partial_images: input.partialImages ?? 3 } : {}),
+    };
+    const request = (body: Record<string, unknown>, acceptsStream: boolean) => fetch(endpoint, {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        accept: acceptsStream ? "text/event-stream" : "application/json",
         ...(this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : {}),
       },
-      body: JSON.stringify({
-        model: image.model,
-        prompt: input.prompt,
-        n: 1,
-        size: input.size ?? "1024x1024",
-        response_format: image.responseFormat,
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(120_000),
     });
-    const payload: unknown = await response.json().catch(() => null);
+    let response = await request(requestBody, stream);
+    if (!response.ok && stream && [400, 404, 415, 422].includes(response.status)) {
+      const { stream: _stream, partial_images: _partialImages, ...bufferedBody } = requestBody;
+      response = await request(bufferedBody, false);
+    }
     if (!response.ok) {
+      const payload = await response.text().catch(() => "");
       throw new BadGatewayException({
         code: "image_generation_failed",
         message: "BerryRouter rejected the image generation request",
         upstreamStatus: response.status,
+        ...(payload ? { upstreamMessage: payload.slice(0, 500) } : {}),
       });
     }
+    if (stream && response.headers.get("content-type")?.includes("text/event-stream")) {
+      let completed: string | undefined;
+      for await (const data of parseEventStream(response)) {
+        let event: unknown;
+        try {
+          event = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+        const record = event as Record<string, unknown>;
+        if ((record.type === "image_generation.partial_image" || record.type === "image_edit.partial_image") && typeof record.b64_json === "string") {
+          onPartial?.({
+            index: typeof record.partial_image_index === "number" ? record.partial_image_index : 0,
+            b64: record.b64_json,
+            mimeType: "image/png",
+          });
+        } else if ((record.type === "image_generation.completed" || record.type === "image_edit.completed") && typeof record.b64_json === "string") {
+          completed = record.b64_json;
+        }
+      }
+      if (!completed) throw new BadGatewayException("BerryRouter image stream ended without a completed image");
+      return { model: image.model, data: [{ b64_json: completed }] };
+    }
+    const payload: unknown = await response.json().catch(() => null);
     const parsed = ImageGenerationResponseSchema.safeParse(payload);
     if (!parsed.success) {
       throw new BadGatewayException("BerryRouter returned an invalid image generation response");
@@ -177,6 +233,34 @@ export class CloudRuntimeConfigService {
       costMicros: image.costMicros,
     };
   }
+}
+
+async function* parseEventStream(response: Response): AsyncGenerator<string> {
+  if (!response.body) return;
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary !== -1) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const data = block
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (data && data !== "[DONE]") yield data;
+      boundary = buffer.indexOf("\n\n");
+    }
+  }
+  buffer += decoder.decode();
+  const tail = buffer
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  if (tail && tail !== "[DONE]") yield tail;
 }
 
 export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRuntimeConfig {
@@ -226,6 +310,7 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
     imageGeneration: baseUrl && imageModel && imageCostMicros !== null
       ? {
           endpoint: first(env.BERRY_ROUTER_IMAGE_GENERATIONS_URL) ?? joinUrl(baseUrl, env.BERRY_ROUTER_IMAGE_GENERATIONS_PATH?.trim() || "/images/generations"),
+          editsEndpoint: first(env.BERRY_ROUTER_IMAGE_EDITS_URL) ?? joinUrl(baseUrl, env.BERRY_ROUTER_IMAGE_EDITS_PATH?.trim() || "/images/edits"),
           model: imageModel,
           responseFormat: env.BERRY_ROUTER_IMAGE_RESPONSE_FORMAT === "url" ? "url" : "b64_json",
           costMicros: imageCostMicros,

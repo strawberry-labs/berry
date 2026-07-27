@@ -491,7 +491,13 @@ export class BerryApiClient {
   async organizationCapabilitySettings(tenantId: string): Promise<{ skills: boolean; mcp: boolean }> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/settings/personal-additions`, z.object({ skills: z.boolean(), mcp: z.boolean() })); }
   async updateOrganizationCapabilitySettings(tenantId: string, input: { skills: boolean; mcp: boolean }): Promise<{ skills: boolean; mcp: boolean }> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/settings/personal-additions`, z.object({ skills: z.boolean(), mcp: z.boolean() }), { method: "PATCH", body: input }); }
 
-  async generateImage(input: { prompt: string; model?: string | undefined; size?: string | undefined }): Promise<ImageGenerationResponse> {
+  async generateImage(input: {
+    prompt: string;
+    model?: string | undefined;
+    size?: string | undefined;
+    aspectRatio?: "1:1" | "3:4" | "4:3" | "9:16" | "16:9" | undefined;
+    transparentBackground?: boolean | undefined;
+  }): Promise<ImageGenerationResponse> {
     return this.#request("/v1/images/generations", ImageGenerationResponseSchema, {
       method: "POST",
       body: input,

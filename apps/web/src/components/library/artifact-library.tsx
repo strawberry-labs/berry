@@ -6,6 +6,7 @@ import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circula
 import { Input } from "@berry/desktop-ui/components/ui/input";
 import { FileImage, Files, FileText, FolderOpen, RefreshCw, Search } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
+import { GeneratedImageLightbox, type GeneratedImageView } from "@berry/desktop-ui/components/generated-image-gallery";
 import type { ArtifactLibraryTab } from "@/lib/cloud-shell-state";
 import { DocumentPreviewModal } from "./document-preview-modal";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
@@ -94,6 +95,17 @@ export function ArtifactLibrary({ client, tab, onTabChange }: {
   const documents = items.filter((item) => !item.mediaType.startsWith("image/"));
   const visibleImages = images;
   const visibleDocuments = documents;
+  const libraryImageViews = React.useMemo<GeneratedImageView[]>(() => images.map((item) => ({
+    id: item.id,
+    src: item.previewUrl,
+    fileId: item.id,
+    title: item.name.replace(/\.[^.]+$/, "") || "Generated image",
+    aspectRatio: "1:1",
+    mimeType: item.mediaType,
+    sizeBytes: item.size,
+    transparentBackground: false,
+    downloadUrl: item.downloadUrl,
+  })), [images]);
 
   return (
     <section className="berry-library-page" aria-labelledby="berry-library-title">
@@ -129,7 +141,7 @@ export function ArtifactLibrary({ client, tab, onTabChange }: {
         <div className="berry-library-image-grid">
           {visibleImages.map((item) => (
             <button type="button" key={item.id} className="berry-library-image-card" onClick={() => setSelected(item)}>
-              <div className="berry-library-image-preview"><img src={item.previewUrl} alt="" loading="lazy" /></div>
+              <div className="berry-library-image-preview"><img src={item.previewUrl} alt={item.name} loading="lazy" /></div>
               <ArtifactMeta item={item} />
             </button>
           ))}
@@ -148,7 +160,15 @@ export function ArtifactLibrary({ client, tab, onTabChange }: {
         </div>
       ) : null}
       {state === "ready" && nextCursor ? <Button className="berry-library-load-more" variant="outline" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more files"}</Button> : null}
-      <DocumentPreviewModal file={selected} onOpenChange={(open) => { if (!open) setSelected(null); }} />
+      {selected?.mediaType.startsWith("image/") ? (
+        <GeneratedImageLightbox
+          images={libraryImageViews}
+          activeId={selected.id}
+          onActiveIdChange={(id) => setSelected(id ? images.find((item) => item.id === id) ?? null : null)}
+        />
+      ) : (
+        <DocumentPreviewModal file={selected} onOpenChange={(open) => { if (!open) setSelected(null); }} />
+      )}
     </section>
   );
 }

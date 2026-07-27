@@ -4,6 +4,7 @@ import { type BerryApiClient } from "@berry/api-client";
 import { MessageAttachmentContentSchema, type ConversationKind, type Message, type StoredFile } from "@berry/shared";
 import { BerryThreadView, BerryUserEditorFrame, fullUserText, type BerryThreadAdapter } from "@berry/desktop-ui/components/berry-thread-view";
 import { ImageGeneration, ImageGenerationError, type ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
+import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
 import type { StreamState, ToolEntry } from "@berry/desktop-ui/components/thread-stream";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { Attachment, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
@@ -18,7 +19,7 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, editTurn, continueTurn, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, continueTurn, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -29,6 +30,8 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
   taskTitles: string[];
   imageGeneration?: ImageGenerationState | null;
   onRetryImage?: ((prompt: string) => void) | undefined;
+  onEditGeneratedImage?: ((image: GeneratedImageView, instruction: string, annotations: ImageEditAnnotation[]) => void | Promise<void>) | undefined;
+  onRegenerateGeneratedImage?: ((image: GeneratedImageView, aspectRatio: "1:1" | "3:4" | "4:3" | "9:16" | "16:9") => void | Promise<void>) | undefined;
   editTurn?: ((message: Message, text: string) => Promise<void>) | undefined;
   continueTurn?: (() => Promise<void>) | undefined;
   cancelTurn: () => Promise<void>;
@@ -70,6 +73,8 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
       ),
     } : {}),
     ...(continueTurn ? { onContinueInterruptedTurn: continueTurn } : {}),
+    ...(onEditGeneratedImage ? { onEditGeneratedImage } : {}),
+    ...(onRegenerateGeneratedImage ? { onRegenerateGeneratedImage } : {}),
     ...(client ? {
       onApprovalDecide: async (approval, decision) => {
         if (decision === "abort") {
@@ -107,13 +112,29 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
       },
       ...(onViewTaskFiles ? { onViewTaskFiles } : {}),
     } : {}),
-  }), [cancelTurn, client, config, continueTurn, editTurn, onViewTaskFiles, taskId, taskTitles]);
+  }), [cancelTurn, client, config, continueTurn, editTurn, onEditGeneratedImage, onRegenerateGeneratedImage, onViewTaskFiles, taskId, taskTitles]);
   const activeImageTool = [...stream.timeline].reverse().find(
-    (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "image_generation" && entry.status === "running",
+    (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "create_image" && entry.status === "running",
   );
+  const imageToolBatch = activeImageTool && Array.isArray(activeImageTool.args?.batch_requests)
+    ? activeImageTool.args.batch_requests.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+  const primaryImageArgs = imageToolBatch[0] ?? activeImageTool?.args;
+  const requestedAspectRatio = primaryImageArgs?.aspect_ratio === "3:4"
+    || primaryImageArgs?.aspect_ratio === "4:3"
+    || primaryImageArgs?.aspect_ratio === "9:16"
+    || primaryImageArgs?.aspect_ratio === "16:9"
+    ? primaryImageArgs.aspect_ratio
+    : "1:1";
   const visibleGeneration: ImageGenerationState | null = imageGeneration
     ?? (activeImageTool
-      ? { prompt: typeof activeImageTool.args?.prompt === "string" ? activeImageTool.args.prompt : "requested image", status: "generating" }
+      ? {
+          prompt: typeof primaryImageArgs?.prompt === "string" ? primaryImageArgs.prompt : "requested image",
+          status: "generating",
+          aspectRatio: requestedAspectRatio,
+          batchCount: Math.max(1, imageToolBatch.length),
+          partials: activeImageTool.imageProgress ?? [],
+        }
       : null);
 
   return (
@@ -129,7 +150,14 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         showReasoning={showReasoning}
         adapter={adapter}
       />
-      {visibleGeneration?.status === "generating" ? <ImageGeneration prompt={visibleGeneration.prompt} /> : null}
+      {visibleGeneration?.status === "generating" ? (
+        <ImageGeneration
+          prompt={visibleGeneration.prompt}
+          aspectRatio={visibleGeneration.aspectRatio ?? "1:1"}
+          batchCount={visibleGeneration.batchCount ?? 1}
+          partials={visibleGeneration.partials ?? []}
+        />
+      ) : null}
       {visibleGeneration?.status === "error" ? (
         <ImageGenerationError
           prompt={visibleGeneration.prompt}

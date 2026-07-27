@@ -6,6 +6,7 @@ import {
   ApprovalDecisionSchema,
   AttachmentInputSchema,
   ConversationKindSchema,
+  IMAGE_ASPECT_RATIO_DIMENSIONS,
   JsonValueSchema,
   messageAttachmentContent,
   MessagePartKindSchema,
@@ -18,6 +19,7 @@ import {
   WorkspaceKindSchema,
   type AgentStreamEvent,
   type ConversationKind,
+  type ImageGenerationRequest,
   type JsonValue,
   type Message,
 } from "@berry/shared";
@@ -139,9 +141,11 @@ const SteerTurnRequestSchema = z.object({
   attachments: z.array(AttachmentInputSchema).max(100).optional(),
 }).strict();
 
-const ImageGenerationRequestSchema = z.object({
-  prompt: z.string().trim().min(1).max(8_000),
-  size: z.enum(["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]).optional(),
+const PublicImageGenerationRequestSchema = z.object({
+  prompt: z.string().trim().min(1).max(32_000),
+  size: z.string().regex(/^\d{2,5}x\d{2,5}$/).optional(),
+  aspectRatio: z.enum(["1:1", "3:4", "4:3", "9:16", "16:9"]).optional(),
+  transparentBackground: z.boolean().optional(),
 }).strict();
 
 const ApprovalDecisionRequestSchema = ApprovalDecisionSchema.pick({ decision: true, remember: true, reason: true }).partial({
@@ -204,10 +208,22 @@ export class AgentApiController {
   }
 
   @Post("/images/generations")
-  async generateImage(@Req() httpRequest: AuthenticatedRequest, @Body() body: unknown) {
-    const request = parseBody(ImageGenerationRequestSchema, body);
+  async generateImage(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Body() body: unknown,
+    onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void,
+  ) {
+    const request = parseBody(PublicImageGenerationRequestSchema, body);
+    return this.#generateImageRequest(httpRequest, request, onPartial);
+  }
+
+  async #generateImageRequest(
+    httpRequest: AuthenticatedRequest,
+    request: ImageGenerationRequest,
+    onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void,
+  ) {
     const image = this.runtimeConfig.imageGenerationInfo();
-    if (!image) return this.runtimeConfig.generateImage(request);
+    if (!image) return this.runtimeConfig.generateImage(request, onPartial);
     const tenantId = tenantIdFromRequest(httpRequest);
     const requestId = `image_${randomUUID()}`;
     const actualCostMicros = BigInt(image.costMicros);
@@ -227,7 +243,7 @@ export class AgentApiController {
     });
     let result: Awaited<ReturnType<CloudRuntimeConfigService["generateImage"]>>;
     try {
-      result = await this.runtimeConfig.generateImage(request);
+      result = await this.runtimeConfig.generateImage(request, onPartial);
     } catch (error) {
       await Promise.all([
         this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n }),
@@ -526,6 +542,7 @@ export class AgentApiController {
         decision: modelDecision,
       });
     }
+    let runtimeImageAttachments: RuntimeImageReference[] = [];
     const governedRequest = {
       ...request,
       provider: resolvedRuntime.provider,
@@ -538,8 +555,31 @@ export class AgentApiController {
       projectTrusted: true,
       ...(this.runtimeConfig.imageGenerationInfo() ? {
         imageGeneration: {
-          generate: async ({ prompt, size }: { prompt: string; model?: string; size?: string; signal?: AbortSignal }) => {
-            const result = await this.generateImage(httpRequest, { prompt, ...(size ? { size } : {}) });
+          generate: async ({ prompt, size, aspectRatio, transparentBackground, referenceImagePaths, referencedImageIds, onPartial }: {
+            prompt: string;
+            model?: string;
+            size?: string;
+            aspectRatio?: "1:1" | "3:4" | "4:3" | "9:16" | "16:9";
+            transparentBackground?: boolean;
+            referenceImagePaths?: string[];
+            referencedImageIds?: string[];
+            onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void;
+            signal?: AbortSignal;
+          }) => {
+            const referenceImageUrls = resolveImageReferenceUrls(
+              runtimeImageAttachments,
+              referenceImagePaths ?? [],
+              referencedImageIds ?? [],
+            );
+            const result = await this.#generateImageRequest(httpRequest, {
+              prompt,
+              ...(size ? { size } : {}),
+              ...(aspectRatio ? { aspectRatio } : {}),
+              ...(transparentBackground ? { transparentBackground: true } : {}),
+              ...(referenceImageUrls.length > 0 ? { referenceImageUrls } : {}),
+              stream: true,
+              partialImages: 3,
+            }, onPartial);
             return imageToolResult(result);
           },
         },
@@ -569,6 +609,7 @@ export class AgentApiController {
     try {
       await this.store.updateTask(task.id, { status: "running" });
       const runtimeAttachments = await this.files.runtimeAttachments(tenantId, httpRequest.auth!.user.id, governedRequest.attachments ?? [], { taskId: task.id, sessionId });
+      runtimeImageAttachments = runtimeAttachments;
       let activeTurnId: string | undefined;
       const { turnId } = this.sessionHost.startTurn({
         ...governedRequest,
@@ -622,20 +663,64 @@ export class AgentApiController {
               }).catch(() => undefined);
             }
           }
-          if (call.toolName === "image_generation" && call.status === "completed") {
+          if (call.toolName === "create_image" && call.status === "completed") {
             const output = call.output && typeof call.output === "object" && !Array.isArray(call.output)
               ? call.output as Record<string, unknown>
               : null;
-            const image = output?.image && typeof output.image === "object" && !Array.isArray(output.image)
-              ? output.image as Record<string, unknown>
-              : null;
-            const data = typeof image?.data === "string" ? image.data : "";
-            const mimeType = typeof image?.mimeType === "string" ? image.mimeType : "image/png";
-            if (data) {
-              this.#queueProjectionWrite(sessionId, () => this.store.appendMessage(sessionId, {
-                role: "assistant",
-                parts: [{ kind: "image", content: `data:${mimeType};base64,${data}` }],
-              }));
+            const generatedImages = normalizedGeneratedImages(output);
+            if (generatedImages.length > 0) {
+              this.#queueProjectionWrite(sessionId, async () => {
+                const parts = await Promise.all(generatedImages.map(async (generated, index) => {
+                  const extension = generated.mimeType === "image/webp" ? "webp" : generated.mimeType === "image/jpeg" ? "jpg" : "png";
+                  const title = generated.title || `image-gen-${index + 1}`;
+                  try {
+                    const stored = await this.files.persistGeneratedImage(tenantId, httpRequest.auth!.user.id, {
+                      name: `${safeGeneratedImageName(title)}.${extension}`,
+                      mediaType: generated.mimeType,
+                      data: generated.data,
+                      taskId: task.id,
+                      sessionId,
+                      ...(activeTurnId ? { turnId: activeTurnId } : {}),
+                    });
+                    return {
+                      kind: "image" as const,
+                      content: {
+                        src: stored.previewUrl,
+                        fileId: stored.id,
+                        title,
+                        prompt: generated.prompt,
+                        ...(generated.revisedPrompt ? { revisedPrompt: generated.revisedPrompt } : {}),
+                        aspectRatio: generated.aspectRatio,
+                        width: generated.width,
+                        height: generated.height,
+                        mimeType: generated.mimeType,
+                        sizeBytes: stored.size,
+                        transparentBackground: generated.transparentBackground,
+                        ...(generated.generationId ? { generationId: generated.generationId } : {}),
+                        downloadUrl: stored.downloadUrl,
+                      } as JsonValue,
+                    };
+                  } catch {
+                    return {
+                      kind: "image" as const,
+                      content: {
+                        src: `data:${generated.mimeType};base64,${generated.data}`,
+                        title,
+                        prompt: generated.prompt,
+                        ...(generated.revisedPrompt ? { revisedPrompt: generated.revisedPrompt } : {}),
+                        aspectRatio: generated.aspectRatio,
+                        width: generated.width,
+                        height: generated.height,
+                        mimeType: generated.mimeType,
+                        sizeBytes: generated.sizeBytes,
+                        transparentBackground: generated.transparentBackground,
+                        ...(generated.generationId ? { generationId: generated.generationId } : {}),
+                      } as JsonValue,
+                    };
+                  }
+                }));
+                return this.store.appendMessage(sessionId, { role: "assistant", parts });
+              });
             }
           }
           const durationMs = Date.parse(call.completedAt) - Date.parse(call.startedAt);
@@ -959,6 +1044,59 @@ async function imageToolResult(result: {
   };
 }
 
+function normalizedGeneratedImages(output: Record<string, unknown> | null): Array<{
+  data: string;
+  mimeType: string;
+  title: string;
+  prompt: string;
+  revisedPrompt?: string;
+  aspectRatio: "1:1" | "3:4" | "4:3" | "9:16" | "16:9";
+  width: number;
+  height: number;
+  sizeBytes?: number;
+  transparentBackground: boolean;
+  generationId?: string;
+}> {
+  const rawItems = Array.isArray(output?.images) ? output.images : [];
+  return rawItems.flatMap((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const item = value as Record<string, unknown>;
+    const image = item.image && typeof item.image === "object" && !Array.isArray(item.image)
+      ? item.image as Record<string, unknown>
+      : null;
+    const data = typeof image?.data === "string" ? image.data : "";
+    if (!data) return [];
+    const aspectRatio = item.aspectRatio === "3:4" || item.aspectRatio === "4:3" || item.aspectRatio === "9:16" || item.aspectRatio === "16:9"
+      ? item.aspectRatio
+      : "1:1";
+    const fallbackDimensions = IMAGE_ASPECT_RATIO_DIMENSIONS[aspectRatio];
+    return [{
+      data,
+      mimeType: typeof image?.mimeType === "string" ? image.mimeType : "image/png",
+      title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : `image-gen-${index + 1}`,
+      prompt: typeof item.prompt === "string" ? item.prompt : "",
+      ...(typeof item.revisedPrompt === "string" ? { revisedPrompt: item.revisedPrompt } : {}),
+      aspectRatio,
+      width: typeof image?.width === "number" ? image.width : fallbackDimensions.width,
+      height: typeof image?.height === "number" ? image.height : fallbackDimensions.height,
+      ...(typeof image?.sizeBytes === "number" ? { sizeBytes: image.sizeBytes } : {}),
+      transparentBackground: item.transparentBackground === true,
+      ...(typeof image?.generationId === "string" ? { generationId: image.generationId } : {}),
+    }];
+  });
+}
+
+function safeGeneratedImageName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/[\\/\0]/g, "-")
+    .replace(/[^\p{L}\p{N}._() -]+/gu, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\.(?:png|jpe?g|webp)$/i, "")
+    .slice(0, 120) || "generated-image";
+}
+
 function normalizeDecision(decision: z.infer<typeof ApprovalDecisionSchema>["decision"]): ApprovalDecisionKind {
   if (decision === "approve") return "approved_once";
   if (decision === "deny") return "denied";
@@ -1009,6 +1147,42 @@ function imagesFromAttachments(attachments: z.infer<typeof AttachmentInputSchema
     if (!match) return [];
     return [{ type: "image" as const, data: match[2]!, mimeType: match[1] ?? attachment.mediaType }];
   });
+}
+
+interface RuntimeImageReference {
+  id?: string | undefined;
+  fileId?: string | undefined;
+  name: string;
+  mediaType: string;
+  dataUrl?: string | null | undefined;
+  remoteUrl?: string | null | undefined;
+}
+
+function resolveImageReferenceUrls(
+  attachments: RuntimeImageReference[],
+  referencePaths: string[],
+  referenceIds: string[],
+): string[] {
+  if (referencePaths.length === 0 && referenceIds.length === 0) return [];
+  const ids = new Set(referenceIds.map((id) => id.toLowerCase()));
+  const pathHints = referencePaths.map((path) => path.toLowerCase());
+  const images = attachments.filter((attachment) => attachment.mediaType.startsWith("image/"));
+  const matches = images.filter((attachment) => {
+    const attachmentIds = [attachment.id, attachment.fileId].filter((id): id is string => Boolean(id)).map((id) => id.toLowerCase());
+    if (attachmentIds.some((id) => ids.has(id))) return true;
+    const name = attachment.name.toLowerCase();
+    return pathHints.some((path) => attachmentIds.some((id) => path.includes(id)) || path.endsWith(`/${name}`) || path.endsWith(`\\${name}`));
+  });
+  const selected = matches.length > 0 ? matches : images.length === 1 ? images : [];
+  const urls = selected.flatMap((attachment) => attachment.dataUrl
+    ? [attachment.dataUrl]
+    : attachment.remoteUrl
+      ? [attachment.remoteUrl]
+      : []);
+  if (urls.length === 0) {
+    throw new BadRequestException("The referenced image is not attached to this turn or is no longer available");
+  }
+  return [...new Set(urls)].slice(0, 16);
 }
 
 function conversationKindFromTask(task: { conversationKind: ConversationKind }): ConversationKind {

@@ -74,10 +74,67 @@ describe("router client", () => {
           prompt: "A generated berry",
           n: 1,
           size: "1024x1024",
-          response_format: "b64_json",
         }),
       },
     ]);
+  });
+
+  it("streams partial images and returns the completed frame", async () => {
+    const requests: string[] = [];
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += String(chunk); });
+      request.on("end", () => {
+        requests.push(raw);
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.write('event: image_generation.partial_image\ndata: {"type":"image_generation.partial_image","b64_json":"cGFydGlhbA==","partial_image_index":0}\n\n');
+        response.end('event: image_generation.completed\ndata: {"type":"image_generation.completed","b64_json":"ZmluYWw="}\n\n');
+      });
+    });
+    const client = new OpenAIImageGenerationClient({
+      provider: { baseUrl: `${baseUrl}v1`, defaultModel: "gpt-image-2", kind: "berry-router", name: "Berry Router" },
+      apiKey: "brry_test",
+    });
+    const partials: Array<{ index: number; b64_json: string }> = [];
+    await expect(client.generate({
+      prompt: "A generated berry",
+      stream: true,
+      partialImages: 3,
+      onPartial: (partial) => partials.push(partial),
+    })).resolves.toMatchObject({ data: [{ b64_json: "ZmluYWw=" }] });
+    expect(partials).toEqual([{ index: 0, b64_json: "cGFydGlhbA==" }]);
+    expect(JSON.parse(requests[0]!)).toMatchObject({ stream: true, partial_images: 3 });
+  });
+
+  it("routes grounded edits through the image edit endpoint", async () => {
+    const requests: Array<{ path: string; body: string }> = [];
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += String(chunk); });
+      request.on("end", () => {
+        requests.push({ path: request.url ?? "", body: raw });
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.write('event: image_edit.partial_image\ndata: {"type":"image_edit.partial_image","b64_json":"cGFydGlhbA==","partial_image_index":0}\n\n');
+        response.end('event: image_edit.completed\ndata: {"type":"image_edit.completed","b64_json":"ZWRpdGVk"}\n\n');
+      });
+    });
+    const client = new OpenAIImageGenerationClient({
+      provider: { baseUrl: `${baseUrl}v1`, defaultModel: "gpt-image-2", kind: "berry-router", name: "Berry Router" },
+      apiKey: "brry_test",
+    });
+    const partials: Array<{ index: number; b64_json: string }> = [];
+    await expect(client.generate({
+      prompt: "Remove the label",
+      referenceImageUrls: ["data:image/png;base64,c291cmNl"],
+      stream: true,
+      onPartial: (partial) => partials.push(partial),
+    })).resolves.toMatchObject({ data: [{ b64_json: "ZWRpdGVk" }] });
+    expect(requests[0]?.path).toBe("/v1/images/edits");
+    expect(JSON.parse(requests[0]!.body)).toMatchObject({
+      images: [{ image_url: "data:image/png;base64,c291cmNl" }],
+    });
+    expect(JSON.parse(requests[0]!.body)).not.toHaveProperty("input_fidelity");
+    expect(partials).toEqual([{ index: 0, b64_json: "cGFydGlhbA==" }]);
   });
 
   it("normalizes Kimi control-token tool calls when an upstream host leaves them in message content", async () => {

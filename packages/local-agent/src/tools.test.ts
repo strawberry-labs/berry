@@ -50,7 +50,7 @@ describe("createBerryTools", () => {
     expect(riskForToolName("browser_navigate")).toBe("browser");
     expect(riskForToolName("web_search")).toBe("browser");
     expect(riskForToolName("fetch_url")).toBe("browser");
-    expect(riskForToolName("image_generation")).toBe("read");
+    expect(riskForToolName("create_image")).toBe("read");
     expect(riskForToolName("tool_search")).toBe("read");
   });
 
@@ -87,25 +87,57 @@ describe("createBerryTools", () => {
   it("exposes image generation as a model-invocable tool when the host bridge is available", async () => {
     const dir = mkdtempSync(join(tmpdir(), "berry-tools-"));
     tempDirs.push(dir);
-    const calls: Array<{ prompt: string; model?: string; size?: string }> = [];
+    const calls: Array<{ prompt: string; model?: string; size?: string; aspectRatio?: string; transparentBackground?: boolean; referenceImagePaths?: string[]; referencedImageIds?: string[]; onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void }> = [];
     const tools = new Map(createBerryTools({
       workspacePath: dir,
       imageGeneration: {
         async generate(input) {
           calls.push(input);
+          input.onPartial?.({ index: 0, b64: "cGFydGlhbA==", mimeType: "image/png" });
           return { model: "gpt-image-2", data: [{ data: "aW1hZ2U=", mimeType: "image/png" }] };
         },
       },
     }).map((tool) => [tool.name, tool]));
-    const image = tools.get("image_generation");
+    const image = tools.get("create_image");
     expect(image).toBeDefined();
-    const result = await image!.execute("call_image", { prompt: "a berry in space", size: "1024x1024" } as never);
-    expect(calls).toEqual([{ prompt: "a berry in space", size: "1024x1024" }]);
+    expect(JSON.stringify(image?.parameters)).not.toContain('"model"');
+    expect(JSON.stringify(image?.parameters)).not.toContain('"size"');
+    const updates: unknown[] = [];
+    const result = await image!.execute("call_image", { prompt: "a berry in space", aspect_ratio: "1:1" } as never, undefined, (partial) => updates.push(partial.details));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      prompt: "a berry in space",
+      size: "1024x1024",
+      aspectRatio: "1:1",
+      transparentBackground: false,
+    });
+    expect(calls[0]?.onPartial).toBeTypeOf("function");
     expect(result.content).toEqual([
-      { type: "text", text: "Generated an image for: a berry in space" },
+      { type: "text", text: expect.stringContaining("Generated 1 image") },
       { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
     ]);
-    expect(result.details).toMatchObject({ prompt: "a berry in space", model: "gpt-image-2", image: { data: "aW1hZ2U=", mimeType: "image/png" } });
+    expect(result.details).toMatchObject({
+      images: [{ title: "A berry in space", aspectRatio: "1:1" }],
+    });
+    expect(result.details).not.toHaveProperty("prompt");
+    expect(result.details).not.toHaveProperty("model");
+    expect(result.details).not.toHaveProperty("image");
+    expect(updates).toEqual([{
+      imagePartial: expect.objectContaining({ requestIndex: 0, index: 0, b64: "cGFydGlhbA==" }),
+    }]);
+
+    const referencePath = join(dir, "source.png");
+    writeFileSync(referencePath, "source");
+    await image!.execute("call_image_edit", {
+      prompt: "remove the label",
+      reference_image_paths: [referencePath],
+      referenced_image_ids: ["attachment_source"],
+    } as never);
+    expect(calls[1]).toMatchObject({
+      prompt: "remove the label",
+      referenceImagePaths: [referencePath],
+      referencedImageIds: ["attachment_source"],
+    });
   });
 
   it("loads a model-selected skill through progressive disclosure", async () => {

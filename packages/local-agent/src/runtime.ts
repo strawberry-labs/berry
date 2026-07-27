@@ -1444,7 +1444,27 @@ export class BerryAgentRuntime {
           break;
         }
         case "tool_execution_update": {
-          const partial = event.partialResult as { content?: Array<{ type: string; text?: string }> } | undefined;
+          const partial = event.partialResult as {
+            content?: Array<{ type: string; text?: string }>;
+            details?: { imagePartial?: Record<string, unknown> };
+          } | undefined;
+          const imagePartial = partial?.details?.imagePartial;
+          if (event.toolName === "create_image" && imagePartial) {
+            const b64 = typeof imagePartial.b64 === "string" ? imagePartial.b64 : "";
+            const aspectRatio = imagePartial.aspectRatio;
+            if (b64 && (aspectRatio === "1:1" || aspectRatio === "3:4" || aspectRatio === "4:3" || aspectRatio === "9:16" || aspectRatio === "16:9")) {
+              this.#emit(active, {
+                kind: "image.partial",
+                toolCallId: event.toolCallId,
+                requestIndex: typeof imagePartial.requestIndex === "number" ? imagePartial.requestIndex : 0,
+                index: typeof imagePartial.index === "number" ? imagePartial.index : 0,
+                percentComplete: typeof imagePartial.percentComplete === "number" ? imagePartial.percentComplete : 0,
+                b64,
+                mimeType: typeof imagePartial.mimeType === "string" ? imagePartial.mimeType : "image/png",
+                aspectRatio,
+              });
+            }
+          }
           const detail = partial?.content ? textFromToolContent(partial.content) : undefined;
           this.#emit(active, {
             kind: "tool.update",
@@ -1567,7 +1587,7 @@ export class BerryAgentRuntime {
     });
     const children = toolName === "task" ? this.#subagentChildren.get(toolCallId) : undefined;
     if (toolName === "task") this.#subagentChildren.delete(toolCallId);
-    const persistedOutput = (toolName === "browser_screenshot" || toolName === "persist_artifact" || toolName === "image_generation" || toolName === "compose_message") && toolResult?.details
+    const persistedOutput = (toolName === "browser_screenshot" || toolName === "persist_artifact" || toolName === "create_image" || toolName === "compose_message") && toolResult?.details
       ? { text: outputText, ...toolResult.details } as JsonValue
       : outputText || null;
     active.onToolCall?.({
