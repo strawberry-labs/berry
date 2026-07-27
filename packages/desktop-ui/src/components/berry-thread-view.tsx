@@ -671,7 +671,7 @@ function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void |
   return (
     <div
       data-testid="continue-interrupted-turn"
-      className="flex max-w-[775px] flex-wrap items-center gap-x-3 gap-y-2 pt-1"
+      className="flex max-w-[775px] items-center pt-1"
     >
       <Button
         type="button"
@@ -685,9 +685,6 @@ function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void |
         <RefreshCw className={cn("size-3.5", continuing && "animate-spin motion-reduce:animate-none")} />
         {continuing ? "Continuing…" : "Continue"}
       </Button>
-      <span className="text-xs text-[var(--berry-text-secondary)]">
-        Keeps completed tool work and resumes from here.
-      </span>
     </div>
   );
 }
