@@ -1,6 +1,6 @@
 import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
-import { BerryApiClient, BerryApiError } from "@berry/api-client";
+import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
@@ -724,7 +724,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const runTurn = React.useCallback(async (
     task: Task,
-    params: { input: string; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined },
+    params:
+      | { input: string; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
+      | { continueInterruptedTurn: true; input?: undefined; attachments?: undefined; replaceFromMessageId?: undefined },
   ) => {
     if (!client || !task.activeSessionId) return;
     const sessionId = task.activeSessionId;
@@ -737,17 +739,22 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     // delivered together from the server's replay buffer.
     attachSessionStream(sessionId);
     try {
-      await client.startTurn(sessionId, {
-        input: params.input,
+      const request = {
         workspacePath: taskWorkspacePath,
         workspaceId: task.workspaceId,
         permissionMode,
         provider: { id: providerId },
         model,
         reasoning,
-        ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
-        ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
-      });
+        ...(params.continueInterruptedTurn
+          ? { continueInterruptedTurn: true as const }
+          : {
+            input: params.input,
+            ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
+            ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
+          }),
+      } satisfies StartTurnRequest;
+      await client.startTurn(sessionId, request);
     } catch (cause) {
       if (!(cause instanceof BerryApiError)) {
         try {
@@ -832,6 +839,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     await refreshSessionMessages(sessionId);
   }, [activeTask, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, runTurn]);
+
+  const continueTurn = React.useCallback(async () => {
+    if (!activeTask?.activeSessionId) return;
+    requestThreadBottom(activeTask.activeSessionId);
+    await runTurn(activeTask, { continueInterruptedTurn: true });
+  }, [activeTask, requestThreadBottom, runTurn]);
 
   const createProject = React.useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1542,6 +1555,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               imageGeneration={imageGenerationBySession[activeTask.activeSessionId ?? activeTask.id] ?? null}
               onRetryImage={(prompt) => void generateImage(activeTask, prompt, false)}
               editTurn={activeTask.activeSessionId ? editTurn : undefined}
+              continueTurn={activeTask.activeSessionId ? continueTurn : undefined}
               cancelTurn={cancelTurn}
               onViewTaskFiles={() => setTaskFilesOpen(true)}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}

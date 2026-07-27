@@ -127,6 +127,26 @@ describe("BerryApiClient", () => {
     expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/cancel", expect.objectContaining({ method: "POST" }));
   });
 
+  it("continues an interrupted turn without serializing user input", async () => {
+    const fetchImpl = vi.fn(async () => json({ turnId: "turn_2", sessionId: "session_1" }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await client.startTurn("session_1", {
+      continueInterruptedTurn: true,
+      workspacePath: "/workspace",
+      provider: { id: "router" },
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/turns", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        continueInterruptedTurn: true,
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+      }),
+    }));
+  });
+
   it("reads replayable per-session turn state", async () => {
     const fetchImpl = vi.fn(async () => json({
       active: true,

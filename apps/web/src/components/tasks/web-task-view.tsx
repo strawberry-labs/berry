@@ -18,7 +18,7 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, editTurn, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, editTurn, continueTurn, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -30,6 +30,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
   imageGeneration?: ImageGenerationState | null;
   onRetryImage?: ((prompt: string) => void) | undefined;
   editTurn?: ((message: Message, text: string) => Promise<void>) | undefined;
+  continueTurn?: (() => Promise<void>) | undefined;
   cancelTurn: () => Promise<void>;
   onViewTaskFiles?: (() => void) | undefined;
   scrollRequest?: number;
@@ -68,6 +69,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         />
       ),
     } : {}),
+    ...(continueTurn ? { onContinueInterruptedTurn: continueTurn } : {}),
     ...(client ? {
       onApprovalDecide: async (approval, decision) => {
         if (decision === "abort") {
@@ -105,7 +107,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
       },
       ...(onViewTaskFiles ? { onViewTaskFiles } : {}),
     } : {}),
-  }), [cancelTurn, client, config, editTurn, onViewTaskFiles, taskId, taskTitles]);
+  }), [cancelTurn, client, config, continueTurn, editTurn, onViewTaskFiles, taskId, taskTitles]);
   const activeImageTool = [...stream.timeline].reverse().find(
     (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "image_generation" && entry.status === "running",
   );

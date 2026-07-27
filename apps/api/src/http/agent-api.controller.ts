@@ -101,7 +101,8 @@ function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "t
 }
 
 const StartTurnRequestSchema = z.object({
-  input: z.string().min(1),
+  input: z.string().min(1).optional(),
+  continueInterruptedTurn: z.boolean().optional(),
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1).optional(),
   permissionMode: PermissionModeSchema.optional(),
@@ -114,7 +115,23 @@ const StartTurnRequestSchema = z.object({
   // and everything after, persist the new input as the user message, and run
   // the turn from that point (mirrors the desktop host's agent.turn).
   replaceFromMessageId: z.string().min(1).optional(),
-}).passthrough();
+}).passthrough().superRefine((request, context) => {
+  if (request.continueInterruptedTurn) {
+    if (request.input !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["input"], message: "A continued turn must not include new user input" });
+    }
+    if (request.attachments !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["attachments"], message: "A continued turn must not include new attachments" });
+    }
+    if (request.replaceFromMessageId !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["replaceFromMessageId"], message: "A continued turn cannot replace an earlier message" });
+    }
+    return;
+  }
+  if (request.input === undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["input"], message: "A new turn requires user input" });
+  }
+});
 
 const SteerTurnRequestSchema = z.object({
   messageId: z.string().uuid(),
@@ -486,6 +503,9 @@ export class AgentApiController {
   async startTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(StartTurnRequestSchema, body);
     const { session, task } = await this.ownedSession(httpRequest, sessionId);
+    if (request.continueInterruptedTurn) {
+      await this.assertContinuableTurn(sessionId);
+    }
     const tenantId = tenantIdFromRequest(httpRequest);
     const requestId = `model_${randomUUID()}`;
     const baseRuntime = this.runtimeConfig.resolve(request);
@@ -544,7 +564,7 @@ export class AgentApiController {
     let usage: { inputTokens?: number; outputTokens?: number; provider?: string | null; model?: string | null } | undefined;
     let assistantErrorPersisted = false;
     if (request.replaceFromMessageId) {
-      await this.rewindForEdit(sessionId, request.replaceFromMessageId, request.input, request.attachments);
+      await this.rewindForEdit(sessionId, request.replaceFromMessageId, request.input ?? "", request.attachments);
     }
     try {
       await this.store.updateTask(task.id, { status: "running" });
@@ -552,6 +572,7 @@ export class AgentApiController {
       let activeTurnId: string | undefined;
       const { turnId } = this.sessionHost.startTurn({
         ...governedRequest,
+        input: request.continueInterruptedTurn ? "" : request.input ?? "",
         sessionId,
         taskId: task.id,
         workspaceId: governedRequest.workspaceId ?? task.workspaceId,
@@ -693,6 +714,18 @@ export class AgentApiController {
     } catch (error) {
       await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
       throw error;
+    }
+  }
+
+  private async assertContinuableTurn(sessionId: string): Promise<void> {
+    if (this.sessionHost.turnState(sessionId).active) {
+      throw new BadRequestException("This task is already running");
+    }
+    await this.#projectionWrites.get(sessionId);
+    const messages = await this.store.listMessages(sessionId);
+    const latestMessage = messages.at(-1);
+    if (!latestMessage || latestMessage.role !== "assistant" || !["failed", "cancelled"].includes(latestMessage.status)) {
+      throw new BadRequestException("Only a failed or cancelled assistant turn can be continued");
     }
   }
 

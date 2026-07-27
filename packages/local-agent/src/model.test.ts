@@ -1,4 +1,4 @@
-import { OpenRouterCompatibleClient } from "@berry/router-client";
+import { OpenRouterCompatibleClient, RouterClientError } from "@berry/router-client";
 import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { BerryModelAdapter, BufferedChatCompletionClient, ContentFallbackChatCompletionClient, contextForModelCapabilities, contextToChatMessages, createBerryModel, createBerryModels } from "./model.ts";
@@ -123,6 +123,58 @@ describe("BerryModelAdapter", () => {
     };
 
     await expect(consume()).rejects.toThrow("SSE disconnected");
+    expect(completed).toBe(0);
+  });
+
+  it("surfaces a transient provider failure after the safe fallback attempt is exhausted", async () => {
+    let completed = 0;
+    const compatible = {
+      async complete(): Promise<never> {
+        completed += 1;
+        throw new RouterClientError("second 504", 504);
+      },
+      async *stream(): AsyncGenerator<never> {
+        throw new RouterClientError("first 504", 504);
+      },
+    };
+    const client = new ContentFallbackChatCompletionClient(
+      compatible,
+      new BufferedChatCompletionClient(compatible),
+    );
+
+    const consume = async () => {
+      for await (const _chunk of client.stream({ messages: [] })) {
+        // Consume until the fallback failure is surfaced.
+      }
+    };
+
+    await expect(consume()).rejects.toThrow("second 504");
+    expect(completed).toBe(1);
+  });
+
+  it("does not retry a non-transient provider rejection", async () => {
+    let completed = 0;
+    const compatible = {
+      async complete(): Promise<never> {
+        completed += 1;
+        throw new Error("must not run");
+      },
+      async *stream(): AsyncGenerator<never> {
+        throw new RouterClientError("invalid API key", 401);
+      },
+    };
+    const client = new ContentFallbackChatCompletionClient(
+      compatible,
+      new BufferedChatCompletionClient(compatible),
+    );
+
+    const consume = async () => {
+      for await (const _chunk of client.stream({ messages: [] })) {
+        // Consume until the provider rejection is surfaced.
+      }
+    };
+
+    await expect(consume()).rejects.toThrow("invalid API key");
     expect(completed).toBe(0);
   });
 

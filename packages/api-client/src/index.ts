@@ -227,8 +227,7 @@ export interface UpdateTaskRequest {
   conversationKind?: "chat" | "code" | undefined;
 }
 
-export interface StartTurnRequest {
-  input: string;
+interface StartTurnRequestBase {
   workspacePath: string;
   workspaceId?: string | undefined;
   permissionMode?: PermissionMode | undefined;
@@ -236,10 +235,24 @@ export interface StartTurnRequest {
   model?: string | undefined;
   apiKey?: string | undefined;
   reasoning?: ReasoningLevel | undefined;
-  attachments?: AttachmentInput[] | undefined;
-  /** Edit-and-resubmit: rewind to before this user message and replace it. */
-  replaceFromMessageId?: string | undefined;
 }
+
+export type StartTurnRequest = StartTurnRequestBase & (
+  | {
+    input: string;
+    continueInterruptedTurn?: false | undefined;
+    attachments?: AttachmentInput[] | undefined;
+    /** Edit-and-resubmit: rewind to before this user message and replace it. */
+    replaceFromMessageId?: string | undefined;
+  }
+  | {
+    /** Resume the interrupted assistant turn without appending another user message. */
+    continueInterruptedTurn: true;
+    input?: undefined;
+    attachments?: undefined;
+    replaceFromMessageId?: undefined;
+  }
+);
 
 export const ManagedModelCatalogSchema = z.object({
   providerId: z.string(),

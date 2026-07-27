@@ -223,6 +223,64 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("continues a failed assistant turn without sending another user message", async () => {
+    let attempt = 0;
+    const startTurn = vi.fn((options: StartTurnOptions) => {
+      attempt += 1;
+      const turnId = `turn_continue_${attempt}`;
+      options.onEvent({ kind: "turn.start", turnId });
+      if (attempt === 1) {
+        options.onEvent({ kind: "error", message: "Provider request failed with 504" });
+        options.onEvent({ kind: "turn.end", turnId, status: "failed" });
+      } else {
+        options.onEvent({ kind: "turn.end", turnId, status: "completed" });
+      }
+      return { turnId };
+    });
+    app = await createApp(fakeSessionHost({ startTurn }));
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Continue task" }).expect(201);
+    const sessionId = created.body.session.id as string;
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/messages`).set(authHeader()).send({
+      role: "user",
+      parts: [{ kind: "text", content: "Do the work" }],
+    }).expect(201);
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/turns`).set(authHeader()).send({
+      input: "Do the work",
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+    }).expect(201);
+    await nextTick();
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${sessionId}/turns`).set(authHeader()).send({
+      continueInterruptedTurn: true,
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+    }).expect(201);
+
+    expect(startTurn).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      sessionId,
+      input: "",
+      continueInterruptedTurn: true,
+      attachments: [],
+    }));
+    const messages = await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/messages`).set(authHeader()).expect(200);
+    expect(messages.body.filter((message: { role: string }) => message.role === "user")).toHaveLength(1);
+  });
+
+  it("rejects continuation unless the latest assistant turn is interrupted", async () => {
+    const startTurn = vi.fn(() => ({ turnId: "turn_never" }));
+    app = await createApp(fakeSessionHost({ startTurn }));
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Invalid continuation" }).expect(201);
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader()).send({
+      continueInterruptedTurn: true,
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+    }).expect(400);
+    expect(startTurn).not.toHaveBeenCalled();
+  });
+
   it("cancels an active session turn through SessionHost", async () => {
     const cancel = vi.fn(async () => true);
     app = await createApp(fakeSessionHost({ cancel }));

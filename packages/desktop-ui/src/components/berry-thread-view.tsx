@@ -1,6 +1,6 @@
 import * as React from "react";
 import { MessageAttachmentContentSchema, type Message, type MessageAttachmentContent, type MessagePart } from "@berry/shared";
-import { CircleHelp, Copy, GaugeIcon, GitFork, Pencil, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
+import { CircleHelp, Copy, GaugeIcon, GitFork, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 
 import {
@@ -70,6 +70,8 @@ export interface BerryThreadAdapter {
   onOpenArtifact?: (artifact: { name: string; path: string; mediaType?: string; size?: number }) => void | Promise<void>;
   /** Open the task-scoped file library. */
   onViewTaskFiles?: () => void;
+  /** Continue the latest failed assistant turn without appending another user message. */
+  onContinueInterruptedTurn?: () => void | Promise<void>;
 }
 
 const rememberedTurnElapsed = new Map<string, number>();
@@ -263,6 +265,11 @@ export function BerryThreadView({
                       showTodos={showTodos}
                       density={density}
                       adapter={adapter}
+                      canContinue={
+                        groupIndex === renderedTurnGroups.length - 1
+                        && !stream.turnActive
+                        && isContinuableAssistantTurn(group.assistants)
+                      }
                     />
                   </MessageScrollerItem>
                 ) : null}
@@ -465,6 +472,7 @@ function BerryAssistantTurnGroup({
   showTodos,
   density,
   adapter,
+  canContinue,
 }: {
   messages: Message[];
   turnKey: string;
@@ -472,6 +480,7 @@ function BerryAssistantTurnGroup({
   showTodos: boolean;
   density: "full" | "compact";
   adapter: BerryThreadAdapter;
+  canContinue: boolean;
 }) {
   const allParts = messages.flatMap((message) => message.parts);
   const imageParts = allParts.filter(isImageMessagePart);
@@ -588,6 +597,9 @@ function BerryAssistantTurnGroup({
         {artifacts.length > 0 ? (
           <BerryTurnArtifacts artifacts={artifacts} adapter={adapter} />
         ) : null}
+        {canContinue && adapter.onContinueInterruptedTurn ? (
+          <BerryContinueInterruptedTurn onContinue={adapter.onContinueInterruptedTurn} />
+        ) : null}
         <MessageFooter className="gap-1 opacity-0 transition-[opacity] group-hover:opacity-100">
           <Button
             variant="ghost"
@@ -635,6 +647,48 @@ function BerryAssistantTurnGroup({
         </MessageFooter>
       </MessageContent>
     </MessageRow>
+  );
+}
+
+export function isContinuableAssistantTurn(messages: Message[]): boolean {
+  const latestAssistant = messages.at(-1);
+  return latestAssistant?.status === "failed";
+}
+
+function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void | Promise<void> }) {
+  const [continuing, setContinuing] = React.useState(false);
+  const continueTurn = async () => {
+    if (continuing) return;
+    setContinuing(true);
+    try {
+      await onContinue();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Unable to continue this turn");
+      setContinuing(false);
+    }
+  };
+
+  return (
+    <div
+      data-testid="continue-interrupted-turn"
+      className="flex max-w-[775px] flex-wrap items-center gap-x-3 gap-y-2 pt-1"
+    >
+      <Button
+        type="button"
+        variant="outline"
+        size="lg"
+        aria-label="Continue from existing work"
+        disabled={continuing}
+        onClick={() => void continueTurn()}
+        className="h-10 rounded-xl border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-3 text-[13px] text-[var(--berry-text-primary)] shadow-none hover:bg-[var(--berry-hover)] active:scale-[0.96]"
+      >
+        <RefreshCw className={cn("size-3.5", continuing && "animate-spin motion-reduce:animate-none")} />
+        {continuing ? "Continuing…" : "Continue"}
+      </Button>
+      <span className="text-xs text-[var(--berry-text-secondary)]">
+        Keeps completed tool work and resumes from here.
+      </span>
+    </div>
   );
 }
 

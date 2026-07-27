@@ -4,6 +4,7 @@ import {
   OllamaNativeChatClient,
   OpenAIChatCompletionsClient,
   OpenAIResponsesClient,
+  RouterClientError,
   BERRY_ROUTER_METADATA_KEY,
   type ChatCompletionOptions,
   type ChatCompletionChunk,
@@ -181,9 +182,10 @@ export class FallbackChatCompletionClient implements ChatCompletionStreamClient 
 }
 
 /**
- * Falls back only when the streaming lane fails before emitting model content.
- * Empty protocol/metadata chunks are held until real text, reasoning, or tool
- * output arrives so they cannot disable the safe fallback prematurely.
+ * Retries once through the buffered lane only when a transient streaming
+ * failure happens before model content. Empty protocol/metadata chunks are
+ * held until real text, reasoning, or tool output arrives so they cannot
+ * disable the safe retry prematurely.
  */
 export class ContentFallbackChatCompletionClient implements ChatCompletionStreamClient {
   constructor(
@@ -209,10 +211,15 @@ export class ContentFallbackChatCompletionClient implements ChatCompletionStream
       yield* pending;
       return;
     } catch (error) {
-      if (emittedContent || options.signal?.aborted) throw error;
+      if (emittedContent || options.signal?.aborted || !isRetryableCompletionError(error)) throw error;
     }
     yield* this.fallback.stream(options);
   }
+}
+
+function isRetryableCompletionError(error: unknown): boolean {
+  if (!(error instanceof RouterClientError) || error.status === undefined) return true;
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(error.status);
 }
 
 function emptyUsage(): Usage {
