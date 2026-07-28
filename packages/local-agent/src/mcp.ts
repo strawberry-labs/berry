@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Type, type TSchema } from "typebox";
 import { ExecPolicyEngine, type ExecPolicyRule } from "@berry/execpolicy";
 import { networkDomainAllowed, type NetworkPolicy } from "@berry/shared";
+import { z } from "zod";
 
 export interface McpCachedTool {
   name: string;
@@ -45,6 +46,66 @@ export interface McpToolSourceOptions {
   onHealth?: (health: McpServerHealth) => void | Promise<void>;
   networkPolicy?: NetworkPolicy;
   execPolicyRules?: ExecPolicyRule[];
+}
+
+const McpServerConfigSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  transport: z.enum(["stdio", "http-sse", "streamable-http"]),
+  command: z.string().nullable().default(null),
+  args: z.array(z.string()).default([]),
+  url: z.string().url().nullable().default(null),
+  env: z.record(z.string()).default({}),
+  enabled: z.boolean().default(true),
+  trusted: z.boolean().default(true),
+  credential: z.string().nullable().optional(),
+  credentialEnv: z.string().min(1).optional(),
+  credentialKey: z.string().nullable().optional(),
+  cachedTools: z.array(z.object({
+    name: z.string(),
+    description: z.string().nullable().default(null),
+    inputSchema: z.record(z.unknown()),
+    annotations: z.object({
+      readOnlyHint: z.boolean().optional(),
+      destructiveHint: z.boolean().optional(),
+      idempotentHint: z.boolean().optional(),
+      openWorldHint: z.boolean().optional(),
+    }).optional(),
+  })).optional(),
+});
+
+/** Parses deploy-safe MCP configuration while resolving credentials from the receiving process only. */
+export function mcpServerSpecsFromJson(
+  raw: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): McpServerSpec[] {
+  if (!raw?.trim()) return [];
+  return z.array(McpServerConfigSchema).parse(JSON.parse(raw)).map((server) => {
+    const credential = server.credentialEnv
+      ? env[server.credentialEnv]?.trim()
+      : server.credential?.trim();
+    return {
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      command: server.command,
+      args: server.args,
+      url: server.url,
+      env: server.env,
+      enabled: server.enabled,
+      trusted: server.trusted,
+      credentialKey: server.credentialKey ?? null,
+      ...(server.cachedTools ? {
+        cachedTools: server.cachedTools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          ...(tool.annotations ? { annotations: compactAnnotations(tool.annotations) } : {}),
+        })),
+      } : {}),
+      ...(credential ? { credential } : {}),
+    };
+  });
 }
 
 interface ConnectedServer {
@@ -260,7 +321,12 @@ export class McpToolSource {
     });
   }
 
-  approvalHints(toolName: string): { destructive: boolean; openWorld: boolean } | undefined {
+  approvalHints(toolName: string): {
+    readOnly: boolean;
+    destructive: boolean;
+    idempotent: boolean;
+    openWorld: boolean;
+  } | undefined {
     for (const spec of this.#options.servers) {
       const prefix = `mcp__${sanitizeName(spec.name)}__`;
       if (!toolName.startsWith(prefix)) continue;
@@ -268,7 +334,12 @@ export class McpToolSource {
       const tools = this.#servers.get(spec.id)?.cachedTools ?? spec.cachedTools ?? [];
       const tool = tools.find((candidate) => sanitizeName(candidate.name) === remoteName);
       if (!tool) return undefined;
-      return { destructive: tool.annotations?.destructiveHint === true, openWorld: tool.annotations?.openWorldHint === true };
+      return {
+        readOnly: tool.annotations?.readOnlyHint === true,
+        destructive: tool.annotations?.destructiveHint === true,
+        idempotent: tool.annotations?.idempotentHint === true,
+        openWorld: tool.annotations?.openWorldHint === true,
+      };
     }
     return undefined;
   }
@@ -307,4 +378,20 @@ export class McpToolSource {
     }));
     this.#servers.clear();
   }
+}
+
+function compactAnnotations(
+  value: {
+    readOnlyHint?: boolean | undefined;
+    destructiveHint?: boolean | undefined;
+    idempotentHint?: boolean | undefined;
+    openWorldHint?: boolean | undefined;
+  },
+): NonNullable<McpCachedTool["annotations"]> {
+  return {
+    ...(value.readOnlyHint !== undefined ? { readOnlyHint: value.readOnlyHint } : {}),
+    ...(value.destructiveHint !== undefined ? { destructiveHint: value.destructiveHint } : {}),
+    ...(value.idempotentHint !== undefined ? { idempotentHint: value.idempotentHint } : {}),
+    ...(value.openWorldHint !== undefined ? { openWorldHint: value.openWorldHint } : {}),
+  };
 }

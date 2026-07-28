@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1085.0",
+    "@berry/local-agent": "workspace:*",
     "@berry/personal-memory": "workspace:*",
     "@berry/router-client": "workspace:*",
     "@berry/sandbox-contract": "workspace:*",

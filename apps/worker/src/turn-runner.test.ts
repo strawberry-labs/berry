@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type { TurnRunState } from "@berry/shared";
+import type { AgentStreamEvent, TurnRunState } from "@berry/shared";
+import {
+  OpenAIChatCompletionsClient,
+  type ChatCompletionChunk,
+  type ChatCompletionOptions,
+} from "@berry/router-client";
 import {
   DurableTurnRunner,
+  RouterDurableTurnModel,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -19,10 +25,10 @@ describe("durable turn runner", () => {
     const repository = new FakeTurnRepository(snapshot("queued", [admittedStep()]));
     let modelCalls = 0;
     const runner = new DurableTurnRunner(repository, {
-      call: async () => {
+      call: async (_snapshot, _step, context) => {
         modelCalls += 1;
+        await context.emitDelta("Done.", "text");
         return {
-          messageId: randomUUID(),
           text: "Done.",
           inputTokens: 2,
           outputTokens: 1,
@@ -49,9 +55,10 @@ describe("durable turn runner", () => {
     const repository = new FakeTurnRepository(state);
     let modelCalls = 0;
     const runner = new DurableTurnRunner(repository, {
-      call: async () => {
+      call: async (_snapshot, _step, context) => {
         modelCalls += 1;
-        return { messageId: randomUUID(), text: "Recovered.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        await context.emitDelta("Recovered.", "text");
+        return { text: "Recovered.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), { owner: "replacement-worker" });
 
@@ -135,9 +142,10 @@ describe("durable turn runner", () => {
     let compactions = 0;
     let modelCalls = 0;
     const runner = new DurableTurnRunner(repository, {
-      call: async () => {
+      call: async (_snapshot, _step, context) => {
         modelCalls += 1;
-        return { messageId: randomUUID(), text: "Continued.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        await context.emitDelta("Continued.", "text");
+        return { text: "Continued.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), {
       owner: "worker-compact",
@@ -157,10 +165,122 @@ describe("durable turn runner", () => {
     expect(compactions).toBe(1);
     expect(modelCalls).toBe(1);
   });
+
+  it("persists model deltas before the model call completes", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        await context.emitDelta("Hello", "text");
+        expect(repository.events.map((event) => event.kind)).toEqual([
+          "message.start",
+          "message.delta",
+        ]);
+        await context.emitDelta(" world", "text");
+        return { text: "Hello world", inputTokens: 2, outputTokens: 2, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-stream" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+
+    expect(repository.events.map((event) => event.kind)).toEqual([
+      "message.start",
+      "message.delta",
+      "message.delta",
+      "message.end",
+    ]);
+    expect(repository.events
+      .filter((event): event is Extract<AgentStreamEvent, { kind: "message.delta" }> => event.kind === "message.delta")
+      .map((event) => event.delta)
+      .join("")).toBe("Hello world");
+  });
+
+  it("uses the router streaming transport and assembles streamed tool calls", async () => {
+    let request: ChatCompletionOptions | undefined;
+    const client = {
+      stream: async function* (options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
+        request = options;
+        yield {
+          id: "completion-1",
+          model: "kimi-2.6",
+          delta: "Searching",
+          finishReason: null,
+          raw: {},
+        };
+        yield {
+          id: "completion-1",
+          model: "kimi-2.6",
+          delta: "",
+          toolCalls: [{
+            index: 0,
+            id: "call_1",
+            function: { name: "mcp__BerryCrawl__search", arguments: "{\"query\":" },
+          }],
+          finishReason: null,
+          raw: {},
+        };
+        yield {
+          id: "completion-1",
+          model: "kimi-2.6",
+          delta: "",
+          toolCalls: [{ index: 0, function: { arguments: "\"AI news\"}" } }],
+          finishReason: "tool_calls",
+          usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+          raw: {},
+        };
+      },
+    } as unknown as OpenAIChatCompletionsClient;
+    const model = new RouterDurableTurnModel(client, "kimi-2.6", {
+      provider: "router",
+      route: "/chat/completions",
+      capabilityForModel: () => ({
+        supported: false,
+        cacheKey: false,
+        cacheControl: false,
+        retention: [],
+        minimumTokens: 1_024,
+      }),
+    });
+    const deltas: string[] = [];
+    const result = await model.call(
+      snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]),
+      modelStep("pending", 1),
+      {
+        messageId: randomUUID(),
+        tools: [{
+          type: "function",
+          function: {
+            name: "mcp__BerryCrawl__search",
+            description: "Search the web",
+            parameters: { type: "object" },
+          },
+        }],
+        emitDelta: async (delta) => { deltas.push(delta); },
+        policyForTool: () => ({
+          retryClass: "read_only",
+          requiresApproval: false,
+          approvalKind: "mcp",
+        }),
+      },
+    );
+
+    expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
+    expect(deltas.join("")).toBe("Searching");
+    expect(result).toMatchObject({
+      text: "Searching",
+      inputTokens: 10,
+      outputTokens: 4,
+      toolCalls: [{
+        name: "mcp__BerryCrawl__search",
+        input: { query: "AI news" },
+        retryClass: "read_only",
+        requiresApproval: false,
+      }],
+    });
+  });
 });
 
 class FakeTurnRepository implements DurableTurnRepository {
-  events: Array<{ kind: string }> = [];
+  events: AgentStreamEvent[] = [];
   outbox: Array<{ eventType: string; dedupeKey: string }> = [];
 
   constructor(public current: MutableSnapshot) {}
@@ -176,6 +296,10 @@ class FakeTurnRepository implements DurableTurnRepository {
 
   async heartbeat(): Promise<boolean> {
     return true;
+  }
+
+  async appendEvents(_snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void> {
+    this.events.push(...events);
   }
 
   async commit(snapshotValue: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void> {

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Test } from "@nestjs/testing";
-import { ApiEventStreamService } from "./event-stream.service.ts";
+import { ApiEventStreamService, DURABLE_EVENT_POLL_MS } from "./event-stream.service.ts";
 import { DurableTurnService } from "../runtime/durable-turn.service.ts";
 
 afterEach(() => vi.useRealTimers());
@@ -100,7 +100,7 @@ describe("ApiEventStreamService", () => {
     );
     const subscription = stream.subscribe((event) => received.push(event));
 
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(DURABLE_EVENT_POLL_MS);
 
     expect(received.map((event) => event.id)).toEqual([
       `${runId}:1`,

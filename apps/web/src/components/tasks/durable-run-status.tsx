@@ -1,6 +1,6 @@
 import * as React from "react";
 import type { TurnState } from "@berry/shared";
-import { AlertTriangle, CheckCircle2, Clock3, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock3, RotateCcw, Square } from "lucide-react";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 
 export type RunPresentation = {
@@ -13,7 +13,6 @@ export type RunPresentation = {
 
 export function runPresentation(
   state: TurnState | null | undefined,
-  connection: "online" | "offline" | "reconnecting",
 ): RunPresentation {
   if (!state?.turnId) return { visible: false, label: "", detail: "", tone: "neutral", recoveryActions: [] };
   if (state.runState === "recovery_required") {
@@ -26,12 +25,6 @@ export function runPresentation(
     };
   }
   if (!state.active) return { visible: false, label: "", detail: "", tone: "neutral", recoveryActions: [] };
-  if (connection === "offline") {
-    return { visible: true, label: "Offline", detail: "The run remains durable. Berry will reconnect when the network returns.", tone: "warning", recoveryActions: [] };
-  }
-  if (connection === "reconnecting") {
-    return { visible: true, label: "Reconnecting", detail: "Replaying any events missed while the stream was unavailable.", tone: "warning", recoveryActions: [] };
-  }
   if (state.runState === "waiting") {
     const userInput = state.waitingReason === "user_input";
     return {
@@ -42,34 +35,20 @@ export function runPresentation(
       recoveryActions: [],
     };
   }
-  if (state.runState === "queued") {
-    return { visible: true, label: "Queued", detail: state.nextAction ?? "Waiting for a worker slot.", tone: "neutral", recoveryActions: [] };
-  }
-  if (!state.owner && state.runState !== "assembling_context") {
-    return { visible: true, label: "Recovering", detail: "The durable run is waiting for another worker to reclaim its next safe step.", tone: "warning", recoveryActions: [] };
-  }
-  return {
-    visible: true,
-    label: state.runState === "compacting" ? "Compacting context" : "Running",
-    detail: state.nextAction ?? "Berry is advancing the durable run.",
-    tone: "neutral",
-    recoveryActions: [],
-  };
+  return { visible: false, label: "", detail: "", tone: "neutral", recoveryActions: [] };
 }
 
 export function DurableRunStatus({
   state,
-  connection,
   onRecover,
 }: {
   state: TurnState | null | undefined;
-  connection: "online" | "offline" | "reconnecting";
   onRecover: (action: "retry" | "mark-complete" | "cancel") => Promise<void>;
 }) {
-  const view = runPresentation(state, connection);
+  const view = runPresentation(state);
   const [pending, setPending] = React.useState<string | null>(null);
   if (!view.visible) return null;
-  const Icon = view.tone === "danger" ? AlertTriangle : view.tone === "warning" ? Clock3 : state?.runState === "completed" ? CheckCircle2 : RefreshCw;
+  const Icon = view.tone === "danger" ? AlertTriangle : Clock3;
   const recover = async (action: "retry" | "mark-complete" | "cancel") => {
     setPending(action);
     try {

@@ -1870,7 +1870,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             />
             <DurableRunStatus
               state={durableState}
-              connection={connectionState}
               onRecover={async (action) => {
                 try {
                   await recoverDurableTurn(action);
@@ -2056,7 +2055,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           />
         </React.Suspense>
       ) : null}
-      {connectionState !== "online" ? <div className="fixed bottom-3 right-3 z-[80] rounded-full bg-popover px-3 py-1.5 text-xs text-popover-foreground shadow-lg" role="status">{connectionState === "offline" ? "Offline" : "Reconnecting…"}</div> : null}
+      {connectionState === "offline" ? <div className="fixed bottom-3 right-3 z-[80] rounded-full bg-popover px-3 py-1.5 text-xs text-popover-foreground shadow-lg" role="status">Offline</div> : null}
     </div>
   );
 }

@@ -738,6 +738,15 @@ export class AgentApiController {
             maxTokens: governedRequest.maxTokens ?? 8_000,
             contextWindowTokens,
             networkPolicy: governedRequest.networkPolicy,
+            mcpServerIds: governedRequest.mcpServers
+              .filter((server) => server.enabled && server.trusted)
+              .map((server) => server.id),
+            extraSkills: governedRequest.extraSkills.map((skill) => ({
+              name: skill.name,
+              description: skill.description,
+              content: skill.content,
+              disableModelInvocation: skill.disableModelInvocation,
+            })),
             attachments: (request.attachments ?? []).map((attachment) => ({
               id: attachment.id,
               fileId: attachment.fileId,

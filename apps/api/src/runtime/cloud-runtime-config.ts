@@ -1,5 +1,11 @@
 import { BadGatewayException, Injectable, ServiceUnavailableException } from "@nestjs/common";
-import type { AgentSkill, BerryModelProviderInfo, McpServerSpec, StartTurnOptions } from "@berry/local-agent";
+import {
+  mcpServerSpecsFromJson,
+  type AgentSkill,
+  type BerryModelProviderInfo,
+  type McpServerSpec,
+  type StartTurnOptions,
+} from "@berry/local-agent";
 import {
   NetworkPolicySchema,
   ProviderCapabilitiesSchema,
@@ -24,32 +30,6 @@ const RequestProviderSchema = z.object({
   capabilities: ProviderCapabilitiesSchema.optional(),
   models: z.array(RemoteModelSchema).optional(),
 }).passthrough();
-
-const CloudMcpServerSchema = z.object({
-  id: z.string().min(1),
-  name: z.string().min(1),
-  transport: z.enum(["stdio", "http-sse", "streamable-http"]),
-  command: z.string().nullable().default(null),
-  args: z.array(z.string()).default([]),
-  url: z.string().url().nullable().default(null),
-  env: z.record(z.string()).default({}),
-  enabled: z.boolean().default(true),
-  trusted: z.boolean().default(true),
-  credential: z.string().nullable().optional(),
-  credentialEnv: z.string().min(1).optional(),
-  credentialKey: z.string().nullable().optional(),
-  cachedTools: z.array(z.object({
-    name: z.string(),
-    description: z.string().nullable().default(null),
-    inputSchema: z.record(z.unknown()),
-    annotations: z.object({
-      readOnlyHint: z.boolean().optional(),
-      destructiveHint: z.boolean().optional(),
-      idempotentHint: z.boolean().optional(),
-      openWorldHint: z.boolean().optional(),
-    }).optional(),
-  })).optional(),
-});
 
 const CloudSkillSchema = z.object({
   name: z.string().trim().min(1).max(64),
@@ -318,7 +298,7 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
         models,
       }
     : null;
-  const mcpServers = parseMcpServers(env.BERRY_CLOUD_MCP_SERVERS_JSON, env);
+  const mcpServers = mcpServerSpecsFromJson(env.BERRY_CLOUD_MCP_SERVERS_JSON, env);
   const allowedDomains = csv(env.BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS);
   const egress = env.BERRY_CLOUD_NETWORK_EGRESS?.trim() || (live ? "on" : "off");
   const networkPolicy = live || mcpServers.length > 0
@@ -366,42 +346,6 @@ function positiveInteger(value: string | undefined): number | undefined {
 function parseModels(raw: string | undefined): RemoteModel[] {
   if (!raw?.trim()) return [];
   return z.array(RemoteModelSchema).parse(JSON.parse(raw));
-}
-
-function parseMcpServers(raw: string | undefined, env: NodeJS.ProcessEnv): McpServerSpec[] {
-  if (!raw?.trim()) return [];
-  return z.array(CloudMcpServerSchema).parse(JSON.parse(raw)).map((server) => {
-    const credential = server.credentialEnv ? first(env[server.credentialEnv]) : server.credential ?? undefined;
-    const result: McpServerSpec = {
-      id: server.id,
-      name: server.name,
-      transport: server.transport,
-      command: server.command,
-      args: server.args,
-      url: server.url,
-      env: server.env,
-      enabled: server.enabled,
-      trusted: server.trusted,
-      credentialKey: server.credentialKey ?? null,
-      ...(server.cachedTools ? { cachedTools: server.cachedTools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        ...(tool.annotations ? { annotations: compactAnnotations(tool.annotations) } : {}),
-      })) } : {}),
-      ...(credential ? { credential } : {}),
-    };
-    return result;
-  });
-}
-
-function compactAnnotations(value: { readOnlyHint?: boolean | undefined; destructiveHint?: boolean | undefined; idempotentHint?: boolean | undefined; openWorldHint?: boolean | undefined }) {
-  return {
-    ...(value.readOnlyHint !== undefined ? { readOnlyHint: value.readOnlyHint } : {}),
-    ...(value.destructiveHint !== undefined ? { destructiveHint: value.destructiveHint } : {}),
-    ...(value.idempotentHint !== undefined ? { idempotentHint: value.idempotentHint } : {}),
-    ...(value.openWorldHint !== undefined ? { openWorldHint: value.openWorldHint } : {}),
-  };
 }
 
 function parseSkills(raw: string | undefined): AgentSkill[] {

@@ -92,8 +92,12 @@ for file in $changed_files; do
     apps/web/*|packages/api-client/*|packages/desktop-ui/*|packages/thread-ui/*|scripts/prepare-web-build.mjs|scripts/verify-web-build-assets.mjs)
       add_service web
       ;;
-    apps/api/*|packages/db/*|packages/desktop-db/*|packages/local-agent/*|packages/execpolicy/*|packages/harness/*|packages/router-client/*|packages/sandbox-contract/*)
+    apps/api/*|packages/db/*)
       add_service api
+      ;;
+    packages/desktop-db/*|packages/local-agent/*|packages/execpolicy/*|packages/harness/*|packages/router-client/*|packages/sandbox-contract/*)
+      add_service api
+      add_service worker
       ;;
     apps/worker/*)
       add_service worker

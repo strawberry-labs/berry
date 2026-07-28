@@ -16,3 +16,4 @@ export * from "./memory/repository.js";
 export * from "./turn-runner.js";
 export * from "./sandbox-continuity.js";
 export * from "./maintenance.js";
+export * from "./mcp-tools.js";

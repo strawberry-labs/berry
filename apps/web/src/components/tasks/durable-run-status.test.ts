@@ -24,20 +24,22 @@ describe("runPresentation", () => {
       owner: null,
       runState: "recovery_required",
       error: "The tool result is ambiguous.",
-    }), "online");
+    }));
 
     expect(view.label).toBe("Recovery required");
     expect(view.recoveryActions).toEqual(["retry", "mark-complete", "cancel"]);
   });
 
-  it("explains durable reconnect and waiting states without recovery controls", () => {
-    expect(runPresentation(state({}), "reconnecting")).toMatchObject({
-      label: "Reconnecting",
-      recoveryActions: [],
-    });
-    expect(runPresentation(state({ runState: "waiting", waitingReason: "user_input" }), "online")).toMatchObject({
+  it("shows waiting states that require user action", () => {
+    expect(runPresentation(state({ runState: "waiting", waitingReason: "user_input" }))).toMatchObject({
       label: "Waiting for your answer",
       recoveryActions: [],
     });
+  });
+
+  it("hides internal queue, worker, compaction, and reconnect progress", () => {
+    for (const runState of ["queued", "assembling_context", "calling_model", "executing_tool", "compacting"] as const) {
+      expect(runPresentation(state({ runState })).visible).toBe(false);
+    }
   });
 });

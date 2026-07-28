@@ -1,7 +1,12 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { McpToolSource, validatedRemoteMcpUrl, type McpServerSpec } from "./mcp.ts";
+import {
+  McpToolSource,
+  mcpServerSpecsFromJson,
+  validatedRemoteMcpUrl,
+  type McpServerSpec,
+} from "./mcp.ts";
 
 const fixturePath = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "mcp-echo-server.mjs");
 
@@ -123,5 +128,30 @@ describe("McpToolSource", () => {
       servers: [stdioServer({ id: "mcp_http", transport: "streamable-http", command: null, args: [], url: "https://mcp.example.com/mcp" })],
     });
     expect(source.listTools()).toEqual([]);
+  });
+
+  it("resolves deploy credentials locally and preserves MCP safety annotations", () => {
+    const servers = mcpServerSpecsFromJson(JSON.stringify([{
+      id: "berrycrawl",
+      name: "BerryCrawl",
+      transport: "streamable-http",
+      url: "https://crawl.example.com/mcp",
+      credentialEnv: "BERRYCRAWL_API_KEY",
+      cachedTools: [{
+        name: "search",
+        description: "Search the web",
+        inputSchema: { type: "object" },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+      }],
+    }]), { BERRYCRAWL_API_KEY: "secret-from-worker" });
+    const source = new McpToolSource({ servers });
+
+    expect(servers[0]).toMatchObject({ credential: "secret-from-worker" });
+    expect(source.approvalHints("mcp__BerryCrawl__search")).toEqual({
+      readOnly: true,
+      destructive: false,
+      idempotent: false,
+      openWorld: true,
+    });
   });
 });

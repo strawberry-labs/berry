@@ -3,6 +3,8 @@ import { AgentStreamEventSchema, HostPushEventSchema, type AgentStreamEvent, typ
 import { Observable, Subject } from "rxjs";
 import { DurableTurnService } from "../runtime/durable-turn.service.js";
 
+export const DURABLE_EVENT_POLL_MS = 150;
+
 @Injectable()
 export class ApiEventStreamService {
   readonly #subjects = new Map<string, Subject<MessageEvent<AgentStreamEvent>>>();
@@ -67,7 +69,7 @@ export class ApiEventStreamService {
           polling = false;
         }
       };
-      const timer = setInterval(() => void poll(), 500);
+      const timer = setInterval(() => void poll(), DURABLE_EVENT_POLL_MS);
       timer.unref?.();
       return () => {
         closed = true;

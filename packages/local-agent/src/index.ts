@@ -11,7 +11,14 @@ export {
   type ToolGuardRequest,
   type ToolRisk,
 } from "./guard.ts";
-export { McpToolSource, validatedRemoteMcpUrl, type McpServerHealth, type McpServerSpec, type McpToolSourceOptions } from "./mcp.ts";
+export {
+  McpToolSource,
+  mcpServerSpecsFromJson,
+  validatedRemoteMcpUrl,
+  type McpServerHealth,
+  type McpServerSpec,
+  type McpToolSourceOptions,
+} from "./mcp.ts";
 export { HookRunner, loadHookConfiguration, parseHookConfig, type HookPayload, type LoadedHooks } from "./hooks.ts";
 export { SandboxEnforcer, assertShellWritePolicy, resolveSandboxHelper, seatbeltProfile, type SandboxEnforcerOptions } from "./sandbox.ts";
 export {

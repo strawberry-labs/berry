@@ -29,6 +29,7 @@ import {
   SqlSandboxSnapshotRepository,
 } from "./sandbox-continuity.ts";
 import { SqlMaintenanceRunner } from "./maintenance.ts";
+import { createDurableTurnToolsFromEnv } from "./mcp-tools.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const durableConfig = durableContextConfigFromEnv(env);
@@ -73,6 +74,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       fallbackModel: env.BERRY_COMPACTION_MODEL ?? "checkpoint-v2",
     },
   );
+  const durableTools = createDurableTurnToolsFromEnv(env, sandboxContinuity);
   const worker = createBerryWorker({
     titles: new SqlTaskTitleRepository(executor),
     usage: new SqlUsageRollupRepository(executor),
@@ -87,7 +89,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     turnRunner: new DurableTurnRunner(
       new SqlDurableTurnRepository(executor),
       createDurableTurnModel(env),
-      sandboxContinuity,
+      durableTools,
       {
         owner: `${hostname()}:${process.pid}:${randomUUID()}:turn`,
         leaseSeconds: durableConfig.runLeaseSeconds,
@@ -102,6 +104,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const outbox = new RuntimeOutboxDispatcher(executor, queue, {
     tenantId: env.BERRY_TENANT_ID ?? "00000000-0000-7000-8000-000000000001",
     workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
+    pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 250,
   });
   outbox.start();
 
@@ -109,6 +112,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     await outbox.stop();
     await queue.close();
     await worker.close();
+    await durableTools.close();
     await executor.close();
   };
   process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
@@ -124,6 +128,12 @@ function knowledgeObjectStore(env: NodeJS.ProcessEnv): KnowledgeObjectStore {
     };
     return { read: fail, write: fail };
   }
+}
+
+function positiveInteger(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
