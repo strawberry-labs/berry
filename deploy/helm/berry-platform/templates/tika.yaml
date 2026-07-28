@@ -1,0 +1,54 @@
+{{- if .Values.tika.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "berry-platform.name" . }}-tika
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tika
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "berry-platform.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: tika
+  template:
+    metadata:
+      labels:
+        {{- include "berry-platform.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: tika
+    spec:
+      containers:
+        - name: tika
+          image: {{ .Values.tika.image | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.tika.port }}
+          readinessProbe:
+            httpGet:
+              path: /version
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /version
+              port: http
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "berry-platform.name" . }}-tika
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tika
+spec:
+  selector:
+    {{- include "berry-platform.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: tika
+  ports:
+    - name: http
+      port: {{ .Values.tika.port }}
+      targetPort: http
+{{- end }}

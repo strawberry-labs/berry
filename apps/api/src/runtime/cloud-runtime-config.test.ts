@@ -64,6 +64,26 @@ describe("cloud runtime configuration", () => {
     expect(config.provider?.completionFallback).toBeUndefined();
   });
 
+  it("removes declared cache controls from the inline rollback path when disabled", () => {
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "model-a",
+      BERRY_PROMPT_CACHE_ENABLED: "false",
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
+        id: "model-a",
+        capabilities: {
+          promptCaching: {
+            supported: true,
+            cacheKey: true,
+            retention: ["long"],
+          },
+        },
+      }]),
+    });
+
+    expect(service.resolve({}).provider.models?.[0]?.capabilities?.promptCaching).toBeUndefined();
+  });
+
   it("rejects an unknown completion transport", () => {
     expect(() => createCloudRuntimeConfigFromEnv({
       BERRY_ROUTER_COMPLETION_TRANSPORT: "instant",

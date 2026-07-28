@@ -17,6 +17,7 @@ export {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	estimateTokens,
+	ensurePortableCompactionResult,
 	findCutPoint,
 	findTurnStartIndex,
 	generateSummary,
@@ -25,10 +26,12 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
+export * from "./harness/compaction/checkpoint.ts";
 export * from "./harness/messages.ts";
 export * from "./harness/prompt-templates.ts";
 export * from "./harness/session/jsonl-repo.ts";
 export * from "./harness/session/memory-repo.ts";
+export * from "./harness/session/postgres-storage.ts";
 export * from "./harness/session/repo-utils.ts";
 export * from "./harness/session/session.ts";
 export { uuidv7 } from "./harness/session/uuid.ts";

@@ -15,6 +15,8 @@ export interface UsageEventRecord {
   tokensIn: number;
   tokensOut: number;
   tokensCached: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   costRawMicros: string | number | bigint;
   costBilledMicros: string | number | bigint;
   latencyMs: number | null;
@@ -40,6 +42,8 @@ export interface UsageRollupRecord {
   tokensIn: number;
   tokensOut: number;
   tokensCached: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   costRawMicros: string;
   costBilledMicros: string;
   latencyMsTotal: number;
@@ -107,6 +111,8 @@ export function aggregateDailyUsage(events: UsageEventRecord[]): UsageRollupReco
         tokensIn: event.tokensIn,
         tokensOut: event.tokensOut,
         tokensCached: event.tokensCached,
+        cacheReadTokens: event.cacheReadTokens ?? event.tokensCached,
+        cacheWriteTokens: event.cacheWriteTokens ?? 0,
         costRawMicros: microsToString(event.costRawMicros),
         costBilledMicros: microsToString(event.costBilledMicros),
         latencyMsTotal: event.latencyMs ?? 0,
@@ -123,6 +129,8 @@ export function aggregateDailyUsage(events: UsageEventRecord[]): UsageRollupReco
     current.tokensIn += event.tokensIn;
     current.tokensOut += event.tokensOut;
     current.tokensCached += event.tokensCached;
+    current.cacheReadTokens = (current.cacheReadTokens ?? 0) + (event.cacheReadTokens ?? event.tokensCached);
+    current.cacheWriteTokens = (current.cacheWriteTokens ?? 0) + (event.cacheWriteTokens ?? 0);
     current.costRawMicros = (BigInt(current.costRawMicros) + toBigIntMicros(event.costRawMicros)).toString();
     current.costBilledMicros = (BigInt(current.costBilledMicros) + toBigIntMicros(event.costBilledMicros)).toString();
     if (event.latencyMs !== null) {

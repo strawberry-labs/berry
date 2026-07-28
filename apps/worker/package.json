@@ -8,12 +8,17 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
+    "maintenance": "node dist/maintenance-cli.js",
     "lint": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest --run"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1085.0",
+    "@berry/router-client": "workspace:*",
+    "@berry/sandbox-contract": "workspace:*",
     "@berry/shared": "workspace:*",
+    "@langchain/textsplitters": "1.0.1",
     "bullmq": "^5.65.1",
     "pg": "8.16.3",
     "zod": "^3.25.76"

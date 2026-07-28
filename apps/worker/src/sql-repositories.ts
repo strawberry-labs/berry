@@ -33,6 +33,7 @@ export class SqlUsageRollupRepository implements UsageRollupRepository {
       `
 SELECT tenant_id, user_id, department_id, workspace_id, agent_id, sandbox_id,
        feature, provider, model, status, tokens_in, tokens_out, tokens_cached,
+       cache_read_tokens, cache_write_tokens,
        cost_raw_micros, cost_billed_micros, latency_ms, ttft_ms, ts
 FROM usage_events
 WHERE tenant_id = $1::uuid AND ts >= $2 AND ts < $3
@@ -54,6 +55,8 @@ ORDER BY ts ASC
       tokensIn: row.tokens_in,
       tokensOut: row.tokens_out,
       tokensCached: row.tokens_cached,
+      cacheReadTokens: row.cache_read_tokens ?? row.tokens_cached,
+      cacheWriteTokens: row.cache_write_tokens ?? 0,
       costRawMicros: row.cost_raw_micros,
       costBilledMicros: row.cost_billed_micros,
       latencyMs: row.latency_ms,
@@ -70,15 +73,16 @@ ORDER BY ts ASC
 INSERT INTO usage_rollups (
   tenant_id, bucket_start, bucket_end, granularity, feature, provider, model, status,
   user_id, department_id, workspace_id, agent_id, sandbox_id,
-  request_count, tokens_in, tokens_out, tokens_cached, cost_raw_micros, cost_billed_micros,
+  request_count, tokens_in, tokens_out, tokens_cached, cache_read_tokens, cache_write_tokens,
+  cost_raw_micros, cost_billed_micros,
   latency_ms_total, latency_ms_count, ttft_ms_total, ttft_ms_count,
   source_event_min_ts, source_event_max_ts, metadata, updated_at
 ) VALUES (
   $1::uuid, $2, $3, $4, $5, $6, $7, $8,
   $9::uuid, $10::uuid, $11::uuid, $12, $13,
-  $14, $15, $16, $17, $18, $19,
-  $20, $21, $22, $23,
-  $24, $25, $26::jsonb, now()
+  $14, $15, $16, $17, $18, $19, $20, $21,
+  $22, $23, $24, $25,
+  $26, $27, $28::jsonb, now()
 )
 ON CONFLICT (tenant_id, bucket_start, granularity, feature, provider, model, status, user_id, department_id, workspace_id, agent_id, sandbox_id)
 DO UPDATE SET
@@ -87,6 +91,8 @@ DO UPDATE SET
   tokens_in = excluded.tokens_in,
   tokens_out = excluded.tokens_out,
   tokens_cached = excluded.tokens_cached,
+  cache_read_tokens = excluded.cache_read_tokens,
+  cache_write_tokens = excluded.cache_write_tokens,
   cost_raw_micros = excluded.cost_raw_micros,
   cost_billed_micros = excluded.cost_billed_micros,
   latency_ms_total = excluded.latency_ms_total,
@@ -116,6 +122,8 @@ DO UPDATE SET
             rollup.tokensIn,
             rollup.tokensOut,
             rollup.tokensCached,
+            rollup.cacheReadTokens ?? rollup.tokensCached,
+            rollup.cacheWriteTokens ?? 0,
             rollup.costRawMicros,
             rollup.costBilledMicros,
             rollup.latencyMsTotal,
@@ -161,6 +169,8 @@ interface UsageEventRow {
   tokens_in: number;
   tokens_out: number;
   tokens_cached: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_raw_micros: string;
   cost_billed_micros: string;
   latency_ms: number | null;

@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Inject, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Headers, Inject, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import {
@@ -14,6 +14,7 @@ import {
   MobileDeviceRegistrationCreateSchema,
   PermissionModeSchema,
   QuestionAnswerSchema,
+  resolveModelCapabilities,
   TaskStatusSchema,
   TurnStateSchema,
   WorkspaceKindSchema,
@@ -39,6 +40,10 @@ import { AUDIT_SERVICE, type AuditService } from "../audit/audit.service.ts";
 import { SANDBOX_WORKSPACE_SERVICE, SandboxWorkspaceService } from "./sandbox-workspace.service.ts";
 import { ORGANIZATION_CAPABILITIES, OrganizationCapabilitiesService } from "./organization-capabilities.service.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
+import { KnowledgeService } from "../knowledge/knowledge.service.ts";
+import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
+import { MemoryService } from "../memory/memory.service.ts";
+import { DurableTurnService } from "../runtime/durable-turn.service.ts";
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -158,6 +163,9 @@ const AnswerQuestionRequestSchema = z.object({
   selectedOptions: z.array(z.string()).max(24).optional(),
   answers: z.array(QuestionAnswerSchema).min(1).max(5).optional(),
 }).strict();
+const RecoveryActionSchema = z.object({
+  action: z.enum(["retry", "mark-complete", "cancel"]),
+}).strict();
 
 const WorkspaceFileRequestSchema = z.object({ path: z.string().trim().min(1).max(4_096), content: z.string().max(1_048_576) }).strict();
 const TerminalCreateRequestSchema = z.object({ cols: z.number().int().min(20).max(500).default(80), rows: z.number().int().min(5).max(200).default(24) }).strict();
@@ -185,6 +193,10 @@ export class AgentApiController {
     @Inject(AUDIT_SERVICE) private readonly audit: AuditService,
     @Inject(ORGANIZATION_CAPABILITIES) private readonly organizationCapabilities: OrganizationCapabilitiesService,
     @Inject(FilePlatformService) private readonly files: FilePlatformService,
+    @Inject(KnowledgeService) private readonly knowledge: KnowledgeService,
+    @Inject(MemoryService) private readonly memory: MemoryService,
+    @Inject(ContextAssemblyService) private readonly contextAssembly: ContextAssemblyService,
+    @Inject(DurableTurnService) private readonly durableTurns: DurableTurnService,
   ) {}
 
   #queueProjectionWrite(sessionId: string, write: () => Promise<unknown>): void {
@@ -319,6 +331,25 @@ export class AgentApiController {
     });
     return Promise.all(tasks.map(async (task) => {
       if (task.status !== "running" || !task.activeSessionId) return task;
+      if (this.durableTurns.enabled) {
+        const durableState = await this.durableTurns.state(
+          tenantIdFromRequest(httpRequest),
+          task.activeSessionId,
+        );
+        if (durableState.active) return task;
+        const durableTerminal = [...durableState.bufferedEvents].reverse()
+          .find((event) => event.kind === "turn.end");
+        if (durableTerminal?.kind === "turn.end") {
+          return this.store.updateTask(
+            task.id,
+            { status: durableTerminal.status },
+            httpRequest.auth?.user.id ?? null,
+          );
+        }
+        // A missing/expired API process is not evidence that a durable worker
+        // run is dead. Leave reconciliation to the persisted run lease/state.
+        return task;
+      }
       const state = this.sessionHost.turnState(task.activeSessionId);
       if (state.active) return task;
       const terminal = [...state.bufferedEvents].reverse().find((event) => event.kind === "turn.end");
@@ -542,6 +573,18 @@ export class AgentApiController {
         decision: modelDecision,
       });
     }
+    const [groundingContext, portableCheckpoint] = await Promise.all([
+      this.contextAssembly.assemble({
+        tenantId,
+        userId: httpRequest.auth!.user.id,
+        workspaceId: request.workspaceId ?? task.workspaceId,
+        taskId: task.id,
+        sessionId,
+        request: request.input ?? task.title,
+        taskTitle: task.title,
+      }),
+      this.contextAssembly.portableCheckpoint(tenantId, sessionId),
+    ]);
     let runtimeImageAttachments: RuntimeImageReference[] = [];
     const governedRequest = {
       ...request,
@@ -553,6 +596,54 @@ export class AgentApiController {
       networkPolicy: resolvedRuntime.networkPolicy,
       maxTokens: resolvedRuntime.providerMaxOutputTokens,
       projectTrusted: true,
+      groundingContext,
+      ...(portableCheckpoint ? { portableCheckpoint } : {}),
+      memory: {
+        remember: async (input: {
+          scope: "personal" | "project";
+          kind: string;
+          stableKey?: string;
+          content: string;
+          value?: Record<string, unknown>;
+          expiresAt?: string | null;
+        }) => {
+          const result = await this.memory.remember({
+            tenantId,
+            userId: httpRequest.auth!.user.id,
+            scope: input.scope,
+            ...(input.scope === "project" ? { workspaceId: request.workspaceId ?? task.workspaceId } : {}),
+            kind: input.kind,
+            ...(input.stableKey ? { stableKey: input.stableKey } : {}),
+            content: input.content,
+            ...(input.value ? { value: input.value } : {}),
+            ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+            source: { taskId: task.id, sessionId },
+          });
+          return {
+            operation: result.operation,
+            reason: result.reason,
+            memoryId: result.item?.id ?? null,
+          };
+        },
+        forget: async (input: {
+          memoryId?: string;
+          stableKey?: string;
+          scope?: "personal" | "project";
+        }) => {
+          const forgotten = input.memoryId
+            ? await this.memory.forget(tenantId, httpRequest.auth!.user.id, input.memoryId)
+            : input.stableKey
+              ? await this.memory.forgetMatching({
+                  tenantId,
+                  userId: httpRequest.auth!.user.id,
+                  scope: input.scope ?? "personal",
+                  ...(input.scope === "project" ? { workspaceId: request.workspaceId ?? task.workspaceId } : {}),
+                  stableKey: input.stableKey,
+                })
+              : null;
+          return { forgotten: Boolean(forgotten), memoryId: forgotten?.id ?? null };
+        },
+      },
       ...(this.runtimeConfig.imageGenerationInfo() ? {
         imageGeneration: {
           generate: async ({ prompt, size, aspectRatio, transparentBackground, referenceImagePaths, referencedImageIds, onPartial }: {
@@ -585,6 +676,9 @@ export class AgentApiController {
         },
       } : {}),
     };
+    const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedRequest.model);
+    const contextWindowTokens = resolveModelCapabilities(governedModel).context?.windowTokens
+      ?? 200_000;
     const reservation = await this.budgets.reserve({
       tenantId,
       requestId,
@@ -601,10 +695,66 @@ export class AgentApiController {
     });
     let actualCostMicros = reservation.reservation ? BigInt(reservation.reservation.reservedMicros) : 0n;
     const startedAt = Date.now();
-    let usage: { inputTokens?: number; outputTokens?: number; provider?: string | null; model?: string | null } | undefined;
+    let usage: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      cacheCreationTokens1h: number;
+      cacheCreationTokens5m: number;
+      cacheEligible: boolean;
+      cacheProvider: string | null;
+      cacheKeyHash: string | null;
+      promptManifestHash: string | null;
+      promptManifest: JsonValue | null;
+      promptManifests: JsonValue[];
+      cacheMissReason: string | null;
+      cacheMissComponentId: string | null;
+      provider: string | null;
+      model: string | null;
+    } | undefined;
     let assistantErrorPersisted = false;
     if (request.replaceFromMessageId) {
       await this.rewindForEdit(sessionId, request.replaceFromMessageId, request.input ?? "", request.attachments);
+    }
+    if (this.durableTurns.enabled) {
+      try {
+        const admitted = await this.durableTurns.admit({
+          tenantId,
+          userId: httpRequest.auth!.user.id,
+          workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+          taskId: task.id,
+          sessionId,
+          requestId,
+          input: request.continueInterruptedTurn ? "" : request.input ?? "",
+          ...(request.attachments ? { attachments: request.attachments } : {}),
+          runtimeRequest: {
+            providerId,
+            model: governedRequest.model ?? null,
+            workspacePath: request.workspacePath,
+            workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+            permissionMode: governedRequest.permissionMode ?? session.permissionMode,
+            reasoning: governedRequest.reasoning ?? "off",
+            maxTokens: governedRequest.maxTokens ?? 8_000,
+            contextWindowTokens,
+            networkPolicy: governedRequest.networkPolicy,
+            attachments: (request.attachments ?? []).map((attachment) => ({
+              id: attachment.id,
+              fileId: attachment.fileId,
+              name: attachment.name,
+              mediaType: attachment.mediaType,
+              size: attachment.size,
+              sourceKind: attachment.sourceKind,
+            })),
+            ...(portableCheckpoint ? { portableCheckpoint } : {}),
+          },
+          groundingContext: groundingContext as unknown as JsonValue,
+        });
+        return { turnId: admitted.runId, sessionId };
+      } catch (error) {
+        await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
+        throw error;
+      }
     }
     try {
       await this.store.updateTask(task.id, { status: "running" });
@@ -613,6 +763,7 @@ export class AgentApiController {
       let activeTurnId: string | undefined;
       const { turnId } = this.sessionHost.startTurn({
         ...governedRequest,
+        tenantId,
         input: request.continueInterruptedTurn ? "" : request.input ?? "",
         sessionId,
         taskId: task.id,
@@ -756,15 +907,53 @@ export class AgentApiController {
           if (parsed.kind === "usage") {
             actualCostMicros = usageCostMicros(parsed, actualCostMicros, governedRequest.provider);
             usage = {
-              inputTokens: parsed.inputTokens,
-              outputTokens: parsed.outputTokens,
-              provider: parsed.servedProvider ?? providerId,
-              model: parsed.servedModel ?? parsed.model ?? governedRequest.model ?? null,
+              inputTokens: (usage?.inputTokens ?? 0) + parsed.inputTokens,
+              outputTokens: (usage?.outputTokens ?? 0) + parsed.outputTokens,
+              cacheReadTokens: (usage?.cacheReadTokens ?? 0) + (parsed.cacheReadTokens ?? 0),
+              cacheWriteTokens: (usage?.cacheWriteTokens ?? 0) + (parsed.cacheWriteTokens ?? 0),
+              cacheCreationTokens1h: (usage?.cacheCreationTokens1h ?? 0) + (parsed.cacheCreationTokens1h ?? 0),
+              cacheCreationTokens5m: (usage?.cacheCreationTokens5m ?? 0) + (parsed.cacheCreationTokens5m ?? 0),
+              cacheEligible: (usage?.cacheEligible ?? false) || (parsed.cacheEligible ?? false),
+              cacheProvider: parsed.cacheProvider ?? usage?.cacheProvider ?? null,
+              cacheKeyHash: parsed.cacheKeyHash ?? usage?.cacheKeyHash ?? null,
+              promptManifestHash: parsed.promptManifestHash ?? usage?.promptManifestHash ?? null,
+              promptManifest: (parsed.promptManifest as unknown as JsonValue | undefined) ?? usage?.promptManifest ?? null,
+              promptManifests: [
+                ...(usage?.promptManifests ?? []),
+                ...(parsed.promptManifest ? [parsed.promptManifest as unknown as JsonValue] : []),
+              ].slice(-64),
+              cacheMissReason: parsed.cacheReadTokens && parsed.cacheReadTokens > 0
+                ? null
+                : parsed.cacheMissReason ?? usage?.cacheMissReason ?? null,
+              cacheMissComponentId: parsed.cacheMissComponentId ?? usage?.cacheMissComponentId ?? null,
+              provider: parsed.servedProvider ?? usage?.provider ?? providerId,
+              model: parsed.servedModel ?? parsed.model ?? usage?.model ?? governedRequest.model ?? null,
             };
           }
           this.events.publish(sessionId, parsed);
           if (parsed.kind === "turn.end") {
-            this.#queueProjectionWrite(sessionId, () => this.store.updateTask(task.id, { status: parsed.status }));
+            this.#queueProjectionWrite(sessionId, async () => {
+              await this.store.updateTask(task.id, { status: parsed.status });
+              if (parsed.status === "completed") {
+                await Promise.all([
+                  this.knowledge.enqueueTaskOutcome({
+                    tenantId,
+                    workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+                    taskId: task.id,
+                    sessionId,
+                    revision: parsed.turnId,
+                  }),
+                  this.memory.enqueueExtraction({
+                    tenantId,
+                    userId: httpRequest.auth!.user.id,
+                    workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+                    taskId: task.id,
+                    sessionId,
+                    revision: parsed.turnId,
+                  }),
+                ]);
+              }
+            });
             void Promise.all([
               this.budgets.reconcile({ tenantId, requestId, actualCostMicros, usage }),
               this.usageRepository.ingestInternal(tenantId, {
@@ -780,14 +969,28 @@ export class AgentApiController {
                 model: usage?.model ?? governedRequest.model ?? null,
                 tokensIn: usage?.inputTokens ?? 0,
                 tokensOut: usage?.outputTokens ?? 0,
-                tokensCached: 0,
+                tokensCached: usage?.cacheReadTokens ?? 0,
+                cacheReadTokens: usage?.cacheReadTokens ?? 0,
+                cacheWriteTokens: usage?.cacheWriteTokens ?? 0,
+                cacheCreationTokens1h: usage?.cacheCreationTokens1h ?? 0,
+                cacheCreationTokens5m: usage?.cacheCreationTokens5m ?? 0,
+                cacheEligible: usage?.cacheEligible ?? false,
+                cacheProvider: usage?.cacheProvider ?? null,
+                cacheKeyHash: usage?.cacheKeyHash ?? null,
+                promptManifestHash: usage?.promptManifestHash ?? null,
+                cacheMissReason: usage?.cacheMissReason ?? null,
                 sandboxUsage: {},
                 costRawMicros: actualCostMicros.toString(),
                 costBilledMicros: actualCostMicros.toString(),
                 latencyMs: Date.now() - startedAt,
                 ttftMs: null,
                 status: parsed.status,
-                metadata: { mode },
+                metadata: {
+                  mode,
+                  ...(usage?.promptManifest ? { promptManifest: usage.promptManifest } : {}),
+                  ...(usage?.promptManifests.length ? { promptManifests: usage.promptManifests } : {}),
+                  ...(usage?.cacheMissComponentId ? { cacheMissComponentId: usage.cacheMissComponentId } : {}),
+                },
                 ts: new Date().toISOString(),
               }),
             ]).catch(() => undefined);
@@ -846,8 +1049,22 @@ export class AgentApiController {
   }
 
   @Post("/questions/:questionId/answer")
-  answerQuestion(@Param("questionId") questionId: string, @Body() body: unknown) {
+  async answerQuestion(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Param("questionId") questionId: string,
+    @Body() body: unknown,
+  ) {
     const request = parseBody(AnswerQuestionRequestSchema, body);
+    if (this.durableTurns.enabled) {
+      return {
+        ok: await this.durableTurns.answerQuestion(
+          tenantIdFromRequest(httpRequest),
+          httpRequest.auth!.user.id,
+          questionId,
+          request,
+        ),
+      };
+    }
     return {
       ok: this.sessionHost.resolveQuestion(questionId, {
         answer: request.answer,
@@ -858,8 +1075,20 @@ export class AgentApiController {
   }
 
   @Sse("/sessions/:sessionId/events")
-  async streamEvents(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string): Promise<Observable<MessageEvent<AgentStreamEvent>>> {
+  async streamEvents(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Param("sessionId") sessionId: string,
+    @Headers("last-event-id") lastEventId?: string,
+    @Query("cursor") cursor?: string,
+  ): Promise<Observable<MessageEvent<AgentStreamEvent>>> {
     await this.ownedSession(httpRequest, sessionId);
+    if (this.durableTurns.enabled) {
+      return this.events.streamDurable(
+        tenantIdFromRequest(httpRequest),
+        sessionId,
+        cursor ?? lastEventId ?? null,
+      );
+    }
     const state = this.sessionHost.turnState(sessionId);
     return this.events.stream(sessionId, state.bufferedEvents);
   }
@@ -867,12 +1096,18 @@ export class AgentApiController {
   @Get("/sessions/:sessionId/turn-state")
   async turnState(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
     await this.ownedSession(httpRequest, sessionId);
+    if (this.durableTurns.enabled) {
+      return this.durableTurns.state(tenantIdFromRequest(httpRequest), sessionId);
+    }
     return TurnStateSchema.parse(this.sessionHost.turnState(sessionId));
   }
 
   @Post("/sessions/:sessionId/cancel")
   async cancelTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
     await this.ownedSession(httpRequest, sessionId);
+    if (this.durableTurns.enabled) {
+      return { ok: await this.durableTurns.cancel(tenantIdFromRequest(httpRequest), sessionId) };
+    }
     const turn = this.sessionHost.turnState(sessionId);
     const ok = await this.sessionHost.cancel(sessionId);
     await this.#projectionWrites.get(sessionId);
@@ -945,7 +1180,13 @@ export class AgentApiController {
   }
 
   @Get("/approvals")
-  async listApprovals() {
+  async listApprovals(@Req() httpRequest: AuthenticatedRequest) {
+    if (this.durableTurns.enabled) {
+      return this.durableTurns.listApprovals(
+        tenantIdFromRequest(httpRequest),
+        httpRequest.auth!.user.id,
+      );
+    }
     const now = new Date().toISOString();
     const detailed = this.sessionHost.pendingApprovals?.() ?? [];
     if (detailed.length > 0) {
@@ -979,10 +1220,45 @@ export class AgentApiController {
   }
 
   @Post("/approvals/:approvalId/decision")
-  decideApproval(@Param("approvalId") approvalId: string, @Body() body: unknown) {
+  async decideApproval(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Param("approvalId") approvalId: string,
+    @Body() body: unknown,
+  ) {
     const request = parseBody(ApprovalDecisionRequestSchema, body);
     const decision = normalizeDecision(request.decision);
+    if (this.durableTurns.enabled) {
+      return {
+        ok: await this.durableTurns.decideApproval(
+          tenantIdFromRequest(httpRequest),
+          httpRequest.auth!.user.id,
+          approvalId,
+          {
+            decision: request.decision,
+            ...(request.remember !== undefined ? { remember: request.remember } : {}),
+            ...(request.reason !== undefined ? { reason: request.reason } : {}),
+          },
+        ),
+      };
+    }
     return { ok: this.sessionHost.resolveApproval(approvalId, decision) };
+  }
+
+  @Post("/runs/:runId/recovery")
+  async recoverTurn(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Param("runId") runId: string,
+    @Body() body: unknown,
+  ) {
+    const request = parseBody(RecoveryActionSchema, body);
+    return {
+      ok: await this.durableTurns.recover(
+        tenantIdFromRequest(httpRequest),
+        httpRequest.auth!.user.id,
+        runId,
+        request.action,
+      ),
+    };
   }
 
   @Get("/devices")
@@ -1220,6 +1496,15 @@ function imageUsageEvent(input: {
     tokensIn: 0,
     tokensOut: 0,
     tokensCached: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cacheCreationTokens1h: 0,
+    cacheCreationTokens5m: 0,
+    cacheEligible: false,
+    cacheProvider: null,
+    cacheKeyHash: null,
+    promptManifestHash: null,
+    cacheMissReason: null,
     sandboxUsage: {},
     costRawMicros: input.actualCostMicros.toString(),
     costBilledMicros: input.actualCostMicros.toString(),

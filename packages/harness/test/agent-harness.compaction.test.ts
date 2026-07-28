@@ -11,9 +11,11 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import type { SessionCheckpointV2 } from "@berry/shared";
 import type { AgentTool } from "../src/types.ts";
 import { AgentHarness } from "../src/harness/agent-harness.ts";
 import { findCutPoint } from "../src/harness/compaction/compaction.ts";
+import { generatePortableCheckpoint } from "../src/harness/compaction/checkpoint.ts";
 import { NodeExecutionEnv } from "../src/harness/env/nodejs.ts";
 import { InMemorySessionRepo } from "../src/harness/session/memory-repo.ts";
 import { buildSessionContext } from "../src/harness/session/session.ts";
@@ -201,7 +203,21 @@ describe("AgentHarness compaction", () => {
 		const compaction = branch.find((entry) => entry.type === "compaction");
 		expect(compaction).toBeTruthy();
 		if (compaction?.type === "compaction") {
-			expect(compaction.details).toMatchObject({ windowNumber: 1, retainedTokens: expect.any(Number) });
+			expect(compaction.details).toMatchObject({
+				windowNumber: 1,
+				retainedTokens: expect.any(Number),
+				checkpointValidationStatus: "fallback",
+				checkpointGenerationAttempts: 2,
+				segmentCheckpoint: {
+					schema: "berry.session-checkpoint",
+					version: 2,
+					currentLeafId: expect.any(String),
+				},
+				rollingCheckpoint: {
+					schema: "berry.session-checkpoint",
+					version: 2,
+				},
+			});
 		}
 	});
 
@@ -250,5 +266,74 @@ describe("AgentHarness compaction", () => {
 			fallbackSummary: "fallback summary",
 		});
 		expect(context.messages[1]).toMatchObject({ role: "user", content: "new" });
+	});
+
+	it("repairs invalid structured output once, then falls back without losing prior constraints", async () => {
+		const model = testModel({ maxTokens: 4096 });
+		let calls = 0;
+		const models = modelsFor((streamModel) => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				calls++;
+				const message = assistant(streamModel, [{ type: "text", text: "{invalid" }], "stop", 10);
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		}, [model]);
+		const previous: SessionCheckpointV2 = {
+			schema: "berry.session-checkpoint",
+			version: 2,
+			generatedAt: "2026-07-28T12:00:00.000Z",
+			goal: "Finish the project",
+			successCriteria: [],
+			constraints: ["Never deploy production"],
+			standingInstructions: [],
+			completedWork: ["Packet 4"],
+			currentWork: ["Packet 5"],
+			blockers: [],
+			waitingState: null,
+			decisions: [],
+			unresolvedQuestions: [],
+			nextAction: "Continue Packet 5",
+			filesRead: [],
+			filesModified: [],
+			artifacts: [],
+			commands: [],
+			toolCalls: [],
+			approvals: [],
+			promptManifestHash: null,
+			retrievalSnapshotIds: [],
+			coveredEntryStart: "old-1",
+			coveredEntryEnd: "old-2",
+			currentLeafId: "old-2",
+			narrative: "Prior durable state.",
+		};
+		const entry: SessionTreeEntry = {
+			type: "message",
+			id: "entry-new",
+			parentId: "old-2",
+			timestamp: "2026-07-28T12:01:00.000Z",
+			message: { role: "user", content: "Implement the worker compactor.", timestamp: 1 },
+		};
+
+		const result = await generatePortableCheckpoint({
+			entries: [entry],
+			messages: [entry.message],
+			previousRolling: previous,
+			priorSegments: [],
+			windowNumber: 2,
+			sourceLeafId: "entry-new",
+			coveredEntryStart: "entry-new",
+			coveredEntryEnd: "entry-new",
+			summary: "Worker compactor is in progress.",
+			maxInputTokens: 1000,
+		}, models, model);
+
+		expect(calls).toBe(2);
+		expect(result.validationStatus).toBe("fallback");
+		expect(result.rolling.constraints).toContain("Never deploy production");
+		expect(result.rolling.nextAction).toContain("Implement the worker compactor");
+		expect(result.rolling.currentLeafId).toBe("entry-new");
 	});
 });

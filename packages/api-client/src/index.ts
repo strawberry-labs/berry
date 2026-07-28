@@ -79,6 +79,7 @@ import {
   FeatureFlagSchema,
   HostPushEventSchema,
   MessageSchema,
+  MemoryItemSchema,
   ModelGovernanceDecisionSchema,
   MobileDeviceRegistrationCreateSchema,
   MobileDeviceRegistrationSchema,
@@ -177,6 +178,7 @@ import {
   type FeatureFlag,
   type HostPushEvent,
   type Message,
+  type MemoryItem,
   type ModelGovernanceDecision,
   type MobileDeviceRegistration,
   type MobileDeviceRegistrationCreate,
@@ -202,6 +204,31 @@ import {
   type AttachmentInput,
 } from "@berry/shared";
 import { z } from "zod";
+
+const MemoryPageSchema = z.object({
+  items: z.array(MemoryItemSchema),
+  nextCursor: z.string().nullable(),
+});
+const MemorySettingsSchema = z.object({
+  memoryEnabled: z.boolean(),
+  implicitMemoryEnabled: z.boolean(),
+});
+const MemoryMutationResultSchema = z.object({
+  operation: z.enum(["ADD", "SUPERSEDE", "REFRESH", "NOOP"]),
+  reason: z.string(),
+  item: MemoryItemSchema.nullable(),
+});
+const ProjectOutcomeSchema = z.object({
+  sourceId: z.string(),
+  taskId: z.string(),
+  title: z.string(),
+  revision: z.string(),
+  status: z.string(),
+  vectorReady: z.boolean(),
+  failureReason: z.string().nullable(),
+  updatedAt: z.string().datetime({ offset: true }),
+});
+export type ProjectOutcome = z.infer<typeof ProjectOutcomeSchema>;
 
 export interface BerryApiClientOptions {
   baseUrl: string;
@@ -622,21 +649,110 @@ export class BerryApiClient {
     return { ...page, items: page.items.map((file) => this.#resolveFileUrls(file)) };
   }
 
+  async listProjectFiles(
+    workspaceId: string,
+    input: { visibility?: "project" | "task_only"; status?: "pending" | "extracting" | "chunking" | "embedding" | "indexed" | "failed"; search?: string; cursor?: string; limit?: number } = {},
+    options: { signal?: AbortSignal } = {},
+  ): Promise<StoredFilePage> {
+    const page = await this.#request(`/v1/workspaces/${encodeURIComponent(workspaceId)}/files${usageQuery(input)}`, StoredFilePageSchema, options);
+    return { ...page, items: page.items.map((file) => this.#resolveFileUrls(file)) };
+  }
+
+  async retryWorkspaceFile(workspaceId: string, fileId: string): Promise<{ ok: true }> {
+    return this.#request(`/v1/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(fileId)}/retry`, z.object({ ok: z.literal(true) }), { method: "POST" });
+  }
+
+  async unlinkWorkspaceFile(workspaceId: string, fileId: string): Promise<{ ok: true }> {
+    return this.#request(`/v1/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(fileId)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  async listProjectOutcomes(workspaceId: string): Promise<ProjectOutcome[]> {
+    return this.#request(
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/knowledge/outcomes`,
+      z.array(ProjectOutcomeSchema),
+    );
+  }
+
+  async listMemories(input: {
+    scope?: "personal" | "project";
+    workspaceId?: string;
+    status?: "active" | "superseded" | "forgotten" | "expired" | "rejected";
+    search?: string;
+    cursor?: string;
+    limit?: number;
+  } = {}): Promise<{ items: MemoryItem[]; nextCursor: string | null }> {
+    return this.#request(`/v1/memory${usageQuery(input)}`, MemoryPageSchema);
+  }
+
+  async getMemory(memoryId: string): Promise<MemoryItem> {
+    return this.#request(`/v1/memory/${encodeURIComponent(memoryId)}`, MemoryItemSchema);
+  }
+
+  async rememberMemory(input: {
+    scope?: "personal" | "project";
+    workspaceId?: string;
+    kind: string;
+    stableKey?: string;
+    content: string;
+    value?: Record<string, unknown>;
+    confidence?: number;
+    salience?: number;
+    expiresAt?: string | null;
+  }) {
+    return this.#request("/v1/memory", MemoryMutationResultSchema, { method: "PUT", body: input });
+  }
+
+  async updateMemory(memoryId: string, input: {
+    content: string;
+    kind?: string;
+    value?: Record<string, unknown>;
+    confidence?: number;
+    salience?: number;
+    expiresAt?: string | null;
+  }) {
+    return this.#request(`/v1/memory/${encodeURIComponent(memoryId)}`, MemoryMutationResultSchema, { method: "PATCH", body: input });
+  }
+
+  async forgetMemory(memoryId: string): Promise<MemoryItem> {
+    return this.#request(`/v1/memory/${encodeURIComponent(memoryId)}`, MemoryItemSchema, { method: "DELETE" });
+  }
+
+  async memorySettings(): Promise<{ memoryEnabled: boolean; implicitMemoryEnabled: boolean }> {
+    return this.#request("/v1/memory/settings", MemorySettingsSchema);
+  }
+
+  async updateMemorySettings(input: { memoryEnabled?: boolean; implicitMemoryEnabled?: boolean }): Promise<{ memoryEnabled: boolean; implicitMemoryEnabled: boolean }> {
+    return this.#request("/v1/memory/settings", MemorySettingsSchema, { method: "PUT", body: input });
+  }
+
+  async exportMemories(): Promise<{ items: MemoryItem[]; versions: unknown[] }> {
+    return this.#request("/v1/memory/export", z.object({ items: z.array(MemoryItemSchema), versions: z.array(z.unknown()) }));
+  }
+
+  async clearMemories(input: { scope?: "personal" | "project"; workspaceId?: string } = {}): Promise<{ ok: true; forgotten: number }> {
+    return this.#request(`/v1/memory${usageQuery(input)}`, z.object({
+      ok: z.literal(true),
+      forgotten: z.number().int().nonnegative(),
+    }), { method: "DELETE" });
+  }
+
   async getFile(fileId: string): Promise<StoredFile> {
     return this.#resolveFileUrls(await this.#request(`/v1/files/${encodeURIComponent(fileId)}`, StoredFileSchema));
   }
 
-  async initiateFileUpload(input: { name: string; mediaType: string; size: number; taskId?: string; sessionId?: string; sha256?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference" }): Promise<MultipartUploadInitiate> {
+  async initiateFileUpload(input: { name: string; mediaType: string; size: number; taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; sha256?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference" }): Promise<MultipartUploadInitiate> {
     return this.#request("/v1/files/uploads", MultipartUploadInitiateSchema, { method: "POST", body: input });
   }
 
-  async uploadFile(file: File, input: { taskId?: string; sessionId?: string; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference"; concurrency?: number; onProgress?: (progress: { uploadedBytes: number; totalBytes: number; ratio: number }) => void; signal?: AbortSignal } = {}): Promise<StoredFile> {
+  async uploadFile(file: File, input: { taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference"; concurrency?: number; onProgress?: (progress: { uploadedBytes: number; totalBytes: number; ratio: number }) => void; signal?: AbortSignal } = {}): Promise<StoredFile> {
     const upload = await this.initiateFileUpload({
       name: file.name,
       mediaType: file.type || "application/octet-stream",
       size: file.size,
       ...(input.taskId ? { taskId: input.taskId } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+      ...(input.workspaceVisibility ? { workspaceVisibility: input.workspaceVisibility } : {}),
       ...(input.origin ? { origin: input.origin } : {}),
       ...(input.associationRole ? { associationRole: input.associationRole } : {}),
     });
@@ -765,6 +881,13 @@ export class BerryApiClient {
 
   async listApprovals(): Promise<ApprovalRequest[]> {
     return this.#request("/v1/approvals", z.array(ApprovalRequestSchema));
+  }
+
+  async recoverTurn(runId: string, action: "retry" | "mark-complete" | "cancel"): Promise<{ ok: boolean }> {
+    return this.#request(`/v1/runs/${encodeURIComponent(runId)}/recovery`, z.object({ ok: z.boolean() }), {
+      method: "POST",
+      body: { action },
+    });
   }
 
   async registerMobileDevice(input: RegisterMobileDeviceRequest): Promise<MobileDeviceRegistration> {
@@ -942,6 +1065,11 @@ export class BerryApiClient {
   async myUsage(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics> {
     const parsed = UsageAnalyticsQuerySchema.parse(query);
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me${usageQuery(parsed)}`, UsageAnalyticsSchema);
+  }
+
+  async myUsageRequests(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageRequestPage> {
+    const parsed = UsageAnalyticsQuerySchema.parse(query);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/usage/me/requests${usageQuery(parsed)}`, UsageRequestPageSchema);
   }
 
   async exportMyUsageCsv(tenantId: string, filter: UsageEventFilter = {}): Promise<string> {
@@ -1123,17 +1251,18 @@ export class BerryApiClient {
   }
 
   streamEvents(sessionId: string, callbacks: {
-    onEvent: (event: AgentStreamEvent) => void;
+    onEvent: (event: AgentStreamEvent, cursor: string | null) => void;
     onError?: (error: unknown) => void;
     onOpen?: () => void;
-  }): EventSource {
-    const source = new EventSource(`${this.#baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/events`);
+  }, cursor?: string | null): EventSource {
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+    const source = new EventSource(`${this.#baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`);
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
       try {
         const parsed = AgentStreamEventSchema.parse(JSON.parse(event.data));
-        callbacks.onEvent(parsed);
+        callbacks.onEvent(parsed, event.lastEventId || null);
         if (parsed.kind === "turn.end") source.close();
       } catch (error) {
         callbacks.onError?.(error);

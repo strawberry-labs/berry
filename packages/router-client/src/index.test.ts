@@ -223,7 +223,7 @@ describe("router client", () => {
     const responses = new OpenAIResponsesClient({ provider: { ...provider, endpointPath: "/responses" }, apiKey: "brry_test" });
     const events: Array<Record<string, unknown>> = [];
     for await (const event of responses.streamEvents({ model: "berry/cheap", input: [] })) events.push(event);
-    expect(events[0]?.[BERRY_ROUTER_METADATA_KEY]).toEqual({
+    expect(events[0]?.[BERRY_ROUTER_METADATA_KEY]).toMatchObject({
       attribution: { requestedModel: "berry/cheap", servedProvider: "openai", servedModel: "openai/gpt-4.1-mini" },
       usage: { inputTokens: 13, outputTokens: 5, totalTokens: 18 },
     });
@@ -274,6 +274,43 @@ describe("router client", () => {
       reasoning: "checked first",
       usage: { totalTokens: 3 },
     });
+  });
+
+  it("serializes declared OpenAI cache fields without inventing them", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += String(chunk); });
+      request.on("end", () => {
+        bodies.push(JSON.parse(raw) as Record<string, unknown>);
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          id: "cache_1",
+          model: "gpt-test",
+          choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: 2_000,
+            completion_tokens: 2,
+            total_tokens: 2_002,
+            prompt_tokens_details: { cached_tokens: 1_500 },
+          },
+        }));
+      });
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "gpt-test", kind: "openai", name: "OpenAI" },
+      apiKey: "key",
+    });
+    const cached = await client.complete({
+      messages: [{ role: "user", content: "hi" }],
+      promptCacheKey: "berry_hash",
+      promptCacheRetention: "long",
+    });
+    await client.complete({ messages: [{ role: "user", content: "hi" }] });
+    expect(bodies[0]).toMatchObject({ prompt_cache_key: "berry_hash", prompt_cache_retention: "24h" });
+    expect(bodies[1]?.prompt_cache_key).toBeUndefined();
+    expect(bodies[1]?.prompt_cache_retention).toBeUndefined();
+    expect(cached.usage).toMatchObject({ cacheReadTokens: 1_500, cacheWriteTokens: 0 });
   });
 
   it("streams SSE deltas", async () => {
@@ -383,7 +420,7 @@ describe("router client", () => {
         'data: {"id":"1","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"berry\\"}"}}]}}]}\n\n',
       );
       response.write(
-        'data: {"id":"1","model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n',
+        'data: {"id":"1","model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":6}}}\n\n',
       );
       response.end("data: [DONE]\n\n");
     });
@@ -412,7 +449,7 @@ describe("router client", () => {
     ]);
     expect(toolDeltas.map((delta) => delta.args ?? "").join("")).toBe('{"pattern":"berry"}');
     expect(finishReason).toBe("tool_calls");
-    expect(usage).toEqual({ inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+    expect(usage).toMatchObject({ inputTokens: 10, outputTokens: 5, totalTokens: 15, cacheReadTokens: 6, cacheWriteTokens: 0 });
   });
 
   it("streams reasoning deltas separately from text deltas", async () => {

@@ -1,6 +1,6 @@
 import * as React from "react";
-import { MessageAttachmentContentSchema, type ImageAspectRatio, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
-import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
+import { MessageAttachmentContentSchema, MessageCitationContentSchema, type ImageAspectRatio, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
+import { ArrowRight02, CircleHelp, Copy, FileImage, FileText, GaugeIcon, GitFork, ImagePlus, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 
 import {
@@ -600,6 +600,8 @@ function BerryAssistantTurnGroup({
       <BerryAssistantErrorBlock key={segment.id}>{segment.text}</BerryAssistantErrorBlock>
     ) : segment.kind === "artifact" ? (
       <BerryArtifactCard key={segment.id} artifact={segment} onOpen={adapter.onOpenArtifact} />
+    ) : segment.kind === "citations" ? (
+      <BerryCitationList key={segment.id} citations={segment.citations} />
     ) : segment.kind === "writing-block" ? (
       <WritingBlockController key={segment.id} draft={segment.draft} />
     ) : (
@@ -844,6 +846,26 @@ export function BerryAssistantErrorBlock({ children }: { children: string }) {
   );
 }
 
+function BerryCitationList({ citations }: { citations: Extract<MessageSegment, { kind: "citations" }>["citations"] }) {
+  return (
+    <aside className="flex max-w-[980px] flex-wrap items-center gap-1.5 text-xs text-muted-foreground" aria-label="Sources used for this response">
+      <span className="inline-flex items-center gap-1 pr-0.5 font-medium text-foreground">
+        <FileText className="size-3.5" />
+        Sources
+      </span>
+      {citations.map((citation) => (
+        <span
+          key={`${citation.sourceId}:${citation.chunkId ?? ""}`}
+          className="inline-flex max-w-full items-center rounded-full border border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-2 py-1"
+          title={citation.href ?? citation.label}
+        >
+          <span className="max-w-80 truncate">{citation.label}</span>
+        </span>
+      ))}
+    </aside>
+  );
+}
+
 function BerryArtifactCard({ artifact, onOpen }: { artifact: Extract<MessageSegment, { kind: "artifact" }>; onOpen?: BerryThreadAdapter["onOpenArtifact"] }) {
   const size = artifact.size != null ? formatArtifactSize(artifact.size) : undefined;
   const content = (
@@ -1020,6 +1042,12 @@ export function partitionAssistantParts(
       if (text.trim().length > 0) segments.push({ kind: "text", id: part.id, text });
     } else if (part.kind === "error") {
       segments.push({ kind: "error", id: part.id, text: String(part.content) });
+    } else if (part.kind === "citation") {
+      const parsed = MessageCitationContentSchema.safeParse(part.content);
+      if (!parsed.success) continue;
+      const last = segments.at(-1);
+      if (last?.kind === "citations") last.citations.push(parsed.data);
+      else segments.push({ kind: "citations", id: part.id, citations: [parsed.data] });
     }
   }
 

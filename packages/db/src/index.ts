@@ -13,6 +13,7 @@ import {
   timestamp,
   uniqueIndex,
   uuid,
+  vector,
 } from "drizzle-orm/pg-core";
 import type { JsonValue } from "@berry/shared";
 
@@ -37,6 +38,7 @@ export const messagePartKindEnum = pgEnum("message_part_kind", [
   "tool-result",
   "image",
   "attachment",
+  "citation",
   "terminal",
   "browser-screenshot",
   "error",
@@ -404,6 +406,7 @@ export const sessions = pgTable("sessions", {
   modelProviderId: text("model_provider_id"),
   model: text("model"),
   permissionMode: permissionModeEnum("permission_mode").notNull().default("ask"),
+  runtimeMetadata: jsonObject("runtime_metadata"),
   createdAt,
   updatedAt,
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -526,10 +529,356 @@ export const fileDerivatives = pgTable("file_derivatives", {
   index("file_derivatives_tenant_status_idx").on(table.tenantId, table.status),
 ]);
 
+export const memorySettings = pgTable("memory_settings", {
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  memoryEnabled: boolean("memory_enabled").notNull().default(true),
+  implicitMemoryEnabled: boolean("implicit_memory_enabled").notNull().default(true),
+  updatedAt,
+}, (table) => [
+  uniqueIndex("memory_settings_tenant_user_unique").on(table.tenantId, table.userId),
+]);
+
+export const memoryItems = pgTable("memory_items", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").references(() => workspaces.id, { onDelete: "cascade" }),
+  scope: text("scope").notNull().default("personal"),
+  kind: text("kind").notNull(),
+  stableKey: text("stable_key").notNull(),
+  content: text("content").notNull(),
+  structuredValue: jsonObject("structured_value"),
+  status: text("status").notNull().default("active"),
+  explicit: boolean("explicit").notNull().default(false),
+  confidence: numeric("confidence", { precision: 5, scale: 4 }).notNull().default("0.5"),
+  salience: numeric("salience", { precision: 5, scale: 4 }).notNull().default("0.5"),
+  validFrom: timestamp("valid_from", { withTimezone: true }),
+  validUntil: timestamp("valid_until", { withTimezone: true }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  extractorVersion: text("extractor_version").notNull().default("v1"),
+  sourceTaskId: uuid("source_task_id").references(() => tasks.id, { onDelete: "set null" }),
+  sourceSessionId: uuid("source_session_id").references(() => sessions.id, { onDelete: "set null" }),
+  sourceMessageId: uuid("source_message_id").references(() => messages.id, { onDelete: "set null" }),
+  supersededItemId: uuid("superseded_item_id"),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+  lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("memory_items_active_key_unique").on(table.tenantId, table.userId, table.workspaceId, table.stableKey).where(sql`${table.status} = 'active'`),
+  index("memory_items_recall_idx").on(table.tenantId, table.userId, table.workspaceId, table.status, table.salience),
+  index("memory_items_expiry_idx").on(table.tenantId, table.expiresAt),
+]);
+
+export const memoryItemVersions = pgTable("memory_item_versions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  memoryItemId: uuid("memory_item_id").notNull().references(() => memoryItems.id, { onDelete: "cascade" }),
+  operation: text("operation").notNull(),
+  beforeValue: jsonb("before_value").$type<JsonValue>(),
+  afterValue: jsonb("after_value").$type<JsonValue>(),
+  actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  sourceTaskId: uuid("source_task_id").references(() => tasks.id, { onDelete: "set null" }),
+  sourceSessionId: uuid("source_session_id").references(() => sessions.id, { onDelete: "set null" }),
+  sourceMessageId: uuid("source_message_id").references(() => messages.id, { onDelete: "set null" }),
+  extractorVersion: text("extractor_version"),
+  reason: text("reason"),
+  createdAt,
+}, (table) => [
+  index("memory_item_versions_item_created_idx").on(table.tenantId, table.memoryItemId, table.createdAt),
+]);
+
+export const workspaceFiles = pgTable("workspace_files", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  fileId: uuid("file_id").notNull().references(() => files.id, { onDelete: "cascade" }),
+  visibility: text("visibility").notNull().default("project"),
+  originatingTaskId: uuid("originating_task_id").references(() => tasks.id, { onDelete: "set null" }),
+  indexStatus: text("index_status").notNull().default("pending"),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt,
+  updatedAt,
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("workspace_files_workspace_file_unique").on(table.tenantId, table.workspaceId, table.fileId),
+  index("workspace_files_list_idx").on(table.tenantId, table.workspaceId, table.visibility, table.indexStatus, table.createdAt),
+]);
+
+export const knowledgeSources = pgTable("knowledge_sources", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  sourceType: text("source_type").notNull(),
+  sourceId: text("source_id").notNull(),
+  sourceRevision: text("source_revision").notNull(),
+  contentHash: text("content_hash").notNull(),
+  title: text("title").notNull(),
+  authority: numeric("authority", { precision: 5, scale: 4 }).notNull().default("0.5"),
+  visibility: text("visibility").notNull().default("project"),
+  aclVersion: integer("acl_version").notNull().default(1),
+  extractionStatus: text("extraction_status").notNull().default("pending"),
+  indexStatus: text("index_status").notNull().default("pending"),
+  vectorReady: boolean("vector_ready").notNull().default(false),
+  extractorVersion: text("extractor_version").notNull().default("v1"),
+  chunkerVersion: text("chunker_version").notNull().default("v1"),
+  failureReason: text("failure_reason"),
+  metadata: jsonObject("metadata"),
+  tombstonedAt: timestamp("tombstoned_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("knowledge_sources_revision_unique").on(table.tenantId, table.workspaceId, table.sourceType, table.sourceId, table.sourceRevision),
+  index("knowledge_sources_active_idx").on(table.tenantId, table.workspaceId, table.indexStatus, table.sourceType),
+  index("knowledge_sources_cleanup_idx").on(table.tenantId, table.tombstonedAt),
+]);
+
+export const knowledgeChunks = pgTable("knowledge_chunks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  sourceId: uuid("source_id").notNull().references(() => knowledgeSources.id, { onDelete: "cascade" }),
+  ordinal: integer("ordinal").notNull(),
+  textContent: text("text_content").notNull(),
+  tokenEstimate: integer("token_estimate").notNull().default(0),
+  metadata: jsonObject("metadata"),
+  embedding: vector("embedding", { dimensions: 1536 }),
+  embeddingProfileId: text("embedding_profile_id"),
+  embeddingProvider: text("embedding_provider"),
+  embeddingModel: text("embedding_model"),
+  embeddingDimensions: integer("embedding_dimensions"),
+  embeddingProfileVersion: integer("embedding_profile_version"),
+  embeddingHash: text("embedding_hash"),
+  vectorReady: boolean("vector_ready").notNull().default(false),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("knowledge_chunks_source_ordinal_unique").on(table.sourceId, table.ordinal),
+  index("knowledge_chunks_scope_idx").on(table.tenantId, table.workspaceId, table.sourceId),
+  index("knowledge_chunks_vector_ready_idx").on(table.tenantId, table.workspaceId, table.vectorReady),
+]);
+
+export const retrievalSnapshots = pgTable("retrieval_snapshots", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+  sessionId: uuid("session_id").references(() => sessions.id, { onDelete: "set null" }),
+  runId: uuid("run_id"),
+  queryHash: text("query_hash").notNull(),
+  candidates: jsonArray("candidates"),
+  selectedSourceIds: jsonArray("selected_source_ids"),
+  selectedChunkIds: jsonArray("selected_chunk_ids"),
+  componentScores: jsonObject("component_scores"),
+  selectionReason: text("selection_reason"),
+  tokenBudget: integer("token_budget").notNull(),
+  tokensSelected: integer("tokens_selected").notNull().default(0),
+  retrievalVersion: text("retrieval_version").notNull(),
+  embeddingProfileId: text("embedding_profile_id"),
+  createdAt,
+}, (table) => [
+  index("retrieval_snapshots_turn_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("retrieval_snapshots_workspace_idx").on(table.tenantId, table.workspaceId, table.createdAt),
+]);
+
+export const sessionEntries = pgTable("session_entries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  entryId: text("entry_id").notNull(),
+  parentEntryId: text("parent_entry_id"),
+  entryType: text("entry_type").notNull(),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  payload: jsonb("payload").$type<JsonValue>().notNull(),
+  isLeafMarker: boolean("is_leaf_marker").notNull().default(false),
+  runId: uuid("run_id"),
+  stepId: uuid("step_id"),
+  checkpointId: uuid("checkpoint_id"),
+  createdAt,
+}, (table) => [
+  uniqueIndex("session_entries_session_entry_unique").on(table.tenantId, table.sessionId, table.entryId),
+  uniqueIndex("session_entries_session_sequence_unique").on(table.tenantId, table.sessionId, table.sequence),
+  index("session_entries_parent_idx").on(table.tenantId, table.sessionId, table.parentEntryId),
+]);
+
+export const sessionCheckpoints = pgTable("session_checkpoints", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(),
+  sourceLeafId: text("source_leaf_id").notNull(),
+  coveredEntryStart: text("covered_entry_start"),
+  coveredEntryEnd: text("covered_entry_end"),
+  schemaVersion: integer("schema_version").notNull().default(2),
+  checkpoint: jsonb("checkpoint").$type<JsonValue>().notNull(),
+  validationStatus: text("validation_status").notNull().default("valid"),
+  modelProvider: text("model_provider"),
+  model: text("model"),
+  promptManifestHash: text("prompt_manifest_hash"),
+  createdAt,
+}, (table) => [
+  uniqueIndex("session_checkpoints_idempotency_unique").on(table.tenantId, table.sessionId, table.kind, table.sourceLeafId, table.coveredEntryEnd, table.schemaVersion),
+  index("session_checkpoints_latest_idx").on(table.tenantId, table.sessionId, table.createdAt),
+]);
+
+export const sessionCompactionLeases = pgTable("session_compaction_leases", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  leaseOwner: text("lease_owner").notNull(),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }).notNull(),
+  lastError: text("last_error"),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("session_compaction_leases_session_unique").on(table.tenantId, table.sessionId),
+  index("session_compaction_leases_expiry_idx").on(table.tenantId, table.leaseExpiresAt),
+]);
+
+export const turnRuns = pgTable("turn_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  requestMessageId: uuid("request_message_id").references(() => messages.id, { onDelete: "set null" }),
+  state: text("state").notNull().default("queued"),
+  attempt: integer("attempt").notNull().default(0),
+  version: integer("version").notNull().default(0),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  nextAction: text("next_action"),
+  waitingReason: text("waiting_reason"),
+  heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
+  error: text("error"),
+  runtimeRequest: jsonObject("runtime_request"),
+  groundingContext: jsonObject("grounding_context"),
+  promptManifest: jsonObject("prompt_manifest"),
+  sandboxProvider: text("sandbox_provider"),
+  sandboxId: text("sandbox_id"),
+  sandboxState: text("sandbox_state"),
+  sandboxHeartbeatAt: timestamp("sandbox_heartbeat_at", { withTimezone: true }),
+  cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  index("turn_runs_claim_idx").on(table.tenantId, table.state, table.leaseExpiresAt),
+  index("turn_runs_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+]);
+
+export const turnSteps = pgTable("turn_steps", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => turnRuns.id, { onDelete: "cascade" }),
+  sequence: integer("sequence").notNull(),
+  stepType: text("step_type").notNull(),
+  state: text("state").notNull().default("pending"),
+  input: jsonObject("input"),
+  output: jsonb("output").$type<JsonValue>(),
+  retryClass: text("retry_class"),
+  idempotencyKey: text("idempotency_key"),
+  sessionEntryId: text("session_entry_id"),
+  checkpointId: uuid("checkpoint_id"),
+  attempt: integer("attempt").notNull().default(0),
+  error: text("error"),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("turn_steps_run_sequence_unique").on(table.tenantId, table.runId, table.sequence),
+  uniqueIndex("turn_steps_idempotency_unique").on(table.tenantId, table.runId, table.idempotencyKey),
+  index("turn_steps_state_idx").on(table.tenantId, table.state, table.createdAt),
+]);
+
+export const turnEvents = pgTable("turn_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => turnRuns.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  eventType: text("event_type").notNull(),
+  payload: jsonb("payload").$type<JsonValue>().notNull(),
+  createdAt,
+}, (table) => [
+  uniqueIndex("turn_events_run_sequence_unique").on(table.tenantId, table.runId, table.sequence),
+  index("turn_events_session_sequence_idx").on(table.tenantId, table.sessionId, table.sequence),
+  index("turn_events_retention_idx").on(table.tenantId, table.createdAt),
+]);
+
+export const runtimeOutbox = pgTable("runtime_outbox", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  eventType: text("event_type").notNull(),
+  aggregateId: text("aggregate_id").notNull(),
+  dedupeKey: text("dedupe_key").notNull(),
+  payload: jsonb("payload").$type<JsonValue>().notNull(),
+  availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+  attempts: integer("attempts").notNull().default(0),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  lastError: text("last_error"),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("runtime_outbox_dedupe_unique").on(table.tenantId, table.dedupeKey),
+  index("runtime_outbox_due_idx").on(table.tenantId, table.completedAt, table.availableAt, table.leaseExpiresAt),
+]);
+
+export const sandboxSnapshots = pgTable("sandbox_snapshots", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => turnRuns.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  sandboxProvider: text("sandbox_provider").notNull(),
+  sandboxId: text("sandbox_id").notNull(),
+  storageFileId: uuid("storage_file_id").references(() => files.id, { onDelete: "set null" }),
+  objectKey: text("object_key").notNull(),
+  contentHash: text("content_hash").notNull(),
+  sequence: integer("sequence").notNull(),
+  status: text("status").notNull().default("pending"),
+  sessionLeafId: text("session_leaf_id"),
+  failureReason: text("failure_reason"),
+  createdAt,
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("sandbox_snapshots_run_sequence_unique").on(table.tenantId, table.runId, table.sequence),
+  index("sandbox_snapshots_restore_idx").on(table.tenantId, table.runId, table.status, table.sequence),
+]);
+
+export const maintenanceRuns = pgTable("maintenance_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(),
+  status: text("status").notNull().default("queued"),
+  cursor: jsonObject("cursor"),
+  scannedCount: bigint("scanned_count", { mode: "number" }).notNull().default(0),
+  changedCount: bigint("changed_count", { mode: "number" }).notNull().default(0),
+  enqueuedCount: bigint("enqueued_count", { mode: "number" }).notNull().default(0),
+  failureCount: integer("failure_count").notNull().default(0),
+  lastError: text("last_error"),
+  requestedByUserId: uuid("requested_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  index("maintenance_runs_tenant_status_idx").on(table.tenantId, table.status, table.updatedAt),
+]);
+
 export const toolCalls = pgTable("tool_calls", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   sessionId: uuid("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => turnRuns.id, { onDelete: "cascade" }),
+  stepId: uuid("step_id").references(() => turnSteps.id, { onDelete: "set null" }),
   messageId: uuid("message_id").references(() => messages.id, { onDelete: "set null" }),
   toolName: text("tool_name").notNull(),
   status: toolCallStatusEnum("status").notNull().default("pending"),
@@ -538,6 +887,8 @@ export const toolCalls = pgTable("tool_calls", {
   children: jsonArray("children"),
   decisionTrace: jsonArray("decision_trace"),
   approvalId: uuid("approval_id"),
+  retryClass: text("retry_class"),
+  idempotencyKey: text("idempotency_key"),
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   createdAt,
@@ -553,6 +904,8 @@ export const approvals = pgTable("approvals", {
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   taskId: uuid("task_id").references(() => tasks.id, { onDelete: "cascade" }),
   sessionId: uuid("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => turnRuns.id, { onDelete: "cascade" }),
+  stepId: uuid("step_id").references(() => turnSteps.id, { onDelete: "set null" }),
   toolCallId: uuid("tool_call_id").references(() => toolCalls.id, { onDelete: "set null" }),
   kind: approvalKindEnum("kind").notNull(),
   status: approvalStatusEnum("status").notNull().default("pending"),
@@ -564,6 +917,26 @@ export const approvals = pgTable("approvals", {
 }, (table) => [
   index("approvals_tenant_status_created_idx").on(table.tenantId, table.status, table.createdAt),
   index("approvals_tenant_task_idx").on(table.tenantId, table.taskId),
+]);
+
+export const turnQuestions = pgTable("turn_questions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => turnRuns.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  stepId: uuid("step_id").references(() => turnSteps.id, { onDelete: "set null" }),
+  toolCallId: uuid("tool_call_id").references(() => toolCalls.id, { onDelete: "set null" }),
+  question: text("question").notNull(),
+  options: jsonArray("options"),
+  questions: jsonArray("questions"),
+  multi: boolean("multi").notNull().default(false),
+  status: text("status").notNull().default("pending"),
+  answer: jsonb("answer").$type<JsonValue>(),
+  createdAt,
+  answeredAt: timestamp("answered_at", { withTimezone: true }),
+}, (table) => [
+  index("turn_questions_session_status_idx").on(table.tenantId, table.sessionId, table.status, table.createdAt),
+  index("turn_questions_run_idx").on(table.tenantId, table.runId, table.createdAt),
 ]);
 
 export const usageEvents = pgTable("usage_events", {
@@ -586,6 +959,15 @@ export const usageEvents = pgTable("usage_events", {
   tokensIn: integer("tokens_in").notNull().default(0),
   tokensOut: integer("tokens_out").notNull().default(0),
   tokensCached: integer("tokens_cached").notNull().default(0),
+  cacheReadTokens: integer("cache_read_tokens").notNull().default(0),
+  cacheWriteTokens: integer("cache_write_tokens").notNull().default(0),
+  cacheCreationTokens1h: integer("cache_creation_tokens_1h").notNull().default(0),
+  cacheCreationTokens5m: integer("cache_creation_tokens_5m").notNull().default(0),
+  cacheEligible: boolean("cache_eligible").notNull().default(false),
+  cacheProvider: text("cache_provider"),
+  cacheKeyHash: text("cache_key_hash"),
+  promptManifestHash: text("prompt_manifest_hash"),
+  cacheMissReason: text("cache_miss_reason"),
   sandboxUsage: jsonObject("sandbox_usage"),
   costRawMicros: numeric("cost_raw_micros", { precision: 20, scale: 0 }).notNull().default("0"),
   costBilledMicros: numeric("cost_billed_micros", { precision: 20, scale: 0 }).notNull().default("0"),
@@ -607,7 +989,7 @@ export const usageEvents = pgTable("usage_events", {
   index("usage_events_tenant_status_ts_idx").on(table.tenantId, table.status, table.ts),
   index("usage_events_tenant_workspace_ts_idx").on(table.tenantId, table.workspaceId, table.ts),
   index("usage_events_tenant_agent_ts_idx").on(table.tenantId, table.agentId, table.ts),
-  check("usage_events_nonnegative_tokens", sql`${table.tokensIn} >= 0 AND ${table.tokensOut} >= 0 AND ${table.tokensCached} >= 0`),
+  check("usage_events_nonnegative_tokens", sql`${table.tokensIn} >= 0 AND ${table.tokensOut} >= 0 AND ${table.tokensCached} >= 0 AND ${table.cacheReadTokens} >= 0 AND ${table.cacheWriteTokens} >= 0`),
 ]);
 
 export const usageRollups = pgTable("usage_rollups", {
@@ -629,6 +1011,8 @@ export const usageRollups = pgTable("usage_rollups", {
   tokensIn: integer("tokens_in").notNull().default(0),
   tokensOut: integer("tokens_out").notNull().default(0),
   tokensCached: integer("tokens_cached").notNull().default(0),
+  cacheReadTokens: integer("cache_read_tokens").notNull().default(0),
+  cacheWriteTokens: integer("cache_write_tokens").notNull().default(0),
   costRawMicros: numeric("cost_raw_micros", { precision: 20, scale: 0 }).notNull().default("0"),
   costBilledMicros: numeric("cost_billed_micros", { precision: 20, scale: 0 }).notNull().default("0"),
   latencyMsTotal: integer("latency_ms_total").notNull().default(0),
@@ -660,7 +1044,7 @@ export const usageRollups = pgTable("usage_rollups", {
   index("usage_rollups_tenant_department_bucket_idx").on(table.tenantId, table.departmentId, table.bucketStart),
   index("usage_rollups_tenant_workspace_bucket_idx").on(table.tenantId, table.workspaceId, table.bucketStart),
   index("usage_rollups_tenant_agent_bucket_idx").on(table.tenantId, table.agentId, table.bucketStart),
-  check("usage_rollups_nonnegative_counts", sql`${table.requestCount} >= 0 AND ${table.tokensIn} >= 0 AND ${table.tokensOut} >= 0 AND ${table.tokensCached} >= 0`),
+  check("usage_rollups_nonnegative_counts", sql`${table.requestCount} >= 0 AND ${table.tokensIn} >= 0 AND ${table.tokensOut} >= 0 AND ${table.tokensCached} >= 0 AND ${table.cacheReadTokens} >= 0 AND ${table.cacheWriteTokens} >= 0`),
 ]);
 
 export const budgetLimits = pgTable("budget_limits", {
@@ -1006,8 +1390,29 @@ export const cloudSchema = {
   sessions,
   messages,
   messageParts,
+  files,
+  fileAssociations,
+  fileUploads,
+  fileDerivatives,
+  memorySettings,
+  memoryItems,
+  memoryItemVersions,
+  workspaceFiles,
+  knowledgeSources,
+  knowledgeChunks,
+  retrievalSnapshots,
+  sessionEntries,
+  sessionCheckpoints,
+  sessionCompactionLeases,
+  turnRuns,
+  turnSteps,
+  turnEvents,
+  runtimeOutbox,
+  sandboxSnapshots,
+  maintenanceRuns,
   toolCalls,
   approvals,
+  turnQuestions,
   usageEvents,
   usageRollups,
   budgetLimits,
@@ -1041,11 +1446,49 @@ export const CLOUD_SCHEMA_TABLES = [
   "sessions",
   "messages",
   "message_parts",
+  "files",
+  "file_associations",
+  "file_uploads",
+  "file_derivatives",
+  "memory_settings",
+  "memory_items",
+  "memory_item_versions",
+  "workspace_files",
+  "knowledge_sources",
+  "knowledge_chunks",
+  "retrieval_snapshots",
+  "session_entries",
+  "session_checkpoints",
+  "session_compaction_leases",
+  "turn_runs",
+  "turn_steps",
+  "turn_events",
+  "runtime_outbox",
+  "sandbox_snapshots",
+  "maintenance_runs",
   "tool_calls",
   "approvals",
+  "turn_questions",
   "usage_events",
   "usage_rollups",
   "audit_events",
+] as const;
+
+export const DURABLE_CONTEXT_TABLES = [
+  "memory_settings",
+  "memory_items",
+  "memory_item_versions",
+  "workspace_files",
+  "knowledge_sources",
+  "knowledge_chunks",
+  "retrieval_snapshots",
+  "session_entries",
+  "session_checkpoints",
+  "turn_runs",
+  "turn_steps",
+  "turn_events",
+  "runtime_outbox",
+  "sandbox_snapshots",
 ] as const;
 
 export const TENANT_SCOPED_TABLES = [
@@ -1055,8 +1498,16 @@ export const TENANT_SCOPED_TABLES = [
   "sessions",
   "messages",
   "message_parts",
+  "files",
+  "file_associations",
+  "file_uploads",
+  "file_derivatives",
+  ...DURABLE_CONTEXT_TABLES,
+  "session_compaction_leases",
+  "maintenance_runs",
   "tool_calls",
   "approvals",
+  "turn_questions",
   "usage_events",
   "usage_rollups",
   "audit_events",
@@ -1446,6 +1897,22 @@ CREATE POLICY ${tableName}_tenant_isolation ON ${tableName}
 `.trim();
 }
 
+// Migration 1 can only reference the tables it creates. Keep this frozen while
+// TENANT_SCOPED_TABLES continues to describe the complete live schema.
+const INITIAL_TENANT_SCOPED_TABLES = [
+  "tenant_memberships",
+  "workspaces",
+  "tasks",
+  "sessions",
+  "messages",
+  "message_parts",
+  "tool_calls",
+  "approvals",
+  "usage_events",
+  "usage_rollups",
+  "audit_events",
+] as const;
+const INITIAL_TENANT_RLS_SQL = INITIAL_TENANT_SCOPED_TABLES.map((tableName) => tenantRlsSql(tableName)).join("\n\n");
 export const TENANT_RLS_SQL = TENANT_SCOPED_TABLES.map((tableName) => tenantRlsSql(tableName)).join("\n\n");
 
 export const APPEND_ONLY_SQL = `
@@ -1499,7 +1966,7 @@ SET name = excluded.name,
 export const CLOUD_INITIAL_MIGRATION = [
   CLOUD_SCHEMA_SQL,
   TENANT_CONTEXT_SQL,
-  TENANT_RLS_SQL,
+  INITIAL_TENANT_RLS_SQL,
   APPEND_ONLY_SQL,
   SELF_HOST_SEED_SQL,
 ].join("\n\n");
@@ -2529,6 +2996,457 @@ CREATE INDEX IF NOT EXISTS files_display_name_original_name_trgm_idx
   WHERE deleted_at IS NULL AND status IN ('available', 'processing');
 `.trim();
 
+export const DURABLE_CONTEXT_MIGRATION = `
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE memory_settings (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  memory_enabled boolean NOT NULL DEFAULT true,
+  implicit_memory_enabled boolean NOT NULL DEFAULT true,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE TABLE memory_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workspace_id uuid REFERENCES workspaces(id) ON DELETE CASCADE,
+  scope text NOT NULL DEFAULT 'personal' CHECK (scope IN ('personal', 'project')),
+  kind text NOT NULL,
+  stable_key text NOT NULL,
+  content text NOT NULL,
+  structured_value jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded', 'forgotten', 'expired', 'rejected')),
+  explicit boolean NOT NULL DEFAULT false,
+  confidence numeric(5,4) NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+  salience numeric(5,4) NOT NULL DEFAULT 0.5 CHECK (salience >= 0 AND salience <= 1),
+  valid_from timestamptz,
+  valid_until timestamptz,
+  expires_at timestamptz,
+  extractor_version text NOT NULL DEFAULT 'v1',
+  source_task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  source_session_id uuid REFERENCES sessions(id) ON DELETE SET NULL,
+  source_message_id uuid REFERENCES messages(id) ON DELETE SET NULL,
+  superseded_item_id uuid REFERENCES memory_items(id) ON DELETE SET NULL,
+  last_seen_at timestamptz,
+  last_used_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT memory_items_scope_workspace_check CHECK (
+    (scope = 'personal' AND workspace_id IS NULL) OR
+    (scope = 'project' AND workspace_id IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX memory_items_active_key_unique
+  ON memory_items (tenant_id, user_id, COALESCE(workspace_id, '00000000-0000-0000-0000-000000000000'::uuid), stable_key)
+  WHERE status = 'active';
+CREATE INDEX memory_items_recall_idx ON memory_items (tenant_id, user_id, workspace_id, status, salience DESC);
+CREATE INDEX memory_items_expiry_idx ON memory_items (tenant_id, expires_at) WHERE expires_at IS NOT NULL;
+
+CREATE TABLE memory_item_versions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  memory_item_id uuid NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+  operation text NOT NULL CHECK (operation IN ('ADD', 'SUPERSEDE', 'REFRESH', 'NOOP', 'FORGET')),
+  before_value jsonb,
+  after_value jsonb,
+  actor_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  source_task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  source_session_id uuid REFERENCES sessions(id) ON DELETE SET NULL,
+  source_message_id uuid REFERENCES messages(id) ON DELETE SET NULL,
+  extractor_version text,
+  reason text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX memory_item_versions_item_created_idx ON memory_item_versions (tenant_id, memory_item_id, created_at DESC);
+
+CREATE TABLE workspace_files (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  file_id uuid NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  visibility text NOT NULL DEFAULT 'project' CHECK (visibility IN ('project', 'task_only')),
+  originating_task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  index_status text NOT NULL DEFAULT 'pending' CHECK (index_status IN ('pending', 'extracting', 'chunking', 'embedding', 'indexed', 'failed', 'deleted')),
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz,
+  UNIQUE (tenant_id, workspace_id, file_id)
+);
+CREATE INDEX workspace_files_list_idx ON workspace_files (tenant_id, workspace_id, visibility, index_status, created_at DESC)
+  WHERE deleted_at IS NULL;
+
+CREATE TABLE knowledge_sources (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  source_type text NOT NULL CHECK (source_type IN ('file', 'task_outcome', 'message', 'checkpoint', 'memory')),
+  source_id text NOT NULL,
+  source_revision text NOT NULL,
+  content_hash text NOT NULL,
+  title text NOT NULL,
+  authority numeric(5,4) NOT NULL DEFAULT 0.5 CHECK (authority >= 0 AND authority <= 1),
+  visibility text NOT NULL DEFAULT 'project' CHECK (visibility IN ('project', 'task_only', 'private')),
+  acl_version integer NOT NULL DEFAULT 1,
+  extraction_status text NOT NULL DEFAULT 'pending',
+  index_status text NOT NULL DEFAULT 'pending',
+  vector_ready boolean NOT NULL DEFAULT false,
+  extractor_version text NOT NULL DEFAULT 'v1',
+  chunker_version text NOT NULL DEFAULT 'v1',
+  failure_reason text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  tombstoned_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, workspace_id, source_type, source_id, source_revision)
+);
+CREATE INDEX knowledge_sources_active_idx ON knowledge_sources (tenant_id, workspace_id, index_status, source_type)
+  WHERE tombstoned_at IS NULL;
+CREATE INDEX knowledge_sources_cleanup_idx ON knowledge_sources (tenant_id, tombstoned_at)
+  WHERE tombstoned_at IS NOT NULL;
+
+CREATE TABLE knowledge_chunks (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  source_id uuid NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+  ordinal integer NOT NULL CHECK (ordinal >= 0),
+  text_content text NOT NULL,
+  token_estimate integer NOT NULL DEFAULT 0 CHECK (token_estimate >= 0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  search_document tsvector GENERATED ALWAYS AS (to_tsvector('simple', COALESCE(text_content, ''))) STORED,
+  embedding vector(1536),
+  embedding_profile_id text,
+  embedding_provider text,
+  embedding_model text,
+  embedding_dimensions integer,
+  embedding_profile_version integer,
+  embedding_hash text,
+  vector_ready boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (source_id, ordinal),
+  CONSTRAINT knowledge_chunks_embedding_dimensions_check CHECK (
+    embedding IS NULL OR embedding_dimensions = 1536
+  )
+);
+CREATE INDEX knowledge_chunks_scope_idx ON knowledge_chunks (tenant_id, workspace_id, source_id);
+CREATE INDEX knowledge_chunks_search_idx ON knowledge_chunks USING gin (search_document);
+CREATE INDEX knowledge_chunks_vector_ready_idx ON knowledge_chunks (tenant_id, workspace_id, vector_ready)
+  WHERE vector_ready = true;
+
+CREATE TABLE retrieval_snapshots (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  session_id uuid REFERENCES sessions(id) ON DELETE SET NULL,
+  run_id uuid,
+  query_hash text NOT NULL,
+  candidates jsonb NOT NULL DEFAULT '[]'::jsonb,
+  selected_source_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  selected_chunk_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  component_scores jsonb NOT NULL DEFAULT '{}'::jsonb,
+  selection_reason text,
+  token_budget integer NOT NULL CHECK (token_budget >= 0),
+  tokens_selected integer NOT NULL DEFAULT 0 CHECK (tokens_selected >= 0),
+  retrieval_version text NOT NULL,
+  embedding_profile_id text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX retrieval_snapshots_turn_idx ON retrieval_snapshots (tenant_id, session_id, created_at DESC);
+CREATE INDEX retrieval_snapshots_workspace_idx ON retrieval_snapshots (tenant_id, workspace_id, created_at DESC);
+
+CREATE TABLE session_entries (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  entry_id text NOT NULL,
+  parent_entry_id text,
+  entry_type text NOT NULL,
+  sequence bigint NOT NULL,
+  payload jsonb NOT NULL,
+  is_leaf_marker boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, session_id, entry_id),
+  UNIQUE (tenant_id, session_id, sequence)
+);
+CREATE INDEX session_entries_parent_idx ON session_entries (tenant_id, session_id, parent_entry_id);
+
+CREATE TABLE session_checkpoints (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  kind text NOT NULL CHECK (kind IN ('segment', 'rolling')),
+  source_leaf_id text NOT NULL,
+  covered_entry_start text,
+  covered_entry_end text,
+  schema_version integer NOT NULL DEFAULT 2,
+  checkpoint jsonb NOT NULL,
+  validation_status text NOT NULL DEFAULT 'valid',
+  model_provider text,
+  model text,
+  prompt_manifest_hash text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, session_id, kind, source_leaf_id, covered_entry_end, schema_version)
+);
+CREATE INDEX session_checkpoints_latest_idx ON session_checkpoints (tenant_id, session_id, created_at DESC);
+
+CREATE TABLE turn_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  request_message_id uuid REFERENCES messages(id) ON DELETE SET NULL,
+  state text NOT NULL DEFAULT 'queued' CHECK (state IN (
+    'queued', 'assembling_context', 'calling_model', 'persisting_response',
+    'executing_tool', 'compacting', 'waiting', 'finalizing', 'completed',
+    'failed', 'cancelled', 'recovery_required'
+  )),
+  attempt integer NOT NULL DEFAULT 0,
+  lease_owner text,
+  lease_expires_at timestamptz,
+  next_action text,
+  waiting_reason text,
+  heartbeat_at timestamptz,
+  error text,
+  runtime_request jsonb NOT NULL DEFAULT '{}'::jsonb,
+  grounding_context jsonb NOT NULL DEFAULT '{}'::jsonb,
+  prompt_manifest jsonb NOT NULL DEFAULT '{}'::jsonb,
+  sandbox_provider text,
+  sandbox_id text,
+  sandbox_state text,
+  sandbox_heartbeat_at timestamptz,
+  cancelled_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX turn_runs_claim_idx ON turn_runs (tenant_id, state, lease_expires_at);
+CREATE INDEX turn_runs_session_idx ON turn_runs (tenant_id, session_id, created_at DESC);
+CREATE UNIQUE INDEX turn_runs_active_session_unique ON turn_runs (tenant_id, session_id)
+  WHERE state NOT IN ('completed', 'failed', 'cancelled', 'recovery_required');
+
+ALTER TABLE retrieval_snapshots
+  ADD CONSTRAINT retrieval_snapshots_run_fk FOREIGN KEY (run_id) REFERENCES turn_runs(id) ON DELETE SET NULL;
+
+CREATE TABLE turn_steps (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES turn_runs(id) ON DELETE CASCADE,
+  sequence integer NOT NULL CHECK (sequence >= 0),
+  step_type text NOT NULL,
+  state text NOT NULL DEFAULT 'pending',
+  input jsonb NOT NULL DEFAULT '{}'::jsonb,
+  output jsonb,
+  retry_class text CHECK (retry_class IS NULL OR retry_class IN ('read_only', 'idempotent', 'idempotent_with_key', 'non_idempotent_manual')),
+  idempotency_key text,
+  attempt integer NOT NULL DEFAULT 0,
+  error text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT turn_events_run_sequence_unique UNIQUE (tenant_id, run_id, sequence)
+);
+CREATE UNIQUE INDEX turn_steps_idempotency_unique ON turn_steps (tenant_id, run_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+CREATE INDEX turn_steps_state_idx ON turn_steps (tenant_id, state, created_at);
+
+CREATE TABLE turn_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES turn_runs(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  sequence bigint NOT NULL,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, run_id, sequence)
+);
+CREATE INDEX turn_events_session_sequence_idx ON turn_events (tenant_id, session_id, sequence);
+CREATE INDEX turn_events_retention_idx ON turn_events (tenant_id, created_at);
+
+CREATE TABLE runtime_outbox (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  event_type text NOT NULL,
+  aggregate_id text NOT NULL,
+  dedupe_key text NOT NULL,
+  payload jsonb NOT NULL,
+  available_at timestamptz NOT NULL DEFAULT now(),
+  attempts integer NOT NULL DEFAULT 0,
+  lease_owner text,
+  lease_expires_at timestamptz,
+  completed_at timestamptz,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, dedupe_key)
+);
+CREATE INDEX runtime_outbox_due_idx ON runtime_outbox (tenant_id, completed_at, available_at, lease_expires_at);
+
+CREATE TABLE sandbox_snapshots (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES turn_runs(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  sandbox_provider text NOT NULL,
+  sandbox_id text NOT NULL,
+  storage_file_id uuid REFERENCES files(id) ON DELETE SET NULL,
+  object_key text NOT NULL,
+  content_hash text NOT NULL,
+  sequence integer NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'uploading', 'complete', 'failed', 'deleted')),
+  session_leaf_id text,
+  failure_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  UNIQUE (tenant_id, run_id, sequence)
+);
+CREATE INDEX sandbox_snapshots_restore_idx ON sandbox_snapshots (tenant_id, run_id, status, sequence DESC);
+
+ALTER TABLE usage_events
+  ADD COLUMN cache_read_tokens integer NOT NULL DEFAULT 0,
+  ADD COLUMN cache_write_tokens integer NOT NULL DEFAULT 0,
+  ADD COLUMN cache_creation_tokens_1h integer NOT NULL DEFAULT 0,
+  ADD COLUMN cache_creation_tokens_5m integer NOT NULL DEFAULT 0,
+  ADD COLUMN cache_eligible boolean NOT NULL DEFAULT false,
+  ADD COLUMN cache_provider text,
+  ADD COLUMN cache_key_hash text,
+  ADD COLUMN prompt_manifest_hash text,
+  ADD COLUMN cache_miss_reason text;
+
+ALTER TABLE usage_rollups
+  ADD COLUMN cache_read_tokens integer NOT NULL DEFAULT 0,
+  ADD COLUMN cache_write_tokens integer NOT NULL DEFAULT 0;
+
+${DURABLE_CONTEXT_TABLES.map((tableName) => tenantRlsSql(tableName)).join("\n\n")}
+
+CREATE TRIGGER memory_item_versions_reject_update
+BEFORE UPDATE ON memory_item_versions
+FOR EACH ROW EXECUTE FUNCTION berry_reject_append_only_mutation();
+CREATE TRIGGER memory_item_versions_reject_delete
+BEFORE DELETE ON memory_item_versions
+FOR EACH ROW EXECUTE FUNCTION berry_reject_append_only_mutation();
+`.trim();
+
+export const SESSION_COMPACTION_LEASES_MIGRATION = `
+CREATE TABLE session_compaction_leases (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  lease_owner text NOT NULL,
+  lease_expires_at timestamptz NOT NULL,
+  heartbeat_at timestamptz NOT NULL,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, session_id)
+);
+CREATE INDEX session_compaction_leases_expiry_idx
+  ON session_compaction_leases (tenant_id, lease_expires_at);
+
+${tenantRlsSql("session_compaction_leases")}
+`.trim();
+
+export const DURABLE_TURN_BINDINGS_MIGRATION = `
+ALTER TABLE sessions
+  ADD COLUMN runtime_metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE turn_runs
+  ADD COLUMN version integer NOT NULL DEFAULT 0;
+
+ALTER TABLE turn_steps
+  ADD COLUMN session_entry_id text,
+  ADD COLUMN checkpoint_id uuid REFERENCES session_checkpoints(id) ON DELETE SET NULL;
+
+ALTER TABLE session_entries
+  ADD COLUMN run_id uuid REFERENCES turn_runs(id) ON DELETE SET NULL,
+  ADD COLUMN step_id uuid REFERENCES turn_steps(id) ON DELETE SET NULL,
+  ADD COLUMN checkpoint_id uuid REFERENCES session_checkpoints(id) ON DELETE SET NULL;
+CREATE INDEX session_entries_run_idx
+  ON session_entries (tenant_id, run_id, sequence);
+
+ALTER TABLE tool_calls
+  ADD COLUMN run_id uuid REFERENCES turn_runs(id) ON DELETE CASCADE,
+  ADD COLUMN step_id uuid REFERENCES turn_steps(id) ON DELETE SET NULL,
+  ADD COLUMN retry_class text CHECK (
+    retry_class IS NULL OR retry_class IN (
+      'read_only', 'idempotent', 'idempotent_with_key', 'non_idempotent_manual'
+    )
+  ),
+  ADD COLUMN idempotency_key text;
+CREATE INDEX tool_calls_run_idx ON tool_calls (tenant_id, run_id, created_at);
+
+ALTER TABLE approvals
+  ADD COLUMN run_id uuid REFERENCES turn_runs(id) ON DELETE CASCADE,
+  ADD COLUMN step_id uuid REFERENCES turn_steps(id) ON DELETE SET NULL;
+CREATE INDEX approvals_run_idx ON approvals (tenant_id, run_id, created_at);
+`.trim();
+
+export const DURABLE_TURN_QUESTIONS_MIGRATION = `
+CREATE TABLE turn_questions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES turn_runs(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  step_id uuid REFERENCES turn_steps(id) ON DELETE SET NULL,
+  tool_call_id uuid REFERENCES tool_calls(id) ON DELETE SET NULL,
+  question text NOT NULL,
+  options jsonb NOT NULL DEFAULT '[]'::jsonb,
+  questions jsonb NOT NULL DEFAULT '[]'::jsonb,
+  multi boolean NOT NULL DEFAULT false,
+  status text NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','answered','cancelled','expired')),
+  answer jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  answered_at timestamptz
+);
+CREATE INDEX turn_questions_session_status_idx
+  ON turn_questions (tenant_id, session_id, status, created_at);
+CREATE INDEX turn_questions_run_idx
+  ON turn_questions (tenant_id, run_id, created_at);
+
+${tenantRlsSql("turn_questions")}
+`.trim();
+
+export const MESSAGE_CITATIONS_MIGRATION = `
+ALTER TYPE message_part_kind ADD VALUE IF NOT EXISTS 'citation';
+`.trim();
+
+export const MAINTENANCE_RUNS_MIGRATION = `
+CREATE TABLE maintenance_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  kind text NOT NULL CHECK (kind IN ('context_backfill','retention_cleanup')),
+  status text NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued','running','completed','failed','cancelled')),
+  cursor jsonb NOT NULL DEFAULT '{}'::jsonb,
+  scanned_count bigint NOT NULL DEFAULT 0 CHECK (scanned_count >= 0),
+  changed_count bigint NOT NULL DEFAULT 0 CHECK (changed_count >= 0),
+  enqueued_count bigint NOT NULL DEFAULT 0 CHECK (enqueued_count >= 0),
+  failure_count integer NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+  last_error text,
+  requested_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX maintenance_runs_tenant_status_idx
+  ON maintenance_runs (tenant_id, status, updated_at DESC);
+
+${tenantRlsSql("maintenance_runs")}
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -2614,4 +3532,10 @@ export const cloudMigrations = [
   { id: 24, name: "remove_queued_follow_ups_v1", sql: REMOVE_QUEUED_FOLLOW_UPS_MIGRATION },
   { id: 25, name: "message_sequence_v1", sql: MESSAGE_SEQUENCE_MIGRATION },
   { id: 26, name: "file_library_search_v1", sql: FILE_LIBRARY_SEARCH_MIGRATION },
+  { id: 27, name: "durable_context_memory_knowledge_runner_v1", sql: DURABLE_CONTEXT_MIGRATION },
+  { id: 28, name: "session_compaction_leases_v1", sql: SESSION_COMPACTION_LEASES_MIGRATION },
+  { id: 29, name: "durable_turn_bindings_v1", sql: DURABLE_TURN_BINDINGS_MIGRATION },
+  { id: 30, name: "durable_turn_questions_v1", sql: DURABLE_TURN_QUESTIONS_MIGRATION },
+  { id: 31, name: "message_citations_v1", sql: MESSAGE_CITATIONS_MIGRATION },
+  { id: 32, name: "maintenance_runs_v1", sql: MAINTENANCE_RUNS_MIGRATION },
 ] as const;

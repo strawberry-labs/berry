@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { message } from "./fixtures";
-import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileFetchedSessionMessages } from "./message-reconciliation";
+import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileDurableEventCursor, reconcileFetchedSessionMessages } from "./message-reconciliation";
 
 describe("reconcileFetchedSessionMessages", () => {
   it("keeps a just-submitted prompt when a route-load response is stale", () => {
@@ -62,5 +62,24 @@ describe("reconcileFetchedSessionMessages", () => {
 
     expect(confirmOptimisticMessage([local], local.id, persisted)).toEqual([persisted]);
     expect(confirmOptimisticMessage([persisted, local], local.id, persisted)).toEqual([persisted]);
+  });
+});
+
+describe("reconcileDurableEventCursor", () => {
+  it("accepts increasing event sequences and rejects replay overlap per run", () => {
+    const first = reconcileDurableEventCursor({}, "ba2f8d43-c491-4318-b0dc-f60b7d4b8360:7");
+    const duplicate = reconcileDurableEventCursor(first.sequences, "ba2f8d43-c491-4318-b0dc-f60b7d4b8360:7");
+    const next = reconcileDurableEventCursor(first.sequences, "ba2f8d43-c491-4318-b0dc-f60b7d4b8360:8");
+    const otherRun = reconcileDurableEventCursor(first.sequences, "d3ddcd40-e234-41f7-94b6-c55eef7d3492:1");
+
+    expect(first.accepted).toBe(true);
+    expect(duplicate.accepted).toBe(false);
+    expect(next.accepted).toBe(true);
+    expect(otherRun.accepted).toBe(true);
+  });
+
+  it("fails open for legacy streams without a durable cursor", () => {
+    expect(reconcileDurableEventCursor({}, null).accepted).toBe(true);
+    expect(reconcileDurableEventCursor({}, "legacy-event-id").accepted).toBe(true);
   });
 });

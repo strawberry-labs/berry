@@ -1,6 +1,6 @@
 import type { OrgPermission } from "@berry/shared";
 import {
-  Activity, Blocks, Boxes, Building2, CreditCard, Database, FileClock, Flag, GitBranch,
+  Activity, Blocks, Boxes, Brain, Building2, CreditCard, Database, FileClock, Flag, GitBranch,
   KeyRound, Landmark, LayoutDashboard, LineChart, ListChecks, Lock, MessageSquareText,
   Network, Puzzle, ScrollText, ShieldCheck, SlidersHorizontal, Terminal, UserCog, Users, Wallet,
   type LucideIcon,
@@ -19,6 +19,7 @@ export const PERSONAL_NAV: NavGroup[] = [
     { id: "prompts", label: "Prompts & commands", icon: Terminal },
   ] },
   { label: "Account & data", items: [
+    { id: "memory", label: "Memory", icon: Brain },
     { id: "privacy", label: "Privacy & permissions", icon: ShieldCheck },
     { id: "usage", label: "My usage", icon: LineChart },
     { id: "archived", label: "Archived chats", icon: MessageSquareText },

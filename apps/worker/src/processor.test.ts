@@ -76,4 +76,25 @@ describe("processBerryWorkerJob", () => {
     }, dependencies)).rejects.toThrow();
     expect(dependencies.titles.updates).toEqual([]);
   });
+
+  it("dispatches bounded maintenance jobs through the typed worker path", async () => {
+    const dependencies = testDependencies();
+    const calls: string[] = [];
+    dependencies.maintenance = {
+      async backfill(payload) {
+        calls.push(`backfill:${payload.batchSize}:${payload.generation}`);
+        return { runId: payload.runId, status: "running", phase: "file_sources", scanned: 50, changed: 20, enqueued: 20 };
+      },
+      async cleanup(payload) {
+        calls.push(`cleanup:${payload.eventRetentionDays}:${payload.batchSize}`);
+        return { runId: payload.runId, status: "completed", phase: "done", scanned: 4, changed: 4, enqueued: 0 };
+      },
+    };
+    const runId = "00000000-0000-7000-8000-000000000099";
+
+    await processBerryWorkerJob("context.backfill", { tenantId, runId, batchSize: 50 }, dependencies);
+    await processBerryWorkerJob("context.cleanup", { tenantId, runId, batchSize: 25 }, dependencies);
+
+    expect(calls).toEqual(["backfill:50:0", "cleanup:30:25"]);
+  });
 });

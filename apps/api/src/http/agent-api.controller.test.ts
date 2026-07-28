@@ -8,6 +8,7 @@ import request from "supertest";
 import { firstValueFrom, take } from "rxjs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentApiModule } from "./agent-api.module.ts";
+import { CloudDatabaseModule } from "../db/cloud-database.module.ts";
 import { InMemoryCloudTaskStore, type CloudTaskStore } from "./cloud-task-store.ts";
 import { ApiEventStreamService } from "./event-stream.service.ts";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
@@ -519,7 +520,19 @@ describe("AgentApiController", () => {
     });
     const reconcile = vi.spyOn(budget, "reconcile");
     const startTurn = vi.fn((options: StartTurnOptions) => {
-      options.onEvent({ kind: "usage", inputTokens: 10, outputTokens: 5, servedProvider: "router", servedModel: "gpt-test" });
+      options.onEvent({
+        kind: "usage",
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 4,
+        cacheWriteTokens: 6,
+        cacheEligible: true,
+        cacheProvider: "router",
+        cacheKeyHash: "cache-hash",
+        promptManifestHash: "manifest-hash",
+        servedProvider: "router",
+        servedModel: "gpt-test",
+      });
       options.onEvent({ kind: "turn.end", turnId: "turn_budget_ok", status: "completed" });
       return { turnId: "turn_budget_ok" };
     });
@@ -549,6 +562,10 @@ describe("AgentApiController", () => {
         model: "gpt-test",
         tokensIn: 10,
         tokensOut: 5,
+        tokensCached: 4,
+        cacheReadTokens: 4,
+        cacheWriteTokens: 6,
+        promptManifestHash: "manifest-hash",
         status: "completed",
       }),
     ]);
@@ -811,13 +828,22 @@ describe("AgentApiController", () => {
 
 async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined } = {}): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
-    imports: [AgentApiModule.register({
+    imports: [
+      CloudDatabaseModule.register({
+        useValue: {
+          execute: async () => undefined,
+          query: async <T,>(sql: string): Promise<readonly T[]> =>
+            (sql.includes("FROM workspaces") ? [{ id: "workspace_cloud" }] : []) as T[],
+        },
+      }),
+      AgentApiModule.register({
       sessionHost: { useValue: sessionHost },
       auth: { useValue: fakeAuthRuntime() },
       ...(options.taskStore ? { taskStore: { useValue: options.taskStore } } : {}),
       ...(options.budget ? { budget: { service: { useValue: options.budget } } } : {}),
       ...(options.modelGovernance ? { modelGovernance: { service: { useValue: options.modelGovernance } } } : {}),
-    })],
+      }),
+    ],
   })
     .overrideProvider(FilePlatformService)
     .useValue(fakeFilePlatformService)

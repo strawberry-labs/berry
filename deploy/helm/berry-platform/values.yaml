@@ -32,6 +32,28 @@ worker:
     maxReplicas: 6
     targetCPUUtilizationPercentage: 75
 
+tika:
+  enabled: true
+  image: apache/tika:3.2.3.0-full
+  port: 9998
+
+durableContext:
+  memoryEnabled: true
+  implicitMemoryEnabled: true
+  projectKnowledgeEnabled: true
+  promptCacheEnabled: true
+  durableRunnerEnabled: true
+  embeddingProvider: openai-compatible
+  embeddingModel: text-embedding-3-small
+  embeddingDimensions: 1536
+  embeddingProfileVersion: 1
+  chunkTokens: 600
+  chunkOverlapTokens: 80
+  retrievalTokenBudget: 5000
+  compactionTriggerTokens: 120000
+  runLeaseSeconds: 90
+  snapshotIntervalSeconds: 900
+
 external:
   postgres:
     url: ""
@@ -87,6 +109,10 @@ billing:
 router:
   inferenceBaseUrl: ""
   completionTransport: stream
+  providerId: router
+  chatCompletionsPath: /chat/completions
+  defaultModel: berry/auto
+  modelsJson: "[]"
   existingSecret: berry-router
   apiKeyKey: BERRY_ROUTER_API_KEY
 

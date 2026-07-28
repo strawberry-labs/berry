@@ -28,6 +28,7 @@
 		"test": "vitest --run --passWithNoTests"
 	},
 	"dependencies": {
+		"@berry/shared": "workspace:*",
 		"@earendil-works/pi-ai": "0.80.3",
 		"ignore": "7.0.5",
 		"typebox": "1.1.38",

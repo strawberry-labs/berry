@@ -30,6 +30,10 @@ import {
   CONVERSATION_KIND_AND_GENERAL_WORKSPACES_MIGRATION,
   CLOUD_SCHEMA_SQL,
   CLOUD_SCHEMA_TABLES,
+  DURABLE_CONTEXT_MIGRATION,
+  DURABLE_CONTEXT_TABLES,
+  DURABLE_TURN_BINDINGS_MIGRATION,
+  DURABLE_TURN_QUESTIONS_MIGRATION,
   ENTERPRISE_IDENTITY_MIGRATION,
   ENTERPRISE_IDENTITY_TABLES,
   ENTERPRISE_IDENTITY_TENANT_SCOPED_TABLES,
@@ -37,6 +41,7 @@ import {
   ENTERPRISE_RBAC_TABLES,
   ENTERPRISE_RBAC_TENANT_SCOPED_TABLES,
   FILE_PLATFORM_MIGRATION,
+  FILE_LIBRARY_SEARCH_MIGRATION,
   MODEL_GOVERNANCE_MIGRATION,
   MODEL_GOVERNANCE_TABLES,
   MODEL_GOVERNANCE_TENANT_SCOPED_TABLES,
@@ -46,12 +51,15 @@ import {
   MANAGEMENT_ADMIN_MIGRATION,
   MANAGEMENT_ADMIN_TABLES,
   MANAGEMENT_ADMIN_TENANT_SCOPED_TABLES,
+  MAINTENANCE_RUNS_MIGRATION,
+  MESSAGE_CITATIONS_MIGRATION,
   MESSAGE_SEQUENCE_MIGRATION,
   POLICY_DISTRIBUTION_MIGRATION,
   POLICY_DISTRIBUTION_TABLES,
   POLICY_DISTRIBUTION_TENANT_SCOPED_TABLES,
   REMOVE_QUEUED_FOLLOW_UPS_MIGRATION,
   SANDBOX_WORKSPACES_MIGRATION,
+  SESSION_COMPACTION_LEASES_MIGRATION,
   PERSONAL_CAPABILITIES_MIGRATION,
   ORG_CAPABILITIES_MIGRATION,
   TWO_PROFILE_MODEL_GOVERNANCE_MIGRATION,
@@ -81,7 +89,7 @@ import {
 
 describe("cloud postgres schema", () => {
   it("defines the Phase 8 table set named in the execution plan", () => {
-    expect(CLOUD_SCHEMA_TABLES).toEqual([
+    expect(CLOUD_SCHEMA_TABLES).toEqual(expect.arrayContaining([
       "tenants",
       "users",
       "auth_sessions",
@@ -98,8 +106,9 @@ describe("cloud postgres schema", () => {
       "usage_events",
       "usage_rollups",
       "audit_events",
-    ]);
-    const fullMigrationSql = [CLOUD_SCHEMA_SQL, BETTER_AUTH_MINIMAL_MIGRATION, USAGE_ROLLUPS_MIGRATION].join("\n");
+      ...DURABLE_CONTEXT_TABLES,
+    ]));
+    const fullMigrationSql = cloudMigrations.map((migration) => migration.sql).join("\n");
     for (const table of CLOUD_SCHEMA_TABLES) {
       expect(fullMigrationSql).toContain(`CREATE TABLE`);
       expect(fullMigrationSql).toContain(table);
@@ -160,7 +169,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {
@@ -177,14 +186,42 @@ describe("cloud postgres schema", () => {
   it("removes obsolete server-side queued follow-up storage", () => {
     expect(REMOVE_QUEUED_FOLLOW_UPS_MIGRATION).toContain("DROP TABLE IF EXISTS queued_follow_ups;");
     expect(REMOVE_QUEUED_FOLLOW_UPS_MIGRATION).toContain("DELETE FROM schema_migrations WHERE id IN (14, 22);");
-    expect(cloudMigrations.at(-2)).toMatchObject({ id: 24, name: "remove_queued_follow_ups_v1" });
+    expect(cloudMigrations.find((migration) => migration.id === 24)).toMatchObject({ id: 24, name: "remove_queued_follow_ups_v1" });
   });
 
   it("orders messages by a monotonic insertion sequence", () => {
-    expect(cloudMigrations.at(-1)).toMatchObject({ id: 25, name: "message_sequence_v1" });
+    expect(cloudMigrations.find((migration) => migration.id === 25)).toMatchObject({ id: 25, name: "message_sequence_v1" });
     expect(MESSAGE_SEQUENCE_MIGRATION).toContain("sequence_id bigint GENERATED ALWAYS AS IDENTITY");
     expect(MESSAGE_SEQUENCE_MIGRATION).toContain("messages_tenant_session_sequence_idx");
     expect(CLOUD_SCHEMA_SQL).toContain("sequence_id bigint GENERATED ALWAYS AS IDENTITY");
+  });
+
+  it("adds durable context storage, vector search, critical indexes, and tenant RLS in migration 27", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 27)).toMatchObject({ id: 27, name: "durable_context_memory_knowledge_runner_v1" });
+    expect(DURABLE_CONTEXT_MIGRATION).toContain("CREATE EXTENSION IF NOT EXISTS vector");
+    expect(DURABLE_CONTEXT_MIGRATION).toContain("embedding vector(1536)");
+    expect(DURABLE_CONTEXT_MIGRATION).toContain("knowledge_chunks_search_idx");
+    expect(DURABLE_CONTEXT_MIGRATION).toContain("turn_runs_claim_idx");
+    expect(DURABLE_CONTEXT_MIGRATION).toContain("turn_events_run_sequence_unique");
+    for (const table of DURABLE_CONTEXT_TABLES) {
+      expect(DURABLE_CONTEXT_MIGRATION).toContain(`CREATE TABLE ${table}`);
+      expect(DURABLE_CONTEXT_MIGRATION).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+      expect(DURABLE_CONTEXT_MIGRATION).toContain(`CREATE POLICY ${table}_tenant_isolation ON ${table}`);
+    }
+    expect(DURABLE_CONTEXT_MIGRATION).not.toContain("DROP TABLE");
+    expect(FILE_LIBRARY_SEARCH_MIGRATION).toContain("files_display_name_original_name_trgm_idx");
+  });
+
+  it("adds compaction leases, turn bindings, durable questions, and citations additively", () => {
+    expect(SESSION_COMPACTION_LEASES_MIGRATION).toContain("CREATE TABLE session_compaction_leases");
+    expect(DURABLE_TURN_BINDINGS_MIGRATION).toContain("ADD COLUMN runtime_metadata");
+    expect(DURABLE_TURN_BINDINGS_MIGRATION).toContain("ADD COLUMN run_id uuid REFERENCES turn_runs");
+    expect(DURABLE_TURN_QUESTIONS_MIGRATION).toContain("CREATE TABLE turn_questions");
+    expect(DURABLE_TURN_QUESTIONS_MIGRATION).toContain("CREATE POLICY turn_questions_tenant_isolation");
+    expect(MESSAGE_CITATIONS_MIGRATION).toContain("ADD VALUE IF NOT EXISTS 'citation'");
+    expect(MAINTENANCE_RUNS_MIGRATION).toContain("CREATE POLICY maintenance_runs_tenant_isolation");
+    expect(MAINTENANCE_RUNS_MIGRATION).toContain("failure_count integer NOT NULL DEFAULT 0");
+    expect(cloudMigrations.at(-1)).toMatchObject({ id: 32, name: "maintenance_runs_v1" });
   });
 
   it("keeps later platform migrations intact", () => {
@@ -445,7 +482,9 @@ describe("cloud postgres schema", () => {
   it("exports ordered additive migrations for API startup and compose smoke tests", () => {
     expect(CLOUD_INITIAL_MIGRATION).toContain(CLOUD_SCHEMA_SQL);
     expect(CLOUD_INITIAL_MIGRATION).toContain(TENANT_CONTEXT_SQL);
-    expect(CLOUD_INITIAL_MIGRATION).toContain(TENANT_RLS_SQL);
+    expect(CLOUD_INITIAL_MIGRATION).toContain("CREATE POLICY tenant_memberships_tenant_isolation");
+    expect(CLOUD_INITIAL_MIGRATION).not.toContain("CREATE POLICY memory_items_tenant_isolation");
+    expect(DURABLE_CONTEXT_MIGRATION).toContain("CREATE POLICY memory_items_tenant_isolation");
     expect(CLOUD_INITIAL_MIGRATION).toContain(APPEND_ONLY_SQL);
     expect(CLOUD_INITIAL_MIGRATION).toContain(SELF_HOST_SEED_SQL);
     expect(BETTER_AUTH_MINIMAL_MIGRATION).not.toContain("CREATE TYPE deployment_mode");

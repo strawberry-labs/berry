@@ -36,3 +36,25 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.external.redis.existingSecret }}
                   key: {{ .Values.external.redis.secretKey }}
+            - name: BERRY_ROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.router.existingSecret }}
+                  key: {{ .Values.router.apiKeyKey }}
+            {{ if eq .Values.sandbox.provider "e2b" }}
+            - name: E2B_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sandbox.existingSecret }}
+                  key: {{ .Values.sandbox.apiKeyKey }}
+            {{ end }}
+            - name: BERRY_ARTIFACT_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.s3.existingSecret }}
+                  key: {{ .Values.external.s3.accessKeyIdKey }}
+            - name: BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.s3.existingSecret }}
+                  key: {{ .Values.external.s3.secretAccessKeyKey }}

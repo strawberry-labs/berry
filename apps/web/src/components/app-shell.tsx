@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -36,13 +36,14 @@ import {
 import { FileSearch as FileSearchIcon } from "lucide-react";
 import { AtSign, Brain, Check, CircleHelp, ChevronDown, Ellipsis, FileText, GitBranch, Hand, Hash, ImagePlus, NotebookPen, PencilLine, Pin, PinOff, ShieldCheck, SlashSquare, Zap } from "@berry/desktop-ui/lib/icons";
 import { fixtureMessages, fixtureTasks, message } from "@/lib/fixtures";
-import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileFetchedSessionMessages } from "@/lib/message-reconciliation";
+import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileDurableEventCursor, reconcileFetchedSessionMessages, type DurableEventSequences } from "@/lib/message-reconciliation";
 import { WebConfigSchema, type WebConfig } from "@/lib/config";
 import { parseCloudShellLocation, type ArtifactLibraryTab, type UserSettingsTab } from "@/lib/cloud-shell-state";
 import { MentionMenu, useStaticMentions } from "./mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "./prompt-editor";
 import { AuthBoundary, type SignedInUser } from "./shell/auth-boundary";
 import { TaskRouteState } from "./tasks/task-route-state";
+import { DurableRunStatus } from "./tasks/durable-run-status";
 import { Composer } from "./tasks/web-composer";
 import { Thread } from "./tasks/web-task-view";
 import { planProgressFromConversation } from "./tasks/plan-progress-pill";
@@ -186,6 +187,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const managementKind: ManagementKind = shellLocation.kind === "admin" ? "admin" : shellLocation.kind === "platform" ? "platform" : "settings";
   const managementTab = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? shellLocation.tab : "general";
   const [streamsBySession, setStreamsBySession] = React.useState<Record<string, StreamState>>({});
+  const [durableStatesBySession, setDurableStatesBySession] = React.useState<Record<string, TurnState>>({});
   const [imageGenerationBySession, setImageGenerationBySession] = React.useState<Record<string, ImageGenerationState | null>>({});
   const [startingSessions, setStartingSessions] = React.useState<Set<string>>(() => new Set());
   const permissionMode = "full-access" satisfies PermissionMode;
@@ -243,6 +245,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const activeSessionId = activeTask?.activeSessionId ?? null;
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
   const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
+  const durableState = activeSessionId ? durableStatesBySession[activeSessionId] : undefined;
   const turnBusy = activeSessionId ? startingSessions.has(activeSessionId) : false;
 
   const replaceSessionMessages = React.useCallback((sessionId: string, next: Message[] | ((current: Message[]) => Message[])) => {
@@ -635,6 +638,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // is visible; it never owns or cancels server-side execution.
   const trackedSessionsRef = React.useRef(new Set<string>());
   const sessionConnectionsRef = React.useRef(new Map<string, { source: EventSource; reconnectTimer: number | null; attempts: number }>());
+  const lastEventCursorBySessionRef = React.useRef(new Map<string, string>());
+  const durableEventSequencesBySessionRef = React.useRef(new Map<string, DurableEventSequences>());
   const handleQueueTurnEndRef = React.useRef<(sessionId: string, status: string) => void>(() => undefined);
   const reconcileQueueWithTurnStateRef = React.useRef<(sessionId: string, active: boolean, messages: Message[]) => void>(() => undefined);
   const sendNextQueuedFollowUpRef = React.useRef<(sessionId: string) => void>(() => undefined);
@@ -645,8 +650,85 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     replaceSessionMessages(sessionId, (current) => reconcileFetchedSessionMessages(nextMessages, current));
   }, [client, replaceSessionMessages]);
 
-  const stopSessionConnection = React.useCallback((sessionId: string) => {
-    trackedSessionsRef.current.delete(sessionId);
+  const applyDurableState = React.useCallback((sessionId: string, state: TurnState, rebuildStream = false) => {
+    setDurableStatesBySession((current) => ({ ...current, [sessionId]: state }));
+    if (state.lastEventId) {
+      lastEventCursorBySessionRef.current.set(sessionId, state.lastEventId);
+      const reconciled = reconcileDurableEventCursor(
+        durableEventSequencesBySessionRef.current.get(sessionId) ?? {},
+        state.lastEventId,
+      );
+      durableEventSequencesBySessionRef.current.set(sessionId, reconciled.sequences);
+    }
+    if (!rebuildStream) return;
+    const pending = pendingStreamDeltasRef.current.get(sessionId);
+    if (pending?.frameId !== null && pending?.frameId !== undefined) cancelAnimationFrame(pending.frameId);
+    pendingStreamDeltasRef.current.delete(sessionId);
+    const replayEvents = state.active
+      && state.turnId
+      && !state.bufferedEvents.some((event) => event.kind === "turn.start")
+      ? [{ kind: "turn.start" as const, turnId: state.turnId, continuation: true }, ...state.bufferedEvents]
+      : state.bufferedEvents;
+    setStreamsBySession((current) => ({
+      ...current,
+      [sessionId]: replayEvents.reduce(
+        (streamState, event) => reduceStream(streamState, event),
+        IDLE,
+      ),
+    }));
+  }, []);
+
+  const updateDurableStateFromEvent = React.useCallback((
+    sessionId: string,
+    event: Parameters<typeof reduceStream>[1],
+  ) => {
+    setDurableStatesBySession((current) => {
+      const previous = current[sessionId];
+      const turnId = event.kind === "turn.start" ? event.turnId : previous?.turnId ?? null;
+      if (!turnId) return current;
+      const base: TurnState = previous ?? {
+        active: true,
+        turnId,
+        bufferedEvents: [],
+        replayOnly: false,
+        owner: null,
+        runState: "queued",
+        waitingReason: null,
+        nextAction: null,
+        error: null,
+      };
+      let next = base;
+      if (event.kind === "turn.start") {
+        next = { ...base, active: true, turnId, runState: "queued", nextAction: "Waiting for a worker slot", error: null };
+      } else if (event.kind === "message.start" || event.kind === "message.delta" || event.kind === "message.end") {
+        next = { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Generating a response" };
+      } else if (event.kind === "tool.start" || event.kind === "tool.update" || event.kind === "tool.end") {
+        next = { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Running the current tool" };
+      } else if (event.kind === "approval.request") {
+        next = { ...base, active: true, runState: "waiting", waitingReason: "approval", nextAction: "Review the pending action to continue" };
+      } else if (event.kind === "question.request") {
+        next = { ...base, active: true, runState: "waiting", waitingReason: "user_input", nextAction: "Answer the question below to continue" };
+      } else if (event.kind === "approval.resolved" || event.kind === "question.answered") {
+        next = { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Resuming the durable run" };
+      } else if (event.kind === "session.note" && event.note === "compacted") {
+        next = { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Continuing with compacted context" };
+      } else if (event.kind === "error") {
+        next = { ...base, error: event.message };
+      } else if (event.kind === "turn.end") {
+        next = {
+          ...base,
+          active: false,
+          runState: event.status,
+          waitingReason: null,
+          nextAction: null,
+        };
+      }
+      return { ...current, [sessionId]: next };
+    });
+  }, []);
+
+  const stopSessionConnection = React.useCallback((sessionId: string, untrack = true) => {
+    if (untrack) trackedSessionsRef.current.delete(sessionId);
     const connection = sessionConnectionsRef.current.get(sessionId);
     if (!connection) return;
     connection.source.close();
@@ -661,34 +743,42 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
     const connect = (attempts: number) => {
       if (!trackedSessionsRef.current.has(sessionId) || sessionConnectionsRef.current.has(sessionId)) return;
-      // The API replays the bounded turn buffer on every connection. Rebuild
-      // from IDLE so a reconnect cannot duplicate text or tool deltas.
-      if (attempts > 0) resetSessionStream(sessionId);
       let terminal = false;
       const source = client.streamEvents(sessionId, {
         onOpen: () => {
           const current = sessionConnectionsRef.current.get(sessionId);
           if (current) current.attempts = 0;
+          setConnectionState("online");
         },
-        onEvent: (event) => {
+        onEvent: (event, cursor) => {
+          const reconciled = reconcileDurableEventCursor(
+            durableEventSequencesBySessionRef.current.get(sessionId) ?? {},
+            cursor,
+          );
+          if (!reconciled.accepted) return;
+          durableEventSequencesBySessionRef.current.set(sessionId, reconciled.sequences);
+          if (cursor) lastEventCursorBySessionRef.current.set(sessionId, cursor);
           updateSessionStream(sessionId, event);
+          updateDurableStateFromEvent(sessionId, event);
           if (event.kind !== "turn.end") return;
           setTasks((current) => current.map((task) => task.activeSessionId === sessionId ? { ...task, status: event.status } : task));
           terminal = true;
           activeSessionsRef.current.delete(sessionId);
           stopSessionConnection(sessionId);
-          void refreshSessionMessages(sessionId)
-            .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"))
-            .finally(() => {
+          void Promise.all([refreshSessionMessages(sessionId), client.turnState(sessionId)])
+            .then(([, state]) => {
+              applyDurableState(sessionId, state);
               resetSessionStream(sessionId);
               handleQueueTurnEndRef.current(sessionId, event.status);
-            });
+            })
+            .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"));
           void refreshAdmin();
         },
         onError: () => {
           if (terminal || !trackedSessionsRef.current.has(sessionId)) return;
           source.close();
           sessionConnectionsRef.current.delete(sessionId);
+          setConnectionState(navigator.onLine ? "reconnecting" : "offline");
           const nextAttempts = attempts + 1;
           const reconnectTimer = window.setTimeout(() => {
             sessionConnectionsRef.current.delete(sessionId);
@@ -696,12 +786,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           }, Math.min(5_000, 500 * (2 ** Math.min(nextAttempts, 4))));
           sessionConnectionsRef.current.set(sessionId, { source, reconnectTimer, attempts: nextAttempts });
         },
-      });
+      }, lastEventCursorBySessionRef.current.get(sessionId) ?? null);
       sessionConnectionsRef.current.set(sessionId, { source, reconnectTimer: null, attempts });
     };
 
     connect(0);
-  }, [client, refreshAdmin, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionStream]);
+  }, [applyDurableState, client, refreshAdmin, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream]);
 
   React.useEffect(() => () => {
     for (const sessionId of [...trackedSessionsRef.current]) stopSessionConnection(sessionId);
@@ -721,17 +811,19 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       .then(([items, state]) => {
         if (cancelled) return;
         replaceSessionMessages(sessionId, (current) => reconcileFetchedSessionMessages(items, current));
+        const preserveDurableSurface = state.active || state.runState === "recovery_required";
+        applyDurableState(sessionId, state, preserveDurableSurface);
         if (state.active) activeSessionsRef.current.add(sessionId);
         else activeSessionsRef.current.delete(sessionId);
         reconcileQueueWithTurnStateRef.current(sessionId, state.active, items);
         if (state.active) attachSessionStream(sessionId);
-        else resetSessionStream(sessionId);
+        else if (!preserveDurableSurface) resetSessionStream(sessionId);
       })
       .catch((cause) => {
         if (!cancelled) setResourceError("messages", cause instanceof Error ? cause.message : "Unable to load this task");
       });
     return () => { cancelled = true; };
-  }, [activeTask?.activeSessionId, attachSessionStream, client, replaceSessionMessages, resetSessionStream]);
+  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, client, replaceSessionMessages, resetSessionStream]);
 
   const runTurn = React.useCallback(async (
     task: Task,
@@ -745,7 +837,19 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
     setStartingSessions((current) => new Set(current).add(sessionId));
     activeSessionsRef.current.add(sessionId);
-    updateSessionStream(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
+    const pendingTurnId = `pending_${Date.now()}`;
+    updateSessionStream(sessionId, { kind: "turn.start", turnId: pendingTurnId });
+    applyDurableState(sessionId, {
+      active: true,
+      turnId: pendingTurnId,
+      bufferedEvents: [],
+      replayOnly: false,
+      owner: null,
+      runState: "queued",
+      waitingReason: null,
+      nextAction: "Submitting the turn",
+      error: null,
+    });
     // Listen before submitting so early deltas render live instead of being
     // delivered together from the server's replay buffer.
     attachSessionStream(sessionId);
@@ -765,11 +869,23 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
           }),
       } satisfies StartTurnRequest;
-      await client.startTurn(sessionId, request);
+      const started = await client.startTurn(sessionId, request);
+      applyDurableState(sessionId, {
+        active: true,
+        turnId: started.turnId,
+        bufferedEvents: [],
+        replayOnly: false,
+        owner: null,
+        runState: "queued",
+        waitingReason: null,
+        nextAction: "Waiting for a worker slot",
+        error: null,
+      });
     } catch (cause) {
       if (!(cause instanceof BerryApiError)) {
         try {
           const state = await client.turnState(sessionId);
+          applyDurableState(sessionId, state);
           if (state.active) {
             activeSessionsRef.current.add(sessionId);
             attachSessionStream(sessionId);
@@ -793,7 +909,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         return next;
       });
     }
-  }, [attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, stopSessionConnection, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, stopSessionConnection, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -812,6 +928,27 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       toast.error(cause instanceof Error ? cause.message : "Unable to stop the active turn");
     }
   }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
+
+  const recoverDurableTurn = React.useCallback(async (action: "retry" | "mark-complete" | "cancel") => {
+    const sessionId = activeTask?.activeSessionId;
+    const runId = sessionId ? durableStatesBySession[sessionId]?.turnId : null;
+    if (!client || !sessionId || !runId) throw new Error("The durable run is no longer available.");
+    const result = await client.recoverTurn(runId, action);
+    if (!result.ok) throw new Error("The recovery action was not accepted. Refresh the task and review its current state.");
+    const state = await client.turnState(sessionId);
+    applyDurableState(sessionId, state, state.active);
+    if (state.active) {
+      activeSessionsRef.current.add(sessionId);
+      attachSessionStream(sessionId);
+      toast.success(action === "retry" ? "Tool retry queued" : "Run resumed");
+      return;
+    }
+    activeSessionsRef.current.delete(sessionId);
+    stopSessionConnection(sessionId);
+    resetSessionStream(sessionId);
+    await refreshSessionMessages(sessionId);
+    toast.success("Run cancelled");
+  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, client, durableStatesBySession, refreshSessionMessages, resetSessionStream, stopSessionConnection]);
 
   // Edit-and-resubmit: optimistically truncate the local thread at the edited
   // message, then rerun the turn from that point (the API rewinds + persists).
@@ -1731,6 +1868,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onViewTaskFiles={() => setTaskFilesOpen(true)}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
             />
+            <DurableRunStatus
+              state={durableState}
+              connection={connectionState}
+              onRecover={async (action) => {
+                try {
+                  await recoverDurableTurn(action);
+                } catch (cause) {
+                  toast.error(cause instanceof Error ? cause.message : "Unable to recover the durable run");
+                }
+              }}
+            />
             <Composer
               config={config}
               activeTask={activeTask}
@@ -1748,7 +1896,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               model={model}
               onModelChange={updateModel}
               variant="thread"
-              streaming={turnBusy || stream.turnActive}
+              streaming={turnBusy || stream.turnActive || Boolean(durableState?.active)}
               reasoning={reasoning}
               onReasoningChange={updateReasoning}
               onCommand={runSlashCommand}
@@ -1865,7 +2013,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         {surface === "library" ? (
           <div className="min-h-0 flex-1 overflow-auto">
             <React.Suspense fallback={<LazySurfaceFallback label="Loading library" />}>
-              <ArtifactLibrary client={client} tab={shellLocation.kind === "library" ? shellLocation.tab : "all"} onTabChange={navigateToLibrary} />
+              <ArtifactLibrary
+                client={client}
+                tab={shellLocation.kind === "library" ? shellLocation.tab : "all"}
+                onTabChange={navigateToLibrary}
+                workspaces={workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                onWorkspaceChange={setActiveWorkspaceId}
+              />
             </React.Suspense>
           </div>
         ) : null}

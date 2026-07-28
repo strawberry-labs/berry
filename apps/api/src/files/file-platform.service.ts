@@ -14,6 +14,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { once } from "node:events";
+import { durableContextConfigFromEnv } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
 
 export type FileStorageConfig = {
@@ -46,6 +47,11 @@ type FileRow = {
   updated_at: Date | string;
   task_ids?: string[] | null;
   roles?: Array<"input" | "output" | "reference"> | null;
+  workspace_id?: string | null;
+  workspace_visibility?: "project" | "task_only" | null;
+  index_status?: "pending" | "extracting" | "chunking" | "embedding" | "indexed" | "failed" | "deleted" | null;
+  vector_ready?: boolean | null;
+  failure_reason?: string | null;
 };
 
 type UploadRow = {
@@ -61,6 +67,8 @@ type UploadRow = {
 
 @Injectable()
 export class FilePlatformService {
+  readonly #durableConfig = durableContextConfigFromEnv(process.env);
+
   constructor(
     @Inject(CloudDatabaseService) private readonly database: CloudDatabaseService,
     @Inject(FILE_STORAGE_CONFIG) private readonly config: FileStorageConfig | null,
@@ -120,7 +128,7 @@ export class FilePlatformService {
   }
 
   async get(tenantId: string, userId: string, fileId: string): Promise<FileRow> {
-    return this.database.withTenant(tenantId, async (executor) => this.requireOwnedFile(executor, tenantId, userId, fileId));
+    return this.database.withTenant(tenantId, async (executor) => this.requireAccessibleFile(executor, tenantId, userId, fileId));
   }
 
   async initiateUpload(tenantId: string, userId: string, input: {
@@ -129,6 +137,8 @@ export class FilePlatformService {
     size: number;
     taskId?: string;
     sessionId?: string;
+    workspaceId?: string;
+    workspaceVisibility?: "project" | "task_only";
     sha256?: string;
     origin?: "user_upload" | "image_generation" | "browser_capture";
     associationRole?: "input" | "output" | "reference";
@@ -153,7 +163,12 @@ export class FilePlatformService {
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
     try {
       await this.database.withTenant(tenantId, async (executor) => {
-        if (input.taskId) await requireTask(executor, tenantId, input.taskId);
+        const task = input.taskId ? await requireTask(executor, tenantId, input.taskId, userId) : null;
+        const workspaceId = input.workspaceId ?? task?.workspace_id;
+        if (input.workspaceId) {
+          await requireWorkspaceAccess(executor, tenantId, userId, input.workspaceId);
+          if (task && task.workspace_id !== input.workspaceId) throw new BadRequestException("Task and workspace do not match");
+        }
         await executor.execute(`
           INSERT INTO files (id, tenant_id, owner_user_id, original_name, display_name, media_type, size_bytes, sha256, bucket, object_key, origin, status)
           VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4, $5, $6, $7, $8, $9, $10::file_origin, 'uploading')
@@ -163,6 +178,19 @@ export class FilePlatformService {
           VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7)
         `, [uploadId, tenantId, fileId, created.UploadId, config.partSize, partCount, expiresAt.toISOString()]);
         if (input.taskId) await associate(executor, { tenantId, fileId, taskId: input.taskId, ...(input.sessionId ? { sessionId: input.sessionId } : {}), role: input.associationRole ?? "input", userId });
+        if (workspaceId && input.workspaceId) {
+          await executor.execute(`
+            INSERT INTO workspace_files (
+              tenant_id, workspace_id, file_id, visibility, originating_task_id,
+              index_status, created_by_user_id
+            ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, 'pending', $6::uuid)
+            ON CONFLICT (tenant_id, workspace_id, file_id) DO UPDATE SET
+              visibility = EXCLUDED.visibility,
+              originating_task_id = COALESCE(workspace_files.originating_task_id, EXCLUDED.originating_task_id),
+              deleted_at = NULL,
+              updated_at = now()
+          `, [tenantId, workspaceId, fileId, input.workspaceVisibility ?? "project", input.taskId ?? null, userId]);
+        }
       });
     } catch (error) {
       await config.client.send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: objectKey, UploadId: created.UploadId })).catch(() => undefined);
@@ -206,13 +234,206 @@ export class FilePlatformService {
     const head = await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: upload.object_key }));
     const file = await this.database.withTenant(tenantId, async (executor) => {
       await executor.execute(`UPDATE file_uploads SET status = 'completed', completed_at = now(), updated_at = now() WHERE tenant_id = $1::uuid AND id = $2::uuid`, [tenantId, uploadId]);
+      const [workspaceFile] = await executor.query<{ workspace_id: string; visibility: "project" | "task_only"; originating_task_id: string | null }>(`
+        SELECT workspace_id, visibility, originating_task_id
+        FROM workspace_files
+        WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND deleted_at IS NULL
+        ORDER BY created_at ASC
+        LIMIT 1
+      `, [tenantId, fileId]);
+      const shouldIndex = Boolean(workspaceFile && this.#durableConfig.projectKnowledgeEnabled);
       await executor.execute(`
-        UPDATE files SET status = 'available', size_bytes = $3, etag = $4, object_version_id = $5, updated_at = now()
+        UPDATE files SET status = $6::file_status, size_bytes = $3, etag = $4, object_version_id = $5, updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
-      `, [tenantId, fileId, Number(head.ContentLength ?? 0), cleanEtag(head.ETag ?? completed.ETag), completed.VersionId ?? null]);
-      return this.requireOwnedFile(executor, tenantId, userId, fileId);
+      `, [tenantId, fileId, Number(head.ContentLength ?? 0), cleanEtag(head.ETag ?? completed.ETag), completed.VersionId ?? null, shouldIndex ? "processing" : "available"]);
+      if (workspaceFile && shouldIndex) {
+        const revision = completed.VersionId ?? cleanEtag(head.ETag ?? completed.ETag) ?? `upload-${uploadId}`;
+        const contentHash = cleanEtag(head.ETag ?? completed.ETag) ?? `file-${fileId}-${revision}`;
+        const [source] = await executor.query<{ id: string }>(`
+          INSERT INTO knowledge_sources (
+            tenant_id, user_id, workspace_id, source_type, source_id, source_revision,
+            content_hash, title, visibility, extraction_status, index_status,
+            extractor_version, chunker_version, metadata
+          )
+          SELECT $1::uuid, $2::uuid, wf.workspace_id, 'file', $3, $4, $5, f.display_name,
+                 wf.visibility, 'pending', 'pending', 'tika-v1', 'recursive-v1',
+                 jsonb_build_object('fileId', f.id, 'mediaType', f.media_type, 'objectKey', f.object_key)
+          FROM workspace_files wf
+          JOIN files f ON f.id = wf.file_id
+          WHERE wf.tenant_id = $1::uuid AND wf.file_id = $3::uuid AND wf.deleted_at IS NULL
+          ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
+          DO UPDATE SET tombstoned_at = NULL, failure_reason = NULL, updated_at = now()
+          RETURNING id
+        `, [tenantId, userId, fileId, revision, contentHash]);
+        if (source) {
+          await executor.execute(`
+            UPDATE knowledge_sources
+            SET tombstoned_at = COALESCE(tombstoned_at, now()),
+                index_status = 'deleted', vector_ready = false, updated_at = now()
+            WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+              AND source_type = 'file' AND source_id = $3
+              AND id <> $4::uuid AND tombstoned_at IS NULL
+          `, [tenantId, workspaceFile.workspace_id, fileId, source.id]);
+          await executor.execute(`
+            INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+            VALUES ($1::uuid, 'knowledge.extract', $2, $3, $4::jsonb)
+            ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+          `, [
+            tenantId,
+            source.id,
+            `knowledge.extract:${source.id}:${revision}`,
+            JSON.stringify({ tenantId, sourceId: source.id, revision }),
+          ]);
+        }
+      }
+      return this.requireAccessibleFile(executor, tenantId, userId, fileId);
     });
     return fileDto(file);
+  }
+
+  async listWorkspaceFiles(tenantId: string, userId: string, workspaceId: string, filters: {
+    visibility?: "project" | "task_only";
+    status?: "pending" | "extracting" | "chunking" | "embedding" | "indexed" | "failed";
+    search?: string;
+    cursor?: string;
+    limit?: number;
+  }) {
+    const limit = Math.min(100, Math.max(1, filters.limit ?? 50));
+    return this.database.withTenant(tenantId, async (executor) => {
+      await requireWorkspaceAccess(executor, tenantId, userId, workspaceId);
+      const values: unknown[] = [tenantId, workspaceId, userId];
+      const where = [
+        "wf.tenant_id = $1::uuid",
+        "wf.workspace_id = $2::uuid",
+        "wf.deleted_at IS NULL",
+        "f.deleted_at IS NULL",
+        `(wf.visibility = 'project' OR (
+          wf.visibility = 'task_only' AND EXISTS (
+            SELECT 1 FROM tasks access_task
+            WHERE access_task.id = wf.originating_task_id
+              AND access_task.tenant_id = wf.tenant_id
+              AND (access_task.user_id = $3::uuid OR access_task.user_id IS NULL)
+          )
+        ))`,
+      ];
+      if (filters.visibility) {
+        values.push(filters.visibility);
+        where.push(`wf.visibility = $${values.length}`);
+      }
+      if (filters.status) {
+        values.push(filters.status);
+        where.push(`wf.index_status = $${values.length}`);
+      }
+      if (filters.search?.trim()) {
+        values.push(`%${escapeLikePattern(filters.search.trim())}%`);
+        where.push(`(f.display_name ILIKE $${values.length} ESCAPE '\\' OR f.original_name ILIKE $${values.length} ESCAPE '\\')`);
+      }
+      if (filters.cursor) {
+        const [createdAt, id] = decodeCursor(filters.cursor);
+        values.push(createdAt, id);
+        where.push(`(wf.created_at, wf.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
+      }
+      values.push(limit + 1);
+      const rows = await executor.query<FileRow>(`
+        SELECT f.*,
+          wf.workspace_id,
+          wf.visibility AS workspace_visibility,
+          wf.index_status,
+          source.vector_ready,
+          source.failure_reason,
+          COALESCE(array_remove(array_agg(DISTINCT a.task_id), NULL), '{}') AS task_ids,
+          COALESCE(array_remove(array_agg(DISTINCT a.role::text), NULL), ARRAY[]::text[]) AS roles
+        FROM workspace_files wf
+        JOIN files f ON f.id = wf.file_id
+        LEFT JOIN file_associations a ON a.file_id = f.id
+        LEFT JOIN LATERAL (
+          SELECT ks.vector_ready, ks.failure_reason
+          FROM knowledge_sources ks
+          WHERE ks.tenant_id = wf.tenant_id
+            AND ks.workspace_id = wf.workspace_id
+            AND ks.source_type = 'file'
+            AND ks.source_id = wf.file_id::text
+            AND ks.tombstoned_at IS NULL
+          ORDER BY ks.created_at DESC
+          LIMIT 1
+        ) source ON true
+        WHERE ${where.join(" AND ")}
+        GROUP BY f.id, wf.id, source.vector_ready, source.failure_reason
+        ORDER BY wf.created_at DESC, wf.id DESC
+        LIMIT $${values.length}
+      `, values);
+      const page = rows.slice(0, limit);
+      const last = page.at(-1);
+      return {
+        items: page.map(fileDto),
+        nextCursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
+      };
+    });
+  }
+
+  async retryWorkspaceFile(tenantId: string, userId: string, workspaceId: string, fileId: string) {
+    return this.database.withTenant(tenantId, async (executor) => {
+      await requireWorkspaceAccess(executor, tenantId, userId, workspaceId);
+      const [source] = await executor.query<{ id: string; source_revision: string }>(`
+        UPDATE knowledge_sources
+        SET extraction_status = 'pending', index_status = 'pending', vector_ready = false,
+            failure_reason = NULL, updated_at = now()
+        WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+          AND source_type = 'file' AND source_id = $3 AND tombstoned_at IS NULL
+        RETURNING id, source_revision
+      `, [tenantId, workspaceId, fileId]);
+      if (!source) throw new NotFoundException("Project file source not found");
+      await executor.execute(`
+        UPDATE workspace_files SET index_status = 'pending', updated_at = now()
+        WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid AND file_id = $3::uuid AND deleted_at IS NULL
+      `, [tenantId, workspaceId, fileId]);
+      await executor.execute(`
+        INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+        VALUES ($1::uuid, 'knowledge.extract', $2, $3, $4::jsonb)
+        ON CONFLICT (tenant_id, dedupe_key) DO UPDATE SET
+          completed_at = NULL, available_at = now(), last_error = NULL, updated_at = now()
+      `, [
+        tenantId,
+        source.id,
+        `knowledge.extract:${source.id}:${source.source_revision}:retry`,
+        JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision }),
+      ]);
+      return { ok: true };
+    });
+  }
+
+  async unlinkWorkspaceFile(tenantId: string, userId: string, workspaceId: string, fileId: string) {
+    return this.database.withTenant(tenantId, async (executor) => {
+      await requireWorkspaceAccess(executor, tenantId, userId, workspaceId);
+      const [source] = await executor.query<{ id: string; source_revision: string }>(`
+        UPDATE knowledge_sources
+        SET tombstoned_at = now(), index_status = 'deleted', updated_at = now()
+        WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+          AND source_type = 'file' AND source_id = $3 AND tombstoned_at IS NULL
+        RETURNING id, source_revision
+      `, [tenantId, workspaceId, fileId]);
+      const result = await executor.query<{ id: string }>(`
+        UPDATE workspace_files
+        SET deleted_at = now(), index_status = 'deleted', updated_at = now()
+        WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+          AND file_id = $3::uuid AND deleted_at IS NULL
+        RETURNING id
+      `, [tenantId, workspaceId, fileId]);
+      if (result.length === 0) throw new NotFoundException("Project file not found");
+      if (source) {
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+          VALUES ($1::uuid, 'knowledge.delete', $2, $3, $4::jsonb)
+          ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+        `, [
+          tenantId,
+          source.id,
+          `knowledge.delete:${source.id}:${source.source_revision}`,
+          JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision }),
+        ]);
+      }
+      return { ok: true };
+    });
   }
 
   async abortUpload(tenantId: string, userId: string, fileId: string, uploadId: string) {
@@ -229,7 +450,7 @@ export class FilePlatformService {
   async associateInputFiles(tenantId: string, userId: string, input: { fileIds: string[]; taskId: string; sessionId: string; messageId?: string }) {
     if (input.fileIds.length === 0) return;
     await this.database.withTenant(tenantId, async (executor) => {
-      await requireTask(executor, tenantId, input.taskId);
+      await requireTask(executor, tenantId, input.taskId, userId);
       for (const fileId of [...new Set(input.fileIds)]) {
         await this.requireOwnedFile(executor, tenantId, userId, fileId);
         await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, ...(input.messageId ? { messageId: input.messageId } : {}), role: "input", userId });
@@ -319,7 +540,7 @@ export class FilePlatformService {
       Metadata: { "file-id": fileId, "original-name": encodeURIComponent(name), source: "image-generation" },
     }));
     return this.database.withTenant(tenantId, async (executor) => {
-      await requireTask(executor, tenantId, input.taskId);
+      await requireTask(executor, tenantId, input.taskId, userId);
       const rows = await executor.query<FileRow>(`
         INSERT INTO files (id, tenant_id, owner_user_id, original_name, display_name, media_type, size_bytes, bucket, object_key, etag, origin, status)
         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4, $5, $6, $7, $8, $9, 'image_generation', 'available')
@@ -390,6 +611,58 @@ export class FilePlatformService {
     if (!row) throw new NotFoundException("File not found");
     return row;
   }
+
+  private async requireAccessibleFile(executor: SqlExecutor, tenantId: string, userId: string, fileId: string): Promise<FileRow> {
+    const [row] = await executor.query<FileRow>(`
+      SELECT f.*,
+        project_link.workspace_id,
+        project_link.visibility AS workspace_visibility,
+        project_link.index_status,
+        source.vector_ready,
+        source.failure_reason,
+        COALESCE(array_remove(array_agg(DISTINCT a.task_id), NULL), '{}') AS task_ids,
+        COALESCE(array_remove(array_agg(DISTINCT a.role::text), NULL), ARRAY[]::text[]) AS roles
+      FROM files f
+      LEFT JOIN file_associations a ON a.file_id = f.id
+      LEFT JOIN LATERAL (
+        SELECT wf.workspace_id, wf.visibility, wf.index_status
+        FROM workspace_files wf
+        JOIN workspaces w ON w.id = wf.workspace_id
+        WHERE wf.tenant_id = f.tenant_id AND wf.file_id = f.id AND wf.deleted_at IS NULL
+          AND (
+            w.owner_id = $2::uuid OR w.owner_id IS NULL OR
+            EXISTS (
+              SELECT 1 FROM tasks access_task
+              WHERE access_task.workspace_id = w.id AND access_task.tenant_id = w.tenant_id
+                AND access_task.user_id = $2::uuid AND access_task.deleted_at IS NULL
+            )
+          )
+          AND (
+            wf.visibility = 'project' OR
+            EXISTS (
+              SELECT 1 FROM tasks access_task
+              WHERE access_task.id = wf.originating_task_id
+                AND (access_task.user_id = $2::uuid OR access_task.user_id IS NULL)
+            )
+          )
+        ORDER BY wf.created_at ASC
+        LIMIT 1
+      ) project_link ON true
+      LEFT JOIN LATERAL (
+        SELECT ks.vector_ready, ks.failure_reason
+        FROM knowledge_sources ks
+        WHERE ks.tenant_id = f.tenant_id AND ks.source_type = 'file'
+          AND ks.source_id = f.id::text AND ks.tombstoned_at IS NULL
+        ORDER BY ks.created_at DESC LIMIT 1
+      ) source ON true
+      WHERE f.tenant_id = $1::uuid AND f.id = $3::uuid AND f.deleted_at IS NULL
+        AND (f.owner_user_id = $2::uuid OR project_link.workspace_id IS NOT NULL)
+      GROUP BY f.id, project_link.workspace_id, project_link.visibility,
+               project_link.index_status, source.vector_ready, source.failure_reason
+    `, [tenantId, userId, fileId]);
+    if (!row) throw new NotFoundException("File not found");
+    return row;
+  }
 }
 
 function escapeLikePattern(value: string): string {
@@ -411,14 +684,43 @@ function fileDto(row: FileRow) {
     updatedAt: new Date(row.updated_at).toISOString(),
     taskIds: row.task_ids ?? [],
     roles: row.roles ?? [],
+    ...(row.workspace_id !== undefined ? { workspaceId: row.workspace_id } : {}),
+    ...(row.workspace_visibility !== undefined ? { workspaceVisibility: row.workspace_visibility } : {}),
+    ...(row.index_status ? { indexStatus: row.index_status } : {}),
+    ...(row.vector_ready !== undefined && row.vector_ready !== null ? { vectorReady: row.vector_ready } : {}),
+    ...(row.failure_reason !== undefined ? { indexFailureReason: row.failure_reason } : {}),
     downloadUrl: `/v1/files/${row.id}/content?download=1`,
     previewUrl: `/v1/files/${row.id}/content`,
   };
 }
 
-async function requireTask(executor: SqlExecutor, tenantId: string, taskId: string) {
-  const [task] = await executor.query<{ id: string }>("SELECT id FROM tasks WHERE tenant_id = $1::uuid AND id = $2::uuid AND deleted_at IS NULL", [tenantId, taskId]);
+async function requireTask(executor: SqlExecutor, tenantId: string, taskId: string, userId: string) {
+  const [task] = await executor.query<{ id: string; workspace_id: string }>(`
+    SELECT id, workspace_id
+    FROM tasks
+    WHERE tenant_id = $1::uuid AND id = $2::uuid AND deleted_at IS NULL
+      AND (user_id = $3::uuid OR user_id IS NULL)
+  `, [tenantId, taskId, userId]);
   if (!task) throw new NotFoundException("Task not found");
+  return task;
+}
+
+async function requireWorkspaceAccess(executor: SqlExecutor, tenantId: string, userId: string, workspaceId: string) {
+  const [workspace] = await executor.query<{ id: string }>(`
+    SELECT w.id
+    FROM workspaces w
+    WHERE w.tenant_id = $1::uuid AND w.id = $2::uuid AND w.deleted_at IS NULL
+      AND (
+        w.owner_id = $3::uuid OR w.owner_id IS NULL OR
+        EXISTS (
+          SELECT 1 FROM tasks access_task
+          WHERE access_task.tenant_id = w.tenant_id AND access_task.workspace_id = w.id
+            AND access_task.user_id = $3::uuid AND access_task.deleted_at IS NULL
+        )
+      )
+  `, [tenantId, workspaceId, userId]);
+  if (!workspace) throw new NotFoundException("Workspace not found");
+  return workspace;
 }
 
 async function associate(executor: SqlExecutor, input: { tenantId: string; fileId: string; taskId?: string; sessionId?: string; messageId?: string; turnId?: string; role: string; userId: string }) {

@@ -22,6 +22,7 @@ import {
   type StartTurnOptions,
 } from "@berry/local-agent";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
+import { durableContextConfigFromEnv } from "@berry/shared";
 import {
   DockerSandboxProvider,
   E2BSandboxProvider,
@@ -190,6 +191,7 @@ function safeArtifactName(name: string): string {
 class BerryApiMainModule {}
 
 export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): DynamicModule {
+  const durableConfig = durableContextConfigFromEnv(env);
   const pg = PgSqlExecutor.fromConnectionString(requiredEnv(env, "BERRY_DATABASE_URL", env.DATABASE_URL));
   const budgetService = createBudgetServiceFromEnv(env, new PostgresBudgetRepository(new CloudDatabaseService(pg)));
   const contractProvider = createBudgetedContractSandboxProvider(env, budgetService);
@@ -203,6 +205,8 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
       CloudDatabaseModule.register({ useValue: pg }),
       FilePlatformModule,
       AgentApiModule.register({
+        durableRunnerEnabled: durableConfig.durableRunnerEnabled,
+        durableContextEnabled: true,
         sessionHost: { useValue: runtime },
         sandboxWorkspace: { useValue: new SandboxWorkspaceService({
           provider: contractProvider,
@@ -284,7 +288,10 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
 }
 
 function createRuntimeSessionHost(env: NodeJS.ProcessEnv, contractProvider: ContractSandboxProvider): SessionHost {
-  const runtimeDbPath = env.BERRY_RUNTIME_DB_PATH ?? "/data/berry-runtime.sqlite";
+  // This SQLite store is only the rollback adapter used when the durable
+  // runner feature flag is disabled. Postgres session_entries is authoritative
+  // for the normal web path.
+  const runtimeDbPath = env.BERRY_RUNTIME_DB_PATH ?? "/data/berry-inline-fallback.sqlite";
   mkdirSync(dirname(runtimeDbPath), { recursive: true });
   const db = new BerryDatabase(runtimeDbPath);
   db.migrate();

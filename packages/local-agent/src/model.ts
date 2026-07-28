@@ -15,7 +15,16 @@ import {
   type ChatToolDefinition,
   type BerryRouterStreamMetadata,
 } from "@berry/router-client";
-import { resolveModelCapabilities, type JsonValue, type ModelApiType, type ProviderAuthType, type ProviderCapabilities, type RemoteModel, type RouterAttribution } from "@berry/shared";
+import {
+  resolveModelCapabilities,
+  type JsonValue,
+  type ModelApiType,
+  type PromptCachingCapabilities,
+  type ProviderAuthType,
+  type ProviderCapabilities,
+  type RemoteModel,
+  type RouterAttribution,
+} from "@berry/shared";
 import {
   createAssistantMessageEventStream,
   type Api,
@@ -32,6 +41,13 @@ import {
   type ToolCall,
   type Usage,
 } from "@earendil-works/pi-ai";
+import {
+  PromptCacheTracker,
+  providerPromptText,
+  resolvePromptCachingCapabilities,
+  splitStablePrompt,
+  type PromptCacheRequest,
+} from "./prompt-cache.ts";
 
 export type BerryStreamFn = StreamFn;
 
@@ -52,6 +68,43 @@ export interface BerryModelProviderInfo {
   completionTransport?: "stream" | "buffered";
   /** Retry through complete-and-replay only when streaming produced no chunks. */
   completionFallback?: "buffered";
+}
+
+export interface PromptCacheAdapterConfig {
+  namespace: string;
+  provider: BerryModelProviderInfo;
+}
+
+function promptCacheCapability(config: PromptCacheAdapterConfig | undefined, modelId: string): PromptCachingCapabilities {
+  if (!config) return resolvePromptCachingCapabilities(undefined, undefined);
+  const metadata = config.provider.models?.find((candidate) => candidate.id === modelId);
+  return resolvePromptCachingCapabilities(
+    config.provider.capabilities?.promptCaching,
+    resolveModelCapabilities(metadata).promptCaching,
+  );
+}
+
+function preparePromptCache(
+  tracker: PromptCacheTracker,
+  config: PromptCacheAdapterConfig | undefined,
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+): BerryPromptCacheMetadata {
+  const route = config?.provider.endpointPath
+    ?? config?.provider.apiType
+    ?? model.api;
+  const request = tracker.prepare({
+    namespace: config?.namespace ?? "local",
+    sessionId: options?.sessionId ?? `${model.provider}:unscoped`,
+    provider: config?.provider.id ?? model.provider,
+    model: model.id,
+    route,
+    context,
+    requestedRetention: options?.cacheRetention,
+    capability: promptCacheCapability(config, model.id),
+  });
+  return { ...request, cacheCreationTokens1h: 0, cacheCreationTokens5m: 0 };
 }
 
 function piApiFor(apiType: ModelApiType | undefined): Api {
@@ -86,12 +139,20 @@ export function createBerryModel(provider: BerryModelProviderInfo, modelId?: str
  * Builds the pi-ai StreamFn for a provider based on its API transport. The
  * apiKey is optional: keyless local providers stream without auth headers.
  */
-export function createProviderStreamFn(provider: BerryModelProviderInfo, apiKey: string | undefined): StreamFn {
+export function createProviderStreamFn(
+  provider: BerryModelProviderInfo,
+  apiKey: string | undefined,
+  options: { cacheNamespace?: string } = {},
+): StreamFn {
+  const promptCache: PromptCacheAdapterConfig = {
+    namespace: options.cacheNamespace ?? "local",
+    provider,
+  };
   let stream: StreamFn;
   if (provider.apiType === "openai-responses") {
-    stream = new OpenAIResponsesAdapter({ client: new OpenAIResponsesClient({ provider, apiKey }) }).stream;
+    stream = new OpenAIResponsesAdapter({ client: new OpenAIResponsesClient({ provider, apiKey }), promptCache }).stream;
   } else if (provider.apiType === "anthropic-messages") {
-    stream = new AnthropicMessagesAdapter({ client: new AnthropicMessagesClient({ provider, apiKey }) }).stream;
+    stream = new AnthropicMessagesAdapter({ client: new AnthropicMessagesClient({ provider, apiKey }), promptCache }).stream;
   } else {
     const compatible = new OpenAIChatCompletionsClient({ provider, apiKey });
     let client: ChatCompletionStreamClient;
@@ -105,7 +166,7 @@ export function createProviderStreamFn(provider: BerryModelProviderInfo, apiKey:
         client = new ContentFallbackChatCompletionClient(client, new BufferedChatCompletionClient(compatible));
       }
     }
-    stream = new BerryModelAdapter({ client }).stream;
+    stream = new BerryModelAdapter({ client, promptCache }).stream;
   }
   return (model, context, options) => {
     return stream(model, contextForModelCapabilities(provider, model.id, context), options);
@@ -233,10 +294,28 @@ function emptyUsage(): Usage {
   };
 }
 
-export type BerryAssistantMessage = AssistantMessage & { berryRouterAttribution?: RouterAttribution };
+export type BerryPromptCacheMetadata = PromptCacheRequest & {
+  cacheCreationTokens1h: number;
+  cacheCreationTokens5m: number;
+};
+
+export type BerryAssistantMessage = AssistantMessage & {
+  berryRouterAttribution?: RouterAttribution;
+  berryPromptCache?: BerryPromptCacheMetadata;
+};
 
 function applyRouterAttribution(message: AssistantMessage, attribution: RouterAttribution | undefined): void {
   if (attribution) (message as BerryAssistantMessage).berryRouterAttribution = attribution;
+}
+
+function applyPromptCache(message: AssistantMessage, promptCache: BerryPromptCacheMetadata): void {
+  (message as BerryAssistantMessage).berryPromptCache = promptCache;
+}
+
+function observeCacheRead(promptCache: BerryPromptCacheMetadata, cacheReadTokens: number): void {
+  if (cacheReadTokens <= 0) return;
+  promptCache.missReason = null;
+  promptCache.missComponentId = null;
 }
 
 function redactSecrets(text: string): string {
@@ -294,7 +373,9 @@ function getResponsesRawItemsMessage(message: unknown): { items: Array<Record<st
 
 export function contextToChatMessages(context: Context, options: { includeImages?: boolean } = {}): ChatMessage[] {
   const messages: ChatMessage[] = [];
-  if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
+  const system = splitStablePrompt(context.systemPrompt);
+  if (system.stable) messages.push({ role: "system", content: system.stable });
+  if (system.dynamic) messages.push({ role: "system", content: system.dynamic });
   for (const message of context.messages) {
     const responsesRawItems = getResponsesRawItemsMessage(message);
     if (responsesRawItems) {
@@ -363,9 +444,12 @@ interface ToolCallBuffer {
  */
 export class BerryModelAdapter {
   readonly #client: ChatCompletionStreamClient;
+  readonly #promptCache: PromptCacheAdapterConfig | undefined;
+  readonly #cacheTracker = new PromptCacheTracker();
 
-  constructor(options: { client: ChatCompletionStreamClient }) {
+  constructor(options: { client: ChatCompletionStreamClient; promptCache?: PromptCacheAdapterConfig }) {
     this.#client = options.client;
+    this.#promptCache = options.promptCache;
   }
 
   stream: StreamFn = (model, context, options) => {
@@ -395,6 +479,8 @@ export class BerryModelAdapter {
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    const promptCache = preparePromptCache(this.#cacheTracker, this.#promptCache, model, context, options);
+    applyPromptCache(message, promptCache);
     let openTextIndex = -1;
     let openThinkingIndex = -1;
     const toolBuffers = new Map<number, ToolCallBuffer>();
@@ -428,17 +514,26 @@ export class BerryModelAdapter {
       if (options?.maxTokens !== undefined) request.maxTokens = options.maxTokens;
       if (options?.signal) request.signal = options.signal;
       if (options?.reasoning && model.reasoning) request.reasoningEffort = reasoningEffort(options.reasoning);
+      if (promptCache.cacheKey) request.promptCacheKey = promptCache.cacheKey;
+      if (promptCache.retention !== "none") request.promptCacheRetention = promptCache.retention;
 
       for await (const chunk of this.#client.stream(request)) {
         if (options?.signal?.aborted) throw new Error("aborted");
         applyRouterAttribution(message, chunk.attribution);
         if (chunk.usage) {
+          const cacheRead = chunk.usage.cacheReadTokens ?? 0;
+          const cacheWrite = chunk.usage.cacheWriteTokens ?? 0;
           message.usage = {
             ...emptyUsage(),
             input: chunk.usage.inputTokens,
             output: chunk.usage.outputTokens,
             totalTokens: chunk.usage.totalTokens,
+            cacheRead,
+            cacheWrite,
           };
+          promptCache.cacheCreationTokens1h = chunk.usage.cacheCreationTokens1h ?? 0;
+          promptCache.cacheCreationTokens5m = chunk.usage.cacheCreationTokens5m ?? 0;
+          observeCacheRead(promptCache, cacheRead);
         }
         if (chunk.reasoningDelta) {
           closeText();
@@ -631,9 +726,12 @@ interface ResponsesStreamClient {
  */
 export class OpenAIResponsesAdapter {
   readonly #client: ResponsesStreamClient;
+  readonly #promptCache: PromptCacheAdapterConfig | undefined;
+  readonly #cacheTracker = new PromptCacheTracker();
 
-  constructor(options: { client: ResponsesStreamClient }) {
+  constructor(options: { client: ResponsesStreamClient; promptCache?: PromptCacheAdapterConfig }) {
     this.#client = options.client;
+    this.#promptCache = options.promptCache;
   }
 
   stream: StreamFn = (model, context, options) => {
@@ -658,6 +756,8 @@ export class OpenAIResponsesAdapter {
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    const promptCache = preparePromptCache(this.#cacheTracker, this.#promptCache, model, context, options);
+    applyPromptCache(message, promptCache);
     let openTextIndex = -1;
     let openThinkingIndex = -1;
     // Streamed function calls keyed by the Responses item id.
@@ -684,7 +784,9 @@ export class OpenAIResponsesAdapter {
         input: contextToResponsesInput(context, { includeImages: model.input.includes("image") }),
         store: false,
       };
-      if (context.systemPrompt) body.instructions = context.systemPrompt;
+      if (context.systemPrompt) body.instructions = providerPromptText(context.systemPrompt);
+      if (promptCache.cacheKey) body.prompt_cache_key = promptCache.cacheKey;
+      if (promptCache.retention === "long") body.prompt_cache_retention = "24h";
       const tools = contextToResponsesTools(context);
       if (tools) body.tools = tools;
       if (options?.temperature !== undefined) body.temperature = options.temperature;
@@ -696,12 +798,19 @@ export class OpenAIResponsesAdapter {
         const routerMetadata = event[BERRY_ROUTER_METADATA_KEY] as BerryRouterStreamMetadata | undefined;
         applyRouterAttribution(message, routerMetadata?.attribution);
         if (routerMetadata?.usage) {
+          const cacheRead = routerMetadata.usage.cacheReadTokens ?? 0;
+          const cacheWrite = routerMetadata.usage.cacheWriteTokens ?? 0;
           message.usage = {
             ...emptyUsage(),
             input: routerMetadata.usage.inputTokens,
             output: routerMetadata.usage.outputTokens,
             totalTokens: routerMetadata.usage.totalTokens,
+            cacheRead,
+            cacheWrite,
           };
+          promptCache.cacheCreationTokens1h = routerMetadata.usage.cacheCreationTokens1h ?? 0;
+          promptCache.cacheCreationTokens5m = routerMetadata.usage.cacheCreationTokens5m ?? 0;
+          observeCacheRead(promptCache, cacheRead);
         }
         const type = typeof event.type === "string" ? event.type : "";
         if (type === "response.output_text.delta") {
@@ -774,15 +883,26 @@ export class OpenAIResponsesAdapter {
         }
         if (type === "response.completed" || type === "response.incomplete") {
           const response = event.response as
-            | { usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number }; incomplete_details?: { reason?: string } }
+            | {
+                usage?: {
+                  input_tokens?: number;
+                  output_tokens?: number;
+                  total_tokens?: number;
+                  input_tokens_details?: { cached_tokens?: number };
+                };
+                incomplete_details?: { reason?: string };
+              }
             | undefined;
           if (response?.usage) {
+            const cacheRead = response.usage.input_tokens_details?.cached_tokens ?? 0;
             message.usage = {
               ...emptyUsage(),
               input: response.usage.input_tokens ?? 0,
               output: response.usage.output_tokens ?? 0,
               totalTokens: response.usage.total_tokens ?? (response.usage.input_tokens ?? 0) + (response.usage.output_tokens ?? 0),
+              cacheRead,
             };
+            observeCacheRead(promptCache, cacheRead);
           }
           if (type === "response.incomplete" || response?.incomplete_details?.reason === "max_output_tokens") sawIncomplete = true;
           continue;
@@ -891,12 +1011,16 @@ export function contextToAnthropicMessages(context: Context): Array<{ role: "use
   return messages;
 }
 
-export function contextToAnthropicTools(context: Context): Array<Record<string, unknown>> | undefined {
+export function contextToAnthropicTools(
+  context: Context,
+  cacheControl?: { type: "ephemeral"; ttl?: "1h" },
+): Array<Record<string, unknown>> | undefined {
   if (!context.tools || context.tools.length === 0) return undefined;
-  return context.tools.map((tool) => ({
+  return context.tools.map((tool, index) => ({
     name: tool.name,
     description: tool.description,
     input_schema: tool.parameters as unknown as JsonValue,
+    ...(cacheControl && index === context.tools!.length - 1 ? { cache_control: cacheControl } : {}),
   }));
 }
 
@@ -931,9 +1055,12 @@ interface AnthropicStreamClient {
  */
 export class AnthropicMessagesAdapter {
   readonly #client: AnthropicStreamClient;
+  readonly #promptCache: PromptCacheAdapterConfig | undefined;
+  readonly #cacheTracker = new PromptCacheTracker();
 
-  constructor(options: { client: AnthropicStreamClient }) {
+  constructor(options: { client: AnthropicStreamClient; promptCache?: PromptCacheAdapterConfig }) {
     this.#client = options.client;
+    this.#promptCache = options.promptCache;
   }
 
   stream: StreamFn = (model, context, options) => {
@@ -958,6 +1085,8 @@ export class AnthropicMessagesAdapter {
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    const promptCache = preparePromptCache(this.#cacheTracker, this.#promptCache, model, context, options);
+    applyPromptCache(message, promptCache);
     // Anthropic block index -> our content index + accumulated tool JSON.
     const blocks = new Map<number, { contentIndex: number; kind: "text" | "thinking" | "toolCall"; toolJson: string }>();
     let stopReason: string | null = null;
@@ -970,8 +1099,20 @@ export class AnthropicMessagesAdapter {
         max_tokens: maxTokens,
         messages: contextToAnthropicMessages(context),
       };
-      if (context.systemPrompt) body.system = context.systemPrompt;
-      const tools = contextToAnthropicTools(context);
+      const capability = promptCacheCapability(this.#promptCache, model.id);
+      const cacheControl = capability.cacheControl && promptCache.retention !== "none"
+        ? { type: "ephemeral" as const, ...(promptCache.retention === "long" ? { ttl: "1h" as const } : {}) }
+        : undefined;
+      if (context.systemPrompt) {
+        const system = splitStablePrompt(context.systemPrompt);
+        body.system = cacheControl
+          ? [
+              ...(system.stable ? [{ type: "text", text: system.stable, cache_control: cacheControl }] : []),
+              ...(system.dynamic ? [{ type: "text", text: system.dynamic }] : []),
+            ]
+          : providerPromptText(context.systemPrompt);
+      }
+      const tools = contextToAnthropicTools(context, cacheControl);
       if (tools) body.tools = tools;
       if (options?.temperature !== undefined) body.temperature = options.temperature;
       if (options?.reasoning && model.reasoning) {
@@ -984,11 +1125,24 @@ export class AnthropicMessagesAdapter {
         if (options?.signal?.aborted) throw new Error("aborted");
         const type = typeof event.type === "string" ? event.type : "";
         if (type === "message_start") {
-          const usage = (event.message as { usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } } | undefined)?.usage;
+          const usage = (event.message as {
+            usage?: {
+              input_tokens?: number;
+              cache_read_input_tokens?: number;
+              cache_creation_input_tokens?: number;
+              cache_creation?: {
+                ephemeral_1h_input_tokens?: number;
+                ephemeral_5m_input_tokens?: number;
+              };
+            };
+          } | undefined)?.usage;
           if (usage) {
             message.usage.input = usage.input_tokens ?? 0;
             message.usage.cacheRead = usage.cache_read_input_tokens ?? 0;
             message.usage.cacheWrite = usage.cache_creation_input_tokens ?? 0;
+            promptCache.cacheCreationTokens1h = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+            promptCache.cacheCreationTokens5m = usage.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+            observeCacheRead(promptCache, message.usage.cacheRead);
           }
           continue;
         }

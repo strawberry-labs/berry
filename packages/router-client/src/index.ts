@@ -37,6 +37,10 @@ export interface ChatCompletionUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  cacheCreationTokens1h?: number;
+  cacheCreationTokens5m?: number;
 }
 
 export interface ChatCompletionResult {
@@ -134,6 +138,10 @@ export interface ChatCompletionOptions {
   maxTokens?: number;
   signal?: AbortSignal;
   metadata?: Record<string, string>;
+  /** OpenAI-compatible prompt cache routing key; supplied only by a declared-capable adapter. */
+  promptCacheKey?: string;
+  /** Requested cache retention; "short" uses the provider default, "long" maps to 24h. */
+  promptCacheRetention?: "short" | "long";
 }
 
 export interface ImageGenerationOptions {
@@ -519,6 +527,8 @@ export class OpenAIChatCompletionsClient {
       if (usesOpenRouterReasoningShape(this.#provider)) body.reasoning = { effort: options.reasoningEffort };
       else body.reasoning_effort = options.reasoningEffort;
     }
+    if (options.promptCacheKey) body.prompt_cache_key = options.promptCacheKey;
+    if (options.promptCacheRetention === "long") body.prompt_cache_retention = "24h";
     if (options.tools && options.tools.length > 0) {
       body.tools = options.tools;
       if (options.toolChoice) body.tool_choice = options.toolChoice;
@@ -873,10 +883,20 @@ function usesOpenRouterReasoningShape(provider: ProviderTransportInfo): boolean 
 
 function normalizeUsage(usage: OpenAIUsage | undefined): ChatCompletionUsage | undefined {
   if (!usage) return undefined;
+  const cacheReadTokens = usage.prompt_tokens_details?.cached_tokens
+    ?? usage.input_tokens_details?.cached_tokens
+    ?? usage.cache_read_input_tokens
+    ?? 0;
+  const cacheWriteTokens = usage.cache_creation_input_tokens ?? 0;
   return {
-    inputTokens: usage.prompt_tokens ?? 0,
-    outputTokens: usage.completion_tokens ?? 0,
-    totalTokens: usage.total_tokens ?? (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0),
+    inputTokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
+    outputTokens: usage.completion_tokens ?? usage.output_tokens ?? 0,
+    totalTokens: usage.total_tokens
+      ?? (usage.prompt_tokens ?? usage.input_tokens ?? 0) + (usage.completion_tokens ?? usage.output_tokens ?? 0),
+    cacheReadTokens,
+    cacheWriteTokens,
+    cacheCreationTokens1h: usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
+    cacheCreationTokens5m: usage.cache_creation?.ephemeral_5m_input_tokens ?? 0,
   };
 }
 
@@ -884,10 +904,20 @@ function normalizeUsageHeaders(headers: Headers): ChatCompletionUsage | undefine
   const inputTokens = numericHeader(headers, ["x-berry-usage-input-tokens", "x-router-usage-input-tokens", "x-usage-input-tokens"]);
   const outputTokens = numericHeader(headers, ["x-berry-usage-output-tokens", "x-router-usage-output-tokens", "x-usage-output-tokens"]);
   const totalTokens = numericHeader(headers, ["x-berry-usage-total-tokens", "x-router-usage-total-tokens", "x-usage-total-tokens"]);
-  if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) return undefined;
+  const cacheReadTokens = numericHeader(headers, ["x-berry-usage-cache-read-tokens", "x-router-usage-cache-read-tokens", "x-usage-cache-read-tokens"]);
+  const cacheWriteTokens = numericHeader(headers, ["x-berry-usage-cache-write-tokens", "x-router-usage-cache-write-tokens", "x-usage-cache-write-tokens"]);
+  if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined && cacheReadTokens === undefined && cacheWriteTokens === undefined) return undefined;
   const input = inputTokens ?? 0;
   const output = outputTokens ?? 0;
-  return { inputTokens: input, outputTokens: output, totalTokens: totalTokens ?? input + output };
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: totalTokens ?? input + output,
+    cacheReadTokens: cacheReadTokens ?? 0,
+    cacheWriteTokens: cacheWriteTokens ?? 0,
+    cacheCreationTokens1h: 0,
+    cacheCreationTokens5m: 0,
+  };
 }
 
 function routerAttribution(
@@ -1116,7 +1146,17 @@ interface ProviderModelEntry {
 interface OpenAIUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
+  input_tokens?: number;
+  output_tokens?: number;
   total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  input_tokens_details?: { cached_tokens?: number };
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_1h_input_tokens?: number;
+    ephemeral_5m_input_tokens?: number;
+  };
 }
 
 interface OllamaChatChunk {

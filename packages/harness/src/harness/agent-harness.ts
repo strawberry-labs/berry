@@ -14,6 +14,7 @@ import { collectEntriesForBranchSummary, generateBranchSummary } from "./compact
 import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	ensurePortableCompactionResult,
 	estimateContextTokens,
 	prepareCompaction,
 	shouldCompact,
@@ -554,7 +555,9 @@ export class AgentHarness<
 			? { ok: true as const, value: provided }
 			: await compact(preparation, this.models, model, options.customInstructions, signal, this.thinkingLevel);
 		if (!compactResult.ok) throw compactResult.error;
-		const result = compactResult.value;
+		const result = provided
+			? ensurePortableCompactionResult(preparation, compactResult.value)
+			: compactResult.value;
 		const entryId = await this.session.appendCompaction(
 			result.summary,
 			result.firstKeptEntryId,

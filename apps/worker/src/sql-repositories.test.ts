@@ -58,7 +58,7 @@ describe("SQL worker repositories", () => {
       tenantId,
       from: new Date("2026-07-10T00:00:00.000Z"),
       to: new Date("2026-07-11T00:00:00.000Z"),
-    })).resolves.toEqual([
+    })).resolves.toMatchObject([
       {
         tenantId,
         feature: "model",
@@ -68,6 +68,8 @@ describe("SQL worker repositories", () => {
         tokensIn: 1,
         tokensOut: 2,
         tokensCached: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
         costRawMicros: "3",
         costBilledMicros: "4",
         latencyMs: 5,

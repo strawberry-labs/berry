@@ -28,10 +28,28 @@ export {
   createProviderStreamFn,
   OpenAIResponsesAdapter,
   type BerryModelProviderInfo,
+  type PromptCacheAdapterConfig,
   type BerryStreamFn,
 } from "./model.ts";
 export {
+  buildPromptManifest,
+  cacheKeyFor,
+  canonicalJson,
+  compareManifests,
+  DYNAMIC_CONTEXT_BOUNDARY,
+  joinStableAndDynamicPrompt,
+  PromptCacheTracker,
+  providerPromptText,
+  resolvePromptCachingCapabilities,
+  sha256,
+  splitStablePrompt,
+  type PromptCacheRequest,
+} from "./prompt-cache.ts";
+export {
+  appendGroundingContext,
+  appendPortableCheckpoint,
   BerryAgentRuntime,
+  formatGroundingContext,
   type ApprovalRequestPayload,
   type AssistantMessagePayload,
   type BerryAgentRuntimeOptions,
@@ -73,6 +91,7 @@ export {
   type BerryToolsOptions,
   type BrowserToolBridge,
   type BrowserToolMethod,
+  type MemoryToolBridge,
   type WebToolBridge,
   type WebToolMethod,
 } from "./tools.ts";

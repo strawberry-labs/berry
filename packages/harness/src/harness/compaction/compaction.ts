@@ -1,4 +1,8 @@
 import type { AssistantMessage, ImageContent, Model, Models, TextContent, Usage } from "@earendil-works/pi-ai";
+import {
+	parseSessionCheckpoint,
+	type SessionCheckpointV2,
+} from "@berry/shared";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import {
 	convertToLlm,
@@ -17,6 +21,11 @@ import {
 	serializeConversation,
 	truncateConversationForSummary,
 } from "./utils.ts";
+import {
+	fallbackPortableCheckpoint,
+	generatePortableCheckpoint,
+	type CheckpointValidationStatus,
+} from "./checkpoint.ts";
 
 /** File-operation details stored on generated compaction entries. */
 export interface CompactionDetails {
@@ -36,6 +45,23 @@ export interface CompactionDetails {
 	retainedTokens?: number;
 	/** Estimated summarizer input tokens after local trimming. */
 	summarizationInputTokens?: number;
+	/** Immutable checkpoint for only the entries covered by this window. */
+	segmentCheckpoint?: SessionCheckpointV2;
+	/** Latest portable checkpoint used to resume the full session. */
+	rollingCheckpoint?: SessionCheckpointV2;
+	/** All immutable segments retained for periodic lossless rebase. */
+	segmentCheckpoints?: SessionCheckpointV2[];
+	/** Validation outcome of the structured checkpoint model output. */
+	checkpointValidationStatus?: CheckpointValidationStatus;
+	/** One normal generation plus at most one repair. */
+	checkpointGenerationAttempts?: number;
+	/** Whether this window rebuilt rolling state from immutable segments. */
+	checkpointRebased?: boolean;
+	/** Leaf whose branch the checkpoint represents. */
+	sourceLeafId?: string;
+	/** Entry ids represented by the immutable segment. */
+	coveredEntryStart?: string | null;
+	coveredEntryEnd?: string | null;
 }
 function safeJsonStringify(value: unknown): string {
 	try {
@@ -570,6 +596,14 @@ export interface CompactionPreparation {
 	windowNumber: number;
 	/** Settings used to prepare compaction. */
 	settings: CompactionSettings;
+	/** Exact entries summarized by this immutable compaction segment. */
+	coveredEntries: SessionTreeEntry[];
+	/** Branch leaf represented by this checkpoint. */
+	sourceLeafId: string;
+	/** Latest validated rolling checkpoint, when available. */
+	previousRollingCheckpoint: SessionCheckpointV2 | null;
+	/** Validated immutable checkpoints retained for periodic rebase. */
+	priorSegmentCheckpoints: SessionCheckpointV2[];
 }
 
 /** Prepare session entries for compaction, or return undefined when compaction is not applicable. */
@@ -640,6 +674,31 @@ export function prepareCompaction(
 		0,
 	);
 	const retainedTokens = retainedMessages.reduce((total, message) => total + estimateTokens(message), 0);
+	const coveredEntries = pathEntries.slice(boundaryStart, cutPoint.firstKeptEntryIndex);
+	const sourceLeafId = pathEntries[pathEntries.length - 1]?.id;
+	if (!sourceLeafId) {
+		return err(new CompactionError("invalid_session", "Session leaf has no UUID - session may need migration"));
+	}
+	const previousRollingCheckpoint = validCheckpoint(previousDetails?.rollingCheckpoint);
+	const priorSegmentCheckpoints: SessionCheckpointV2[] = [];
+	for (const entry of pathEntries) {
+		if (entry.type !== "compaction") continue;
+		const details = entry.details as CompactionDetails | undefined;
+		const candidates = Array.isArray(details?.segmentCheckpoints)
+			? details.segmentCheckpoints
+			: details?.segmentCheckpoint
+				? [details.segmentCheckpoint]
+				: [];
+		for (const candidate of candidates) {
+			const checkpoint = validCheckpoint(candidate);
+			if (checkpoint && !priorSegmentCheckpoints.some((item) =>
+				item.currentLeafId === checkpoint.currentLeafId
+				&& item.coveredEntryEnd === checkpoint.coveredEntryEnd
+			)) {
+				priorSegmentCheckpoints.push(checkpoint);
+			}
+		}
+	}
 
 	return ok({
 		firstKeptEntryId,
@@ -653,6 +712,10 @@ export function prepareCompaction(
 		retainedTokens,
 		windowNumber,
 		settings,
+		coveredEntries,
+		sourceLeafId,
+		previousRollingCheckpoint,
+		priorSegmentCheckpoints,
 	});
 }
 
@@ -754,6 +817,13 @@ export async function compact(
 			settings.maxSummarizationInputTokens * 4,
 		).length / 4,
 	);
+	const checkpoint = await generatePortableCheckpoint(
+		checkpointInput(preparation, summary),
+		models,
+		model,
+		signal,
+		thinkingLevel,
+	);
 
 	return ok({
 		summary,
@@ -768,8 +838,66 @@ export async function compact(
 			compactedTokens,
 			retainedTokens,
 			summarizationInputTokens,
+			segmentCheckpoint: checkpoint.segment,
+			rollingCheckpoint: checkpoint.rolling,
+			segmentCheckpoints: [...preparation.priorSegmentCheckpoints, checkpoint.segment],
+			checkpointValidationStatus: checkpoint.validationStatus,
+			checkpointGenerationAttempts: checkpoint.generationAttempts,
+			checkpointRebased: checkpoint.rebased,
+			sourceLeafId: preparation.sourceLeafId,
+			coveredEntryStart: checkpoint.segment.coveredEntryStart,
+			coveredEntryEnd: checkpoint.segment.coveredEntryEnd,
 		} as CompactionDetails,
 	});
+}
+
+/**
+ * Add a provider-portable checkpoint when a hook supplied opaque native
+ * compaction output.
+ */
+export function ensurePortableCompactionResult(
+	preparation: CompactionPreparation,
+	result: CompactionResult,
+): CompactionResult<CompactionDetails & Record<string, unknown>> {
+	const existing = (result.details ?? {}) as CompactionDetails & Record<string, unknown>;
+	if (validCheckpoint(existing.rollingCheckpoint) && validCheckpoint(existing.segmentCheckpoint)) {
+		return result as CompactionResult<CompactionDetails & Record<string, unknown>>;
+	}
+	const checkpoint = fallbackPortableCheckpoint(checkpointInput(preparation, result.summary));
+	return {
+		...result,
+		details: {
+			...existing,
+			segmentCheckpoint: checkpoint.segment,
+			rollingCheckpoint: checkpoint.rolling,
+			segmentCheckpoints: [...preparation.priorSegmentCheckpoints, checkpoint.segment],
+			checkpointValidationStatus: checkpoint.validationStatus,
+			checkpointGenerationAttempts: checkpoint.generationAttempts,
+			checkpointRebased: checkpoint.rebased,
+			sourceLeafId: preparation.sourceLeafId,
+			coveredEntryStart: checkpoint.segment.coveredEntryStart,
+			coveredEntryEnd: checkpoint.segment.coveredEntryEnd,
+		},
+	};
+}
+
+function checkpointInput(preparation: CompactionPreparation, summary: string) {
+	return {
+		entries: preparation.coveredEntries,
+		messages: [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages],
+		previousRolling: preparation.previousRollingCheckpoint,
+		priorSegments: preparation.priorSegmentCheckpoints,
+		windowNumber: preparation.windowNumber,
+		sourceLeafId: preparation.sourceLeafId,
+		coveredEntryStart: preparation.coveredEntries[0]?.id ?? null,
+		coveredEntryEnd: preparation.coveredEntries[preparation.coveredEntries.length - 1]?.id ?? null,
+		summary,
+		maxInputTokens: preparation.settings.maxSummarizationInputTokens,
+	};
+}
+
+function validCheckpoint(value: unknown): SessionCheckpointV2 | null {
+	return parseSessionCheckpoint(value).checkpoint;
 }
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],

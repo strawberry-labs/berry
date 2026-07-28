@@ -82,6 +82,15 @@ export class InMemoryUsageRepository implements UsageRepository {
       tokensIn: input.normalized.tokensIn,
       tokensOut: input.normalized.tokensOut,
       tokensCached: input.normalized.tokensCached,
+      cacheReadTokens: Math.max(input.normalized.cacheReadTokens, input.normalized.tokensCached),
+      cacheWriteTokens: input.normalized.cacheWriteTokens,
+      cacheCreationTokens1h: input.normalized.cacheCreationTokens1h,
+      cacheCreationTokens5m: input.normalized.cacheCreationTokens5m,
+      cacheEligible: input.normalized.cacheEligible,
+      cacheProvider: input.normalized.cacheProvider ?? null,
+      cacheKeyHash: input.normalized.cacheKeyHash ?? null,
+      promptManifestHash: input.normalized.promptManifestHash ?? null,
+      cacheMissReason: input.normalized.cacheMissReason ?? null,
       sandboxUsage: input.normalized.sandboxUsage,
       costRawMicros: input.normalized.costRawMicros,
       costBilledMicros: input.normalized.costBilledMicros,
@@ -205,12 +214,15 @@ export class PostgresUsageRepository implements UsageRepository {
     const rows = await executor.query<UsageEventRow>(
       `INSERT INTO usage_events (
         tenant_id, request_id, idempotency_key, source, user_id, department_id, workspace_id, task_id, session_id, tool_call_id, agent_id, sandbox_id,
-        feature, provider, model, tokens_in, tokens_out, tokens_cached, sandbox_usage,
+        feature, provider, model, tokens_in, tokens_out, tokens_cached,
+        cache_read_tokens, cache_write_tokens, cache_creation_tokens_1h, cache_creation_tokens_5m,
+        cache_eligible, cache_provider, cache_key_hash, prompt_manifest_hash, cache_miss_reason, sandbox_usage,
         cost_raw_micros, cost_billed_micros, latency_ms, ttft_ms, status, metadata, signed_payload, signature, ts
       ) VALUES (
         $1::uuid, $2, $2, $3, $4::uuid, $5::uuid, $6::uuid, $7::uuid, $8::uuid, $9::uuid,
-        $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb,
-        $19, $20, $21, $22, $23, $24::jsonb, $25::jsonb, $26::jsonb, $27
+        $10, $11, $12, $13, $14, $15, $16, $17,
+        $18, $19, $20, $21, $22, $23, $24, $25, $26, $27::jsonb,
+        $28, $29, $30, $31, $32, $33::jsonb, $34::jsonb, $35::jsonb, $36
       )
       ON CONFLICT (tenant_id, request_id) DO NOTHING
       RETURNING *`,
@@ -232,6 +244,15 @@ export class PostgresUsageRepository implements UsageRepository {
         normalized.tokensIn,
         normalized.tokensOut,
         normalized.tokensCached,
+        Math.max(normalized.cacheReadTokens, normalized.tokensCached),
+        normalized.cacheWriteTokens,
+        normalized.cacheCreationTokens1h,
+        normalized.cacheCreationTokens5m,
+        normalized.cacheEligible,
+        normalized.cacheProvider ?? null,
+        normalized.cacheKeyHash ?? null,
+        normalized.promptManifestHash ?? null,
+        normalized.cacheMissReason ?? null,
         JSON.stringify(normalized.sandboxUsage),
         normalized.costRawMicros,
         normalized.costBilledMicros,
@@ -256,7 +277,11 @@ type UsageWriteInput = Omit<CloudUsageIngestRequest, "source" | "signature"> & {
 };
 
 export function usageEventsCsv(events: CloudUsageEventRecord[]): string {
-  const headers = ["ts", "source", "request_id", "feature", "provider", "model", "user_id", "department_id", "status", "tokens_in", "tokens_out", "cost_billed_micros"];
+  const headers = [
+    "ts", "source", "request_id", "feature", "provider", "model", "user_id", "department_id", "status",
+    "tokens_in", "tokens_out", "cache_read_tokens", "cache_write_tokens", "cache_eligible",
+    "cache_miss_reason", "cost_billed_micros",
+  ];
   const rows = events.map((event) => [
     event.ts,
     event.source,
@@ -269,6 +294,10 @@ export function usageEventsCsv(events: CloudUsageEventRecord[]): string {
     event.status,
     String(event.tokensIn),
     String(event.tokensOut),
+    String(event.cacheReadTokens),
+    String(event.cacheWriteTokens),
+    String(event.cacheEligible),
+    event.cacheMissReason ?? "",
     event.costBilledMicros,
   ]);
   return [headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
@@ -315,6 +344,8 @@ function rollupsFromEvents(events: CloudUsageEventRecord[]): CloudUsageRollup[] 
         tokensIn: event.tokensIn,
         tokensOut: event.tokensOut,
         tokensCached: event.tokensCached,
+        cacheReadTokens: event.cacheReadTokens,
+        cacheWriteTokens: event.cacheWriteTokens,
         costRawMicros: event.costRawMicros,
         costBilledMicros: event.costBilledMicros,
       }));
@@ -324,6 +355,8 @@ function rollupsFromEvents(events: CloudUsageEventRecord[]): CloudUsageRollup[] 
     current.tokensIn += event.tokensIn;
     current.tokensOut += event.tokensOut;
     current.tokensCached += event.tokensCached;
+    current.cacheReadTokens += event.cacheReadTokens;
+    current.cacheWriteTokens += event.cacheWriteTokens;
     current.costRawMicros = (BigInt(current.costRawMicros) + BigInt(event.costRawMicros)).toString();
     current.costBilledMicros = (BigInt(current.costBilledMicros) + BigInt(event.costBilledMicros)).toString();
   }
@@ -415,7 +448,10 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
     performance: {
       latencyP50Ms: percentile(latencies, 0.5), latencyP95Ms: percentile(latencies, 0.95),
       ttftP50Ms: percentile(ttfts, 0.5), ttftP95Ms: percentile(ttfts, 0.95),
-      cachedTokens: events.reduce((sum, event) => sum + event.tokensCached, 0), sandboxMinutes,
+      cachedTokens: events.reduce((sum, event) => sum + event.tokensCached, 0),
+      cacheReadTokens: events.reduce((sum, event) => sum + event.cacheReadTokens, 0),
+      cacheWriteTokens: events.reduce((sum, event) => sum + event.cacheWriteTokens, 0),
+      sandboxMinutes,
     },
     anomalies: explainAnomalies(events, query),
     unavailableDimensions: events.some((event) => event.agentId) ? [] : ["agent"],
@@ -488,7 +524,16 @@ function requestPageFromEvents(events: CloudUsageEventRecord[], query: UsageAnal
 
 function requestSummaryFromEvent(event: CloudUsageEventRecord) {
   const status = reservationStatus(event.metadata);
-  return { id: event.id, requestId: redactRequestId(event.requestId), ts: event.ts, userId: event.userId, departmentId: event.departmentId, workspaceId: event.workspaceId, agentId: event.agentId, feature: event.feature, provider: event.provider, model: event.model, status: event.status, tokensIn: event.tokensIn, tokensOut: event.tokensOut, tokensCached: event.tokensCached, billedCostMicros: event.costBilledMicros, latencyMs: event.latencyMs, ttftMs: event.ttftMs, reservationStatus: status };
+  return {
+    id: event.id, requestId: redactRequestId(event.requestId), ts: event.ts, userId: event.userId,
+    departmentId: event.departmentId, workspaceId: event.workspaceId, agentId: event.agentId,
+    feature: event.feature, provider: event.provider, model: event.model, status: event.status,
+    tokensIn: event.tokensIn, tokensOut: event.tokensOut, tokensCached: event.tokensCached,
+    cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens,
+    cacheEligible: event.cacheEligible, cacheMissReason: event.cacheMissReason,
+    billedCostMicros: event.costBilledMicros, latencyMs: event.latencyMs, ttftMs: event.ttftMs,
+    reservationStatus: status,
+  };
 }
 
 function requestDetailFromEvent(event: CloudUsageEventRecord): UsageRequestDetail {
@@ -539,6 +584,15 @@ function usageEventFromRow(row: UsageEventRow): CloudUsageEventRecord {
     tokensIn: row.tokens_in,
     tokensOut: row.tokens_out,
     tokensCached: row.tokens_cached,
+    cacheReadTokens: row.cache_read_tokens ?? row.tokens_cached,
+    cacheWriteTokens: row.cache_write_tokens ?? 0,
+    cacheCreationTokens1h: row.cache_creation_tokens_1h ?? 0,
+    cacheCreationTokens5m: row.cache_creation_tokens_5m ?? 0,
+    cacheEligible: row.cache_eligible ?? false,
+    cacheProvider: row.cache_provider ?? null,
+    cacheKeyHash: row.cache_key_hash ?? null,
+    promptManifestHash: row.prompt_manifest_hash ?? null,
+    cacheMissReason: row.cache_miss_reason ?? null,
     sandboxUsage: row.sandbox_usage ?? {},
     costRawMicros: String(row.cost_raw_micros),
     costBilledMicros: String(row.cost_billed_micros),
@@ -572,6 +626,8 @@ function usageRollupFromRow(row: UsageRollupRow): CloudUsageRollup {
     tokensIn: row.tokens_in,
     tokensOut: row.tokens_out,
     tokensCached: row.tokens_cached,
+    cacheReadTokens: row.cache_read_tokens ?? row.tokens_cached,
+    cacheWriteTokens: row.cache_write_tokens ?? 0,
     costRawMicros: String(row.cost_raw_micros),
     costBilledMicros: String(row.cost_billed_micros),
   });
@@ -638,6 +694,15 @@ type UsageEventRow = {
   tokens_in: number;
   tokens_out: number;
   tokens_cached: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cache_creation_tokens_1h: number;
+  cache_creation_tokens_5m: number;
+  cache_eligible: boolean;
+  cache_provider: string | null;
+  cache_key_hash: string | null;
+  prompt_manifest_hash: string | null;
+  cache_miss_reason: string | null;
   sandbox_usage: JsonValue;
   cost_raw_micros: string;
   cost_billed_micros: string;
@@ -669,6 +734,8 @@ type UsageRollupRow = {
   tokens_in: number;
   tokens_out: number;
   tokens_cached: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   cost_raw_micros: string;
   cost_billed_micros: string;
 };

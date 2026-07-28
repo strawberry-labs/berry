@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiEventStreamService } from "./event-stream.service.ts";
+import type { DurableTurnService } from "../runtime/durable-turn.service.ts";
+
+afterEach(() => vi.useRealTimers());
 
 describe("ApiEventStreamService", () => {
   it("emits default SSE messages so EventSource.onmessage receives replayed and live events", () => {
     const service = new ApiEventStreamService();
-    const received: Array<MessageEvent<unknown>> = [];
+    const received: Array<MessageEvent<unknown> & { id?: string }> = [];
     const subscription = service.stream("session_1", [{ kind: "turn.start", turnId: "turn_1" }]).subscribe((event) => received.push(event));
 
     service.publish("session_1", { kind: "turn.end", turnId: "turn_1", status: "completed" });
@@ -46,4 +49,59 @@ describe("ApiEventStreamService", () => {
     expect(received).toEqual([expect.objectContaining({ data: expect.objectContaining({ type: "task.updated", task: expect.objectContaining({ id: "task_1", conversationKind: "code" }) }) })]);
     subscription.unsubscribe();
   });
+
+  it("replays durable event sequences and ignores a duplicate returned during live polling", async () => {
+    vi.useFakeTimers();
+    const runId = "00000000-0000-7000-8000-000000000011";
+    const pages = [
+      [
+        envelope(runId, 1, { kind: "turn.start", turnId: runId }),
+        envelope(runId, 2, { kind: "message.start", messageId: "message-1", role: "assistant" }),
+      ],
+      [
+        envelope(runId, 2, { kind: "message.start", messageId: "message-1", role: "assistant" }),
+        envelope(runId, 3, { kind: "message.delta", messageId: "message-1", delta: "hello", channel: "text" }),
+      ],
+    ];
+    let call = 0;
+    const durable = {
+      eventsAfter: async () => pages[Math.min(call++, pages.length - 1)]!,
+    } as unknown as DurableTurnService;
+    const service = new ApiEventStreamService(durable);
+    const received: Array<MessageEvent<unknown> & { id?: string }> = [];
+    const stream = await service.streamDurable(
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000002",
+      null,
+    );
+    const subscription = stream.subscribe((event) => received.push(event));
+
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(received.map((event) => event.id)).toEqual([
+      `${runId}:1`,
+      `${runId}:2`,
+      `${runId}:3`,
+    ]);
+    expect(received.map((event) => event.data)).toEqual([
+      { kind: "turn.start", turnId: runId },
+      { kind: "message.start", messageId: "message-1", role: "assistant" },
+      { kind: "message.delta", messageId: "message-1", delta: "hello", channel: "text" },
+    ]);
+    subscription.unsubscribe();
+  });
 });
+
+function envelope(
+  runId: string,
+  sequence: number,
+  event: Parameters<ApiEventStreamService["publish"]>[1],
+) {
+  return {
+    id: `${runId}:${sequence}`,
+    runId,
+    sequence,
+    event,
+    createdAt: `2026-07-28T12:00:0${sequence}.000Z`,
+  };
+}

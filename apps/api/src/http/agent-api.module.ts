@@ -22,6 +22,11 @@ import { OrganizationCapabilitiesController } from "./organization-capabilities.
 import { ORGANIZATION_CAPABILITIES, OrganizationCapabilitiesService } from "./organization-capabilities.service.ts";
 import { ManagementModule, type ManagementModuleOptions } from "../management/management.module.ts";
 import { FilePlatformModule } from "../files/file-platform.module.ts";
+import { MemoryModule } from "../memory/memory.module.ts";
+import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
+import { MemoryService } from "../memory/memory.service.ts";
+import { KnowledgeService } from "../knowledge/knowledge.service.ts";
+import { DURABLE_TURN_RUNNER_ENABLED, DurableTurnService } from "../runtime/durable-turn.service.ts";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -39,11 +44,14 @@ export type AgentApiModuleOptions = {
   personalCapabilities?: { useValue: PersonalCapabilitiesService };
   organizationCapabilities?: { useValue: OrganizationCapabilitiesService };
   management?: ManagementModuleOptions;
+  durableRunnerEnabled?: boolean;
+  durableContextEnabled?: boolean;
 };
 
 @Module({})
 export class AgentApiModule {
   static register(options: AgentApiModuleOptions): DynamicModule {
+    const durableContextEnabled = options.durableContextEnabled ?? options.durableRunnerEnabled ?? false;
     const storeProvider: Provider<CloudTaskStore> = options.taskStore
       ? "useValue" in options.taskStore
         ? { provide: CLOUD_TASK_STORE, useValue: options.taskStore.useValue }
@@ -71,11 +79,58 @@ export class AgentApiModule {
         PolicyDistributionModule.register({ ...(options.policyDistribution ?? {}), identity: options.policyDistribution?.identity ?? options.identity }),
         ManagementModule.register({ ...(options.management ?? {}), ...((options.management?.identity ?? options.identity) ? { identity: options.management?.identity ?? options.identity } : {}) }),
         FilePlatformModule,
+        ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],
       controllers: [AgentApiController, PersonalCapabilitiesController, OrganizationCapabilitiesController],
-      providers: [storeProvider, mobileDeviceProvider, sandboxWorkspaceProvider, options.personalCapabilities ? { provide: PERSONAL_CAPABILITIES, useValue: options.personalCapabilities.useValue } : { provide: PERSONAL_CAPABILITIES, useClass: PersonalCapabilitiesService }, options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) }, ApiEventStreamService, CompanionPushService, CloudRuntimeConfigService],
-      exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, ApiEventStreamService, CompanionPushService],
+      providers: [
+        storeProvider,
+        mobileDeviceProvider,
+        sandboxWorkspaceProvider,
+        options.personalCapabilities ? { provide: PERSONAL_CAPABILITIES, useValue: options.personalCapabilities.useValue } : { provide: PERSONAL_CAPABILITIES, useClass: PersonalCapabilitiesService },
+        options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) },
+        { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
+        ...(durableContextEnabled
+          ? [DurableTurnService]
+          : [
+              { provide: DurableTurnService, useValue: { enabled: false } },
+              {
+                provide: ContextAssemblyService,
+                useValue: {
+                  assemble: async () => ({
+                    personalMemory: [],
+                    projectFacts: [],
+                    citations: [],
+                    retrieval: {
+                      snapshotId: null,
+                      queryHash: "disabled",
+                      tokenBudget: 0,
+                      tokensSelected: 0,
+                      degradedReason: "memory_disabled",
+                    },
+                  }),
+                  portableCheckpoint: async () => null,
+                },
+              },
+              {
+                provide: MemoryService,
+                useValue: {
+                  remember: async () => ({ operation: "NOOP", reason: "disabled", item: null }),
+                  forget: async () => null,
+                  forgetMatching: async () => null,
+                  enqueueExtraction: async () => undefined,
+                },
+              },
+              {
+                provide: KnowledgeService,
+                useValue: { enqueueTaskOutcome: async () => undefined },
+              },
+            ]),
+        ApiEventStreamService,
+        CompanionPushService,
+        CloudRuntimeConfigService,
+      ],
+      exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, DurableTurnService, ApiEventStreamService, CompanionPushService],
     };
   }
 }

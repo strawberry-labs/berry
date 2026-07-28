@@ -89,6 +89,24 @@ export interface BerryToolsOptions {
   artifactStore?: ArtifactStore;
   /** Host-owned OpenAI-compatible image generation capability. */
   imageGeneration?: ImageGenerationToolBridge;
+  /** Host-owned scoped memory mutations. Identity is bound by the host. */
+  memory?: MemoryToolBridge;
+}
+
+export interface MemoryToolBridge {
+  remember(input: {
+    scope: "personal" | "project";
+    kind: string;
+    stableKey?: string;
+    content: string;
+    value?: Record<string, unknown>;
+    expiresAt?: string | null;
+  }): Promise<{ operation: string; reason: string; memoryId: string | null }>;
+  forget(input: {
+    memoryId?: string;
+    stableKey?: string;
+    scope?: "personal" | "project";
+  }): Promise<{ forgotten: boolean; memoryId: string | null }>;
 }
 
 export interface ImageGenerationToolBridge {
@@ -202,6 +220,8 @@ const TOOL_RISKS: Record<string, BerryToolRisk> = {
   write_file: "file-edit",
   edit_file: "file-edit",
   apply_patch: "file-edit",
+  remember_memory: "file-edit",
+  forget_memory: "file-edit",
   git_checkpoint: "file-edit",
   bash: "shell",
   browser_navigate: "browser",
@@ -869,6 +889,66 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
       )
     : undefined;
 
+  const rememberMemory = options.memory
+    ? defineTool(
+        "remember_memory",
+        "Remember memory",
+        "Store an explicit durable fact or preference for this user. Use project scope only for a reusable fact about the current project. Never store credentials, secrets, copied documents, or ephemeral task details.",
+        Type.Object({
+          scope: Type.Union([Type.Literal("personal"), Type.Literal("project")]),
+          kind: Type.String({ minLength: 1, maxLength: 80 }),
+          stable_key: Type.Optional(Type.String({ minLength: 1, maxLength: 240 })),
+          content: Type.String({ minLength: 1, maxLength: 20_000 }),
+          value: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+          expires_at: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+        }),
+        async (_id, params) => {
+          const result = await options.memory!.remember({
+            scope: params.scope === "project" ? "project" : "personal",
+            kind: String(params.kind),
+            ...(typeof params.stable_key === "string" ? { stableKey: params.stable_key } : {}),
+            content: String(params.content),
+            ...(params.value && typeof params.value === "object" && !Array.isArray(params.value)
+              ? { value: params.value as Record<string, unknown> }
+              : {}),
+            ...(typeof params.expires_at === "string" || params.expires_at === null
+              ? { expiresAt: params.expires_at }
+              : {}),
+          });
+          return textResult(
+            result.memoryId
+              ? `Memory ${result.operation.toLowerCase()}: ${result.memoryId}`
+              : `Memory was not stored: ${result.reason}`,
+            result,
+          );
+        },
+      )
+    : undefined;
+
+  const forgetMemory = options.memory
+    ? defineTool(
+        "forget_memory",
+        "Forget memory",
+        "Immediately forget a durable memory belonging to this user. Supply the memory id when available; otherwise use its stable key and scope.",
+        Type.Object({
+          memory_id: Type.Optional(Type.String({ minLength: 1 })),
+          stable_key: Type.Optional(Type.String({ minLength: 1, maxLength: 240 })),
+          scope: Type.Optional(Type.Union([Type.Literal("personal"), Type.Literal("project")])),
+        }),
+        async (_id, params) => {
+          if (typeof params.memory_id !== "string" && typeof params.stable_key !== "string") {
+            throw new Error("forget_memory requires memory_id or stable_key");
+          }
+          const result = await options.memory!.forget({
+            ...(typeof params.memory_id === "string" ? { memoryId: params.memory_id } : {}),
+            ...(typeof params.stable_key === "string" ? { stableKey: params.stable_key } : {}),
+            ...(params.scope === "personal" || params.scope === "project" ? { scope: params.scope } : {}),
+          });
+          return textResult(result.forgotten ? `Forgot memory ${result.memoryId}` : "No active matching memory was found.", result);
+        },
+      )
+    : undefined;
+
   const todoWrite = defineTool(
     "todo_write",
     "Todo",
@@ -1175,7 +1255,7 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
     );
   }
 
-  const tools = [readFile, readAttachment, skillTool, askUserQuestion, composeMessage, createImage, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
+  const tools = [readFile, readAttachment, skillTool, askUserQuestion, composeMessage, createImage, rememberMemory, forgetMemory, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
   if (persistArtifact) tools.push(persistArtifact);
   tools.push(...browserTools);
   tools.push(...webTools);

@@ -11,6 +11,8 @@ const InitiateSchema = z.object({
   size: z.number().int().nonnegative(),
   taskId: z.string().uuid().optional(),
   sessionId: z.string().uuid().optional(),
+  workspaceId: z.string().uuid().optional(),
+  workspaceVisibility: z.enum(["project", "task_only"]).optional(),
   sha256: z.string().regex(/^[a-f0-9]{64}$/i).optional(),
   origin: z.enum(["user_upload", "image_generation", "browser_capture"]).default("user_upload"),
   associationRole: z.enum(["input", "output", "reference"]).default("input"),
@@ -23,6 +25,13 @@ const CompleteSchema = z.object({
 const ListSchema = z.object({
   taskId: z.string().uuid().optional(),
   category: z.enum(["images", "documents"]).optional(),
+  search: z.string().trim().max(200).optional(),
+  cursor: z.string().max(1000).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+}).strict();
+const WorkspaceFileListSchema = z.object({
+  visibility: z.enum(["project", "task_only"]).optional(),
+  status: z.enum(["pending", "extracting", "chunking", "embedding", "indexed", "failed"]).optional(),
   search: z.string().trim().max(200).optional(),
   cursor: z.string().max(1000).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
@@ -75,6 +84,8 @@ export class FilePlatformController {
       size: input.size,
       ...(input.taskId ? { taskId: input.taskId } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+      ...(input.workspaceVisibility ? { workspaceVisibility: input.workspaceVisibility } : {}),
       ...(input.sha256 ? { sha256: input.sha256 } : {}),
       origin: input.origin ?? "user_upload",
       associationRole: input.associationRole ?? "input",
@@ -103,6 +114,43 @@ export class FilePlatformController {
   @Get(":fileId/content")
   content(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Query("download") download: string | undefined, @Res() response: ServerResponse) {
     return this.files.streamContent(tenant(), user(request), z.string().uuid().parse(fileId), typeof request.headers.range === "string" ? request.headers.range : undefined, response, download === "1");
+  }
+}
+
+@Controller("/v1/workspaces/:workspaceId/files")
+export class WorkspaceFileController {
+  constructor(@Inject(FilePlatformService) private readonly files: FilePlatformService) {}
+
+  @Get()
+  list(@Req() request: AuthenticatedRequest, @Param("workspaceId") workspaceId: string, @Query() query: Record<string, unknown>) {
+    const parsed = parse(WorkspaceFileListSchema, query);
+    return this.files.listWorkspaceFiles(tenant(), user(request), z.string().uuid().parse(workspaceId), {
+      ...(parsed.visibility ? { visibility: parsed.visibility } : {}),
+      ...(parsed.status ? { status: parsed.status } : {}),
+      ...(parsed.search ? { search: parsed.search } : {}),
+      ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+      ...(parsed.limit ? { limit: parsed.limit } : {}),
+    });
+  }
+
+  @Post(":fileId/retry")
+  retry(@Req() request: AuthenticatedRequest, @Param("workspaceId") workspaceId: string, @Param("fileId") fileId: string) {
+    return this.files.retryWorkspaceFile(
+      tenant(),
+      user(request),
+      z.string().uuid().parse(workspaceId),
+      z.string().uuid().parse(fileId),
+    );
+  }
+
+  @Delete(":fileId")
+  unlink(@Req() request: AuthenticatedRequest, @Param("workspaceId") workspaceId: string, @Param("fileId") fileId: string) {
+    return this.files.unlinkWorkspaceFile(
+      tenant(),
+      user(request),
+      z.string().uuid().parse(workspaceId),
+      z.string().uuid().parse(fileId),
+    );
   }
 }
 

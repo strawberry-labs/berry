@@ -100,6 +100,14 @@ export class UsageController {
     return UsageAnalyticsSchema.parse(await this.usage.analytics(tenantId, { ...parsed, memberId: request.auth!.user.id }));
   }
 
+  @Get("/me/requests")
+  async myRequests(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
+    await this.requirePermission(request, tenantId, "org:read");
+    return UsageRequestPageSchema.parse(
+      await this.usage.requestPage(tenantId, analyticsQuery(query), request.auth!.user.id),
+    );
+  }
+
   @Get("/me/export.csv")
   @Header("content-type", "text/csv; charset=utf-8")
   async exportMyUsageCsv(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {

@@ -59,3 +59,25 @@ export function confirmOptimisticMessage(messages: Message[], optimisticMessageI
     return persistedAlreadyPresent ? [] : [persistedMessage];
   });
 }
+
+export type DurableEventSequences = Readonly<Record<string, number>>;
+
+/**
+ * Turn events are replayed from Postgres and may overlap the last live batch.
+ * Keep the highest sequence per run so reconnects cannot duplicate deltas,
+ * tool rows, approvals, or terminal events.
+ */
+export function reconcileDurableEventCursor(
+  current: DurableEventSequences,
+  cursor: string | null | undefined,
+): { accepted: boolean; sequences: DurableEventSequences } {
+  if (!cursor) return { accepted: true, sequences: current };
+  const match = /^([0-9a-f-]{36}):(\d+)$/i.exec(cursor);
+  if (!match) return { accepted: true, sequences: current };
+  const runId = match[1]!;
+  const sequence = Number(match[2]);
+  if (!Number.isSafeInteger(sequence) || sequence <= (current[runId] ?? 0)) {
+    return { accepted: false, sequences: current };
+  }
+  return { accepted: true, sequences: { ...current, [runId]: sequence } };
+}

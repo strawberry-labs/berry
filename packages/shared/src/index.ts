@@ -1,6 +1,11 @@
 import { z } from "zod";
+import { PromptManifestSchema } from "./durable-context.ts";
 
 export { BUILT_IN_COMMANDS, builtInCommandManifests, parseSlashCommand, type BuiltInCommandDefinition } from "./commands.ts";
+export * from "./durable-context.ts";
+export * from "./checkpoint.ts";
+export * from "./retrieval.ts";
+export * from "./memory.ts";
 
 /**
  * Pre-1.0 host protocol version shared by desktop, host, CLI, and future
@@ -163,6 +168,7 @@ export const MessagePartKindSchema = z.enum([
   "tool-result",
   "image",
   "attachment",
+  "citation",
   "terminal",
   "browser-screenshot",
   "error",
@@ -569,6 +575,15 @@ export const CloudUsageEventRecordSchema = z.object({
   tokensIn: z.number().int().nonnegative(),
   tokensOut: z.number().int().nonnegative(),
   tokensCached: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative().default(0),
+  cacheWriteTokens: z.number().int().nonnegative().default(0),
+  cacheCreationTokens1h: z.number().int().nonnegative().default(0),
+  cacheCreationTokens5m: z.number().int().nonnegative().default(0),
+  cacheEligible: z.boolean().default(false),
+  cacheProvider: z.string().nullable().default(null),
+  cacheKeyHash: z.string().nullable().default(null),
+  promptManifestHash: z.string().nullable().default(null),
+  cacheMissReason: z.string().nullable().default(null),
   sandboxUsage: JsonValueSchema.default({}),
   costRawMicros: z.string(),
   costBilledMicros: z.string(),
@@ -603,6 +618,15 @@ export const CloudUsageIngestRequestSchema = z.object({
     tokensIn: z.number().int().nonnegative().default(0),
     tokensOut: z.number().int().nonnegative().default(0),
     tokensCached: z.number().int().nonnegative().default(0),
+    cacheReadTokens: z.number().int().nonnegative().default(0),
+    cacheWriteTokens: z.number().int().nonnegative().default(0),
+    cacheCreationTokens1h: z.number().int().nonnegative().default(0),
+    cacheCreationTokens5m: z.number().int().nonnegative().default(0),
+    cacheEligible: z.boolean().default(false),
+    cacheProvider: z.string().nullable().optional(),
+    cacheKeyHash: z.string().nullable().optional(),
+    promptManifestHash: z.string().nullable().optional(),
+    cacheMissReason: z.string().nullable().optional(),
     sandboxUsage: JsonValueSchema.default({}),
     costRawMicros: z.string().regex(/^\d+$/).default("0"),
     costBilledMicros: z.string().regex(/^\d+$/).default("0"),
@@ -633,6 +657,8 @@ export const CloudUsageRollupSchema = z.object({
   tokensIn: z.number().int().nonnegative(),
   tokensOut: z.number().int().nonnegative(),
   tokensCached: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative().default(0),
+  cacheWriteTokens: z.number().int().nonnegative().default(0),
   costRawMicros: z.string(),
   costBilledMicros: z.string(),
 });
@@ -1028,6 +1054,19 @@ export const ModelCostHintsSchema = z.object({
 });
 export type ModelCostHints = z.infer<typeof ModelCostHintsSchema>;
 
+/**
+ * Explicit prompt-cache capabilities. These values are intentionally
+ * declarative: transports must not infer support from provider or model names.
+ */
+export const PromptCachingCapabilitiesSchema = z.object({
+  supported: z.boolean(),
+  cacheKey: z.boolean().default(false),
+  cacheControl: z.boolean().default(false),
+  retention: z.array(z.enum(["short", "long"])).default([]),
+  minimumTokens: z.number().int().nonnegative().default(1_024),
+});
+export type PromptCachingCapabilities = z.infer<typeof PromptCachingCapabilitiesSchema>;
+
 export const ModelCapabilitiesSchema = z.object({
   tools: z.boolean().optional(),
   vision: z.boolean().optional(),
@@ -1035,6 +1074,7 @@ export const ModelCapabilitiesSchema = z.object({
   json: z.boolean().optional(),
   context: ModelContextHintsSchema.optional(),
   cost: ModelCostHintsSchema.optional(),
+  promptCaching: PromptCachingCapabilitiesSchema.optional(),
 });
 export type ModelCapabilities = z.infer<typeof ModelCapabilitiesSchema>;
 
@@ -1082,6 +1122,12 @@ export function resolveModelCapabilities(model: RemoteModel | undefined): ModelC
       ...overrideContext,
     },
     cost: { ...(detected.cost ?? {}), ...(overrides.cost ?? {}) },
+    ...(detected.promptCaching || overrides.promptCaching
+      ? { promptCaching: PromptCachingCapabilitiesSchema.parse({
+          ...(detected.promptCaching ?? {}),
+          ...(overrides.promptCaching ?? {}),
+        }) }
+      : {}),
   };
 }
 
@@ -1104,6 +1150,7 @@ export const ProviderCapabilitiesSchema = z.object({
   reasoning: z.boolean().optional(),
   toolCalling: z.boolean().optional(),
   imageInput: z.boolean().optional(),
+  promptCaching: PromptCachingCapabilitiesSchema.optional(),
 });
 export type ProviderCapabilities = z.infer<typeof ProviderCapabilitiesSchema>;
 
@@ -2069,6 +2116,11 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     openWorld: z.boolean().optional(),
   }),
   z.object({
+    kind: z.literal("approval.resolved"),
+    approvalId: z.string(),
+    decision: z.enum(["approved", "denied", "expired"]),
+  }),
+  z.object({
     kind: z.literal("question.request"),
     questionId: z.string(),
     toolCallId: z.string(),
@@ -2082,6 +2134,27 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     kind: z.literal("usage"),
     inputTokens: z.number(),
     outputTokens: z.number(),
+    totalTokens: z.number().int().nonnegative().optional(),
+    cacheReadTokens: z.number().int().nonnegative().optional(),
+    cacheWriteTokens: z.number().int().nonnegative().optional(),
+    cacheCreationTokens1h: z.number().int().nonnegative().optional(),
+    cacheCreationTokens5m: z.number().int().nonnegative().optional(),
+    cacheEligible: z.boolean().optional(),
+    cacheProvider: z.string().optional(),
+    cacheKeyHash: z.string().optional(),
+    promptManifestHash: z.string().optional(),
+    promptManifest: PromptManifestSchema.optional(),
+    cacheMissReason: z.enum([
+      "provider_unsupported",
+      "below_minimum_tokens",
+      "first_request",
+      "prefix_changed",
+      "cache_expired",
+      "routing_changed",
+      "retention_unsupported",
+      "unknown",
+    ]).optional(),
+    cacheMissComponentId: z.string().optional(),
     model: z.string().optional(),
     requestedModel: z.string().optional(),
     servedProvider: z.string().optional(),
@@ -2105,8 +2178,27 @@ export const TurnStateSchema = z.object({
   active: z.boolean(),
   turnId: z.string().nullable(),
   bufferedEvents: z.array(AgentStreamEventSchema),
+  /** Durable SSE cursor for the final buffered event, if one exists. */
+  lastEventId: z.string().nullable().optional(),
   replayOnly: z.boolean().default(false),
   owner: z.string().nullable().optional(),
+  runState: z.enum([
+    "queued",
+    "assembling_context",
+    "calling_model",
+    "persisting_response",
+    "executing_tool",
+    "compacting",
+    "waiting",
+    "finalizing",
+    "completed",
+    "failed",
+    "cancelled",
+    "recovery_required",
+  ]).nullable().optional(),
+  waitingReason: z.string().nullable().optional(),
+  nextAction: z.string().nullable().optional(),
+  error: z.string().nullable().optional(),
 });
 export type TurnState = z.infer<typeof TurnStateSchema>;
 
@@ -2312,6 +2404,14 @@ export const MessageAttachmentContentSchema = z.object({
 });
 export type MessageAttachmentContent = z.infer<typeof MessageAttachmentContentSchema>;
 
+export const MessageCitationContentSchema = z.object({
+  sourceId: z.string(),
+  chunkId: z.string().nullable().default(null),
+  label: z.string().min(1),
+  href: z.string().nullable().default(null),
+});
+export type MessageCitationContent = z.infer<typeof MessageCitationContentSchema>;
+
 export function messageAttachmentContent(attachment: AttachmentInput): JsonValue {
   return {
     ...(attachment.id ? { id: attachment.id } : {}),
@@ -2353,6 +2453,11 @@ export const StoredFileSchema = z.object({
   updatedAt: ISODateSchema,
   taskIds: z.array(z.string().uuid()).default([]),
   roles: z.array(FileAssociationRoleSchema).default([]),
+  workspaceId: z.string().uuid().nullable().optional(),
+  workspaceVisibility: z.enum(["project", "task_only"]).nullable().optional(),
+  indexStatus: z.enum(["pending", "extracting", "chunking", "embedding", "indexed", "failed", "deleted"]).optional(),
+  vectorReady: z.boolean().optional(),
+  indexFailureReason: z.string().nullable().optional(),
   downloadUrl: z.string(),
   previewUrl: z.string(),
 });
@@ -3008,7 +3113,9 @@ export const UsageBreakdownRowSchema = z.object({
 });
 export const UsagePerformanceSummarySchema = z.object({
   latencyP50Ms: z.number().nonnegative().nullable(), latencyP95Ms: z.number().nonnegative().nullable(), ttftP50Ms: z.number().nonnegative().nullable(),
-  ttftP95Ms: z.number().nonnegative().nullable(), cachedTokens: z.number().int().nonnegative(), sandboxMinutes: z.number().nonnegative(),
+  ttftP95Ms: z.number().nonnegative().nullable(), cachedTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
+  sandboxMinutes: z.number().nonnegative(),
 });
 export const UsageAnomalySchema = z.object({
   id: z.string(), kind: z.enum(["spend", "requests", "failures", "latency", "budget_projection"]), severity: z.enum(["info", "warning", "error"]),
@@ -3027,6 +3134,8 @@ export const UsageRequestSummarySchema = z.object({
   id: z.string(), requestId: z.string(), ts: ISODateSchema, userId: z.string().nullable(), departmentId: z.string().nullable(), workspaceId: z.string().nullable(),
   agentId: z.string().nullable(), feature: z.string(), provider: z.string().nullable(), model: z.string().nullable(), status: z.string(),
   tokensIn: z.number().int().nonnegative(), tokensOut: z.number().int().nonnegative(), tokensCached: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
+  cacheEligible: z.boolean().default(false), cacheMissReason: z.string().nullable().default(null),
   billedCostMicros: z.string(), latencyMs: z.number().int().nonnegative().nullable(), ttftMs: z.number().int().nonnegative().nullable(),
   reservationStatus: BudgetReservationStatusSchema.nullable(),
 });

@@ -1,11 +1,11 @@
 import { Global, Module } from "@nestjs/common";
 import { S3Client } from "@aws-sdk/client-s3";
-import { FilePlatformController } from "./file-platform.controller.ts";
+import { FilePlatformController, WorkspaceFileController } from "./file-platform.controller.ts";
 import { FILE_STORAGE_CONFIG, FilePlatformService, type FileStorageConfig } from "./file-platform.service.ts";
 
 @Global()
 @Module({
-  controllers: [FilePlatformController],
+  controllers: [FilePlatformController, WorkspaceFileController],
   providers: [
     {
       provide: FILE_STORAGE_CONFIG,

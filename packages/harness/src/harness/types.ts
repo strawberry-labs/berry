@@ -1,4 +1,5 @@
 import type { ImageContent, Model, Models, SimpleStreamOptions, TextContent, Transport } from "@earendil-works/pi-ai";
+import type { SessionCheckpointV2 } from "@berry/shared";
 import type { AgentContext, AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
 import type { Session } from "./session/session.ts";
 
@@ -774,6 +775,10 @@ export interface CompactionPreparation {
 	retainedTokens: number;
 	windowNumber: number;
 	settings: CompactionSettings;
+	coveredEntries: SessionTreeEntry[];
+	sourceLeafId: string;
+	previousRollingCheckpoint: SessionCheckpointV2 | null;
+	priorSegmentCheckpoints: SessionCheckpointV2[];
 }
 
 export interface FileOperations {

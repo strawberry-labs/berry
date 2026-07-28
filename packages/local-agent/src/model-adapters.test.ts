@@ -9,6 +9,7 @@ import {
   FallbackChatCompletionClient,
   OpenAIResponsesAdapter,
 } from "./model.ts";
+import { joinStableAndDynamicPrompt } from "./prompt-cache.ts";
 
 const responsesProvider = {
   id: "provider_openai",
@@ -48,6 +49,47 @@ async function collect(stream: ReturnType<OpenAIResponsesAdapter["stream"]>): Pr
 }
 
 describe("OpenAIResponsesAdapter", () => {
+  it("sends declared OpenAI cache controls and omits them when unsupported", async () => {
+    const supportedCapture: { body?: Record<string, unknown> } = {};
+    const supportedProvider = {
+      ...responsesProvider,
+      capabilities: {
+        promptCaching: {
+          supported: true,
+          cacheKey: true,
+          cacheControl: false,
+          retention: ["short", "long"] as Array<"short" | "long">,
+          minimumTokens: 0,
+        },
+      },
+    };
+    const supported = new OpenAIResponsesAdapter({
+      client: fakeClient([{ type: "response.completed", response: { usage: { input_tokens: 4, output_tokens: 1 } } }], supportedCapture),
+      promptCache: { namespace: "tenant_1", provider: supportedProvider },
+    });
+    await collect(supported.stream(
+      createBerryModel(supportedProvider),
+      { systemPrompt: "stable", messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      { cacheRetention: "long", sessionId: "session_1" },
+    ));
+    expect(supportedCapture.body).toMatchObject({
+      prompt_cache_key: expect.stringMatching(/^berry_[a-f0-9]{64}$/),
+      prompt_cache_retention: "24h",
+    });
+
+    const unsupportedCapture: { body?: Record<string, unknown> } = {};
+    const unsupported = new OpenAIResponsesAdapter({
+      client: fakeClient([{ type: "response.completed", response: {} }], unsupportedCapture),
+    });
+    await collect(unsupported.stream(
+      createBerryModel(responsesProvider),
+      { systemPrompt: "stable", messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      { cacheRetention: "long", sessionId: "session_1" },
+    ));
+    expect(unsupportedCapture.body?.prompt_cache_key).toBeUndefined();
+    expect(unsupportedCapture.body?.prompt_cache_retention).toBeUndefined();
+  });
+
   it("maps reasoning effort to the Responses reasoning object", async () => {
     const capture: { body?: Record<string, unknown> } = {};
     const adapter = new OpenAIResponsesAdapter({
@@ -224,6 +266,57 @@ describe("Ollama adapter", () => {
 });
 
 describe("AnthropicMessagesAdapter", () => {
+  it("marks stable Anthropic blocks cacheable but leaves dynamic grounding unmarked", async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    const provider = {
+      ...anthropicProvider,
+      capabilities: {
+        promptCaching: {
+          supported: true,
+          cacheKey: false,
+          cacheControl: true,
+          retention: ["short", "long"] as Array<"short" | "long">,
+          minimumTokens: 0,
+        },
+      },
+    };
+    const adapter = new AnthropicMessagesAdapter({
+      client: fakeClient([
+        {
+          type: "message_start",
+          message: {
+            usage: {
+              input_tokens: 20,
+              cache_read_input_tokens: 12,
+              cache_creation_input_tokens: 8,
+              cache_creation: { ephemeral_1h_input_tokens: 8, ephemeral_5m_input_tokens: 0 },
+            },
+          },
+        },
+        { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+      ], capture),
+      promptCache: { namespace: "tenant_1", provider },
+    });
+    const prompt = joinStableAndDynamicPrompt("stable system", "retrieved memory");
+    const events = await collect(adapter.stream(
+      createBerryModel(provider),
+      {
+        systemPrompt: prompt,
+        messages: [{ role: "user", content: "hi", timestamp: 1 }],
+        tools: [{ name: "lookup", description: "Lookup", parameters: { type: "object" } as never }],
+      },
+      { cacheRetention: "long", sessionId: "session_1" },
+    ));
+    const system = capture.body?.system as Array<Record<string, unknown>>;
+    expect(system[0]).toMatchObject({ text: "stable system", cache_control: { type: "ephemeral", ttl: "1h" } });
+    expect(system[1]).toEqual({ type: "text", text: "retrieved memory" });
+    const tools = capture.body?.tools as Array<Record<string, unknown>>;
+    expect(tools.at(-1)?.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected done event");
+    expect(done.message.usage).toMatchObject({ cacheRead: 12, cacheWrite: 8 });
+  });
+
   it("maps reasoning effort to an Anthropic thinking budget", async () => {
     const capture: { body?: Record<string, unknown> } = {};
     const adapter = new AnthropicMessagesAdapter({ client: fakeClient([{ type: "message_stop" }], capture) });

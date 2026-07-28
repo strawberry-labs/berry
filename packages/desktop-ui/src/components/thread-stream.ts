@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, ApprovalKind, ImageAspectRatio, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
+import type { AgentStreamEvent, ApprovalKind, ImageAspectRatio, MessageCitationContent, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
 import type { ActivityTool } from "@berry/desktop-ui/components/thread-activity";
 
 /* ------------------------------------------------------------------------ */
@@ -287,6 +287,10 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
           openWorld: event.openWorld,
         },
       };
+    case "approval.resolved":
+      return state.approval?.approvalId === event.approvalId
+        ? { ...state, approval: null }
+        : state;
     case "question.request":
       {
         const questions = event.questions?.length
@@ -350,6 +354,7 @@ export type MessageSegment =
   | { kind: "tools"; tools: ActivityTool[] }
   | { kind: "thought"; id: string; text: string }
   | { kind: "artifact"; id: string; name: string; path: string; mediaType?: string; size?: number }
+  | { kind: "citations"; id: string; citations: MessageCitationContent[] }
   | { kind: "writing-block"; id: string; draft: MessageDraft }
   | { kind: "text" | "error"; id: string; text: string };
 
@@ -373,7 +378,7 @@ export function classifyTurnSegments(segments: MessageSegment[]): {
   const activity: MessageSegment[] = [];
   const body: MessageSegment[] = [];
   segments.forEach((segment, index) => {
-    if (segment.kind === "error" || segment.kind === "artifact" || segment.kind === "writing-block") body.push(segment);
+    if (segment.kind === "error" || segment.kind === "artifact" || segment.kind === "citations" || segment.kind === "writing-block") body.push(segment);
     else if (segment.kind === "text" && index > lastActivity) body.push(segment);
     else activity.push(segment);
   });

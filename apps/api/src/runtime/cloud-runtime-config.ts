@@ -2,6 +2,7 @@ import { BadGatewayException, Injectable, ServiceUnavailableException } from "@n
 import type { AgentSkill, BerryModelProviderInfo, McpServerSpec, StartTurnOptions } from "@berry/local-agent";
 import {
   NetworkPolicySchema,
+  ProviderCapabilitiesSchema,
   RemoteModelSchema,
   imageSizeForAspectRatio,
   type ImageGenerationRequest,
@@ -20,6 +21,8 @@ const RequestProviderSchema = z.object({
   endpointPath: z.string().nullable().optional(),
   modelsPath: z.string().nullable().optional(),
   authType: z.enum(["none", "bearer", "optional-bearer", "x-api-key"]).optional(),
+  capabilities: ProviderCapabilitiesSchema.optional(),
+  models: z.array(RemoteModelSchema).optional(),
 }).passthrough();
 
 const CloudMcpServerSchema = z.object({
@@ -76,6 +79,7 @@ interface CloudImageGenerationConfig {
 
 export interface CloudRuntimeConfig {
   managed: boolean;
+  promptCacheEnabled: boolean;
   provider: BerryModelProviderInfo | null;
   apiKey: string | undefined;
   mcpServers: McpServerSpec[];
@@ -105,7 +109,9 @@ export class CloudRuntimeConfigService {
   resolve(request: { provider?: unknown; apiKey?: string | undefined; model?: string | undefined }): ResolvedCloudTurnConfig {
     if (this.config.provider) {
       return {
-        provider: this.config.provider,
+        provider: this.config.promptCacheEnabled
+          ? this.config.provider
+          : withoutPromptCaching(this.config.provider),
         apiKey: this.config.apiKey,
         mcpServers: this.config.mcpServers,
         extraSkills: this.config.extraSkills,
@@ -119,7 +125,7 @@ export class CloudRuntimeConfigService {
       defaultModel: parsedProvider.defaultModel ?? request.model ?? "berry/auto",
     } as BerryModelProviderInfo;
     return {
-      provider,
+      provider: this.config.promptCacheEnabled ? provider : withoutPromptCaching(provider),
       apiKey: request.apiKey,
       mcpServers: [],
       extraSkills: [],
@@ -322,6 +328,7 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
   const imageCostMicros = imageModel ? nonnegativeIntegerString(env.BERRY_ROUTER_IMAGE_COST_MICROS, live) : null;
   return {
     managed: provider !== null,
+    promptCacheEnabled: env.BERRY_PROMPT_CACHE_ENABLED?.trim().toLowerCase() !== "false",
     provider,
     apiKey: first(env.BERRY_ROUTER_API_KEY, env.BERRY_INFERENCE_API_KEY),
     mcpServers,
@@ -419,6 +426,31 @@ function decodeBase64(value: string | undefined): string | undefined {
 
 function safeSegment(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "skill";
+}
+
+function withoutPromptCaching(provider: BerryModelProviderInfo): BerryModelProviderInfo {
+  const capabilities = provider.capabilities
+    ? (({ promptCaching: _promptCaching, ...rest }) => rest)(provider.capabilities)
+    : undefined;
+  return {
+    ...provider,
+    ...(capabilities ? { capabilities } : {}),
+    ...(provider.models ? {
+      models: provider.models.map((model) => {
+        const modelCapabilities = model.capabilities
+          ? (({ promptCaching: _promptCaching, ...rest }) => rest)(model.capabilities)
+          : undefined;
+        const capabilityOverrides = model.capabilityOverrides
+          ? (({ promptCaching: _promptCaching, ...rest }) => rest)(model.capabilityOverrides)
+          : undefined;
+        return {
+          ...model,
+          ...(modelCapabilities ? { capabilities: modelCapabilities } : {}),
+          ...(capabilityOverrides ? { capabilityOverrides } : {}),
+        };
+      }),
+    } : {}),
+  };
 }
 
 function csv(value: string | undefined): string[] {

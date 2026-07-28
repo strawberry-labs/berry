@@ -20,3 +20,7 @@ Defaults are intentionally local-only:
 Before exposing this deployment, set production secrets and public URLs in `deploy/.env`: `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD`, `BETTER_AUTH_SECRET`, `BERRY_SETUP_OWNER_EMAIL`, `BERRY_SETUP_TOKEN`, `BERRY_AUTH_BASE_URL`, `BERRY_AUTH_TRUSTED_ORIGINS`, `E2B_API_KEY`, `BERRY_SCIM_BEARER_TOKEN` if SCIM provisioning is enabled, `BERRY_USAGE_SIGNING_SECRETS` for signed provider usage webhooks, `BERRY_POLICY_SIGNING_KEY_ID` plus `BERRY_POLICY_SIGNING_PRIVATE_KEY_PEM` for signed `berry-policy.json` publication, `BERRY_PLATFORM_*` values for desktop/CLI org login verification, `BERRY_AUDIT_S3_*` for audit SIEM drops when using S3 export, `STRIPE_*` values for managed/dedicated billing when `BERRY_BILLING_PROVIDER=stripe`, and the BerryRouter inference credentials. Webhook SIEM export destinations are configured per org through `PUT /v1/orgs/:tenantId/audit/exports`.
 
 For the Hetzner single-box deployment, follow `deploy/PRODUCTION.md` and start from `deploy/.env.production.example`. For Kubernetes, install `deploy/helm/berry-platform` and provide external Postgres, Redis, and S3-compatible buckets through Kubernetes Secrets. Use `deploy/dedicated-instance-runbook.md` for a dedicated-customer namespace with custom web/API domains.
+
+For memory, project RAG, prompt-cache telemetry, long-running turn recovery,
+backfills, and retention cleanup, use
+[`docs/durable-context-operations.md`](../docs/durable-context-operations.md).

@@ -18,6 +18,10 @@ data:
   BERRY_BILLING_STRIPE_API_BASE_URL: {{ .Values.billing.stripeApiBaseUrl | quote }}
   BERRY_ROUTER_INFERENCE_BASE_URL: {{ .Values.router.inferenceBaseUrl | quote }}
   BERRY_ROUTER_COMPLETION_TRANSPORT: {{ .Values.router.completionTransport | quote }}
+  BERRY_ROUTER_PROVIDER_ID: {{ .Values.router.providerId | quote }}
+  BERRY_ROUTER_CHAT_COMPLETIONS_PATH: {{ .Values.router.chatCompletionsPath | quote }}
+  BERRY_ROUTER_DEFAULT_MODEL: {{ .Values.router.defaultModel | quote }}
+  BERRY_ROUTER_MODELS_JSON: {{ .Values.router.modelsJson | quote }}
   BERRY_SANDBOX_PROVIDER: {{ .Values.sandbox.provider | quote }}
   BERRY_SANDBOX_IMAGE: {{ .Values.sandbox.templateId | quote }}
   BERRY_E2B_TEMPLATE_ID: {{ .Values.sandbox.templateId | quote }}
@@ -41,3 +45,19 @@ data:
   BERRY_WEB_API_INTERNAL_URL: {{ printf "http://%s-api:%v" (include "berry-platform.name" .) .Values.api.port | quote }}
   BERRY_WEB_DEMO_MODE: "false"
   BERRY_WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}
+  BERRY_MEMORY_ENABLED: {{ .Values.durableContext.memoryEnabled | quote }}
+  BERRY_IMPLICIT_MEMORY_ENABLED: {{ .Values.durableContext.implicitMemoryEnabled | quote }}
+  BERRY_PROJECT_KNOWLEDGE_ENABLED: {{ .Values.durableContext.projectKnowledgeEnabled | quote }}
+  BERRY_PROMPT_CACHE_ENABLED: {{ .Values.durableContext.promptCacheEnabled | quote }}
+  BERRY_DURABLE_RUNNER_ENABLED: {{ .Values.durableContext.durableRunnerEnabled | quote }}
+  BERRY_TIKA_URL: {{ printf "http://%s-tika:%v" (include "berry-platform.name" .) .Values.tika.port | quote }}
+  BERRY_EMBEDDING_PROVIDER: {{ .Values.durableContext.embeddingProvider | quote }}
+  BERRY_EMBEDDING_MODEL: {{ .Values.durableContext.embeddingModel | quote }}
+  BERRY_EMBEDDING_DIMENSIONS: {{ .Values.durableContext.embeddingDimensions | quote }}
+  BERRY_EMBEDDING_PROFILE_VERSION: {{ .Values.durableContext.embeddingProfileVersion | quote }}
+  BERRY_KNOWLEDGE_CHUNK_TOKENS: {{ .Values.durableContext.chunkTokens | quote }}
+  BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS: {{ .Values.durableContext.chunkOverlapTokens | quote }}
+  BERRY_RETRIEVAL_TOKEN_BUDGET: {{ .Values.durableContext.retrievalTokenBudget | quote }}
+  BERRY_COMPACTION_TRIGGER_TOKENS: {{ .Values.durableContext.compactionTriggerTokens | quote }}
+  BERRY_RUN_LEASE_SECONDS: {{ .Values.durableContext.runLeaseSeconds | quote }}
+  BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS: {{ .Values.durableContext.snapshotIntervalSeconds | quote }}
