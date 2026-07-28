@@ -84,6 +84,7 @@ caddy_changed=false
 for file in $changed_files; do
   case "$file" in
     package.json|pnpm-lock.yaml|pnpm-workspace.yaml|turbo.json|tsconfig.base.json|Dockerfile|.dockerignore)
+      add_service mem0
       add_service web
       add_service api
       add_service worker
@@ -97,13 +98,23 @@ for file in $changed_files; do
     apps/worker/*)
       add_service worker
       ;;
+    apps/mem0/*)
+      add_service mem0
+      ;;
+    packages/personal-memory/*)
+      add_service mem0
+      add_service api
+      add_service worker
+      ;;
     packages/shared/*)
+      add_service mem0
       add_service web
       add_service api
       add_service worker
       ;;
     deploy/compose.yaml|deploy/.env.production.example)
       compose_changed=true
+      add_service mem0
       ;;
     deploy/Caddyfile)
       caddy_changed=true

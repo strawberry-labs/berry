@@ -1,4 +1,10 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import {
+  PersonalMemoryHttpError,
+  createPersonalMemoryProviderFromEnv,
+  operationToPersonalMemoryInput,
+  type PersonalMemoryProvider,
+} from "@berry/personal-memory";
 import {
   MemoryOperationSchema,
   durableContextConfigFromEnv,
@@ -18,12 +24,14 @@ import {
 } from "./memory.repository.js";
 
 export const MEMORY_REPOSITORY = Symbol("MEMORY_REPOSITORY");
+export const PERSONAL_MEMORY_PROVIDER = Symbol("PERSONAL_MEMORY_PROVIDER");
 
 export type MemoryRecall = {
   personal: MemoryItem[];
   project: MemoryItem[];
   personalTokens: number;
   projectTokens: number;
+  personalDegraded: boolean;
 };
 
 @Injectable()
@@ -33,9 +41,10 @@ export class MemoryService {
   constructor(
     @Inject(MEMORY_REPOSITORY) private readonly repository: MemoryRepository,
     @Inject(CloudDatabaseService) private readonly database: CloudDatabaseService,
+    @Inject(PERSONAL_MEMORY_PROVIDER) private readonly personalMemory: PersonalMemoryProvider | null = null,
   ) {}
 
-  list(input: {
+  async list(input: {
     tenantId: string;
     userId: string;
     scope: MemoryScope;
@@ -46,17 +55,34 @@ export class MemoryService {
     limit?: number;
   }) {
     const identity = memoryIdentity(input);
-    return this.repository.list({
+    const pageInput = {
       ...identity,
       ...(input.status ? { status: input.status } : {}),
       ...(input.search ? { search: input.search } : {}),
       ...(input.cursor ? { cursor: input.cursor } : {}),
       limit: Math.min(100, Math.max(1, input.limit ?? 50)),
-    });
+    };
+    if (identity.scope === "personal" && this.personalMemory) {
+      return this.callPersonal(() => this.personalMemory!.list({
+        tenantId: identity.tenantId,
+        userId: identity.userId,
+        ...(input.status ? { status: input.status } : {}),
+        ...(input.search ? { search: input.search } : {}),
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        limit: pageInput.limit,
+      }));
+    }
+    return this.repository.list(pageInput);
   }
 
-  get(tenantId: string, userId: string, memoryId: string): Promise<MemoryItem> {
-    return this.repository.get(tenantId, userId, memoryId);
+  async get(tenantId: string, userId: string, memoryId: string): Promise<MemoryItem> {
+    const berry = await this.findBerry(tenantId, userId, memoryId);
+    if (berry) return berry;
+    if (this.personalMemory) {
+      const personal = await this.callPersonal(() => this.personalMemory!.get({ tenantId, userId }, memoryId));
+      if (personal) return personal;
+    }
+    throw new NotFoundException("Memory item not found");
   }
 
   settings(tenantId: string, userId: string) {
@@ -102,6 +128,13 @@ export class MemoryService {
       expiresAt: input.expiresAt ?? null,
       reason: "explicit_user_memory",
     });
+    if (identity.scope === "personal" && this.personalMemory) {
+      return this.callPersonal(() => this.personalMemory!.remember(operationToPersonalMemoryInput(
+        { tenantId: identity.tenantId, userId: identity.userId },
+        operation,
+        sourceWithDefaults(input.userId, input.source, "explicit-v1"),
+      )));
+    }
     return this.repository.apply(identity, operation, sourceWithDefaults(input.userId, input.source, "explicit-v1"));
   }
 
@@ -116,7 +149,42 @@ export class MemoryService {
     salience?: number;
     expiresAt?: string | null;
   }): Promise<MemoryMutationResult> {
-    const current = await this.repository.get(input.tenantId, input.userId, input.memoryId);
+    const berry = await this.findBerry(input.tenantId, input.userId, input.memoryId);
+    if (berry) return this.updateBerry(berry, input);
+    if (this.personalMemory) {
+      const current = await this.callPersonal(() => this.personalMemory!.get({
+        tenantId: input.tenantId,
+        userId: input.userId,
+      }, input.memoryId));
+      if (current) {
+        return this.callPersonal(() => this.personalMemory!.update({
+          tenantId: input.tenantId,
+          userId: input.userId,
+          memoryId: input.memoryId,
+          content: input.content.trim(),
+          ...(input.kind ? { kind: input.kind } : {}),
+          ...(input.value ? { value: input.value } : {}),
+          ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
+          ...(input.salience !== undefined ? { salience: input.salience } : {}),
+          ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+          source: sourceWithDefaults(input.userId, {}, "explicit-v1"),
+        }));
+      }
+    }
+    throw new NotFoundException("Memory item not found");
+  }
+
+  private async updateBerry(current: MemoryItem, input: {
+    tenantId: string;
+    userId: string;
+    memoryId: string;
+    content: string;
+    kind?: string;
+    value?: Record<string, unknown>;
+    confidence?: number;
+    salience?: number;
+    expiresAt?: string | null;
+  }): Promise<MemoryMutationResult> {
     const operation = MemoryOperationSchema.parse({
       operation: "SUPERSEDE",
       stableKey: current.stableKey,
@@ -138,8 +206,16 @@ export class MemoryService {
     }, operation, sourceWithDefaults(input.userId, {}, "explicit-v1"));
   }
 
-  forget(tenantId: string, userId: string, memoryId: string): Promise<MemoryItem> {
-    return this.repository.forget(tenantId, userId, memoryId, sourceWithDefaults(userId, {}, "explicit-v1"));
+  async forget(tenantId: string, userId: string, memoryId: string): Promise<MemoryItem> {
+    const berry = await this.findBerry(tenantId, userId, memoryId);
+    if (berry) {
+      return this.repository.forget(tenantId, userId, memoryId, sourceWithDefaults(userId, {}, "explicit-v1"));
+    }
+    if (this.personalMemory) {
+      const forgotten = await this.callPersonal(() => this.personalMemory!.forget({ tenantId, userId }, memoryId));
+      if (forgotten) return forgotten;
+    }
+    throw new NotFoundException("Memory item not found");
   }
 
   async forgetMatching(input: {
@@ -150,8 +226,11 @@ export class MemoryService {
     stableKey: string;
   }): Promise<MemoryItem | null> {
     const identity = memoryIdentity(input);
-    const page = await this.repository.list({
-      ...identity,
+    const page = await this.list({
+      tenantId: identity.tenantId,
+      userId: identity.userId,
+      scope: identity.scope,
+      ...(identity.workspaceId ? { workspaceId: identity.workspaceId } : {}),
       status: "active",
       search: normalizeMemoryStableKey(input.stableKey),
       limit: 20,
@@ -160,8 +239,14 @@ export class MemoryService {
     return item ? this.forget(input.tenantId, input.userId, item.id) : null;
   }
 
-  export(tenantId: string, userId: string) {
-    return this.repository.export(tenantId, userId);
+  async export(tenantId: string, userId: string) {
+    const berry = await this.repository.export(tenantId, userId);
+    if (!this.personalMemory) return berry;
+    const mem0 = await this.callPersonal(() => this.personalMemory!.export({ tenantId, userId }));
+    return {
+      items: dedupeMemoryItems([...mem0.items, ...berry.items]),
+      versions: [...berry.versions, ...mem0.versions],
+    };
   }
 
   async clear(input: {
@@ -175,6 +260,13 @@ export class MemoryService {
       await this.repository.assertWorkspaceAccess(identity.tenantId, identity.userId, identity.workspaceId!);
     }
     let forgotten = 0;
+    if (identity.scope === "personal" && this.personalMemory) {
+      const result = await this.callPersonal(() => this.personalMemory!.clear({
+        tenantId: identity.tenantId,
+        userId: identity.userId,
+      }));
+      forgotten += result.forgotten;
+    }
     for (let batch = 0; batch < 1_000; batch += 1) {
       const page = await this.repository.list({ ...identity, status: "active", limit: 100 });
       if (page.items.length === 0) return { ok: true, forgotten };
@@ -207,7 +299,15 @@ export class MemoryService {
         stableKey: normalizeMemoryStableKey(raw.stableKey),
         explicit: false,
       });
-      results.push(await this.repository.apply(identity, operation, input.source));
+      if (identity.scope === "personal" && this.personalMemory) {
+        results.push(await this.callPersonal(() => this.personalMemory!.remember(operationToPersonalMemoryInput(
+          { tenantId: identity.tenantId, userId: identity.userId },
+          operation,
+          input.source,
+        ))));
+      } else {
+        results.push(await this.repository.apply(identity, operation, input.source));
+      }
     }
     return results;
   }
@@ -220,14 +320,39 @@ export class MemoryService {
     personalTokenBudget?: number;
     projectTokenBudget?: number;
   }): Promise<MemoryRecall> {
-    if (!this.#config.memoryEnabled) return { personal: [], project: [], personalTokens: 0, projectTokens: 0 };
-    const candidates = await this.repository.recall({
-      tenantId: input.tenantId,
-      userId: input.userId,
-      workspaceId: input.workspaceId,
-      query: input.query,
-      limit: 40,
-    });
+    if (!this.#config.memoryEnabled) {
+      return { personal: [], project: [], personalTokens: 0, projectTokens: 0, personalDegraded: false };
+    }
+    const settings = await this.repository.settings(input.tenantId, input.userId);
+    if (!settings.memoryEnabled) {
+      return { personal: [], project: [], personalTokens: 0, projectTokens: 0, personalDegraded: false };
+    }
+    const [berryCandidates, personalRecall] = await Promise.all([
+      this.repository.recall({
+        tenantId: input.tenantId,
+        userId: input.userId,
+        workspaceId: input.workspaceId,
+        query: input.query,
+        limit: 40,
+      }),
+      this.personalMemory
+        ? this.recallPersonal(() => this.personalMemory!.search({
+            tenantId: input.tenantId,
+            userId: input.userId,
+            query: input.query,
+            limit: 40,
+          }))
+        : Promise.resolve({ items: [], degraded: false }),
+    ]);
+    const candidates = this.personalMemory
+      ? [
+          ...dedupeMemoryItems([
+            ...personalRecall.items,
+            ...berryCandidates.filter((item) => item.scope === "personal"),
+          ]),
+          ...berryCandidates.filter((item) => item.scope === "project"),
+        ]
+      : berryCandidates;
     const personalSelection = selectMemoryBudget(
       candidates.filter((item) => item.scope === "personal"),
       input.personalTokenBudget ?? 900,
@@ -241,6 +366,7 @@ export class MemoryService {
       project: projectSelection.items,
       personalTokens: personalSelection.tokens,
       projectTokens: projectSelection.tokens,
+      personalDegraded: personalRecall.degraded,
     };
   }
 
@@ -315,10 +441,49 @@ export class MemoryService {
       ]);
     });
   }
+
+  private async callPersonal<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof PersonalMemoryHttpError) {
+        throw new ServiceUnavailableException("The self-hosted personal memory service is unavailable");
+      }
+      throw error;
+    }
+  }
+
+  private async recallPersonal(
+    operation: () => Promise<MemoryItem[]>,
+  ): Promise<{ items: MemoryItem[]; degraded: boolean }> {
+    try {
+      return { items: await operation(), degraded: false };
+    } catch (error) {
+      if (error instanceof PersonalMemoryHttpError) {
+        return { items: [], degraded: true };
+      }
+      throw error;
+    }
+  }
+
+  private async findBerry(tenantId: string, userId: string, memoryId: string): Promise<MemoryItem | null> {
+    try {
+      return await this.repository.get(tenantId, userId, memoryId);
+    } catch (error) {
+      if (error instanceof NotFoundException) return null;
+      throw error;
+    }
+  }
 }
 
 export function createSqlMemoryRepository(database: CloudDatabaseService): SqlMemoryRepository {
   return new SqlMemoryRepository(database);
+}
+
+export function createConfiguredPersonalMemoryProvider(
+  env: NodeJS.ProcessEnv = process.env,
+): PersonalMemoryProvider | null {
+  return createPersonalMemoryProviderFromEnv(env);
 }
 
 function memoryIdentity(input: {
@@ -372,4 +537,14 @@ function clipExtractionText(value: string): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function dedupeMemoryItems(items: readonly MemoryItem[]): MemoryItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = `${item.scope}:${item.workspaceId ?? ""}:${item.stableKey}:${item.content.trim().toLocaleLowerCase()}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }

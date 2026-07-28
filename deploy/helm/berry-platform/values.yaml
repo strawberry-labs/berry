@@ -54,6 +54,20 @@ durableContext:
   runLeaseSeconds: 90
   snapshotIntervalSeconds: 900
 
+mem0:
+  enabled: true
+  replicas: 1
+  port: 8010
+  timeoutMs: 30000
+  collection: berry_personal_memories
+  telemetry: "false"
+  llmModel: gpt-5-mini
+  embeddingModel: text-embedding-3-small
+  embeddingDimensions: 1536
+  existingSecret: berry-mem0
+  apiKeyKey: BERRY_MEM0_API_KEY
+  databaseUrlKey: BERRY_MEM0_DATABASE_URL
+
 external:
   postgres:
     url: ""

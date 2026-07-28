@@ -12,7 +12,10 @@ const EnvelopeSchema = z.object({
 }).strict();
 
 export interface MemoryOperationGenerator {
-  generate(input: MemoryExtractJobPayload): Promise<readonly ExtractedMemoryOperation[]>;
+  generate(
+    input: MemoryExtractJobPayload,
+    scopes?: readonly MemoryScope[],
+  ): Promise<readonly ExtractedMemoryOperation[]>;
 }
 
 export class RouterMemoryOperationGenerator implements MemoryOperationGenerator {
@@ -21,14 +24,22 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
     private readonly model: string,
   ) {}
 
-  async generate(input: MemoryExtractJobPayload): Promise<readonly ExtractedMemoryOperation[]> {
+  async generate(
+    input: MemoryExtractJobPayload,
+    scopes: readonly MemoryScope[] = ["personal", "project"],
+  ): Promise<readonly ExtractedMemoryOperation[]> {
+    const allowedScopes = new Set(scopes);
     const messages = [
       {
         role: "system" as const,
         content: [
-          "Extract only durable user memory candidates.",
-          "Eligible personal facts are preferences, stable profile facts, recurring working conventions, durable relationships, accessibility needs, and communication style.",
-          "Eligible project facts are explicit reusable project decisions or conventions.",
+          `Extract only durable memory candidates for these scopes: ${scopes.join(", ")}.`,
+          ...(allowedScopes.has("personal")
+            ? ["Eligible personal facts are preferences, stable profile facts, recurring working conventions, durable relationships, accessibility needs, and communication style."]
+            : []),
+          ...(allowedScopes.has("project")
+            ? ["Eligible project facts are explicit reusable project decisions or conventions."]
+            : []),
           "Reject credentials, secrets, copied documents, temporary task details, hidden reasoning, and anything known only from assistant speculation.",
           "Return ADD candidates; consolidation decides whether they become ADD, REFRESH, SUPERSEDE, or NOOP.",
         ].join("\n"),
@@ -46,7 +57,7 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
     ];
     const first = await this.complete(messages);
     const parsed = parseEnvelope(first);
-    if (parsed.success) return parsed.data.operations;
+    if (parsed.success) return parsed.data.operations.filter((operation) => allowedScopes.has(operation.scope));
     const repaired = await this.complete([
       ...messages,
       {
@@ -55,7 +66,9 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
       },
     ]);
     const repairedParsed = parseEnvelope(repaired);
-    return repairedParsed.success ? repairedParsed.data.operations : [];
+    return repairedParsed.success
+      ? repairedParsed.data.operations.filter((operation) => allowedScopes.has(operation.scope))
+      : [];
   }
 
   private async complete(messages: Array<{ role: "system" | "user"; content: string }>) {

@@ -81,3 +81,14 @@ export function normalizeMemoryStableKey(value: string): string {
 export function normalizeMemoryContent(value: string): string {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
 }
+
+export function sanitizePersonalMemorySource(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/\0/g, "")
+    .split("\n")
+    .filter((line) => !SECRET_PATTERNS.some((pattern) => pattern.test(line)))
+    .join("\n")
+    .trim()
+    .slice(0, 16_000);
+}

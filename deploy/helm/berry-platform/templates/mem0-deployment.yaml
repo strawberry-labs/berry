@@ -1,0 +1,77 @@
+{{- if .Values.mem0.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "berry-platform.name" . }}-mem0
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mem0
+spec:
+  replicas: {{ .Values.mem0.replicas }}
+  selector:
+    matchLabels:
+      {{- include "berry-platform.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: mem0
+  template:
+    metadata:
+      labels:
+        {{- include "berry-platform.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: mem0
+    spec:
+      containers:
+        - name: mem0
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "apps/mem0/dist/main.js"]
+          ports:
+            - containerPort: {{ .Values.mem0.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "berry-platform.name" . }}-config
+          env:
+            - name: BERRY_MEM0_PORT
+              value: {{ .Values.mem0.port | quote }}
+            - name: BERRY_MEM0_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mem0.existingSecret }}
+                  key: {{ .Values.mem0.databaseUrlKey }}
+            - name: BERRY_MEM0_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mem0.existingSecret }}
+                  key: {{ .Values.mem0.apiKeyKey }}
+            - name: BERRY_ROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.router.existingSecret }}
+                  key: {{ .Values.router.apiKeyKey }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.mem0.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.mem0.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "berry-platform.name" . }}-mem0
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mem0
+spec:
+  selector:
+    {{- include "berry-platform.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: mem0
+  ports:
+    - name: http
+      port: {{ .Values.mem0.port }}
+      targetPort: {{ .Values.mem0.port }}
+{{- end }}

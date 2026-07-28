@@ -6,7 +6,8 @@ Use this path for a single-machine or staging Berry platform stack.
 
 - Docker with Compose v2.
 - A shell with access to this repository.
-- Local ports `3001`, `3108`, `5432`, and `6379` available, or edited service ports in the Compose file.
+- Local ports `3001`, `3108`, `5432`, `6379`, and loopback-only `8010`
+  available, or edited service ports in the Compose file.
 
 ## Steps
 
@@ -14,7 +15,11 @@ Use this path for a single-machine or staging Berry platform stack.
 cp deploy/.env.example deploy/.env
 ```
 
-Edit `deploy/.env` and set production-grade secrets before using the stack outside local development. The default fixture values are for tests only.
+Edit `deploy/.env` and set production-grade secrets before using the stack
+outside local development. Personal memory also requires
+`BERRY_MEM0_API_KEY`, `BERRY_MEM0_POSTGRES_PASSWORD`, and OpenAI-compatible
+Mem0 LLM and embedding credentials. The default fixture values are for tests
+only. See [self-hosted personal memory](../self-hosted-personal-memory.md).
 
 Start the stack:
 

@@ -32,6 +32,10 @@ FROM workspace AS build-worker
 RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
   corepack pnpm --filter @berry/worker... build
 
+FROM workspace AS build-mem0
+RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
+  corepack pnpm --filter @berry/mem0... build
+
 FROM workspace AS build-web
 RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
   corepack pnpm --filter @berry/web... build
@@ -45,7 +49,7 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable
 
 VOLUME ["/data"]
-EXPOSE 3000 3108
+EXPOSE 3000 3108 8010
 
 FROM runtime-base AS api
 
@@ -62,6 +66,12 @@ FROM runtime-base AS worker
 COPY --from=build-worker /app /app
 
 CMD ["node", "apps/worker/dist/main.js"]
+
+FROM runtime-base AS mem0
+
+COPY --from=build-mem0 /app /app
+
+CMD ["node", "apps/mem0/dist/main.js"]
 
 FROM runtime-base AS web
 

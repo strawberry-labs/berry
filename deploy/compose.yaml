@@ -36,6 +36,55 @@ services:
       timeout: 5s
       retries: 20
 
+  mem0-postgres:
+    image: pgvector/pgvector:0.8.2-pg16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${BERRY_MEM0_POSTGRES_DB:-mem0}
+      POSTGRES_USER: ${BERRY_MEM0_POSTGRES_USER:-mem0}
+      POSTGRES_PASSWORD: ${BERRY_MEM0_POSTGRES_PASSWORD:-berry-dev-mem0-postgres-password}
+    volumes:
+      - mem0_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mem0:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: mem0
+    restart: unless-stopped
+    command: ["node", "apps/mem0/dist/main.js"]
+    depends_on:
+      mem0-postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      BERRY_MEM0_PORT: 8010
+      BERRY_MEM0_DATABASE_URL: postgres://${BERRY_MEM0_POSTGRES_USER:-mem0}:${BERRY_MEM0_POSTGRES_PASSWORD:-berry-dev-mem0-postgres-password}@mem0-postgres:5432/${BERRY_MEM0_POSTGRES_DB:-mem0}
+      BERRY_MEM0_API_KEY: ${BERRY_MEM0_API_KEY:-berry-dev-mem0-api-key-change-me}
+      BERRY_MEM0_COLLECTION: ${BERRY_MEM0_COLLECTION:-berry_personal_memories}
+      BERRY_MEM0_LLM_BASE_URL: ${BERRY_MEM0_LLM_BASE_URL:-${BERRY_ROUTER_INFERENCE_BASE_URL:-}}
+      BERRY_MEM0_LLM_API_KEY: ${BERRY_MEM0_LLM_API_KEY:-${BERRY_ROUTER_API_KEY:-}}
+      BERRY_MEM0_LLM_MODEL: ${BERRY_MEM0_LLM_MODEL:-${BERRY_MEMORY_MODEL:-${BERRY_ROUTER_DEFAULT_MODEL:-kimi-2.6}}}
+      BERRY_MEM0_EMBEDDING_BASE_URL: ${BERRY_MEM0_EMBEDDING_BASE_URL:-${BERRY_EMBEDDING_BASE_URL:-${BERRY_ROUTER_INFERENCE_BASE_URL:-}}}
+      BERRY_MEM0_EMBEDDING_API_KEY: ${BERRY_MEM0_EMBEDDING_API_KEY:-${BERRY_EMBEDDING_API_KEY:-${BERRY_ROUTER_API_KEY:-}}}
+      BERRY_MEM0_EMBEDDING_MODEL: ${BERRY_MEM0_EMBEDDING_MODEL:-${BERRY_EMBEDDING_MODEL:-text-embedding-3-small}}
+      BERRY_MEM0_EMBEDDING_DIMENSIONS: ${BERRY_MEM0_EMBEDDING_DIMENSIONS:-${BERRY_EMBEDDING_DIMENSIONS:-1536}}
+      BERRY_MEM0_CUSTOM_INSTRUCTIONS: ${BERRY_MEM0_CUSTOM_INSTRUCTIONS:-}
+    ports:
+      - "127.0.0.1:${BERRY_MEM0_HOST_PORT:-8010}:8010"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8010/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   tika:
     image: apache/tika:3.2.3.0-full
     restart: unless-stopped
@@ -199,6 +248,10 @@ services:
       BERRY_FILE_PRESIGN_SECONDS: ${BERRY_FILE_PRESIGN_SECONDS:-900}
       BERRY_MEMORY_ENABLED: ${BERRY_MEMORY_ENABLED:-true}
       BERRY_IMPLICIT_MEMORY_ENABLED: ${BERRY_IMPLICIT_MEMORY_ENABLED:-true}
+      BERRY_PERSONAL_MEMORY_PROVIDER: ${BERRY_PERSONAL_MEMORY_PROVIDER:-mem0}
+      BERRY_MEM0_BASE_URL: ${BERRY_MEM0_BASE_URL:-http://mem0:8010}
+      BERRY_MEM0_API_KEY: ${BERRY_MEM0_API_KEY:-berry-dev-mem0-api-key-change-me}
+      BERRY_MEM0_TIMEOUT_MS: ${BERRY_MEM0_TIMEOUT_MS:-30000}
       BERRY_PROJECT_KNOWLEDGE_ENABLED: ${BERRY_PROJECT_KNOWLEDGE_ENABLED:-true}
       BERRY_PROMPT_CACHE_ENABLED: ${BERRY_PROMPT_CACHE_ENABLED:-true}
       BERRY_DURABLE_RUNNER_ENABLED: ${BERRY_DURABLE_RUNNER_ENABLED:-true}
@@ -244,6 +297,10 @@ services:
       BERRY_WORKER_CONCURRENCY: ${BERRY_WORKER_CONCURRENCY:-4}
       BERRY_MEMORY_ENABLED: ${BERRY_MEMORY_ENABLED:-true}
       BERRY_IMPLICIT_MEMORY_ENABLED: ${BERRY_IMPLICIT_MEMORY_ENABLED:-true}
+      BERRY_PERSONAL_MEMORY_PROVIDER: ${BERRY_PERSONAL_MEMORY_PROVIDER:-mem0}
+      BERRY_MEM0_BASE_URL: ${BERRY_MEM0_BASE_URL:-http://mem0:8010}
+      BERRY_MEM0_API_KEY: ${BERRY_MEM0_API_KEY:-berry-dev-mem0-api-key-change-me}
+      BERRY_MEM0_TIMEOUT_MS: ${BERRY_MEM0_TIMEOUT_MS:-30000}
       BERRY_PROJECT_KNOWLEDGE_ENABLED: ${BERRY_PROJECT_KNOWLEDGE_ENABLED:-true}
       BERRY_PROMPT_CACHE_ENABLED: ${BERRY_PROMPT_CACHE_ENABLED:-true}
       BERRY_DURABLE_RUNNER_ENABLED: ${BERRY_DURABLE_RUNNER_ENABLED:-true}
@@ -311,6 +368,7 @@ services:
 
 volumes:
   postgres_data:
+  mem0_postgres_data:
   redis_data:
   minio_data:
   api_data:

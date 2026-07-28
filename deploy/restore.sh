@@ -25,10 +25,16 @@ if [ -f "$backup_dir/minio-data.tar.gz" ]; then
   tar -C "$restore_dir" -xzf "$backup_dir/minio-data.tar.gz"
 fi
 
-docker compose --env-file "$env_file" -f deploy/compose.yaml stop api worker web
+docker compose --env-file "$env_file" -f deploy/compose.yaml stop api worker mem0 web
 docker compose --env-file "$env_file" -f deploy/compose.yaml exec -T postgres \
   sh -c 'pg_restore --clean --if-exists --no-owner --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
   < "$backup_dir/postgres.dump"
+
+if [ -f "$backup_dir/mem0-postgres.dump" ]; then
+  docker compose --env-file "$env_file" -f deploy/compose.yaml exec -T mem0-postgres \
+    sh -c 'pg_restore --clean --if-exists --no-owner --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
+    < "$backup_dir/mem0-postgres.dump"
+fi
 
 if [ -f "$backup_dir/minio-data.tar.gz" ]; then
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml run --rm --no-deps -T \
@@ -39,5 +45,5 @@ if [ -f "$backup_dir/minio-data.tar.gz" ]; then
      mc mirror --overwrite /restore/"$BERRY_AUDIT_S3_BUCKET" berry-minio/"$BERRY_AUDIT_S3_BUCKET"'
 fi
 
-docker compose --env-file "$env_file" -f deploy/compose.yaml start api worker web
+docker compose --env-file "$env_file" -f deploy/compose.yaml start mem0 api worker web
 echo "Restore completed from $backup_dir"

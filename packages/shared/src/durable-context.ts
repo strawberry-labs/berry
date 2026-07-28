@@ -182,7 +182,13 @@ export const GroundingContextSchema = z.object({
     queryHash: z.string(),
     tokenBudget: z.number().int().nonnegative(),
     tokensSelected: z.number().int().nonnegative(),
-    degradedReason: z.enum(["none", "embeddings_unavailable", "knowledge_disabled", "memory_disabled"]).default("none"),
+    degradedReason: z.enum([
+      "none",
+      "embeddings_unavailable",
+      "knowledge_disabled",
+      "memory_disabled",
+      "personal_memory_unavailable",
+    ]).default("none"),
   }),
 });
 export type GroundingContext = z.infer<typeof GroundingContextSchema>;

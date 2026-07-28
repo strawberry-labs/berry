@@ -3,7 +3,12 @@ import { KnowledgeModule } from "../knowledge/knowledge.module.js";
 import { ContextAssemblyService } from "./context-assembly.service.js";
 import { MemoryController } from "./memory.controller.js";
 import { SqlMemoryRepository } from "./memory.repository.js";
-import { MEMORY_REPOSITORY, MemoryService } from "./memory.service.js";
+import {
+  MEMORY_REPOSITORY,
+  PERSONAL_MEMORY_PROVIDER,
+  MemoryService,
+  createConfiguredPersonalMemoryProvider,
+} from "./memory.service.js";
 
 @Global()
 @Module({
@@ -12,9 +17,10 @@ import { MEMORY_REPOSITORY, MemoryService } from "./memory.service.js";
   providers: [
     SqlMemoryRepository,
     { provide: MEMORY_REPOSITORY, useExisting: SqlMemoryRepository },
+    { provide: PERSONAL_MEMORY_PROVIDER, useFactory: () => createConfiguredPersonalMemoryProvider(process.env) },
     MemoryService,
     ContextAssemblyService,
   ],
-  exports: [MemoryService, ContextAssemblyService, MEMORY_REPOSITORY],
+  exports: [MemoryService, ContextAssemblyService, MEMORY_REPOSITORY, PERSONAL_MEMORY_PROVIDER],
 })
 export class MemoryModule {}

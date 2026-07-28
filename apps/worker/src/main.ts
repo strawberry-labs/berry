@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
+import { createPersonalMemoryProviderFromEnv } from "@berry/personal-memory";
 import { BullMqBerryQueueClient, createBerryQueue, createBerryWorker } from "./bullmq.ts";
 import { durableContextConfigFromEnv } from "@berry/shared";
 import { PgSqlExecutor } from "./pg-executor.ts";
@@ -80,6 +81,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     memory: new MemoryProcessor(
       new SqlWorkerMemoryRepository(executor),
       createMemoryOperationGenerator(env),
+      createPersonalMemoryProviderFromEnv(env),
     ),
     compactor,
     turnRunner: new DurableTurnRunner(

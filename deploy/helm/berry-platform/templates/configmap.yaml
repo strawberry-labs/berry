@@ -47,6 +47,16 @@ data:
   BERRY_WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}
   BERRY_MEMORY_ENABLED: {{ .Values.durableContext.memoryEnabled | quote }}
   BERRY_IMPLICIT_MEMORY_ENABLED: {{ .Values.durableContext.implicitMemoryEnabled | quote }}
+  BERRY_PERSONAL_MEMORY_PROVIDER: {{ ternary "mem0" "berry" .Values.mem0.enabled | quote }}
+  BERRY_MEM0_BASE_URL: {{ printf "http://%s-mem0:%v" (include "berry-platform.name" .) .Values.mem0.port | quote }}
+  BERRY_MEM0_TIMEOUT_MS: {{ .Values.mem0.timeoutMs | quote }}
+  BERRY_MEM0_COLLECTION: {{ .Values.mem0.collection | quote }}
+  BERRY_MEM0_LLM_BASE_URL: {{ .Values.router.inferenceBaseUrl | quote }}
+  BERRY_MEM0_LLM_MODEL: {{ .Values.mem0.llmModel | quote }}
+  BERRY_MEM0_EMBEDDING_BASE_URL: {{ .Values.router.inferenceBaseUrl | quote }}
+  BERRY_MEM0_EMBEDDING_MODEL: {{ .Values.mem0.embeddingModel | quote }}
+  BERRY_MEM0_EMBEDDING_DIMENSIONS: {{ .Values.mem0.embeddingDimensions | quote }}
+  MEM0_TELEMETRY: {{ .Values.mem0.telemetry | quote }}
   BERRY_PROJECT_KNOWLEDGE_ENABLED: {{ .Values.durableContext.projectKnowledgeEnabled | quote }}
   BERRY_PROMPT_CACHE_ENABLED: {{ .Values.durableContext.promptCacheEnabled | quote }}
   BERRY_DURABLE_RUNNER_ENABLED: {{ .Values.durableContext.durableRunnerEnabled | quote }}

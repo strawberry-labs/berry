@@ -6,7 +6,8 @@ Use the Helm chart for Kubernetes environments that already have ingress, TLS, s
 
 - Kubernetes cluster access with permission to create a namespace, deployments, services, secrets, config maps, and Ingress resources.
 - Helm 3.
-- External or in-cluster Postgres, Redis, and object storage credentials.
+- External or in-cluster Postgres, a pgvector database for Mem0, Redis, and
+  object storage credentials.
 - A DNS name and TLS certificate for the platform/router endpoint.
 
 ## Configure values
@@ -22,6 +23,8 @@ Set:
 - Image repositories and tags built by the release pipeline.
 - Public platform URL and router URL.
 - Postgres, Redis, and object storage connection values.
+- The `berry-mem0` secret with `BERRY_MEM0_API_KEY` and
+  `BERRY_MEM0_DATABASE_URL`.
 - Managed policy public keys.
 - Ingress host, TLS secret, and class name.
 - Resource requests and limits for the target cluster.

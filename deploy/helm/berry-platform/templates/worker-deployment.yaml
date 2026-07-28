@@ -41,6 +41,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.router.existingSecret }}
                   key: {{ .Values.router.apiKeyKey }}
+            {{ if .Values.mem0.enabled }}
+            - name: BERRY_MEM0_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mem0.existingSecret }}
+                  key: {{ .Values.mem0.apiKeyKey }}
+            {{ end }}
             {{ if eq .Values.sandbox.provider "e2b" }}
             - name: E2B_API_KEY
               valueFrom:

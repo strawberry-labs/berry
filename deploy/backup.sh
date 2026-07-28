@@ -12,6 +12,10 @@ docker compose --env-file "$env_file" -f deploy/compose.yaml exec -T postgres \
   sh -c 'pg_dump --format=custom --no-owner --username="$POSTGRES_USER" "$POSTGRES_DB"' \
   > "$target/postgres.dump"
 
+docker compose --env-file "$env_file" -f deploy/compose.yaml exec -T mem0-postgres \
+  sh -c 'pg_dump --format=custom --no-owner --username="$POSTGRES_USER" "$POSTGRES_DB"' \
+  > "$target/mem0-postgres.dump"
+
 storage_mode="$(sed -n 's/^BERRY_OBJECT_STORAGE_MODE=//p' "$env_file" | tail -n 1)"
 storage_mode="${storage_mode:-minio}"
 if [ "$storage_mode" = "minio" ]; then
@@ -24,9 +28,9 @@ if [ "$storage_mode" = "minio" ]; then
      mc mirror --overwrite berry-minio/"$BERRY_AUDIT_S3_BUCKET" /backup/"$BERRY_AUDIT_S3_BUCKET"'
   tar -C "$target/minio-data" -czf "$target/minio-data.tar.gz" .
   rm -rf "$target/minio-data"
-  sha256sum "$target/postgres.dump" "$target/minio-data.tar.gz" > "$target/SHA256SUMS"
+  sha256sum "$target/postgres.dump" "$target/mem0-postgres.dump" "$target/minio-data.tar.gz" > "$target/SHA256SUMS"
 else
-  sha256sum "$target/postgres.dump" > "$target/SHA256SUMS"
+  sha256sum "$target/postgres.dump" "$target/mem0-postgres.dump" > "$target/SHA256SUMS"
   echo "R2 object data is external and was not copied by this database backup." > "$target/OBJECT_STORAGE.txt"
 fi
 echo "Backup written to $target"

@@ -52,10 +52,13 @@ Implement four connected capabilities for the Berry web platform:
 4. Portable, structured compaction and a durable task runner that can resume
    24–48 hour tasks after API, worker, stream, or sandbox interruptions.
 
-The result must use one identity and access-control model, one source of truth in
-Postgres, and one context assembly path. Prompt caching is an optimization, not
-a substitute for memory. Compaction is session state, not automatically a
-personal fact. BullMQ is a dispatcher, not the authoritative run ledger.
+The result must use one identity and access-control model and one context
+assembly path. Berry Postgres remains authoritative for project knowledge,
+compaction, runs, and audit state. Self-hosted Mem0 OSS, backed by a separate
+Berry-managed pgvector database, is authoritative only for personal memory.
+Prompt caching is an optimization, not a substitute for memory. Compaction is
+session state, not automatically a personal fact. BullMQ is a dispatcher, not
+the authoritative run ledger.
 
 ## Outcome checklist
 
@@ -234,10 +237,15 @@ Use small, replaceable dependencies:
   Reciprocal Rank Fusion (RRF). Start with exact vector search for small
   collections; create a partial HNSW index once the table size/config threshold
   warrants it. If HNSW is used with ACL filters, enable pgvector iterative scans.
-- Follow the useful part of the Mem0 method—extract candidate facts,
-  consolidate deterministically, retrieve selectively—but keep Berry Postgres
-  as the source of truth. Do not make an external memory SaaS a required
-  dependency.
+- Use the official `mem0ai/oss` library for personal memory only. Run it inside
+  a Berry-owned internal service with a dedicated pgvector database; never call
+  Mem0's hosted API. Keep Berry Postgres and the existing Berry memory engine
+  as the source of truth for project RAG, task outcomes, compaction, and durable
+  execution.
+- Put a provider-neutral personal-memory adapter between API/worker code and
+  Mem0 so self-hosters can select `mem0`, retain the legacy `berry` path as a
+  rollback seam, and upgrade Mem0 without coupling the rest of the context
+  engine to its SDK.
 - Use Zod schemas already standard in the repository for memory operations,
   retrieval results, job payloads, and `SessionCheckpointV2`.
 
@@ -256,6 +264,16 @@ Add non-secret examples and typed validation for:
 ```text
 BERRY_MEMORY_ENABLED=true
 BERRY_IMPLICIT_MEMORY_ENABLED=true
+BERRY_PERSONAL_MEMORY_PROVIDER=mem0
+BERRY_MEM0_BASE_URL=http://mem0:8010
+BERRY_MEM0_API_KEY=<deployment-generated-internal-secret>
+BERRY_MEM0_DATABASE_URL=<private-pgvector-database-url>
+BERRY_MEM0_LLM_BASE_URL=<openai-compatible-base-url>
+BERRY_MEM0_LLM_MODEL=<memory-extraction-model>
+BERRY_MEM0_EMBEDDING_BASE_URL=<openai-compatible-base-url>
+BERRY_MEM0_EMBEDDING_MODEL=<embedding-model>
+BERRY_MEM0_EMBEDDING_DIMENSIONS=1536
+MEM0_TELEMETRY=false
 BERRY_PROJECT_KNOWLEDGE_ENABLED=true
 BERRY_PROMPT_CACHE_ENABLED=true
 BERRY_DURABLE_RUNNER_ENABLED=true

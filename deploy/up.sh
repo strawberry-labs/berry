@@ -60,6 +60,37 @@ if [ "$sandbox_provider" = "e2b" ] && [ -z "$e2b_api_key" ]; then
   exit 1
 fi
 
+mem0_api_key="$(env_value BERRY_MEM0_API_KEY)"
+mem0_postgres_password="$(env_value BERRY_MEM0_POSTGRES_PASSWORD)"
+mem0_llm_base_url="$(env_value BERRY_MEM0_LLM_BASE_URL)"
+mem0_llm_api_key="$(env_value BERRY_MEM0_LLM_API_KEY)"
+mem0_llm_model="$(env_value BERRY_MEM0_LLM_MODEL)"
+mem0_embedding_base_url="$(env_value BERRY_MEM0_EMBEDDING_BASE_URL)"
+mem0_embedding_api_key="$(env_value BERRY_MEM0_EMBEDDING_API_KEY)"
+router_base_url="$(env_value BERRY_ROUTER_INFERENCE_BASE_URL)"
+router_api_key="$(env_value BERRY_ROUTER_API_KEY)"
+router_model="$(env_value BERRY_ROUTER_DEFAULT_MODEL)"
+memory_model="$(env_value BERRY_MEMORY_MODEL)"
+if [ "${#mem0_api_key}" -lt 16 ]; then
+  echo "BERRY_MEM0_API_KEY must be at least 16 characters. Generate one with: openssl rand -hex 32" >&2
+  exit 1
+fi
+if [ -z "$mem0_postgres_password" ]; then
+  echo "BERRY_MEM0_POSTGRES_PASSWORD is required." >&2
+  exit 1
+fi
+if { [ -z "$mem0_llm_base_url" ] && [ -z "$router_base_url" ]; } ||
+   { [ -z "$mem0_llm_api_key" ] && [ -z "$router_api_key" ]; } ||
+   { [ -z "$mem0_llm_model" ] && [ -z "$memory_model" ] && [ -z "$router_model" ]; }; then
+  echo "Configure BERRY_MEM0_LLM_* or the equivalent Berry Router URL, key, and model." >&2
+  exit 1
+fi
+if { [ -z "$mem0_embedding_base_url" ] && [ -z "$router_base_url" ]; } ||
+   { [ -z "$mem0_embedding_api_key" ] && [ -z "$router_api_key" ]; }; then
+  echo "Configure BERRY_MEM0_EMBEDDING_* or an equivalent Berry Router URL and key." >&2
+  exit 1
+fi
+
 storage_mode="$(env_value BERRY_OBJECT_STORAGE_MODE)"
 storage_mode="${storage_mode:-minio}"
 if [ "$storage_mode" = "r2" ]; then
@@ -71,8 +102,8 @@ if [ "$storage_mode" = "r2" ]; then
     fi
   done
   docker compose --env-file "$env_file" -f deploy/compose.yaml config --quiet
-  docker compose --env-file "$env_file" -f deploy/compose.yaml pull postgres redis caddy
-  docker compose --env-file "$env_file" -f deploy/compose.yaml build api worker web
+  docker compose --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres redis caddy
+  docker compose --env-file "$env_file" -f deploy/compose.yaml build mem0 api worker web
   docker compose --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans
   docker compose --env-file "$env_file" -f deploy/compose.yaml ps
 elif [ "$storage_mode" = "minio" ]; then
@@ -82,8 +113,8 @@ elif [ "$storage_mode" = "minio" ]; then
     exit 1
   fi
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml config --quiet
-  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml pull postgres redis minio minio-init caddy
-  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml build api worker web
+  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres redis minio minio-init caddy
+  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml build mem0 api worker web
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml ps
 else

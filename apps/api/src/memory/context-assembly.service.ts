@@ -82,6 +82,9 @@ export class ContextAssemblyService {
       citations: [...projectMemoryCitations, ...knowledge.citations],
       retrieval: {
         ...knowledge.retrieval,
+        degradedReason: memory.personalDegraded && knowledge.retrieval.degradedReason === "none"
+          ? "personal_memory_unavailable"
+          : knowledge.retrieval.degradedReason,
         tokenBudget: knowledge.retrieval.tokenBudget + 1_800,
         tokensSelected: knowledge.retrieval.tokensSelected + memory.personalTokens + memory.projectTokens,
       },

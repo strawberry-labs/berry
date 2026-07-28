@@ -12,7 +12,8 @@ This topology is for one private organization with roughly 5–10 users at `aesg
 - An E2B Cloud team with billing enabled, a server API key, and either the built-in `base` template or a reviewed custom template ID. The E2B key is injected only into the private API container and never reaches the web app or browser.
 - BerryCrawl public HTTPS MCP URL and bearer key.
 - The initial account email allow-list, plus a decision on whether subsequent self-service signup remains enabled.
-- An off-box destination for the dated Postgres and MinIO backups created by the included backup script.
+- An off-box destination for the dated Berry Postgres, personal-memory
+  pgvector, and MinIO backups created by the included backup script.
 
 This deployment uses a pinned, network-private MinIO Community image. It is suitable for the 5–10-user test, but its data shares the Hetzner failure domain and the historical Community images are not maintained. Copy every dated backup off the server and enable Hetzner server backups.
 
@@ -65,8 +66,13 @@ Project records, tasks, messages, governance, budgets, usage, and audit data are
 
 ## Operations
 
-- Run `deploy/backup.sh` daily from systemd/cron, copy the dated Postgres and MinIO archive off-box, retain at least 7 daily and 4 weekly copies, and test restores quarterly.
-- Restore drills use `BERRY_RESTORE_CONFIRM=YES ./deploy/restore.sh /path/to/backup`. The script verifies checksums, stops the application writers, restores Postgres and both object buckets, then restarts the application services.
+- Run `deploy/backup.sh` daily from systemd/cron, copy the dated Berry Postgres,
+  Mem0 pgvector, and MinIO archive off-box, retain at least 7 daily and 4 weekly
+  copies, and test restores quarterly.
+- Restore drills use `BERRY_RESTORE_CONFIRM=YES ./deploy/restore.sh /path/to/backup`.
+  The script verifies checksums, stops the application writers, restores both
+  PostgreSQL databases and both object buckets, then restarts the application
+  services.
 - Apply OS security updates automatically. Rebuild and redeploy Berry from a pinned Git commit; do not edit a running container.
 - Monitor disk, memory, Postgres health, Redis health, HTTP 5xx rate, Caddy certificate renewal, BerryRouter/E2B latency, budget rejections, and backup freshness.
 - Keep `deploy/.env.production` mode `0600`, never commit it, and rotate BerryRouter, E2B, BerryCrawl, auth, database, MinIO, usage-signing, and SCIM secrets after any suspected exposure.

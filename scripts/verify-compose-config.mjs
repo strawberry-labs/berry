@@ -18,6 +18,8 @@ const productionEnv = readFileSync(resolve(root, "deploy/.env.production.example
 
 const requiredComposeSnippets = [
   "postgres:",
+  "mem0-postgres:",
+  "mem0:",
   "caddy:",
   "redis:",
   "minio:",
@@ -28,9 +30,12 @@ const requiredComposeSnippets = [
   "DEPLOYMENT_MODE:",
   "node\", \"apps/api/dist/main.js",
   "node\", \"apps/worker/dist/main.js",
+  "node\", \"apps/mem0/dist/main.js",
   "apps/web/node_modules/.bin/srvx\", \"--prod\", \"-s\", \"../client\", \"apps/web/dist/server/server.js",
   "BERRY_DATABASE_URL:",
   "BERRY_REDIS_URL:",
+  "BERRY_MEM0_DATABASE_URL:",
+  "BERRY_MEM0_BASE_URL:",
   "BERRY_BUDGETS_ENABLED:",
   "BERRY_BUDGET_FAIL_CLOSED:",
   "BERRY_BILLING_PROVIDER:",
@@ -64,8 +69,10 @@ const requiredDockerfileSnippets = [
   "corepack pnpm --filter @berry/api... build",
   "corepack pnpm --filter @berry/web... build",
   "corepack pnpm --filter @berry/worker... build",
+  "corepack pnpm --filter @berry/mem0... build",
   "docker.io",
   "CMD [\"node\", \"apps/api/dist/main.js\"]",
+  "CMD [\"node\", \"apps/mem0/dist/main.js\"]",
 ];
 
 const requiredEnvSnippets = [
@@ -73,6 +80,8 @@ const requiredEnvSnippets = [
   "BERRY_SCIM_BEARER_TOKEN=",
   "BERRY_BUDGETS_ENABLED=true",
   "BERRY_BUDGET_FAIL_CLOSED=true",
+  "BERRY_PERSONAL_MEMORY_PROVIDER=mem0",
+  "BERRY_MEM0_API_KEY=",
   "BERRY_BILLING_PROVIDER=none",
   "STRIPE_CREDIT_PRICE_ID=",
   "BERRY_USAGE_SIGNING_SECRETS=fixture:replace-me-usage-secret",
@@ -98,6 +107,7 @@ const requiredHelmSnippets = [
   "existingSecret: berry-redis",
   "existingSecret: berry-s3",
   "existingSecret: berry-billing",
+  "existingSecret: berry-mem0",
   "hpa:",
 ];
 
@@ -107,6 +117,7 @@ const requiredHelmTemplateSnippets = [
   "BERRY_REDIS_URL",
   "BERRY_BILLING_PROVIDER",
   "BERRY_ROUTER_API_KEY",
+  "BERRY_MEM0_API_KEY",
   "E2B_API_KEY",
   "STRIPE_SECRET_KEY",
   "STRIPE_BILLING_METER_EVENT_NAME",
@@ -121,13 +132,15 @@ const requiredHelmTemplateSnippets = [
   "name: {{ include \"berry-platform.name\" . }}-api",
   "name: {{ include \"berry-platform.name\" . }}-web",
   "name: {{ include \"berry-platform.name\" . }}-worker",
+  "name: {{ include \"berry-platform.name\" . }}-mem0",
 ];
 
 assertContains("deploy/compose.yaml", compose, requiredComposeSnippets);
 assertContains("Dockerfile", dockerfile, requiredDockerfileSnippets);
 assertContains("deploy/.env.example", envExample, requiredEnvSnippets);
 assertContains("deploy/helm/berry-platform/values.yaml", helmValues, requiredHelmSnippets);
-assertContains("deploy/helm/berry-platform/templates/*", `${helmConfig}\n${helmApi}\n${helmWeb}\n${helmWorker}\n${helmHpa}`, requiredHelmTemplateSnippets);
+const helmMem0 = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/mem0-deployment.yaml"), "utf8");
+assertContains("deploy/helm/berry-platform/templates/*", `${helmConfig}\n${helmApi}\n${helmWeb}\n${helmWorker}\n${helmMem0}\n${helmHpa}`, requiredHelmTemplateSnippets);
 assertContains("deploy/dedicated-instance-runbook.md", dedicatedRunbook, ["DEPLOYMENT_MODE=dedicated", "helm upgrade --install berry", "kubectl -n berry-acme create secret generic berry-postgres", "kubectl -n berry-acme create secret generic berry-billing", "kubectl -n berry-acme create secret generic berry-e2b"]);
 assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy @api api:3000", "reverse_proxy web:3108", "header @immutable_assets Cache-Control \"public, max-age=31536000, immutable\""]);
 assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY="]);
