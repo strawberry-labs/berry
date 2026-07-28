@@ -644,7 +644,7 @@ export const knowledgeChunks = pgTable("knowledge_chunks", {
   textContent: text("text_content").notNull(),
   tokenEstimate: integer("token_estimate").notNull().default(0),
   metadata: jsonObject("metadata"),
-  embedding: vector("embedding", { dimensions: 1536 }),
+  embedding: vector("embedding", { dimensions: 768 }),
   embeddingProfileId: text("embedding_profile_id"),
   embeddingProvider: text("embedding_provider"),
   embeddingModel: text("embedding_model"),
@@ -3447,6 +3447,32 @@ CREATE INDEX maintenance_runs_tenant_status_idx
 ${tenantRlsSql("maintenance_runs")}
 `.trim();
 
+export const SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION = `
+UPDATE knowledge_chunks
+SET embedding = NULL,
+    embedding_profile_id = NULL,
+    embedding_provider = NULL,
+    embedding_model = NULL,
+    embedding_dimensions = NULL,
+    embedding_profile_version = NULL,
+    embedding_hash = NULL,
+    vector_ready = false
+WHERE embedding IS NOT NULL OR vector_ready = true;
+
+UPDATE knowledge_sources
+SET vector_ready = false
+WHERE vector_ready = true;
+
+ALTER TABLE knowledge_chunks
+  DROP CONSTRAINT knowledge_chunks_embedding_dimensions_check;
+ALTER TABLE knowledge_chunks
+  ALTER COLUMN embedding TYPE vector(768);
+ALTER TABLE knowledge_chunks
+  ADD CONSTRAINT knowledge_chunks_embedding_dimensions_check CHECK (
+    embedding IS NULL OR embedding_dimensions = 768
+  );
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -3538,4 +3564,5 @@ export const cloudMigrations = [
   { id: 30, name: "durable_turn_questions_v1", sql: DURABLE_TURN_QUESTIONS_MIGRATION },
   { id: 31, name: "message_citations_v1", sql: MESSAGE_CITATIONS_MIGRATION },
   { id: 32, name: "maintenance_runs_v1", sql: MAINTENANCE_RUNS_MIGRATION },
+  { id: 33, name: "self_hosted_embedding_profile_v2", sql: SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION },
 ] as const;

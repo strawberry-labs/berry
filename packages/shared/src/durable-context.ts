@@ -401,11 +401,22 @@ export const DurableContextConfigSchema = z.object({
       message: "Chunk overlap must be smaller than the chunk size",
     });
   }
-  if (value.embeddingDimensions !== 1536) {
+  const expectedDimensions = value.embeddingProfileVersion === 1
+    ? 1536
+    : value.embeddingProfileVersion === 2
+      ? 768
+      : null;
+  if (expectedDimensions === null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["embeddingProfileVersion"],
+      message: "Embedding profile version must be 1 or 2",
+    });
+  } else if (value.embeddingDimensions !== expectedDimensions) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["embeddingDimensions"],
-      message: "Embedding profile v1 requires 1536 dimensions",
+      message: `Embedding profile v${value.embeddingProfileVersion} requires ${expectedDimensions} dimensions`,
     });
   }
 });

@@ -62,8 +62,8 @@ Before the rollout:
    ```
 
 3. Start the pinned pgvector-capable database image before API migrations.
-4. Start one API instance and allow additive migrations 27–32 to finish.
-5. Confirm `schema_migrations`, `pg_extension`, and the
+4. Start one API instance and allow additive migrations 27–33 to finish.
+5. Confirm `schema_migrations` through migration 33, `pg_extension`, and the
    `knowledge_chunks_search_idx` index before adding workers.
 
 Do not downgrade a migrated database to a stock Postgres image that lacks the
@@ -78,14 +78,16 @@ extension or vector column in place.
 pin `apache/tika:3.2.3.0-full`. Do not expose Tika publicly. Extraction failures
 leave a source in `failed`; the Project Knowledge surface can enqueue a retry.
 
-The initial vector contract is:
+Compose runs a private CPU embedding service using
+`sentence-transformers/all-mpnet-base-v2`. Its vector contract is:
 
 - `BERRY_EMBEDDING_PROVIDER=openai-compatible`
-- `BERRY_EMBEDDING_MODEL=<reviewed embedding model ID>`
-- `BERRY_EMBEDDING_DIMENSIONS=1536`
-- `BERRY_EMBEDDING_PROFILE_VERSION=1`
-- `BERRY_KNOWLEDGE_CHUNK_TOKENS=600`
-- `BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS=80`
+- `BERRY_EMBEDDING_BASE_URL=http://embeddings:80/v1`
+- `BERRY_EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2`
+- `BERRY_EMBEDDING_DIMENSIONS=768`
+- `BERRY_EMBEDDING_PROFILE_VERSION=2`
+- `BERRY_KNOWLEDGE_CHUNK_TOKENS=300`
+- `BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS=50`
 
 Changing dimensions requires a new additive schema/profile migration and a
 reindex. Changing the model with the same dimensions requires incrementing

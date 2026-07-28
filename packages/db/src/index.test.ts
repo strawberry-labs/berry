@@ -59,6 +59,7 @@ import {
   POLICY_DISTRIBUTION_TENANT_SCOPED_TABLES,
   REMOVE_QUEUED_FOLLOW_UPS_MIGRATION,
   SANDBOX_WORKSPACES_MIGRATION,
+  SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION,
   SESSION_COMPACTION_LEASES_MIGRATION,
   PERSONAL_CAPABILITIES_MIGRATION,
   ORG_CAPABILITIES_MIGRATION,
@@ -169,7 +170,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]);
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {
@@ -221,7 +222,14 @@ describe("cloud postgres schema", () => {
     expect(MESSAGE_CITATIONS_MIGRATION).toContain("ADD VALUE IF NOT EXISTS 'citation'");
     expect(MAINTENANCE_RUNS_MIGRATION).toContain("CREATE POLICY maintenance_runs_tenant_isolation");
     expect(MAINTENANCE_RUNS_MIGRATION).toContain("failure_count integer NOT NULL DEFAULT 0");
-    expect(cloudMigrations.at(-1)).toMatchObject({ id: 32, name: "maintenance_runs_v1" });
+    expect(cloudMigrations.find((migration) => migration.id === 32)).toMatchObject({ id: 32, name: "maintenance_runs_v1" });
+  });
+
+  it("adds the self-hosted 768-dimensional embedding profile as an additive migration", () => {
+    expect(cloudMigrations.at(-1)).toMatchObject({ id: 33, name: "self_hosted_embedding_profile_v2" });
+    expect(SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION).toContain("ALTER COLUMN embedding TYPE vector(768)");
+    expect(SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION).toContain("embedding_dimensions = 768");
+    expect(SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION).toContain("vector_ready = false");
   });
 
   it("keeps later platform migrations intact", () => {

@@ -19,6 +19,7 @@ const productionEnv = readFileSync(resolve(root, "deploy/.env.production.example
 const requiredComposeSnippets = [
   "postgres:",
   "mem0-postgres:",
+  "embeddings:",
   "mem0:",
   "caddy:",
   "redis:",
@@ -36,6 +37,8 @@ const requiredComposeSnippets = [
   "BERRY_REDIS_URL:",
   "BERRY_MEM0_DATABASE_URL:",
   "BERRY_MEM0_BASE_URL:",
+  "BERRY_EMBEDDING_BASE_URL:",
+  "BERRY_EMBEDDING_API_KEY:",
   "BERRY_BUDGETS_ENABLED:",
   "BERRY_BUDGET_FAIL_CLOSED:",
   "BERRY_BILLING_PROVIDER:",

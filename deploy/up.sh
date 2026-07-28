@@ -102,7 +102,7 @@ if [ "$storage_mode" = "r2" ]; then
     fi
   done
   docker compose --env-file "$env_file" -f deploy/compose.yaml config --quiet
-  docker compose --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres redis caddy
+  docker compose --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres embeddings tika redis caddy
   docker compose --env-file "$env_file" -f deploy/compose.yaml build mem0 api worker web
   docker compose --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans
   docker compose --env-file "$env_file" -f deploy/compose.yaml ps
@@ -113,7 +113,7 @@ elif [ "$storage_mode" = "minio" ]; then
     exit 1
   fi
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml config --quiet
-  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres redis minio minio-init caddy
+  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres embeddings tika redis minio minio-init caddy
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml build mem0 api worker web
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml ps
