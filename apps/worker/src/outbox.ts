@@ -90,7 +90,11 @@ export class RuntimeOutboxDispatcher {
         }
         try {
           const name = parsedName.data;
-          await this.queue.enqueue(name, row.payload as BerryWorkerJobMap[typeof name]);
+          await this.queue.enqueue(
+            name,
+            row.payload as BerryWorkerJobMap[typeof name],
+            { jobId: outboxJobId(name, row.id) },
+          );
           await this.withTenant((executor) => executor.execute(`
             UPDATE runtime_outbox
             SET completed_at = now(), lease_owner = NULL, lease_expires_at = NULL,
@@ -127,4 +131,8 @@ export class RuntimeOutboxDispatcher {
     };
     return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
   }
+}
+
+export function outboxJobId(name: BerryWorkerJobName, outboxId: string): string {
+  return `outbox-${name.replaceAll(".", "-")}-${outboxId}`;
 }

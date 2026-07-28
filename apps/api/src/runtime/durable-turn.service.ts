@@ -656,7 +656,7 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
             tenantId,
             question.run_id,
             `${question.run_id}:question:${questionId}`,
-            JSON.stringify({ tenantId, runId: question.run_id, reason: "question-answered" }),
+            JSON.stringify({ tenantId, runId: question.run_id, reason: "user-input" }),
           ],
         );
         return true;

@@ -87,6 +87,27 @@ describe("portable session checkpoints", () => {
     expect(merged.nextAction).toBe("Implement Packet 3");
   });
 
+  it("clears current work, resolved questions, and the next action", () => {
+    const previous = checkpoint({
+      currentWork: ["Investigate queue retries"],
+      unresolvedQuestions: ["Which environment?"],
+      nextAction: "Wait for the environment answer",
+    });
+    const segment = checkpoint({
+      completedWork: ["Queue retries fixed"],
+      currentWork: [],
+      unresolvedQuestions: [],
+      nextAction: "",
+    });
+
+    const merged = mergeSessionCheckpoints(previous, segment, deterministic());
+
+    expect(merged.currentWork).toEqual([]);
+    expect(merged.unresolvedQuestions).toEqual([]);
+    expect(merged.nextAction).toBe("");
+    expect(merged.completedWork).toEqual(["Queue retries fixed"]);
+  });
+
   it("rebases rolling state from immutable segments in order", () => {
     const segments = [
       checkpoint({ completedWork: ["one"], coveredEntryStart: "entry-1", coveredEntryEnd: "entry-2" }),

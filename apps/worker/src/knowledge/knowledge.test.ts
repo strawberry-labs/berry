@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { reciprocalRankFusion, selectRetrievalCandidates } from "@berry/shared";
 import type { SqlExecutor } from "../sql-repositories.js";
-import { SqlKnowledgeRepository } from "./repository.js";
+import {
+  buildTaskOutcomeText,
+  redactProjectKnowledgeText,
+  SqlKnowledgeRepository,
+} from "./repository.js";
 import { DocumentExtractor, KnowledgeChunker } from "./services.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
@@ -67,5 +71,48 @@ describe("knowledge ingestion and ranking", () => {
     expect(sql).toContain("tenant_id = $1::uuid");
     expect(sql).toContain("tombstoned_at = COALESCE(tombstoned_at, now())");
     expect(executor.calls.at(-1)?.params).toEqual([tenantId, sourceId, "revision-1"]);
+  });
+
+  it("builds a bounded task outcome and removes credentials before project indexing", () => {
+    const outcome = buildTaskOutcomeText({
+      checkpoint: {
+        goal: "Deploy the service",
+        narrative: "Deployment completed with password='checkpoint-secret'.",
+        completedWork: ["Configured api_key=checkpoint-key"],
+        decisions: [],
+        artifacts: [],
+        nextAction: "",
+      },
+      assistantParts: [{
+        text: [
+          "Deployment completed.",
+          "Authorization: Bearer sk-live-secret",
+          "AWS key: AKIAIOSFODNN7EXAMPLE",
+          "-----BEGIN PRIVATE KEY-----",
+          "private-material",
+          "-----END PRIVATE KEY-----",
+        ].join("\n"),
+      }],
+    });
+
+    expect(outcome).toContain("Portable checkpoint:");
+    expect(outcome).toContain("Final assistant result:");
+    expect(outcome).toContain("Deployment completed.");
+    expect(outcome).not.toContain("checkpoint-secret");
+    expect(outcome).not.toContain("checkpoint-key");
+    expect(outcome).not.toContain("sk-live-secret");
+    expect(outcome).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(outcome).not.toContain("private-material");
+    expect(outcome.length).toBeLessThanOrEqual(16_000);
+  });
+
+  it("redacts URL credentials and common provider token formats", () => {
+    const redacted = redactProjectKnowledgeText(
+      "https://alice:password@example.test xoxb-1234567890123456 ghp_abcdefghijklmnopqrstuvwxyz",
+    );
+
+    expect(redacted).not.toContain("alice:password");
+    expect(redacted).not.toContain("xoxb-1234567890123456");
+    expect(redacted).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz");
   });
 });

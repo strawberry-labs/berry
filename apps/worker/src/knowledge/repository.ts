@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { redactSecrets } from "@berry/router-client";
 import type { TextChunk } from "./services.js";
 import type { SqlExecutor } from "../sql-repositories.js";
 
@@ -311,15 +312,21 @@ export class SqlKnowledgeRepository {
           AND workspace_id = $3::uuid AND status = 'completed' AND deleted_at IS NULL
       `, [input.tenantId, input.taskId, input.workspaceId]);
       if (!task) return null;
-      const parts = await executor.query<{ role: string; type: string; content: unknown; created_at: Date | string }>(`
-        SELECT m.role::text, mp.type::text, mp.content, m.created_at
+      const parts = await executor.query<{ type: string; content: unknown }>(`
+        SELECT mp.type::text, mp.content
         FROM messages m
         JOIN message_parts mp ON mp.message_id = m.id
-        WHERE m.tenant_id = $1::uuid AND m.session_id = $2::uuid
-          AND m.role IN ('user', 'assistant')
+        WHERE m.tenant_id = $1::uuid
+          AND m.id = (
+            SELECT latest.id
+            FROM messages latest
+            WHERE latest.tenant_id = $1::uuid AND latest.session_id = $2::uuid
+              AND latest.role = 'assistant' AND latest.status = 'complete'
+            ORDER BY latest.sequence_id DESC, latest.created_at DESC
+            LIMIT 1
+          )
           AND mp.type IN ('text', 'code')
-          AND m.status = 'complete'
-        ORDER BY m.sequence_id ASC, mp.ordinal ASC
+        ORDER BY mp.ordinal ASC
       `, [input.tenantId, input.sessionId]);
       const [checkpoint] = await executor.query<{ checkpoint: unknown }>(`
         SELECT checkpoint FROM session_checkpoints
@@ -327,13 +334,10 @@ export class SqlKnowledgeRepository {
           AND kind = 'rolling' AND validation_status = 'valid'
         ORDER BY created_at DESC LIMIT 1
       `, [input.tenantId, input.sessionId]);
-      const textParts = parts.flatMap((part) => {
-        const content = textContent(part.content);
-        return content ? [`${part.role === "user" ? "User request" : "Assistant result"}:\n${content}`] : [];
+      const text = buildTaskOutcomeText({
+        assistantParts: parts.map((part) => part.content),
+        checkpoint: checkpoint?.checkpoint,
       });
-      const checkpointSummary = checkpointNarrative(checkpoint?.checkpoint);
-      if (checkpointSummary) textParts.push(`Portable checkpoint:\n${checkpointSummary}`);
-      const text = textParts.join("\n\n").trim();
       if (!text) return null;
       const contentHash = createHash("sha256").update(text).digest("hex");
       const [row] = await executor.query<SourceRow>(`
@@ -536,6 +540,48 @@ function checkpointNarrative(value: unknown): string {
     typeof checkpoint.nextAction === "string" ? `Next action: ${checkpoint.nextAction}` : "",
   ];
   return parts.filter(Boolean).join("\n");
+}
+
+const MAX_TASK_OUTCOME_CHARS = 16_000;
+const MAX_REDACTION_SCAN_CHARS = 100_000;
+
+export function buildTaskOutcomeText(input: {
+  assistantParts: readonly unknown[];
+  checkpoint: unknown;
+}): string {
+  const checkpointSummary = redactProjectKnowledgeText(checkpointNarrative(input.checkpoint));
+  const assistantResult = redactProjectKnowledgeText(
+    input.assistantParts.map(textContent).filter(Boolean).join("\n\n"),
+  );
+  const sections = [
+    checkpointSummary ? `Portable checkpoint:\n${checkpointSummary}` : "",
+    assistantResult ? `Final assistant result:\n${assistantResult}` : "",
+  ].filter(Boolean);
+  return sections.join("\n\n").slice(0, MAX_TASK_OUTCOME_CHARS).trim();
+}
+
+export function redactProjectKnowledgeText(value: string): string {
+  const bounded = value.slice(0, MAX_REDACTION_SCAN_CHARS);
+  return redactSecrets(bounded)
+    .replace(
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi,
+      "[redacted private key]",
+    )
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[redacted credential]")
+    .replace(
+      /\b(?:sk-[A-Za-z0-9_-]{16,}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/g,
+      "[redacted credential]",
+    )
+    .replace(
+      /(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret|password|passwd|credential|secret)["']?\s*[:=]\s*)(["'])([\s\S]*?)\2/gi,
+      "$1$2[redacted]$2",
+    )
+    .replace(
+      /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret|password|passwd|credential|secret)\s*[:=]\s*)[^\s,;]+/gi,
+      "$1[redacted]",
+    )
+    .replace(/:\/\/[^:/\s]+:[^@\s]+@/g, "://[redacted]@")
+    .trim();
 }
 
 function stringList(value: unknown): string[] {

@@ -250,7 +250,15 @@ export class KnowledgeService {
         AND (
           ks.visibility = 'project' OR
           (ks.visibility = 'private' AND ks.user_id = $3::uuid) OR
-          (ks.visibility = 'task_only' AND ks.metadata->>'taskId' = $4)
+          (ks.visibility = 'task_only' AND EXISTS (
+            SELECT 1
+            FROM workspace_files task_file
+            WHERE task_file.tenant_id = ks.tenant_id
+              AND task_file.workspace_id = ks.workspace_id
+              AND task_file.file_id::text = ks.source_id
+              AND task_file.originating_task_id::text = $4
+              AND task_file.deleted_at IS NULL
+          ))
         )
         AND (
           lower(ks.title) = lower($5) OR
@@ -282,7 +290,15 @@ export class KnowledgeService {
         AND (
           ks.visibility = 'project' OR
           (ks.visibility = 'private' AND ks.user_id = $3::uuid) OR
-          (ks.visibility = 'task_only' AND ks.metadata->>'taskId' = $4)
+          (ks.visibility = 'task_only' AND EXISTS (
+            SELECT 1
+            FROM workspace_files task_file
+            WHERE task_file.tenant_id = ks.tenant_id
+              AND task_file.workspace_id = ks.workspace_id
+              AND task_file.file_id::text = ks.source_id
+              AND task_file.originating_task_id::text = $4
+              AND task_file.deleted_at IS NULL
+          ))
         )
         AND kc.search_document @@ websearch_to_tsquery('simple', $5)
       ORDER BY rank DESC, ks.authority DESC, kc.id
@@ -310,7 +326,15 @@ export class KnowledgeService {
         AND (
           ks.visibility = 'project' OR
           (ks.visibility = 'private' AND ks.user_id = $3::uuid) OR
-          (ks.visibility = 'task_only' AND ks.metadata->>'taskId' = $4)
+          (ks.visibility = 'task_only' AND EXISTS (
+            SELECT 1
+            FROM workspace_files task_file
+            WHERE task_file.tenant_id = ks.tenant_id
+              AND task_file.workspace_id = ks.workspace_id
+              AND task_file.file_id::text = ks.source_id
+              AND task_file.originating_task_id::text = $4
+              AND task_file.deleted_at IS NULL
+          ))
         )
       ORDER BY kc.embedding <=> $5::vector, ks.authority DESC, kc.id
       LIMIT 60

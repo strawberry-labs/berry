@@ -212,11 +212,12 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
       display_name: string;
       media_type: string;
       object_key: string;
+      originating_task_id: string | null;
       revision: string;
       content_hash: string;
     }>(`
       SELECT wf.id AS workspace_file_id, wf.workspace_id, wf.file_id, wf.visibility,
-             f.owner_user_id, f.display_name, f.media_type, f.object_key,
+             wf.originating_task_id, f.owner_user_id, f.display_name, f.media_type, f.object_key,
              COALESCE(NULLIF(f.object_version_id,''), NULLIF(f.etag,''), NULLIF(f.sha256,''), 'legacy-' || f.id::text) AS revision,
              COALESCE(NULLIF(f.sha256,''), NULLIF(f.etag,''), NULLIF(f.object_version_id,''), 'legacy-' || f.id::text) AS content_hash
       FROM workspace_files wf
@@ -245,7 +246,13 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
         ) VALUES (
           $1::uuid, $2::uuid, $3::uuid, 'file', $4, $5, $6, $7, $8,
           'pending', 'pending', 'tika-v1', 'recursive-v1',
-          jsonb_build_object('fileId',$4,'mediaType',$9,'objectKey',$10,'backfilled',true)
+          jsonb_strip_nulls(jsonb_build_object(
+            'fileId',$4,
+            'mediaType',$9,
+            'objectKey',$10,
+            'taskId',$11::text,
+            'backfilled',true
+          ))
         )
         ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
         DO UPDATE SET tombstoned_at = NULL, failure_reason = NULL,
@@ -262,6 +269,7 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
         row.visibility,
         row.media_type,
         row.object_key,
+        row.originating_task_id,
       ]);
       const source = sources[0];
       if (!source) continue;

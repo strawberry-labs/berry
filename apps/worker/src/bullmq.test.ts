@@ -33,4 +33,29 @@ describe("BullMqBerryQueueClient", () => {
       },
     ]);
   });
+
+  it("honors an outbox-specific job id instead of collapsing equal payloads", async () => {
+    const added: unknown[] = [];
+    const queue = {
+      async add(name: string, payload: unknown, options: unknown) {
+        added.push({ name, payload, options });
+        return { id: "outbox-turn-execute-1" };
+      },
+      async close() {},
+    };
+    const client = new BullMqBerryQueueClient(queue as never);
+    const payload = {
+      tenantId: "00000000-0000-7000-8000-000000000001",
+      runId: "00000000-0000-7000-8000-000000000002",
+      reason: "continue" as const,
+    };
+
+    await client.enqueue("turn.execute", payload, { jobId: "outbox-turn-execute-1" });
+    await client.enqueue("turn.execute", payload, { jobId: "outbox-turn-execute-2" });
+
+    expect(added).toEqual([
+      expect.objectContaining({ options: expect.objectContaining({ jobId: "outbox-turn-execute-1" }) }),
+      expect.objectContaining({ options: expect.objectContaining({ jobId: "outbox-turn-execute-2" }) }),
+    ]);
+  });
 });

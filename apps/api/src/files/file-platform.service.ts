@@ -178,7 +178,8 @@ export class FilePlatformService {
           VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7)
         `, [uploadId, tenantId, fileId, created.UploadId, config.partSize, partCount, expiresAt.toISOString()]);
         if (input.taskId) await associate(executor, { tenantId, fileId, taskId: input.taskId, ...(input.sessionId ? { sessionId: input.sessionId } : {}), role: input.associationRole ?? "input", userId });
-        if (workspaceId && input.workspaceId) {
+        if (workspaceId) {
+          const workspaceVisibility = input.workspaceVisibility ?? (input.workspaceId ? "project" : "task_only");
           await executor.execute(`
             INSERT INTO workspace_files (
               tenant_id, workspace_id, file_id, visibility, originating_task_id,
@@ -189,7 +190,7 @@ export class FilePlatformService {
               originating_task_id = COALESCE(workspace_files.originating_task_id, EXCLUDED.originating_task_id),
               deleted_at = NULL,
               updated_at = now()
-          `, [tenantId, workspaceId, fileId, input.workspaceVisibility ?? "project", input.taskId ?? null, userId]);
+          `, [tenantId, workspaceId, fileId, workspaceVisibility, input.taskId ?? null, userId]);
         }
       });
     } catch (error) {
@@ -257,7 +258,12 @@ export class FilePlatformService {
           )
           SELECT $1::uuid, $2::uuid, wf.workspace_id, 'file', $3, $4, $5, f.display_name,
                  wf.visibility, 'pending', 'pending', 'tika-v1', 'recursive-v1',
-                 jsonb_build_object('fileId', f.id, 'mediaType', f.media_type, 'objectKey', f.object_key)
+                 jsonb_strip_nulls(jsonb_build_object(
+                   'fileId', f.id,
+                   'mediaType', f.media_type,
+                   'objectKey', f.object_key,
+                   'taskId', wf.originating_task_id
+                 ))
           FROM workspace_files wf
           JOIN files f ON f.id = wf.file_id
           WHERE wf.tenant_id = $1::uuid AND wf.file_id = $3::uuid AND wf.deleted_at IS NULL
@@ -374,6 +380,7 @@ export class FilePlatformService {
   async retryWorkspaceFile(tenantId: string, userId: string, workspaceId: string, fileId: string) {
     return this.database.withTenant(tenantId, async (executor) => {
       await requireWorkspaceAccess(executor, tenantId, userId, workspaceId);
+      const retryId = randomUUID();
       const [source] = await executor.query<{ id: string; source_revision: string }>(`
         UPDATE knowledge_sources
         SET extraction_status = 'pending', index_status = 'pending', vector_ready = false,
@@ -395,8 +402,8 @@ export class FilePlatformService {
       `, [
         tenantId,
         source.id,
-        `knowledge.extract:${source.id}:${source.source_revision}:retry`,
-        JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision }),
+        `knowledge.extract:${source.id}:${source.source_revision}:retry:${retryId}`,
+        JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision, retryId }),
       ]);
       return { ok: true };
     });

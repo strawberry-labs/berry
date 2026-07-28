@@ -75,6 +75,9 @@ describe("KnowledgeService", () => {
       expect(sql).toContain("ks.tombstoned_at IS NULL");
       expect(sql).toContain("ks.visibility = 'project'");
       expect(sql).toContain("ks.user_id = $3::uuid");
+      expect(sql).toContain("FROM workspace_files task_file");
+      expect(sql).toContain("task_file.originating_task_id::text = $4");
+      expect(sql).not.toContain("ks.metadata->>'taskId'");
     }
     expect(executor.calls.some((call) => call.kind === "execute" && call.sql.includes("INSERT INTO retrieval_snapshots"))).toBe(true);
   });
