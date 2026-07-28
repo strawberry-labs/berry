@@ -112,7 +112,7 @@ describe("cloud runtime configuration", () => {
     const service = new CloudRuntimeConfigService({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_DEFAULT_MODEL: "berry/auto",
-      BERRY_ROUTER_IMAGE_MODEL: "gpt-image-2",
+      BERRY_ROUTER_IMAGE_MODEL: "openai/gpt-image-2",
       BERRY_ROUTER_IMAGE_COST_MICROS: "0",
     });
     const partials: Array<{ index: number; b64: string }> = [];
@@ -122,7 +122,7 @@ describe("cloud runtime configuration", () => {
       stream: true,
       partialImages: 3,
     }, (partial) => partials.push(partial))).resolves.toMatchObject({
-      model: "gpt-image-2",
+      model: "openai/gpt-image-2",
       data: [{ b64_json: "ZmluYWw=" }],
     });
     expect(partials).toEqual([{ index: 0, b64: "cGFydGlhbA==", mimeType: "image/png" }]);
@@ -145,7 +145,7 @@ describe("cloud runtime configuration", () => {
     const service = new CloudRuntimeConfigService({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_DEFAULT_MODEL: "berry/auto",
-      BERRY_ROUTER_IMAGE_MODEL: "gpt-image-2",
+      BERRY_ROUTER_IMAGE_MODEL: "openai/gpt-image-2",
       BERRY_ROUTER_IMAGE_COST_MICROS: "0",
     });
     await expect(service.generateImage({
@@ -160,5 +160,25 @@ describe("cloud runtime configuration", () => {
       images: [{ image_url: "data:image/png;base64,c291cmNl" }],
     });
     expect(requestBody).not.toHaveProperty("input_fidelity");
+  });
+
+  it("surfaces the upstream image error instead of hiding it behind a generic rejection", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      error: {
+        message: "Unknown parameter: 'response_format'.",
+        type: "invalid_request_error",
+        code: "unknown_parameter",
+      },
+    }, { status: 400 })));
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "berry/auto",
+      BERRY_ROUTER_IMAGE_MODEL: "vendor/image-model",
+      BERRY_ROUTER_IMAGE_COST_MICROS: "0",
+    });
+
+    await expect(service.generateImage({
+      prompt: "A berry floating over Dubai",
+    })).rejects.toThrow("BerryRouter rejected the image generation request: Unknown parameter: 'response_format'.");
   });
 });

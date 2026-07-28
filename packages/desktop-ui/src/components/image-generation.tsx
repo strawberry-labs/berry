@@ -39,7 +39,10 @@ export function ImageGeneration({
   const previewByIndex = new Map(partials.map((partial) => [partial.requestIndex, partial]));
   return (
     <div className={styles.wrap} role="status" aria-live="polite" aria-busy="true">
-      <p className={styles.status}>Generating a more detailed image — hang tight.</p>
+      <div className={styles.heading}>
+        <span className={`${styles.label} berry-shimmer`}>Creating image</span>
+        <span className={styles.status}>Rendering preview…</span>
+      </div>
       <div className={styles.gallery}>
         <div className={styles.canvas} style={{ aspectRatio: `${dimensions.width} / ${dimensions.height}` }}>
           {activePartial ? (
@@ -76,10 +79,7 @@ export function ImageGeneration({
           </aside>
         ) : null}
       </div>
-      <div className={styles.meta}>
-        <span className={`${styles.label} berry-shimmer`}>Creating image</span>
-        <span className={styles.prompt}>“{prompt}”</span>
-      </div>
+      <span className={styles.prompt} title={prompt}>“{prompt}”</span>
     </div>
   );
 }

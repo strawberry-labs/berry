@@ -153,18 +153,21 @@ export class CloudRuntimeConfigService {
     const stream = input.stream === true && Boolean(onPartial);
     const referenceImageUrls = input.referenceImageUrls?.filter(Boolean).slice(0, 16) ?? [];
     const endpoint = referenceImageUrls.length > 0 ? image.editsEndpoint : image.endpoint;
+    const upstreamModel = image.model.split("/").at(-1) ?? image.model;
+    const isGptImageModel = upstreamModel.startsWith("gpt-image-");
+    const isGptImage2Model = upstreamModel.startsWith("gpt-image-2");
     const requestBody = {
       model: image.model,
       prompt: input.prompt,
       ...(referenceImageUrls.length > 0
         ? {
             images: referenceImageUrls.map((imageUrl) => ({ image_url: imageUrl })),
-            ...(!image.model.startsWith("gpt-image-2") ? { input_fidelity: "high" } : {}),
+            ...(!isGptImage2Model ? { input_fidelity: "high" } : {}),
           }
         : {}),
       n: 1,
       size,
-      ...(!image.model.startsWith("gpt-image-") ? { response_format: image.responseFormat } : {}),
+      ...(!isGptImageModel ? { response_format: image.responseFormat } : {}),
       ...(input.transparentBackground ? { background: "transparent", output_format: "png" } : { background: "auto" }),
       ...(stream ? { stream: true, partial_images: input.partialImages ?? 3 } : {}),
     };
@@ -185,9 +188,12 @@ export class CloudRuntimeConfigService {
     }
     if (!response.ok) {
       const payload = await response.text().catch(() => "");
+      const upstreamMessage = imageProviderErrorMessage(payload);
       throw new BadGatewayException({
         code: "image_generation_failed",
-        message: "BerryRouter rejected the image generation request",
+        message: upstreamMessage
+          ? `BerryRouter rejected the image generation request: ${upstreamMessage}`
+          : "BerryRouter rejected the image generation request",
         upstreamStatus: response.status,
         ...(payload ? { upstreamMessage: payload.slice(0, 500) } : {}),
       });
@@ -232,6 +238,20 @@ export class CloudRuntimeConfigService {
       model: image.model,
       costMicros: image.costMicros,
     };
+  }
+}
+
+function imageProviderErrorMessage(payload: string): string | null {
+  if (!payload.trim()) return null;
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const error = (parsed as Record<string, unknown>).error;
+    if (!error || typeof error !== "object" || Array.isArray(error)) return null;
+    const message = (error as Record<string, unknown>).message;
+    return typeof message === "string" && message.trim() ? message.trim() : null;
+  } catch {
+    return null;
   }
 }
 
