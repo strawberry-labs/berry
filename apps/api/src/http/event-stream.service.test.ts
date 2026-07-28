@@ -1,10 +1,34 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Test } from "@nestjs/testing";
 import { ApiEventStreamService } from "./event-stream.service.ts";
-import type { DurableTurnService } from "../runtime/durable-turn.service.ts";
+import { DurableTurnService } from "../runtime/durable-turn.service.ts";
 
 afterEach(() => vi.useRealTimers());
 
 describe("ApiEventStreamService", () => {
+  it("receives durable event storage through Nest dependency injection", async () => {
+    const durable = {
+      eventsAfter: vi.fn(async () => []),
+    };
+    const module = await Test.createTestingModule({
+      providers: [
+        ApiEventStreamService,
+        { provide: DurableTurnService, useValue: durable },
+      ],
+    }).compile();
+    const service = module.get(ApiEventStreamService);
+
+    const stream = await service.streamDurable(
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000002",
+      null,
+    );
+
+    expect(stream).toBeDefined();
+    expect(durable.eventsAfter).toHaveBeenCalledOnce();
+    await module.close();
+  });
+
   it("emits default SSE messages so EventSource.onmessage receives replayed and live events", () => {
     const service = new ApiEventStreamService();
     const received: Array<MessageEvent<unknown> & { id?: string }> = [];

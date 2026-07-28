@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 import { AgentStreamEventSchema, HostPushEventSchema, type AgentStreamEvent, type HostPushEvent, type Task } from "@berry/shared";
 import { Observable, Subject } from "rxjs";
 import { DurableTurnService } from "../runtime/durable-turn.service.js";
@@ -8,7 +8,7 @@ export class ApiEventStreamService {
   readonly #subjects = new Map<string, Subject<MessageEvent<AgentStreamEvent>>>();
   readonly #taskSubjects = new Map<string, Subject<MessageEvent<HostPushEvent>>>();
 
-  constructor(private readonly durableTurns?: DurableTurnService) {}
+  constructor(@Inject(DurableTurnService) private readonly durableTurns?: DurableTurnService) {}
 
   publish(sessionId: string, event: AgentStreamEvent): AgentStreamEvent {
     const parsed = AgentStreamEventSchema.parse(event);

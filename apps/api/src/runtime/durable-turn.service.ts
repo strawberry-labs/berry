@@ -144,15 +144,20 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       await executor.execute(
         `
 UPDATE tasks SET status='running',updated_at=now()
-WHERE tenant_id=$1::uuid AND id=$2::uuid;
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+        `.trim(),
+        [input.tenantId, input.taskId],
+      );
+      await executor.execute(
+        `
 UPDATE sessions
 SET runtime_metadata=runtime_metadata || jsonb_build_object(
-      'activeRunId',$3::text,'lastRunState','queued','leafId',$4::text
+      'activeRunId',$2::text,'lastRunState','queued','leafId',$3::text
     ),
     updated_at=now()
-WHERE tenant_id=$1::uuid AND id=$5::uuid
+WHERE tenant_id=$1::uuid AND id=$4::uuid
         `.trim(),
-        [input.tenantId, input.taskId, runId, requestMessageId, input.sessionId],
+        [input.tenantId, runId, requestMessageId, input.sessionId],
       );
       return { runId, sessionId: input.sessionId };
     });
@@ -725,9 +730,19 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
         await executor.execute(
           `
 UPDATE turn_steps SET state='completed',completed_at=now(),error=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND state='recovery_required';
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND state='recovery_required'
+          `.trim(),
+          [tenantId, runId],
+        );
+        await executor.execute(
+          `
 UPDATE tool_calls SET status='completed',completed_at=now(),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed';
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed'
+          `.trim(),
+          [tenantId, runId],
+        );
+        await executor.execute(
+          `
 UPDATE turn_runs
 SET state='calling_model',error=NULL,next_action='Continue after operator-confirmed tool completion',
     completed_at=NULL,updated_at=now()
@@ -739,9 +754,19 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
         await executor.execute(
           `
 UPDATE turn_steps SET state='pending',error=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND state='recovery_required';
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND state='recovery_required'
+          `.trim(),
+          [tenantId, runId],
+        );
+        await executor.execute(
+          `
 UPDATE tool_calls SET status='pending',completed_at=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed';
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed'
+          `.trim(),
+          [tenantId, runId],
+        );
+        await executor.execute(
+          `
 UPDATE turn_runs
 SET state='executing_tool',error=NULL,next_action='Retry tool after explicit operator confirmation',
     completed_at=NULL,updated_at=now()
