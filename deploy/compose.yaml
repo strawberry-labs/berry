@@ -303,6 +303,8 @@ services:
     restart: unless-stopped
     command: ["node", "apps/worker/dist/main.js"]
     depends_on:
+      api:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
