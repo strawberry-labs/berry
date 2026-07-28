@@ -1,18 +1,18 @@
 .gallery {
   display: flex;
-  width: min(100%, 536px);
+  width: min(100%, 444px);
   align-items: flex-start;
   gap: 8px;
 }
 
 .card {
   position: relative;
-  width: min(100%, 480px);
-  max-height: 640px;
+  width: min(100%, 380px);
+  max-height: 506px;
   overflow: hidden;
-  border-radius: 36px;
+  border-radius: 24px;
   background: var(--berry-surface-raised);
-  box-shadow: var(--berry-ring-subtle);
+  box-shadow: var(--berry-ring-subtle), var(--berry-shadow-sm);
   isolation: isolate;
 }
 
@@ -24,6 +24,7 @@
   display: block;
   width: 100%;
   height: 100%;
+  padding: 0;
   border: 0;
   border-radius: inherit;
   outline: none;
@@ -58,6 +59,8 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
+  outline: 1px solid light-dark(oklch(0 0 0 / 10%), oklch(1 0 0 / 10%));
+  outline-offset: -1px;
 }
 
 .unconstrained {
@@ -230,21 +233,25 @@
 }
 
 .lightbox {
-  inset: 0 !important;
+  top: 12px !important;
+  right: auto !important;
+  bottom: auto !important;
+  left: 50% !important;
   z-index: 120 !important;
   display: flex !important;
-  width: 100vw !important;
-  max-width: none !important;
-  height: 100dvh !important;
-  max-height: none !important;
-  translate: none !important;
+  width: min(calc(100vw - 24px), 1440px) !important;
+  max-width: calc(100vw - 24px) !important;
+  height: calc(100dvh - 24px) !important;
+  max-height: calc(100dvh - 24px) !important;
+  translate: -50% 0 !important;
   transform: none !important;
   flex-direction: column;
   gap: 0 !important;
   overflow: hidden;
   border: 0 !important;
-  border-radius: 0 !important;
+  border-radius: 20px !important;
   background: var(--berry-main-bg) !important;
+  box-shadow: var(--berry-ring-subtle), var(--berry-shadow-lg) !important;
   padding: 0 !important;
 }
 
@@ -362,7 +369,7 @@
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  border-radius: 10px;
+  border-radius: 14px;
   background: var(--berry-surface-raised);
 }
 
@@ -381,17 +388,24 @@
 .lightboxImageFrame {
   position: relative;
   display: flex;
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
 }
 
 .lightboxImageFrame > img {
   display: block;
+  width: 100%;
+  height: 100%;
   max-width: 100%;
   max-height: 100%;
-  border: 1px solid var(--berry-border);
   object-fit: contain;
-  box-shadow: var(--berry-shadow-lg);
+  outline: 1px solid light-dark(oklch(0 0 0 / 10%), oklch(1 0 0 / 10%));
+  outline-offset: -1px;
+  box-shadow: var(--berry-shadow-md);
 }
 
 .helper {
@@ -498,7 +512,16 @@
 
 @media (max-width: 720px) {
   .card {
-    border-radius: 26px;
+    border-radius: 20px;
+  }
+
+  .lightbox {
+    top: 6px !important;
+    width: calc(100vw - 12px) !important;
+    max-width: calc(100vw - 12px) !important;
+    height: calc(100dvh - 12px) !important;
+    max-height: calc(100dvh - 12px) !important;
+    border-radius: 16px !important;
   }
 
   .lightboxHeader {

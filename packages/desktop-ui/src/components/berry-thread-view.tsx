@@ -110,6 +110,8 @@ export interface BerryThreadViewProps {
   taskId?: string;
   stream: StreamState;
   messages: Message[];
+  /** Host-owned content rendered inside the active turn's message column. */
+  liveContent?: React.ReactNode;
   density?: "full" | "compact";
   autoScroll?: boolean;
   showReasoning?: boolean;
@@ -134,6 +136,7 @@ export function BerryThreadView({
   taskId,
   stream,
   messages,
+  liveContent,
   density = "full",
   autoScroll = true,
   showReasoning = false,
@@ -166,14 +169,22 @@ export function BerryThreadView({
     stream.text.length > 0 ||
     stream.timeline.length > 0 ||
     stream.reasoning.length > 0 ||
-    Boolean(stream.error);
+    Boolean(stream.error) ||
+    Boolean(liveContent);
   const liveHasSessionNote = stream.timeline.some((entry) => entry.kind === "note");
   const latestTurnHasSettledAssistant = Boolean(latestTurn?.user && latestTurn.assistants.length > 0);
   // The host stores settled assistant messages with database ids, not the
   // transient stream message id. Use the latest user turn as the handoff
   // boundary so a stopped turn cannot render both persisted and live activity.
   const liveVisible =
-    liveHasContent && (stream.turnActive || Boolean(stream.approval) || Boolean(stream.question) || liveHasSessionNote || !latestTurnHasSettledAssistant);
+    liveHasContent && (
+      stream.turnActive
+      || Boolean(stream.approval)
+      || Boolean(stream.question)
+      || Boolean(liveContent)
+      || liveHasSessionNote
+      || !latestTurnHasSettledAssistant
+    );
   const renderedTurnGroups =
     liveVisible && latestTurn?.user
       ? turnGroups.map((group, index) => (index === turnGroups.length - 1 ? { ...group, assistants: [] } : group))
@@ -353,6 +364,7 @@ export function BerryThreadView({
                   ) : null}
                   {stream.text ? <BerryAssistantMarkdownBlock live>{stream.text}</BerryAssistantMarkdownBlock> : null}
                   {stream.error ? <BerryAssistantErrorBlock>{stream.error}</BerryAssistantErrorBlock> : null}
+                  {liveContent}
                 </div>
               </MessageScrollerItem>
             ) : null}

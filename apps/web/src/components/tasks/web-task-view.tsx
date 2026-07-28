@@ -136,6 +136,20 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
           partials: activeImageTool.imageProgress ?? [],
         }
       : null);
+  const imageGenerationContent = visibleGeneration?.status === "generating" ? (
+    <ImageGeneration
+      prompt={visibleGeneration.prompt}
+      aspectRatio={visibleGeneration.aspectRatio ?? "1:1"}
+      batchCount={visibleGeneration.batchCount ?? 1}
+      partials={visibleGeneration.partials ?? []}
+    />
+  ) : visibleGeneration?.status === "error" ? (
+    <ImageGenerationError
+      prompt={visibleGeneration.prompt}
+      message={visibleGeneration.message ?? "The image provider could not complete the request"}
+      onRetry={() => onRetryImage?.(visibleGeneration.prompt)}
+    />
+  ) : null;
 
   return (
     <div ref={threadRef} className="berry-web-thread contents" data-testid="web-thread" data-mode={mode}>
@@ -149,22 +163,8 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         showPendingTurnActivity
         showReasoning={showReasoning}
         adapter={adapter}
+        liveContent={imageGenerationContent}
       />
-      {visibleGeneration?.status === "generating" ? (
-        <ImageGeneration
-          prompt={visibleGeneration.prompt}
-          aspectRatio={visibleGeneration.aspectRatio ?? "1:1"}
-          batchCount={visibleGeneration.batchCount ?? 1}
-          partials={visibleGeneration.partials ?? []}
-        />
-      ) : null}
-      {visibleGeneration?.status === "error" ? (
-        <ImageGenerationError
-          prompt={visibleGeneration.prompt}
-          message={visibleGeneration.message ?? "The image provider could not complete the request"}
-          onRetry={() => onRetryImage?.(visibleGeneration.prompt)}
-        />
-      ) : null}
       {selectedAttachment ? (
         <React.Suspense fallback={null}>
           <DocumentPreviewModal file={selectedAttachment} onOpenChange={(open) => { if (!open) setSelectedAttachment(null); }} />

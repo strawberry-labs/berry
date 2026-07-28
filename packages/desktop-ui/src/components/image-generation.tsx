@@ -1,6 +1,6 @@
 import * as React from "react";
 import { IMAGE_ASPECT_RATIO_DIMENSIONS, type ImageAspectRatio } from "@berry/shared";
-import { RefreshCw } from "@berry/desktop-ui/lib/icons";
+import { InfoIcon, RefreshCw } from "@berry/desktop-ui/lib/icons";
 import { ProgressiveImage } from "@berry/desktop-ui/components/generated-image-gallery";
 
 import styles from "./image-generation.module.css";
@@ -41,7 +41,15 @@ export function ImageGeneration({
     <div className={styles.wrap} role="status" aria-live="polite" aria-busy="true">
       <div className={styles.heading}>
         <span className={`${styles.label} berry-shimmer`}>Creating image</span>
-        <span className={styles.status}>Rendering preview…</span>
+        <div className={styles.headingMeta}>
+          <span className={styles.status}>Rendering preview…</span>
+          <details className={styles.promptDetails}>
+            <summary aria-label="View image prompt">
+              <InfoIcon aria-hidden />
+            </summary>
+            <span className={styles.promptPopover} role="tooltip">{prompt}</span>
+          </details>
+        </div>
       </div>
       <div className={styles.gallery}>
         <div className={styles.canvas} style={{ aspectRatio: `${dimensions.width} / ${dimensions.height}` }}>
@@ -79,7 +87,6 @@ export function ImageGeneration({
           </aside>
         ) : null}
       </div>
-      <span className={styles.prompt} title={prompt}>“{prompt}”</span>
     </div>
   );
 }
