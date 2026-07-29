@@ -12,6 +12,7 @@ import { RuntimeOutboxDispatcher } from "./outbox.ts";
 import { createMemoryOperationGenerator } from "./memory/generator.ts";
 import { MemoryProcessor } from "./memory/processor.ts";
 import { SqlWorkerMemoryRepository } from "./memory/repository.ts";
+import { DurablePersonalMemoryToolExecutor } from "./memory/tools.ts";
 import {
   createCheckpointGenerator,
   DurableSessionCompactor,
@@ -74,16 +75,28 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       fallbackModel: env.BERRY_COMPACTION_MODEL ?? "checkpoint-v2",
     },
   );
-  const durableTools = createDurableTurnToolsFromEnv(env, sandboxContinuity);
+  const personalMemory = createPersonalMemoryProviderFromEnv(env);
+  const memoryRepository = new SqlWorkerMemoryRepository(executor);
+  const memoryTools = new DurablePersonalMemoryToolExecutor(
+    sandboxContinuity,
+    memoryRepository,
+    personalMemory,
+    durableConfig.memoryEnabled,
+  );
+  const durableTools = createDurableTurnToolsFromEnv(env, memoryTools);
   const worker = createBerryWorker({
     titles: new SqlTaskTitleRepository(executor),
     usage: new SqlUsageRollupRepository(executor),
     management: new SqlManagementJobRepository(executor),
     knowledge,
     memory: new MemoryProcessor(
-      new SqlWorkerMemoryRepository(executor),
+      memoryRepository,
       createMemoryOperationGenerator(env),
-      createPersonalMemoryProviderFromEnv(env),
+      personalMemory,
+      {
+        memoryEnabled: durableConfig.memoryEnabled,
+        implicitMemoryEnabled: durableConfig.implicitMemoryEnabled,
+      },
     ),
     compactor,
     turnRunner: new DurableTurnRunner(

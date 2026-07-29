@@ -11,6 +11,26 @@ import type { ExtractedMemoryOperation } from "./generator.js";
 export class SqlWorkerMemoryRepository {
   constructor(private readonly executor: SqlExecutor) {}
 
+  async settings(
+    tenantId: string,
+    userId: string,
+  ): Promise<{ memoryEnabled: boolean; implicitMemoryEnabled: boolean }> {
+    return this.withTenant(tenantId, async (executor) => {
+      const [row] = await executor.query<{
+        memory_enabled: boolean;
+        implicit_memory_enabled: boolean;
+      }>(`
+        SELECT memory_enabled, implicit_memory_enabled
+        FROM memory_settings
+        WHERE tenant_id = $1::uuid AND user_id = $2::uuid
+      `, [tenantId, userId]);
+      return {
+        memoryEnabled: row?.memory_enabled ?? true,
+        implicitMemoryEnabled: row?.implicit_memory_enabled ?? true,
+      };
+    });
+  }
+
   async apply(
     payload: MemoryExtractJobPayload,
     operations: readonly ExtractedMemoryOperation[],

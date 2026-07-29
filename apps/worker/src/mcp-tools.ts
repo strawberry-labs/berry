@@ -43,9 +43,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   }
 
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
-    await this.#ready;
+    const [inherited] = await Promise.all([
+      this.base.definitions?.(snapshot) ?? Promise.resolve([]),
+      this.#ready,
+    ]);
     const allowed = this.#allowedServers(snapshot);
-    return this.#source.listTools()
+    const mcpTools = this.#source.listTools()
       .filter((tool) => this.#serverForTool(tool.name, allowed) !== undefined)
       .map((tool): ChatToolDefinition => ({
         type: "function",
@@ -55,6 +58,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           parameters: jsonValue(tool.parameters),
         },
       }));
+    return [...inherited, ...mcpTools];
   }
 
   policy(

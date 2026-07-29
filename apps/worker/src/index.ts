@@ -13,6 +13,7 @@ export * from "./outbox.js";
 export * from "./memory/generator.js";
 export * from "./memory/processor.js";
 export * from "./memory/repository.js";
+export * from "./memory/tools.js";
 export * from "./turn-runner.js";
 export * from "./sandbox-continuity.js";
 export * from "./maintenance.js";

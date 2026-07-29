@@ -28,6 +28,9 @@ describe("MemoryProcessor with self-hosted Mem0", () => {
       },
     } as unknown as PersonalMemoryProvider;
     const repository = {
+      async settings() {
+        return { memoryEnabled: true, implicitMemoryEnabled: true };
+      },
       async apply(
         _payload: MemoryExtractJobPayload,
         operations: readonly (MemoryOperation & { scope: "personal" | "project" })[],
@@ -47,6 +50,34 @@ describe("MemoryProcessor with self-hosted Mem0", () => {
     ]);
     expect(captured.mem0Input?.idempotencyKey).toContain("memory-extractor-v1");
     expect(result).toEqual({ applied: 1, noops: 1 });
+  });
+
+  it("does not extract memories when implicit memory is disabled for the user", async () => {
+    let generated = false;
+    let ingested = false;
+    const generator: MemoryOperationGenerator = {
+      async generate() {
+        generated = true;
+        return [];
+      },
+    };
+    const personalMemory = personalMemoryProvider({
+      async ingestConversation() {
+        ingested = true;
+        return { items: [], replayed: false };
+      },
+    });
+    const repository = {
+      async settings() {
+        return { memoryEnabled: true, implicitMemoryEnabled: false };
+      },
+    } as unknown as SqlWorkerMemoryRepository;
+
+    const result = await new MemoryProcessor(repository, generator, personalMemory).process(payload());
+
+    expect(result).toEqual({ applied: 0, noops: 1 });
+    expect(generated).toBe(false);
+    expect(ingested).toBe(false);
   });
 });
 
@@ -80,5 +111,23 @@ function payload(): MemoryExtractJobPayload {
     extractorVersion: "memory-extractor-v1",
     userText: "api_key=must-not-survive\nPlease remember that I prefer concise answers.",
     assistantText: "Understood.",
+  };
+}
+
+function personalMemoryProvider(
+  overrides: Partial<PersonalMemoryProvider>,
+): PersonalMemoryProvider {
+  return {
+    remember: async () => ({ operation: "NOOP", reason: "fixture", item: null }),
+    ingestConversation: async () => ({ items: [], replayed: false }),
+    list: async () => ({ items: [], nextCursor: null }),
+    get: async () => null,
+    search: async () => [],
+    update: async () => ({ operation: "NOOP", reason: "fixture", item: null }),
+    forget: async () => null,
+    clear: async () => ({ forgotten: 0 }),
+    export: async () => ({ items: [], versions: [] }),
+    health: async () => true,
+    ...overrides,
   };
 }

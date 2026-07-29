@@ -9,9 +9,20 @@ export class MemoryProcessor {
     private readonly repository: SqlWorkerMemoryRepository,
     private readonly generator: MemoryOperationGenerator | null,
     private readonly personalMemory: PersonalMemoryProvider | null = null,
+    private readonly options: {
+      memoryEnabled?: boolean;
+      implicitMemoryEnabled?: boolean;
+    } = {},
   ) {}
 
   async process(payload: MemoryExtractJobPayload): Promise<{ applied: number; noops: number; degraded?: boolean }> {
+    if (this.options.memoryEnabled === false || this.options.implicitMemoryEnabled === false) {
+      return { applied: 0, noops: 1 };
+    }
+    const settings = await this.repository.settings(payload.tenantId, payload.userId);
+    if (!settings.memoryEnabled || !settings.implicitMemoryEnabled) {
+      return { applied: 0, noops: 1 };
+    }
     if (!this.generator && !this.personalMemory) return { applied: 0, noops: 0, degraded: true };
     const [operations, personal] = await Promise.all([
       this.generator
