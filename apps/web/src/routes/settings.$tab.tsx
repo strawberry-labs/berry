@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { ArchivedChatsSearchSchema } from "@berry/shared";
-import { ManagementExperience } from "@/components/management/management-experience";
+import { PersonalSettingsScreen } from "@/components/management/personal-settings-screen";
 import { useManagementRouteContext } from "@/components/management/management-route-context";
 
 export const Route = createFileRoute("/settings/$tab")({
@@ -11,5 +11,5 @@ export const Route = createFileRoute("/settings/$tab")({
 function PersonalSettingsRoute() {
   const { tab } = Route.useParams();
   const context = useManagementRouteContext();
-  return <ManagementExperience kind="settings" tab={tab} {...context} />;
+  return <PersonalSettingsScreen tab={tab} {...context} />;
 }

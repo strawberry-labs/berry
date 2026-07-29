@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { AdminAnalyticsSearchSchema } from "@berry/shared";
-import { ManagementExperience } from "@/components/management/management-experience";
+import { AdminScreen } from "@/components/management/admin-screens";
 import { useManagementRouteContext } from "@/components/management/management-route-context";
 
 export const Route = createFileRoute("/admin/$tab")({
@@ -11,5 +11,5 @@ export const Route = createFileRoute("/admin/$tab")({
 function OrganizationAdminRoute() {
   const { tab } = Route.useParams();
   const context = useManagementRouteContext();
-  return <ManagementExperience kind="admin" tab={tab} {...context} />;
+  return <AdminScreen tab={tab} {...context} />;
 }

@@ -1,4 +1,4 @@
-export const USER_SETTINGS_TABS = ["general", "providers", "skills", "mcp", "prompts", "privacy", "usage", "archived"] as const;
+export const USER_SETTINGS_TABS = ["general", "providers", "skills", "mcp", "prompts", "memory", "privacy", "usage", "archived"] as const;
 export type UserSettingsTab = (typeof USER_SETTINGS_TABS)[number];
 export const ARTIFACT_LIBRARY_TABS = ["all", "images", "documents"] as const;
 export type ArtifactLibraryTab = (typeof ARTIFACT_LIBRARY_TABS)[number];

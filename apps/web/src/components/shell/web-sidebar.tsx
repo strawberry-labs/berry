@@ -1,6 +1,6 @@
 import * as React from "react";
 import { LogOut } from "lucide-react";
-import type { Task, Workspace } from "@berry/shared";
+import type { OrgPermission, Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -30,6 +30,8 @@ import {
 } from "@berry/desktop-ui/components/ui/sidebar";
 import { Archive, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
 import type { SignedInUser } from "./auth-boundary";
+import type { ManagementKind } from "../management/management-navigation";
+import { WebSettingsNavigation } from "./web-settings-navigation";
 
 export type SettingsTab = "general" | "prompts" | "providers" | "mcp" | "skills" | "privacy" | "usage" | "archived" | "governance" | "platform";
 
@@ -79,7 +81,7 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, loadError, user, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onSettings, onSignOut }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, management, loadError, user, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onSettings, onSignOut }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -87,6 +89,14 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   activeTaskId: string | null;
   chatsSelected: boolean;
   librarySelected: boolean;
+  management: {
+    kind: ManagementKind;
+    tab: string;
+    permissions: OrgPermission[];
+    platformAuthorized: boolean;
+    onNavigate: (kind: ManagementKind, tab: string) => void;
+    onBack: () => void;
+  } | null;
   loadError: string;
   user: SignedInUser | null;
   onNewTask: () => void;
@@ -113,7 +123,9 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   const allTasks = [...Object.values(tasksByWorkspace).flat(), ...generalTasks];
   return (
     <Sidebar variant="inset" className="berry-app-sidebar">
-      <BerryConversationSidebarContent
+      {management ? (
+        <WebSettingsNavigation {...management} />
+      ) : <BerryConversationSidebarContent
         selectedKind="chat"
         showKindControl={false}
         pinnedConversations={allTasks.filter((task) => task.pinned)}
@@ -146,11 +158,11 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
             </SidebarMenu>
           </>
         )}
-      />
+      />}
       <SidebarFooter className="berry-sidebar-footer">
         <div className="flex items-center gap-2">
           <div className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2"><span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><BerryLogo className="size-full" alt="" /></span><span className="min-w-0 truncate text-sm font-semibold">{user?.name || user?.email || "Berry Cloud"}</span></div>
-          <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button>
+          <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" aria-current={management ? "page" : undefined} data-active={management ? "true" : undefined} className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button>
           {user ? <Button variant="ghost" size="icon-sm" onClick={onSignOut} aria-label="Sign out" className="berry-sidebar-mini-control"><LogOut size={15} /></Button> : null}
         </div>
       </SidebarFooter>

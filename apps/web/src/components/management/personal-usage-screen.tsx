@@ -8,12 +8,12 @@ import {
   DataTable,
   ManagementPage,
   MetricGrid,
-  MiniSeries,
   Section,
   StatusPill,
   formatMoney,
   formatNumber,
 } from "./management-primitives";
+import { MiniSeries } from "./management-charts";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
 export type PromptCacheSummary = {

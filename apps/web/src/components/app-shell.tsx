@@ -48,8 +48,8 @@ import { Composer } from "./tasks/web-composer";
 import { Thread } from "./tasks/web-task-view";
 import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
-import { replaceTenantValue, settledValue } from "@/lib/management/config-refresh";
 import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
+import { ManagementRouteProvider } from "./management/management-route-context";
 
 function generatedImageTitle(prompt: string): string {
   const title = prompt
@@ -73,12 +73,6 @@ import {
   type QueuedFollowUp,
 } from "@/lib/queued-follow-ups";
 
-const ManagementSidebar = React.lazy(async () => ({
-  default: (await import("./management/management-sidebar")).ManagementSidebar,
-}));
-const ManagementRouteProvider = React.lazy(async () => ({
-  default: (await import("./management/management-route-context")).ManagementRouteProvider,
-}));
 const ArtifactLibrary = React.lazy(async () => ({
   default: (await import("./library/artifact-library")).ArtifactLibrary,
 }));
@@ -537,57 +531,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     return () => { cancelled = true; };
   }, [client, shellLocation, taskRouteError, tasks, tasksLoaded]);
 
-  const refreshAdmin = React.useCallback(async () => {
-    if (!client || !activeOrganizationId) return;
-    if (shellLocation.kind !== "admin") return;
-    if (!shouldRefreshAdministration(effectiveOrgPermissions)) {
-      setResourceError("settings", "");
-      return;
-    }
-    const [budgets, usage, billing, policies, defaults, roles, departments, flags, acls, sso, policyVersions, auditSettings, auditEvents, auditExports] = await Promise.allSettled([
-      client.listBudgetLimits(activeOrganizationId),
-      client.usageDashboard(activeOrganizationId),
-      client.billingSummary(activeOrganizationId),
-      client.listOrgModels(activeOrganizationId, { includeBlocked: true }),
-      client.listOrgModelDefaults(activeOrganizationId),
-      client.listRolePermissions(activeOrganizationId),
-      client.listDepartments(activeOrganizationId),
-      client.listFeatureFlags(activeOrganizationId),
-      client.listResourceAcls(activeOrganizationId),
-      client.listSsoConnections(activeOrganizationId),
-      client.listPolicyVersions(activeOrganizationId),
-      client.auditSettings(activeOrganizationId),
-      client.listAuditEvents(activeOrganizationId, { limit: 100 }),
-      client.listAuditExportConfigs(activeOrganizationId),
-    ]);
-    const sectionResults = [
-      ["budgets", budgets], ["usage", usage], ["billing", billing], ["model policies", policies], ["model defaults", defaults], ["roles", roles], ["departments", departments], ["feature flags", flags], ["resource access", acls], ["SSO", sso], ["policy versions", policyVersions], ["audit settings", auditSettings], ["audit events", auditEvents], ["audit exports", auditExports],
-    ] as const;
-    const staleSections = sectionResults.filter(([, result]) => result.status === "rejected").map(([name]) => name);
-    setResourceError("settings", staleSections.length > 0 ? `Some administration data is stale: ${staleSections.join(", ")}. Retry to refresh.` : "");
-    setConfig((current) => WebConfigSchema.parse({
-      ...current,
-      budgetLimits: settledValue(budgets, current.budgetLimits),
-      usageDashboards: replaceTenantValue(current.usageDashboards, activeOrganizationId, settledValue(usage, null)),
-      billingSummaries: replaceTenantValue(current.billingSummaries, activeOrganizationId, settledValue(billing, null)),
-      modelPolicies: settledValue(policies, current.modelPolicies),
-      modelDefaults: settledValue(defaults, current.modelDefaults),
-      rolePermissions: settledValue(roles, current.rolePermissions),
-      departments: settledValue(departments, current.departments).filter((department: { status?: string }) => department.status !== "disabled"),
-      featureFlags: settledValue(flags, current.featureFlags),
-      resourceAcls: settledValue(acls, current.resourceAcls),
-      ssoConnections: settledValue(sso, current.ssoConnections),
-      policyVersions: settledValue(policyVersions, current.policyVersions),
-      auditSettings: replaceTenantValue(current.auditSettings, activeOrganizationId, settledValue(auditSettings, null)),
-      auditEvents: settledValue(auditEvents, current.auditEvents),
-      auditExports: settledValue(auditExports, current.auditExports),
-    }));
-  }, [activeOrganizationId, client, effectiveOrgPermissions, setResourceError, shellLocation.kind]);
-
-  React.useEffect(() => {
-    void refreshAdmin().catch((cause) => setResourceError("settings", cause instanceof Error ? cause.message : "Unable to load administration data"));
-  }, [refreshAdmin]);
-
   const createTask = React.useCallback(async (options?: { title?: string }) => {
     const title = options?.title?.trim().slice(0, 80) || "New cloud task";
     if (client) {
@@ -801,7 +744,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               handleQueueTurnEndRef.current(sessionId, event.status);
             })
             .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"));
-          void refreshAdmin();
         },
         onError: () => {
           if (terminal || !trackedSessionsRef.current.has(sessionId)) return;
@@ -834,7 +776,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     };
 
     return connect(0);
-  }, [applyDurableState, client, refreshAdmin, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream]);
+  }, [applyDurableState, client, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream]);
 
   React.useEffect(() => () => {
     for (const sessionId of [...trackedSessionsRef.current]) stopSessionConnection(sessionId);
@@ -1742,11 +1684,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             }}
           />
         }
-        sidebar={surface === "settings" ? (
-          <React.Suspense fallback={null}>
-            <ManagementSidebar kind={managementKind} tab={managementTab} permissions={effectiveOrgPermissions} platformAuthorized={config.platformAuthorized} onNavigate={navigateManagement} onBack={navigateBackToWorkspace} />
-          </React.Suspense>
-        ) : (
+        sidebar={(
           <WebSidebar
             workspaces={projectWorkspaces}
             tasksByWorkspace={tasksByWorkspace}
@@ -1784,6 +1722,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             }}
             chatsSelected={!activeTask && Boolean(generalWorkspace && activeWorkspaceId === generalWorkspace.id)}
             librarySelected={surface === "library"}
+            management={surface === "settings" ? {
+              kind: managementKind,
+              tab: managementTab,
+              permissions: effectiveOrgPermissions,
+              platformAuthorized: config.platformAuthorized,
+              onNavigate: navigateManagement,
+              onBack: navigateBackToWorkspace,
+            } : null}
             onSkills={() => navigateToSettings("skills")}
             onLibrary={() => navigateToLibrary("all")}
             onSettings={() => navigateToSettings("general")}

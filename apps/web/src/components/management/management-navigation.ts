@@ -73,3 +73,12 @@ export const PLATFORM_NAV: NavGroup[] = [
 export const PERSONAL_TABS = PERSONAL_NAV.flatMap((g) => g.items.map((i) => i.id));
 export const ADMIN_TABS = ADMIN_NAV.flatMap((g) => g.items.map((i) => i.id));
 export const PLATFORM_TABS = PLATFORM_NAV.flatMap((g) => g.items.map((i) => i.id));
+
+export function visibleNavigationGroups(groups: NavGroup[], permissions: readonly OrgPermission[]): NavGroup[] {
+  return groups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !item.permission || permissions.includes(item.permission)),
+    }))
+    .filter((group) => group.items.length > 0);
+}

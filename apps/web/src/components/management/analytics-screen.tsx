@@ -1,7 +1,8 @@
 import * as React from "react";
 import { Download, X } from "lucide-react";
 import type { UsageAnalyticsQuery, UsageRequestDetail } from "@berry/shared";
-import { AsyncState, Button, DataTable, DetailDrawer, DualTrend, Input, ManagementPage, MetricGrid, Section, StatusPill, Toolbar, formatMoney, formatNumber } from "./management-primitives";
+import { AsyncState, Button, DataTable, DetailDrawer, Input, ManagementPage, MetricGrid, Section, StatusPill, Toolbar, formatMoney, formatNumber } from "./management-primitives";
+import { DualTrend } from "./management-charts";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
 const VIEWS = ["overview", "people", "models", "agents", "requests", "reports"] as const;
