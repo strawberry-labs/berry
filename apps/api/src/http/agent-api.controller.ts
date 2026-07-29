@@ -544,16 +544,21 @@ export class AgentApiController {
     const request = parseBody(ContextStatsRequestSchema, body);
     const { session } = await this.ownedSession(httpRequest, sessionId);
     const model = request.model ?? session.model ?? undefined;
-    const runtime = this.runtimeConfig.resolve({ model });
-    const selectedModel = model ?? runtime.provider.defaultModel;
-    const modelMetadata = runtime.provider.models?.find((candidate) => candidate.id === selectedModel);
+    const catalog = this.runtimeConfig.catalog();
+    const selectedModel = model ?? catalog?.defaultModel;
+    const modelMetadata = catalog?.models.find((candidate) => candidate.id === selectedModel);
     const contextWindow = resolveModelCapabilities(modelMetadata).context?.windowTokens
       ?? modelMetadata?.contextWindow
       ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
-    const runtimeStats = await this.sessionHost.contextStats(sessionId, {
-      ...(request.pendingInput !== undefined ? { pendingInput: request.pendingInput } : {}),
-      ...(request.attachments ? { attachments: contextStatsAttachments(request.attachments) } : {}),
-    });
+    const runtimeStats = this.durableTurns.enabled
+      ? await this.durableTurns.contextStats(tenantIdFromRequest(httpRequest), sessionId, {
+          ...(request.pendingInput !== undefined ? { pendingInput: request.pendingInput } : {}),
+          ...(request.attachments ? { attachments: request.attachments } : {}),
+        })
+      : await this.sessionHost.contextStats(sessionId, {
+          ...(request.pendingInput !== undefined ? { pendingInput: request.pendingInput } : {}),
+          ...(request.attachments ? { attachments: contextStatsAttachments(request.attachments) } : {}),
+        });
     const percentUsed = contextWindow
       ? Math.min(100, Math.max(0, (runtimeStats.usedTokens / contextWindow) * 100))
       : null;

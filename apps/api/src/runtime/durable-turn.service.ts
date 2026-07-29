@@ -4,6 +4,7 @@ import {
   AgentStreamEventSchema,
   latestAssistantStreamDraft,
   messageAttachmentContent,
+  PromptManifestSchema,
   TurnStateSchema,
   type AttachmentInput,
   type AgentStreamEvent,
@@ -36,6 +37,11 @@ export interface DurableEventEnvelope {
   sequence: number;
   event: AgentStreamEvent;
   createdAt: string;
+}
+
+export interface DurableContextStats {
+  usedTokens: number;
+  source: "estimated" | "provider-reported";
 }
 
 @Injectable()
@@ -254,6 +260,164 @@ LIMIT 256
         nextAction: run.next_action,
         error: run.error,
       });
+    });
+  }
+
+  /**
+   * Estimate the context used by the durable worker from its authoritative
+   * Postgres journal. Provider usage wins when it was recorded after the
+   * latest rolling checkpoint; newer journal entries and an in-flight draft
+   * are then added conservatively.
+   */
+  async contextStats(
+    tenantId: string,
+    sessionId: string,
+    options: { pendingInput?: string; attachments?: AttachmentInput[] } = {},
+  ): Promise<DurableContextStats> {
+    if (!this.enabled) return { usedTokens: 0, source: "estimated" };
+    return this.database.withTenant(tenantId, async (executor) => {
+      const [entries, checkpoints, runs] = await Promise.all([
+        executor.query<DurableContextEntryRow>(
+          `
+WITH latest_checkpoint AS (
+  SELECT covered_entry_end
+  FROM session_checkpoints
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
+    AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+  ORDER BY created_at DESC,id DESC
+  LIMIT 1
+),
+covered AS (
+  SELECT sequence
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+    AND entry_id=(SELECT covered_entry_end FROM latest_checkpoint)
+),
+active_entries AS (
+  SELECT entry_id,sequence,payload,run_id
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+    AND entry_type='message'
+    AND sequence>COALESCE((SELECT sequence FROM covered),0)
+),
+current_run AS (
+  SELECT id
+  FROM turn_runs
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+  ORDER BY created_at DESC
+  LIMIT 1
+),
+latest_usage AS (
+  SELECT MAX(sequence) AS sequence
+  FROM active_entries
+  WHERE jsonb_typeof(payload->'message'->'usage')='object'
+    AND COALESCE(payload->'message'->>'stopReason','') NOT IN ('aborted','error')
+    AND run_id=(SELECT id FROM current_run)
+)
+SELECT entry_id,sequence,payload,run_id
+FROM active_entries
+WHERE sequence>=COALESCE(
+  (SELECT sequence FROM latest_usage),
+  (SELECT MIN(sequence) FROM active_entries)
+)
+ORDER BY sequence ASC
+          `.trim(),
+          [tenantId, sessionId],
+        ),
+        executor.query<DurableContextCheckpointRow>(
+          `
+SELECT checkpoint,covered_entry_end
+FROM session_checkpoints
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
+  AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+ORDER BY created_at DESC,id DESC
+LIMIT 1
+          `.trim(),
+          [tenantId, sessionId],
+        ),
+        executor.query<DurableContextRunRow>(
+          `
+SELECT r.id,r.state,
+       COALESCE(
+         NULLIF(r.prompt_manifest,'{}'::jsonb),
+         (
+           SELECT previous.prompt_manifest
+           FROM turn_runs previous
+           WHERE previous.tenant_id=r.tenant_id
+             AND previous.session_id=r.session_id
+             AND previous.id<>r.id
+             AND previous.prompt_manifest<>'{}'::jsonb
+           ORDER BY previous.created_at DESC
+           LIMIT 1
+         ),
+         '{}'::jsonb
+       ) AS prompt_manifest,
+       r.grounding_context,
+       COALESCE((
+         WITH boundary AS (
+           SELECT
+             MAX(sequence) FILTER (WHERE event_type='message.start') AS message_start,
+             MAX(sequence) FILTER (WHERE event_type='message.end') AS message_end
+           FROM turn_events
+           WHERE tenant_id=r.tenant_id AND run_id=r.id
+         )
+         SELECT SUM(length(e.payload->>'delta'))
+         FROM turn_events e
+         CROSS JOIN boundary b
+         WHERE e.tenant_id=r.tenant_id AND e.run_id=r.id
+           AND b.message_start>COALESCE(b.message_end,0)
+           AND e.sequence>b.message_start
+           AND e.event_type='message.delta'
+           AND e.payload->>'channel' IN ('text','reasoning')
+       ),0) AS partial_chars
+FROM turn_runs r
+WHERE r.tenant_id=$1::uuid AND r.session_id=$2::uuid
+ORDER BY r.created_at DESC
+LIMIT 1
+          `.trim(),
+          [tenantId, sessionId],
+        ),
+      ]);
+
+      const checkpoint = checkpoints[0];
+      const coveredIndex = checkpoint?.covered_entry_end
+        ? entries.findIndex((entry) => entry.entry_id === checkpoint.covered_entry_end)
+        : -1;
+      const activeEntries = coveredIndex >= 0 ? entries.slice(coveredIndex + 1) : entries;
+      const usageIndex = findLatestProviderUsageIndex(activeEntries);
+      const providerTokens = usageIndex >= 0
+        ? providerContextTokens(activeEntries[usageIndex]?.payload)
+        : null;
+      const trailingEntries = usageIndex >= 0 ? activeEntries.slice(usageIndex + 1) : activeEntries;
+      const run = runs[0];
+      const partialTokens = run && !isTerminalRunState(run.state)
+        ? estimateCharacterTokens(Number(run.partial_chars))
+        : 0;
+      const pendingTokens = estimatePendingContextTokens(options.pendingInput, options.attachments);
+
+      if (providerTokens !== null) {
+        return {
+          usedTokens: Math.max(0, providerTokens + estimateDurableEntriesTokens(trailingEntries) + partialTokens + pendingTokens),
+          source: "provider-reported",
+        };
+      }
+
+      const manifest = PromptManifestSchema.safeParse(run?.prompt_manifest);
+      const stablePrefixTokens = manifest.success ? manifest.data.stablePrefixTokens : 0;
+      const checkpointTokens = checkpoint ? estimateJsonTokens(checkpoint.checkpoint) : 0;
+      const groundingTokens = run ? estimateJsonTokens(run.grounding_context) : 0;
+      return {
+        usedTokens: Math.max(
+          0,
+          stablePrefixTokens
+            + checkpointTokens
+            + groundingTokens
+            + estimateDurableEntriesTokens(activeEntries)
+            + partialTokens
+            + pendingTokens,
+        ),
+        source: "estimated",
+      };
     });
   }
 
@@ -1539,6 +1703,111 @@ INSERT INTO session_entries (
   );
 }
 
+function findLatestProviderUsageIndex(entries: readonly DurableContextEntryRow[]): number {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (providerContextTokens(entries[index]?.payload) !== null) return index;
+  }
+  return -1;
+}
+
+function providerContextTokens(payload: unknown): number | null {
+  const message = recordValue(recordValue(payload)?.message);
+  const stopReason = stringValue(message?.stopReason);
+  if (!message || stopReason === "aborted" || stopReason === "error") return null;
+  const usage = recordValue(message.usage);
+  if (!usage) return null;
+  const total = nonnegativeNumber(usage.totalTokens);
+  if (total !== null && total > 0) return Math.round(total);
+  const input = nonnegativeNumber(usage.input) ?? 0;
+  const output = nonnegativeNumber(usage.output) ?? 0;
+  return input + output > 0 ? Math.round(input + output) : null;
+}
+
+function estimateDurableEntriesTokens(entries: readonly DurableContextEntryRow[]): number {
+  return entries.reduce((total, entry) => total + estimateDurableEntryTokens(entry.payload), 0);
+}
+
+function estimateDurableEntryTokens(payload: unknown): number {
+  const message = recordValue(recordValue(payload)?.message);
+  const role = stringValue(message?.role);
+  if (!message || !role) return 0;
+  if (role !== "user" && role !== "assistant" && role !== "toolResult") return 0;
+  const content = message.content;
+  if (typeof content === "string") return estimateCharacterTokens(content.length);
+  if (!Array.isArray(content)) return 0;
+  let characters = 0;
+  let imageTokens = 0;
+  for (const rawPart of content) {
+    const part = recordValue(rawPart);
+    if (!part) continue;
+    const text = typeof part.text === "string"
+      ? part.text
+      : typeof part.thinking === "string"
+        ? part.thinking
+        : "";
+    characters += text.length;
+    if (part.type === "toolCall") {
+      characters += (stringValue(part.name)?.length ?? 0) + jsonLength(part.arguments);
+    } else if (part.type === "image") {
+      imageTokens += 1_200;
+    }
+  }
+  return estimateCharacterTokens(characters) + imageTokens;
+}
+
+function estimatePendingContextTokens(
+  input: string | undefined,
+  attachments: readonly AttachmentInput[] = [],
+): number {
+  let tokens = estimateCharacterTokens(input?.length ?? 0);
+  for (const attachment of attachments) {
+    tokens += estimateCharacterTokens(
+      attachment.name.length
+        + attachment.mediaType.length
+        + (attachment.textContent?.length ?? 0),
+    );
+    if (attachment.mediaType.startsWith("image/")) tokens += 1_200;
+  }
+  return tokens;
+}
+
+function estimateJsonTokens(value: unknown): number {
+  if (value === null || value === undefined) return 0;
+  if (Array.isArray(value) && value.length === 0) return 0;
+  if (typeof value === "object" && !Array.isArray(value) && Object.keys(value as object).length === 0) return 0;
+  return estimateCharacterTokens(jsonLength(value));
+}
+
+function estimateCharacterTokens(characters: number): number {
+  return Number.isFinite(characters) && characters > 0 ? Math.ceil(characters / 4) : 0;
+}
+
+function jsonLength(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return String(value).length;
+  }
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function nonnegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function isTerminalRunState(state: string): boolean {
+  return state === "completed" || state === "failed" || state === "cancelled" || state === "recovery_required";
+}
+
 function activeLeafId(row: { entry_id: string; entry_type: string; payload: unknown } | undefined): string | null {
   if (!row) return null;
   if (row.entry_type !== "leaf") return row.entry_id;
@@ -1605,4 +1874,24 @@ interface ApprovalRow {
   request: unknown;
   created_at: Date | string;
   decided_at: Date | string | null;
+}
+
+interface DurableContextEntryRow {
+  entry_id: string;
+  sequence: number | string;
+  payload: unknown;
+  run_id: string | null;
+}
+
+interface DurableContextCheckpointRow {
+  checkpoint: unknown;
+  covered_entry_end: string | null;
+}
+
+interface DurableContextRunRow {
+  id: string;
+  state: string;
+  prompt_manifest: unknown;
+  grounding_context: unknown;
+  partial_chars: number | string;
 }

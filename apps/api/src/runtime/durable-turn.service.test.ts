@@ -12,6 +12,119 @@ const stepId = "00000000-0000-7000-8000-000000000007";
 const workspaceId = "00000000-0000-7000-8000-000000000008";
 
 describe("DurableTurnService", () => {
+  it("reports context from the durable journal, including trailing and in-flight text", async () => {
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT entry_id,sequence,payload")) {
+          return [
+            {
+              entry_id: "entry-user",
+              sequence: 1,
+              payload: { message: { role: "user", content: [{ type: "text", text: "hello" }] } },
+            },
+            {
+              entry_id: "entry-assistant",
+              sequence: 2,
+              payload: {
+                message: {
+                  role: "assistant",
+                  stopReason: "toolUse",
+                  content: [{ type: "text", text: "answer" }],
+                  usage: { input: 4_800, output: 200, totalTokens: 5_000 },
+                },
+              },
+            },
+            {
+              entry_id: "entry-tool",
+              sequence: 3,
+              payload: { message: { role: "toolResult", content: [{ type: "text", text: "x".repeat(40) }] } },
+            },
+          ] as T[];
+        }
+        if (sql.includes("FROM session_checkpoints")) return [] as T[];
+        if (sql.includes("FROM turn_runs r")) {
+          return [{
+            id: runId,
+            state: "calling_model",
+            prompt_manifest: {},
+            grounding_context: {},
+            partial_chars: 80,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.contextStats(tenantId, sessionId, {
+      pendingInput: "12345678901234567890",
+    })).resolves.toEqual({
+      usedTokens: 5_035,
+      source: "provider-reported",
+    });
+  });
+
+  it("drops provider usage covered by the latest rolling checkpoint", async () => {
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT entry_id,sequence,payload")) {
+          return [
+            {
+              entry_id: "entry-covered",
+              sequence: 1,
+              payload: {
+                message: {
+                  role: "assistant",
+                  stopReason: "stop",
+                  content: [{ type: "text", text: "old" }],
+                  usage: { input: 8_000, output: 1_000, totalTokens: 9_000 },
+                },
+              },
+            },
+            {
+              entry_id: "entry-recent",
+              sequence: 2,
+              payload: { message: { role: "user", content: [{ type: "text", text: "x".repeat(400) }] } },
+            },
+          ] as T[];
+        }
+        if (sql.includes("FROM session_checkpoints")) {
+          return [{ checkpoint: { summary: "x".repeat(40) }, covered_entry_end: "entry-covered" }] as T[];
+        }
+        if (sql.includes("FROM turn_runs r")) {
+          return [{
+            id: runId,
+            state: "completed",
+            prompt_manifest: {
+              version: 1,
+              provider: "berry-router",
+              model: "model",
+              route: "openai-completions",
+              components: [],
+              cacheRetention: "none",
+              stablePrefixTokens: 100,
+              dynamicContextBoundary: 0,
+              stablePrefixHash: "stable",
+              manifestHash: "manifest",
+            },
+            grounding_context: {},
+            partial_chars: 0,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    const stats = await service.contextStats(tenantId, sessionId);
+
+    expect(stats.source).toBe("estimated");
+    expect(stats.usedTokens).toBeGreaterThan(200);
+    expect(stats.usedTokens).toBeLessThan(9_000);
+  });
+
   it("compacts redundant active-run replay without losing streamed text", () => {
     expect(compactReplayEvents([
       { kind: "message.start", messageId: "message-1", role: "assistant" },

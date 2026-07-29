@@ -113,7 +113,7 @@ export function Composer({
   const [uploadError, setUploadError] = React.useState("");
   const [fileDragActive, setFileDragActive] = React.useState(false);
   const [createImageMode, setCreateImageMode] = React.useState(false);
-  const [contextStats, setContextStats] = React.useState<ContextStats | undefined>();
+  const [contextStatsResult, setContextStatsResult] = React.useState<{ sessionId: string; stats: ContextStats } | undefined>();
   const [editingFollowUp, setEditingFollowUp] = React.useState<QueuedFollowUp | null>(null);
   const [savingQueuedEdit, setSavingQueuedEdit] = React.useState(false);
   const fileDragDepthRef = React.useRef(0);
@@ -123,11 +123,23 @@ export function Composer({
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
   const contextStatsRequestRef = React.useRef(0);
+  const contextStatsInFlightRef = React.useRef(false);
+  const contextStatsRefreshPendingRef = React.useRef(false);
+  const contextStatsRefreshRef = React.useRef<() => Promise<void>>(async () => {});
   const contextStatsInputRef = React.useRef({ model, text, attachments });
   contextStatsInputRef.current = { model, text, attachments };
   const contextSessionId = activeTask?.activeSessionId ?? null;
+  const contextStats = contextStatsResult?.sessionId === contextSessionId
+    ? contextStatsResult.stats
+    : undefined;
   const refreshContextStats = React.useCallback(async () => {
     if (!client || !contextSessionId) return;
+    if (contextStatsInFlightRef.current) {
+      contextStatsRefreshPendingRef.current = true;
+      return;
+    }
+    contextStatsInFlightRef.current = true;
+    contextStatsRefreshPendingRef.current = false;
     const requestId = ++contextStatsRequestRef.current;
     const current = contextStatsInputRef.current;
     try {
@@ -136,29 +148,46 @@ export function Composer({
         pendingInput: current.text.replaceAll(CREATE_IMAGE_TOKEN, "Create image"),
         attachments: current.attachments,
       });
-      if (requestId === contextStatsRequestRef.current) setContextStats(next);
+      if (requestId === contextStatsRequestRef.current) {
+        setContextStatsResult({ sessionId: contextSessionId, stats: next });
+      }
     } catch {
-      if (requestId === contextStatsRequestRef.current) setContextStats(undefined);
+      // Keep the last valid reading through a transient request failure.
+    } finally {
+      contextStatsInFlightRef.current = false;
+      if (contextStatsRefreshPendingRef.current) {
+        contextStatsRefreshPendingRef.current = false;
+        window.queueMicrotask(() => void contextStatsRefreshRef.current());
+      }
     }
   }, [client, contextSessionId]);
+  contextStatsRefreshRef.current = refreshContextStats;
   React.useEffect(() => {
     contextStatsRequestRef.current += 1;
+    contextStatsRefreshPendingRef.current = false;
     if (!client || !contextSessionId) {
-      setContextStats(undefined);
+      setContextStatsResult(undefined);
       return;
     }
     void refreshContextStats();
-    const interval = window.setInterval(() => void refreshContextStats(), 1_500);
     return () => {
-      window.clearInterval(interval);
       contextStatsRequestRef.current += 1;
     };
   }, [client, contextSessionId, refreshContextStats]);
   React.useEffect(() => {
     if (!client || !contextSessionId) return;
-    const timeout = window.setTimeout(() => void refreshContextStats(), 180);
+    const timeout = window.setTimeout(() => void refreshContextStats(), 220);
     return () => window.clearTimeout(timeout);
-  }, [attachments, client, contextSessionId, model, refreshContextStats, streaming, text]);
+  }, [attachments, client, contextSessionId, model, refreshContextStats, text]);
+  React.useEffect(() => {
+    if (!client || !contextSessionId) return;
+    void refreshContextStats();
+    const interval = window.setInterval(
+      () => void refreshContextStats(),
+      streaming ? 1_500 : 15_000,
+    );
+    return () => window.clearInterval(interval);
+  }, [client, contextSessionId, refreshContextStats, streaming]);
   const onMentionSelected = React.useCallback((item: { id: string; value: string; label: string }) => {
     if (!item.id.startsWith("file:")) return;
     const reference: AttachmentInput = {
@@ -595,12 +624,15 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
   const percent = stats?.percentUsed ?? null;
   const used = stats ? formatContextTokens(stats.usedTokens) : null;
   const total = stats?.contextWindow ? formatContextTokens(stats.contextWindow) : null;
+  const left = stats?.tokensLeft !== null && stats?.tokensLeft !== undefined
+    ? formatContextTokens(stats.tokensLeft)
+    : null;
   const leftPercent = percent === null ? null : Math.max(0, 100 - percent);
-  const roundedUsedPercent = percent === null ? null : Math.round(percent);
-  const roundedLeftPercent = leftPercent === null ? null : Math.round(leftPercent);
-  const tooltipLabel = stats && roundedUsedPercent !== null
-    ? `Context window: ${roundedUsedPercent}% used (${roundedLeftPercent ?? 0}% left)${used && total ? `, ${used} / ${total} tokens used` : ""}`
-    : "Context window usage unavailable";
+  const usedPercent = formatContextPercent(percent);
+  const leftPercentLabel = formatContextPercent(leftPercent);
+  const tooltipLabel = stats && usedPercent !== null
+    ? `Context window: ${usedPercent}% used (${leftPercentLabel ?? "0"}% left)${used && total ? `, ${used} / ${total} tokens used` : ""}`
+    : "Calculating context window usage";
 
   return (
     <TooltipProvider delayDuration={250}>
@@ -619,19 +651,22 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
               label="Context window usage"
               trackClassName="opacity-30"
               formatValueText={(percentage) => `${Math.round(percentage)}% of context used`}
+              aria-busy={!stats}
+              title={undefined}
             />
           </button>
         </TooltipTrigger>
         <TooltipContent side="top" className="berry-context-tooltip">
           <div className="berry-context-tooltip-content">
-            {stats && roundedUsedPercent !== null ? (
+            {stats && usedPercent !== null ? (
               <>
                 <span className="berry-context-tooltip-label">Context window</span>
-                <span>{roundedUsedPercent}% used ({roundedLeftPercent ?? 0}% left)</span>
+                <span>{usedPercent}% used ({leftPercentLabel ?? "0"}% left)</span>
                 {used && total ? <span>{used} / {total} tokens used</span> : null}
+                {left ? <span className="berry-context-tooltip-label">{left} tokens remaining</span> : null}
               </>
             ) : (
-              <span className="berry-context-tooltip-label">Context window usage unavailable</span>
+              <span className="berry-context-tooltip-label">Calculating context usage…</span>
             )}
           </div>
         </TooltipContent>
@@ -656,6 +691,12 @@ function formatContextTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   if (tokens >= 1_000) return `${Math.round(tokens / 100) / 10}K`;
   return String(tokens);
+}
+
+function formatContextPercent(percent: number | null): string | null {
+  if (percent === null) return null;
+  if (percent > 0 && percent < 10) return percent.toFixed(1);
+  return String(Math.round(percent));
 }
 
 function formatFileSize(bytes: number): string {

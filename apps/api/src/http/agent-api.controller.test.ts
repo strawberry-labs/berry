@@ -57,6 +57,38 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("reports context usage with the current draft in fallback runtime mode", async () => {
+    let observedInput = "";
+    app = await createApp(fakeSessionHost({
+      contextStats: async (_sessionId, options) => {
+        observedInput = options?.pendingInput ?? "";
+        return { usedTokens: 12_000, source: "provider-reported" };
+      },
+    }));
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Context stats task", model: "berry/auto" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/context-stats`)
+      .set(authHeader())
+      .send({ model: "berry/auto", pendingInput: "Continue this task" })
+      .expect(201)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({
+          usedTokens: 12_000,
+          contextWindow: 200_000,
+          percentUsed: 6,
+          tokensLeft: 188_000,
+          source: "provider-reported",
+          thresholdState: "normal",
+        });
+      });
+    expect(observedInput).toBe("Continue this task");
+  });
+
   it("updates and removes a user-owned project", async () => {
     app = await createApp(fakeSessionHost());
     const project = await request(app.getHttpServer())
