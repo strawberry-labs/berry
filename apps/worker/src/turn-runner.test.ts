@@ -9,6 +9,7 @@ import {
 import {
   DurableTurnRunner,
   RouterDurableTurnModel,
+  SqlDurableTurnRepository,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -16,6 +17,7 @@ import {
   type DurableTurnStep,
   type DurableTurnToolExecutor,
 } from "./turn-runner.js";
+import type { SqlExecutor } from "./sql-repositories.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
 const runId = "00000000-0000-7000-8000-000000000002";
@@ -276,6 +278,36 @@ describe("durable turn runner", () => {
         requiresApproval: false,
       }],
     });
+  });
+
+  it("casts persisted tool statuses to the PostgreSQL enum", async () => {
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+          return [{ state: "executing_tool", cancelled_at: null }] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql: string) => {
+        statements.push(sql);
+      },
+    };
+    const current = snapshot("executing_tool", [admittedStep()]);
+    current.leaseOwner = "worker-sql";
+    const tool = toolStep("completed", "read_only", false);
+
+    await new SqlDurableTurnRepository(executor).commit(current, {
+      expectedState: "executing_tool",
+      nextState: "calling_model",
+      steps: [tool],
+      keepLease: true,
+    });
+
+    const update = statements.find((sql) => sql.startsWith("UPDATE tool_calls"));
+    expect(update).toContain("SET status=$4::tool_call_status");
+    expect(update).toContain("CASE WHEN $4::tool_call_status='running'");
+    expect(update).toContain("CASE WHEN $4::tool_call_status IN");
   });
 });
 

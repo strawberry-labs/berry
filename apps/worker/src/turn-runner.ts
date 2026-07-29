@@ -1902,10 +1902,10 @@ ON CONFLICT (tenant_id,run_id,sequence) DO UPDATE SET
     await executor.execute(
       `
 UPDATE tool_calls
-SET status=$4,
+SET status=$4::tool_call_status,
     output=COALESCE($5::jsonb,output),
-    started_at=CASE WHEN $4='running' THEN COALESCE(started_at,now()) ELSE started_at END,
-    completed_at=CASE WHEN $4 IN ('completed','failed','cancelled','denied') THEN now() ELSE completed_at END,
+    started_at=CASE WHEN $4::tool_call_status='running' THEN COALESCE(started_at,now()) ELSE started_at END,
+    completed_at=CASE WHEN $4::tool_call_status IN ('completed','failed','cancelled','denied') THEN now() ELSE completed_at END,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND step_id=$3::uuid
       `.trim(),
