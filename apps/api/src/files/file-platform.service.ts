@@ -74,9 +74,10 @@ export class FilePlatformService {
     @Inject(FILE_STORAGE_CONFIG) private readonly config: FileStorageConfig | null,
   ) {}
 
-  async list(tenantId: string, userId: string, filters: { taskId?: string; category?: string; search?: string; cursor?: string; limit?: number }) {
+  async list(tenantId: string, userId: string, filters: { taskId?: string; workspaceId?: string; category?: string; search?: string; cursor?: string; limit?: number }) {
     const limit = Math.min(100, Math.max(1, filters.limit ?? 50));
     return this.database.withTenant(tenantId, async (executor) => {
+      if (filters.workspaceId) await requireWorkspaceAccess(executor, tenantId, userId, filters.workspaceId);
       await executor.execute(`
         WITH expired AS (
           UPDATE file_uploads SET status = 'expired', updated_at = now()
@@ -91,6 +92,28 @@ export class FilePlatformService {
       if (filters.taskId) {
         values.push(filters.taskId);
         where.push(`EXISTS (SELECT 1 FROM file_associations task_link WHERE task_link.file_id = f.id AND task_link.task_id = $${values.length}::uuid)`);
+      }
+      if (filters.workspaceId) {
+        values.push(filters.workspaceId);
+        where.push(`(
+          EXISTS (
+            SELECT 1
+            FROM file_associations workspace_task_link
+            JOIN tasks workspace_task ON workspace_task.id = workspace_task_link.task_id
+            WHERE workspace_task_link.file_id = f.id
+              AND workspace_task.tenant_id = f.tenant_id
+              AND workspace_task.workspace_id = $${values.length}::uuid
+              AND workspace_task.deleted_at IS NULL
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM workspace_files project_file_link
+            WHERE project_file_link.tenant_id = f.tenant_id
+              AND project_file_link.workspace_id = $${values.length}::uuid
+              AND project_file_link.file_id = f.id
+              AND project_file_link.deleted_at IS NULL
+          )
+        )`);
       }
       if (filters.category === "images") where.push("f.media_type LIKE 'image/%'");
       if (filters.category === "documents") where.push("f.media_type NOT LIKE 'image/%'");

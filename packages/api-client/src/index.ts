@@ -647,7 +647,7 @@ export class BerryApiClient {
     });
   }
 
-  async listFiles(input: { taskId?: string; category?: "images" | "documents"; search?: string; cursor?: string; limit?: number } = {}, options: { signal?: AbortSignal } = {}): Promise<StoredFilePage> {
+  async listFiles(input: { taskId?: string; workspaceId?: string; category?: "images" | "documents"; search?: string; cursor?: string; limit?: number } = {}, options: { signal?: AbortSignal } = {}): Promise<StoredFilePage> {
     const page = await this.#request(`/v1/files${usageQuery(input)}`, StoredFilePageSchema, options);
     return { ...page, items: page.items.map((file) => this.#resolveFileUrls(file)) };
   }

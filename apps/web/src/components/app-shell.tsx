@@ -2063,8 +2063,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 tab={shellLocation.kind === "library" ? shellLocation.tab : "all"}
                 onTabChange={navigateToLibrary}
                 workspaces={workspaces}
-                activeWorkspaceId={activeWorkspaceId}
-                onWorkspaceChange={setActiveWorkspaceId}
               />
             </React.Suspense>
           </div>

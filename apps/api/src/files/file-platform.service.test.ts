@@ -31,6 +31,30 @@ describe("FilePlatformService.list", () => {
     expect(sql).toContain("f.display_name ILIKE $3 ESCAPE '\\' OR f.original_name ILIKE $3 ESCAPE '\\'");
     expect(params).toEqual([TENANT_ID, USER_ID, "%budget 100\\%\\_\\\\%", 26]);
   });
+
+  it("scopes the library to files linked to tasks or uploads in a project", async () => {
+    const execute = vi.fn(async () => undefined);
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("FROM workspaces")) return [{ id: WORKSPACE_ID }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = {
+      withTenant: vi.fn(async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor)),
+    };
+    const service = new FilePlatformService(database as never, null);
+
+    await service.list(TENANT_ID, USER_ID, { workspaceId: WORKSPACE_ID, limit: 25 });
+
+    const listQuery = queries.at(-1)!;
+    expect(listQuery.sql).toContain("workspace_task.workspace_id = $3::uuid");
+    expect(listQuery.sql).toContain("project_file_link.workspace_id = $3::uuid");
+    expect(listQuery.params).toEqual([TENANT_ID, USER_ID, WORKSPACE_ID, 26]);
+  });
 });
 
 describe("FilePlatformService.initiateUpload", () => {

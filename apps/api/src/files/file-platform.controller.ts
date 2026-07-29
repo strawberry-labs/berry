@@ -24,6 +24,7 @@ const CompleteSchema = z.object({
 }).strict();
 const ListSchema = z.object({
   taskId: z.string().uuid().optional(),
+  workspaceId: z.string().uuid().optional(),
   category: z.enum(["images", "documents"]).optional(),
   search: z.string().trim().max(200).optional(),
   cursor: z.string().max(1000).optional(),
@@ -46,6 +47,7 @@ export class FilePlatformController {
     const parsed = parse(ListSchema, query);
     return this.files.list(tenant(), user(request), {
       ...(parsed.taskId ? { taskId: parsed.taskId } : {}),
+      ...(parsed.workspaceId ? { workspaceId: parsed.workspaceId } : {}),
       ...(parsed.category ? { category: parsed.category } : {}),
       ...(parsed.search ? { search: parsed.search } : {}),
       ...(parsed.cursor ? { cursor: parsed.cursor } : {}),

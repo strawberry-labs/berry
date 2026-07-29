@@ -1,11 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { knowledgeStatusView } from "./artifact-library";
+import type { Workspace } from "@berry/shared";
+import { projectFilterWorkspaces } from "./artifact-library";
 
-describe("knowledgeStatusView", () => {
-  it("distinguishes indexed, in-progress, failed, and pending sources", () => {
-    expect(knowledgeStatusView("indexed")).toEqual({ label: "Indexed", tone: "good" });
-    expect(knowledgeStatusView("embedding")).toEqual({ label: "Embedding", tone: "warning" });
-    expect(knowledgeStatusView("failed")).toEqual({ label: "Failed", tone: "danger" });
-    expect(knowledgeStatusView("pending")).toEqual({ label: "Pending", tone: "neutral" });
-  });
+const workspace = (id: string, workspaceKind: Workspace["workspaceKind"]): Workspace => ({
+	id,
+	path: `/workspace/${id}`,
+	name: id,
+	workspaceKind,
+	ownerUserId: null,
+	trustState: "trusted",
+	lastOpenedAt: "2026-07-29T00:00:00.000Z",
+	indexedAt: null,
+	createdAt: "2026-07-29T00:00:00.000Z",
+	updatedAt: "2026-07-29T00:00:00.000Z",
+	pinned: false,
+});
+
+describe("projectFilterWorkspaces", () => {
+	it("keeps project workspaces and excludes the general chat workspace", () => {
+		expect(projectFilterWorkspaces([workspace("project", "project"), workspace("general", "general")])).toEqual([
+			workspace("project", "project"),
+		]);
+	});
 });

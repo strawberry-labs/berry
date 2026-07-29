@@ -8,10 +8,10 @@ describe("BerryApiClient", () => {
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
     const controller = new AbortController();
 
-    await client.listFiles({ category: "documents", search: "annual report", limit: 50 }, { signal: controller.signal });
+    await client.listFiles({ workspaceId: "project_1", category: "documents", search: "annual report", limit: 50 }, { signal: controller.signal });
 
     expect(fetchImpl).toHaveBeenCalledWith(
-      "https://api.berry.test/v1/files?category=documents&search=annual+report&limit=50",
+      "https://api.berry.test/v1/files?workspaceId=project_1&category=documents&search=annual+report&limit=50",
       expect.objectContaining({ method: "GET", signal: controller.signal }),
     );
   });
