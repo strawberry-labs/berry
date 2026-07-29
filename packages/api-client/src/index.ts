@@ -267,6 +267,8 @@ interface StartTurnRequestBase {
 export type StartTurnRequest = StartTurnRequestBase & (
   | {
     input: string;
+    /** Exact persisted user message that this turn consumes. */
+    requestMessageId?: string | undefined;
     continueInterruptedTurn?: false | undefined;
     attachments?: AttachmentInput[] | undefined;
     /** Edit-and-resubmit: rewind to before this user message and replace it. */
@@ -276,6 +278,7 @@ export type StartTurnRequest = StartTurnRequestBase & (
     /** Resume the interrupted assistant turn without appending another user message. */
     continueInterruptedTurn: true;
     input?: undefined;
+    requestMessageId?: undefined;
     attachments?: undefined;
     replaceFromMessageId?: undefined;
   }
@@ -862,6 +865,7 @@ export class BerryApiClient {
     questionId: string,
     input: {
       answer: string;
+      answerMessageId?: string | undefined;
       selectedOptions?: string[] | undefined;
       answers?: Array<{ question: string; answer: string; selectedOptions?: string[] | undefined; skipped?: boolean | undefined }> | undefined;
     },

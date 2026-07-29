@@ -8,6 +8,7 @@ import {
 } from "@berry/router-client";
 import {
   DurableTurnRunner,
+  DurableTurnRetryableError,
   RouterDurableTurnModel,
   SqlDurableTurnRepository,
   type DurableTurnModel,
@@ -196,6 +197,69 @@ describe("durable turn runner", () => {
       .join("")).toBe("Hello world");
   });
 
+  it("feeds a read-only tool exception back to the model instead of failing the turn", async () => {
+    const tool = toolStep("pending", "read_only", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => { throw new Error("Search provider unavailable"); },
+    }, { owner: "worker-tool-failure" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({
+      state: "calling_model",
+    });
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "tool.end",
+      status: "failed",
+    }));
+    expect(repository.events.some((event) => event.kind === "turn.end")).toBe(false);
+    expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("failed");
+    expect(repository.current.steps.some((step) =>
+      step.type === "model.call" && step.state === "pending"
+    )).toBe(true);
+  });
+
+  it("settles a denied tool and continues the remaining tool calls", async () => {
+    const denied = toolStep("pending", "idempotent", true);
+    const remaining = { ...toolStep("pending", "read_only", false), id: randomUUID(), sequence: 2 };
+    const current = snapshot("executing_tool", [admittedStep(), denied, remaining]);
+    current.approvals.push({
+      id: randomUUID(),
+      stepId: denied.id,
+      status: "denied",
+      decision: { decision: "denied" },
+    });
+    const repository = new FakeTurnRepository(current);
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        calls += 1;
+        return { output: { content: "safe" }, summary: "Read completed" };
+      },
+    }, { owner: "worker-denied-tool" });
+
+    expect((await runner.execute({ tenantId, runId, reason: "approval-resolved" })).state)
+      .toBe("executing_tool");
+    expect(repository.current.steps.find((step) => step.id === denied.id)?.state).toBe("failed");
+
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state)
+      .toBe("calling_model");
+    expect(calls).toBe(1);
+  });
+
+  it("surfaces a lost long-operation heartbeat as a retryable failure", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    repository.heartbeat = async () => false;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return { text: "late", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-heartbeat", heartbeatMs: 1, leaseSeconds: 1 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toBeInstanceOf(DurableTurnRetryableError);
+  });
+
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
     let request: ChatCompletionOptions | undefined;
     const client = {
@@ -205,6 +269,7 @@ describe("durable turn runner", () => {
           id: "completion-1",
           model: "kimi-2.6",
           delta: "Searching",
+          reasoningDelta: "Need current sources.",
           finishReason: null,
           raw: {},
         };
@@ -242,7 +307,7 @@ describe("durable turn runner", () => {
         minimumTokens: 1_024,
       }),
     });
-    const deltas: string[] = [];
+    const deltas: Array<{ delta: string; channel: "text" | "reasoning" }> = [];
     const result = await model.call(
       snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]),
       modelStep("pending", 1),
@@ -256,7 +321,7 @@ describe("durable turn runner", () => {
             parameters: { type: "object" },
           },
         }],
-        emitDelta: async (delta) => { deltas.push(delta); },
+        emitDelta: async (delta, channel) => { deltas.push({ delta, channel }); },
         policyForTool: () => ({
           retryClass: "read_only",
           requiresApproval: false,
@@ -266,9 +331,11 @@ describe("durable turn runner", () => {
     );
 
     expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
-    expect(deltas.join("")).toBe("Searching");
+    expect(deltas.filter((item) => item.channel === "text").map((item) => item.delta).join("")).toBe("Searching");
+    expect(deltas.filter((item) => item.channel === "reasoning").map((item) => item.delta).join("")).toBe("Need current sources.");
     expect(result).toMatchObject({
       text: "Searching",
+      reasoning: "Need current sources.",
       inputTokens: 10,
       outputTokens: 4,
       toolCalls: [{
@@ -301,6 +368,21 @@ describe("durable turn runner", () => {
       expectedState: "executing_tool",
       nextState: "calling_model",
       steps: [tool],
+      assistantMessage: {
+        id: randomUUID(),
+        text: "",
+        inputTokens: 1,
+        outputTokens: 1,
+        toolCalls: [{ id: randomUUID(), name: "read_file", input: { path: "/workspace/a.txt" } }],
+      },
+      toolResultMessage: {
+        id: randomUUID(),
+        toolCallId: randomUUID(),
+        name: "read_file",
+        input: { path: "/workspace/a.txt" },
+        status: "completed",
+        output: { content: "ok" },
+      },
       keepLease: true,
     });
 
@@ -308,6 +390,8 @@ describe("durable turn runner", () => {
     expect(update).toContain("SET status=$4::tool_call_status");
     expect(update).toContain("CASE WHEN $4::tool_call_status='running'");
     expect(update).toContain("CASE WHEN $4::tool_call_status IN");
+    expect(statements.some((sql) => sql.includes("'tool-call'"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("'tool-result'"))).toBe(true);
   });
 });
 

@@ -37,6 +37,9 @@ describe("self-host compose deployment", () => {
     expect(compose).toContain('127.0.0.1:${BERRY_API_PORT:-3001}:3000');
     expect(caddyfile).toContain("reverse_proxy @api api:3000");
     expect(caddyfile).toContain("reverse_proxy web:3108");
+    expect(caddyfile).toContain("not path /v1/sessions/*/events /v1/tasks/*/events");
+    expect(caddyfile).toContain('Cache-Control "no-cache, no-transform"');
+    expect(caddyfile).toContain("flush_interval -1");
   });
 
   it("uses direct E2B in production while keeping Docker and Router seams available", () => {

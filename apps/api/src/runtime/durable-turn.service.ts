@@ -1,7 +1,8 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { ConflictException, Inject, Injectable } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
 import {
   AgentStreamEventSchema,
+  latestAssistantStreamDraft,
   messageAttachmentContent,
   TurnStateSchema,
   type AttachmentInput,
@@ -20,8 +21,10 @@ export interface DurableTurnAdmission {
   taskId: string;
   sessionId: string;
   requestId: string;
+  requestMessageId?: string;
   input: string;
   attachments?: AttachmentInput[];
+  continueInterruptedTurn?: boolean;
   runtimeRequest: Record<string, unknown>;
   groundingContext: JsonValue;
   promptManifest?: JsonValue;
@@ -60,9 +63,9 @@ FOR UPDATE OF s,t
         [input.tenantId, input.userId, input.sessionId, input.taskId, input.workspaceId],
       );
       if (!owned[0]) throw new Error("Session is not authorized for durable execution");
-      const existing = await executor.query<{ id: string }>(
+      const existing = await executor.query<{ id: string; request_message_id: string | null }>(
         `
-SELECT id FROM turn_runs
+SELECT id,request_message_id FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
   AND state NOT IN ('completed','failed','cancelled','recovery_required')
 ORDER BY created_at DESC
@@ -70,11 +73,20 @@ LIMIT 1
         `.trim(),
         [input.tenantId, input.sessionId],
       );
-      if (existing[0]) return { runId: existing[0].id, sessionId: input.sessionId };
+      if (existing[0]) {
+        if (input.requestMessageId && existing[0].request_message_id === input.requestMessageId) {
+          return { runId: existing[0].id, sessionId: input.sessionId };
+        }
+        throw new ConflictException("This session already has an active turn");
+      }
 
-      const requestMessageId = await ensureUserMessage(executor, input);
-      await ensureInputFileAssociations(executor, input, requestMessageId);
-      await ensureUserJournalEntry(executor, input, requestMessageId);
+      const requestMessageId = input.continueInterruptedTurn
+        ? await continuableRequestMessageId(executor, input)
+        : await ensureUserMessage(executor, input);
+      if (!input.continueInterruptedTurn) {
+        await ensureInputFileAssociations(executor, input, requestMessageId);
+        await ensureUserJournalEntry(executor, input, requestMessageId);
+      }
       const runId = randomUUID();
       const admittedStepId = randomUUID();
       await executor.execute(
@@ -184,20 +196,57 @@ LIMIT 1
       );
       const run = runs[0];
       if (!run) return TurnStateSchema.parse({ active: false, turnId: null, bufferedEvents: [], replayOnly: false });
-      const events = await executor.query<{ sequence: number; payload: unknown }>(
+      const active = !["completed", "failed", "cancelled", "recovery_required"].includes(run.state);
+      const positions = await executor.query<{
+        message_start: number | string | null;
+        message_end: number | string | null;
+        tool_start: number | string | null;
+        tool_end: number | string | null;
+        turn_start: number | string | null;
+        maximum: number | string | null;
+      }>(
         `
+SELECT
+  MAX(sequence) FILTER (WHERE event_type='message.start') AS message_start,
+  MAX(sequence) FILTER (WHERE event_type='message.end') AS message_end,
+  MAX(sequence) FILTER (WHERE event_type='tool.start') AS tool_start,
+  MAX(sequence) FILTER (WHERE event_type='tool.end') AS tool_end,
+  MAX(sequence) FILTER (WHERE event_type='turn.start') AS turn_start,
+  MAX(sequence) AS maximum
+FROM turn_events
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+        `.trim(),
+        [tenantId, run.id],
+      );
+      const position = positions[0];
+      const maximum = nullableNumber(position?.maximum);
+      const replayFrom = active
+        ? activeReplayBoundary(run.state, position, maximum)
+        : null;
+      const events = await executor.query<{ sequence: number; payload: unknown }>(
+        active
+          ? `
+SELECT sequence,payload FROM turn_events
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND sequence >= $3
+ORDER BY sequence ASC
+            `.trim()
+          : `
 SELECT sequence,payload FROM turn_events
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid
 ORDER BY sequence DESC
 LIMIT 256
-        `.trim(),
-        [tenantId, run.id],
+            `.trim(),
+        active ? [tenantId, run.id, replayFrom ?? 0] : [tenantId, run.id],
       );
+      const chronological = active ? events : [...events].reverse();
+      const bufferedEvents = active
+        ? compactReplayEvents(chronological.map((row) => AgentStreamEventSchema.parse(row.payload)))
+        : chronological.map((row) => AgentStreamEventSchema.parse(row.payload));
       return TurnStateSchema.parse({
-        active: !["completed", "failed", "cancelled", "recovery_required"].includes(run.state),
+        active,
         turnId: run.id,
-        bufferedEvents: [...events].reverse().map((row) => AgentStreamEventSchema.parse(row.payload)),
-        lastEventId: events[0] ? `${run.id}:${events[0].sequence}` : null,
+        bufferedEvents,
+        lastEventId: maximum === null ? null : `${run.id}:${maximum}`,
         replayOnly: false,
         owner: run.lease_owner,
         runState: run.state,
@@ -213,36 +262,66 @@ LIMIT 256
     sessionId: string,
     cursor?: string | null,
     limit = 500,
+    notBefore?: Date,
   ): Promise<DurableEventEnvelope[]> {
     return this.database.withTenant(tenantId, async (executor) => {
       const parsed = parseEventCursor(cursor);
       const rows = await executor.query<EventRow>(
         parsed
           ? `
-WITH cursor_event AS (
-  SELECT created_at FROM turn_events
-  WHERE tenant_id=$1::uuid AND run_id=$3::uuid AND sequence=$4
+WITH cursor_run AS (
+  SELECT id,created_at FROM turn_runs
+  WHERE tenant_id=$1::uuid AND id=$3::uuid AND session_id=$2::uuid
 )
 SELECT e.run_id,e.sequence,e.payload,e.created_at
 FROM turn_events e
+JOIN turn_runs r ON r.tenant_id=e.tenant_id AND r.id=e.run_id
 WHERE e.tenant_id=$1::uuid AND e.session_id=$2::uuid
+  AND EXISTS (SELECT 1 FROM cursor_run)
   AND (
-    e.created_at > COALESCE((SELECT created_at FROM cursor_event),'-infinity'::timestamptz)
+    r.created_at > (SELECT created_at FROM cursor_run)
+    OR (
+      r.created_at = (SELECT created_at FROM cursor_run)
+      AND r.id > (SELECT id FROM cursor_run)
+    )
     OR (e.run_id=$3::uuid AND e.sequence>$4)
   )
-ORDER BY e.created_at ASC,e.run_id ASC,e.sequence ASC
+ORDER BY r.created_at ASC,r.id ASC,e.sequence ASC
 LIMIT $5
             `.trim()
-          : `
-SELECT run_id,sequence,payload,created_at
-FROM turn_events
-WHERE tenant_id=$1::uuid AND session_id=$2::uuid
-ORDER BY created_at ASC,run_id ASC,sequence ASC
-LIMIT $5
+          : notBefore
+            ? `
+SELECT e.run_id,e.sequence,e.payload,e.created_at
+FROM turn_events e
+JOIN turn_runs r ON r.tenant_id=e.tenant_id AND r.id=e.run_id
+WHERE e.tenant_id=$1::uuid AND e.session_id=$2::uuid
+  AND (
+    e.created_at >= $3::timestamptz
+    OR r.state NOT IN ('completed','failed','cancelled','recovery_required')
+  )
+ORDER BY r.created_at ASC,r.id ASC,e.sequence ASC
+LIMIT $4
+            `.trim()
+            : `
+SELECT e.run_id,e.sequence,e.payload,e.created_at
+FROM turn_events e
+JOIN turn_runs r ON r.tenant_id=e.tenant_id AND r.id=e.run_id
+WHERE e.tenant_id=$1::uuid AND e.session_id=$2::uuid
+  AND r.id=(
+    SELECT id FROM turn_runs
+    WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+      AND state NOT IN ('completed','failed','cancelled','recovery_required')
+    ORDER BY created_at DESC
+    LIMIT 1
+  )
+ORDER BY e.sequence ASC
+LIMIT $3
             `.trim(),
         parsed
           ? [tenantId, sessionId, parsed.runId, parsed.sequence, limit]
-          : [tenantId, sessionId, null, 0, limit],
+          : notBefore
+            ? [tenantId, sessionId, notBefore, limit]
+            : [tenantId, sessionId, limit],
       );
       return rows.map((row) => ({
         id: eventCursor(row.run_id, Number(row.sequence)),
@@ -257,27 +336,110 @@ LIMIT $5
   async cancel(tenantId: string, sessionId: string): Promise<boolean> {
     if (!this.enabled) return false;
     return this.database.withTenant(tenantId, async (executor) => {
-      const rows = await executor.query<{ id: string }>(
-        `
-UPDATE turn_runs
-SET cancelled_at=now(),lease_expires_at=now(),updated_at=now()
+      const run = async (transaction: SqlExecutor): Promise<boolean> => {
+        const rows = await transaction.query<{
+          id: string;
+          task_id: string;
+          request_message_id: string | null;
+        }>(
+          `
+SELECT id,task_id,request_message_id
+FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
   AND state NOT IN ('completed','failed','cancelled','recovery_required')
-RETURNING id
-        `.trim(),
-        [tenantId, sessionId],
-      );
-      const run = rows[0];
-      if (!run) return false;
-      await executor.execute(
-        `
-INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
-VALUES ($1::uuid,'turn.execute',$2,$3,$4::jsonb)
-ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
-        `.trim(),
-        [tenantId, run.id, `${run.id}:wake:cancel`, JSON.stringify({ tenantId, runId: run.id, reason: "continue" })],
-      );
-      return true;
+ORDER BY created_at DESC
+LIMIT 1
+FOR UPDATE
+          `.trim(),
+          [tenantId, sessionId],
+        );
+        const active = rows[0];
+        if (!active) return false;
+        await projectInterruptedTools(transaction, tenantId, sessionId, active.task_id, active.id);
+        await projectTerminalAssistant(transaction, tenantId, sessionId, active.task_id, active.id, "cancelled");
+        await transaction.execute(
+          `
+UPDATE turn_steps
+SET state='cancelled',completed_at=now(),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND state IN ('pending','running','waiting')
+          `.trim(),
+          [tenantId, active.id],
+        );
+        await transaction.execute(
+          `
+UPDATE tool_calls
+SET status='cancelled',completed_at=now(),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND status IN ('pending','waiting-for-approval','running')
+          `.trim(),
+          [tenantId, active.id],
+        );
+        await transaction.execute(
+          "UPDATE approvals SET status='expired',decided_at=now() WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
+          [tenantId, active.id],
+        );
+        await transaction.execute(
+          "UPDATE turn_questions SET status='cancelled' WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
+          [tenantId, active.id],
+        );
+        await appendDurableEvents(transaction, tenantId, active.id, sessionId, [
+          { kind: "turn.end", turnId: active.id, status: "cancelled" },
+        ]);
+        await transaction.execute(
+          `
+UPDATE turn_runs
+SET state='cancelled',cancelled_at=now(),completed_at=now(),
+    lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
+    version=version+1,updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+          `.trim(),
+          [tenantId, active.id],
+        );
+        await transaction.execute(
+          `
+UPDATE runtime_outbox
+SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND completed_at IS NULL
+          `.trim(),
+          [tenantId, active.id],
+        );
+        await transaction.execute(
+          "UPDATE tasks SET status='cancelled',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+          [tenantId, active.task_id],
+        );
+        await transaction.execute(
+          `
+UPDATE budget_reservations b
+SET actual_cost_micros=0,status='reconciled',updated_at=now()
+FROM turn_runs r
+WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
+  AND b.tenant_id=r.tenant_id
+  AND b.request_id=COALESCE(r.runtime_request->>'requestId','turn_' || r.id::text)
+  AND b.status='reserved'
+          `.trim(),
+          [tenantId, active.id],
+        );
+        await transaction.execute(
+          `
+UPDATE sessions
+SET runtime_metadata=runtime_metadata || jsonb_build_object(
+      'activeRunId',$2::text,
+      'lastRunState','cancelled',
+      'leafId',COALESCE((
+        SELECT entry_id FROM session_entries
+        WHERE tenant_id=$1::uuid AND session_id=$3::uuid AND is_leaf_marker=true
+        ORDER BY sequence DESC LIMIT 1
+      ),runtime_metadata->>'leafId')
+    ),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$3::uuid
+          `.trim(),
+          [tenantId, active.id, sessionId],
+        );
+        return true;
+      };
+      return executor.transaction ? executor.transaction(run) : run(executor);
     });
   }
 
@@ -353,10 +515,10 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
           await transaction.execute(
             `
 UPDATE turn_steps
-SET state=$4,error=CASE WHEN $4='failed' THEN 'Approval denied' ELSE NULL END,updated_at=now()
+SET state='pending',error=NULL,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND run_id=$3::uuid
             `.trim(),
-            [tenantId, approval.step_id, approval.run_id, approved ? "pending" : "failed"],
+            [tenantId, approval.step_id, approval.run_id],
           );
         }
         await transaction.execute(
@@ -381,10 +543,9 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND state='waiting'
                 detail: "Approval granted; the durable turn will resume.",
               }
             : {
-                kind: "tool.end" as const,
+                kind: "tool.update" as const,
                 toolCallId: approval.tool_call_id ?? approval.step_id ?? approval.id,
-                status: "denied" as const,
-                summary: decision.reason ?? "Approval denied",
+                detail: decision.reason ?? "Approval denied; the model will be informed.",
               },
         ]);
         await transaction.execute(
@@ -412,6 +573,7 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
     questionId: string,
     answer: {
       answer: string;
+      answerMessageId?: string | undefined;
       selectedOptions?: readonly string[] | undefined;
       answers?: ReadonlyArray<{
         question: string;
@@ -478,16 +640,29 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
         );
 
         const messageRows = await transaction.query<{ id: string }>(
-          `
+          answer.answerMessageId
+            ? `
+SELECT m.id
+FROM messages m
+WHERE m.tenant_id=$1::uuid AND m.session_id=$2::uuid AND m.task_id=$3::uuid
+  AND m.id=$4::uuid AND m.role='user'
+LIMIT 1
+              `.trim()
+            : `
 SELECT m.id
 FROM messages m
 WHERE m.tenant_id=$1::uuid AND m.session_id=$2::uuid AND m.role='user'
   AND m.created_at >= $3::timestamptz
 ORDER BY m.created_at DESC
 LIMIT 1
-          `.trim(),
-          [tenantId, question.session_id, iso(question.created_at)],
+              `.trim(),
+          answer.answerMessageId
+            ? [tenantId, question.session_id, question.task_id, answer.answerMessageId]
+            : [tenantId, question.session_id, iso(question.created_at)],
         );
+        if (answer.answerMessageId && !messageRows[0]) {
+          throw new Error("The submitted question answer message does not belong to this session");
+        }
         const answerMessageId = messageRows[0]?.id ?? randomUUID();
         if (!messageRows[0]) {
           await transaction.execute(
@@ -588,6 +763,32 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND run_id=$3::uuid
             [tenantId, question.tool_call_id, question.run_id, JSON.stringify(toolResult)],
           );
         }
+        const toolProjectionId = randomUUID();
+        await transaction.execute(
+          `
+INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant','complete')
+          `.trim(),
+          [toolProjectionId, tenantId, question.session_id, question.task_id],
+        );
+        await transaction.execute(
+          `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'tool-result',$3::jsonb,0)
+          `.trim(),
+          [
+            tenantId,
+            toolProjectionId,
+            JSON.stringify({
+              toolCallId: question.tool_call_id ?? question.step_id,
+              name: "ask_user_question",
+              arguments: { question: question.question },
+              status: "completed",
+              output: toolResult,
+              summary: "User answered the question.",
+            }),
+          ],
+        );
         const nextStep = await transaction.query<{ sequence: number | string; iteration: number | string }>(
           `
 SELECT COALESCE(MAX(sequence),0)+1 AS sequence,
@@ -683,12 +884,17 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
         session_id: string;
         task_id: string;
         tool_call_id: string | null;
+        tool_call_step_id: string | null;
+        tool_call_name: string | null;
+        tool_call_input: unknown;
       }>(
         `
-SELECT r.id,r.session_id,r.task_id,tc.id AS tool_call_id
+SELECT r.id,r.session_id,r.task_id,tc.id AS tool_call_id,
+       tc.step_id AS tool_call_step_id,tc.tool_name AS tool_call_name,
+       tc.input AS tool_call_input
 FROM turn_runs r JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
 LEFT JOIN LATERAL (
-  SELECT id FROM tool_calls
+  SELECT id,step_id,tool_name,input FROM tool_calls
   WHERE tenant_id=r.tenant_id AND run_id=r.id AND status='failed'
   ORDER BY created_at DESC LIMIT 1
 ) tc ON true
@@ -727,19 +933,120 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
         return true;
       }
       if (action === "mark-complete") {
-        await executor.execute(
+        if (!recovered.tool_call_id || !recovered.tool_call_step_id || !recovered.tool_call_name) {
+          throw new Error("Recovery-required run has no failed tool call to mark complete");
+        }
+        const entryId = randomUUID();
+        const confirmation = {
+          confirmedByOperator: true,
+          summary: "Operator confirmed that the external tool completed.",
+        };
+        const leaf = await executor.query<{ entry_id: string; entry_type: string; payload: unknown }>(
           `
-UPDATE turn_steps SET state='completed',completed_at=now(),error=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND state='recovery_required'
+SELECT entry_id,entry_type,payload FROM session_entries
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+ORDER BY sequence DESC LIMIT 1
+FOR UPDATE
           `.trim(),
-          [tenantId, runId],
+          [tenantId, recovered.session_id],
+        );
+        const parentId = activeLeafId(leaf[0]);
+        const entrySequence = await executor.query<{ value: number | string }>(
+          "SELECT COALESCE(MAX(sequence),0)+1 AS value FROM session_entries WHERE tenant_id=$1::uuid AND session_id=$2::uuid",
+          [tenantId, recovered.session_id],
+        );
+        await executor.execute(
+          "UPDATE session_entries SET is_leaf_marker=false WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true",
+          [tenantId, recovered.session_id],
         );
         await executor.execute(
           `
-UPDATE tool_calls SET status='completed',completed_at=now(),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed'
+INSERT INTO session_entries (
+  tenant_id,session_id,entry_id,parent_entry_id,entry_type,sequence,payload,
+  is_leaf_marker,run_id,step_id
+) VALUES ($1::uuid,$2::uuid,$3,$4,'message',$5,$6::jsonb,true,$7::uuid,$8::uuid)
+          `.trim(),
+          [
+            tenantId,
+            recovered.session_id,
+            entryId,
+            parentId,
+            Number(entrySequence[0]?.value ?? 1),
+            JSON.stringify({
+              type: "message",
+              id: entryId,
+              parentId,
+              timestamp: new Date().toISOString(),
+              message: {
+                role: "toolResult",
+                toolCallId: recovered.tool_call_id,
+                toolName: recovered.tool_call_name,
+                content: [{ type: "text", text: confirmation.summary }],
+                isError: false,
+                timestamp: Date.now(),
+                details: confirmation,
+              },
+            }),
+            runId,
+            recovered.tool_call_step_id,
+          ],
+        );
+        await executor.execute(
+          `
+UPDATE turn_steps
+SET state='completed',output=$4::jsonb,session_entry_id=$5,
+    completed_at=now(),error=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
+          `.trim(),
+          [tenantId, runId, recovered.tool_call_step_id, JSON.stringify(confirmation), entryId],
+        );
+        await executor.execute(
+          `
+UPDATE tool_calls
+SET status='completed',output=$4::jsonb,completed_at=now(),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
+          `.trim(),
+          [tenantId, runId, recovered.tool_call_id, JSON.stringify(confirmation)],
+        );
+        await executor.execute(
+          `
+UPDATE message_parts
+SET content=content || jsonb_build_object(
+      'status','completed',
+      'output',$3::jsonb,
+      'summary','Operator confirmed that the tool completed.'
+    )
+WHERE tenant_id=$1::uuid AND type='tool-result'
+  AND content->>'toolCallId'=$2
+          `.trim(),
+          [tenantId, recovered.tool_call_id, JSON.stringify(confirmation)],
+        );
+        const nextStep = await executor.query<{ sequence: number | string; iteration: number | string }>(
+          `
+SELECT COALESCE(MAX(sequence),0)+1 AS sequence,
+       COUNT(*) FILTER (WHERE step_type='model.call')+1 AS iteration
+FROM turn_steps
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
           `.trim(),
           [tenantId, runId],
+        );
+        const iteration = Number(nextStep[0]?.iteration ?? 1);
+        await executor.execute(
+          `
+INSERT INTO turn_steps (
+  tenant_id,run_id,sequence,step_type,state,input,retry_class,idempotency_key
+) VALUES (
+  $1::uuid,$2::uuid,$3,'model.call','pending',$4::jsonb,
+  'idempotent_with_key',$5
+)
+          `.trim(),
+          [
+            tenantId,
+            runId,
+            Number(nextStep[0]?.sequence ?? 1),
+            JSON.stringify({ iteration, operatorRecovery: "mark-complete" }),
+            `${runId}:model:${iteration}`,
+          ],
         );
         await executor.execute(
           `
@@ -749,6 +1056,17 @@ SET state='calling_model',error=NULL,next_action='Continue after operator-confir
 WHERE tenant_id=$1::uuid AND id=$2::uuid
           `.trim(),
           [tenantId, runId],
+        );
+        await executor.execute(
+          `
+UPDATE sessions
+SET runtime_metadata=runtime_metadata || jsonb_build_object(
+      'leafId',$3::text,'activeRunId',$4::text,'lastRunState','calling_model'
+    ),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+          `.trim(),
+          [tenantId, recovered.session_id, entryId, runId],
         );
       } else {
         await executor.execute(
@@ -781,6 +1099,20 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
       );
       await appendDurableEvents(executor, tenantId, runId, recovered.session_id, [
         { kind: "turn.start", turnId: runId, continuation: true },
+        ...(action === "mark-complete" && recovered.tool_call_id && recovered.tool_call_name ? [
+          {
+            kind: "tool.start" as const,
+            toolCallId: recovered.tool_call_id,
+            name: recovered.tool_call_name,
+            args: (recovered.tool_call_input ?? {}) as JsonValue,
+          },
+          {
+            kind: "tool.end" as const,
+            toolCallId: recovered.tool_call_id,
+            status: "completed" as const,
+            summary: "Operator confirmed that the tool completed.",
+          },
+        ] : []),
         {
           kind: "tool.update",
           toolCallId: recovered.tool_call_id ?? runId,
@@ -807,10 +1139,119 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
   }
 }
 
+export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentStreamEvent[] {
+  const merged: AgentStreamEvent[] = [];
+  for (const event of events) {
+    const previous = merged.at(-1);
+    if (
+      event.kind === "message.delta"
+      && previous?.kind === "message.delta"
+      && previous.messageId === event.messageId
+      && previous.channel === event.channel
+    ) {
+      merged[merged.length - 1] = { ...previous, delta: previous.delta + event.delta };
+      continue;
+    }
+    if (
+      event.kind === "tool.update"
+      && previous?.kind === "tool.update"
+      && previous.toolCallId === event.toolCallId
+    ) {
+      merged[merged.length - 1] = event;
+      continue;
+    }
+    merged.push(event);
+  }
+
+  const keep = new Array<boolean>(merged.length).fill(true);
+  const latestPartial = new Set<string>();
+  let keptUsage = false;
+  for (let index = merged.length - 1; index >= 0; index -= 1) {
+    const event = merged[index]!;
+    if (event.kind === "image.partial") {
+      const key = `${event.toolCallId}:${event.requestIndex}`;
+      if (latestPartial.has(key)) keep[index] = false;
+      else latestPartial.add(key);
+    } else if (event.kind === "usage") {
+      if (keptUsage) keep[index] = false;
+      else keptUsage = true;
+    }
+  }
+  return merged.filter((_event, index) => keep[index]);
+}
+
+function activeReplayBoundary(
+  state: string,
+  positions: {
+    message_start: number | string | null;
+    message_end: number | string | null;
+    tool_start: number | string | null;
+    tool_end: number | string | null;
+    turn_start: number | string | null;
+  } | undefined,
+  maximum: number | null,
+): number {
+  const afterEverything = (maximum ?? 0) + 1;
+  if (state === "queued" || state === "assembling_context") {
+    return nullableNumber(positions?.turn_start) ?? afterEverything;
+  }
+  if (state === "calling_model") {
+    const start = nullableNumber(positions?.message_start);
+    const end = nullableNumber(positions?.message_end);
+    return start !== null && start > (end ?? 0) ? start : afterEverything;
+  }
+  if (state === "executing_tool" || state === "waiting") {
+    const start = nullableNumber(positions?.tool_start);
+    const end = nullableNumber(positions?.tool_end);
+    return start !== null && start > (end ?? 0) ? start : afterEverything;
+  }
+  return afterEverything;
+}
+
+function nullableNumber(value: number | string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function continuableRequestMessageId(
+  executor: SqlExecutor,
+  input: DurableTurnAdmission,
+): Promise<string> {
+  const rows = await executor.query<{ request_message_id: string | null }>(
+    `
+SELECT request_message_id
+FROM turn_runs
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+  AND state IN ('failed','cancelled')
+ORDER BY created_at DESC
+LIMIT 1
+    `.trim(),
+    [input.tenantId, input.sessionId],
+  );
+  const requestMessageId = rows[0]?.request_message_id;
+  if (!requestMessageId) throw new Error("No failed or cancelled durable turn can be continued");
+  return requestMessageId;
+}
+
 async function ensureUserMessage(
   executor: SqlExecutor,
   input: DurableTurnAdmission,
 ): Promise<string> {
+  if (input.requestMessageId) {
+    const requested = await executor.query<{ id: string }>(
+      `
+SELECT id
+FROM messages
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND task_id=$3::uuid
+  AND id=$4::uuid AND role='user'
+LIMIT 1
+      `.trim(),
+      [input.tenantId, input.sessionId, input.taskId, input.requestMessageId],
+    );
+    if (!requested[0]) throw new Error("The submitted user message does not belong to this session");
+    return requested[0].id;
+  }
   const rows = await executor.query<{ id: string }>(
     `
 SELECT m.id
@@ -854,6 +1295,158 @@ VALUES ($1::uuid,$2::uuid,'attachment',$3::jsonb,$4)
     );
   }
   return id;
+}
+
+async function projectTerminalAssistant(
+  executor: SqlExecutor,
+  tenantId: string,
+  sessionId: string,
+  taskId: string,
+  runId: string,
+  status: "failed" | "cancelled",
+  error?: string,
+): Promise<void> {
+  const eventRows = await executor.query<{ payload: unknown }>(
+    `
+SELECT payload
+FROM turn_events
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND sequence >= COALESCE((
+    SELECT MAX(sequence) FROM turn_events
+    WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='message.start'
+  ),0)
+ORDER BY sequence ASC
+    `.trim(),
+    [tenantId, runId],
+  );
+  const events = eventRows.map((row) => AgentStreamEventSchema.parse(row.payload));
+  const latest = latestAssistantStreamDraft(events);
+  const usePartial = latest?.open === true;
+  const messageId = usePartial ? latest.messageId : randomUUID();
+  const reasoning = usePartial && latest.reasoning.trim()
+    ? latest.reasoning
+    : !usePartial && !error
+      ? "Response interrupted."
+      : "";
+  const text = usePartial ? latest.text : "";
+
+  await executor.execute(
+    `
+INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant',$5::message_status)
+ON CONFLICT (id) DO UPDATE
+SET status=EXCLUDED.status,updated_at=now()
+    `.trim(),
+    [messageId, tenantId, sessionId, taskId, status],
+  );
+  let ordinal = 0;
+  for (const part of [
+    ...(reasoning ? [{ type: "reasoning", content: reasoning }] : []),
+    ...(text ? [{ type: "text", content: text }] : []),
+    ...(error ? [{ type: "error", content: error.slice(0, 4_000) }] : []),
+  ]) {
+    await executor.execute(
+      `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,$3::message_part_kind,$4::jsonb,$5)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+      `.trim(),
+      [tenantId, messageId, part.type, JSON.stringify(part.content), ordinal],
+    );
+    ordinal += 1;
+  }
+
+  if (!text.trim()) return;
+  const existing = await executor.query<{ entry_id: string }>(
+    "SELECT entry_id FROM session_entries WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND entry_id=$3",
+    [tenantId, sessionId, messageId],
+  );
+  if (existing[0]) return;
+  const leaf = await executor.query<{ entry_id: string; entry_type: string; payload: unknown }>(
+    `
+SELECT entry_id,entry_type,payload FROM session_entries
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+ORDER BY sequence DESC LIMIT 1
+FOR UPDATE
+    `.trim(),
+    [tenantId, sessionId],
+  );
+  const parentId = activeLeafId(leaf[0]);
+  const sequence = await executor.query<{ value: number | string }>(
+    "SELECT COALESCE(MAX(sequence),0)+1 AS value FROM session_entries WHERE tenant_id=$1::uuid AND session_id=$2::uuid",
+    [tenantId, sessionId],
+  );
+  await executor.execute(
+    "UPDATE session_entries SET is_leaf_marker=false WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true",
+    [tenantId, sessionId],
+  );
+  const payload = {
+    type: "message",
+    id: messageId,
+    parentId,
+    timestamp: new Date().toISOString(),
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      stopReason: status,
+      timestamp: Date.now(),
+    },
+  };
+  await executor.execute(
+    `
+INSERT INTO session_entries (
+  tenant_id,session_id,entry_id,parent_entry_id,entry_type,sequence,payload,is_leaf_marker,run_id
+) VALUES ($1::uuid,$2::uuid,$3,$4,'message',$5,$6::jsonb,true,$7::uuid)
+ON CONFLICT (tenant_id,session_id,entry_id) DO NOTHING
+    `.trim(),
+    [tenantId, sessionId, messageId, parentId, Number(sequence[0]?.value ?? 1), JSON.stringify(payload), runId],
+  );
+}
+
+async function projectInterruptedTools(
+  executor: SqlExecutor,
+  tenantId: string,
+  sessionId: string,
+  taskId: string,
+  runId: string,
+): Promise<void> {
+  const tools = await executor.query<{ id: string; tool_name: string; input: unknown }>(
+    `
+SELECT id,tool_name,input
+FROM tool_calls
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND status IN ('pending','waiting-for-approval','running')
+ORDER BY created_at ASC
+    `.trim(),
+    [tenantId, runId],
+  );
+  for (const tool of tools) {
+    const messageId = randomUUID();
+    await executor.execute(
+      `
+INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant','complete')
+      `.trim(),
+      [messageId, tenantId, sessionId, taskId],
+    );
+    await executor.execute(
+      `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'tool-result',$3::jsonb,0)
+      `.trim(),
+      [
+        tenantId,
+        messageId,
+        JSON.stringify({
+          toolCallId: tool.id,
+          name: tool.tool_name,
+          arguments: tool.input,
+          status: "failed",
+          summary: "Interrupted by the user.",
+        }),
+      ],
+    );
+  }
 }
 
 async function ensureInputFileAssociations(

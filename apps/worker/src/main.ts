@@ -104,7 +104,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const outbox = new RuntimeOutboxDispatcher(executor, queue, {
     tenantId: env.BERRY_TENANT_ID ?? "00000000-0000-7000-8000-000000000001",
     workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
-    pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 250,
+    pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 100,
   });
   outbox.start();
 

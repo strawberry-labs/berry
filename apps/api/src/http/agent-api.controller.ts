@@ -109,6 +109,7 @@ function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "t
 
 const StartTurnRequestSchema = z.object({
   input: z.string().min(1).optional(),
+  requestMessageId: z.string().uuid().optional(),
   continueInterruptedTurn: z.boolean().optional(),
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1).optional(),
@@ -129,6 +130,9 @@ const StartTurnRequestSchema = z.object({
     }
     if (request.attachments !== undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["attachments"], message: "A continued turn must not include new attachments" });
+    }
+    if (request.requestMessageId !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["requestMessageId"], message: "A continued turn must not reference a new user message" });
     }
     if (request.replaceFromMessageId !== undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["replaceFromMessageId"], message: "A continued turn cannot replace an earlier message" });
@@ -160,6 +164,7 @@ const ApprovalDecisionRequestSchema = ApprovalDecisionSchema.pick({ decision: tr
 
 const AnswerQuestionRequestSchema = z.object({
   answer: z.string().trim().min(1),
+  answerMessageId: z.string().uuid().optional(),
   selectedOptions: z.array(z.string()).max(24).optional(),
   answers: z.array(QuestionAnswerSchema).min(1).max(5).optional(),
 }).strict();
@@ -726,8 +731,10 @@ export class AgentApiController {
           taskId: task.id,
           sessionId,
           requestId,
+          ...(request.requestMessageId ? { requestMessageId: request.requestMessageId } : {}),
           input: request.continueInterruptedTurn ? "" : request.input ?? "",
           ...(request.attachments ? { attachments: request.attachments } : {}),
+          ...(request.continueInterruptedTurn ? { continueInterruptedTurn: true } : {}),
           runtimeRequest: {
             providerId,
             model: governedRequest.model ?? null,
@@ -735,6 +742,7 @@ export class AgentApiController {
             workspaceId: governedRequest.workspaceId ?? task.workspaceId,
             permissionMode: governedRequest.permissionMode ?? session.permissionMode,
             reasoning: governedRequest.reasoning ?? "off",
+            continueInterruptedTurn: request.continueInterruptedTurn === true,
             maxTokens: governedRequest.maxTokens ?? 8_000,
             contextWindowTokens,
             networkPolicy: governedRequest.networkPolicy,

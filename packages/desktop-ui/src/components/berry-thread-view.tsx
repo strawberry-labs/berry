@@ -343,9 +343,7 @@ export function BerryThreadView({
                           turnKey={liveTurnKey}
                           active
                           elapsedMs={stream.turnStartedAt ? now - stream.turnStartedAt : undefined}
-                        >
-                          <ThoughtRow active reasoning="" />
-                        </TurnActivity>
+                        />
                       ) : (
                         // Desktop keeps Codex's compact pending treatment.
                         <ThoughtRow active reasoning="" />
@@ -701,7 +699,7 @@ function BerryAssistantTurnGroup({
 
 export function isContinuableAssistantTurn(messages: Message[]): boolean {
   const latestAssistant = messages.at(-1);
-  return latestAssistant?.status === "failed";
+  return latestAssistant?.status === "failed" || latestAssistant?.status === "cancelled";
 }
 
 function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void | Promise<void> }) {

@@ -3,7 +3,16 @@
 }
 
 {$BERRY_DOMAIN} {
-	encode zstd gzip
+	@not_event_streams {
+		not path /v1/sessions/*/events /v1/tasks/*/events
+	}
+	encode @not_event_streams zstd gzip
+
+	@event_streams path /v1/sessions/*/events /v1/tasks/*/events
+	header @event_streams {
+		Cache-Control "no-cache, no-transform"
+		X-Accel-Buffering "no"
+	}
 
 	@immutable_assets path /assets/*
 	header @immutable_assets Cache-Control "public, max-age=31536000, immutable"

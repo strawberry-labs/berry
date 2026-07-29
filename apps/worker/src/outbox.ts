@@ -22,8 +22,8 @@ export class RuntimeOutboxDispatcher {
 
   start(): void {
     if (this.#timer) return;
-    void this.dispatchDue();
-    this.#timer = setInterval(() => void this.dispatchDue(), this.options.pollMs ?? 1_000);
+    this.#dispatchSafely();
+    this.#timer = setInterval(() => this.#dispatchSafely(), this.options.pollMs ?? 1_000);
     this.#timer.unref?.();
   }
 
@@ -130,6 +130,12 @@ export class RuntimeOutboxDispatcher {
       return callback(executor);
     };
     return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
+  }
+
+  #dispatchSafely(): void {
+    void this.dispatchDue().catch((error) => {
+      console.error("[runtime-outbox] Dispatch cycle failed; the next poll will retry.", error);
+    });
   }
 }
 

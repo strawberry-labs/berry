@@ -2174,6 +2174,38 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
 ]);
 export type AgentStreamEvent = z.infer<typeof AgentStreamEventSchema>;
 
+export interface AssistantStreamDraft {
+  messageId: string;
+  text: string;
+  reasoning: string;
+  open: boolean;
+}
+
+/**
+ * Reconstruct the latest assistant stream from durable events. This is used by
+ * both the API cancellation path and the worker failure path so partial output
+ * survives a disconnect, cancellation, or provider error.
+ */
+export function latestAssistantStreamDraft(
+  events: readonly AgentStreamEvent[],
+): AssistantStreamDraft | null {
+  let draft: AssistantStreamDraft | null = null;
+  for (const event of events) {
+    if (event.kind === "message.start" && event.role === "assistant") {
+      draft = { messageId: event.messageId, text: "", reasoning: "", open: true };
+      continue;
+    }
+    if (!draft || !("messageId" in event) || event.messageId !== draft.messageId) continue;
+    if (event.kind === "message.delta") {
+      if (event.channel === "reasoning") draft.reasoning += event.delta;
+      else draft.text += event.delta;
+    } else if (event.kind === "message.end") {
+      draft.open = false;
+    }
+  }
+  return draft;
+}
+
 export const TurnStateSchema = z.object({
   active: z.boolean(),
   turnId: z.string().nullable(),

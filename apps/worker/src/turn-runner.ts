@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   AgentStreamEventSchema,
+  latestAssistantStreamDraft,
   PromptManifestSchema,
   SessionCheckpointV2Schema,
   type AgentStreamEvent,
@@ -126,14 +127,37 @@ export interface DurableTurnMutation {
   assistantMessage?: {
     id: string;
     text: string;
+    reasoning?: string;
+    status?: "complete" | "failed" | "cancelled";
+    error?: string;
     inputTokens: number;
     outputTokens: number;
+    generationMs?: number;
+    toolCalls?: ReadonlyArray<{
+      id: string;
+      name: string;
+      input: JsonValue;
+    }>;
     citations?: ReadonlyArray<{
       sourceId: string;
       chunkId: string | null;
       label: string;
       href: string | null;
     }>;
+  };
+  terminalAssistant?: {
+    status: "failed" | "cancelled";
+    error?: string;
+  };
+  toolResultMessage?: {
+    id: string;
+    toolCallId: string;
+    name: string;
+    input: JsonValue;
+    status: "completed" | "failed" | "denied";
+    output?: JsonValue;
+    summary?: string;
+    durationMs?: number;
   };
   toolCalls?: ReadonlyArray<{
     id: string;
@@ -204,6 +228,7 @@ export interface TurnModelToolIntent {
 
 export interface TurnModelResult {
   text: string;
+  reasoning?: string;
   inputTokens: number;
   outputTokens: number;
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
@@ -396,6 +421,7 @@ export class DurableTurnRunner {
       return "compacting";
     }
     const messageId = randomUUID();
+    const modelStartedAt = Date.now();
     await this.repository.commit(snapshot, {
       expectedState: "calling_model",
       nextState: "calling_model",
@@ -513,9 +539,16 @@ export class DurableTurnRunner {
       assistantMessage: {
         id: messageId,
         text: result.text,
+        ...(result.reasoning ? { reasoning: result.reasoning } : {}),
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
+        generationMs: Math.max(1, Date.now() - modelStartedAt),
         citations: groundingCitations(snapshot.groundingContext),
+        toolCalls: result.toolCalls.map((call) => ({
+          id: call.id,
+          name: call.name,
+          input: call.input,
+        })),
       },
       ...(result.promptManifest ? { promptManifest: result.promptManifest } : {}),
       toolCalls: result.toolCalls.map((call, index) => ({
@@ -568,13 +601,20 @@ export class DurableTurnRunner {
         state: "completed",
         output: compactionResultJson(result),
       }],
+      events: [{
+        kind: "session.note",
+        note: "compacted",
+        detail: result.tokensAfter === undefined
+          ? `Context compacted from ${result.tokensBefore} tokens into a portable checkpoint.`
+          : `Context compacted from ${result.tokensBefore} to ${result.tokensAfter} tokens.`,
+      }],
       nextAction: "Resume the pending model request from the portable checkpoint",
     });
   }
 
   private async executeTool(snapshot: DurableTurnSnapshot): Promise<TurnRunState> {
     const step = snapshot.steps
-      .filter((candidate) => candidate.type.startsWith("tool.") && candidate.state !== "completed")
+      .filter(isRunnableToolStep)
       .sort((left, right) => left.sequence - right.sequence)[0];
     if (!step) {
       const iteration = modelIteration(snapshot.steps) + 1;
@@ -647,9 +687,23 @@ export class DurableTurnRunner {
         nextState: "recovery_required",
         steps: [{ ...step, state: "recovery_required", error: "The worker stopped after this non-idempotent tool began; its outcome is ambiguous." }],
         events: [
+          {
+            kind: "tool.end",
+            toolCallId,
+            status: "failed",
+            summary: "The tool outcome is ambiguous and requires operator review.",
+          },
           { kind: "error", message: "A tool may have changed external state before the worker stopped. Human recovery is required." },
           { kind: "turn.end", turnId: snapshot.id, status: "failed" },
         ],
+        toolResultMessage: {
+          id: randomUUID(),
+          toolCallId,
+          name: toolName,
+          input: (step.input.arguments ?? {}) as JsonValue,
+          status: "failed",
+          summary: "The tool outcome is ambiguous and requires operator review.",
+        },
         error: "ambiguous_non_idempotent_tool",
         nextAction: "Review the tool outcome and choose retry, mark complete, or cancel",
         taskStatus: "failed",
@@ -662,11 +716,34 @@ export class DurableTurnRunner {
     if (requiresApproval && approval?.status !== "approved") {
       if (approval?.status === "denied" || approval?.status === "expired") {
         const entryId = randomUUID();
+        const remaining = snapshot.steps.some((candidate) =>
+          candidate.id !== step.id && isRunnableToolStep(candidate)
+        );
+        const iteration = modelIteration(snapshot.steps) + 1;
         await this.commitAndWake(snapshot, {
           expectedState: "executing_tool",
-          nextState: "calling_model",
-          steps: [{ ...step, state: "failed", error: `Tool approval was ${approval.status}` }],
+          nextState: remaining ? "executing_tool" : "calling_model",
+          steps: [
+            { ...step, state: "failed", error: `Tool approval was ${approval.status}` },
+            ...(!remaining ? [{
+              id: randomUUID(),
+              sequence: nextStepSequence(snapshot.steps),
+              type: "model.call",
+              state: "pending" as const,
+              input: { iteration },
+              retryClass: "idempotent_with_key" as const,
+              idempotencyKey: `${snapshot.id}:model:${iteration}`,
+            }] : []),
+          ],
           events: [{ kind: "tool.end", toolCallId, status: "denied", summary: `Approval ${approval.status}` }],
+          toolResultMessage: {
+            id: randomUUID(),
+            toolCallId,
+            name: toolName,
+            input: (step.input.arguments ?? {}) as JsonValue,
+            status: "denied",
+            summary: `Approval ${approval.status}`,
+          },
           entries: [{
             entryId,
             entryType: "message",
@@ -686,9 +763,9 @@ export class DurableTurnRunner {
               },
             },
           }],
-          nextAction: "Tell the model the tool was denied",
+          nextAction: remaining ? "Execute the next tool step" : "Tell the model the tool was denied",
         });
-        return "calling_model";
+        return remaining ? "executing_tool" : "calling_model";
       }
       if (!approval) {
         const approvalId = randomUUID();
@@ -748,12 +825,76 @@ export class DurableTurnRunner {
       nextAction: `Execute ${step.type}`,
       keepLease: true,
     });
-    const result = await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
+    const toolStartedAt = Date.now();
+    let result: TurnToolResult;
+    try {
+      result = await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
+    } catch (error) {
+      if (error instanceof DurableTurnRetryableError || step.retryClass === "non_idempotent_manual") {
+        throw error;
+      }
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000);
+      const entryId = randomUUID();
+      const remaining = snapshot.steps.some((candidate) =>
+        candidate.id !== step.id && isRunnableToolStep(candidate)
+      );
+      const iteration = modelIteration(snapshot.steps) + 1;
+      await this.commitAndWake(snapshot, {
+        expectedState: "executing_tool",
+        nextState: remaining ? "executing_tool" : "calling_model",
+        steps: [
+          { ...step, state: "failed", error: message },
+          ...(!remaining ? [{
+            id: randomUUID(),
+            sequence: nextStepSequence(snapshot.steps),
+            type: "model.call",
+            state: "pending" as const,
+            input: { iteration },
+            retryClass: "idempotent_with_key" as const,
+            idempotencyKey: `${snapshot.id}:model:${iteration}`,
+          }] : []),
+        ],
+        events: [{
+          kind: "tool.end",
+          toolCallId,
+          status: "failed",
+          summary: message.slice(0, 2_000),
+        }],
+        toolResultMessage: {
+          id: randomUUID(),
+          toolCallId,
+          name: toolName,
+          input: (step.input.arguments ?? {}) as JsonValue,
+          status: "failed",
+          summary: message.slice(0, 2_000),
+          durationMs: Math.max(0, Date.now() - toolStartedAt),
+        },
+        entries: [{
+          entryId,
+          entryType: "message",
+          stepId: step.id,
+          payload: {
+            type: "message",
+            id: entryId,
+            parentId: snapshot.entries.at(-1)?.entryId ?? null,
+            timestamp: new Date().toISOString(),
+            message: {
+              role: "toolResult",
+              toolCallId,
+              toolName,
+              content: [{ type: "text", text: `Tool failed: ${message}` }],
+              isError: true,
+              timestamp: Date.now(),
+            },
+          },
+        }],
+        nextAction: remaining ? "Execute the next tool step" : "Let the model handle the failed tool result",
+      });
+      return remaining ? "executing_tool" : "calling_model";
+    }
     const entryId = randomUUID();
     const remaining = snapshot.steps.some((candidate) =>
-      candidate.type.startsWith("tool.")
-      && candidate.id !== step.id
-      && candidate.state !== "completed"
+      candidate.id !== step.id && isRunnableToolStep(candidate)
     );
     const iteration = modelIteration(snapshot.steps) + 1;
     await this.commitAndWake(snapshot, {
@@ -782,6 +923,16 @@ export class DurableTurnRunner {
         status: "completed",
         summary: result.summary.slice(0, 2_000),
       }],
+      toolResultMessage: {
+        id: randomUUID(),
+        toolCallId,
+        name: toolName,
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "completed",
+        output: result.output,
+        summary: result.summary.slice(0, 2_000),
+        durationMs: Math.max(0, Date.now() - toolStartedAt),
+      },
       entries: [{
         entryId,
         entryType: "message",
@@ -893,6 +1044,7 @@ export class DurableTurnRunner {
         .filter((step) => step.state === "pending" || step.state === "waiting")
         .map((step) => ({ ...step, state: "cancelled" as const })),
       events: [{ kind: "turn.end", turnId: snapshot.id, status: "cancelled" }],
+      terminalAssistant: { status: "cancelled" },
       nextAction: null,
       waitingReason: null,
       taskStatus: "cancelled",
@@ -916,9 +1068,26 @@ export class DurableTurnRunner {
         }],
       } : {}),
       events: [
+        ...(activeStep?.type.startsWith("tool.") ? [{
+          kind: "tool.end" as const,
+          toolCallId: stringValue(activeStep.input.toolCallId) ?? activeStep.id,
+          status: "failed" as const,
+          summary: message.slice(0, 2_000),
+        }] : []),
         { kind: "error", message: message.slice(0, 4_000) },
         { kind: "turn.end", turnId: snapshot.id, status: "failed" },
       ],
+      terminalAssistant: { status: "failed", error: message.slice(0, 4_000) },
+      ...(activeStep?.type.startsWith("tool.") ? {
+        toolResultMessage: {
+          id: randomUUID(),
+          toolCallId: stringValue(activeStep.input.toolCallId) ?? activeStep.id,
+          name: stringValue(activeStep.input.toolName) ?? activeStep.type.slice(5),
+          input: (activeStep.input.arguments ?? {}) as JsonValue,
+          status: "failed" as const,
+          summary: message.slice(0, 2_000),
+        },
+      } : {}),
       nextAction: null,
       waitingReason: null,
       error: message.slice(0, 4_000),
@@ -967,16 +1136,36 @@ export class DurableTurnRunner {
     const heartbeatMs = this.options.heartbeatMs ?? Math.max(5_000, Math.floor(leaseSeconds * 1_000 / 3));
     let timer: NodeJS.Timeout | null = null;
     let stopped = false;
+    let heartbeatFailure: unknown;
     const heartbeat = async () => {
       if (stopped) return;
-      await this.repository.heartbeat(snapshot.tenantId, snapshot.id, snapshot.leaseOwner, leaseSeconds);
+      try {
+        const retained = await this.repository.heartbeat(
+          snapshot.tenantId,
+          snapshot.id,
+          snapshot.leaseOwner,
+          leaseSeconds,
+        );
+        if (!retained) {
+          heartbeatFailure = new DurableTurnRetryableError("Turn lease was lost during a long-running operation");
+        }
+      } catch (error) {
+        heartbeatFailure = error;
+      }
+      if (heartbeatFailure) return;
       if (!stopped) timer = setTimeout(() => void heartbeat(), heartbeatMs);
       timer?.unref?.();
     };
     timer = setTimeout(() => void heartbeat(), heartbeatMs);
     timer.unref?.();
     try {
-      return await operation();
+      const result = await operation();
+      if (heartbeatFailure) {
+        throw heartbeatFailure instanceof DurableTurnRetryableError
+          ? heartbeatFailure
+          : new DurableTurnRetryableError("Turn heartbeat failed during a long-running operation", heartbeatFailure);
+      }
+      return result;
     } finally {
       stopped = true;
       if (timer) clearTimeout(timer);
@@ -1146,6 +1335,17 @@ FOR UPDATE
       if (mutation.question) await insertQuestion(executor, snapshot, mutation.question);
       const appendedEntries = await appendEntries(executor, snapshot, mutation.entries ?? []);
       if (mutation.assistantMessage) await insertAssistantProjection(executor, snapshot, mutation.assistantMessage);
+      if (mutation.toolResultMessage) {
+        await insertToolResultProjection(executor, snapshot, mutation.toolResultMessage);
+      }
+      if (mutation.terminalAssistant) {
+        const terminalEntryIds = await insertTerminalAssistantProjection(
+          executor,
+          snapshot,
+          mutation.terminalAssistant,
+        );
+        appendedEntries.push(...terminalEntryIds);
+      }
       await appendEvents(executor, snapshot, mutation.events ?? []);
       for (const item of mutation.outbox ?? []) {
         await executor.execute(
@@ -1276,6 +1476,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       arguments: string;
     }>();
     let rawText = "";
+    let rawReasoning = "";
     let emittedText = "";
     let bufferedText = "";
     let kimiMarkupStarted = false;
@@ -1328,7 +1529,10 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     })) {
       servedModel = chunk.model || servedModel;
       await acceptTextDelta(chunk.delta);
-      if (chunk.reasoningDelta) await context.emitDelta(chunk.reasoningDelta, "reasoning");
+      if (chunk.reasoningDelta) {
+        rawReasoning += chunk.reasoningDelta;
+        await context.emitDelta(chunk.reasoningDelta, "reasoning");
+      }
       for (const delta of chunk.toolCalls ?? []) {
         const current = streamedToolCalls.get(delta.index) ?? {
           id: "",
@@ -1403,6 +1607,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       : undefined;
     return {
       text,
+      ...(rawReasoning ? { reasoning: rawReasoning } : {}),
       inputTokens: finalUsage?.inputTokens ?? 0,
       outputTokens: finalUsage?.outputTokens ?? 0,
       ...(usage ? { usage } : {}),
@@ -1541,6 +1746,11 @@ function hasAmbiguousNonIdempotentTool(snapshot: DurableTurnSnapshot): boolean {
     );
 }
 
+function isRunnableToolStep(step: DurableTurnStep): boolean {
+  return step.type.startsWith("tool.")
+    && (step.state === "pending" || step.state === "running");
+}
+
 function approvalKind(value: unknown): NonNullable<TurnModelToolIntent["approvalKind"]> {
   return value === "file-edit" || value === "shell" || value === "terminal"
     || value === "mcp" || value === "browser" || value === "credential"
@@ -1643,6 +1853,9 @@ function modelMessages(snapshot: DurableTurnSnapshot): {
     skillInstructions,
   ].filter(Boolean).join("\n\n");
   const dynamicSystem = [
+    snapshot.runtimeRequest.continueInterruptedTurn === true
+      ? "This is an explicit continuation request. Continue the interrupted assistant response from the persisted partial output without repeating completed content."
+      : "",
     checkpoint
       ? `Portable checkpoint:\n${JSON.stringify(checkpoint)}`
       : "",
@@ -1688,6 +1901,12 @@ function modelMessages(snapshot: DurableTurnSnapshot): {
         content: contentText(message?.content),
       });
     }
+  }
+  if (snapshot.runtimeRequest.continueInterruptedTurn === true) {
+    messages.push({
+      role: "user",
+      content: "Continue the interrupted response from where it stopped. Do not repeat the completed portion.",
+    });
   }
   if (!messages.some((message) => message.role === "user")) {
     messages.push({
@@ -2064,29 +2283,79 @@ async function insertAssistantProjection(
   await executor.execute(
     `
 INSERT INTO messages (
-  id,tenant_id,session_id,task_id,role,status,model,input_tokens,output_tokens
-) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant','complete',$5,$6,$7)
-ON CONFLICT (id) DO NOTHING
+  id,tenant_id,session_id,task_id,role,status,model,input_tokens,output_tokens,generation_ms
+) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant',$5::message_status,$6,$7,$8,$9)
+ON CONFLICT (id) DO UPDATE
+SET status=EXCLUDED.status,
+    input_tokens=GREATEST(messages.input_tokens,EXCLUDED.input_tokens),
+    output_tokens=GREATEST(messages.output_tokens,EXCLUDED.output_tokens),
+    generation_ms=GREATEST(messages.generation_ms,EXCLUDED.generation_ms),
+    updated_at=now()
     `.trim(),
     [
       message.id,
       snapshot.tenantId,
       snapshot.sessionId,
       snapshot.taskId,
+      message.status ?? "complete",
       stringValue(snapshot.runtimeRequest.model),
       message.inputTokens,
       message.outputTokens,
+      message.generationMs ?? 0,
     ],
   );
   let ordinal = 0;
+  if (message.reasoning) {
+    await executor.execute(
+      `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'reasoning',$3::jsonb,$4)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+      `.trim(),
+      [snapshot.tenantId, message.id, JSON.stringify(message.reasoning), ordinal],
+    );
+    ordinal += 1;
+  }
   if (message.text) {
     await executor.execute(
       `
 INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
-VALUES ($1::uuid,$2::uuid,'text',$3::jsonb,0)
+VALUES ($1::uuid,$2::uuid,'text',$3::jsonb,$4)
 ON CONFLICT (message_id,ordinal) DO NOTHING
       `.trim(),
-      [snapshot.tenantId, message.id, JSON.stringify(message.text)],
+      [snapshot.tenantId, message.id, JSON.stringify(message.text), ordinal],
+    );
+    ordinal += 1;
+  }
+  if (message.error) {
+    await executor.execute(
+      `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'error',$3::jsonb,$4)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+      `.trim(),
+      [snapshot.tenantId, message.id, JSON.stringify(message.error), ordinal],
+    );
+    ordinal += 1;
+  }
+  for (const toolCall of message.toolCalls ?? []) {
+    await executor.execute(
+      `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'tool-call',$3::jsonb,$4)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+      `.trim(),
+      [
+        snapshot.tenantId,
+        message.id,
+        JSON.stringify({
+          toolCallId: toolCall.id,
+          name: toolCall.name,
+          arguments: toolCall.input,
+          status: "running",
+        }),
+        ordinal,
+      ],
     );
     ordinal += 1;
   }
@@ -2101,6 +2370,98 @@ ON CONFLICT (message_id,ordinal) DO NOTHING
     );
     ordinal += 1;
   }
+}
+
+async function insertToolResultProjection(
+  executor: SqlExecutor,
+  snapshot: DurableTurnSnapshot,
+  result: NonNullable<DurableTurnMutation["toolResultMessage"]>,
+): Promise<void> {
+  await executor.execute(
+    `
+INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant','complete')
+ON CONFLICT (id) DO NOTHING
+    `.trim(),
+    [result.id, snapshot.tenantId, snapshot.sessionId, snapshot.taskId],
+  );
+  await executor.execute(
+    `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'tool-result',$3::jsonb,0)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+    `.trim(),
+    [
+      snapshot.tenantId,
+      result.id,
+      JSON.stringify({
+        toolCallId: result.toolCallId,
+        name: result.name,
+        arguments: result.input,
+        status: result.status,
+        ...(result.output !== undefined ? { output: result.output } : {}),
+        ...(result.summary ? { summary: result.summary } : {}),
+        ...(result.durationMs !== undefined ? { durationMs: result.durationMs } : {}),
+      }),
+    ],
+  );
+}
+
+async function insertTerminalAssistantProjection(
+  executor: SqlExecutor,
+  snapshot: DurableTurnSnapshot,
+  terminal: NonNullable<DurableTurnMutation["terminalAssistant"]>,
+): Promise<string[]> {
+  const rows = await executor.query<{ payload: unknown }>(
+    `
+SELECT payload
+FROM turn_events
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND sequence >= COALESCE((
+    SELECT MAX(sequence) FROM turn_events
+    WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='message.start'
+  ),0)
+ORDER BY sequence ASC
+    `.trim(),
+    [snapshot.tenantId, snapshot.id],
+  );
+  const draft = latestAssistantStreamDraft(
+    rows.map((row) => AgentStreamEventSchema.parse(row.payload)),
+  );
+  const usePartial = draft?.open === true;
+  const messageId = usePartial ? draft.messageId : randomUUID();
+  const text = usePartial ? draft.text : "";
+  const reasoning = usePartial && draft.reasoning.trim()
+    ? draft.reasoning
+    : !usePartial && !terminal.error
+      ? "Response interrupted."
+      : "";
+  await insertAssistantProjection(executor, snapshot, {
+    id: messageId,
+    text,
+    reasoning,
+    status: terminal.status,
+    ...(terminal.error ? { error: terminal.error } : {}),
+    inputTokens: 0,
+    outputTokens: Math.ceil((text.length + reasoning.length) / 4),
+  });
+  if (!text.trim()) return [];
+  return appendEntries(executor, snapshot, [{
+    entryId: messageId,
+    entryType: "message",
+    payload: {
+      type: "message",
+      id: messageId,
+      parentId: snapshot.entries.at(-1)?.entryId ?? null,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text }],
+        stopReason: terminal.status,
+        timestamp: Date.now(),
+      },
+    },
+  }]);
 }
 
 async function appendEvents(

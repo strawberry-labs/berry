@@ -80,7 +80,7 @@ export function Composer({
   onUserMessagePersisted: (sessionId: string, optimisticMessageId: string, message: Message) => void;
   onAssistantMessage: (text: string, sessionId: string, taskId: string) => void;
   onEvent: (sessionId: string, event: Parameters<typeof reduceStream>[1]) => void;
-  runTurn: (task: Task, params: { input: string; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
+  runTurn: (task: Task, params: { input: string; requestMessageId?: string | undefined; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
   onCancel: () => void;
   variant: "home" | "thread";
   onCreateTask: (options?: { title?: string }) => Promise<Task | null>;
@@ -194,6 +194,7 @@ export function Composer({
     if (optimisticMessageId) onUserMessagePersisted(sessionId, optimisticMessageId, persistedMessage);
     await client.answerQuestion(question.questionId, {
       answer: questionToolAnswer(answers),
+      answerMessageId: persistedMessage.id,
       selectedOptions: answers.flatMap((item) => item.selectedOptions),
       answers,
     });
@@ -298,7 +299,11 @@ export function Composer({
         if (optimisticMessageId) onUserMessagePersisted(sessionId, optimisticMessageId, persistedUserMessage);
         const sent = attachments;
         setAttachments([]);
-        await runTurn(task, { input: runtimeInput, ...(sent.length > 0 ? { attachments: sent } : {}) });
+        await runTurn(task, {
+          input: runtimeInput,
+          requestMessageId: persistedUserMessage.id,
+          ...(sent.length > 0 ? { attachments: sent } : {}),
+        });
       } else {
         onEvent(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
         const turnId = `turn_${Date.now()}`;

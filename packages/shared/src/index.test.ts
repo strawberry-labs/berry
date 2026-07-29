@@ -30,12 +30,27 @@ import {
   networkPolicyForSandbox,
   parseNetworkDomainAllowlist,
   activeMessageDraftVariantIndex,
+  latestAssistantStreamDraft,
   type AgentStreamEvent,
 } from "./index.ts";
 import { renderHostProtocolDocs } from "./protocol-docs.ts";
 import { builtInCommandManifests, parseSlashCommand } from "./commands.ts";
 
 describe("AgentStreamEventSchema", () => {
+  it("reconstructs the latest partial assistant stream", () => {
+    expect(latestAssistantStreamDraft([
+      { kind: "message.start", messageId: "msg_1", role: "assistant" },
+      { kind: "message.delta", messageId: "msg_1", delta: "Checking ", channel: "reasoning" },
+      { kind: "message.delta", messageId: "msg_1", delta: "files", channel: "reasoning" },
+      { kind: "message.delta", messageId: "msg_1", delta: "Partial answer", channel: "text" },
+    ])).toEqual({
+      messageId: "msg_1",
+      reasoning: "Checking files",
+      text: "Partial answer",
+      open: true,
+    });
+  });
+
   it("parses every event kind in the turn vocabulary", () => {
     const events: AgentStreamEvent[] = [
       { kind: "turn.start", turnId: "turn_1" },

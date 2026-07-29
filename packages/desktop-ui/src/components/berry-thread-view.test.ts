@@ -33,6 +33,12 @@ describe("failed assistant turn recovery", () => {
     ])).toBe(true);
   });
 
+  it("offers continuation when the latest assistant boundary was cancelled", () => {
+    expect(isContinuableAssistantTurn([
+      assistant("cancelled", "assistant_cancelled"),
+    ])).toBe(true);
+  });
+
   it("removes continuation after a later assistant response completes", () => {
     expect(isContinuableAssistantTurn([
       assistant("failed", "assistant_failure"),

@@ -637,7 +637,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // active SSE reader at shell scope so navigation only changes which stream
   // is visible; it never owns or cancels server-side execution.
   const trackedSessionsRef = React.useRef(new Set<string>());
-  const sessionConnectionsRef = React.useRef(new Map<string, { source: EventSource; reconnectTimer: number | null; attempts: number }>());
+  const sessionConnectionsRef = React.useRef(new Map<string, {
+    source: EventSource;
+    reconnectTimer: number | null;
+    attempts: number;
+    ready: Promise<void>;
+    cancelReady: () => void;
+  }>());
   const lastEventCursorBySessionRef = React.useRef(new Map<string, string>());
   const durableEventSequencesBySessionRef = React.useRef(new Map<string, DurableEventSequences>());
   const handleQueueTurnEndRef = React.useRef<(sessionId: string, status: string) => void>(() => undefined);
@@ -731,24 +737,35 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (untrack) trackedSessionsRef.current.delete(sessionId);
     const connection = sessionConnectionsRef.current.get(sessionId);
     if (!connection) return;
+    connection.cancelReady();
     connection.source.close();
     if (connection.reconnectTimer !== null) window.clearTimeout(connection.reconnectTimer);
     sessionConnectionsRef.current.delete(sessionId);
   }, []);
 
   const attachSessionStream = React.useCallback((sessionId: string) => {
-    if (!client) return;
+    if (!client) return Promise.resolve();
     trackedSessionsRef.current.add(sessionId);
-    if (sessionConnectionsRef.current.has(sessionId)) return;
+    const existing = sessionConnectionsRef.current.get(sessionId);
+    if (existing) return existing.ready;
 
-    const connect = (attempts: number) => {
-      if (!trackedSessionsRef.current.has(sessionId) || sessionConnectionsRef.current.has(sessionId)) return;
+    const connect = (attempts: number): Promise<void> => {
+      const currentConnection = sessionConnectionsRef.current.get(sessionId);
+      if (!trackedSessionsRef.current.has(sessionId)) return Promise.resolve();
+      if (currentConnection) return currentConnection.ready;
       let terminal = false;
+      let resolveReady!: () => void;
+      let rejectReady!: (cause: unknown) => void;
+      const ready = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
       const source = client.streamEvents(sessionId, {
         onOpen: () => {
           const current = sessionConnectionsRef.current.get(sessionId);
           if (current) current.attempts = 0;
           setConnectionState("online");
+          resolveReady();
         },
         onEvent: (event, cursor) => {
           const reconciled = reconcileDurableEventCursor(
@@ -756,7 +773,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             cursor,
           );
           if (!reconciled.accepted) return;
-          durableEventSequencesBySessionRef.current.set(sessionId, reconciled.sequences);
+          const currentRunId = event.kind === "turn.start" && cursor
+            ? cursor.slice(0, cursor.lastIndexOf(":"))
+            : null;
+          durableEventSequencesBySessionRef.current.set(
+            sessionId,
+            currentRunId
+              ? { [currentRunId]: reconciled.sequences[currentRunId] ?? 0 }
+              : reconciled.sequences,
+          );
           if (cursor) lastEventCursorBySessionRef.current.set(sessionId, cursor);
           updateSessionStream(sessionId, event);
           updateDurableStateFromEvent(sessionId, event);
@@ -776,21 +801,35 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         },
         onError: () => {
           if (terminal || !trackedSessionsRef.current.has(sessionId)) return;
+          rejectReady(new Error("The live response stream could not be opened"));
           source.close();
           sessionConnectionsRef.current.delete(sessionId);
           setConnectionState(navigator.onLine ? "reconnecting" : "offline");
           const nextAttempts = attempts + 1;
           const reconnectTimer = window.setTimeout(() => {
             sessionConnectionsRef.current.delete(sessionId);
-            connect(nextAttempts);
+            void connect(nextAttempts);
           }, Math.min(5_000, 500 * (2 ** Math.min(nextAttempts, 4))));
-          sessionConnectionsRef.current.set(sessionId, { source, reconnectTimer, attempts: nextAttempts });
+          sessionConnectionsRef.current.set(sessionId, {
+            source,
+            reconnectTimer,
+            attempts: nextAttempts,
+            ready,
+            cancelReady: () => rejectReady(new Error("The live response stream was closed")),
+          });
         },
       }, lastEventCursorBySessionRef.current.get(sessionId) ?? null);
-      sessionConnectionsRef.current.set(sessionId, { source, reconnectTimer: null, attempts });
+      sessionConnectionsRef.current.set(sessionId, {
+        source,
+        reconnectTimer: null,
+        attempts,
+        ready,
+        cancelReady: () => rejectReady(new Error("The live response stream was closed")),
+      });
+      return ready;
     };
 
-    connect(0);
+    return connect(0);
   }, [applyDurableState, client, refreshAdmin, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream]);
 
   React.useEffect(() => () => {
@@ -816,7 +855,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (state.active) activeSessionsRef.current.add(sessionId);
         else activeSessionsRef.current.delete(sessionId);
         reconcileQueueWithTurnStateRef.current(sessionId, state.active, items);
-        if (state.active) attachSessionStream(sessionId);
+        if (state.active) void attachSessionStream(sessionId).catch(() => undefined);
         else if (!preserveDurableSurface) resetSessionStream(sessionId);
       })
       .catch((cause) => {
@@ -828,7 +867,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const runTurn = React.useCallback(async (
     task: Task,
     params:
-      | { input: string; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
+      | { input: string; requestMessageId?: string | undefined; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
       | { continueInterruptedTurn: true; input?: undefined; attachments?: undefined; replaceFromMessageId?: undefined },
   ) => {
     if (!client || !task.activeSessionId) return;
@@ -852,7 +891,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     // Listen before submitting so early deltas render live instead of being
     // delivered together from the server's replay buffer.
-    attachSessionStream(sessionId);
+    await attachSessionStream(sessionId);
     try {
       const request = {
         workspacePath: taskWorkspacePath,
@@ -865,6 +904,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           ? { continueInterruptedTurn: true as const }
           : {
             input: params.input,
+            ...(params.requestMessageId ? { requestMessageId: params.requestMessageId } : {}),
             ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
             ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
           }),
@@ -888,7 +928,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           applyDurableState(sessionId, state);
           if (state.active) {
             activeSessionsRef.current.add(sessionId);
-            attachSessionStream(sessionId);
+            void attachSessionStream(sessionId).catch(() => undefined);
             return;
           }
         } catch {
@@ -939,7 +979,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     applyDurableState(sessionId, state, state.active);
     if (state.active) {
       activeSessionsRef.current.add(sessionId);
-      attachSessionStream(sessionId);
+      void attachSessionStream(sessionId).catch(() => undefined);
       toast.success(action === "retry" ? "Tool retry queued" : "Run resumed");
       return;
     }
@@ -1271,6 +1311,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     requestThreadBottom(sessionId);
     await runTurn(task, {
       input,
+      requestMessageId: persisted.id,
       ...(attachments.length > 0 ? { attachments } : {}),
     });
     requestThreadBottom(sessionId);
@@ -1340,6 +1381,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         }
         await runTurn(task, {
           input: followUp.input,
+          requestMessageId: messageId,
           ...(followUp.attachments.length > 0 ? { attachments: followUp.attachments } : {}),
         });
       }
@@ -1611,7 +1653,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     replaceSessionMessages(activeTask.activeSessionId, (current) => [...current, userMessage]);
     requestThreadBottom(activeTask.activeSessionId);
-    await runTurn(activeTask, { input, attachments: [attachment] });
+    await runTurn(activeTask, { input, requestMessageId: userMessage.id, attachments: [attachment] });
   }, [activeTask, appendDemoGeneratedImageIteration, client, generatedImageAttachment, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const regenerateGeneratedImage = React.useCallback(async (
@@ -1634,7 +1676,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     replaceSessionMessages(activeTask.activeSessionId, (current) => [...current, userMessage]);
     requestThreadBottom(activeTask.activeSessionId);
-    await runTurn(activeTask, { input, attachments: [attachment] });
+    await runTurn(activeTask, { input, requestMessageId: userMessage.id, attachments: [attachment] });
   }, [activeTask, appendDemoGeneratedImageIteration, client, generatedImageAttachment, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const runSlashCommand = React.useCallback(async (name: string, args: string[]) => {

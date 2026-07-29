@@ -40,15 +40,24 @@ export class ApiEventStreamService {
   ): Promise<Observable<MessageEvent<AgentStreamEvent>>> {
     if (!this.durableTurns) throw new Error("Durable event storage is not configured");
     const durableTurns = this.durableTurns;
-    let initial = await durableTurns.eventsAfter(tenantId, sessionId, cursor);
+    // A no-cursor connection is opened before POST /turns so it cannot use an
+    // old terminal event as its replay boundary. Keep polling from the
+    // connection timestamp until the newly admitted run emits its first event.
+    const connectedAt = cursor ? undefined : new Date();
+    let initial = await durableTurns.eventsAfter(tenantId, sessionId, cursor, 500, connectedAt);
     return new Observable((subscriber) => {
       let closed = false;
       let polling = false;
       let lastCursor = cursor ?? null;
       const seen = new Set<string>();
+      const seenOrder: string[] = [];
       const emit = (envelope: typeof initial[number]) => {
         if (seen.has(envelope.id)) return;
         seen.add(envelope.id);
+        seenOrder.push(envelope.id);
+        if (seenOrder.length > 2_048) {
+          seen.delete(seenOrder.shift()!);
+        }
         lastCursor = envelope.id;
         subscriber.next({
           id: envelope.id,
@@ -61,7 +70,13 @@ export class ApiEventStreamService {
         if (closed || polling) return;
         polling = true;
         try {
-          const events = await durableTurns.eventsAfter(tenantId, sessionId, lastCursor);
+          const events = await durableTurns.eventsAfter(
+            tenantId,
+            sessionId,
+            lastCursor,
+            500,
+            lastCursor ? undefined : connectedAt,
+          );
           for (const envelope of events) emit(envelope);
         } catch (error) {
           if (!closed) subscriber.error(error);
