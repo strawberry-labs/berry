@@ -1960,6 +1960,7 @@ code, pre {
 }
 .berry-context-tooltip-content { display: flex; flex-direction: column; gap: 2px; white-space: nowrap; }
 .berry-context-tooltip-label { color: var(--berry-text-tertiary); }
+.berry-context-tooltip > svg { display: none; }
 
 @media (max-width: 640px) {
   .berry-queued-message-scroll { padding-inline: 8px; }

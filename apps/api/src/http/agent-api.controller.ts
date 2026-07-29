@@ -97,6 +97,10 @@ const ContextStatsRequestSchema = z.object({
   attachments: z.array(AttachmentInputSchema).max(100).optional(),
 }).strict();
 
+// Keep context reporting aligned with the runtime turn path when a provider
+// catalog omits an explicit model context window.
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000;
+
 function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "text" | "reasoning"; content: string }> {
   let text = "";
   let reasoning = "";
@@ -543,7 +547,9 @@ export class AgentApiController {
     const runtime = this.runtimeConfig.resolve({ model });
     const selectedModel = model ?? runtime.provider.defaultModel;
     const modelMetadata = runtime.provider.models?.find((candidate) => candidate.id === selectedModel);
-    const contextWindow = resolveModelCapabilities(modelMetadata).context?.windowTokens ?? modelMetadata?.contextWindow ?? null;
+    const contextWindow = resolveModelCapabilities(modelMetadata).context?.windowTokens
+      ?? modelMetadata?.contextWindow
+      ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     const runtimeStats = await this.sessionHost.contextStats(sessionId, {
       ...(request.pendingInput !== undefined ? { pendingInput: request.pendingInput } : {}),
       ...(request.attachments ? { attachments: contextStatsAttachments(request.attachments) } : {}),
@@ -716,7 +722,7 @@ export class AgentApiController {
     };
     const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedRequest.model);
     const contextWindowTokens = resolveModelCapabilities(governedModel).context?.windowTokens
-      ?? 200_000;
+      ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     const reservation = await this.budgets.reserve({
       tenantId,
       requestId,
