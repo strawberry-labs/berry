@@ -50,29 +50,29 @@ function RolesScreen({ client, config, tenantId, permissions }: ManagementScreen
     setMessage("Role permissions saved and recorded in the audit log.");
   };
   return <ManagementPage title="Roles & permissions" description="Define what each role can read and manage. System roles are locked; clone them to customize." eyebrow="Access">
-    <div className="mgmt-split">
-      <div className="mgmt-split-list">
+    <div className="grid gap-4 lg:grid-cols-[minmax(220px,280px)_minmax(0,1fr)]">
+      <div className="grid min-w-0 gap-3">
         <Toolbar><SearchInput label="Search roles" value={query} onChange={setQuery} placeholder="Search roles" /></Toolbar>
         <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={roles.length === 0}>
-          <ul className="mgmt-record-list" aria-label="Roles">
+          <ul className="grid list-none gap-1 p-0 [&_button]:grid [&_button]:h-auto [&_button]:w-full [&_button]:gap-1.5 [&_button]:rounded-lg [&_button]:border [&_button]:border-border [&_button]:p-2.5 [&_button]:text-left" aria-label="Roles">
             {roles.map((role: any) => <li key={role.role}><Button type="button" aria-current={selected === role.role ? "true" : undefined} onClick={() => setSelected(role.role)}>
-              <span className="mgmt-record-title">{humanize(role.role)}</span>
-              <span className="mgmt-record-meta"><StatusPill tone={role.source === "system" ? "neutral" : "info"}>{role.source === "system" ? "System" : "Custom"}</StatusPill><small>{role.permissions.length} permissions</small></span>
+              <span className="text-sm font-medium">{humanize(role.role)}</span>
+              <span className="flex items-center gap-2 [&_small]:text-xs [&_small]:text-muted-foreground"><StatusPill tone={role.source === "system" ? "neutral" : "info"}>{role.source === "system" ? "System" : "Custom"}</StatusPill><small>{role.permissions.length} permissions</small></span>
             </Button></li>)}
           </ul>
         </AsyncState>
       </div>
-      <div className="mgmt-split-detail">
+      <div className="min-w-0">
         {active && draft ? <Section title={humanize(active.role)} description={isSystem ? "System role — permissions are managed by Berry and cannot be changed." : "Toggle the permissions granted to this role."} actions={canWrite && !isSystem ? <Button onClick={save} disabled={!dirty}><Save aria-hidden />Save role</Button> : null}>
-          <div className="mgmt-permission-matrix">
+          <div className="grid gap-4">
             {PERMISSION_DOMAINS.map((domain) => {
               const perms = ALL_PERMISSIONS.filter((p) => domainOf(p) === domain.id);
               if (!perms.length) return null;
-              return <fieldset key={domain.id} className="mgmt-permission-group"><legend>{domain.label}</legend>{perms.map((permission) => <label key={permission} className="mgmt-permission-cell"><Checkbox checked={draft.has(permission)} disabled={isSystem || !canWrite} onCheckedChange={() => toggle(permission)} /><span>{humanize(actionOf(permission))}</span><code>{permission}</code></label>)}</fieldset>;
+              return <fieldset key={domain.id} className="grid gap-1.5 border-0 p-0 [&_legend]:mb-1 [&_legend]:text-xs [&_legend]:font-semibold"><legend>{domain.label}</legend>{perms.map((permission) => <label key={permission} className="flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-2.5 py-2 text-xs [&_code]:ml-auto [&_code]:font-mono [&_code]:text-xs [&_code]:text-muted-foreground"><Checkbox checked={draft.has(permission)} disabled={isSystem || !canWrite} onCheckedChange={() => toggle(permission)} /><span>{humanize(actionOf(permission))}</span><code>{permission}</code></label>)}</fieldset>;
             })}
           </div>
           {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-        </Section> : <div className="mgmt-split-empty"><p>Select a role to review or edit its permissions.</p></div>}
+        </Section> : <div className="flex min-h-48 items-center justify-center rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground"><p>Select a role to review or edit its permissions.</p></div>}
       </div>
     </div>
   </ManagementPage>;
@@ -106,7 +106,7 @@ function ResourceAccessScreen({ client, config, tenantId, permissions }: Managem
       <FilterSelect label="Principal" value={principalType} onChange={setPrincipalType} options={[{ value: "all", label: "All" }, { value: "user", label: "User" }, { value: "role", label: "Role" }, { value: "department", label: "Department" }]} />
     </Toolbar>
     {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-    {adding ? <form className="mgmt-inline-form" onSubmit={submit}>
+    {adding ? <form className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submit}>
       <label>Resource type<Input name="resourceType" placeholder="workspace" required /></label>
       <label>Resource ID<Input name="resourceId" required /></label>
       <label>Principal type<FormSelect name="principalType" defaultValue="user" options={[{ value: "user", label: "User" }, { value: "role", label: "Role" }, { value: "department", label: "Department" }]} /></label>
@@ -116,13 +116,13 @@ function ResourceAccessScreen({ client, config, tenantId, permissions }: Managem
       <Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button>
       <Button><Save aria-hidden />Save rule</Button>
     </form> : null}
-    <div className={detail ? "mgmt-with-drawer" : undefined}>
+    <div className={detail ? "min-w-0" : undefined}>
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={rows.length === 0}>
         <DataTable label="Resource access rules" columns={["Resource", "Principal", "Allowed", "Denied", "Updated"]} onRowSelect={setActive} activeRow={active} rowLabel={(i) => `${rows[i].resourceType} ${rows[i].resourceId}`} rows={rows.map((x: any) => [
-          <span className="mgmt-cell-strong"><b>{x.resourceId}</b><small>{humanize(x.resourceType)}</small></span>,
-          <span className="mgmt-cell-strong"><b>{x.principalId}</b><small>{humanize(x.principalType)}</small></span>,
-          x.allow.length ? <span className="mgmt-badge-row">{x.allow.map((p: string) => <StatusPill key={p} tone="good">{p}</StatusPill>)}</span> : "—",
-          x.deny.length ? <span className="mgmt-badge-row">{x.deny.map((p: string) => <StatusPill key={p} tone="danger">{p}</StatusPill>)}</span> : "—",
+          <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground"><b>{x.resourceId}</b><small>{humanize(x.resourceType)}</small></span>,
+          <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground"><b>{x.principalId}</b><small>{humanize(x.principalType)}</small></span>,
+          x.allow.length ? <span className="flex flex-wrap gap-1.5">{x.allow.map((p: string) => <StatusPill key={p} tone="good">{p}</StatusPill>)}</span> : "—",
+          x.deny.length ? <span className="flex flex-wrap gap-1.5">{x.deny.map((p: string) => <StatusPill key={p} tone="danger">{p}</StatusPill>)}</span> : "—",
           formatDate(x.updatedAt),
         ])} />
       </AsyncState>
@@ -132,9 +132,9 @@ function ResourceAccessScreen({ client, config, tenantId, permissions }: Managem
           { term: "Principal", detail: `${humanize(detail.principalType)} · ${detail.principalId}` },
           { term: "Updated", detail: formatDateTime(detail.updatedAt) },
         ]} />
-        <h3 className="mgmt-drawer-subhead">Effective permissions</h3>
-        <div className="mgmt-badge-row">{detail.allow.length ? detail.allow.map((p: string) => <StatusPill key={p} tone="good">{p}</StatusPill>) : <span className="mgmt-muted">No explicit grants</span>}</div>
-        {detail.deny.length ? <><h3 className="mgmt-drawer-subhead">Denied</h3><div className="mgmt-badge-row">{detail.deny.map((p: string) => <StatusPill key={p} tone="danger">{p}</StatusPill>)}</div></> : null}
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Effective permissions</h3>
+        <div className="flex flex-wrap gap-1.5">{detail.allow.length ? detail.allow.map((p: string) => <StatusPill key={p} tone="good">{p}</StatusPill>) : <span className="text-xs text-muted-foreground">No explicit grants</span>}</div>
+        {detail.deny.length ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Denied</h3><div className="flex flex-wrap gap-1.5">{detail.deny.map((p: string) => <StatusPill key={p} tone="danger">{p}</StatusPill>)}</div></> : null}
       </DetailDrawer> : null}
     </div>
   </ManagementPage>;
@@ -173,7 +173,7 @@ function ModelsScreen({ client, config, tenantId, permissions }: ManagementScree
   };
   return <ManagementPage title="Models" description="Control which models are available and set the defaults for Chat and Code." eyebrow="AI controls">
     <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
-      <section className="mgmt-metrics" aria-label="Model defaults">
+      <section className="grid gap-3 sm:grid-cols-2" aria-label="Model defaults">
         {(["chat", "code"] as const).map((mode) => { const d = defaultFor(mode); return <article key={mode} data-status={d ? "good" : "warning"}><span>Default for {mode === "chat" ? "Chat" : "Code"}</span><strong>{d ? (d.model) : "Not set"}</strong><small>{d ? `${d.providerId}${d.enforce ? " · Enforced" : ""}` : "Choose a model below"}</small></article>; })}
       </section>
       <Toolbar>
@@ -182,31 +182,31 @@ function ModelsScreen({ client, config, tenantId, permissions }: ManagementScree
         <FilterSelect label="Status" value={status} onChange={setStatus} options={[{ value: "all", label: "All status" }, { value: "allowed", label: "Allowed" }, { value: "blocked", label: "Blocked" }]} />
       </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      <div className={detail ? "mgmt-with-drawer" : undefined}>
+      <div className={detail ? "min-w-0" : undefined}>
         <AsyncState loading={false} error={null} onRetry={r.retry} empty={rows.length === 0}>
           <DataTable label="Model catalog" columns={["Model", "Provider", "Modes", "Policy", "Default"]} onRowSelect={setActive} activeRow={active} rowLabel={(i) => rows[i].model} rows={rows.map((m) => [
-            <span className="mgmt-cell-strong"><b>{m.displayName || m.model}</b><small>{m.model}</small></span>,
+            <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground"><b>{m.displayName || m.model}</b><small>{m.model}</small></span>,
             m.providerId,
-            <span className="mgmt-badge-row">{(m.modeAllow ?? []).map((mode: string) => <StatusPill key={mode} tone="neutral">{mode}</StatusPill>)}</span>,
-            <span className="mgmt-badge-row"><StatusPill tone={m.status === "allowed" ? "good" : "danger"}>{humanize(m.status)}</StatusPill>{m.enforce ? <StatusPill tone="info">Enforced</StatusPill> : null}</span>,
-            isDefault(m, "chat") || isDefault(m, "code") ? <Check aria-label="Default" className="mgmt-check" /> : "—",
+            <span className="flex flex-wrap gap-1.5">{(m.modeAllow ?? []).map((mode: string) => <StatusPill key={mode} tone="neutral">{mode}</StatusPill>)}</span>,
+            <span className="flex flex-wrap gap-1.5"><StatusPill tone={m.status === "allowed" ? "good" : "danger"}>{humanize(m.status)}</StatusPill>{m.enforce ? <StatusPill tone="info">Enforced</StatusPill> : null}</span>,
+            isDefault(m, "chat") || isDefault(m, "code") ? <Check aria-label="Default" className="size-4 text-[var(--berry-accent)]" /> : "—",
           ])} />
         </AsyncState>
-        {detail && draft ? <DetailDrawer title={draft.displayName || draft.model} subtitle={draft.providerId} badge={<StatusPill tone={draft.status === "allowed" ? "good" : "danger"}>{humanize(draft.status)}</StatusPill>} onClose={() => setActive(null)} footer={canWrite ? <><Button variant="secondary" onClick={() => setActive(null)}>Cancel</Button><Button onClick={save}><Save aria-hidden />Save policy</Button></> : <span className="mgmt-muted">Read-only — models:write required to edit.</span>}>
-          <fieldset className="mgmt-field-block" disabled={!canWrite}>
+        {detail && draft ? <DetailDrawer title={draft.displayName || draft.model} subtitle={draft.providerId} badge={<StatusPill tone={draft.status === "allowed" ? "good" : "danger"}>{humanize(draft.status)}</StatusPill>} onClose={() => setActive(null)} footer={canWrite ? <><Button variant="secondary" onClick={() => setActive(null)}>Cancel</Button><Button onClick={save}><Save aria-hidden />Save policy</Button></> : <span className="text-xs text-muted-foreground">Read-only — models:write required to edit.</span>}>
+          <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
             <legend>Policy</legend>
-            <div className="mgmt-segmented" role="group" aria-label="Policy">
+            <div className="inline-flex flex-wrap gap-1 rounded-lg border border-border bg-muted/40 p-1" role="group" aria-label="Policy">
               <Button variant="ghost" type="button" aria-selected={draft.status === "allowed"} onClick={() => setDraft({ ...draft, status: "allowed" })}>Allowed</Button>
               <Button variant="ghost" type="button" aria-selected={draft.status === "blocked"} onClick={() => setDraft({ ...draft, status: "blocked" })}>Blocked</Button>
             </div>
           </fieldset>
-          <fieldset className="mgmt-field-block" disabled={!canWrite}>
+          <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
             <legend>Available in</legend>
-            {(["chat", "code"] as const).map((mode) => <label key={mode} className="mgmt-toggle-row"><span>{mode === "chat" ? "Chat" : "Code"}</span><ManagementSwitch checked={(draft.modeAllow ?? []).includes(mode)} onCheckedChange={(checked) => setMode(mode, checked)} aria-label={`${mode} access`} /></label>)}
+            {(["chat", "code"] as const).map((mode) => <label key={mode} className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>{mode === "chat" ? "Chat" : "Code"}</span><ManagementSwitch checked={(draft.modeAllow ?? []).includes(mode)} onCheckedChange={(checked) => setMode(mode, checked)} aria-label={`${mode} access`} /></label>)}
           </fieldset>
-          <label className="mgmt-toggle-row"><span>Enforce policy<small>Members cannot override this policy.</small></span><ManagementSwitch checked={Boolean(draft.enforce)} disabled={!canWrite} onCheckedChange={(checked) => setDraft({ ...draft, enforce: checked })} aria-label="Enforce policy" /></label>
-          {draft.capabilities && Object.keys(draft.capabilities).length ? <><h3 className="mgmt-drawer-subhead">Capabilities</h3><div className="mgmt-badge-row">{Object.entries(draft.capabilities).filter(([, v]) => v === true).map(([k]) => <StatusPill key={k} tone="neutral">{humanize(k)}</StatusPill>)}</div></> : null}
-          {canWrite ? <><h3 className="mgmt-drawer-subhead">Make default</h3><div className="mgmt-button-row"><Button variant="secondary" onClick={() => makeDefault("chat")} disabled={isDefault(draft, "chat")}>Set as Chat default</Button><Button variant="secondary" onClick={() => makeDefault("code")} disabled={isDefault(draft, "code")}>Set as Code default</Button></div></> : null}
+          <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>Enforce policy<small>Members cannot override this policy.</small></span><ManagementSwitch checked={Boolean(draft.enforce)} disabled={!canWrite} onCheckedChange={(checked) => setDraft({ ...draft, enforce: checked })} aria-label="Enforce policy" /></label>
+          {draft.capabilities && Object.keys(draft.capabilities).length ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Capabilities</h3><div className="flex flex-wrap gap-1.5">{Object.entries(draft.capabilities).filter(([, v]) => v === true).map(([k]) => <StatusPill key={k} tone="neutral">{humanize(k)}</StatusPill>)}</div></> : null}
+          {canWrite ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Make default</h3><div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => makeDefault("chat")} disabled={isDefault(draft, "chat")}>Set as Chat default</Button><Button variant="secondary" onClick={() => makeDefault("code")} disabled={isDefault(draft, "code")}>Set as Code default</Button></div></> : null}
         </DetailDrawer> : null}
       </div>
     </AsyncState>
@@ -285,48 +285,48 @@ function SkillsMcpScreen({ client, tenantId, permissions }: ManagementScreenProp
     ]} />
     <TabBar label="Capability kind" active={tab} onSelect={(id) => { setTab(id); setActive(null); }} tabs={[{ id: "skill", label: "Skills" }, { id: "mcp", label: "MCP servers" }]} />
     {adding && tab === "skill" ? <Section title={review ? "Review organization skill" : "Add organization skill"} description="Import an Agent Skills package or paste SKILL.md, then choose how it is assigned.">
-      {!review ? <form className="mgmt-inline-form" onSubmit={reviewSkill}>
-        <label className="mgmt-skill-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void selectSkillFile(event.dataTransfer.files[0]); }}><input type="file" accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectSkillFile(event.currentTarget.files?.[0])} /><Upload aria-hidden /><span><b>{skillDraft.fileName || "Choose or drop a .skill package"}</b><small>.skill, .zip, or SKILL.md · up to 5 MB</small></span></label>
-        <label className="mgmt-field mgmt-field-wide">Or paste SKILL.md<Textarea className="mgmt-textarea" required value={skillDraft.content} onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [] })} /></label>
-        {importError ? <div className="mgmt-callout" role="alert">{importError}</div> : null}
+      {!review ? <form className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={reviewSkill}>
+        <label className="settings-skill-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void selectSkillFile(event.dataTransfer.files[0]); }}><input type="file" accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectSkillFile(event.currentTarget.files?.[0])} /><Upload aria-hidden /><span><b>{skillDraft.fileName || "Choose or drop a .skill package"}</b><small>.skill, .zip, or SKILL.md · up to 5 MB</small></span></label>
+        <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">Or paste SKILL.md<Textarea className="min-h-32 resize-y" required value={skillDraft.content} onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [] })} /></label>
+        {importError ? <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground" role="alert">{importError}</div> : null}
         <Button type="button" variant="secondary" onClick={() => setAdding(false)}><X aria-hidden />Cancel</Button><Button><ShieldCheck aria-hidden />Review</Button>
-      </form> : <div className="mgmt-review-flow">
+      </form> : <div className="grid gap-3 [&_dl]:grid [&_dl]:gap-3 sm:[&_dl]:grid-cols-3 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:text-sm">
         <dl><div><dt>Skill</dt><dd>${review.name}</dd></div><div><dt>Description</dt><dd>{review.description}</dd></div><div><dt>Content hash</dt><dd><code>{review.hash}</code></dd></div><div><dt>Package</dt><dd>{review.resources.length ? `${review.resources.length + 1} files` : "SKILL.md only"}</dd></div></dl>
-        {review.warnings.length ? <div className="mgmt-callout" role="alert">{review.warnings.join(" · ")}</div> : <p className="mgmt-success"><Check aria-hidden />No review warnings found.</p>}
-        <label className="mgmt-field">Assignment<FormSelect value={skillDraft.assignment} onChange={(assignment) => setSkillDraft({ ...skillDraft, assignment: assignment as OrgCapabilityAssignment })} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} /></label>
-        <label className="mgmt-toggle-row"><span>Allow user disable<small>Members can turn off default-on skills.</small></span><ManagementSwitch checked={skillDraft.allowUserDisable} disabled={skillDraft.assignment === "required" || skillDraft.assignment === "blocked"} onCheckedChange={(allowUserDisable) => setSkillDraft({ ...skillDraft, allowUserDisable })} aria-label="Allow user disable" /></label>
-        <div className="mgmt-form-actions"><Button variant="secondary" onClick={() => setReview(null)}>Back</Button><Button onClick={() => void saveSkill()}><Check aria-hidden />Add to organization</Button></div>
+        {review.warnings.length ? <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground" role="alert">{review.warnings.join(" · ")}</div> : <p className="flex items-center gap-2 rounded-lg border border-[var(--berry-success)]/25 bg-[var(--berry-success)]/5 px-3 py-2 text-xs text-[var(--berry-success)]"><Check aria-hidden />No review warnings found.</p>}
+        <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Assignment<FormSelect value={skillDraft.assignment} onChange={(assignment) => setSkillDraft({ ...skillDraft, assignment: assignment as OrgCapabilityAssignment })} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} /></label>
+        <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>Allow user disable<small>Members can turn off default-on skills.</small></span><ManagementSwitch checked={skillDraft.allowUserDisable} disabled={skillDraft.assignment === "required" || skillDraft.assignment === "blocked"} onCheckedChange={(allowUserDisable) => setSkillDraft({ ...skillDraft, allowUserDisable })} aria-label="Allow user disable" /></label>
+        <div className="flex flex-wrap justify-end gap-2"><Button variant="secondary" onClick={() => setReview(null)}>Back</Button><Button onClick={() => void saveSkill()}><Check aria-hidden />Add to organization</Button></div>
       </div>}
     </Section> : null}
     <Section title="Personal additions" description="Control whether members can add their own capabilities.">
-      <div className="mgmt-policy-list"><label className="mgmt-toggle-row"><span>Personal skills<small>Members can import and manage their own skills.</small></span><ManagementSwitch checked={policy.data.skills} disabled={!canWritePolicies} onCheckedChange={(skills) => void updatePersonalPolicy({ ...policy.data, skills })} aria-label="Allow personal skills" /></label><label className="mgmt-toggle-row"><span>Personal MCP servers<small>Members can add their own remote MCP servers.</small></span><ManagementSwitch checked={policy.data.mcp} disabled={!canWritePolicies} onCheckedChange={(mcp) => void updatePersonalPolicy({ ...policy.data, mcp })} aria-label="Allow personal MCP servers" /></label></div>
+      <div className="grid gap-2"><label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>Personal skills<small>Members can import and manage their own skills.</small></span><ManagementSwitch checked={policy.data.skills} disabled={!canWritePolicies} onCheckedChange={(skills) => void updatePersonalPolicy({ ...policy.data, skills })} aria-label="Allow personal skills" /></label><label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>Personal MCP servers<small>Members can add their own remote MCP servers.</small></span><ManagementSwitch checked={policy.data.mcp} disabled={!canWritePolicies} onCheckedChange={(mcp) => void updatePersonalPolicy({ ...policy.data, mcp })} aria-label="Allow personal MCP servers" /></label></div>
     </Section>
     <Toolbar>
       <SearchInput label="Search capabilities" value={query} onChange={setQuery} placeholder="Search capabilities" />
       <FilterSelect label="Assignment" value={assignment} onChange={setAssignment} options={[{ value: "all", label: "All" }, { value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} />
     </Toolbar>
     {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-    <div className={detail ? "mgmt-with-drawer" : undefined}>
+    <div className={detail ? "min-w-0" : undefined}>
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={rows.length === 0} emptyTitle="No organization capabilities" emptyText="Skills and MCP servers assigned to the organization will appear here.">
         <DataTable label="Organization capabilities" columns={["Capability", "Assignment", "User override", "Managed"]} onRowSelect={setActive} activeRow={active} rowLabel={(i) => rows[i].name} rows={rows.map((c: any) => [
-          <span className="mgmt-cell-strong"><b>{c.name}</b><small>{c.capabilityId}</small></span>,
+          <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground"><b>{c.name}</b><small>{c.capabilityId}</small></span>,
           <StatusPill tone={assignmentTone(c.assignment) as any}>{humanize(c.assignment)}</StatusPill>,
           c.allowUserDisable ? "Allowed" : "Not allowed",
           c.contentHash ? "Signed" : "Unsigned",
         ])} />
       </AsyncState>
       {detail ? <DetailDrawer title={detail.name} subtitle={detail.capabilityId} badge={<StatusPill tone={assignmentTone(detail.assignment) as any}>{humanize(detail.assignment)}</StatusPill>} onClose={() => setActive(null)}>
-        {detail.description ? <p className="mgmt-drawer-lead">{detail.description}</p> : null}
+        {detail.description ? <p className="text-sm leading-6 text-muted-foreground">{detail.description}</p> : null}
         <DefinitionList items={[
           { term: "Type", detail: detail.kind === "skill" ? "Skill" : "MCP server" },
-          { term: "Content hash", detail: detail.contentHash ? <code className="mgmt-hash">{detail.contentHash.slice(0, 20)}…<Button type="button" variant="ghost" size="icon" onClick={() => copyText(detail.contentHash)} aria-label="Copy hash"><Copy aria-hidden /></Button></code> : "Unsigned" },
+          { term: "Content hash", detail: detail.contentHash ? <code className="inline-flex items-center gap-1 font-mono text-xs">{detail.contentHash.slice(0, 20)}…<Button type="button" variant="ghost" size="icon" onClick={() => copyText(detail.contentHash)} aria-label="Copy hash"><Copy aria-hidden /></Button></code> : "Unsigned" },
           { term: "Updated", detail: formatDateTime(detail.updatedAt) },
         ]} />
-        <fieldset className="mgmt-field-block" disabled={!canWrite}>
+        <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
           <legend>Assignment</legend>
           <FilterSelect label="Assignment" value={detail.assignment} onChange={(v) => setAssignmentValue(detail, v)} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} />
         </fieldset>
-        <label className="mgmt-toggle-row"><span>Allow user disable<small>Members can turn this off for themselves.</small></span><ManagementSwitch checked={Boolean(detail.allowUserDisable)} disabled={!canWrite || detail.assignment === "required"} onCheckedChange={(checked) => setAllowDisable(detail, checked)} aria-label="Allow user disable" /></label>
+        <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>Allow user disable<small>Members can turn this off for themselves.</small></span><ManagementSwitch checked={Boolean(detail.allowUserDisable)} disabled={!canWrite || detail.assignment === "required"} onCheckedChange={(checked) => setAllowDisable(detail, checked)} aria-label="Allow user disable" /></label>
         {canWrite ? <Button variant="secondary" onClick={() => void removeCapability(detail)}><Trash2 aria-hidden />Remove capability</Button> : null}
       </DetailDrawer> : null}
     </div>
@@ -350,7 +350,7 @@ function FeatureAccessScreen({ client, config, tenantId, permissions }: Manageme
   return <ManagementPage title="Feature access" description="Roll features out across the organization and refine access by role." eyebrow="AI controls">
     <Toolbar><SearchInput label="Search features" value={query} onChange={setQuery} placeholder="Search features" /></Toolbar>
     {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-    <div className={detail ? "mgmt-with-drawer" : undefined}>
+    <div className={detail ? "min-w-0" : undefined}>
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={rows.length === 0}>
         <DataTable label="Feature access" columns={["Feature", "Organization default", "Role overrides", "Updated"]} onRowSelect={setActive} activeRow={active} rowLabel={(i) => humanize(rows[i].flag)} rows={rows.map((f: any) => [
           <b>{humanize(f.flag)}</b>,
@@ -360,10 +360,10 @@ function FeatureAccessScreen({ client, config, tenantId, permissions }: Manageme
         ])} />
       </AsyncState>
       {detail ? <DetailDrawer title={humanize(detail.flag)} subtitle={detail.flag} badge={<StatusPill tone={detail.enabled ? "good" : "neutral"}>{detail.enabled ? "On" : "Off"}</StatusPill>} onClose={() => setActive(null)}>
-        <label className="mgmt-toggle-row"><span>Organization default<small>Turn this feature on for the whole organization.</small></span><ManagementSwitch checked={Boolean(detail.enabled)} disabled={!canWrite} onCheckedChange={(checked) => setEnabled(detail, checked)} aria-label="Organization default" /></label>
-        <h3 className="mgmt-drawer-subhead">Role overrides</h3>
-        {Object.keys(detail.roleDefaults ?? {}).length ? <DefinitionList items={Object.entries(detail.roleDefaults).map(([role, perms]) => ({ term: humanize(role), detail: (perms as string[]).join(", ") || "—" }))} /> : <p className="mgmt-muted">No role overrides. All roles inherit the organization default.</p>}
-        {!canWrite ? <p className="mgmt-muted">Read-only — feature_flags:write required to edit.</p> : null}
+        <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"><span>Organization default<small>Turn this feature on for the whole organization.</small></span><ManagementSwitch checked={Boolean(detail.enabled)} disabled={!canWrite} onCheckedChange={(checked) => setEnabled(detail, checked)} aria-label="Organization default" /></label>
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Role overrides</h3>
+        {Object.keys(detail.roleDefaults ?? {}).length ? <DefinitionList items={Object.entries(detail.roleDefaults).map(([role, perms]) => ({ term: humanize(role), detail: (perms as string[]).join(", ") || "—" }))} /> : <p className="text-xs text-muted-foreground">No role overrides. All roles inherit the organization default.</p>}
+        {!canWrite ? <p className="text-xs text-muted-foreground">Read-only — feature_flags:write required to edit.</p> : null}
       </DetailDrawer> : null}
     </div>
   </ManagementPage>;
@@ -394,21 +394,21 @@ function SsoScimScreen({ client, config, tenantId, permissions }: ManagementScre
       { label: "SCIM provisioning", value: scimCount ? "On" : "Off", status: scimCount ? "good" : "warning" },
     ]} />
     {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-    {adding ? <form className="mgmt-inline-form" onSubmit={submit}>
+    {adding ? <form className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submit}>
       <label>Type<FormSelect name="kind" defaultValue="oidc" options={[{ value: "oidc", label: "OIDC" }, { value: "saml", label: "SAML" }]} /></label>
       <label>Slug<Input name="slug" pattern="[a-z0-9-]+" required /></label>
       <label>Display name<Input name="displayName" required /></label>
-      <label className="mgmt-field-wide">Verified domains (comma-separated)<Input name="domains" placeholder="acme.com" /></label>
-      <label className="mgmt-confirm"><Checkbox name="scim" /><span>Enable SCIM provisioning</span></label>
+      <label className="sm:col-span-2">Verified domains (comma-separated)<Input name="domains" placeholder="acme.com" /></label>
+      <label className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground"><Checkbox name="scim" /><span>Enable SCIM provisioning</span></label>
       <Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button>
       <Button><Save aria-hidden />Create connection</Button>
     </form> : null}
-    <div className={detail ? "mgmt-with-drawer" : undefined}>
+    <div className={detail ? "min-w-0" : undefined}>
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={r.data.length === 0} emptyTitle="No identity connections" emptyText="Add an OIDC or SAML connection to enable enterprise sign-in.">
-        <div className="mgmt-card-grid">
-          {r.data.map((connection: any, index: number) => <Button key={connection.id} type="button" variant="ghost" className="mgmt-connection-card" aria-current={active === index ? "true" : undefined} onClick={() => setActive(index)}>
-            <div className="mgmt-connection-head"><b>{connection.displayName}</b><StatusPill tone={connection.status === "enabled" ? "good" : connection.status === "disabled" ? "danger" : "warning"}>{humanize(connection.status)}</StatusPill></div>
-            <dl className="mgmt-connection-facts"><div><dt>Sign-in</dt><dd>{connection.kind.toUpperCase()}</dd></div><div><dt>SCIM</dt><dd>{connection.scimEnabled ? "Enabled" : "Off"}</dd></div><div><dt>Domains</dt><dd>{connection.domains.join(", ") || "—"}</dd></div></dl>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {r.data.map((connection: any, index: number) => <Button key={connection.id} type="button" variant="ghost" className="grid h-auto gap-3 rounded-xl border border-border p-3 text-left" aria-current={active === index ? "true" : undefined} onClick={() => setActive(index)}>
+            <div className="flex items-center justify-between gap-3 text-sm font-medium"><b>{connection.displayName}</b><StatusPill tone={connection.status === "enabled" ? "good" : connection.status === "disabled" ? "danger" : "warning"}>{humanize(connection.status)}</StatusPill></div>
+            <dl className="grid grid-cols-3 gap-2 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:truncate [&_dd]:text-xs"><div><dt>Sign-in</dt><dd>{connection.kind.toUpperCase()}</dd></div><div><dt>SCIM</dt><dd>{connection.scimEnabled ? "Enabled" : "Off"}</dd></div><div><dt>Domains</dt><dd>{connection.domains.join(", ") || "—"}</dd></div></dl>
           </Button>)}
         </div>
       </AsyncState>
@@ -444,7 +444,7 @@ function ManagedPolicyScreen({ client, config, tenantId }: ManagementScreenProps
           { label: "Published", value: formatDate(current.publishedAt ?? current.createdAt) },
         ]} />
       </Section> : null}
-      <div className={detail ? "mgmt-with-drawer" : undefined}>
+      <div className={detail ? "min-w-0" : undefined}>
         <Section title="Versions">
           <DataTable label="Policy versions" columns={["Version", "Status", "Signing key", "Published", "Note"]} onRowSelect={setActive} activeRow={active} rowLabel={(i) => `Version ${versions[i].version}`} rows={versions.map((v: any) => [
             <b>v{v.version}</b>,
@@ -456,15 +456,15 @@ function ManagedPolicyScreen({ client, config, tenantId }: ManagementScreenProps
         </Section>
         {detail ? <DetailDrawer title={`Version ${detail.version}`} badge={<StatusPill tone={detail.status === "active" ? "good" : detail.status === "revoked" ? "danger" : "neutral"}>{humanize(detail.status)}</StatusPill>} onClose={() => setActive(null)}>
           <DefinitionList items={[
-            { term: "Bundle hash", detail: detail.bundleHash ? <code className="mgmt-hash">{detail.bundleHash.slice(0, 24)}…<Button type="button" variant="ghost" size="icon" onClick={() => copyText(detail.bundleHash)} aria-label="Copy hash"><Copy aria-hidden /></Button></code> : "—" },
+            { term: "Bundle hash", detail: detail.bundleHash ? <code className="inline-flex items-center gap-1 font-mono text-xs">{detail.bundleHash.slice(0, 24)}…<Button type="button" variant="ghost" size="icon" onClick={() => copyText(detail.bundleHash)} aria-label="Copy hash"><Copy aria-hidden /></Button></code> : "—" },
             { term: "Signing key", detail: detail.keyId ?? "—" },
             { term: "Published", detail: formatDateTime(detail.publishedAt ?? detail.createdAt) },
             { term: "Published by", detail: detail.publishedBy ?? "System" },
             ...(detail.revokedAt ? [{ term: "Revoked", detail: formatDateTime(detail.revokedAt) }] : []),
           ]} />
-          <h3 className="mgmt-drawer-subhead">Locks enforced</h3>
-          <div className="mgmt-badge-row">{locksOf(detail).length ? locksOf(detail).map((lock: string) => <StatusPill key={lock} tone="info">{humanize(lock)}</StatusPill>) : <span className="mgmt-muted">No locks</span>}</div>
-          {detail.bundlePath ? <><h3 className="mgmt-drawer-subhead">Bundle</h3><p className="mgmt-muted">{detail.bundlePath}</p></> : null}
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Locks enforced</h3>
+          <div className="flex flex-wrap gap-1.5">{locksOf(detail).length ? locksOf(detail).map((lock: string) => <StatusPill key={lock} tone="info">{humanize(lock)}</StatusPill>) : <span className="text-xs text-muted-foreground">No locks</span>}</div>
+          {detail.bundlePath ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Bundle</h3><p className="text-xs text-muted-foreground">{detail.bundlePath}</p></> : null}
         </DetailDrawer> : null}
       </div>
     </AsyncState>
@@ -491,12 +491,12 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
       <SearchInput label="Search audit events" value={query} onChange={setQuery} placeholder="Search action, actor, or target" />
       <FilterSelect label="Category" value={category} onChange={setCategory} options={[{ value: "all", label: "All categories" }, ...categories.map((c) => ({ value: String(c), label: humanize(String(c)) }))]} />
     </Toolbar>
-    <div className={detail ? "mgmt-with-drawer" : undefined}>
+    <div className={detail ? "min-w-0" : undefined}>
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={rows.length === 0}>
         <DataTable label="Audit events" columns={["Time", "Actor", "Action", "Target", "Sequence"]} onRowSelect={setActive} activeRow={active} rowLabel={(i) => `${rows[i].category} ${rows[i].action}`} rows={rows.map((x: any) => [
           formatDateTime(x.ts ?? x.createdAt),
           x.actorUserId ?? "System",
-          <span className="mgmt-cell-strong"><b>{humanize(x.action)}</b><small>{x.category}.{x.action}</small></span>,
+          <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground"><b>{humanize(x.action)}</b><small>{x.category}.{x.action}</small></span>,
           x.targetId ? `${humanize(x.targetType ?? "")}: ${x.targetId}` : "—",
           <code>#{x.sequence}</code>,
         ])} />
@@ -507,11 +507,11 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
           { term: "Actor", detail: detail.actorUserId ?? "System" },
           { term: "Target", detail: detail.targetId ? `${humanize(detail.targetType ?? "")}: ${detail.targetId}` : "—" },
         ]} />
-        {detail.before || detail.after ? <><h3 className="mgmt-drawer-subhead">Change</h3><div className="mgmt-diff"><div><span>Before</span><pre>{JSON.stringify(detail.before ?? null, null, 2)}</pre></div><div><span>After</span><pre>{JSON.stringify(detail.after ?? null, null, 2)}</pre></div></div></> : null}
-        {detail.metadata && Object.keys(detail.metadata).length ? <><h3 className="mgmt-drawer-subhead">Metadata</h3><pre className="mgmt-code-block">{JSON.stringify(detail.metadata, null, 2)}</pre></> : null}
-        {detail.eventHash ? <><h3 className="mgmt-drawer-subhead">Hash chain</h3><DefinitionList items={[
-          { term: "Previous hash", detail: <code className="mgmt-hash">{String(detail.previousHash ?? "—").slice(0, 24)}…</code> },
-          { term: "Event hash", detail: <code className="mgmt-hash">{String(detail.eventHash).slice(0, 24)}…</code> },
+        {detail.before || detail.after ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Change</h3><div className="grid gap-2 sm:grid-cols-2 [&>div]:min-w-0 [&>div]:rounded-lg [&>div]:border [&>div]:border-border [&>div]:bg-muted/30 [&>div]:p-2 [&_span]:mb-1 [&_span]:block [&_span]:text-xs [&_span]:font-semibold [&_span]:uppercase [&_span]:text-muted-foreground [&_pre]:max-h-52 [&_pre]:overflow-auto [&_pre]:whitespace-pre-wrap [&_pre]:break-words [&_pre]:font-mono [&_pre]:text-xs"><div><span>Before</span><pre>{JSON.stringify(detail.before ?? null, null, 2)}</pre></div><div><span>After</span><pre>{JSON.stringify(detail.after ?? null, null, 2)}</pre></div></div></> : null}
+        {detail.metadata && Object.keys(detail.metadata).length ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Metadata</h3><pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words bg-transparent font-mono text-xs leading-5 text-muted-foreground">{JSON.stringify(detail.metadata, null, 2)}</pre></> : null}
+        {detail.eventHash ? <><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Hash chain</h3><DefinitionList items={[
+          { term: "Previous hash", detail: <code className="inline-flex items-center gap-1 font-mono text-xs">{String(detail.previousHash ?? "—").slice(0, 24)}…</code> },
+          { term: "Event hash", detail: <code className="inline-flex items-center gap-1 font-mono text-xs">{String(detail.eventHash).slice(0, 24)}…</code> },
         ]} /></> : null}
       </DetailDrawer> : null}
     </div>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
-import { ADMIN_NAV, visibleNavigationGroups } from "./management/management-navigation";
+import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
 import { initialCloudContent, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 
 describe("cloud shell bootstrap", () => {
@@ -36,6 +36,20 @@ describe("cloud shell bootstrap", () => {
 
   it("keeps memory on the personal settings surface", () => {
     expect(parseCloudShellLocation("/settings/memory")).toEqual({ kind: "settings", tab: "memory" });
+  });
+
+  it("keeps personal settings grouped and ordered by user intent", () => {
+    expect(PERSONAL_NAV.map((group) => ({
+      label: group.label,
+      items: group.items.map((item) => [item.id, item.label]),
+    }))).toEqual([
+      { label: "Preferences", items: [["general", "Appearance & behavior"], ["providers", "Model defaults"]] },
+      { label: "Personalization", items: [["prompts", "Instructions & prompts"], ["memory", "Memory"]] },
+      { label: "Tools & connections", items: [["skills", "Skills"], ["mcp", "MCP servers"]] },
+      { label: "Privacy & local data", items: [["privacy", "Privacy & local data"]] },
+      { label: "Usage", items: [["usage", "Personal usage"]] },
+      { label: "History", items: [["archived", "Archived chats"]] },
+    ]);
   });
 
   it("shows the composer project switcher only when the transcript is empty", () => {

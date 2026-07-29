@@ -25,28 +25,28 @@ export function PrivacySettingsScreen({ client, config, tenantId }: ManagementSc
 
   return (
     <ManagementPage
-      title="Privacy & permissions"
+      title="Privacy & local data"
       description="Understand effective access, local browser data, and organization-managed policy."
-      eyebrow="Account & data"
+      eyebrow="Privacy & local data"
     >
       <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
         <Section
           title="Effective access"
           description={`Role: ${resource.data?.role ?? "Unknown"}. Denied capabilities are enforced by the server.`}
         >
-          <div className="mgmt-chip-list">
-            {(resource.data?.permissions ?? []).map((permission: string) => <code key={permission}>{permission}</code>)}
+          <div className="flex flex-wrap gap-1.5">
+            {(resource.data?.permissions ?? []).map((permission: string) => <code className="rounded-md border border-border bg-muted px-2 py-1 text-xs text-muted-foreground" key={permission}>{permission}</code>)}
           </div>
         </Section>
         <Section
           title="Local browser data"
           description="Clearing local preferences does not delete cloud tasks or organization records."
         >
-          <div className="mgmt-setting-list">
-            <label>
-              <span>
-                <b>Berry preferences</b>
-                <small>Theme, composer defaults, custom instructions, and local prompt library.</small>
+          <div className="grid divide-y divide-border">
+            <label className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0">
+              <span className="grid gap-0.5">
+                <b className="text-sm font-medium text-foreground">Berry preferences</b>
+                <small className="text-xs text-muted-foreground">Theme, composer defaults, custom instructions, and local prompt library.</small>
               </span>
               <Button variant="destructive" onClick={clear}>Clear local data</Button>
             </label>

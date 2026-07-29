@@ -111,9 +111,9 @@ export function PersonalUsageScreen({ client, tenantId }: ManagementScreenProps)
 
   return (
     <ManagementPage
-      title="My usage"
+      title="Personal usage"
       description="Only activity attributed to your authenticated account is shown here."
-      eyebrow="Account & data"
+      eyebrow="Usage"
       actions={(
         <Button
           variant="secondary"
@@ -179,7 +179,7 @@ export function PersonalUsageScreen({ client, tenantId }: ManagementScreenProps)
               })}
             />
           ) : (
-            <p className="mgmt-muted">No request-level cache telemetry is available for this period.</p>
+            <p className="text-xs text-muted-foreground">No request-level cache telemetry is available for this period.</p>
           )}
         </Section>
       </AsyncState>

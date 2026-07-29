@@ -21,9 +21,9 @@ export function ModelSettingsScreen({ client, config, tenantId }: ManagementScre
 
   return (
     <ManagementPage
-      title="Models"
+      title="Model defaults"
       description="Choose personal Chat and Code defaults within your organization’s model policy."
-      eyebrow="Personal settings"
+      eyebrow="Preferences"
     >
       <AsyncState
         loading={resource.loading}

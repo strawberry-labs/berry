@@ -36,13 +36,13 @@ import { WebSettingsNavigation } from "./web-settings-navigation";
 export type SettingsTab = "general" | "prompts" | "providers" | "mcp" | "skills" | "privacy" | "usage" | "archived" | "governance" | "platform";
 
 export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
-  { id: "general", label: "General" },
-  { id: "providers", label: "Models" },
+  { id: "general", label: "Appearance & behavior" },
+  { id: "providers", label: "Model defaults" },
   { id: "skills", label: "Skills" },
-  { id: "mcp", label: "MCP Servers" },
-  { id: "prompts", label: "Prompts and commands" },
-  { id: "privacy", label: "Permissions and privacy" },
-  { id: "usage", label: "Usage" },
+  { id: "mcp", label: "MCP servers" },
+  { id: "prompts", label: "Instructions & prompts" },
+  { id: "privacy", label: "Privacy & local data" },
+  { id: "usage", label: "Personal usage" },
   { id: "archived", label: "Archived chats" },
   { id: "governance", label: "Organization administration" },
   { id: "platform", label: "Platform administration" },

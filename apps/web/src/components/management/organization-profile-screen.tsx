@@ -25,25 +25,25 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
     <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} empty={!resource.data} emptyTitle="Profile unavailable">
       {draft ? <>
         <Section title="Organization profile" description={writable ? "Changes are visible across Berry." : "Your role can view this managed profile but cannot change it."}>
-          <form className="mgmt-policy-grid" onSubmit={save}>
-            <label className="mgmt-field">Name<Input disabled={!writable} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} /></label>
-            <label className="mgmt-field">Slug<Input disabled={!writable} pattern="[a-z0-9-]+" value={draft.slug} onChange={(event) => setDraft({ ...draft, slug: event.currentTarget.value })} /></label>
-            <label className="mgmt-field">Timezone<Input disabled={!writable} value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.currentTarget.value })} /></label>
-            <label className="mgmt-field">Language<Input disabled={!writable} value={draft.language} onChange={(event) => setDraft({ ...draft, language: event.currentTarget.value })} /></label>
-            <label className="mgmt-field">Support contact<Input disabled={!writable} type="email" value={draft.supportEmail ?? ""} onChange={(event) => setDraft({ ...draft, supportEmail: event.currentTarget.value || null })} /></label>
-            <label className="mgmt-field">Security contact<Input disabled={!writable} type="email" value={draft.securityEmail ?? ""} onChange={(event) => setDraft({ ...draft, securityEmail: event.currentTarget.value || null })} /></label>
-            <label className="mgmt-field">Terms URL<Input disabled={!writable} type="url" value={draft.termsUrl ?? ""} onChange={(event) => setDraft({ ...draft, termsUrl: event.currentTarget.value || null })} /></label>
-            <label className="mgmt-field">Privacy URL<Input disabled={!writable} type="url" value={draft.privacyUrl ?? ""} onChange={(event) => setDraft({ ...draft, privacyUrl: event.currentTarget.value || null })} /></label>
-            {writable ? <div className="mgmt-form-actions mgmt-field-wide"><Button><Save />Save profile</Button></div> : null}
+          <form className="grid gap-3 sm:grid-cols-2" onSubmit={save}>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Name<Input disabled={!writable} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Slug<Input disabled={!writable} pattern="[a-z0-9-]+" value={draft.slug} onChange={(event) => setDraft({ ...draft, slug: event.currentTarget.value })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Timezone<Input disabled={!writable} value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.currentTarget.value })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Language<Input disabled={!writable} value={draft.language} onChange={(event) => setDraft({ ...draft, language: event.currentTarget.value })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Support contact<Input disabled={!writable} type="email" value={draft.supportEmail ?? ""} onChange={(event) => setDraft({ ...draft, supportEmail: event.currentTarget.value || null })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Security contact<Input disabled={!writable} type="email" value={draft.securityEmail ?? ""} onChange={(event) => setDraft({ ...draft, securityEmail: event.currentTarget.value || null })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Terms URL<Input disabled={!writable} type="url" value={draft.termsUrl ?? ""} onChange={(event) => setDraft({ ...draft, termsUrl: event.currentTarget.value || null })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Privacy URL<Input disabled={!writable} type="url" value={draft.privacyUrl ?? ""} onChange={(event) => setDraft({ ...draft, privacyUrl: event.currentTarget.value || null })} /></label>
+            {writable ? <div className="flex flex-wrap justify-end gap-2 sm:col-span-2"><Button><Save />Save profile</Button></div> : null}
           </form>
           {message ? <SuccessMessage>{message}</SuccessMessage> : null}
         </Section>
-        <div className="mgmt-two-column">
+        <div className="grid gap-4 xl:grid-cols-2">
           <Section title="Domains" description="Verification state is returned by the organization domain service.">
             <DataTable label="Organization domains" columns={["Domain", "Use", "Status"]} rows={draft.domains.map((domain) => [domain.domain, domain.customDomain ? "Custom hostname" : "Login domain", <StatusPill tone={domain.status === "verified" ? "good" : domain.status === "failed" ? "danger" : "warning"}>{domain.status}</StatusPill>])} />
           </Section>
           <Section title="Deployment" description="These values are platform-managed and read only.">
-            <dl className="mgmt-metadata"><div><dt>Mode</dt><dd>{draft.deploymentMode}</dd></div><div><dt>Region</dt><dd>{draft.region ?? "Deployment default"}</dd></div><div><dt>Last updated</dt><dd>{new Date(draft.updatedAt).toLocaleString()}</dd></div></dl>
+            <dl className="grid divide-y divide-border [&>div]:flex [&>div]:justify-between [&>div]:gap-4 [&>div]:py-2 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:text-right [&_dd]:text-sm"><div><dt>Mode</dt><dd>{draft.deploymentMode}</dd></div><div><dt>Region</dt><dd>{draft.region ?? "Deployment default"}</dd></div><div><dt>Last updated</dt><dd>{new Date(draft.updatedAt).toLocaleString()}</dd></div></dl>
           </Section>
         </div>
       </> : null}

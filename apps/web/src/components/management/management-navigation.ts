@@ -9,19 +9,25 @@ export type ManagementKind = "settings" | "admin" | "platform";
 export type NavItem = { id: string; label: string; icon: LucideIcon; permission?: OrgPermission };
 export type NavGroup = { label: string; items: NavItem[] };
 export const PERSONAL_NAV: NavGroup[] = [
-  { label: "Personal", items: [
-    { id: "general", label: "General", icon: SlidersHorizontal },
-    { id: "providers", label: "Models", icon: Boxes },
+  { label: "Preferences", items: [
+    { id: "general", label: "Appearance & behavior", icon: SlidersHorizontal },
+    { id: "providers", label: "Model defaults", icon: Boxes },
   ] },
-  { label: "Capabilities", items: [
+  { label: "Personalization", items: [
+    { id: "prompts", label: "Instructions & prompts", icon: Terminal },
+    { id: "memory", label: "Memory", icon: Brain },
+  ] },
+  { label: "Tools & connections", items: [
     { id: "skills", label: "Skills", icon: Puzzle },
     { id: "mcp", label: "MCP servers", icon: Network },
-    { id: "prompts", label: "Prompts & commands", icon: Terminal },
   ] },
-  { label: "Account & data", items: [
-    { id: "memory", label: "Memory", icon: Brain },
-    { id: "privacy", label: "Privacy & permissions", icon: ShieldCheck },
-    { id: "usage", label: "My usage", icon: LineChart },
+  { label: "Privacy & local data", items: [
+    { id: "privacy", label: "Privacy & local data", icon: ShieldCheck },
+  ] },
+  { label: "Usage", items: [
+    { id: "usage", label: "Personal usage", icon: LineChart },
+  ] },
+  { label: "History", items: [
     { id: "archived", label: "Archived chats", icon: MessageSquareText },
   ] },
 ];

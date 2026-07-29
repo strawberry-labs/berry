@@ -27,13 +27,13 @@ export function MiniSeries({
   const config = { value: { label, color: "var(--berry-accent)" } } satisfies ChartConfig;
 
   return (
-    <figure className="mgmt-series">
+    <figure className="settings-chart-series">
       <figcaption>{label}</figcaption>
       {points.length ? (
-        <ChartContainer config={config} className="mgmt-chart aspect-auto w-full">
+        <ChartContainer config={config} className="settings-chart aspect-auto w-full">
           <AreaChart data={points} margin={{ left: 0, right: 6, top: 6, bottom: 0 }}>
             <defs>
-              <linearGradient id={`mgmt-fill-${reactId}`} x1="0" y1="0" x2="0" y2="1">
+              <linearGradient id={`settings-fill-${reactId}`} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="var(--color-value)" stopOpacity={0.24} />
                 <stop offset="100%" stopColor="var(--color-value)" stopOpacity={0.02} />
               </linearGradient>
@@ -42,10 +42,10 @@ export function MiniSeries({
             <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={28} tickFormatter={tickLabel} />
             <YAxis tickLine={false} axisLine={false} width={54} tickFormatter={(value) => format(Number(value))} />
             <ChartTooltip cursor={{ stroke: "var(--berry-border-strong)" }} content={<ChartTooltipContent hideIndicator formatter={(value) => format(Number(value))} />} />
-            <Area type="monotone" dataKey="value" stroke="var(--color-value)" strokeWidth={2} fill={`url(#mgmt-fill-${reactId})`} dot={false} isAnimationActive={false} />
+            <Area type="monotone" dataKey="value" stroke="var(--color-value)" strokeWidth={2} fill={`url(#settings-fill-${reactId})`} dot={false} isAnimationActive={false} />
           </AreaChart>
         </ChartContainer>
-      ) : <p className="mgmt-muted">No activity in this period.</p>}
+      ) : <p className="text-xs text-muted-foreground">No activity in this period.</p>}
       <p className="sr-only">{points.map((point) => `${point.label}: ${format(point.value)}`).join("; ")}</p>
     </figure>
   );
@@ -68,10 +68,10 @@ export function DualTrend({
   } satisfies ChartConfig;
 
   return (
-    <figure className="mgmt-series">
+    <figure className="settings-chart-series">
       <figcaption>{label}</figcaption>
       {points.length ? (
-        <ChartContainer config={config} className="mgmt-chart aspect-auto w-full">
+        <ChartContainer config={config} className="settings-chart aspect-auto w-full">
           <ComposedChart data={points} margin={{ left: 0, right: 6, top: 6, bottom: 0 }}>
             <CartesianGrid vertical={false} strokeDasharray="3 3" />
             <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} minTickGap={28} tickFormatter={tickLabel} />
@@ -83,7 +83,7 @@ export function DualTrend({
             <Line yAxisId="spend" type="monotone" dataKey="spend" stroke="var(--color-spend)" strokeWidth={2} dot={false} isAnimationActive={false} />
           </ComposedChart>
         </ChartContainer>
-      ) : <p className="mgmt-muted">No activity in this period.</p>}
+      ) : <p className="text-xs text-muted-foreground">No activity in this period.</p>}
       <p className="sr-only">{points.map((point) => `${point.label}: ${spendFormat(point.spend)}, ${point.requests} ${requestLabel}`).join("; ")}</p>
     </figure>
   );

@@ -209,7 +209,7 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
     <ManagementPage
       title="Memory"
       description="Control the personal facts and working preferences Berry may recall across your chats and projects."
-      eyebrow="Account & data"
+      eyebrow="Personalization"
       actions={(
         <>
           <Button variant="secondary" onClick={() => void exportMemory()} disabled={!client || busy === "export"}>
@@ -221,7 +221,7 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
     >
       <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
         <Section title="Recall controls" description="These settings apply only to your authenticated account.">
-          <div className="mgmt-setting-list">
+          <div className="grid divide-y divide-border [&>label]:flex [&>label]:items-center [&>label]:justify-between [&>label]:gap-4 [&>label]:py-3 [&>label>span]:grid [&>label>span]:gap-0.5 [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
             <label>
               <span><b>Use personal memory</b><small>Recall active facts and preferences in future chats.</small></span>
               <ManagementSwitch
@@ -241,16 +241,16 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
               />
             </label>
           </div>
-          {disabled ? <p className="mgmt-callout">Recall and implicit extraction are disabled. Existing entries remain available to edit, export, or forget.</p> : null}
+          {disabled ? <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">Recall and implicit extraction are disabled. Existing entries remain available to edit, export, or forget.</p> : null}
         </Section>
 
         {(creating || editing) ? (
           <Section title={editing ? "Edit memory" : "Add a memory"} description="Save only durable context you want Berry to reuse.">
             <div className="memory-editor">
-              <label className="mgmt-field">Kind<Input value={kind} maxLength={80} onChange={(event) => setKind(event.currentTarget.value)} /></label>
-              <label className="mgmt-field mgmt-field-wide">Memory<Input value={content} maxLength={20_000} onChange={(event) => setContent(event.currentTarget.value)} /></label>
-              <label className="mgmt-field">Expires<Input type="date" value={expiresAt} onChange={(event) => setExpiresAt(event.currentTarget.value)} /></label>
-              <div className="mgmt-form-actions">
+              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Kind<Input value={kind} maxLength={80} onChange={(event) => setKind(event.currentTarget.value)} /></label>
+              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">Memory<Input value={content} maxLength={20_000} onChange={(event) => setContent(event.currentTarget.value)} /></label>
+              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Expires<Input type="date" value={expiresAt} onChange={(event) => setExpiresAt(event.currentTarget.value)} /></label>
+              <div className="flex flex-wrap justify-end gap-2">
                 <Button variant="ghost" onClick={closeEditor}><X />Cancel</Button>
                 <Button onClick={() => void saveMemory()} disabled={!content.trim() || busy === "create" || busy?.startsWith("edit:")}>Save</Button>
               </div>
@@ -263,7 +263,7 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
           description="Explicit entries are user-authored. Inferred entries were consolidated from completed chats."
           actions={<Input className="memory-search" aria-label="Search memory" placeholder="Search memory" value={query} onChange={(event) => setQuery(event.currentTarget.value)} />}
         >
-          {mutationError ? <p className="mgmt-anomaly" role="alert">{mutationError}</p> : null}
+          {mutationError ? <p className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground" role="alert">{mutationError}</p> : null}
           {groups.length === 0 ? (
             <div className="memory-empty">
               <strong>{query ? "No matching memories" : "Nothing saved yet"}</strong>
@@ -308,10 +308,10 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
           {data.nextCursor && !query ? <Button variant="outline" onClick={() => void loadMore()} disabled={busy === "more"}>Load more</Button> : null}
           <div className="memory-clear">
             {confirmClear ? (
-              <div className="mgmt-confirm">
+              <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
                 <strong>Forget all personal memory?</strong>
                 <span>This removes every active personal entry from recall while preserving the audit/version history.</span>
-                <div className="mgmt-form-actions">
+                <div className="flex flex-wrap justify-end gap-2">
                   <Button variant="ghost" onClick={() => setConfirmClear(false)}>Cancel</Button>
                   <Button variant="destructive" disabled={busy === "clear"} onClick={() => void clearAll()}>Forget all</Button>
                 </div>

@@ -80,28 +80,28 @@ export function ArchivedChatsScreen({ tasks, workspaces, onArchiveTask, onDelete
     <ManagementPage
       title="Archived chats"
       description="Search, restore, or remove conversations without adding recovery controls beneath the composer."
-      eyebrow="Account & data"
+      eyebrow="History"
       actions={archivedCount > 0 ? <Button variant="destructive" disabled={busyId !== null} onClick={() => setConfirmDeleteAll(true)}><Trash2 />Delete all</Button> : null}
     >
-      <div className="mgmt-archive-filters" aria-label="Archived chat filters">
+      <div className="grid gap-2 rounded-xl border border-border bg-card p-3 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1fr)_repeat(3,minmax(140px,auto))]" aria-label="Archived chat filters">
         <SearchInput label="Search archived chats" value={filters.q ?? ""} onChange={(value) => update({ q: value || undefined })} placeholder="Search archived chats" />
         <label><span className="sr-only">Conversation type</span><FormSelect value={filters.kind} onChange={(value) => update({ kind: value as typeof filters.kind })} options={[{ value: "all", label: "All chats" }, { value: "chat", label: "Chat" }, { value: "code", label: "Code" }]} /></label>
         <label><span className="sr-only">Project</span><FormSelect value={filters.workspace} onChange={(value) => update({ workspace: value })} options={[{ value: "all", label: "All projects" }, ...workspaces.map((workspace) => ({ value: workspace.id, label: workspace.workspaceKind === "general" ? "Chats" : workspace.name }))]} /></label>
         <label><span className="sr-only">Archive state</span><FormSelect value={filters.state} onChange={(value) => update({ state: value as typeof filters.state })} options={[{ value: "archived", label: "Archived" }, { value: "deleted", label: "Recently deleted" }, { value: "all", label: "Archived and deleted" }]} /></label>
       </div>
 
-      {confirmDeleteAll ? <div className="mgmt-confirm-panel" role="alertdialog" aria-labelledby="delete-archived-title" aria-describedby="delete-archived-description"><div><b id="delete-archived-title">Delete {archivedCount} archived {archivedCount === 1 ? "chat" : "chats"}?</b><p id="delete-archived-description">They will move to Recently deleted and can still be restored.</p></div><Button variant="secondary" onClick={() => setConfirmDeleteAll(false)}>Cancel</Button><Button variant="destructive" disabled={busyId !== null} onClick={() => void deleteAll()}><Trash2 />Delete all</Button></div> : null}
-      {error ? <p className="mgmt-callout" role="alert">{error}</p> : null}
-      {status ? <p className="mgmt-success" role="status">{status}</p> : null}
+      {confirmDeleteAll ? <div className="flex flex-col gap-3 rounded-xl border border-destructive/30 bg-destructive/5 p-4 sm:flex-row sm:items-center" role="alertdialog" aria-labelledby="delete-archived-title" aria-describedby="delete-archived-description"><div className="mr-auto"><b className="text-sm text-foreground" id="delete-archived-title">Delete {archivedCount} archived {archivedCount === 1 ? "chat" : "chats"}?</b><p className="mt-1 text-xs text-muted-foreground" id="delete-archived-description">They will move to Recently deleted and can still be restored.</p></div><Button variant="secondary" onClick={() => setConfirmDeleteAll(false)}>Cancel</Button><Button variant="destructive" disabled={busyId !== null} onClick={() => void deleteAll()}><Trash2 />Delete all</Button></div> : null}
+      {error ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
+      {status ? <p className="rounded-lg border border-[var(--berry-success)]/25 bg-[var(--berry-success)]/5 px-3 py-2 text-xs text-[var(--berry-success)]" role="status">{status}</p> : null}
 
-      {groups.length === 0 ? <div className="mgmt-state"><ArchiveRestore aria-hidden /><h2>{filters.state === "deleted" ? "No recently deleted chats" : "No archived chats"}</h2><p>{filters.q ? "Try a different search or filter." : "Conversations you archive will appear here."}</p></div> : groups.map(({ workspace, items }) => (
-        <section className="mgmt-archive-group" key={workspace?.id ?? items[0]?.workspaceId} aria-labelledby={`archive-group-${items[0]?.workspaceId}`}>
-          <header><h2 id={`archive-group-${items[0]?.workspaceId}`}><Folder aria-hidden />{workspace?.workspaceKind === "general" ? "Chats" : workspace?.name ?? "Unknown project"}</h2><span>{items.length} {items.length === 1 ? "chat" : "chats"}</span></header>
-          <div className="mgmt-archive-list">
-            {items.map((task) => <article className="mgmt-archive-row" key={task.id}>
-              <div className="mgmt-archive-copy"><b title={task.title}>{task.title}</b><time dateTime={task.updatedAt}>{new Date(task.updatedAt).toLocaleString()}</time></div>
+      {groups.length === 0 ? <div className="flex min-h-44 flex-col items-center justify-center gap-2 rounded-xl border border-border bg-card px-6 py-8 text-center"><ArchiveRestore className="size-5 text-muted-foreground" aria-hidden /><h2 className="text-sm font-medium text-foreground">{filters.state === "deleted" ? "No recently deleted chats" : "No archived chats"}</h2><p className="text-xs text-muted-foreground">{filters.q ? "Try a different search or filter." : "Conversations you archive will appear here."}</p></div> : groups.map(({ workspace, items }) => (
+        <section className="grid gap-2" key={workspace?.id ?? items[0]?.workspaceId} aria-labelledby={`archive-group-${items[0]?.workspaceId}`}>
+          <header className="flex items-center justify-between gap-4 px-1"><h2 className="flex items-center gap-2 text-sm font-medium text-foreground" id={`archive-group-${items[0]?.workspaceId}`}><Folder className="size-4 text-muted-foreground" aria-hidden />{workspace?.workspaceKind === "general" ? "Chats" : workspace?.name ?? "Unknown project"}</h2><span className="text-xs text-muted-foreground">{items.length} {items.length === 1 ? "chat" : "chats"}</span></header>
+          <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
+            {items.map((task) => <article className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto]" key={task.id}>
+              <div className="grid min-w-0 gap-0.5"><b className="truncate text-sm font-medium text-foreground" title={task.title}>{task.title}</b><time className="text-xs text-muted-foreground" dateTime={task.updatedAt}>{new Date(task.updatedAt).toLocaleString()}</time></div>
               <StatusPill tone={task.deletedAt ? "warning" : "info"}>{task.deletedAt ? "Recently deleted" : task.conversationKind === "code" ? "Code" : "Chat"}</StatusPill>
-              {!task.deletedAt ? <Button variant="ghost" size="icon" className="mgmt-archive-delete" aria-label={`Delete ${task.title}`} disabled={busyId !== null} onClick={() => void mutate(task, "delete")}><Trash2 /></Button> : null}
+              {!task.deletedAt ? <Button variant="ghost" size="icon" aria-label={`Delete ${task.title}`} disabled={busyId !== null} onClick={() => void mutate(task, "delete")}><Trash2 /></Button> : null}
               <Button variant="secondary" disabled={busyId !== null} onClick={() => void mutate(task, task.deletedAt ? "restore" : "unarchive")}>{task.deletedAt ? "Restore" : "Unarchive"}</Button>
             </article>)}
           </div>
