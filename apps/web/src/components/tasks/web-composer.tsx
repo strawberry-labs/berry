@@ -1,15 +1,16 @@
 import * as React from "react";
 import { ArrowUp, Plus, Square } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
-import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type Message, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularProgressIndicator } from "@berry/desktop-ui/components/ui/circular-progress-indicator";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry/desktop-ui/components/ui/tooltip";
 import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/thread-stream";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
-import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare, X } from "@berry/desktop-ui/lib/icons";
+import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
@@ -28,6 +29,8 @@ interface PendingFileUpload {
   state: "uploading" | "error";
   error?: string;
 }
+
+const CREATE_IMAGE_TOKEN = "__berry_create_image__";
 
 export function Composer({
   config,
@@ -110,6 +113,7 @@ export function Composer({
   const [uploadError, setUploadError] = React.useState("");
   const [fileDragActive, setFileDragActive] = React.useState(false);
   const [createImageMode, setCreateImageMode] = React.useState(false);
+  const [contextStats, setContextStats] = React.useState<ContextStats | undefined>();
   const [editingFollowUp, setEditingFollowUp] = React.useState<QueuedFollowUp | null>(null);
   const [savingQueuedEdit, setSavingQueuedEdit] = React.useState(false);
   const fileDragDepthRef = React.useRef(0);
@@ -118,6 +122,43 @@ export function Composer({
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[] } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
+  const contextStatsRequestRef = React.useRef(0);
+  const contextStatsInputRef = React.useRef({ model, text, attachments });
+  contextStatsInputRef.current = { model, text, attachments };
+  const contextSessionId = activeTask?.activeSessionId ?? null;
+  const refreshContextStats = React.useCallback(async () => {
+    if (!client || !contextSessionId) return;
+    const requestId = ++contextStatsRequestRef.current;
+    const current = contextStatsInputRef.current;
+    try {
+      const next = await client.contextStats(contextSessionId, {
+        model: current.model || null,
+        pendingInput: current.text.replaceAll(CREATE_IMAGE_TOKEN, "Create image"),
+        attachments: current.attachments,
+      });
+      if (requestId === contextStatsRequestRef.current) setContextStats(next);
+    } catch {
+      if (requestId === contextStatsRequestRef.current) setContextStats(undefined);
+    }
+  }, [client, contextSessionId]);
+  React.useEffect(() => {
+    contextStatsRequestRef.current += 1;
+    if (!client || !contextSessionId) {
+      setContextStats(undefined);
+      return;
+    }
+    void refreshContextStats();
+    const interval = window.setInterval(() => void refreshContextStats(), 1_500);
+    return () => {
+      window.clearInterval(interval);
+      contextStatsRequestRef.current += 1;
+    };
+  }, [client, contextSessionId, refreshContextStats]);
+  React.useEffect(() => {
+    if (!client || !contextSessionId) return;
+    const timeout = window.setTimeout(() => void refreshContextStats(), 180);
+    return () => window.clearTimeout(timeout);
+  }, [attachments, client, contextSessionId, model, refreshContextStats, streaming, text]);
   const onMentionSelected = React.useCallback((item: { id: string; value: string; label: string }) => {
     if (!item.id.startsWith("file:")) return;
     const reference: AttachmentInput = {
@@ -130,6 +171,19 @@ export function Composer({
     };
     setAttachments((current) => current.some((attachment) => attachment.id === reference.id) ? current : [...current, reference]);
   }, []);
+  const enableCreateImageMode = React.useCallback(() => {
+    if (createImageMode) {
+      editorRef.current?.focus();
+      return;
+    }
+    setCreateImageMode(true);
+    window.requestAnimationFrame(() => editorRef.current?.insertPromptToken({
+      id: "mode:create-image",
+      category: "image",
+      label: "Create image",
+      markdown: CREATE_IMAGE_TOKEN,
+    }));
+  }, [createImageMode]);
   const mentions = useStaticMentions({ editorRef, config, taskTitles, onSelectItem: onMentionSelected });
   React.useEffect(() => {
     const pending = window.localStorage.getItem("berry.web.pendingPrompt");
@@ -202,7 +256,7 @@ export function Composer({
 
   const submit = React.useCallback(async (event?: KeyboardEvent | null) => {
     if (savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading")) return;
-    const plainInput = text.trim() || (attachments.length > 0 ? "Review the attached files." : "");
+    const plainInput = text.replaceAll(CREATE_IMAGE_TOKEN, "").trim() || (attachments.length > 0 ? "Review the attached files." : "");
     const input = createImageMode ? `Create image\n${plainInput}` : plainInput;
     if (!input) return;
     if (editingFollowUp) {
@@ -489,33 +543,22 @@ export function Composer({
           </AttachmentGroup>
         ) : null}
         <div className="berry-composer-editor relative flex-1">
-          {createImageMode ? (
-            <button
-              type="button"
-              className="berry-create-image-chip"
-              onClick={() => setCreateImageMode(false)}
-              aria-label="Remove Create image"
-            >
-              <ImagePlus />
-              <span>Create image</span>
-              <X />
-            </button>
-          ) : null}
           <PromptEditor
             ref={editorRef}
             placeholder={editingFollowUp ? "Edit queued prompt" : variant === "home" ? "Ask Berry anything, @ for files or folders, / for commands, # for related conversations" : "Ask for follow-up changes"}
             autoFocus
             mentions={mentions}
             onPasteEvent={handlePaste}
-            onChange={setText}
+            onChange={(next) => { setText(next); setCreateImageMode(next.includes(CREATE_IMAGE_TOKEN)); }}
             onSubmit={(event) => void submit(event)}
             onEscape={editingFollowUp ? cancelQueuedEdit : undefined}
           />
         </div>
         <div className="berry-composer-controls flex min-w-0 flex-nowrap items-center gap-1">
           <input ref={fileInputRef} className="visually-hidden" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => void addFiles(event.currentTarget.files)} />
-          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem onClick={() => { setCreateImageMode(true); window.requestAnimationFrame(() => editorRef.current?.focus()); }}><ImagePlus /><span className="flex flex-col"><strong className="text-[13px] font-medium">Create image</strong><small className="text-[11px] text-muted-foreground">Visualize anything</small></span></DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem className="berry-create-image-menu-item" onClick={enableCreateImageMode}><ImagePlus /><strong className="berry-create-image-menu-label">Create image</strong></DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           <span className="min-w-0 flex-1" />
+          {contextSessionId ? <ContextWindowRing stats={contextStats} /> : null}
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{composerModels.find((item) => item.id === model)?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => onModelChange(item.id)}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoning[0]!.toUpperCase() + reasoning.slice(1)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Reasoning</DropdownMenuLabel>{(["off", "low", "medium", "high"] as const).map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span className="capitalize">{level}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           {working && !editingFollowUp ? (
@@ -548,6 +591,55 @@ export function Composer({
   );
 }
 
+function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
+  const percent = stats?.percentUsed ?? null;
+  const used = stats ? formatContextTokens(stats.usedTokens) : null;
+  const total = stats?.contextWindow ? formatContextTokens(stats.contextWindow) : null;
+  const leftPercent = percent === null ? null : Math.max(0, 100 - percent);
+  const roundedUsedPercent = percent === null ? null : Math.round(percent);
+  const roundedLeftPercent = leftPercent === null ? null : Math.round(leftPercent);
+  const tooltipLabel = stats && roundedUsedPercent !== null
+    ? `Context window: ${roundedUsedPercent}% used (${roundedLeftPercent ?? 0}% left)${used && total ? `, ${used} / ${total} tokens used` : ""}`
+    : "Context window usage unavailable";
+
+  return (
+    <TooltipProvider delayDuration={250}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label={tooltipLabel}
+            className="berry-context-ring"
+            data-state={stats?.thresholdState ?? "unknown"}
+          >
+            <CircularProgressIndicator
+              value={percent ?? 0}
+              size={20}
+              strokeWidth={2.4}
+              label="Context window usage"
+              trackClassName="opacity-30"
+              formatValueText={(percentage) => `${Math.round(percentage)}% of context used`}
+            />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="berry-context-tooltip">
+          <div className="berry-context-tooltip-content">
+            {stats && roundedUsedPercent !== null ? (
+              <>
+                <span className="berry-context-tooltip-label">Context window</span>
+                <span>{roundedUsedPercent}% used ({roundedLeftPercent ?? 0}% left)</span>
+                {used && total ? <span>{used} / {total} tokens used</span> : null}
+              </>
+            ) : (
+              <span className="berry-context-tooltip-label">Context window usage unavailable</span>
+            )}
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 function UploadProgressRing({ ratio }: { ratio: number }) {
   return (
     <CircularProgressIndicator
@@ -558,6 +650,12 @@ function UploadProgressRing({ ratio }: { ratio: number }) {
       formatValueText={(percentage) => `${Math.round(percentage)}% uploaded`}
     />
   );
+}
+
+function formatContextTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${Math.round(tokens / 100) / 10}K`;
+  return String(tokens);
 }
 
 function formatFileSize(bytes: number): string {

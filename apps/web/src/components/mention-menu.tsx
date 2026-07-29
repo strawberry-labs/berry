@@ -180,6 +180,7 @@ export function MentionMenu({ controller }: { controller: MentionsController }) 
                   type="button"
                   className="mention-row"
                   data-active={active}
+                  data-category={item.category}
                   onMouseEnter={() => controller.setActiveIndex(sectionOffset + index)}
                   onClick={() => controller.select(item)}
                   role="option"

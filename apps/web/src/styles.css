@@ -123,45 +123,15 @@ textarea:not([data-slot="textarea"]):focus-visible,
   flex: 1;
 }
 
-.berry-create-image-chip {
-  display: inline-flex;
-  min-height: 28px;
-  max-width: 16rem;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 5px;
-  margin-top: 1px;
-  padding: 0 7px;
-  border: 1px solid var(--berry-border);
-  border-radius: 9px;
-  color: var(--berry-text-primary);
-  background: var(--berry-control-bg);
-  font-size: 12px;
-  font-weight: 560;
-  transition: background-color 140ms ease, border-color 140ms ease;
+.berry-create-image-menu-label {
+  color: #63a8f8;
+  font-size: 13px;
+  font-weight: 600;
 }
 
-.berry-create-image-chip:hover {
-  border-color: var(--berry-border-strong);
-  background: var(--berry-hover);
-}
-
-.berry-create-image-chip span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.berry-create-image-chip svg {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 auto;
-}
-
-.berry-create-image-chip svg:last-child {
-  width: 12px;
-  height: 12px;
-  color: var(--berry-text-tertiary);
+.berry-prompt-mention:is([data-mention-category="skills"], [data-mention-category="image"]) {
+  color: #63a8f8;
+  font-weight: 600;
 }
 
 /* Berry's web surface stays visually quiet on focus. Popovers and dialogs are
@@ -692,6 +662,11 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .mgmt-skill-dropzo
   flex: 1 1 52%;
   max-width: 56%;
   color: var(--berry-text);
+}
+
+.mention-row[data-category="skills"] .mention-row-label {
+  color: #63a8f8;
+  font-weight: 600;
 }
 
 .mention-row-description {
@@ -1944,6 +1919,47 @@ code, pre {
 .berry-composer-context-value svg { width: 14px; height: 14px; flex: 0 0 auto; }
 .berry-follow-up-mode { gap: 5px; color: var(--berry-text-secondary); font-size: 12px; }
 .berry-follow-up-mode svg { width: 14px; height: 14px; }
+
+.berry-context-ring {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 9999px;
+  color: var(--berry-text-tertiary);
+  background: transparent;
+  outline: none;
+  transition-property: background-color, color, transform;
+  transition-duration: 140ms;
+  transition-timing-function: var(--ease-out);
+}
+.berry-context-ring:hover,
+.berry-context-ring:focus-visible {
+  color: var(--berry-text-primary);
+  background: var(--berry-hover);
+}
+.berry-context-ring:active { transform: scale(0.96); }
+.berry-context-ring [role="progressbar"] { color: inherit; }
+.berry-context-ring[data-state="normal"] { color: var(--berry-text-secondary); }
+.berry-context-ring[data-state="warning"] { color: var(--berry-warning); }
+.berry-context-ring[data-state="critical"] { color: var(--berry-danger); }
+.berry-context-tooltip {
+  min-width: 176px;
+  border: 1px solid var(--berry-border-strong);
+  border-radius: 12px;
+  padding: 9px 12px;
+  color: var(--berry-text-primary);
+  background: var(--berry-card-bg);
+  box-shadow: var(--berry-shadow-lg);
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+}
+.berry-context-tooltip-content { display: flex; flex-direction: column; gap: 2px; white-space: nowrap; }
+.berry-context-tooltip-label { color: var(--berry-text-tertiary); }
 
 @media (max-width: 640px) {
   .berry-queued-message-scroll { padding-inline: 8px; }

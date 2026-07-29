@@ -2,6 +2,7 @@ import {
   AgentStreamEventSchema,
   ApprovalRequestSchema,
   ArtifactLibraryItemSchema,
+  ContextStatsSchema,
   MultipartUploadInitiateSchema,
   MultipartUploadPartUrlsSchema,
   StoredFilePageSchema,
@@ -167,6 +168,7 @@ import {
   type CloudTerminalSession,
   type CloudGitState,
   type CloudPreview,
+  type ContextStats,
   type PersonalSkill,
   type PersonalSkillReview,
   type PersonalMcpServer,
@@ -832,6 +834,17 @@ export class BerryApiClient {
 
   async turnState(sessionId: string): Promise<TurnState> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turn-state`, TurnStateSchema);
+  }
+
+  async contextStats(sessionId: string, input: {
+    model?: string | null | undefined;
+    pendingInput?: string | undefined;
+    attachments?: AttachmentInput[] | undefined;
+  } = {}): Promise<ContextStats> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/context-stats`, ContextStatsSchema, {
+      method: "POST",
+      body: input,
+    });
   }
 
   async appendMessage(sessionId: string, input: { messageId?: string | undefined; role?: "system" | "user" | "assistant" | "tool" | undefined; parts: Array<{ kind: string; content: unknown }> }): Promise<Message> {

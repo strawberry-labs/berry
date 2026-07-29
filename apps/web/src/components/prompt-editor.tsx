@@ -33,7 +33,7 @@ import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import { useHotkeys } from "react-hotkeys-hook";
 import { detectTrigger, type DetectedTrigger, type MentionTrigger } from "@/lib/mentions";
 
-export type MentionCategory = "files" | "folders" | "commands" | "skills" | "subagents" | "sessions";
+export type MentionCategory = "files" | "folders" | "commands" | "skills" | "image" | "subagents" | "sessions";
 
 export function shouldSubmitPromptOnEnter(
   event: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "isComposing" | "metaKey" | "repeat" | "shiftKey"> | null,
@@ -151,6 +151,7 @@ export interface PromptEditorHandle {
   setText: (text: string) => void;
   insertText: (text: string) => void;
   insertMention: (config: PromptMentionConfig, trigger: MentionTrigger) => void;
+  insertPromptToken: (config: PromptMentionConfig) => void;
 }
 
 function replaceEditorText(editor: LexicalEditor, text: string): void {
@@ -309,6 +310,17 @@ function $insertMentionAtSelection(config: PromptMentionConfig): void {
   space.select(1, 1);
 }
 
+function $insertPromptTokenAtStart(config: PromptMentionConfig): void {
+  const root = $getRoot();
+  root.selectStart();
+  const selection = $getSelection();
+  if (!$isRangeSelection(selection)) return;
+  const mention = $createPromptMentionNode(config);
+  const space = $createTextNode(" ");
+  selection.insertNodes([mention, space]);
+  space.selectEnd();
+}
+
 export const PromptEditor = React.forwardRef(function PromptEditor(
   {
     placeholder,
@@ -383,6 +395,12 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
       const editor = editorBox.current.editor;
       if (!editor) return;
       editor.update(() => $insertMentionAtSelection(config));
+      editor.focus();
+    },
+    insertPromptToken: (config) => {
+      const editor = editorBox.current.editor;
+      if (!editor) return;
+      editor.update(() => $insertPromptTokenAtStart(config));
       editor.focus();
     },
   }), []);

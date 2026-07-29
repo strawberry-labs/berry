@@ -5,6 +5,7 @@ import {
   AgentStreamEventSchema,
   ApprovalDecisionSchema,
   AttachmentInputSchema,
+  ContextStatsSchema,
   ConversationKindSchema,
   IMAGE_ASPECT_RATIO_DIMENSIONS,
   JsonValueSchema,
@@ -88,6 +89,12 @@ const AppendMessageRequestSchema = z.object({
     kind: MessagePartKindSchema,
     content: JsonValueSchema,
   })).min(1),
+}).strict();
+
+const ContextStatsRequestSchema = z.object({
+  model: z.string().trim().min(1).nullable().optional(),
+  pendingInput: z.string().optional(),
+  attachments: z.array(AttachmentInputSchema).max(100).optional(),
 }).strict();
 
 function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "text" | "reasoning"; content: string }> {
@@ -526,6 +533,32 @@ export class AgentApiController {
     await this.ownedSession(httpRequest, sessionId);
     await this.#projectionWrites.get(sessionId);
     return this.store.listMessages(sessionId);
+  }
+
+  @Post("/sessions/:sessionId/context-stats")
+  async contextStats(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
+    const request = parseBody(ContextStatsRequestSchema, body);
+    const { session } = await this.ownedSession(httpRequest, sessionId);
+    const model = request.model ?? session.model ?? undefined;
+    const runtime = this.runtimeConfig.resolve({ model });
+    const selectedModel = model ?? runtime.provider.defaultModel;
+    const modelMetadata = runtime.provider.models?.find((candidate) => candidate.id === selectedModel);
+    const contextWindow = resolveModelCapabilities(modelMetadata).context?.windowTokens ?? modelMetadata?.contextWindow ?? null;
+    const runtimeStats = await this.sessionHost.contextStats(sessionId, {
+      ...(request.pendingInput !== undefined ? { pendingInput: request.pendingInput } : {}),
+      ...(request.attachments ? { attachments: contextStatsAttachments(request.attachments) } : {}),
+    });
+    const percentUsed = contextWindow
+      ? Math.min(100, Math.max(0, (runtimeStats.usedTokens / contextWindow) * 100))
+      : null;
+    return ContextStatsSchema.parse({
+      usedTokens: runtimeStats.usedTokens,
+      contextWindow,
+      percentUsed,
+      tokensLeft: contextWindow ? Math.max(0, contextWindow - runtimeStats.usedTokens) : null,
+      source: runtimeStats.source,
+      thresholdState: contextThresholdState(percentUsed),
+    });
   }
 
   @Post("/sessions/:sessionId/messages")
@@ -1488,6 +1521,27 @@ function modelGovernanceMessage(reason: string): string {
   if (reason === "mode_not_allowed") return "The requested model is not allowed for this mode.";
   if (reason === "not_in_enforced_allowlist") return "The requested model is not in the organization allow-list.";
   return "The requested model is not allowed by organization policy.";
+}
+
+function contextThresholdState(percentUsed: number | null): "unknown" | "normal" | "warning" | "critical" {
+  if (percentUsed === null) return "unknown";
+  if (percentUsed >= 95) return "critical";
+  if (percentUsed >= 85) return "warning";
+  return "normal";
+}
+
+function contextStatsAttachments(attachments: z.infer<typeof AttachmentInputSchema>[]) {
+  return attachments.map((attachment, index) => ({
+    id: attachment.id ?? `context-attachment-${index}`,
+    name: attachment.name,
+    mediaType: attachment.mediaType,
+    size: attachment.size,
+    ...(attachment.fileId !== undefined ? { fileId: attachment.fileId } : {}),
+    ...(attachment.dataUrl !== undefined ? { dataUrl: attachment.dataUrl } : {}),
+    ...(attachment.textContent !== undefined ? { textContent: attachment.textContent } : {}),
+    ...(attachment.localPath !== undefined ? { localPath: attachment.localPath } : {}),
+    ...(attachment.sourceKind !== undefined ? { sourceKind: attachment.sourceKind } : {}),
+  }));
 }
 
 function imageUsageEvent(input: {

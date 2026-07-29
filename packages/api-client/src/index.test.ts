@@ -161,6 +161,27 @@ describe("BerryApiClient", () => {
     expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/turn-state", expect.objectContaining({ method: "GET" }));
   });
 
+  it("reads live context-window usage with the current draft", async () => {
+    const fetchImpl = vi.fn(async () => json({
+      usedTokens: 12_000,
+      contextWindow: 128_000,
+      percentUsed: 9.375,
+      tokensLeft: 116_000,
+      source: "estimated",
+      thresholdState: "normal",
+    }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.contextStats("session_1", { model: "berry/auto", pendingInput: "Continue the task" })).resolves.toMatchObject({
+      usedTokens: 12_000,
+      contextWindow: 128_000,
+    });
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/context-stats", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ model: "berry/auto", pendingInput: "Continue the task" }),
+    }));
+  });
+
   it("queues steering input for an active turn", async () => {
     const messageId = "46df263a-3453-4d22-9b65-fb585ba71c9b";
     const message = {
