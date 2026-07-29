@@ -104,6 +104,10 @@ export function shouldRefreshAdministration(permissions: readonly OrgPermission[
   return permissions.includes("org:admin");
 }
 
+export function shouldShowComposerProjectSwitcher(messages: readonly unknown[]): boolean {
+  return messages.length === 0;
+}
+
 export function AppShell({ initial }: { initial: ShellData }) {
   if (initial.config.demoMode) return <CloudShell initial={initial} user={null} />;
   return (
@@ -1953,7 +1957,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onSteerMessage={steerActiveTurn}
               planProgress={planProgressFromConversation(messages, stream)}
               question={stream.question}
-              showProjectSwitcher={!messages.some((message) => message.role === "user")}
+              showProjectSwitcher={shouldShowComposerProjectSwitcher(messages)}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
               runTurn={runTurn}
