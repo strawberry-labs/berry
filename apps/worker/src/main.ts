@@ -51,12 +51,17 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
       cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
       ttlSeconds: Number(env.BERRY_SANDBOX_TTL_SECONDS ?? 3600),
+      maxInputBytes: durableConfig.sandboxInputMaxBytes,
     },
   );
   const knowledge = new KnowledgeProcessor({
     repository: new SqlKnowledgeRepository(executor),
     objects: knowledgeObjectStore(env),
-    extractor: new DocumentExtractor(durableConfig.tikaUrl),
+    extractor: new DocumentExtractor(durableConfig.tikaUrl, {
+      timeoutMs: 60_000,
+      maxInputBytes: durableConfig.knowledgeMaxInputBytes,
+      maxOutputBytes: durableConfig.knowledgeMaxOutputBytes,
+    }),
     chunker: new KnowledgeChunker(durableConfig.knowledgeChunkTokens, durableConfig.knowledgeChunkOverlapTokens),
     embeddings: createEmbeddingProviderFromEnv(env, {
       provider: durableConfig.embeddingProvider,
@@ -108,14 +113,22 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
         leaseSeconds: durableConfig.runLeaseSeconds,
         snapshotIntervalSeconds: durableConfig.sandboxSnapshotIntervalSeconds,
         compactionTriggerTokens: durableConfig.compactionTriggerTokens,
+        maxModelIterations: durableConfig.turnMaxModelIterations,
+        maxToolCalls: durableConfig.turnMaxToolCalls,
+        maxTotalTokens: durableConfig.turnMaxTotalTokens,
+        maxSpendMicros: durableConfig.turnMaxSpendMicros,
+        maxWallTimeSeconds: durableConfig.turnMaxWallTimeSeconds,
         compactor,
       },
     ),
     snapshotter: sandboxContinuity,
     maintenance: new SqlMaintenanceRunner(executor),
+    tenantContext: {
+      run: (tenantId, callback) => executor.runWithTenant(tenantId, callback),
+    },
   }, workerOptions);
   const outbox = new RuntimeOutboxDispatcher(executor, queue, {
-    tenantId: env.BERRY_TENANT_ID ?? "00000000-0000-7000-8000-000000000001",
+    ...(env.BERRY_TENANT_ID ? { tenantId: env.BERRY_TENANT_ID } : {}),
     workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
     pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 100,
   });

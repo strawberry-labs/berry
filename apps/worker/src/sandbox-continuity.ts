@@ -81,6 +81,7 @@ export interface SandboxSnapshotObjectStore {
   put(key: string, body: Uint8Array): Promise<void>;
   get(key: string): Promise<Uint8Array>;
   getSource(key: string): Promise<Uint8Array>;
+  streamSource?(key: string, maxBytes: number): AsyncIterable<Uint8Array>;
 }
 
 export class SandboxContinuityManager implements DurableTurnToolExecutor {
@@ -92,6 +93,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       image: string;
       cwd?: string;
       ttlSeconds?: number;
+      maxInputBytes?: number;
     },
   ) {}
 
@@ -249,10 +251,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (files.length === 0) return;
     if (!this.objects) throw new Error("Input file object storage is not configured");
     for (const file of files) {
-      const bytes = await this.objects.getSource(file.objectKey);
-      if (bytes.byteLength !== file.sizeBytes) {
-        throw new Error(`Input file ${file.name} is incomplete`);
-      }
+      const maxInputBytes = this.options.maxInputBytes ?? 100 * 1024 * 1024;
+      if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
       const path = durableAttachmentPath({ fileId: file.fileId, name: file.name });
       for await (const event of this.provider.exec({
         sandbox_id: sandboxId,
@@ -265,12 +265,69 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           throw new Error(`Unable to prepare the sandbox directory for ${file.name}`);
         }
       }
-      await this.provider.files.write({
-        sandbox_id: sandboxId,
+      await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name);
+      const source = this.objects.streamSource
+        ? this.objects.streamSource(file.objectKey, maxInputBytes)
+        : singleChunk(await this.objects.getSource(file.objectKey));
+      let written = 0;
+      for await (const sourceChunk of source) {
+        for (let offset = 0; offset < sourceChunk.byteLength; offset += 256 * 1024) {
+          const chunk = sourceChunk.subarray(offset, Math.min(sourceChunk.byteLength, offset + 256 * 1024));
+          written += chunk.byteLength;
+          if (written > maxInputBytes || written > file.sizeBytes) {
+            throw new Error(`Input file ${file.name} exceeds its validated size`);
+          }
+          await this.appendSandboxChunk(snapshot.id, sandboxId, path, file.name, chunk, written);
+        }
+      }
+      if (written !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
+    }
+  }
+
+  private async truncateSandboxFile(
+    runId: string,
+    sandboxId: string,
+    path: string,
+    name: string,
+  ): Promise<void> {
+    for await (const event of this.provider.exec({
+      sandbox_id: sandboxId,
+      request_id: `${runId}:stage:truncate:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
+      command: ["sh", "-c", ': > "$1"', "berry-stage", path],
+      timeout_ms: 30_000,
+    })) {
+      if (event.kind === "error") throw new Error(event.message);
+      if (event.kind === "exit" && event.exit_code !== 0) {
+        throw new Error(`Unable to initialize the sandbox file for ${name}`);
+      }
+    }
+  }
+
+  private async appendSandboxChunk(
+    runId: string,
+    sandboxId: string,
+    path: string,
+    name: string,
+    chunk: Uint8Array,
+    written: number,
+  ): Promise<void> {
+    for await (const event of this.provider.exec({
+      sandbox_id: sandboxId,
+      request_id: `${runId}:stage:append:${createHash("sha256").update(path).digest("hex").slice(0, 12)}:${written}`,
+      command: [
+        "sh",
+        "-c",
+        'printf "%s" "$2" | base64 -d >> "$1"',
+        "berry-stage",
         path,
-        content: Buffer.from(bytes).toString("base64"),
-        encoding: "base64",
-      });
+        Buffer.from(chunk).toString("base64"),
+      ],
+      timeout_ms: 30_000,
+    })) {
+      if (event.kind === "error") throw new Error(event.message);
+      if (event.kind === "exit" && event.exit_code !== 0) {
+        throw new Error(`Unable to stream ${name} into the sandbox`);
+      }
     }
   }
 
@@ -425,6 +482,7 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     private readonly client: S3Client,
     private readonly bucket: string,
     private readonly prefix: string,
+    private readonly maxSourceBytes = 100 * 1024 * 1024,
   ) {}
 
   static fromEnv(env: NodeJS.ProcessEnv): S3SandboxSnapshotObjectStore | null {
@@ -442,6 +500,7 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
       }),
       bucket,
       (env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
+      positiveInteger(env.BERRY_SANDBOX_INPUT_MAX_BYTES, 100 * 1024 * 1024),
     );
   }
 
@@ -455,21 +514,41 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
   }
 
   async get(key: string): Promise<Uint8Array> {
-    const result = await this.client.send(new GetObjectCommand({
-      Bucket: this.bucket,
-      Key: `${this.prefix}/${key}`,
-    }));
-    if (!result.Body) throw new Error("Sandbox snapshot object has no body");
-    return result.Body.transformToByteArray();
+    return this.getSource(key);
   }
 
   async getSource(key: string): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of this.streamSource(key, this.maxSourceBytes)) {
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return result;
+  }
+
+  async *streamSource(key: string, maxBytes: number): AsyncIterable<Uint8Array> {
     const result = await this.client.send(new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
     }));
     if (!result.Body) throw new Error("Input file object has no body");
-    return result.Body.transformToByteArray();
+    if (result.ContentLength !== undefined && result.ContentLength > maxBytes) {
+      throw new Error(`Input file object exceeds the ${maxBytes}-byte sandbox limit`);
+    }
+    let total = 0;
+    for await (const raw of result.Body as AsyncIterable<Uint8Array>) {
+      const chunk = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+      total += chunk.byteLength;
+      if (total > maxBytes) throw new Error(`Input file object exceeds the ${maxBytes}-byte sandbox limit`);
+      yield chunk;
+    }
   }
 }
 
@@ -606,6 +685,15 @@ function stringValue(value: unknown, allowEmpty = false): string | null {
 
 function numberValue(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+async function* singleChunk(bytes: Uint8Array): AsyncIterable<Uint8Array> {
+  yield bytes;
+}
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function mapSnapshot(row: SnapshotRow): SnapshotRecord {

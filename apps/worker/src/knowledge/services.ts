@@ -11,29 +11,38 @@ export type KnowledgeObject = {
 };
 
 export interface KnowledgeObjectStore {
-  read(input: KnowledgeObject): Promise<Uint8Array>;
+  read(input: KnowledgeObject, maxBytes?: number): Promise<Uint8Array>;
   write(input: { bucket: string; key: string; mediaType: string; body: Uint8Array }): Promise<void>;
 }
 
 export class S3KnowledgeObjectStore implements KnowledgeObjectStore {
-  constructor(private readonly client: S3Client) {}
+  constructor(
+    private readonly client: S3Client,
+    private readonly maxReadBytes = 100 * 1024 * 1024,
+  ) {}
 
   static fromEnv(env: NodeJS.ProcessEnv): S3KnowledgeObjectStore {
     const endpoint = required(env.BERRY_ARTIFACT_S3_ENDPOINT, "BERRY_ARTIFACT_S3_ENDPOINT");
     const accessKeyId = required(env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID, "BERRY_ARTIFACT_S3_ACCESS_KEY_ID");
     const secretAccessKey = required(env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY, "BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY");
-    return new S3KnowledgeObjectStore(new S3Client({
-      endpoint,
-      region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-      forcePathStyle: true,
-      credentials: { accessKeyId, secretAccessKey },
-    }));
+    return new S3KnowledgeObjectStore(
+      new S3Client({
+        endpoint,
+        region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
+        forcePathStyle: true,
+        credentials: { accessKeyId, secretAccessKey },
+      }),
+      positiveInteger(env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES, 100 * 1024 * 1024),
+    );
   }
 
-  async read(input: KnowledgeObject): Promise<Uint8Array> {
+  async read(input: KnowledgeObject, maxBytes = this.maxReadBytes): Promise<Uint8Array> {
     const object = await this.client.send(new GetObjectCommand({ Bucket: input.bucket, Key: input.key }));
     if (!object.Body) throw new Error(`Knowledge object ${input.key} has no body`);
-    return object.Body.transformToByteArray();
+    if (object.ContentLength !== undefined && object.ContentLength > maxBytes) {
+      throw new Error(`Knowledge object ${input.key} exceeds the ${maxBytes}-byte read limit`);
+    }
+    return readBoundedBody(object.Body as AsyncIterable<Uint8Array>, maxBytes, input.key);
   }
 
   async write(input: { bucket: string; key: string; mediaType: string; body: Uint8Array }): Promise<void> {
@@ -44,6 +53,28 @@ export class S3KnowledgeObjectStore implements KnowledgeObjectStore {
       Body: input.body,
     }));
   }
+}
+
+async function readBoundedBody(
+  body: AsyncIterable<Uint8Array>,
+  maxBytes: number,
+  label: string,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const raw of body) {
+    const chunk = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    total += chunk.byteLength;
+    if (total > maxBytes) throw new Error(`Knowledge object ${label} exceeds the ${maxBytes}-byte read limit`);
+    chunks.push(chunk);
+  }
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
 }
 
 const DIRECT_TEXT_MEDIA = new Set([
@@ -212,4 +243,9 @@ function normalizeExtractedText(text: string): string {
 function required(value: string | undefined, name: string): string {
   if (!value?.trim()) throw new Error(`${name} is required for knowledge ingestion`);
   return value.trim();
+}
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }

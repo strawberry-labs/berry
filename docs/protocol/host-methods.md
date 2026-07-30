@@ -1063,6 +1063,60 @@ Result:
                 "properties": {
                   "kind": {
                     "type": "string",
+                    "const": "image.partial"
+                  },
+                  "toolCallId": {
+                    "type": "string"
+                  },
+                  "requestIndex": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "percentComplete": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "b64": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "mimeType": {
+                    "type": "string",
+                    "minLength": 1,
+                    "default": "image/png"
+                  },
+                  "aspectRatio": {
+                    "type": "string",
+                    "enum": [
+                      "1:1",
+                      "3:4",
+                      "4:3",
+                      "9:16",
+                      "16:9"
+                    ],
+                    "default": "1:1"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "toolCallId",
+                  "requestIndex",
+                  "index",
+                  "percentComplete",
+                  "b64"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
                     "const": "tool.end"
                   },
                   "toolCallId": {
@@ -1150,6 +1204,32 @@ Result:
                 "properties": {
                   "kind": {
                     "type": "string",
+                    "const": "approval.resolved"
+                  },
+                  "approvalId": {
+                    "type": "string"
+                  },
+                  "decision": {
+                    "type": "string",
+                    "enum": [
+                      "approved",
+                      "denied",
+                      "expired"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "approvalId",
+                  "decision"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
                     "const": "question.request"
                   },
                   "questionId": {
@@ -1197,7 +1277,7 @@ Result:
                         "options": {
                           "type": "array",
                           "items": {
-                            "$ref": "#/definitions/agent.turnState.result/properties/bufferedEvents/items/anyOf/8/properties/options/items"
+                            "$ref": "#/definitions/agent.turnState.result/properties/bufferedEvents/items/anyOf/10/properties/options/items"
                           },
                           "maxItems": 12,
                           "default": []
@@ -1254,6 +1334,153 @@ Result:
                   "outputTokens": {
                     "type": "number"
                   },
+                  "totalTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "costRawMicros": {
+                    "type": "string",
+                    "pattern": "^\\d+$"
+                  },
+                  "cacheReadTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cacheWriteTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cacheCreationTokens1h": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cacheCreationTokens5m": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cacheEligible": {
+                    "type": "boolean"
+                  },
+                  "cacheProvider": {
+                    "type": "string"
+                  },
+                  "cacheKeyHash": {
+                    "type": "string"
+                  },
+                  "promptManifestHash": {
+                    "type": "string"
+                  },
+                  "promptManifest": {
+                    "type": "object",
+                    "properties": {
+                      "version": {
+                        "type": "number",
+                        "const": 1
+                      },
+                      "provider": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "route": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "components": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "kind": {
+                              "type": "string",
+                              "enum": [
+                                "system",
+                                "tool_schema",
+                                "policy",
+                                "capability",
+                                "project_instruction"
+                              ]
+                            },
+                            "hash": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "tokenEstimate": {
+                              "type": "integer",
+                              "minimum": 0
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "kind",
+                            "hash",
+                            "tokenEstimate"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "cacheRetention": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "short",
+                          "long"
+                        ],
+                        "default": "none"
+                      },
+                      "stablePrefixTokens": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "dynamicContextBoundary": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "stablePrefixHash": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "manifestHash": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "version",
+                      "provider",
+                      "model",
+                      "route",
+                      "components",
+                      "stablePrefixTokens",
+                      "dynamicContextBoundary",
+                      "stablePrefixHash",
+                      "manifestHash"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "cacheMissReason": {
+                    "type": "string",
+                    "enum": [
+                      "provider_unsupported",
+                      "below_minimum_tokens",
+                      "first_request",
+                      "prefix_changed",
+                      "cache_expired",
+                      "routing_changed",
+                      "retention_unsupported",
+                      "unknown"
+                    ]
+                  },
+                  "cacheMissComponentId": {
+                    "type": "string"
+                  },
                   "model": {
                     "type": "string"
                   },
@@ -1289,7 +1516,8 @@ Result:
                       "forked",
                       "rewound",
                       "steered",
-                      "followed-up"
+                      "followed-up",
+                      "limit-reached"
                     ]
                   },
                   "detail": {
@@ -1391,11 +1619,59 @@ Result:
             ]
           }
         },
+        "lastEventId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "replayOnly": {
           "type": "boolean",
           "default": false
         },
         "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runState": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "queued",
+                "assembling_context",
+                "calling_model",
+                "persisting_response",
+                "executing_tool",
+                "compacting",
+                "waiting",
+                "finalizing",
+                "completed",
+                "failed",
+                "cancelled",
+                "recovery_required"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "waitingReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nextAction": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
           "type": [
             "string",
             "null"
@@ -8448,6 +8724,42 @@ Result:
                         }
                       },
                       "additionalProperties": false
+                    },
+                    "promptCaching": {
+                      "type": "object",
+                      "properties": {
+                        "supported": {
+                          "type": "boolean"
+                        },
+                        "cacheKey": {
+                          "type": "boolean",
+                          "default": false
+                        },
+                        "cacheControl": {
+                          "type": "boolean",
+                          "default": false
+                        },
+                        "retention": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "short",
+                              "long"
+                            ]
+                          },
+                          "default": []
+                        },
+                        "minimumTokens": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "default": 1024
+                        }
+                      },
+                      "required": [
+                        "supported"
+                      ],
+                      "additionalProperties": false
                     }
                   },
                   "additionalProperties": false
@@ -9143,6 +9455,42 @@ Result:
                         }
                       },
                       "additionalProperties": false
+                    },
+                    "promptCaching": {
+                      "type": "object",
+                      "properties": {
+                        "supported": {
+                          "type": "boolean"
+                        },
+                        "cacheKey": {
+                          "type": "boolean",
+                          "default": false
+                        },
+                        "cacheControl": {
+                          "type": "boolean",
+                          "default": false
+                        },
+                        "retention": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "short",
+                              "long"
+                            ]
+                          },
+                          "default": []
+                        },
+                        "minimumTokens": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "default": 1024
+                        }
+                      },
+                      "required": [
+                        "supported"
+                      ],
+                      "additionalProperties": false
                     }
                   },
                   "additionalProperties": false
@@ -9236,6 +9584,9 @@ Result:
               },
               "imageInput": {
                 "type": "boolean"
+              },
+              "promptCaching": {
+                "$ref": "#/definitions/model.provider.list.result/items/properties/models/items/properties/capabilities/properties/promptCaching"
               }
             },
             "additionalProperties": false,
@@ -9406,6 +9757,42 @@ Result:
                     "minimum": 0
                   }
                 },
+                "additionalProperties": false
+              },
+              "promptCaching": {
+                "type": "object",
+                "properties": {
+                  "supported": {
+                    "type": "boolean"
+                  },
+                  "cacheKey": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "cacheControl": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "retention": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "short",
+                        "long"
+                      ]
+                    },
+                    "default": []
+                  },
+                  "minimumTokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 1024
+                  }
+                },
+                "required": [
+                  "supported"
+                ],
                 "additionalProperties": false
               }
             },
@@ -9686,6 +10073,42 @@ Result:
                       }
                     },
                     "additionalProperties": false
+                  },
+                  "promptCaching": {
+                    "type": "object",
+                    "properties": {
+                      "supported": {
+                        "type": "boolean"
+                      },
+                      "cacheKey": {
+                        "type": "boolean",
+                        "default": false
+                      },
+                      "cacheControl": {
+                        "type": "boolean",
+                        "default": false
+                      },
+                      "retention": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "short",
+                            "long"
+                          ]
+                        },
+                        "default": []
+                      },
+                      "minimumTokens": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 1024
+                      }
+                    },
+                    "required": [
+                      "supported"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "additionalProperties": false
@@ -9779,6 +10202,9 @@ Result:
             },
             "imageInput": {
               "type": "boolean"
+            },
+            "promptCaching": {
+              "$ref": "#/definitions/model.provider.save.result/properties/models/items/properties/capabilities/properties/promptCaching"
             }
           },
           "additionalProperties": false,
@@ -16182,6 +16608,35 @@ Params:
         "size": {
           "type": "string",
           "minLength": 1
+        },
+        "aspectRatio": {
+          "type": "string",
+          "enum": [
+            "1:1",
+            "3:4",
+            "4:3",
+            "9:16",
+            "16:9"
+          ]
+        },
+        "transparentBackground": {
+          "type": "boolean"
+        },
+        "referenceImageUrls": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "maxItems": 16
+        },
+        "stream": {
+          "type": "boolean"
+        },
+        "partialImages": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
         }
       },
       "required": [
@@ -17123,6 +17578,7 @@ Result:
                     "tool-result",
                     "image",
                     "attachment",
+                    "citation",
                     "terminal",
                     "browser-screenshot",
                     "error"

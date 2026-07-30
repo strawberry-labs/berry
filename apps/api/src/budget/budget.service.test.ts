@@ -5,6 +5,7 @@ import {
   InMemoryBudgetHotCounters,
   InMemoryBudgetRepository,
   budgetEstimateFromRequest,
+  usageCostMicros,
 } from "./budget.service.ts";
 
 describe("BudgetService", () => {
@@ -121,6 +122,19 @@ describe("BudgetService", () => {
     expect(budgetEstimateFromRequest({ provider: { cost: { input: 0.25, output: 0.75 } }, model: "test" })).toBe(4000n);
     expect(budgetEstimateFromRequest({ provider: { models: [{ id: "priced", capabilities: { cost: { input: 0.5, output: 1 } } }] }, model: "priced" })).toBe(6000n);
     expect(budgetEstimateFromRequest({ provider: {}, model: "test" })).toBe(1n);
+  });
+
+  it("uses exact provider usage cost, preserves explicit zero pricing, and falls back when pricing is absent", () => {
+    const usage = {
+      kind: "usage" as const,
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+    };
+
+    expect(usageCostMicros({ ...usage, costRawMicros: "7" }, 99n, {})).toBe(7n);
+    expect(usageCostMicros(usage, 99n, { cost: { input: 0, output: 0 } })).toBe(0n);
+    expect(usageCostMicros(usage, 99n, {})).toBe(99n);
   });
 });
 

@@ -1,7 +1,8 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, Optional } from "@nestjs/common";
 import { cloudMigrations, SELF_HOST_TENANT_ID } from "@berry/db";
 
 export const CLOUD_DATABASE_EXECUTOR = Symbol("CLOUD_DATABASE_EXECUTOR");
+export const CLOUD_PLATFORM_DATABASE_EXECUTOR = Symbol("CLOUD_PLATFORM_DATABASE_EXECUTOR");
 
 export interface SqlExecutor {
   execute(sql: string, params?: readonly unknown[]): Promise<unknown>;
@@ -13,7 +14,11 @@ export interface SqlExecutor {
 export class CloudDatabaseService {
   readonly selfHostTenantId = SELF_HOST_TENANT_ID;
 
-  constructor(@Inject(CLOUD_DATABASE_EXECUTOR) private readonly executor: SqlExecutor) {}
+  constructor(
+    @Inject(CLOUD_DATABASE_EXECUTOR) private readonly executor: SqlExecutor,
+    @Optional() @Inject(CLOUD_PLATFORM_DATABASE_EXECUTOR)
+    private readonly platformExecutor?: SqlExecutor,
+  ) {}
 
   async migrate(): Promise<void> {
     await this.executor.execute(`
@@ -56,7 +61,7 @@ export class CloudDatabaseService {
 
   /** Cross-tenant query seam. Only platform services guarded by PlatformAuthorizer may call this. */
   async privilegedQuery<T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> {
-    return this.executor.query<T>(sql, params);
+    return (this.platformExecutor ?? this.executor).query<T>(sql, params);
   }
 }
 

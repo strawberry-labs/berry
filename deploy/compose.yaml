@@ -36,6 +36,37 @@ services:
       timeout: 5s
       retries: 20
 
+  db-migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    restart: "no"
+    command: ["node", "apps/api/dist/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+
+  postgres-roles:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    restart: "no"
+    command: ["node", "apps/api/dist/configure-service-roles.js"]
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_API_DATABASE_PASSWORD: ${BERRY_API_DATABASE_PASSWORD:-berry-api-dev-password}
+      BERRY_WORKER_DATABASE_PASSWORD: ${BERRY_WORKER_DATABASE_PASSWORD:-berry-worker-dev-password}
+      BERRY_PLATFORM_DATABASE_PASSWORD: ${BERRY_PLATFORM_DATABASE_PASSWORD:-berry-platform-dev-password}
+
   mem0-postgres:
     image: pgvector/pgvector:0.8.2-pg16-bookworm
     restart: unless-stopped
@@ -165,8 +196,8 @@ services:
     restart: unless-stopped
     command: ["node", "apps/api/dist/main.js"]
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres-roles:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       embeddings:
@@ -175,7 +206,9 @@ services:
       NODE_ENV: production
       PORT: 3000
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-self-hosted}
-      BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_DATABASE_URL: postgres://berry_api:${BERRY_API_DATABASE_PASSWORD:-berry-api-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_PLATFORM_DATABASE_URL: postgres://berry_platform:${BERRY_PLATFORM_DATABASE_PASSWORD:-berry-platform-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_RUN_MIGRATIONS: "false"
       BERRY_REDIS_URL: redis://redis:6379
       BERRY_BUDGETS_ENABLED: ${BERRY_BUDGETS_ENABLED:-true}
       BERRY_BUDGET_FAIL_CLOSED: ${BERRY_BUDGET_FAIL_CLOSED:-true}
@@ -259,6 +292,14 @@ services:
       BERRY_ARTIFACT_S3_PREFIX: ${BERRY_ARTIFACT_S3_PREFIX:-artifacts}
       BERRY_ARTIFACT_PUBLIC_BASE_URL: ${BERRY_ARTIFACT_PUBLIC_BASE_URL:-https://aesg-v2.berry.me/v1/artifacts}
       BERRY_FILE_MAX_UPLOAD_BYTES: ${BERRY_FILE_MAX_UPLOAD_BYTES:-1073741824}
+      BERRY_KNOWLEDGE_MAX_INPUT_BYTES: ${BERRY_KNOWLEDGE_MAX_INPUT_BYTES:-104857600}
+      BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES: ${BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES:-26214400}
+      BERRY_SANDBOX_INPUT_MAX_BYTES: ${BERRY_SANDBOX_INPUT_MAX_BYTES:-104857600}
+      BERRY_TURN_MAX_MODEL_ITERATIONS: ${BERRY_TURN_MAX_MODEL_ITERATIONS:-12}
+      BERRY_TURN_MAX_TOOL_CALLS: ${BERRY_TURN_MAX_TOOL_CALLS:-48}
+      BERRY_TURN_MAX_TOTAL_TOKENS: ${BERRY_TURN_MAX_TOTAL_TOKENS:-250000}
+      BERRY_TURN_MAX_SPEND_MICROS: ${BERRY_TURN_MAX_SPEND_MICROS:-1000000}
+      BERRY_TURN_MAX_WALL_TIME_SECONDS: ${BERRY_TURN_MAX_WALL_TIME_SECONDS:-1800}
       BERRY_FILE_MULTIPART_PART_SIZE: ${BERRY_FILE_MULTIPART_PART_SIZE:-16777216}
       BERRY_FILE_PRESIGN_SECONDS: ${BERRY_FILE_PRESIGN_SECONDS:-900}
       BERRY_MEMORY_ENABLED: ${BERRY_MEMORY_ENABLED:-true}
@@ -305,15 +346,15 @@ services:
     depends_on:
       api:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
+      postgres-roles:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       embeddings:
         condition: service_started
     environment:
       NODE_ENV: production
-      BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
+      BERRY_DATABASE_URL: postgres://berry_worker:${BERRY_WORKER_DATABASE_PASSWORD:-berry-worker-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
       BERRY_REDIS_URL: redis://redis:6379
       BERRY_WORKER_CONCURRENCY: ${BERRY_WORKER_CONCURRENCY:-4}
       BERRY_MEMORY_ENABLED: ${BERRY_MEMORY_ENABLED:-true}
@@ -338,6 +379,14 @@ services:
       BERRY_COMPACTION_TRIGGER_TOKENS: ${BERRY_COMPACTION_TRIGGER_TOKENS:-120000}
       BERRY_RUN_LEASE_SECONDS: ${BERRY_RUN_LEASE_SECONDS:-90}
       BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS: ${BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS:-900}
+      BERRY_KNOWLEDGE_MAX_INPUT_BYTES: ${BERRY_KNOWLEDGE_MAX_INPUT_BYTES:-104857600}
+      BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES: ${BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES:-26214400}
+      BERRY_SANDBOX_INPUT_MAX_BYTES: ${BERRY_SANDBOX_INPUT_MAX_BYTES:-104857600}
+      BERRY_TURN_MAX_MODEL_ITERATIONS: ${BERRY_TURN_MAX_MODEL_ITERATIONS:-12}
+      BERRY_TURN_MAX_TOOL_CALLS: ${BERRY_TURN_MAX_TOOL_CALLS:-48}
+      BERRY_TURN_MAX_TOTAL_TOKENS: ${BERRY_TURN_MAX_TOTAL_TOKENS:-250000}
+      BERRY_TURN_MAX_SPEND_MICROS: ${BERRY_TURN_MAX_SPEND_MICROS:-1000000}
+      BERRY_TURN_MAX_WALL_TIME_SECONDS: ${BERRY_TURN_MAX_WALL_TIME_SECONDS:-1800}
       BERRY_API_MODEL_MODE: ${BERRY_API_MODEL_MODE:-live}
       BERRY_ROUTER_INFERENCE_BASE_URL: ${BERRY_ROUTER_INFERENCE_BASE_URL:-}
       BERRY_ROUTER_API_KEY: ${BERRY_ROUTER_API_KEY:-}

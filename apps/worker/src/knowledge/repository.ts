@@ -153,20 +153,30 @@ export class SqlKnowledgeRepository {
         return;
       }
       await executor.execute("DELETE FROM knowledge_chunks WHERE tenant_id = $1::uuid AND source_id = $2::uuid", [input.tenantId, input.source.id]);
-      for (const chunk of input.chunks) {
+      for (const batch of batches(input.chunks, 500)) {
         await executor.execute(`
           INSERT INTO knowledge_chunks (
             tenant_id, workspace_id, source_id, ordinal, text_content,
             token_estimate, metadata, vector_ready
-          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::jsonb, false)
+          )
+          SELECT $1::uuid, $2::uuid, $3::uuid, chunk.ordinal,
+                 chunk.text_content, chunk.token_estimate, chunk.metadata, false
+          FROM jsonb_to_recordset($4::jsonb) AS chunk(
+            ordinal integer,
+            text_content text,
+            token_estimate integer,
+            metadata jsonb
+          )
         `, [
           input.tenantId,
           input.source.workspaceId,
           input.source.id,
-          chunk.ordinal,
-          chunk.text,
-          chunk.tokenEstimate,
-          JSON.stringify(chunk.metadata),
+          JSON.stringify(batch.map((chunk) => ({
+            ordinal: chunk.ordinal,
+            text_content: chunk.text,
+            token_estimate: chunk.tokenEstimate,
+            metadata: chunk.metadata,
+          }))),
         ]);
       }
       await this.markTextReady(executor, input);
@@ -202,32 +212,42 @@ export class SqlKnowledgeRepository {
   }): Promise<void> {
     if (input.chunks.length !== input.vectors.length) throw new Error("Embedding count does not match chunk count");
     await this.withTenant(input.tenantId, async (executor) => {
-      for (let index = 0; index < input.chunks.length; index += 1) {
-        const chunk = input.chunks[index]!;
-        const vector = input.vectors[index]!;
+      const embedded = input.chunks.map((chunk, index) => ({ chunk, vector: input.vectors[index]! }));
+      for (const batch of batches(embedded, 100)) {
         await executor.execute(`
-          UPDATE knowledge_chunks SET
-            embedding = $4::vector,
-            embedding_profile_id = $5,
-            embedding_provider = $6,
-            embedding_model = $7,
-            embedding_dimensions = $8,
-            embedding_profile_version = $9,
-            embedding_hash = $10,
+          UPDATE knowledge_chunks AS target SET
+            embedding = batch.embedding::vector,
+            embedding_profile_id = $4,
+            embedding_provider = $5,
+            embedding_model = $6,
+            embedding_dimensions = $7,
+            embedding_profile_version = $8,
+            embedding_hash = batch.embedding_hash,
             vector_ready = true,
             updated_at = now()
-          WHERE tenant_id = $1::uuid AND source_id = $2::uuid AND id = $3::uuid
+          FROM jsonb_to_recordset($3::jsonb) AS batch(
+            id uuid,
+            embedding text,
+            embedding_hash text
+          )
+          WHERE target.tenant_id = $1::uuid
+            AND target.source_id = $2::uuid
+            AND target.id = batch.id
         `, [
           input.tenantId,
           input.source.id,
-          chunk.id,
-          `[${vector.join(",")}]`,
+          JSON.stringify(batch.map(({ chunk, vector }) => {
+            return {
+              id: chunk.id,
+              embedding: `[${vector.join(",")}]`,
+              embedding_hash: createHash("sha256").update(JSON.stringify(vector)).digest("hex"),
+            };
+          })),
           input.profile.id,
           input.profile.provider,
           input.profile.model,
           input.profile.dimensions,
           input.profile.version,
-          createHash("sha256").update(JSON.stringify(vector)).digest("hex"),
         ]);
       }
       await executor.execute(`
@@ -606,6 +626,14 @@ function checkpointArtifactList(value: unknown): string[] {
     const path = typeof record.path === "string" ? record.path : "";
     return label || path ? [[label, path].filter(Boolean).join(" — ")] : [];
   });
+}
+
+function batches<T>(values: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let offset = 0; offset < values.length; offset += size) {
+    result.push(values.slice(offset, offset + size));
+  }
+  return result;
 }
 
 function safeReason(value: string): string {

@@ -379,31 +379,70 @@ export function createBudgetServiceFromEnv(env: NodeJS.ProcessEnv, repository: B
   return new BudgetService({ repository, hotCounters, enabled, failClosed });
 }
 
-export function budgetEstimateFromRequest(input: { provider?: unknown; model?: string | undefined }): bigint {
-  const cost = costHints(input.provider, input.model);
+export function budgetEstimateFromRequest(input: {
+  provider?: unknown;
+  model?: string | undefined;
+  estimatedInputTokens?: number | undefined;
+  estimatedOutputTokens?: number | undefined;
+}): bigint {
+  const cost = modelCostSnapshot(input.provider, input.model);
   const inputCost = typeof cost.input === "number" ? cost.input : 0;
   const outputCost = typeof cost.output === "number" ? cost.output : 0;
-  const estimatedTokens = 4000;
-  return BigInt(Math.max(1, Math.ceil(((inputCost + outputCost) * estimatedTokens) || 1)));
+  const inputTokens = positiveTokenEstimate(input.estimatedInputTokens, 4_000);
+  const outputTokens = positiveTokenEstimate(input.estimatedOutputTokens, 4_000);
+  return BigInt(Math.max(1, Math.ceil((inputCost * inputTokens + outputCost * outputTokens) || 1)));
 }
 
 export function usageCostMicros(event: AgentStreamEvent, fallback: bigint, provider?: unknown): bigint {
   if (event.kind !== "usage") return fallback;
-  const cost = costHints(provider, event.requestedModel ?? event.model);
-  const inputCost = typeof cost.input === "number" ? cost.input : 0;
-  const outputCost = typeof cost.output === "number" ? cost.output : 0;
-  const calculated = Math.ceil(event.inputTokens * inputCost + event.outputTokens * outputCost);
-  return calculated > 0 ? BigInt(calculated) : fallback;
+  if (event.costRawMicros !== undefined) return BigInt(event.costRawMicros);
+  const cost = modelCostSnapshot(provider, event.requestedModel ?? event.model);
+  const calculated = usageCostFromPrices(event, cost);
+  return Object.values(cost).some((value) => typeof value === "number")
+    ? BigInt(calculated)
+    : fallback;
 }
 
-function costHints(providerInput: unknown, model: string | undefined): { input?: number | undefined; output?: number | undefined } {
-  type Cost = { input?: number | undefined; output?: number | undefined };
+export function modelCostSnapshot(providerInput: unknown, model: string | undefined): {
+  input?: number | undefined;
+  output?: number | undefined;
+  cacheRead?: number | undefined;
+  cacheWrite?: number | undefined;
+} {
+  type Cost = {
+    input?: number | undefined;
+    output?: number | undefined;
+    cacheRead?: number | undefined;
+    cacheWrite?: number | undefined;
+  };
   type Provider = { capabilities?: { cost?: Cost }; cost?: Cost; models?: Array<{ id?: string; capabilities?: { cost?: Cost } }> };
   const provider = providerInput && typeof providerInput === "object" ? providerInput as Provider : {};
   return provider.models?.find((candidate) => candidate.id === model)?.capabilities?.cost
     ?? provider.capabilities?.cost
     ?? provider.cost
     ?? {};
+}
+
+function usageCostFromPrices(
+  event: Extract<AgentStreamEvent, { kind: "usage" }>,
+  cost: {
+    input?: number | undefined;
+    output?: number | undefined;
+    cacheRead?: number | undefined;
+    cacheWrite?: number | undefined;
+  },
+): number {
+  const cacheReadTokens = Math.min(event.inputTokens, event.cacheReadTokens ?? 0);
+  const regularInputTokens = Math.max(0, event.inputTokens - cacheReadTokens);
+  const input = regularInputTokens * (cost.input ?? 0);
+  const cacheRead = cacheReadTokens * (cost.cacheRead ?? cost.input ?? 0);
+  const cacheWrite = (event.cacheWriteTokens ?? 0) * (cost.cacheWrite ?? 0);
+  const output = event.outputTokens * (cost.output ?? 0);
+  return Math.ceil(input + cacheRead + cacheWrite + output);
+}
+
+function positiveTokenEstimate(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : fallback;
 }
 
 function budgetScopes(tenantId: string, userId: string | null, departmentId: string | null): BudgetScope[] {

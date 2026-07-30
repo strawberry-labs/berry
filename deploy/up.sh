@@ -18,6 +18,20 @@ if grep -q "REPLACE_WITH" "$env_file"; then
   exit 1
 fi
 
+for name in BERRY_API_DATABASE_PASSWORD BERRY_WORKER_DATABASE_PASSWORD BERRY_PLATFORM_DATABASE_PASSWORD; do
+  value="$(env_value "$name")"
+  if [ "${#value}" -lt 16 ]; then
+    echo "$name must be at least 16 URL-safe characters. Generate one with: openssl rand -hex 32" >&2
+    exit 1
+  fi
+  case "$value" in
+    *[:/@]*)
+      echo "$name must be URL-safe because it is used in a PostgreSQL connection URL." >&2
+      exit 1
+      ;;
+  esac
+done
+
 auth_mode="$(env_value BERRY_AUTH_MODE)"
 auth_mode="${auth_mode:-better-auth}"
 if [ "$auth_mode" != "better-auth" ]; then

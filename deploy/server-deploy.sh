@@ -71,6 +71,7 @@ else
 fi
 
 services=""
+run_database_bootstrap=false
 add_service() {
   case " $services " in
     *" $1 "*) ;;
@@ -93,7 +94,10 @@ for file in $changed_files; do
       add_service web
       ;;
     apps/api/*|packages/db/*)
+      add_service db-migrate
+      add_service postgres-roles
       add_service api
+      run_database_bootstrap=true
       ;;
     packages/desktop-db/*|packages/local-agent/*|packages/execpolicy/*|packages/harness/*|packages/router-client/*|packages/sandbox-contract/*)
       add_service api
@@ -119,6 +123,12 @@ for file in $changed_files; do
     deploy/compose.yaml|deploy/.env.production.example)
       compose_changed=true
       add_service mem0
+      add_service db-migrate
+      add_service postgres-roles
+      add_service api
+      add_service worker
+      add_service web
+      run_database_bootstrap=true
       ;;
     deploy/Caddyfile)
       caddy_changed=true
@@ -133,7 +143,17 @@ for service in $services; do
   DOCKER_BUILDKIT=1 compose build "$service"
 done
 
+if [ "$run_database_bootstrap" = true ]; then
+  echo "Running database migrations..."
+  compose up --no-deps --force-recreate db-migrate
+  echo "Configuring least-privilege database roles..."
+  compose up --no-deps --force-recreate postgres-roles
+fi
+
 for service in $services; do
+  case "$service" in
+    db-migrate|postgres-roles) continue ;;
+  esac
   echo "Restarting $service..."
   compose up -d --no-deps "$service"
 done

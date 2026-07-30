@@ -1,4 +1,4 @@
-import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema } from "./jobs.js";
+import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
 import { processAlertEvaluationJob, processReportRunJob, type ManagementJobRepository } from "./reporting-alerts.js";
 import { processCompactionJob, type SessionCompactionRunner } from "./compaction.js";
 import { processTitleGenerationJob, type TaskTitleRepository, type TitleGenerator } from "./title-gen.js";
@@ -20,6 +20,9 @@ export interface BerryWorkerDependencies {
   turnRunner?: DurableTurnRunner | undefined;
   snapshotter?: SandboxContinuityManager | undefined;
   maintenance?: MaintenanceRunner | undefined;
+  tenantContext?: {
+    run<T>(tenantId: string, callback: () => Promise<T>): Promise<T>;
+  } | undefined;
 }
 
 export async function processBerryWorkerJob(
@@ -28,6 +31,14 @@ export async function processBerryWorkerJob(
   dependencies: BerryWorkerDependencies,
 ): Promise<unknown> {
   const jobName = BerryWorkerJobNameSchema.parse(name);
+  if (dependencies.tenantContext) {
+    const payload = parseWorkerJob(jobName, data);
+    const nestedDependencies = { ...dependencies, tenantContext: undefined };
+    return dependencies.tenantContext.run(
+      payload.tenantId,
+      () => processBerryWorkerJob(jobName, payload, nestedDependencies),
+    );
+  }
   if (jobName === "title.generate") {
     const payload = TitleGenJobPayloadSchema.parse(data);
     const titleDependencies = dependencies.titleGenerator

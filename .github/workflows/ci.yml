@@ -76,3 +76,102 @@ jobs:
           pnpm --filter @berry/web... typecheck
           pnpm --filter @berry/api... typecheck
           pnpm --filter @berry/worker... typecheck
+
+      - name: Test web stack
+        run: |
+          pnpm --filter @berry/shared test
+          pnpm --filter @berry/db test
+          pnpm --filter @berry/api test
+          pnpm --filter @berry/worker test
+          pnpm --filter @berry/web test
+
+  production-integration:
+    name: Production runtime integration
+    needs: compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg16-bookworm
+        env:
+          POSTGRES_DB: berry
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d berry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      tika:
+        image: apache/tika:3.2.3.0-full
+        ports:
+          - 9998:9998
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build durable runtime
+        run: |
+          pnpm --filter @berry/api... build
+          pnpm --filter @berry/worker... build
+
+      - name: Start object storage
+        run: >-
+          docker run --detach --name berry-ci-minio
+          --publish 9000:9000
+          --env MINIO_ROOT_USER=berry
+          --env MINIO_ROOT_PASSWORD=berry-integration-password
+          minio/minio:RELEASE.2025-09-07T16-13-09Z
+          server /data
+
+      - name: Apply migrations
+        env:
+          BERRY_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/berry
+        run: node apps/api/dist/migrate.js
+
+      - name: Configure least-privilege database roles
+        env:
+          BERRY_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/berry
+          BERRY_API_DATABASE_PASSWORD: api-integration-password
+          BERRY_WORKER_DATABASE_PASSWORD: worker-integration-password
+          BERRY_PLATFORM_DATABASE_PASSWORD: platform-integration-password
+        run: node apps/api/dist/configure-service-roles.js
+
+      - name: Verify production runtime
+        env:
+          BERRY_INTEGRATION_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/berry
+          BERRY_INTEGRATION_API_DATABASE_URL: postgres://berry_api:api-integration-password@127.0.0.1:5432/berry
+          BERRY_INTEGRATION_WORKER_DATABASE_URL: postgres://berry_worker:worker-integration-password@127.0.0.1:5432/berry
+          BERRY_INTEGRATION_S3_ENDPOINT: http://127.0.0.1:9000
+          BERRY_INTEGRATION_S3_ACCESS_KEY_ID: berry
+          BERRY_INTEGRATION_S3_SECRET_ACCESS_KEY: berry-integration-password
+          BERRY_INTEGRATION_TIKA_URL: http://127.0.0.1:9998
+          BERRY_INTEGRATION_REDIS_HOST: 127.0.0.1
+          BERRY_INTEGRATION_REDIS_PORT: 6379
+        run: node apps/worker/scripts/verify-production-runtime.mjs

@@ -3,6 +3,7 @@ import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -23,6 +24,7 @@ export type FileStorageConfig = {
   bucket: string;
   prefix: string;
   maxUploadBytes: number;
+  maxIndexableBytes: number;
   partSize: number;
   presignSeconds: number;
 };
@@ -63,6 +65,7 @@ type UploadRow = {
   status: string;
   expires_at: Date | string;
   object_key: string;
+  declared_size_bytes: number | string;
 };
 
 @Injectable()
@@ -232,11 +235,13 @@ export class FilePlatformService {
     }
     const parts = await Promise.all(unique.map(async (partNumber) => ({
       partNumber,
+      size: expectedPartBytes(upload, partNumber),
       url: await getSignedUrl(config.presignClient, new UploadPartCommand({
         Bucket: config.bucket,
         Key: upload.object_key,
         UploadId: upload.provider_upload_id,
         PartNumber: partNumber,
+        ContentLength: expectedPartBytes(upload, partNumber),
       }), { expiresIn: config.presignSeconds }),
     })));
     return { parts };
@@ -256,6 +261,38 @@ export class FilePlatformService {
       MultipartUpload: { Parts: ordered },
     }));
     const head = await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: upload.object_key }));
+    const actualSize = Number(head.ContentLength);
+    const declaredSize = Number(upload.declared_size_bytes);
+    if (!Number.isSafeInteger(actualSize)
+      || actualSize < 0
+      || actualSize > config.maxUploadBytes
+      || actualSize !== declaredSize) {
+      const removed = await config.client.send(new DeleteObjectCommand({
+        Bucket: config.bucket,
+        Key: upload.object_key,
+      })).then(() => true, () => false);
+      await this.database.withTenant(tenantId, async (executor) => {
+        await executor.execute(
+          "UPDATE file_uploads SET status='failed',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+          [tenantId, uploadId],
+        );
+        await executor.execute(
+          "UPDATE files SET status=$3::file_status,metadata=metadata || $4::jsonb,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+          [
+            tenantId,
+            fileId,
+            removed ? "failed" : "quarantined",
+            JSON.stringify({
+              uploadValidation: "size_mismatch",
+              declaredSize,
+              actualSize: Number.isFinite(actualSize) ? actualSize : null,
+              objectRemoved: removed,
+            }),
+          ],
+        );
+      });
+      throw new BadRequestException("The uploaded object size does not match the requested upload");
+    }
     const file = await this.database.withTenant(tenantId, async (executor) => {
       await executor.execute(`UPDATE file_uploads SET status = 'completed', completed_at = now(), updated_at = now() WHERE tenant_id = $1::uuid AND id = $2::uuid`, [tenantId, uploadId]);
       const [workspaceFile] = await executor.query<{ workspace_id: string; visibility: "project" | "task_only"; originating_task_id: string | null }>(`
@@ -265,11 +302,21 @@ export class FilePlatformService {
         ORDER BY created_at ASC
         LIMIT 1
       `, [tenantId, fileId]);
-      const shouldIndex = Boolean(workspaceFile && this.#durableConfig.projectKnowledgeEnabled);
+      const shouldIndex = Boolean(
+        workspaceFile
+        && this.#durableConfig.projectKnowledgeEnabled
+        && actualSize <= config.maxIndexableBytes,
+      );
+      if (workspaceFile && this.#durableConfig.projectKnowledgeEnabled && !shouldIndex) {
+        await executor.execute(
+          "UPDATE workspace_files SET index_status='failed',updated_at=now() WHERE tenant_id=$1::uuid AND file_id=$2::uuid",
+          [tenantId, fileId],
+        );
+      }
       await executor.execute(`
         UPDATE files SET status = $6::file_status, size_bytes = $3, etag = $4, object_version_id = $5, updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
-      `, [tenantId, fileId, Number(head.ContentLength ?? 0), cleanEtag(head.ETag ?? completed.ETag), completed.VersionId ?? null, shouldIndex ? "processing" : "available"]);
+      `, [tenantId, fileId, actualSize, cleanEtag(head.ETag ?? completed.ETag), completed.VersionId ?? null, shouldIndex ? "processing" : "available"]);
       if (workspaceFile && shouldIndex) {
         const revision = completed.VersionId ?? cleanEtag(head.ETag ?? completed.ETag) ?? `upload-${uploadId}`;
         const contentHash = cleanEtag(head.ETag ?? completed.ETag) ?? `file-${fileId}-${revision}`;
@@ -618,7 +665,8 @@ export class FilePlatformService {
     return this.database.withTenant(tenantId, async (executor) => {
       await this.requireOwnedFile(executor, tenantId, userId, fileId);
       const [row] = await executor.query<UploadRow>(`
-        SELECT u.*, f.object_key FROM file_uploads u JOIN files f ON f.id = u.file_id
+        SELECT u.*, f.object_key, f.size_bytes AS declared_size_bytes
+        FROM file_uploads u JOIN files f ON f.id = u.file_id
         WHERE u.tenant_id = $1::uuid AND u.id = $2::uuid AND u.file_id = $3::uuid AND u.status = 'uploading' AND u.expires_at > now()
       `, [tenantId, uploadId, fileId]);
       if (!row) throw new NotFoundException("Upload session not found or expired");
@@ -697,6 +745,12 @@ export class FilePlatformService {
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[%_\\]/g, "\\$&");
+}
+
+function expectedPartBytes(upload: UploadRow, partNumber: number): number {
+  const declared = Number(upload.declared_size_bytes);
+  const offset = (partNumber - 1) * upload.part_size;
+  return Math.max(0, Math.min(upload.part_size, declared - offset));
 }
 
 function fileDto(row: FileRow) {

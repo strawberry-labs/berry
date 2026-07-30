@@ -12,6 +12,7 @@ const helmApi = readFileSync(resolve(root, "deploy/helm/berry-platform/templates
 const helmWeb = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/web-deployment.yaml"), "utf8");
 const helmWorker = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/worker-deployment.yaml"), "utf8");
 const helmHpa = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/hpa.yaml"), "utf8");
+const helmDatabaseBootstrap = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/database-bootstrap-job.yaml"), "utf8");
 const runbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md"), "utf8");
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
 const deploymentLauncher = readFileSync(resolve(root, "deploy/up.sh"), "utf8");
@@ -19,13 +20,18 @@ const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
 
 describe("self-host compose deployment", () => {
   it("runs api, web, and worker from one built image with Postgres, Redis, and MinIO", () => {
-    for (const service of ["caddy", "postgres", "redis", "minio", "minio-init", "api", "worker", "web"]) {
+    for (const service of ["caddy", "postgres", "db-migrate", "postgres-roles", "redis", "minio", "minio-init", "api", "worker", "web"]) {
       expect(compose).toContain(`  ${service}:`);
     }
     expect(compose).toContain('command: ["node", "apps/api/dist/main.js"]');
     expect(compose).toContain('command: ["apps/web/node_modules/.bin/srvx", "--prod", "-s", "../client", "apps/web/dist/server/server.js"]');
     expect(compose).toContain('command: ["node", "apps/worker/dist/main.js"]');
     expect(compose).toContain("BERRY_DATABASE_URL:");
+    expect(compose).toContain("berry_api:");
+    expect(compose).toContain("berry_worker:");
+    expect(compose).toContain("berry_platform:");
+    expect(compose).toContain("BERRY_RUN_MIGRATIONS: \"false\"");
+    expect(compose).toContain('command: ["node", "apps/api/dist/configure-service-roles.js"]');
     expect(compose).toContain("BERRY_REDIS_URL:");
     expect(compose).toContain("DEPLOYMENT_MODE:");
     expect(compose).toContain("BERRY_BUDGETS_ENABLED:");
@@ -99,6 +105,7 @@ describe("self-host compose deployment", () => {
     expect(helmApi).toContain("BERRY_SETUP_TOKEN");
     expect(helmApi).toContain("command: [\"node\", \"apps/api/dist/main.js\"]");
     expect(helmApi).toContain("BERRY_DATABASE_URL");
+    expect(helmApi).toContain("BERRY_PLATFORM_DATABASE_URL");
     expect(helmApi).toContain("BERRY_REDIS_URL");
     expect(helmApi).toContain("BERRY_POLICY_SIGNING_PRIVATE_KEY_PEM");
     expect(helmApi).toContain("BERRY_USAGE_SIGNING_SECRETS");
@@ -108,6 +115,13 @@ describe("self-host compose deployment", () => {
     expect(helmApi).toContain("STRIPE_BILLING_METER_EVENT_NAME");
     expect(helmWeb).toContain("command: [\"apps/web/node_modules/.bin/srvx\", \"--prod\", \"-s\", \"../client\", \"apps/web/dist/server/server.js\"]");
     expect(helmWorker).toContain("command: [\"node\", \"apps/worker/dist/main.js\"]");
+    expect(helmWorker).toContain("workerSecretKey");
+    expect(helmDatabaseBootstrap).toContain("pre-install,pre-upgrade");
+    expect(helmDatabaseBootstrap).toContain("node apps/api/dist/migrate.js && node apps/api/dist/configure-service-roles.js");
+    expect(helmDatabaseBootstrap).toContain("migrationSecretKey");
+    expect(helmDatabaseBootstrap).toContain("BERRY_API_DATABASE_PASSWORD");
+    expect(helmDatabaseBootstrap).toContain("BERRY_WORKER_DATABASE_PASSWORD");
+    expect(helmDatabaseBootstrap).toContain("BERRY_PLATFORM_DATABASE_PASSWORD");
     expect(helmHpa.match(/kind: HorizontalPodAutoscaler/g)?.length).toBe(3);
     expect(runbook).toContain("--set deploymentMode=dedicated");
     expect(runbook).toContain("kubectl -n berry-acme create secret generic berry-billing");

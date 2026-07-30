@@ -544,7 +544,7 @@ describe("AgentApiController", () => {
         scopeId: SELF_HOST_TENANT_ID,
         period: "month",
         softLimitMicros: "0",
-        hardLimitMicros: "10000",
+        hardLimitMicros: "50000",
         status: "active",
       }]),
       hotCounters: new InMemoryBudgetHotCounters(),

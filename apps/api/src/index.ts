@@ -66,6 +66,7 @@ export {
   RedisBudgetHotCounters,
   budgetEstimateFromRequest,
   createBudgetServiceFromEnv,
+  modelCostSnapshot,
   usageCostMicros,
   type BudgetHotCounters,
   type BudgetRepository,

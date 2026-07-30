@@ -29,6 +29,7 @@ import { FILE_STORAGE_CONFIG, FilePlatformService, type FileStorageConfig } from
           bucket,
           prefix: (process.env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
           maxUploadBytes: positiveInteger(process.env.BERRY_FILE_MAX_UPLOAD_BYTES, 1024 * 1024 * 1024),
+          maxIndexableBytes: positiveInteger(process.env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES, 100 * 1024 * 1024),
           partSize: Math.max(5 * 1024 * 1024, positiveInteger(process.env.BERRY_FILE_MULTIPART_PART_SIZE, 16 * 1024 * 1024)),
           presignSeconds: Math.min(3600, positiveInteger(process.env.BERRY_FILE_PRESIGN_SECONDS, 900)),
         };

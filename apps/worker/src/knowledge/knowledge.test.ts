@@ -73,6 +73,66 @@ describe("knowledge ingestion and ranking", () => {
     expect(executor.calls.at(-1)?.params).toEqual([tenantId, sourceId, "revision-1"]);
   });
 
+  it("writes large chunk and embedding sets in bounded SQL batches", async () => {
+    class ExistingSourceExecutor extends FakeExecutor {
+      override async query<T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> {
+        this.calls.push({ kind: "query", sql, params });
+        if (sql.includes("SELECT id FROM knowledge_sources")) return [{ id: sourceId }] as T[];
+        return [];
+      }
+    }
+    const executor = new ExistingSourceExecutor();
+    const repository = new SqlKnowledgeRepository(executor);
+    const source = {
+      id: sourceId,
+      tenantId,
+      workspaceId: "00000000-0000-7000-8000-000000000003",
+      userId: null,
+      sourceType: "file" as const,
+      sourceId: "00000000-0000-7000-8000-000000000004",
+      revision: "revision-1",
+      contentHash: "source-hash",
+      title: "Large source",
+      visibility: "project" as const,
+      status: "chunking",
+      mediaType: "text/plain",
+      bucket: "test",
+      objectKey: "large.txt",
+      derivativeObjectKey: null,
+      inlineText: null,
+      tombstonedAt: null,
+    };
+    const chunks = Array.from({ length: 501 }, (_, ordinal) => ({
+      text: `chunk-${ordinal}`,
+      ordinal,
+      tokenEstimate: 2,
+      metadata: { contentHash: `hash-${ordinal}` },
+    }));
+    await repository.replaceChunks({ tenantId, source, chunks });
+    const inserts = executor.calls.filter((call) => call.kind === "execute" && call.sql.includes("INSERT INTO knowledge_chunks"));
+    expect(inserts).toHaveLength(2);
+    expect(JSON.parse(String(inserts[0]?.params[3]))).toHaveLength(500);
+    expect(JSON.parse(String(inserts[1]?.params[3]))).toHaveLength(1);
+
+    const stored = Array.from({ length: 101 }, (_, index) => ({
+      id: `00000000-0000-7000-8000-${String(index + 10).padStart(12, "0")}`,
+      text: `chunk-${index}`,
+      ordinal: index,
+      tokenEstimate: 2,
+    }));
+    await repository.saveEmbeddings({
+      tenantId,
+      source,
+      chunks: stored,
+      vectors: stored.map(() => [0.25, 0.75]),
+      profile: { id: "profile-v2", provider: "fixture", model: "fixture", dimensions: 2, version: 2 },
+    });
+    const updates = executor.calls.filter((call) => call.kind === "execute" && call.sql.includes("UPDATE knowledge_chunks AS target"));
+    expect(updates).toHaveLength(2);
+    expect(JSON.parse(String(updates[0]?.params[2]))).toHaveLength(100);
+    expect(JSON.parse(String(updates[1]?.params[2]))).toHaveLength(1);
+  });
+
   it("builds a bounded task outcome and removes credentials before project indexing", () => {
     const outcome = buildTaskOutcomeText({
       checkpoint: {

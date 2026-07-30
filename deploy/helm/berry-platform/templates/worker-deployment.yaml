@@ -30,7 +30,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.external.postgres.existingSecret }}
-                  key: {{ .Values.external.postgres.secretKey }}
+                  key: {{ .Values.external.postgres.workerSecretKey }}
             - name: BERRY_REDIS_URL
               valueFrom:
                 secretKeyRef:

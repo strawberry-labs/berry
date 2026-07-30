@@ -278,6 +278,52 @@ describe("durable turn runner", () => {
       .rejects.toBeInstanceOf(DurableTurnRetryableError);
   });
 
+  it("stops before an extra model iteration when the configured limit is reached", async () => {
+    const current = snapshot("calling_model", [
+      admittedStep(),
+      { ...modelStep("completed", 1), input: { iteration: 1 } },
+      { ...modelStep("pending", 2), input: { iteration: 2 } },
+    ]);
+    const repository = new FakeTurnRepository(current);
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        calls += 1;
+        return { text: "unexpected", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), { maxModelIterations: 1 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "completed" });
+    expect(calls).toBe(0);
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "session.note",
+      note: "limit-reached",
+    }));
+  });
+
+  it("stops before another tool after the cumulative token limit is reached", async () => {
+    const current = snapshot("executing_tool", [admittedStep(), toolStep("pending", "read_only", false)]);
+    current.usageTotals = {
+      inputTokens: 90,
+      outputTokens: 10,
+      totalTokens: 100,
+      costMicros: "20",
+    };
+    const repository = new FakeTurnRepository(current);
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        calls += 1;
+        return { output: {}, summary: "" };
+      },
+    }, { maxTotalTokens: 100 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "completed" });
+    expect(calls).toBe(0);
+  });
+
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
     let request: ChatCompletionOptions | undefined;
     const client = {
@@ -327,6 +373,7 @@ describe("durable turn runner", () => {
     });
     const deltas: Array<{ delta: string; channel: "text" | "reasoning" }> = [];
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.modelPricing = { input: 1, output: 2 };
     current.entries[0]!.payload = {
       type: "message",
       message: {
@@ -378,6 +425,7 @@ describe("durable turn runner", () => {
       reasoning: "Need current sources.",
       inputTokens: 10,
       outputTokens: 4,
+      usage: { costRawMicros: "18" },
       toolCalls: [{
         name: "mcp__BerryCrawl__search",
         input: { query: "AI news" },
@@ -518,6 +566,7 @@ type MutableSnapshot = Omit<DurableTurnSnapshot, "steps" | "entries" | "approval
 function snapshot(state: TurnRunState, steps: DurableTurnStep[]): MutableSnapshot {
   return {
     id: runId,
+    createdAt: new Date().toISOString(),
     tenantId,
     userId: "00000000-0000-7000-8000-000000000003",
     workspaceId: "00000000-0000-7000-8000-000000000004",
@@ -535,6 +584,12 @@ function snapshot(state: TurnRunState, steps: DurableTurnStep[]): MutableSnapsho
     sandboxProvider: null,
     sandboxId: null,
     sandboxState: null,
+    usageTotals: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      costMicros: "0",
+    },
     steps,
     entries: [{
       entryId: "entry-user",

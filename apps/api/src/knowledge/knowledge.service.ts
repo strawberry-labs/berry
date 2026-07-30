@@ -149,6 +149,7 @@ export class KnowledgeService {
       await requireWorkspace(executor, input);
       const exactRows = await this.exact(executor, input, query);
       const fullTextRows = await this.fullText(executor, input, query);
+      if (queryVector) await executor.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'");
       const vectorRows = queryVector ? await this.vector(executor, input, queryVector) : [];
       const fullText = uniqueRows([...exactRows, ...fullTextRows]).map(rowToRanked);
       const vector = vectorRows.map(rowToRanked);
@@ -173,6 +174,19 @@ export class KnowledgeService {
           metadata: candidate.metadata,
         });
       });
+      const diagnosticCandidates = candidates.map((candidate) => ({
+        chunkId: candidate.chunkId,
+        sourceId: candidate.sourceId,
+        sourceType: candidate.sourceType,
+        tokenEstimate: candidate.tokenEstimate,
+        ftsRank: candidate.ftsRank,
+        vectorRank: candidate.vectorRank,
+        fusedScore: candidate.fusedScore,
+        authority: candidate.authority,
+        selected: candidate.selected,
+        selectionReason: candidate.selectionReason,
+        contentHash: sha256(candidate.text),
+      }));
       const snapshotId = randomUUID();
       await executor.execute(`
         INSERT INTO retrieval_snapshots (
@@ -194,7 +208,7 @@ export class KnowledgeService {
         input.sessionId ?? null,
         input.runId ?? null,
         queryHash,
-        JSON.stringify(candidates),
+        JSON.stringify(diagnosticCandidates),
         JSON.stringify([...new Set(selection.selected.map((item) => item.sourceId))]),
         JSON.stringify(selection.selected.map((item) => item.chunkId)),
         JSON.stringify(Object.fromEntries(fused.map((item) => [item.chunkId, {
@@ -336,7 +350,7 @@ export class KnowledgeService {
               AND task_file.deleted_at IS NULL
           ))
         )
-      ORDER BY kc.embedding <=> $5::vector, ks.authority DESC, kc.id
+      ORDER BY kc.embedding <=> $5::vector
       LIMIT 60
     `, [input.tenantId, input.workspaceId, input.userId, input.taskId ?? "", `[${queryVector.join(",")}]`]);
   }

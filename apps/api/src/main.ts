@@ -1,6 +1,7 @@
 import "reflect-metadata";
 
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { BadRequestException, Body, Controller, Get, Inject, Module, NotFoundException, Param, Post, Res, type DynamicModule } from "@nestjs/common";
@@ -139,13 +140,15 @@ class ArtifactController {
     try {
       const object = await this.config.client.send(new GetObjectCommand({ Bucket: this.config.bucket, Key: key }));
       if (!object.Body) throw new NotFoundException("Artifact not found");
-      const content = await object.Body.transformToByteArray();
       response.statusCode = 200;
       response.setHeader("Content-Type", object.ContentType ?? "application/octet-stream");
-      response.setHeader("Content-Length", String(content.byteLength));
+      if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
       response.setHeader("Cache-Control", "private, max-age=3600");
       response.setHeader("Content-Disposition", inlineDisposition(object.ContentType) ? "inline" : "attachment");
-      response.end(Buffer.from(content));
+      for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
+        if (!response.write(chunk)) await once(response, "drain");
+      }
+      response.end();
     } catch (error) {
       if (error instanceof NotFoundException) throw error;
       const status = typeof error === "object" && error !== null && "$metadata" in error
@@ -193,16 +196,20 @@ class BerryApiMainModule {}
 export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): DynamicModule {
   const durableConfig = durableContextConfigFromEnv(env);
   const pg = PgSqlExecutor.fromConnectionString(requiredEnv(env, "BERRY_DATABASE_URL", env.DATABASE_URL));
-  const budgetService = createBudgetServiceFromEnv(env, new PostgresBudgetRepository(new CloudDatabaseService(pg)));
+  const platformPg = env.BERRY_PLATFORM_DATABASE_URL
+    ? PgSqlExecutor.fromConnectionString(env.BERRY_PLATFORM_DATABASE_URL)
+    : pg;
+  const database = new CloudDatabaseService(pg, platformPg);
+  const budgetService = createBudgetServiceFromEnv(env, new PostgresBudgetRepository(database));
   const contractProvider = createBudgetedContractSandboxProvider(env, budgetService);
   const runtime = createRuntimeSessionHost(env, contractProvider);
-  const personalCapabilities = new PersonalCapabilitiesService(new CloudDatabaseService(pg));
-  const organizationCapabilities = new OrganizationCapabilitiesService(personalCapabilities, new CloudDatabaseService(pg));
+  const personalCapabilities = new PersonalCapabilitiesService(database);
+  const organizationCapabilities = new OrganizationCapabilitiesService(personalCapabilities, database);
   const auth = createAuthRuntime(env);
   return {
     module: BerryApiMainModule,
     imports: [
-      CloudDatabaseModule.register({ useValue: pg }),
+      CloudDatabaseModule.register({ useValue: pg, privilegedUseValue: platformPg }),
       FilePlatformModule,
       AgentApiModule.register({
         durableRunnerEnabled: durableConfig.durableRunnerEnabled,
@@ -210,7 +217,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
         sessionHost: { useValue: runtime },
         sandboxWorkspace: { useValue: new SandboxWorkspaceService({
           provider: contractProvider,
-          repository: new PostgresSandboxWorkspaceRepository(new CloudDatabaseService(pg)),
+          repository: new PostgresSandboxWorkspaceRepository(database),
           image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
           ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 3600),
         }) },
@@ -230,7 +237,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
             ),
           },
         },
-        budget: { service: { useValue: budgetService }, allowanceRepository: new PostgresAllowanceRepository(new CloudDatabaseService(pg)) },
+        budget: { service: { useValue: budgetService }, allowanceRepository: new PostgresAllowanceRepository(database) },
         usage: {
           repository: {
             inject: [CloudDatabaseService],
@@ -252,10 +259,10 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
             useFactory: (database: CloudDatabaseService) => new PostgresModelGovernanceRepository(database),
           },
         },
-        policyDistribution: { service: { useValue: new PolicyDistributionService(new PostgresPolicyDistributionRepository(new CloudDatabaseService(pg)), createPolicySignerFromEnv(env), organizationCapabilities) } },
+        policyDistribution: { service: { useValue: new PolicyDistributionService(new PostgresPolicyDistributionRepository(database), createPolicySignerFromEnv(env), organizationCapabilities) } },
         management: {
-          repository: new PostgresManagementRepository(new CloudDatabaseService(pg)),
-          platformService: new PostgresPlatformService(new CloudDatabaseService(pg)),
+          repository: new PostgresManagementRepository(database),
+          platformService: new PostgresPlatformService(database),
           platformAuthorizer: new ExplicitPlatformAuthorizer({
             userIds: csv(env.BERRY_PLATFORM_OPERATOR_USER_IDS ?? ""),
             emails: csv(env.BERRY_PLATFORM_OPERATOR_EMAILS ?? ""),
@@ -282,7 +289,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   app.useBodyParser("urlencoded", { limit: env.BERRY_API_JSON_BODY_LIMIT ?? "40mb", extended: true });
   app.enableShutdownHooks();
   const database = app.get(CloudDatabaseService);
-  await database.migrate();
+  if (env.BERRY_RUN_MIGRATIONS !== "false") await database.migrate();
   const port = Number(env.PORT ?? env.BERRY_API_PORT ?? 3000);
   await app.listen(port, "0.0.0.0");
 }

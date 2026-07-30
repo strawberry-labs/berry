@@ -658,6 +658,9 @@ export const knowledgeChunks = pgTable("knowledge_chunks", {
   uniqueIndex("knowledge_chunks_source_ordinal_unique").on(table.sourceId, table.ordinal),
   index("knowledge_chunks_scope_idx").on(table.tenantId, table.workspaceId, table.sourceId),
   index("knowledge_chunks_vector_ready_idx").on(table.tenantId, table.workspaceId, table.vectorReady),
+  index("knowledge_chunks_embedding_hnsw_idx")
+    .using("hnsw", table.embedding.op("vector_cosine_ops"))
+    .where(sql`${table.vectorReady} = true AND ${table.embedding} IS NOT NULL`),
 ]);
 
 export const retrievalSnapshots = pgTable("retrieval_snapshots", {
@@ -3473,6 +3476,18 @@ ALTER TABLE knowledge_chunks
   );
 `.trim();
 
+export const KNOWLEDGE_VECTOR_HNSW_MIGRATION = `
+CREATE INDEX IF NOT EXISTS knowledge_chunks_embedding_hnsw_idx
+ON knowledge_chunks
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64)
+WHERE vector_ready = true AND embedding IS NOT NULL;
+`.trim();
+
+export const TENANT_CONTEXT_EXECUTE_HARDENING_MIGRATION = `
+REVOKE ALL ON FUNCTION berry_set_tenant_id(uuid) FROM PUBLIC;
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -3565,4 +3580,6 @@ export const cloudMigrations = [
   { id: 31, name: "message_citations_v1", sql: MESSAGE_CITATIONS_MIGRATION },
   { id: 32, name: "maintenance_runs_v1", sql: MAINTENANCE_RUNS_MIGRATION },
   { id: 33, name: "self_hosted_embedding_profile_v2", sql: SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION },
+  { id: 34, name: "knowledge_vector_hnsw_v1", sql: KNOWLEDGE_VECTOR_HNSW_MIGRATION },
+  { id: 35, name: "tenant_context_execute_hardening_v1", sql: TENANT_CONTEXT_EXECUTE_HARDENING_MIGRATION },
 ] as const;

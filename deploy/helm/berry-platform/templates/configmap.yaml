@@ -12,6 +12,7 @@ data:
   BERRY_AUTH_SIGNUP_ENABLED: {{ .Values.auth.signupEnabled | quote }}
   BERRY_SETUP_OWNER_EMAIL: {{ .Values.auth.setupOwnerEmail | quote }}
   BERRY_API_MODEL_MODE: "live"
+  BERRY_RUN_MIGRATIONS: "false"
   BERRY_BUDGETS_ENABLED: "true"
   BERRY_BUDGET_FAIL_CLOSED: "true"
   BERRY_BILLING_PROVIDER: {{ .Values.billing.provider | quote }}
@@ -71,3 +72,11 @@ data:
   BERRY_COMPACTION_TRIGGER_TOKENS: {{ .Values.durableContext.compactionTriggerTokens | quote }}
   BERRY_RUN_LEASE_SECONDS: {{ .Values.durableContext.runLeaseSeconds | quote }}
   BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS: {{ .Values.durableContext.snapshotIntervalSeconds | quote }}
+  BERRY_KNOWLEDGE_MAX_INPUT_BYTES: {{ .Values.durableContext.maxInputBytes | quote }}
+  BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES: {{ .Values.durableContext.maxOutputBytes | quote }}
+  BERRY_SANDBOX_INPUT_MAX_BYTES: {{ .Values.durableContext.sandboxInputMaxBytes | quote }}
+  BERRY_TURN_MAX_MODEL_ITERATIONS: {{ .Values.durableContext.maxModelIterations | quote }}
+  BERRY_TURN_MAX_TOOL_CALLS: {{ .Values.durableContext.maxToolCalls | quote }}
+  BERRY_TURN_MAX_TOTAL_TOKENS: {{ .Values.durableContext.maxTotalTokens | quote }}
+  BERRY_TURN_MAX_SPEND_MICROS: {{ .Values.durableContext.maxSpendMicros | quote }}
+  BERRY_TURN_MAX_WALL_TIME_SECONDS: {{ .Values.durableContext.maxWallTimeSeconds | quote }}

@@ -17,7 +17,7 @@ export class RuntimeOutboxDispatcher {
   constructor(
     private readonly executor: SqlExecutor,
     private readonly queue: BerryQueueClient,
-    private readonly options: { tenantId: string; workerId: string; pollMs?: number; batchSize?: number },
+    private readonly options: { tenantId?: string; workerId: string; pollMs?: number; batchSize?: number },
   ) {}
 
   start(): void {
@@ -37,7 +37,10 @@ export class RuntimeOutboxDispatcher {
     if (this.#running) return 0;
     this.#running = true;
     try {
-      await this.withTenant((executor) => executor.execute(`
+      const rows: OutboxRow[] = [];
+      const tenantIds = await this.tenantIds();
+      for (const tenantId of tenantIds) {
+        await this.withTenant(tenantId, (executor) => executor.execute(`
         INSERT INTO runtime_outbox (
           tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at
         )
@@ -60,8 +63,10 @@ export class RuntimeOutboxDispatcher {
               AND pending.completed_at IS NULL
           )
         ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
-      `, [this.options.tenantId]));
-      const rows = await this.withTenant(async (executor) => executor.query<OutboxRow>(`
+      `, [tenantId]));
+        const remaining = (this.options.batchSize ?? 50) - rows.length;
+        if (remaining <= 0) break;
+        const claimed = await this.withTenant(tenantId, async (executor) => executor.query<OutboxRow>(`
         WITH due AS (
           SELECT id
           FROM runtime_outbox
@@ -80,7 +85,9 @@ export class RuntimeOutboxDispatcher {
         WHERE outbox.id = due.id
         RETURNING outbox.id, outbox.tenant_id, outbox.event_type,
                   outbox.payload, outbox.attempts
-      `, [this.options.tenantId, this.options.workerId, this.options.batchSize ?? 50]));
+      `, [tenantId, this.options.workerId, remaining]));
+        rows.push(...claimed);
+      }
       let dispatched = 0;
       for (const row of rows) {
         const parsedName = BerryWorkerJobNameSchema.safeParse(row.event_type);
@@ -95,7 +102,7 @@ export class RuntimeOutboxDispatcher {
             row.payload as BerryWorkerJobMap[typeof name],
             { jobId: outboxJobId(name, row.id) },
           );
-          await this.withTenant((executor) => executor.execute(`
+          await this.withTenant(row.tenant_id, (executor) => executor.execute(`
             UPDATE runtime_outbox
             SET completed_at = now(), lease_owner = NULL, lease_expires_at = NULL,
                 last_error = NULL, updated_at = now()
@@ -114,7 +121,7 @@ export class RuntimeOutboxDispatcher {
 
   private async fail(row: OutboxRow, reason: string, terminal: boolean): Promise<void> {
     const delaySeconds = Math.min(300, 2 ** Math.min(row.attempts, 8));
-    await this.withTenant((executor) => executor.execute(`
+    await this.withTenant(row.tenant_id, (executor) => executor.execute(`
       UPDATE runtime_outbox
       SET lease_owner = NULL, lease_expires_at = NULL,
           available_at = CASE WHEN $4::boolean THEN available_at ELSE now() + ($5 || ' seconds')::interval END,
@@ -124,9 +131,17 @@ export class RuntimeOutboxDispatcher {
     `, [row.tenant_id, row.id, reason.slice(0, 2_000), terminal, delaySeconds]));
   }
 
-  private async withTenant<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {
+  private async tenantIds(): Promise<string[]> {
+    if (this.options.tenantId) return [this.options.tenantId];
+    const rows = await this.executor.query<{ id: string }>(
+      "SELECT id::text FROM tenants WHERE status='active' ORDER BY id",
+    );
+    return rows.map((row) => row.id);
+  }
+
+  private async withTenant<T>(tenantId: string, callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {
     const run = async (executor: SqlExecutor) => {
-      await executor.execute("SELECT berry_set_tenant_id($1::uuid)", [this.options.tenantId]);
+      await executor.execute("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
       return callback(executor);
     };
     return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);

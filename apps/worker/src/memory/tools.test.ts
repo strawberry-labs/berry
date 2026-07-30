@@ -133,6 +133,7 @@ function personalMemory(
 function snapshot(): DurableTurnSnapshot {
   return {
     id: "00000000-0000-7000-8000-000000000007",
+    createdAt: new Date().toISOString(),
     tenantId: "00000000-0000-7000-8000-000000000001",
     userId: "00000000-0000-7000-8000-000000000002",
     workspaceId: "00000000-0000-7000-8000-000000000003",
@@ -150,6 +151,7 @@ function snapshot(): DurableTurnSnapshot {
     sandboxProvider: null,
     sandboxId: null,
     sandboxState: null,
+    usageTotals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costMicros: "0" },
     steps: [],
     entries: [],
     approvals: [],

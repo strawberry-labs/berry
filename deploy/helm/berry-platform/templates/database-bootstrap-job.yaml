@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "berry-platform.name" . }}-database-bootstrap
+  labels:
+    {{- include "berry-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "berry-platform.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: database-bootstrap
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: database-bootstrap
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - node apps/api/dist/migrate.js && node apps/api/dist/configure-service-roles.js
+          env:
+            - name: BERRY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.postgres.existingSecret }}
+                  key: {{ .Values.external.postgres.migrationSecretKey }}
+            - name: BERRY_API_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.postgres.existingSecret }}
+                  key: {{ .Values.external.postgres.apiPasswordKey }}
+            - name: BERRY_WORKER_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.postgres.existingSecret }}
+                  key: {{ .Values.external.postgres.workerPasswordKey }}
+            - name: BERRY_PLATFORM_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.postgres.existingSecret }}
+                  key: {{ .Values.external.postgres.platformPasswordKey }}

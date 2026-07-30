@@ -5,7 +5,9 @@ This runbook is for one Berry tenant per isolated cluster or namespace. It uses 
 ## Prerequisites
 
 - Kubernetes 1.30+ with an ingress controller and metrics server.
-- External Postgres with the Berry schema owner account.
+- External Postgres with a migration account that owns the Berry schema and can
+  create the three service roles. The long-lived API and worker accounts must
+  not own tables or have `BYPASSRLS`.
 - External Redis for budgets, streaming jobs, and workers.
 - S3-compatible artifact and audit buckets.
 - DNS control for the customer web and API hostnames.
@@ -15,7 +17,14 @@ This runbook is for one Berry tenant per isolated cluster or namespace. It uses 
 
 ```sh
 kubectl create namespace berry-acme
-kubectl -n berry-acme create secret generic berry-postgres --from-literal=BERRY_DATABASE_URL='postgres://...'
+kubectl -n berry-acme create secret generic berry-postgres \
+  --from-literal=BERRY_MIGRATION_DATABASE_URL='postgres://schema-owner:...@postgres/berry' \
+  --from-literal=BERRY_API_DATABASE_URL='postgres://berry_api:...@postgres/berry' \
+  --from-literal=BERRY_WORKER_DATABASE_URL='postgres://berry_worker:...@postgres/berry' \
+  --from-literal=BERRY_PLATFORM_DATABASE_URL='postgres://berry_platform:...@postgres/berry' \
+  --from-literal=BERRY_API_DATABASE_PASSWORD='...' \
+  --from-literal=BERRY_WORKER_DATABASE_PASSWORD='...' \
+  --from-literal=BERRY_PLATFORM_DATABASE_PASSWORD='...'
 kubectl -n berry-acme create secret generic berry-redis --from-literal=BERRY_REDIS_URL='redis://...'
 kubectl -n berry-acme create secret generic berry-s3 \
   --from-literal=BERRY_ARTIFACT_S3_ACCESS_KEY_ID='...' \

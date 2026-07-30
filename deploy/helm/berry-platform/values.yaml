@@ -44,15 +44,23 @@ durableContext:
   promptCacheEnabled: true
   durableRunnerEnabled: true
   embeddingProvider: openai-compatible
-  embeddingModel: text-embedding-3-small
-  embeddingDimensions: 1536
-  embeddingProfileVersion: 1
-  chunkTokens: 600
-  chunkOverlapTokens: 80
+  embeddingModel: sentence-transformers/all-mpnet-base-v2
+  embeddingDimensions: 768
+  embeddingProfileVersion: 2
+  chunkTokens: 300
+  chunkOverlapTokens: 50
   retrievalTokenBudget: 5000
   compactionTriggerTokens: 120000
   runLeaseSeconds: 90
   snapshotIntervalSeconds: 900
+  maxInputBytes: "104857600"
+  maxOutputBytes: "26214400"
+  sandboxInputMaxBytes: "104857600"
+  maxModelIterations: "12"
+  maxToolCalls: "48"
+  maxTotalTokens: "250000"
+  maxSpendMicros: "1000000"
+  maxWallTimeSeconds: "1800"
 
 mem0:
   enabled: true
@@ -62,8 +70,8 @@ mem0:
   collection: berry_personal_memories
   telemetry: "false"
   llmModel: gpt-5-mini
-  embeddingModel: text-embedding-3-small
-  embeddingDimensions: 1536
+  embeddingModel: sentence-transformers/all-mpnet-base-v2
+  embeddingDimensions: 768
   existingSecret: berry-mem0
   apiKeyKey: BERRY_MEM0_API_KEY
   databaseUrlKey: BERRY_MEM0_DATABASE_URL
@@ -72,7 +80,13 @@ external:
   postgres:
     url: ""
     existingSecret: berry-postgres
-    secretKey: BERRY_DATABASE_URL
+    migrationSecretKey: BERRY_MIGRATION_DATABASE_URL
+    apiSecretKey: BERRY_API_DATABASE_URL
+    workerSecretKey: BERRY_WORKER_DATABASE_URL
+    platformSecretKey: BERRY_PLATFORM_DATABASE_URL
+    apiPasswordKey: BERRY_API_DATABASE_PASSWORD
+    workerPasswordKey: BERRY_WORKER_DATABASE_PASSWORD
+    platformPasswordKey: BERRY_PLATFORM_DATABASE_PASSWORD
   redis:
     url: ""
     existingSecret: berry-redis

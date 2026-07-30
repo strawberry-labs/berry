@@ -9,7 +9,7 @@ import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 
 describe("SandboxContinuityManager", () => {
   it("stages message-associated input files before the first tool runs", async () => {
-    const writes: Array<{ path: string; content: string }> = [];
+    const staged = new Map<string, Uint8Array[]>();
     const provider = {
       kind: "e2b",
       create: vi.fn(async () => ({
@@ -17,21 +17,24 @@ describe("SandboxContinuityManager", () => {
         provider: "e2b",
         status: "running",
       })),
-      exec: async function* () {
+      exec: async function* (input: { command: string[] }) {
+        if (input.command[0] === "sh" && input.command[2]?.includes("base64 -d")) {
+          const path = input.command[4]!;
+          const chunks = staged.get(path) ?? [];
+          chunks.push(Buffer.from(input.command[5]!, "base64"));
+          staged.set(path, chunks);
+        }
         yield { kind: "exit", exit_code: 0, signal: null };
       },
       files: {
         read: vi.fn(),
-        write: vi.fn(async (input: { path: string; content: string }) => {
-          writes.push(input);
-          return { path: input.path, size_bytes: 3, mtime: null };
-        }),
+        write: vi.fn(),
         list: vi.fn(async (input: { path: string }) => ({
           path: input.path,
-          entries: writes.map((write) => ({
-            path: write.path,
+          entries: [...staged.entries()].map(([path, chunks]) => ({
+            path,
             type: "file",
-            size_bytes: 3,
+            size_bytes: chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
             mtime: null,
           })),
         })),
@@ -54,6 +57,10 @@ describe("SandboxContinuityManager", () => {
       put: vi.fn(),
       get: vi.fn(),
       getSource: vi.fn(async () => new Uint8Array([1, 2, 3])),
+      streamSource: vi.fn(async function* () {
+        yield new Uint8Array([1]);
+        yield new Uint8Array([2, 3]);
+      }),
     } satisfies SandboxSnapshotObjectStore;
     const manager = new SandboxContinuityManager(provider, repository, objects, {
       image: "berry-sandbox",
@@ -61,13 +68,14 @@ describe("SandboxContinuityManager", () => {
 
     const result = await manager.execute(snapshot(), listFilesStep());
 
-    expect(objects.getSource).toHaveBeenCalledWith("artifacts/tenants/t/files/candidate.pdf");
-    expect(writes).toEqual([expect.objectContaining({
-      path: "/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
-      content: "AQID",
-    })]);
+    expect(objects.streamSource).toHaveBeenCalledWith(
+      "artifacts/tenants/t/files/candidate.pdf",
+      100 * 1024 * 1024,
+    );
+    const path = "/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf";
+    expect(Buffer.concat(staged.get(path)!.map((chunk) => Buffer.from(chunk)))).toEqual(Buffer.from([1, 2, 3]));
     expect(result.output).toMatchObject({
-      entries: [expect.objectContaining({ path: writes[0]!.path })],
+      entries: [expect.objectContaining({ path })],
     });
   });
 });

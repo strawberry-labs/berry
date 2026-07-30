@@ -106,3 +106,83 @@ describe("FilePlatformService.initiateUpload", () => {
     ]);
   });
 });
+
+describe("FilePlatformService.completeUpload", () => {
+  it("rejects and removes an object whose actual size differs from the declared upload", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => {
+        executions.push({ sql, params });
+      },
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT f.*")) {
+          return [{
+            id: "00000000-0000-7000-8000-000000000204",
+            owner_user_id: USER_ID,
+            original_name: "notes.txt",
+            display_name: "notes.txt",
+            media_type: "text/plain",
+            detected_media_type: null,
+            size_bytes: 12,
+            sha256: null,
+            bucket: "berry-test",
+            object_key: "artifacts/notes.txt",
+            etag: null,
+            origin: "user_upload",
+            status: "uploading",
+            created_at: new Date(),
+            updated_at: new Date(),
+          }] as T[];
+        }
+        if (sql.includes("SELECT u.*")) {
+          return [{
+            id: "00000000-0000-7000-8000-000000000205",
+            file_id: "00000000-0000-7000-8000-000000000204",
+            provider_upload_id: "provider-upload-1",
+            part_size: 5 * 1024 * 1024,
+            part_count: 1,
+            status: "uploading",
+            expires_at: new Date(Date.now() + 60_000),
+            object_key: "artifacts/notes.txt",
+            declared_size_bytes: 12,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const client = {
+      send: vi.fn(async (command: object) => {
+        if (command.constructor.name === "CompleteMultipartUploadCommand") return { ETag: "etag" };
+        if (command.constructor.name === "HeadObjectCommand") return { ContentLength: 13, ETag: "etag" };
+        if (command.constructor.name === "DeleteObjectCommand") return {};
+        throw new Error(`Unexpected S3 command: ${command.constructor.name}`);
+      }),
+    };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024,
+      maxIndexableBytes: 512,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+
+    await expect(service.completeUpload(
+      TENANT_ID,
+      USER_ID,
+      "00000000-0000-7000-8000-000000000204",
+      "00000000-0000-7000-8000-000000000205",
+      [{ PartNumber: 1, ETag: "etag" }],
+    )).rejects.toThrow("does not match");
+
+    expect(client.send).toHaveBeenCalledWith(expect.objectContaining({
+      constructor: expect.objectContaining({ name: "DeleteObjectCommand" }),
+    }));
+    expect(executions.some((call) => call.sql.includes("status='failed'"))).toBe(true);
+  });
+});

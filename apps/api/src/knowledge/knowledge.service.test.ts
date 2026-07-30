@@ -79,6 +79,34 @@ describe("KnowledgeService", () => {
       expect(sql).toContain("task_file.originating_task_id::text = $4");
       expect(sql).not.toContain("ks.metadata->>'taskId'");
     }
-    expect(executor.calls.some((call) => call.kind === "execute" && call.sql.includes("INSERT INTO retrieval_snapshots"))).toBe(true);
+    const snapshotWrite = executor.calls.find((call) =>
+      call.kind === "execute" && call.sql.includes("INSERT INTO retrieval_snapshots")
+    );
+    expect(snapshotWrite).toBeDefined();
+    expect(String(snapshotWrite!.params[8])).not.toContain("renews a database lease");
+    expect(String(snapshotWrite!.params[8])).toContain('"contentHash"');
+  });
+
+  it("enables filtered HNSW iteration and keeps vector ordering index-compatible", async () => {
+    const executor = new RetrievalExecutor();
+    const service = new KnowledgeService(new CloudDatabaseService(executor), {
+      profile: { id: "profile", provider: "fixture", model: "fixture", dimensions: 3, version: 1 },
+      embed: async () => [[0.1, 0.2, 0.3]],
+    });
+
+    await service.retrieve({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      request: "lease recovery",
+    });
+
+    expect(executor.calls).toContainEqual(expect.objectContaining({
+      kind: "execute",
+      sql: "SET LOCAL hnsw.iterative_scan = 'strict_order'",
+    }));
+    const vectorQuery = executor.calls.find((call) => call.kind === "query" && call.sql.includes("<=>"));
+    expect(vectorQuery?.sql).toContain("ORDER BY kc.embedding <=> $5::vector\n      LIMIT 60");
   });
 });

@@ -44,4 +44,43 @@ describe("RuntimeOutboxDispatcher", () => {
       { jobId: `outbox-turn-execute-${outboxId}` },
     );
   });
+
+  it("discovers and dispatches due rows for every active tenant", async () => {
+    const secondTenantId = "00000000-0000-7000-8000-000000000010";
+    const executor: SqlExecutor = {
+      execute: vi.fn(async () => undefined),
+      query: async <T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> => {
+        if (sql.includes("FROM tenants")) {
+          return [{ id: tenantId }, { id: secondTenantId }] as T[];
+        }
+        if (sql.includes("RETURNING outbox.id")) {
+          const currentTenant = String(params[0]);
+          return [{
+            id: currentTenant === tenantId ? outboxId : "00000000-0000-7000-8000-000000000011",
+            tenant_id: currentTenant,
+            event_type: "turn.execute",
+            payload: { tenantId: currentTenant, runId, reason: "continue" },
+            attempts: 1,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const enqueuedTenants: string[] = [];
+    const enqueue = vi.fn(async (_name: string, payload: { tenantId: string }) => {
+      enqueuedTenants.push(payload.tenantId);
+      return { id: "queued", name: "turn.execute" as const };
+    });
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: enqueue as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      workerId: "worker-test",
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(2);
+    expect(enqueue).toHaveBeenCalledTimes(2);
+    expect(enqueuedTenants).toEqual([tenantId, secondTenantId]);
+  });
 });

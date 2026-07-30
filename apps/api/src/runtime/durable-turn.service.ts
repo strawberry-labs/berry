@@ -572,18 +572,7 @@ WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND completed_at IS NULL
           "UPDATE tasks SET status='cancelled',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
           [tenantId, active.task_id],
         );
-        await transaction.execute(
-          `
-UPDATE budget_reservations b
-SET actual_cost_micros=0,status='reconciled',updated_at=now()
-FROM turn_runs r
-WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
-  AND b.tenant_id=r.tenant_id
-  AND b.request_id=COALESCE(r.runtime_request->>'requestId','turn_' || r.id::text)
-  AND b.status='reserved'
-          `.trim(),
-          [tenantId, active.id],
-        );
+        await reconcileTerminalUsage(transaction, tenantId, active.id, "cancelled");
         await transaction.execute(
           `
 UPDATE sessions
@@ -1080,18 +1069,7 @@ FOR UPDATE OF r
           "UPDATE tasks SET status='cancelled',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
           [tenantId, recovered.task_id],
         );
-        await executor.execute(
-          `
-UPDATE budget_reservations b
-SET actual_cost_micros=0,status='reconciled',updated_at=now()
-FROM turn_runs r
-WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
-  AND b.tenant_id=r.tenant_id
-  AND b.request_id=COALESCE(r.runtime_request->>'requestId','turn_' || r.id::text)
-  AND b.status='reserved'
-          `.trim(),
-          [tenantId, runId],
-        );
+        await reconcileTerminalUsage(executor, tenantId, runId, "cancelled");
         await appendDurableEvents(executor, tenantId, runId, recovered.session_id, [
           { kind: "turn.end", turnId: runId, status: "cancelled" },
         ]);
@@ -1827,6 +1805,197 @@ export function parseEventCursor(value: string | null | undefined): { runId: str
   const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):(\d+)$/i.exec(value.trim());
   if (!match) return null;
   return { runId: match[1]!, sequence: Number(match[2]) };
+}
+
+async function reconcileTerminalUsage(
+  executor: SqlExecutor,
+  tenantId: string,
+  runId: string,
+  status: "completed" | "failed" | "cancelled",
+): Promise<void> {
+  const runs = await executor.query<{
+    user_id: string;
+    workspace_id: string;
+    task_id: string;
+    session_id: string;
+    runtime_request: unknown;
+  }>(
+    `SELECT user_id,workspace_id,task_id,session_id,runtime_request
+     FROM turn_runs WHERE tenant_id=$1::uuid AND id=$2::uuid`,
+    [tenantId, runId],
+  );
+  const run = runs[0];
+  if (!run) return;
+  const runtimeRequest = recordValue(run.runtime_request) ?? {};
+  const requestId = stringValue(runtimeRequest.requestId) ?? `turn_${runId}`;
+  const usage = await executor.query<{
+    input_tokens: number | string;
+    output_tokens: number | string;
+    cache_read_tokens: number | string;
+    cache_write_tokens: number | string;
+    cache_creation_tokens_1h: number | string;
+    cache_creation_tokens_5m: number | string;
+    usage_event_count: number | string;
+    priced_event_count: number | string;
+    exact_cost_micros: string;
+  }>(
+    `
+SELECT
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN (payload->>'inputTokens')::bigint ELSE 0 END),0) AS input_tokens,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN (payload->>'outputTokens')::bigint ELSE 0 END),0) AS output_tokens,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheReadTokens')::bigint,0) ELSE 0 END),0) AS cache_read_tokens,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheWriteTokens')::bigint,0) ELSE 0 END),0) AS cache_write_tokens,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheCreationTokens1h')::bigint,0) ELSE 0 END),0) AS cache_creation_tokens_1h,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheCreationTokens5m')::bigint,0) ELSE 0 END),0) AS cache_creation_tokens_5m,
+  COUNT(*) FILTER (WHERE event_type='usage') AS usage_event_count,
+  COUNT(*) FILTER (WHERE event_type='usage' AND payload ? 'costRawMicros') AS priced_event_count,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'costRawMicros')::bigint,0) ELSE 0 END),0)::text AS exact_cost_micros
+FROM turn_events
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+    `.trim(),
+    [tenantId, runId],
+  );
+  const totals = usage[0] ?? {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    cache_creation_tokens_1h: 0,
+    cache_creation_tokens_5m: 0,
+    usage_event_count: 0,
+    priced_event_count: 0,
+    exact_cost_micros: "0",
+  };
+  const lastUsageRows = await executor.query<{ payload: unknown }>(
+    `SELECT payload FROM turn_events
+     WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
+     ORDER BY sequence DESC LIMIT 1`,
+    [tenantId, runId],
+  );
+  const lastUsage = recordValue(lastUsageRows[0]?.payload) ?? {};
+  const reservations = await executor.query<{
+    id: string;
+    user_id: string | null;
+    department_id: string | null;
+    reserved_micros: string;
+  }>(
+    `SELECT id,user_id,department_id,reserved_micros::text
+     FROM budget_reservations
+     WHERE tenant_id=$1::uuid AND request_id=$2 LIMIT 1`,
+    [tenantId, requestId],
+  );
+  const hasUsage = Number(totals.usage_event_count) > 0;
+  const exactPricing = hasUsage
+    && Number(totals.priced_event_count) === Number(totals.usage_event_count);
+  const actualMicros = exactPricing
+    ? totals.exact_cost_micros
+    : hasUsage
+      ? reservations[0]?.reserved_micros ?? "0"
+      : "0";
+  const provider = stringValue(lastUsage.servedProvider)
+    ?? stringValue(runtimeRequest.providerId);
+  const model = stringValue(lastUsage.servedModel)
+    ?? stringValue(lastUsage.model)
+    ?? stringValue(runtimeRequest.model);
+  await executor.execute(
+    `
+INSERT INTO usage_events (
+  tenant_id,request_id,idempotency_key,source,user_id,workspace_id,task_id,
+  session_id,feature,provider,model,tokens_in,tokens_out,tokens_cached,
+  cache_read_tokens,cache_write_tokens,cache_creation_tokens_1h,cache_creation_tokens_5m,
+  cache_eligible,cache_provider,cache_key_hash,prompt_manifest_hash,cache_miss_reason,
+  cost_raw_micros,cost_billed_micros,status,metadata
+) VALUES (
+  $1::uuid,$2,$3,'router',$4::uuid,$5::uuid,$6::uuid,$7::uuid,
+  'model.turn',$8,$9,$10,$11,$12,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
+  $21,$22,$23::jsonb
+)
+ON CONFLICT (tenant_id,request_id) DO NOTHING
+    `.trim(),
+    [
+      tenantId,
+      requestId,
+      `${runId}:usage`,
+      run.user_id,
+      run.workspace_id,
+      run.task_id,
+      run.session_id,
+      provider,
+      model,
+      Number(totals.input_tokens),
+      Number(totals.output_tokens),
+      Number(totals.cache_read_tokens),
+      Number(totals.cache_write_tokens),
+      Number(totals.cache_creation_tokens_1h),
+      Number(totals.cache_creation_tokens_5m),
+      lastUsage.cacheEligible === true,
+      stringValue(lastUsage.cacheProvider),
+      stringValue(lastUsage.cacheKeyHash),
+      stringValue(lastUsage.promptManifestHash),
+      stringValue(lastUsage.cacheMissReason),
+      actualMicros,
+      status,
+      JSON.stringify({ runId, durable: true, terminalStatus: status, exactPricing }),
+    ],
+  );
+  const settled = await executor.query<{
+    id: string;
+    user_id: string | null;
+    department_id: string | null;
+    reserved_micros: string;
+  }>(
+    `
+UPDATE budget_reservations
+SET actual_cost_micros=$5::bigint,status='reconciled',
+    provider=COALESCE($3,provider),model=COALESCE($4,model),updated_at=now()
+WHERE tenant_id=$1::uuid AND request_id=$2 AND status='reserved'
+RETURNING id,user_id,department_id,reserved_micros::text
+    `.trim(),
+    [tenantId, requestId, provider, model, actualMicros],
+  );
+  if (!settled[0]) return;
+  const adjustment = safeBigInt(actualMicros) - safeBigInt(settled[0].reserved_micros);
+  const scopes = [
+    { type: "org", id: tenantId },
+    ...(settled[0].department_id ? [{ type: "department", id: settled[0].department_id }] : []),
+    ...(settled[0].user_id ? [{ type: "user", id: settled[0].user_id }] : []),
+  ];
+  for (const scope of scopes) {
+    const prior = await executor.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount_micros),0)::text AS total
+       FROM credit_ledger_entries
+       WHERE tenant_id=$1::uuid AND scope_type=$2 AND scope_id=$3`,
+      [tenantId, scope.type, scope.id],
+    );
+    const balanceAfter = safeBigInt(prior[0]?.total) + adjustment;
+    await executor.execute(
+      `
+INSERT INTO credit_ledger_entries (
+  tenant_id,scope_type,scope_id,reservation_id,request_id,kind,
+  amount_micros,balance_after_micros,metadata
+) VALUES ($1::uuid,$2,$3,$4::uuid,$5,'reconcile',$6,$7,$8::jsonb)
+ON CONFLICT (tenant_id,request_id,scope_type,scope_id,kind) DO NOTHING
+      `.trim(),
+      [
+        tenantId,
+        scope.type,
+        scope.id,
+        settled[0].id,
+        requestId,
+        adjustment.toString(),
+        balanceAfter.toString(),
+        JSON.stringify({ runId, terminalStatus: status, exactPricing }),
+      ],
+    );
+  }
+}
+
+function safeBigInt(value: unknown): bigint {
+  try {
+    return BigInt(typeof value === "string" || typeof value === "number" ? value : 0);
+  } catch {
+    return 0n;
+  }
 }
 
 async function appendDurableEvents(

@@ -31,7 +31,7 @@ import { Observable } from "rxjs";
 import { SessionHostService } from "../runtime/session-host.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
-import { BUDGET_SERVICE, budgetEstimateFromRequest, usageCostMicros, type BudgetService } from "../budget/budget.service.ts";
+import { BUDGET_SERVICE, budgetEstimateFromRequest, modelCostSnapshot, usageCostMicros, type BudgetService } from "../budget/budget.service.ts";
 import { MODEL_GOVERNANCE_SERVICE, type ModelGovernanceService } from "../model-governance/model-governance.service.ts";
 import { CLOUD_TASK_STORE, type CloudTaskStore } from "./cloud-task-store.ts";
 import { ApiEventStreamService } from "./event-stream.service.ts";
@@ -728,7 +728,9 @@ export class AgentApiController {
     const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedRequest.model);
     const contextWindowTokens = resolveModelCapabilities(governedModel).context?.windowTokens
       ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
-    const reservation = await this.budgets.reserve({
+    const pricingSnapshot = modelCostSnapshot(governedRequest.provider, governedRequest.model);
+    const hasModelPricing = Object.values(pricingSnapshot).some((value) => typeof value === "number");
+    const budgetCheck = await this.budgets.reserve({
       tenantId,
       requestId,
       userId: httpRequest.auth?.user.id ?? null,
@@ -738,11 +740,18 @@ export class AgentApiController {
       feature: "model",
       provider: providerId,
       model: governedRequest.model ?? null,
-      estimatedCostMicros: budgetEstimateFromRequest({ provider: governedRequest.provider, model: governedRequest.model }),
+      estimatedCostMicros: budgetEstimateFromRequest({
+        provider: governedRequest.provider,
+        model: governedRequest.model,
+        estimatedInputTokens: Math.min(contextWindowTokens, 12_000),
+        estimatedOutputTokens: governedRequest.maxTokens ?? 8_000,
+      }),
       estimatedTokens: governedRequest.maxTokens ?? 4000,
       metadata: { workspaceId: request.workspaceId ?? task.workspaceId },
     });
-    let actualCostMicros = reservation.reservation ? BigInt(reservation.reservation.reservedMicros) : 0n;
+    const reservedCostMicros = BigInt(budgetCheck.reservation?.reservedMicros ?? "0");
+    let actualCostMicros = 0n;
+    let usagePricingComplete = true;
     const startedAt = Date.now();
     let usage: {
       inputTokens: number;
@@ -789,6 +798,7 @@ export class AgentApiController {
             continueInterruptedTurn: request.continueInterruptedTurn === true,
             maxTokens: governedRequest.maxTokens ?? 8_000,
             contextWindowTokens,
+            modelPricing: pricingSnapshot,
             networkPolicy: governedRequest.networkPolicy,
             mcpServerIds: governedRequest.mcpServers
               .filter((server) => server.enabled && server.trusted)
@@ -966,7 +976,8 @@ export class AgentApiController {
             }));
           }
           if (parsed.kind === "usage") {
-            actualCostMicros = usageCostMicros(parsed, actualCostMicros, governedRequest.provider);
+            if (parsed.costRawMicros === undefined && !hasModelPricing) usagePricingComplete = false;
+            actualCostMicros += usageCostMicros(parsed, 0n, governedRequest.provider);
             usage = {
               inputTokens: (usage?.inputTokens ?? 0) + parsed.inputTokens,
               outputTokens: (usage?.outputTokens ?? 0) + parsed.outputTokens,
@@ -993,6 +1004,7 @@ export class AgentApiController {
           }
           this.events.publish(sessionId, parsed);
           if (parsed.kind === "turn.end") {
+            const terminalCostMicros = usage && !usagePricingComplete ? reservedCostMicros : actualCostMicros;
             this.#queueProjectionWrite(sessionId, async () => {
               await this.store.updateTask(task.id, { status: parsed.status });
               if (parsed.status === "completed") {
@@ -1016,7 +1028,7 @@ export class AgentApiController {
               }
             });
             void Promise.all([
-              this.budgets.reconcile({ tenantId, requestId, actualCostMicros, usage }),
+              this.budgets.reconcile({ tenantId, requestId, actualCostMicros: terminalCostMicros, usage }),
               this.usageRepository.ingestInternal(tenantId, {
                 requestId,
                 userId: httpRequest.auth?.user.id ?? null,
@@ -1041,8 +1053,8 @@ export class AgentApiController {
                 promptManifestHash: usage?.promptManifestHash ?? null,
                 cacheMissReason: usage?.cacheMissReason ?? null,
                 sandboxUsage: {},
-                costRawMicros: actualCostMicros.toString(),
-                costBilledMicros: actualCostMicros.toString(),
+                costRawMicros: terminalCostMicros.toString(),
+                costBilledMicros: terminalCostMicros.toString(),
                 latencyMs: Date.now() - startedAt,
                 ttftMs: null,
                 status: parsed.status,
@@ -1061,7 +1073,8 @@ export class AgentApiController {
       activeTurnId = turnId;
       return { turnId, sessionId };
     } catch (error) {
-      await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
+      const terminalCostMicros = usage && !usagePricingComplete ? reservedCostMicros : actualCostMicros;
+      await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: terminalCostMicros, usage });
       throw error;
     }
   }

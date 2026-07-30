@@ -73,6 +73,7 @@ export interface DurableApproval {
 
 export interface DurableTurnSnapshot {
   id: string;
+  createdAt: string;
   tenantId: string;
   userId: string;
   workspaceId: string;
@@ -95,6 +96,12 @@ export interface DurableTurnSnapshot {
   sandboxProvider: string | null;
   sandboxId: string | null;
   sandboxState: string | null;
+  usageTotals: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    costMicros: string;
+  };
   steps: readonly DurableTurnStep[];
   entries: readonly DurableSessionEntry[];
   approvals: readonly DurableApproval[];
@@ -283,6 +290,11 @@ export class DurableTurnRunner {
       compactionTriggerTokens?: number;
       contextWindowTokens?: number;
       compactor?: SessionCompactionRunner;
+      maxModelIterations?: number;
+      maxToolCalls?: number;
+      maxTotalTokens?: number;
+      maxSpendMicros?: number;
+      maxWallTimeSeconds?: number;
     } = {},
   ) {}
 
@@ -298,6 +310,13 @@ export class DurableTurnRunner {
       if (TERMINAL_STATES.has(snapshot.state)) {
         await this.repository.release(snapshot);
         return { runId: snapshot.id, state: snapshot.state, noOp: true };
+      }
+      if (snapshot.state !== "finalizing" && snapshot.state !== "persisting_response") {
+        const limit = durableTurnLimit(snapshot, this.options);
+        if (limit) {
+          await this.finishAtLimit(snapshot, limit);
+          return { runId: snapshot.id, state: "completed" };
+        }
       }
       if (snapshot.state === "queued" || snapshot.state === "assembling_context") {
         await this.assemble(snapshot);
@@ -1111,6 +1130,48 @@ export class DurableTurnRunner {
     });
   }
 
+  private async finishAtLimit(snapshot: DurableTurnSnapshot, message: string): Promise<void> {
+    const messageId = randomUUID();
+    const entry = {
+      entryId: messageId,
+      entryType: "message",
+      payload: {
+        type: "message",
+        id: messageId,
+        parentId: snapshot.entries.at(-1)?.entryId ?? null,
+        timestamp: new Date().toISOString(),
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: message }],
+          stopReason: "stop",
+          timestamp: Date.now(),
+        },
+      } as JsonValue,
+    };
+    await this.repository.commit(snapshot, {
+      expectedState: snapshot.state,
+      nextState: "completed",
+      steps: snapshot.steps
+        .filter((step) => step.state === "pending" || step.state === "running" || step.state === "waiting")
+        .map((step) => ({ ...step, state: "cancelled" as const, error: "durable_turn_limit_reached" })),
+      entries: [entry],
+      assistantMessage: {
+        id: messageId,
+        text: message,
+        status: "complete",
+        inputTokens: 0,
+        outputTokens: Math.ceil(message.length / 4),
+      },
+      events: [
+        { kind: "session.note", note: "limit-reached", detail: message },
+        { kind: "turn.end", turnId: snapshot.id, status: "completed" },
+      ],
+      nextAction: null,
+      waitingReason: null,
+      taskStatus: "completed",
+    });
+  }
+
   private async commitAndWake(
     snapshot: DurableTurnSnapshot,
     mutation: DurableTurnMutation,
@@ -1238,7 +1299,7 @@ RETURNING *
     );
     const run = runs[0];
     if (!run) return null;
-    const [steps, entries, approvals, previousManifests, checkpoints] = await Promise.all([
+    const [steps, entries, approvals, previousManifests, checkpoints, usageTotals] = await Promise.all([
       this.executor.query<StepRow>(
         "SELECT * FROM turn_steps WHERE tenant_id = $1::uuid AND run_id = $2::uuid ORDER BY sequence ASC",
         [input.tenantId, input.runId],
@@ -1273,8 +1334,21 @@ LIMIT 1
         `.trim(),
         [input.tenantId, run.session_id],
       ),
+      this.executor.query<UsageTotalsRow>(
+        `
+SELECT
+  COALESCE(SUM((payload->>'inputTokens')::bigint),0)::text AS input_tokens,
+  COALESCE(SUM((payload->>'outputTokens')::bigint),0)::text AS output_tokens,
+  COALESCE(SUM(COALESCE((payload->>'totalTokens')::bigint,
+    (payload->>'inputTokens')::bigint + (payload->>'outputTokens')::bigint)),0)::text AS total_tokens,
+  COALESCE(SUM(COALESCE((payload->>'costRawMicros')::bigint,0)),0)::text AS cost_micros
+FROM turn_events
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
+        `.trim(),
+        [input.tenantId, input.runId],
+      ),
     ]);
-    return mapSnapshot(run, owner, steps, entries, approvals, previousManifests[0], checkpoints[0]);
+    return mapSnapshot(run, owner, steps, entries, approvals, usageTotals[0], previousManifests[0], checkpoints[0]);
   }
 
   async heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number): Promise<boolean> {
@@ -1585,12 +1659,18 @@ export class RouterDurableTurnModel implements DurableTurnModel {
         approvalKind: policy.approvalKind,
       };
     });
+    const pricing = record(snapshot.runtimeRequest.modelPricing) ?? {};
+    const hasPricing = ["input", "output", "cacheRead", "cacheWrite"]
+      .some((field) => nonnegativeNumber(pricing[field]) !== null);
     const usage: Extract<AgentStreamEvent, { kind: "usage" }> | undefined = finalUsage
       ? AgentStreamEventSchema.parse({
           kind: "usage",
           inputTokens: finalUsage.inputTokens,
           outputTokens: finalUsage.outputTokens,
           totalTokens: finalUsage.totalTokens,
+          ...(hasPricing ? {
+            costRawMicros: usageCostMicros(finalUsage, pricing).toString(),
+          } : {}),
           cacheReadTokens: finalUsage.cacheReadTokens ?? 0,
           cacheWriteTokens: finalUsage.cacheWriteTokens ?? 0,
           cacheCreationTokens1h: finalUsage.cacheCreationTokens1h ?? 0,
@@ -1709,6 +1789,81 @@ function reasoningEffort(value: unknown): "minimal" | "low" | "medium" | "high" 
 
 function modelIteration(steps: readonly DurableTurnStep[]): number {
   return steps.filter((step) => step.type === "model.call").length;
+}
+
+function durableTurnLimit(
+  snapshot: DurableTurnSnapshot,
+  options: {
+    maxModelIterations?: number;
+    maxToolCalls?: number;
+    maxTotalTokens?: number;
+    maxSpendMicros?: number;
+    maxWallTimeSeconds?: number;
+  },
+): string | null {
+  const maxModelIterations = options.maxModelIterations ?? 12;
+  const maxToolCalls = options.maxToolCalls ?? 48;
+  const maxTotalTokens = options.maxTotalTokens ?? 250_000;
+  const maxSpendMicros = BigInt(options.maxSpendMicros ?? 1_000_000);
+  const maxWallTimeSeconds = options.maxWallTimeSeconds ?? 1_800;
+  const nextModelIteration = snapshot.steps
+    .filter((step) => step.type === "model.call")
+    .reduce((highest, step) => Math.max(highest, numberValue(step.input.iteration) ?? 0), 0);
+  if (snapshot.state === "calling_model" && nextModelIteration > maxModelIterations) {
+    return "I stopped this response because it reached the model-step safety limit. Retry with a narrower request.";
+  }
+  const toolCalls = snapshot.steps.filter((step) => step.type.startsWith("tool.")).length;
+  if (snapshot.state === "executing_tool" && toolCalls > maxToolCalls) {
+    return "I stopped this response because it reached the tool-action safety limit. Retry with a narrower request.";
+  }
+  if (snapshot.usageTotals.totalTokens >= maxTotalTokens) {
+    return "I stopped this response because it reached the token safety limit. Continue in a new message.";
+  }
+  if (safeBigInt(snapshot.usageTotals.costMicros) >= maxSpendMicros) {
+    return "I stopped this response because it reached the spending safety limit. Continue in a new message.";
+  }
+  const createdAt = Date.parse(snapshot.createdAt);
+  if (Number.isFinite(createdAt) && Date.now() - createdAt >= maxWallTimeSeconds * 1_000) {
+    return "I stopped this response because it reached the execution-time safety limit. Retry to start a fresh run.";
+  }
+  return null;
+}
+
+function usageCostMicros(
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  },
+  pricingInput: unknown,
+): bigint {
+  const pricing = record(pricingInput) ?? {};
+  const inputPrice = nonnegativeNumber(pricing.input);
+  const outputPrice = nonnegativeNumber(pricing.output);
+  const cacheReadPrice = nonnegativeNumber(pricing.cacheRead) ?? inputPrice;
+  const cacheWritePrice = nonnegativeNumber(pricing.cacheWrite) ?? 0;
+  const cacheReadTokens = Math.min(usage.inputTokens, usage.cacheReadTokens ?? 0);
+  const regularInputTokens = Math.max(0, usage.inputTokens - cacheReadTokens);
+  const micros = Math.ceil(
+    regularInputTokens * (inputPrice ?? 0)
+    + cacheReadTokens * (cacheReadPrice ?? 0)
+    + (usage.cacheWriteTokens ?? 0) * cacheWritePrice
+    + usage.outputTokens * (outputPrice ?? 0),
+  );
+  return BigInt(Math.max(0, micros));
+}
+
+function nonnegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function safeBigInt(value: unknown): bigint {
+  try {
+    return BigInt(typeof value === "string" || typeof value === "number" || typeof value === "bigint" ? value : 0);
+  } catch {
+    return 0n;
+  }
 }
 
 function shouldCompactSnapshot(
@@ -2508,6 +2663,9 @@ async function finalizeUsageAndBudget(
     cache_write_tokens: number | string;
     cache_creation_tokens_1h: number | string;
     cache_creation_tokens_5m: number | string;
+    usage_event_count: number | string;
+    priced_event_count: number | string;
+    exact_cost_micros: string;
   }>(
     `
 SELECT
@@ -2516,7 +2674,10 @@ SELECT
   COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheReadTokens')::bigint,0) ELSE 0 END),0) AS cache_read_tokens,
   COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheWriteTokens')::bigint,0) ELSE 0 END),0) AS cache_write_tokens,
   COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheCreationTokens1h')::bigint,0) ELSE 0 END),0) AS cache_creation_tokens_1h,
-  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheCreationTokens5m')::bigint,0) ELSE 0 END),0) AS cache_creation_tokens_5m
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'cacheCreationTokens5m')::bigint,0) ELSE 0 END),0) AS cache_creation_tokens_5m,
+  COUNT(*) FILTER (WHERE event_type='usage') AS usage_event_count,
+  COUNT(*) FILTER (WHERE event_type='usage' AND payload ? 'costRawMicros') AS priced_event_count,
+  COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'costRawMicros')::bigint,0) ELSE 0 END),0)::text AS exact_cost_micros
 FROM turn_events
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid
     `.trim(),
@@ -2529,6 +2690,9 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
     cache_write_tokens: 0,
     cache_creation_tokens_1h: 0,
     cache_creation_tokens_5m: 0,
+    usage_event_count: 0,
+    priced_event_count: 0,
+    exact_cost_micros: "0",
   };
   const lastUsageRows = await executor.query<{ payload: unknown }>(
     `
@@ -2541,11 +2705,32 @@ LIMIT 1
     [snapshot.tenantId, snapshot.id],
   );
   const lastUsage = record(lastUsageRows[0]?.payload) ?? {};
-  const reservation = await executor.query<{ reserved_micros: string }>(
-    "SELECT reserved_micros::text FROM budget_reservations WHERE tenant_id=$1::uuid AND request_id=$2 LIMIT 1",
+  const reservation = await executor.query<{
+    id: string;
+    user_id: string | null;
+    department_id: string | null;
+    reserved_micros: string;
+  }>(
+    `
+SELECT id,user_id,department_id,reserved_micros::text
+FROM budget_reservations
+WHERE tenant_id=$1::uuid AND request_id=$2
+LIMIT 1
+    `.trim(),
     [snapshot.tenantId, requestId],
   );
-  const actualMicros = status === "completed" ? reservation[0]?.reserved_micros ?? "0" : "0";
+  const hasUsage = Number(totals.usage_event_count) > 0;
+  const hasExactPricing = Number(totals.priced_event_count) === Number(totals.usage_event_count) && hasUsage;
+  const actualMicros = hasExactPricing
+    ? totals.exact_cost_micros
+    : hasUsage
+      ? reservation[0]?.reserved_micros ?? "0"
+      : "0";
+  const provider = stringValue(lastUsage.servedProvider)
+    ?? stringValue(snapshot.runtimeRequest.providerId);
+  const model = stringValue(lastUsage.servedModel)
+    ?? stringValue(lastUsage.model)
+    ?? stringValue(snapshot.runtimeRequest.model);
   await executor.execute(
     `
 INSERT INTO usage_events (
@@ -2569,8 +2754,8 @@ ON CONFLICT (tenant_id,request_id) DO NOTHING
       snapshot.workspaceId,
       snapshot.taskId,
       snapshot.sessionId,
-      stringValue(snapshot.runtimeRequest.providerId),
-      stringValue(snapshot.runtimeRequest.model),
+      provider,
+      model,
       Number(totals.input_tokens),
       Number(totals.output_tokens),
       Number(totals.cache_read_tokens),
@@ -2588,25 +2773,70 @@ ON CONFLICT (tenant_id,request_id) DO NOTHING
         runId: snapshot.id,
         durable: true,
         terminalStatus: status,
+        exactPricing: hasExactPricing,
         cacheMissComponentId: stringValue(lastUsage.cacheMissComponentId),
       }),
     ],
   );
-  await executor.execute(
+  const reconciled = await executor.query<{
+    id: string;
+    user_id: string | null;
+    department_id: string | null;
+    reserved_micros: string;
+  }>(
     `
 UPDATE budget_reservations
 SET actual_cost_micros=$5::bigint,status='reconciled',
     provider=COALESCE($3,provider),model=COALESCE($4,model),updated_at=now()
 WHERE tenant_id=$1::uuid AND request_id=$2 AND status='reserved'
+RETURNING id,user_id,department_id,reserved_micros::text
     `.trim(),
     [
       snapshot.tenantId,
       requestId,
-      stringValue(snapshot.runtimeRequest.providerId),
-      stringValue(snapshot.runtimeRequest.model),
+      provider,
+      model,
       actualMicros,
     ],
   );
+  const settled = reconciled[0];
+  if (!settled) return;
+  const adjustment = safeBigInt(actualMicros) - safeBigInt(settled.reserved_micros);
+  const scopes = [
+    { type: "org", id: snapshot.tenantId },
+    ...(settled.department_id ? [{ type: "department", id: settled.department_id }] : []),
+    ...(settled.user_id ? [{ type: "user", id: settled.user_id }] : []),
+  ];
+  for (const scope of scopes) {
+    const prior = await executor.query<{ total: string }>(
+      `
+SELECT COALESCE(SUM(amount_micros),0)::text AS total
+FROM credit_ledger_entries
+WHERE tenant_id=$1::uuid AND scope_type=$2 AND scope_id=$3
+      `.trim(),
+      [snapshot.tenantId, scope.type, scope.id],
+    );
+    const balanceAfter = safeBigInt(prior[0]?.total) + adjustment;
+    await executor.execute(
+      `
+INSERT INTO credit_ledger_entries (
+  tenant_id,scope_type,scope_id,reservation_id,request_id,kind,
+  amount_micros,balance_after_micros,metadata
+) VALUES ($1::uuid,$2,$3,$4::uuid,$5,'reconcile',$6,$7,$8::jsonb)
+ON CONFLICT (tenant_id,request_id,scope_type,scope_id,kind) DO NOTHING
+      `.trim(),
+      [
+        snapshot.tenantId,
+        scope.type,
+        scope.id,
+        settled.id,
+        requestId,
+        adjustment.toString(),
+        balanceAfter.toString(),
+        JSON.stringify({ runId: snapshot.id, terminalStatus: status, exactPricing: hasExactPricing }),
+      ],
+    );
+  }
 }
 
 function mapSnapshot(
@@ -2615,12 +2845,14 @@ function mapSnapshot(
   steps: readonly StepRow[],
   entries: readonly EntryRow[],
   approvals: readonly ApprovalRow[],
+  usageTotals?: UsageTotalsRow,
   previousManifest?: { prompt_manifest: unknown; updated_at: Date | string },
   checkpointRow?: { checkpoint: unknown; covered_entry_end: string | null },
 ): DurableTurnSnapshot {
   const checkpoint = SessionCheckpointV2Schema.safeParse(checkpointRow?.checkpoint);
   return {
     id: run.id,
+    createdAt: dateString(run.created_at) ?? new Date(0).toISOString(),
     tenantId: run.tenant_id,
     userId: run.user_id,
     workspaceId: run.workspace_id,
@@ -2643,6 +2875,12 @@ function mapSnapshot(
     sandboxProvider: run.sandbox_provider,
     sandboxId: run.sandbox_id,
     sandboxState: run.sandbox_state,
+    usageTotals: {
+      inputTokens: Number(usageTotals?.input_tokens ?? 0),
+      outputTokens: Number(usageTotals?.output_tokens ?? 0),
+      totalTokens: Number(usageTotals?.total_tokens ?? 0),
+      costMicros: String(usageTotals?.cost_micros ?? "0"),
+    },
     steps: steps.map((step) => ({
       id: step.id,
       sequence: step.sequence,
@@ -2743,6 +2981,7 @@ function isRetryableStatus(status: number | undefined): boolean {
 
 interface RunRow {
   id: string;
+  created_at: Date | string;
   tenant_id: string;
   user_id: string;
   workspace_id: string;
@@ -2760,6 +2999,13 @@ interface RunRow {
   sandbox_provider: string | null;
   sandbox_id: string | null;
   sandbox_state: string | null;
+}
+
+interface UsageTotalsRow {
+  input_tokens: number | string;
+  output_tokens: number | string;
+  total_tokens: number | string;
+  cost_micros: string;
 }
 
 interface StepRow {

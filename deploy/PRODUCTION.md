@@ -42,7 +42,12 @@ openssl rand -base64 36
 ./deploy/production-up.sh
 ```
 
-Fill every `REPLACE_WITH` value before running the script. The API runs additive Postgres migrations before listening. Caddy obtains and renews the certificate after DNS resolves and ports 80/443 are reachable.
+Fill every `REPLACE_WITH` value before running the script. A one-shot migration
+container applies additive Postgres migrations with the schema-owner account,
+then creates or refreshes separate non-bypass API and worker roles plus the
+tightly scoped platform role. The long-lived services never receive the schema
+owner credential. Caddy obtains and renews the certificate after DNS resolves
+and ports 80/443 are reachable.
 
 Use URL-safe hexadecimal values for the Postgres, MinIO, setup, and usage-webhook secrets because the Postgres password is interpolated into a connection URL and the setup key is printed in a URL fragment. Use a separate 36-byte base64 value for `BETTER_AUTH_SECRET`. The launcher refuses to start while any `REPLACE_WITH` placeholder remains.
 

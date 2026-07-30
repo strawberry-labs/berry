@@ -8,6 +8,7 @@ export interface SqlExecutor {
   execute(sql: string, params?: readonly unknown[]): Promise<unknown>;
   query<T>(sql: string, params?: readonly unknown[]): Promise<readonly T[]>;
   transaction?<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T>;
+  runWithTenant?<T>(tenantId: string, callback: () => Promise<T>): Promise<T>;
 }
 
 export class SqlTaskTitleRepository implements TaskTitleRepository {

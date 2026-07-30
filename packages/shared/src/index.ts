@@ -2053,7 +2053,7 @@ export type HostEvent = z.infer<typeof HostEventSchema>;
 export const TurnEndStatusSchema = z.enum(["completed", "cancelled", "failed"]);
 export type TurnEndStatus = z.infer<typeof TurnEndStatusSchema>;
 
-export const SessionNoteKindSchema = z.enum(["compacted", "resumed", "forked", "rewound", "steered", "followed-up"]);
+export const SessionNoteKindSchema = z.enum(["compacted", "resumed", "forked", "rewound", "steered", "followed-up", "limit-reached"]);
 export type SessionNoteKind = z.infer<typeof SessionNoteKindSchema>;
 
 /**
@@ -2135,6 +2135,7 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     inputTokens: z.number(),
     outputTokens: z.number(),
     totalTokens: z.number().int().nonnegative().optional(),
+    costRawMicros: z.string().regex(/^\d+$/).optional(),
     cacheReadTokens: z.number().int().nonnegative().optional(),
     cacheWriteTokens: z.number().int().nonnegative().optional(),
     cacheCreationTokens1h: z.number().int().nonnegative().optional(),
