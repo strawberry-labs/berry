@@ -816,6 +816,7 @@ function BerryUserAttachmentCard({ part, adapter }: { part: MessagePart; adapter
     <Attachment
       size="default"
       className="w-full max-w-[560px] flex-nowrap border-0 bg-card shadow-[var(--berry-ring-subtle)]"
+      role="group"
       aria-label={`Attached file: ${attachment.name}`}
     >
       {attachment.fileId && adapter.onOpenAttachment ? (

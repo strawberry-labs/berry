@@ -537,18 +537,18 @@ function ToolLayout({
         aria-expanded={effectiveOpen}
       >
         {showIcon ? (
-          <span className="shrink-0 text-muted-foreground/70 [&_svg]:text-muted-foreground/70">{icon}</span>
+          <span className="shrink-0 text-muted-foreground [&_svg]:text-muted-foreground">{icon}</span>
         ) : null}
         <span
           className={cn(
             "shrink-0 whitespace-nowrap font-medium",
-            isRunning ? "berry-shimmer" : strongLabel ? "text-foreground" : "text-muted-foreground/70",
+            isRunning ? "berry-shimmer" : strongLabel ? "text-foreground" : "text-muted-foreground",
           )}
         >
           {kindLabel}
         </span>
         {kindDetail}
-        <span className="flex min-w-0 max-w-full items-center gap-2 text-muted-foreground/70">
+        <span className="flex min-w-0 max-w-full items-center gap-2 text-muted-foreground">
           {separator ? <span className="shrink-0">{separator}</span> : null}
           {/* Berry $q: expanded rows show the static expanded text; collapsed
               rows show the (optionally rolling) live summary. */}
@@ -559,13 +559,13 @@ function ToolLayout({
             enabled={animateSummaryContent && !effectiveOpen}
             sequence={summarySequence}
           />
-          {metaText ? <span className="shrink-0 whitespace-nowrap text-muted-foreground/50">{metaText}</span> : null}
-          {statusLabel ? <span className="shrink-0 whitespace-nowrap text-destructive/70">{statusLabel}</span> : null}
+          {metaText ? <span className="shrink-0 whitespace-nowrap text-muted-foreground">{metaText}</span> : null}
+          {statusLabel ? <span className="shrink-0 whitespace-nowrap text-destructive">{statusLabel}</span> : null}
         </span>
         {canToggle ? (
           <ChevronRight
             className={cn(
-              "size-4 shrink-0 text-muted-foreground/70 will-change-transform",
+              "size-4 shrink-0 text-muted-foreground will-change-transform",
               "transition-[transform,opacity] duration-[var(--duration-quick)] ease-[var(--ease-in-out)]",
               effectiveOpen ? "rotate-90 opacity-100" : "rotate-0 opacity-0 group-hover/tool-summary:opacity-100",
             )}
@@ -644,7 +644,7 @@ function ReadRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean }) 
       primaryText={
         path ? <FilePathButton path={path} label={base} /> : <span className="min-w-0 truncate font-medium">{base}</span>
       }
-      secondaryText={dir ? <span className="min-w-0 truncate text-muted-foreground/70">{dir}</span> : undefined}
+      secondaryText={dir ? <span className="min-w-0 truncate text-muted-foreground">{dir}</span> : undefined}
       metaText={metaTextOf(tool)}
       statusLabel={failureLabel(tool.status)}
     />
@@ -769,7 +769,7 @@ function EditRow({ tool, showIcon }: { tool: ActivityTool; showIcon: boolean }) 
       primaryText={
         path ? <FilePathButton path={path} label={base} /> : <span className="min-w-0 truncate font-medium">{base}</span>
       }
-      secondaryText={dir ? <span className="min-w-0 truncate text-muted-foreground/70">{dir}</span> : undefined}
+      secondaryText={dir ? <span className="min-w-0 truncate text-muted-foreground">{dir}</span> : undefined}
       metaText={metaTextOf(tool)}
       statusLabel={failureLabel(tool.status)}
     >
@@ -942,12 +942,12 @@ function SessionContextRow({ tool, showIcon }: { tool: ActivityTool; showIcon: b
     >
       <div className="mb-2 space-y-2 rounded-xl border border-border bg-[var(--berry-panel-bg)] px-4 py-3 text-[13px]">
         <section>
-          <h4 className="mb-1 font-medium text-muted-foreground/70">Query</h4>
+          <h4 className="mb-1 font-medium text-muted-foreground">Query</h4>
           <p className="text-foreground">{query}</p>
         </section>
         {output ? (
           <section>
-            <h4 className="mb-1 font-medium text-muted-foreground/70">Result</h4>
+            <h4 className="mb-1 font-medium text-muted-foreground">Result</h4>
             <Markdown className="text-muted-foreground [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">{output}</Markdown>
           </section>
         ) : null}
@@ -988,12 +988,12 @@ const TODO_ICON: Record<TodoStatus, typeof CircleCheckIcon> = {
 const TODO_ICON_COLOR: Record<TodoStatus, string> = {
   completed: "text-emerald-500",
   in_progress: "text-foreground",
-  pending: "text-muted-foreground/50",
+  pending: "text-muted-foreground",
 };
 const TODO_TEXT: Record<TodoStatus, string> = {
   pending: "text-muted-foreground",
   in_progress: "text-foreground",
-  completed: "text-muted-foreground/50 line-through",
+  completed: "text-muted-foreground line-through",
 };
 
 /**
@@ -1368,7 +1368,7 @@ function SubagentBox({ label, children, tinted }: { label: string; children: str
   return (
     <section className="space-y-2">
       <div className={cn("flex flex-col rounded-lg border border-border", tinted && "bg-muted/40")}>
-        <h4 className="p-3 text-[13px] font-medium tracking-wide text-muted-foreground/70 uppercase">{label}</h4>
+        <h4 className="p-3 text-[13px] font-medium tracking-wide text-muted-foreground uppercase">{label}</h4>
         <div className={cn("overflow-auto", tinted ? "max-h-64" : "max-h-52")}>
           <Markdown className="min-w-0 px-3 pb-2 text-[13px] break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
             {children}
@@ -1559,7 +1559,7 @@ export function TurnActivity({
             always visible so collapsed turns are obviously expandable. */}
         <ChevronRight
           className={cn(
-            "size-4 shrink-0 text-muted-foreground/70 will-change-transform",
+            "size-4 shrink-0 text-muted-foreground will-change-transform",
             "transition-transform duration-[var(--duration-quick)] ease-[var(--ease-in-out)]",
             open ? "rotate-90" : "rotate-0",
           )}
@@ -1570,7 +1570,7 @@ export function TurnActivity({
           is never a blank shimmer while tool calls stream invisibly. */}
       {active && !open && liveAction ? (
         <div
-          className="flex min-w-0 max-w-full items-center gap-2 pt-3 text-[13px] text-muted-foreground/70"
+          className="flex min-w-0 max-w-full items-center gap-2 pt-3 text-[13px] text-muted-foreground"
           data-testid="turn-activity-live-action"
         >
           <RollingSummary contentKey={liveAction.key} primaryText={liveAction.node} enabled />
@@ -1668,17 +1668,17 @@ export function ThoughtRow({
         )}
         aria-expanded={effectiveOpen}
       >
-        <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground/70">
+        <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground">
           {thinking ? <CircularActivitySpinner size={14} label="Thinking" /> : <Brain className="size-4" />}
         </span>
-        <span className={cn("font-medium", active ? "berry-shimmer" : "text-muted-foreground/70")}>
+        <span className={cn("font-medium", active ? "berry-shimmer" : "text-muted-foreground")}>
           {active ? "Thinking" : "Thought"}
         </span>
-        {suffix ? <span className="text-muted-foreground/60">{suffix}</span> : null}
+        {suffix ? <span className="text-muted-foreground">{suffix}</span> : null}
         {hasText ? (
           <ChevronRight
             className={cn(
-              "size-4 shrink-0 text-muted-foreground/70 will-change-transform",
+              "size-4 shrink-0 text-muted-foreground will-change-transform",
               "transition-[transform,opacity] duration-[var(--duration-quick)] ease-[var(--ease-in-out)]",
               effectiveOpen ? "rotate-90 opacity-100" : "rotate-0 opacity-0 group-hover/thought:opacity-100",
             )}
