@@ -6,7 +6,8 @@ import {
   redactProjectKnowledgeText,
   SqlKnowledgeRepository,
 } from "./repository.js";
-import { DocumentExtractor, KnowledgeChunker } from "./services.js";
+import { KnowledgeProcessor } from "./processor.js";
+import { DocumentExtractor, KnowledgeChunker, type KnowledgeObjectStore } from "./services.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
 const sourceId = "00000000-0000-7000-8000-000000000002";
@@ -165,6 +166,62 @@ describe("knowledge ingestion and ranking", () => {
     expect(updates).toHaveLength(2);
     expect(JSON.parse(String(updates[0]?.params[2]))).toHaveLength(100);
     expect(JSON.parse(String(updates[1]?.params[2]))).toHaveLength(1);
+  });
+
+  it("keeps embedding requests within the production provider batch limit", async () => {
+    const source = {
+      id: sourceId,
+      tenantId,
+      workspaceId: "00000000-0000-7000-8000-000000000003",
+      userId: null,
+      sourceType: "file" as const,
+      sourceId: "00000000-0000-7000-8000-000000000004",
+      revision: "revision-1",
+      contentHash: "source-hash",
+      title: "Large source",
+      visibility: "project" as const,
+      status: "indexed",
+      mediaType: "text/plain",
+      bucket: "test",
+      objectKey: "large.txt",
+      derivativeObjectKey: "large.extract.txt",
+      inlineText: null,
+      tombstonedAt: null,
+    };
+    const chunks = Array.from({ length: 65 }, (_, ordinal) => ({
+      id: `chunk-${ordinal}`,
+      text: `chunk-${ordinal}`,
+      ordinal,
+      tokenEstimate: 2,
+    }));
+    const requestSizes: number[] = [];
+    let savedVectorCount = 0;
+    const repository = {
+      loadSource: async () => source,
+      listChunks: async () => chunks,
+      saveEmbeddings: async (input: { vectors: readonly number[][] }) => {
+        savedVectorCount = input.vectors.length;
+      },
+      markEmbeddingRetryable: async () => undefined,
+    } as unknown as SqlKnowledgeRepository;
+    const processor = new KnowledgeProcessor({
+      repository,
+      objects: {} as KnowledgeObjectStore,
+      extractor: new DocumentExtractor("http://tika.invalid"),
+      chunker: new KnowledgeChunker(),
+      embeddings: {
+        profile: { id: "profile-v2", provider: "fixture", model: "fixture", dimensions: 2, version: 2 },
+        embed: async (texts) => {
+          requestSizes.push(texts.length);
+          return texts.map(() => [0.25, 0.75]);
+        },
+      },
+    });
+
+    await processor.process("knowledge.embed", { tenantId, sourceId, revision: "revision-1" });
+
+    expect(requestSizes).toEqual([32, 32, 1]);
+    expect(savedVectorCount).toBe(65);
   });
 
   it("builds a bounded task outcome and removes credentials before project indexing", () => {

@@ -4,6 +4,8 @@ import type { KnowledgeIndexTaskJobPayload, KnowledgeRevisionJobPayload } from "
 import { SqlKnowledgeRepository } from "./repository.js";
 import { DocumentExtractor, KnowledgeChunker, type KnowledgeObjectStore } from "./services.js";
 
+const EMBEDDING_BATCH_SIZE = 32;
+
 export type KnowledgeJobName =
   | "knowledge.extract"
   | "knowledge.chunk"
@@ -124,8 +126,8 @@ export class KnowledgeProcessor {
     }
     try {
       const vectors: number[][] = [];
-      for (let offset = 0; offset < chunks.length; offset += 64) {
-        const batch = chunks.slice(offset, offset + 64);
+      for (let offset = 0; offset < chunks.length; offset += EMBEDDING_BATCH_SIZE) {
+        const batch = chunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
         vectors.push(...await this.dependencies.embeddings.embed(batch.map((chunk) => chunk.text)) as number[][]);
       }
       await this.dependencies.repository.saveEmbeddings({
