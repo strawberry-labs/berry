@@ -52,8 +52,9 @@ export function WebWindowChrome({ onHome, onSearch }: {
   onHome: () => void;
   onSearch: () => void;
 }) {
-  const { state, toggleSidebar } = useSidebar();
+  const { isMobile, state, toggleSidebar } = useSidebar();
   const sidebarCollapsed = state === "collapsed";
+  const homeControlOpensSidebar = isMobile || sidebarCollapsed;
 
   return (
     <div
@@ -64,9 +65,9 @@ export function WebWindowChrome({ onHome, onSearch }: {
         <button
           type="button"
           className="berry-web-home-link"
-          onClick={sidebarCollapsed ? toggleSidebar : onHome}
-          aria-label={sidebarCollapsed ? "Expand sidebar" : "Berry home"}
-          title={sidebarCollapsed ? "Expand sidebar" : undefined}
+          onClick={homeControlOpensSidebar ? toggleSidebar : onHome}
+          aria-label={homeControlOpensSidebar ? "Open sidebar" : "Berry home"}
+          title={homeControlOpensSidebar ? "Open sidebar" : undefined}
         >
           <BerryLogo className="berry-web-home-logo size-5" alt="" />
           <LayoutAlignLeft className="berry-web-sidebar-expand-icon" aria-hidden="true" />

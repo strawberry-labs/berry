@@ -2633,6 +2633,33 @@ code, pre {
 
   .berry-web-window-chrome { width: 100%; }
 
+  /* A task already owns the titlebar on compact screens. Keep one 44px
+     navigation control instead of layering the full web chrome over it. */
+  .berry-web-shell:has(.berry-task-header) .berry-web-window-chrome {
+    width: 52px;
+  }
+
+  .berry-web-shell:has(.berry-task-header) .berry-web-window-header {
+    justify-content: flex-start;
+    padding: 0 4px;
+  }
+
+  .berry-web-shell:has(.berry-task-header) .berry-web-home-link {
+    width: 44px;
+    height: 44px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .berry-web-shell:has(.berry-task-header) .berry-web-home-label,
+  .berry-web-shell:has(.berry-task-header) .berry-web-window-actions {
+    display: none;
+  }
+
+  .berry-web-shell:has(.berry-task-header) .berry-task-header {
+    padding-left: 56px;
+  }
+
   .berry-web-main .workspace,
   .berry-web-main .workspace[data-mode="code"] {
     grid-template-columns: minmax(0, 1fr);
