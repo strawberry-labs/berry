@@ -147,6 +147,8 @@ router:
 sandbox:
   provider: e2b
   templateId: base
+  domain: ""
+  requestTimeoutMs: 60000
   ttlSeconds: 900
   keepMemoryOnPause: false
   cpuCount: 2

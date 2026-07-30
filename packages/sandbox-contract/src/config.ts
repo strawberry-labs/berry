@@ -39,7 +39,7 @@ export function sandboxProviderConfigFromEnv(env: Record<string, string | undefi
       provider,
       e2b: {
         apiKey,
-        template: env.BERRY_E2B_TEMPLATE_ID ?? "base",
+        template: env.BERRY_E2B_TEMPLATE_ID ?? env.BERRY_SANDBOX_IMAGE ?? "base",
         ...(env.BERRY_E2B_DOMAIN ? { domain: env.BERRY_E2B_DOMAIN } : {}),
         ...(env.BERRY_E2B_REQUEST_TIMEOUT_MS ? { requestTimeoutMs: positiveInteger(env.BERRY_E2B_REQUEST_TIMEOUT_MS, "BERRY_E2B_REQUEST_TIMEOUT_MS") } : {}),
         ...(env.BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS ? { estimatedHourlyCostMicros: nonnegativeInteger(env.BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS, "BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS") } : {}),

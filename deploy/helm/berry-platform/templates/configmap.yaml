@@ -26,6 +26,8 @@ data:
   BERRY_SANDBOX_PROVIDER: {{ .Values.sandbox.provider | quote }}
   BERRY_SANDBOX_IMAGE: {{ .Values.sandbox.templateId | quote }}
   BERRY_E2B_TEMPLATE_ID: {{ .Values.sandbox.templateId | quote }}
+  BERRY_E2B_DOMAIN: {{ .Values.sandbox.domain | quote }}
+  BERRY_E2B_REQUEST_TIMEOUT_MS: {{ .Values.sandbox.requestTimeoutMs | quote }}
   BERRY_E2B_KEEP_MEMORY_ON_PAUSE: {{ .Values.sandbox.keepMemoryOnPause | quote }}
   BERRY_SANDBOX_TTL_SECONDS: {{ .Values.sandbox.ttlSeconds | quote }}
   BERRY_SANDBOX_CPU_COUNT: {{ .Values.sandbox.cpuCount | quote }}

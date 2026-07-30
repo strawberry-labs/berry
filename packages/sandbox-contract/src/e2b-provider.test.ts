@@ -133,6 +133,19 @@ describe("E2BSandboxProvider", () => {
     expect(createSandboxProviderFromConfig(config)).toBeInstanceOf(E2BSandboxProvider);
     expect(() => sandboxProviderConfigFromEnv({ BERRY_SANDBOX_PROVIDER: "e2b" })).toThrow("E2B_API_KEY");
   });
+
+  it("uses the generic sandbox image when the E2B-specific template is absent", () => {
+    expect(sandboxProviderConfigFromEnv({
+      BERRY_SANDBOX_PROVIDER: "e2b",
+      BERRY_SANDBOX_IMAGE: "berry-worker-template",
+      E2B_API_KEY: "e2b_server_key",
+    })).toMatchObject({
+      provider: "e2b",
+      e2b: {
+        template: "berry-worker-template",
+      },
+    });
+  });
 });
 
 type StoredSandbox = {

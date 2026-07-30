@@ -17,6 +17,8 @@ const runbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
 const deploymentLauncher = readFileSync(resolve(root, "deploy/up.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
+const composeApi = compose.split("\n  api:")[1]?.split("\n  worker:")[0] ?? "";
+const composeWorker = compose.split("\n  worker:")[1]?.split("\n  web:")[0] ?? "";
 
 describe("self-host compose deployment", () => {
   it("runs api, web, and worker from one built image with Postgres, Redis, and MinIO", () => {
@@ -58,6 +60,18 @@ describe("self-host compose deployment", () => {
     expect(compose).toContain("BERRY_SANDBOX_CWD: ${BERRY_SANDBOX_CWD:-/workspace}");
     expect(compose).not.toContain("/var/run/docker.sock:/var/run/docker.sock");
     expect(envExample).toContain("BERRY_SANDBOX_COMMERCIAL_PROVIDER=");
+    for (const key of [
+      "E2B_API_KEY",
+      "BERRY_E2B_TEMPLATE_ID",
+      "BERRY_E2B_DOMAIN",
+      "BERRY_E2B_REQUEST_TIMEOUT_MS",
+      "BERRY_E2B_KEEP_MEMORY_ON_PAUSE",
+      "BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS",
+      "BERRY_E2B_MINIMUM_EXEC_COST_MICROS",
+    ]) {
+      expect(composeApi).toContain(`${key}:`);
+      expect(composeWorker).toContain(`${key}:`);
+    }
   });
 
   it("builds the deployable surfaces and documents local-only defaults", () => {
