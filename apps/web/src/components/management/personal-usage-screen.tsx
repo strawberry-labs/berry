@@ -13,7 +13,12 @@ import {
   formatMoney,
   formatNumber,
 } from "./management-primitives";
-import { MiniSeries } from "./management-charts";
+import {
+  BreakdownBars,
+  DualTrend,
+  HealthRings,
+  OutcomeBars,
+} from "./management-charts";
 import { useResource, type ManagementScreenProps } from "./management-context";
 
 export type PromptCacheSummary = {
@@ -137,12 +142,42 @@ export function PersonalUsageScreen({ client, tenantId }: ManagementScreenProps)
           { label: "Cache writes", value: formatNumber(resource.data.analytics.performance.cacheWriteTokens), hint: "Prompt tokens written" },
         ]} />
         <Section title="Usage over time">
-          <MiniSeries
+          <DualTrend
             label="Daily billed usage"
             points={resource.data.analytics.series.map((point) => ({
-              label: new Date(point.ts).toLocaleDateString(),
-              value: Number(point.billedCostMicros) / 1_000_000,
+              label: point.ts.slice(0, 10),
+              spend: Number(point.billedCostMicros) / 1_000_000,
+              requests: point.requests,
             }))}
+            spendFormat={(value) => formatMoney(value * 1_000_000)}
+          />
+        </Section>
+        <div className="grid gap-4 xl:grid-cols-2">
+          <Section title="Request outcomes">
+            <OutcomeBars
+              points={resource.data.analytics.series.map((point) => ({
+                label: point.ts.slice(0, 10),
+                successes: point.successes,
+                failures: point.failures,
+              }))}
+            />
+          </Section>
+          <Section title="Personal quality signals">
+            <HealthRings
+              successRate={resource.data.analytics.totals.successRate}
+              cacheRate={cache.hitRate}
+            />
+          </Section>
+        </div>
+        <Section title="Model spend distribution">
+          <BreakdownBars
+            label="Billed spend"
+            rows={(resource.data.analytics.breakdowns.models ?? []).map(
+              (item) => ({
+                label: item.label,
+                value: Number(item.billedCostMicros) / 1_000_000,
+              }),
+            )}
             format={(value) => formatMoney(value * 1_000_000)}
           />
         </Section>

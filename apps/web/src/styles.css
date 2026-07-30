@@ -3022,12 +3022,11 @@ code, pre {
 .memory-empty span { font-size: 12px; }
 .memory-clear { display: flex; justify-content: flex-end; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--berry-border); }
 
-/* Recharts and the file drop target need stateful selectors that utilities cannot express clearly. */
+/* Analytics charts and the file drop target need stateful selectors that utilities cannot express clearly. */
 .settings-chart-series { min-width: 0; margin: 0; }
 .settings-chart-series figcaption { margin-bottom: 10px; color: var(--berry-text-secondary); font-size: 12px; font-weight: 560; }
 .settings-chart { width: 100%; height: 168px; }
-.settings-chart .recharts-cartesian-grid line { stroke: var(--berry-border); }
-.settings-chart .recharts-cartesian-axis-tick text { fill: var(--berry-text-tertiary); font-size: 10px; }
+.settings-chart-tall { height: 244px; }
 .settings-skill-dropzone {
   position: relative;
   display: flex;

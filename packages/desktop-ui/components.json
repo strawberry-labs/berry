@@ -16,5 +16,9 @@
     "utils": "@berry/desktop-ui/lib/utils",
     "hooks": "@berry/desktop-ui/hooks",
     "lib": "@berry/desktop-ui/lib"
+  },
+  "registries": {
+    "@bklit": "https://ui.bklit.com/r/{name}.json",
+    "@niko-table": "https://niko-table.com/r/{name}.json"
   }
 }

@@ -3271,7 +3271,30 @@ export type ServiceAccount = z.infer<typeof ServiceAccountSchema>;
 export type ServiceAccountCreate = z.infer<typeof ServiceAccountCreateSchema>;
 export type ServiceAccountTokenResponse = z.infer<typeof ServiceAccountTokenResponseSchema>;
 
-export const PlatformOverviewSchema = z.object({ tenants: z.number().int().nonnegative(), activeTenants: z.number().int().nonnegative(), billedSpendMicros: z.string(), rawCostMicros: z.string(), marginMicros: z.string(), successfulRequestRate: z.number().min(0).max(1).nullable(), routerLagSeconds: z.number().nonnegative().nullable(), incidents: z.array(AdminHealthSchema), recentOperatorActivity: z.array(JsonValueSchema) });
+export const PlatformOverviewSchema = z.object({
+  tenants: z.number().int().nonnegative(),
+  activeTenants: z.number().int().nonnegative(),
+  billedSpendMicros: z.string(),
+  rawCostMicros: z.string(),
+  marginMicros: z.string(),
+  successfulRequestRate: z.number().min(0).max(1).nullable(),
+  routerLagSeconds: z.number().nonnegative().nullable(),
+  incidents: z.array(AdminHealthSchema),
+  recentOperatorActivity: z.array(JsonValueSchema),
+  series: z.array(z.object({
+    ts: ISODateSchema,
+    billedCostMicros: z.string(),
+    rawCostMicros: z.string(),
+    requests: z.number().int().nonnegative(),
+    successRate: z.number().min(0).max(1).nullable(),
+  })).default([]),
+  topTenants: z.array(z.object({
+    tenantId: z.string(),
+    name: z.string(),
+    billedCostMicros: z.string(),
+    requests: z.number().int().nonnegative(),
+  })).default([]),
+});
 export type PlatformOverview = z.infer<typeof PlatformOverviewSchema>;
 export const PlatformTenantSummarySchema = z.object({ tenantId: z.string(), name: z.string(), slug: z.string(), lifecycle: z.string(), deploymentMode: z.string(), region: z.string().nullable(), hostname: z.string().nullable(), plan: z.string(), seats: z.number().int().nonnegative(), monthlySpendMicros: z.string(), prepaidBalanceMicros: z.string(), billingHealth: z.string(), ssoHealth: z.string(), updatedAt: ISODateSchema });
 export type PlatformTenantSummary = z.infer<typeof PlatformTenantSummarySchema>;

@@ -1995,11 +1995,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         )}
         </div>
         {surface === "settings" ? (
-          <React.Suspense fallback={<LazySurfaceFallback label="Loading settings" />}>
-            <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask, onUsePrompt: (prompt) => { window.localStorage.setItem("berry.web.pendingPrompt", prompt); navigateHome(); } }}>
-              <Outlet />
-            </ManagementRouteProvider>
-          </React.Suspense>
+          <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
+            <React.Suspense fallback={<LazySurfaceFallback label="Loading settings" />}>
+              <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask, onUsePrompt: (prompt) => { window.localStorage.setItem("berry.web.pendingPrompt", prompt); navigateHome(); } }}>
+                <Outlet />
+              </ManagementRouteProvider>
+            </React.Suspense>
+          </div>
         ) : null}
         {surface === "library" ? (
           <div className="min-h-0 flex-1 overflow-auto">

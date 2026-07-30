@@ -1,11 +1,12 @@
 import * as React from "react";
 import type { BerryApiClient } from "@berry/api-client";
 import type { MemoryItem } from "@berry/shared";
-import { Download, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Download, Pencil, Plus, Trash2 } from "lucide-react";
 import {
   AsyncState,
   Button,
   Input,
+  ManagementDialog,
   ManagementPage,
   ManagementSwitch,
   Section,
@@ -20,7 +21,9 @@ type MemoryResource = {
   nextCursor: string | null;
 };
 
-export function groupActiveMemories(items: readonly MemoryItem[]): Array<{ kind: string; items: MemoryItem[] }> {
+export function groupActiveMemories(
+  items: readonly MemoryItem[],
+): Array<{ kind: string; items: MemoryItem[] }> {
   const groups = new Map<string, MemoryItem[]>();
   for (const item of items) {
     if (item.status !== "active") continue;
@@ -33,7 +36,10 @@ export function groupActiveMemories(items: readonly MemoryItem[]): Array<{ kind:
     .map(([kind, grouped]) => ({ kind, items: grouped }));
 }
 
-export function withoutMemory(items: readonly MemoryItem[], memoryId: string): MemoryItem[] {
+export function withoutMemory(
+  items: readonly MemoryItem[],
+  memoryId: string,
+): MemoryItem[] {
   return items.filter((item) => item.id !== memoryId);
 }
 
@@ -41,14 +47,23 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
   const resource = useResource<MemoryResource>(
     "personal-memory",
     async () => {
-      if (!client) return { settings: { memoryEnabled: true, implicitMemoryEnabled: true }, items: [], nextCursor: null };
+      if (!client)
+        return {
+          settings: { memoryEnabled: true, implicitMemoryEnabled: true },
+          items: [],
+          nextCursor: null,
+        };
       const [settings, page] = await Promise.all([
         client.memorySettings(),
         client.listMemories({ scope: "personal", status: "active", limit: 50 }),
       ]);
       return { settings, ...page };
     },
-    { settings: { memoryEnabled: true, implicitMemoryEnabled: true }, items: [], nextCursor: null },
+    {
+      settings: { memoryEnabled: true, implicitMemoryEnabled: true },
+      items: [],
+      nextCursor: null,
+    },
   );
   const [data, setData] = React.useState(resource.data);
   const [query, setQuery] = React.useState("");
@@ -64,7 +79,10 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
 
   React.useEffect(() => setData(resource.data), [resource.data]);
 
-  const updateSetting = async (patch: { memoryEnabled?: boolean; implicitMemoryEnabled?: boolean }) => {
+  const updateSetting = async (patch: {
+    memoryEnabled?: boolean;
+    implicitMemoryEnabled?: boolean;
+  }) => {
     if (!client || busy) return;
     const previous = data.settings;
     const optimistic = { ...previous, ...patch };
@@ -91,18 +109,27 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
         ? await client.updateMemory(editing.id, {
             content: content.trim(),
             kind: kind.trim() || editing.kind,
-            expiresAt: expiresAt ? new Date(`${expiresAt}T23:59:59`).toISOString() : null,
+            expiresAt: expiresAt
+              ? new Date(`${expiresAt}T23:59:59`).toISOString()
+              : null,
           })
         : await client.rememberMemory({
             scope: "personal",
             kind: kind.trim() || "preference",
             content: content.trim(),
-            expiresAt: expiresAt ? new Date(`${expiresAt}T23:59:59`).toISOString() : null,
+            expiresAt: expiresAt
+              ? new Date(`${expiresAt}T23:59:59`).toISOString()
+              : null,
           });
       if (result.item) {
         setData((current) => ({
           ...current,
-          items: [result.item!, ...current.items.filter((item) => item.id !== editing?.id && item.id !== result.item!.id)],
+          items: [
+            result.item!,
+            ...current.items.filter(
+              (item) => item.id !== editing?.id && item.id !== result.item!.id,
+            ),
+          ],
         }));
       }
       closeEditor();
@@ -119,7 +146,10 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
     setMutationError("");
     try {
       await client.forgetMemory(memoryId);
-      setData((current) => ({ ...current, items: withoutMemory(current.items, memoryId) }));
+      setData((current) => ({
+        ...current,
+        items: withoutMemory(current.items, memoryId),
+      }));
       setConfirmForget(null);
     } catch (cause) {
       setMutationError(message(cause, "Unable to forget this memory"));
@@ -155,7 +185,13 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
       });
       setData((current) => ({
         ...current,
-        items: [...current.items, ...page.items.filter((item) => !current.items.some((existing) => existing.id === item.id))],
+        items: [
+          ...current.items,
+          ...page.items.filter(
+            (item) =>
+              !current.items.some((existing) => existing.id === item.id),
+          ),
+        ],
         nextCursor: page.nextCursor,
       }));
     } catch (cause) {
@@ -170,7 +206,10 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
     setBusy("export");
     try {
       const value = await client.exportMemories();
-      downloadJson(value, `berry-memory-${new Date().toISOString().slice(0, 10)}.json`);
+      downloadJson(
+        value,
+        `berry-memory-${new Date().toISOString().slice(0, 10)}.json`,
+      );
     } catch (cause) {
       setMutationError(message(cause, "Unable to export memory"));
     } finally {
@@ -200,7 +239,9 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
   };
 
   const filtered = data.items.filter((item) =>
-    `${item.kind} ${item.content}`.toLowerCase().includes(query.trim().toLowerCase())
+    `${item.kind} ${item.content}`
+      .toLowerCase()
+      .includes(query.trim().toLowerCase()),
   );
   const groups = groupActiveMemories(filtered);
   const disabled = !data.settings.memoryEnabled;
@@ -210,92 +251,238 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
       title="Memory"
       description="Control the personal facts and working preferences Berry may recall across your chats and projects."
       eyebrow="Personalization"
-      actions={(
+      actions={
         <>
-          <Button variant="secondary" onClick={() => void exportMemory()} disabled={!client || busy === "export"}>
-            <Download />Export
+          <Button
+            variant="secondary"
+            onClick={() => void exportMemory()}
+            disabled={!client || busy === "export"}
+          >
+            <Download />
+            Export
           </Button>
-          <Button onClick={openCreate} disabled={!client || disabled}><Plus />Add memory</Button>
+          <Button onClick={openCreate} disabled={!client || disabled}>
+            <Plus />
+            Add memory
+          </Button>
         </>
-      )}
+      }
     >
-      <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
-        <Section title="Recall controls" description="These settings apply only to your authenticated account.">
+      <AsyncState
+        loading={resource.loading}
+        error={resource.error}
+        onRetry={resource.retry}
+      >
+        <Section
+          title="Recall controls"
+          description="These settings apply only to your authenticated account."
+        >
           <div className="grid divide-y divide-border [&>label]:flex [&>label]:items-center [&>label]:justify-between [&>label]:gap-4 [&>label]:py-3 [&>label>span]:grid [&>label>span]:gap-0.5 [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
             <label>
-              <span><b>Use personal memory</b><small>Recall active facts and preferences in future chats.</small></span>
+              <span>
+                <b>Use personal memory</b>
+                <small>
+                  Recall active facts and preferences in future chats.
+                </small>
+              </span>
               <ManagementSwitch
                 checked={data.settings.memoryEnabled}
                 disabled={busy === "settings"}
                 aria-label="Use personal memory"
-                onCheckedChange={(memoryEnabled) => void updateSetting({ memoryEnabled })}
+                onCheckedChange={(memoryEnabled) =>
+                  void updateSetting({ memoryEnabled })
+                }
               />
             </label>
             <label>
-              <span><b>Learn from completed chats</b><small>Propose durable facts after a turn. Explicit entries always take priority.</small></span>
+              <span>
+                <b>Learn from completed chats</b>
+                <small>
+                  Propose durable facts after a turn. Explicit entries always
+                  take priority.
+                </small>
+              </span>
               <ManagementSwitch
                 checked={data.settings.implicitMemoryEnabled}
                 disabled={disabled || busy === "settings"}
                 aria-label="Learn from completed chats"
-                onCheckedChange={(implicitMemoryEnabled) => void updateSetting({ implicitMemoryEnabled })}
+                onCheckedChange={(implicitMemoryEnabled) =>
+                  void updateSetting({ implicitMemoryEnabled })
+                }
               />
             </label>
           </div>
-          {disabled ? <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">Recall and implicit extraction are disabled. Existing entries remain available to edit, export, or forget.</p> : null}
+          {disabled ? (
+            <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+              Recall and implicit extraction are disabled. Existing entries
+              remain available to edit, export, or forget.
+            </p>
+          ) : null}
         </Section>
 
-        {(creating || editing) ? (
-          <Section title={editing ? "Edit memory" : "Add a memory"} description="Save only durable context you want Berry to reuse.">
-            <div className="memory-editor">
-              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Kind<Input value={kind} maxLength={80} onChange={(event) => setKind(event.currentTarget.value)} /></label>
-              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">Memory<Input value={content} maxLength={20_000} onChange={(event) => setContent(event.currentTarget.value)} /></label>
-              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Expires<Input type="date" value={expiresAt} onChange={(event) => setExpiresAt(event.currentTarget.value)} /></label>
-              <div className="flex flex-wrap justify-end gap-2">
-                <Button variant="ghost" onClick={closeEditor}><X />Cancel</Button>
-                <Button onClick={() => void saveMemory()} disabled={!content.trim() || busy === "create" || busy?.startsWith("edit:")}>Save</Button>
-              </div>
-            </div>
-          </Section>
-        ) : null}
+        <ManagementDialog
+          open={Boolean(creating || editing)}
+          onOpenChange={(open) => {
+            if (!open) closeEditor();
+          }}
+          title={editing ? "Edit memory" : "Add a memory"}
+          description="Save only durable context you want Berry to reuse."
+          footer={
+            <>
+              <Button variant="secondary" onClick={closeEditor}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void saveMemory()}
+                disabled={
+                  !content.trim() ||
+                  busy === "create" ||
+                  busy?.startsWith("edit:")
+                }
+              >
+                Save memory
+              </Button>
+            </>
+          }
+        >
+          <div className="memory-editor">
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              Kind
+              <Input
+                value={kind}
+                maxLength={80}
+                autoFocus
+                onChange={(event) => setKind(event.currentTarget.value)}
+              />
+            </label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
+              Memory
+              <Input
+                value={content}
+                maxLength={20_000}
+                onChange={(event) => setContent(event.currentTarget.value)}
+              />
+            </label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              Expires
+              <Input
+                type="date"
+                value={expiresAt}
+                onChange={(event) => setExpiresAt(event.currentTarget.value)}
+              />
+            </label>
+          </div>
+        </ManagementDialog>
 
         <Section
           title="Saved memory"
           description="Explicit entries are user-authored. Inferred entries were consolidated from completed chats."
-          actions={<Input className="memory-search" aria-label="Search memory" placeholder="Search memory" value={query} onChange={(event) => setQuery(event.currentTarget.value)} />}
+          actions={
+            <Input
+              className="memory-search"
+              aria-label="Search memory"
+              placeholder="Search memory"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+          }
         >
-          {mutationError ? <p className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground" role="alert">{mutationError}</p> : null}
+          {mutationError ? (
+            <p
+              className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground"
+              role="alert"
+            >
+              {mutationError}
+            </p>
+          ) : null}
           {groups.length === 0 ? (
             <div className="memory-empty">
-              <strong>{query ? "No matching memories" : "Nothing saved yet"}</strong>
-              <span>{query ? "Try a different search." : "Add a preference or let Berry learn after completed chats."}</span>
+              <strong>
+                {query ? "No matching memories" : "Nothing saved yet"}
+              </strong>
+              <span>
+                {query
+                  ? "Try a different search."
+                  : "Add a preference or let Berry learn after completed chats."}
+              </span>
             </div>
           ) : (
             <div className="memory-groups">
               {groups.map((group) => (
-                <section key={group.kind} className="memory-group" aria-labelledby={`memory-kind-${group.kind}`}>
-                  <header><h3 id={`memory-kind-${group.kind}`}>{humanize(group.kind)}</h3><span>{group.items.length}</span></header>
+                <section
+                  key={group.kind}
+                  className="memory-group"
+                  aria-labelledby={`memory-kind-${group.kind}`}
+                >
+                  <header>
+                    <h3 id={`memory-kind-${group.kind}`}>
+                      {humanize(group.kind)}
+                    </h3>
+                    <span>{group.items.length}</span>
+                  </header>
                   <div className="memory-list">
                     {group.items.map((item) => (
                       <article key={item.id} className="memory-row">
                         <div className="memory-copy">
                           <p>{item.content}</p>
                           <div className="memory-meta">
-                            <StatusPill tone={item.explicit ? "info" : "neutral"}>{item.explicit ? "Explicit" : "Inferred"}</StatusPill>
-                            <span>{Math.round(item.confidence * 100)}% confidence</span>
+                            <StatusPill
+                              tone={item.explicit ? "info" : "neutral"}
+                            >
+                              {item.explicit ? "Explicit" : "Inferred"}
+                            </StatusPill>
+                            <span>
+                              {Math.round(item.confidence * 100)}% confidence
+                            </span>
                             <span>Last used {formatDate(item.lastUsedAt)}</span>
-                            {item.expiresAt ? <span>Expires {formatDate(item.expiresAt)}</span> : null}
-                            {item.sourceTaskId ? <a href={`/tasks/${encodeURIComponent(item.sourceTaskId)}`}>Source task</a> : null}
+                            {item.expiresAt ? (
+                              <span>Expires {formatDate(item.expiresAt)}</span>
+                            ) : null}
+                            {item.sourceTaskId ? (
+                              <a
+                                href={`/tasks/${encodeURIComponent(item.sourceTaskId)}`}
+                              >
+                                Source task
+                              </a>
+                            ) : null}
                           </div>
                         </div>
                         <div className="memory-actions">
-                          <Button variant="ghost" size="icon-sm" aria-label={`Edit ${item.content}`} onClick={() => openEdit(item)}><Pencil /></Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={`Edit ${item.content}`}
+                            onClick={() => openEdit(item)}
+                          >
+                            <Pencil />
+                          </Button>
                           {confirmForget === item.id ? (
                             <>
-                              <Button variant="ghost" size="sm" onClick={() => setConfirmForget(null)}>Keep</Button>
-                              <Button variant="destructive" size="sm" disabled={busy === `forget:${item.id}`} onClick={() => void forget(item.id)}>Forget</Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setConfirmForget(null)}
+                              >
+                                Keep
+                              </Button>
+                              <Button
+                                variant="destructive"
+                                size="sm"
+                                disabled={busy === `forget:${item.id}`}
+                                onClick={() => void forget(item.id)}
+                              >
+                                Forget
+                              </Button>
                             </>
                           ) : (
-                            <Button variant="ghost" size="icon-sm" aria-label={`Forget ${item.content}`} onClick={() => setConfirmForget(item.id)}><Trash2 /></Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={`Forget ${item.content}`}
+                              onClick={() => setConfirmForget(item.id)}
+                            >
+                              <Trash2 />
+                            </Button>
                           )}
                         </div>
                       </article>
@@ -305,19 +492,48 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
               ))}
             </div>
           )}
-          {data.nextCursor && !query ? <Button variant="outline" onClick={() => void loadMore()} disabled={busy === "more"}>Load more</Button> : null}
+          {data.nextCursor && !query ? (
+            <Button
+              variant="outline"
+              onClick={() => void loadMore()}
+              disabled={busy === "more"}
+            >
+              Load more
+            </Button>
+          ) : null}
           <div className="memory-clear">
             {confirmClear ? (
               <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
                 <strong>Forget all personal memory?</strong>
-                <span>This removes every active personal entry from recall while preserving the audit/version history.</span>
+                <span>
+                  This removes every active personal entry from recall while
+                  preserving the audit/version history.
+                </span>
                 <div className="flex flex-wrap justify-end gap-2">
-                  <Button variant="ghost" onClick={() => setConfirmClear(false)}>Cancel</Button>
-                  <Button variant="destructive" disabled={busy === "clear"} onClick={() => void clearAll()}>Forget all</Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => setConfirmClear(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    disabled={busy === "clear"}
+                    onClick={() => void clearAll()}
+                  >
+                    Forget all
+                  </Button>
                 </div>
               </div>
             ) : (
-              <Button variant="ghost" onClick={() => setConfirmClear(true)} disabled={data.items.length === 0}><Trash2 />Clear all personal memory</Button>
+              <Button
+                variant="ghost"
+                onClick={() => setConfirmClear(true)}
+                disabled={data.items.length === 0}
+              >
+                <Trash2 />
+                Clear all personal memory
+              </Button>
             )}
           </div>
         </Section>
@@ -336,7 +552,9 @@ function message(cause: unknown, fallback: string): string {
 }
 
 function downloadJson(value: unknown, name: string): void {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+  const url = URL.createObjectURL(
+    new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }),
+  );
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = name;
@@ -346,5 +564,12 @@ function downloadJson(value: unknown, name: string): void {
 
 export type MemoryClient = Pick<
   BerryApiClient,
-  "listMemories" | "memorySettings" | "updateMemorySettings" | "rememberMemory" | "updateMemory" | "forgetMemory" | "clearMemories" | "exportMemories"
+  | "listMemories"
+  | "memorySettings"
+  | "updateMemorySettings"
+  | "rememberMemory"
+  | "updateMemory"
+  | "forgetMemory"
+  | "clearMemories"
+  | "exportMemories"
 >;

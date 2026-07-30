@@ -1,0 +1,277 @@
+import React from "react"
+import { type Table } from "@tanstack/react-table"
+import { Button } from "@berry/desktop-ui/components/ui/button"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@berry/desktop-ui/components/ui/select"
+import { Input } from "@berry/desktop-ui/components/ui/input"
+import { ChevronLeft, ChevronRight } from "lucide-react"
+import { Skeleton } from "@berry/desktop-ui/components/ui/skeleton"
+
+export interface TablePaginationProps<TData> {
+  table: Table<TData>
+  pageSizeOptions?: number[]
+  defaultPageSize?: number
+  /**
+   * External loading state (e.g., from API)
+   */
+  isLoading?: boolean
+  /**
+   * External fetching state (e.g., from TanStack Query).
+   * Disables nav while a request is in flight so users can't advance the
+   * cursor before the next page resolves.
+   */
+  isFetching?: boolean
+  /**
+   * Explicitly disable the next page button.
+   * Useful when you want to prevent navigation during initial load but allow it during background fetching.
+   */
+  disableNextPage?: boolean
+  /**
+   * Explicitly disable the previous page button.
+   * Useful when you want to prevent navigation during initial load but allow it during background fetching.
+   */
+  disablePreviousPage?: boolean
+  /**
+   * Total count of items from server (for server-side pagination).
+   * If provided, this will be used instead of table.getFilteredRowModel().rows.length
+   */
+  totalCount?: number
+  onPageSizeChange?: (pageSize: number, pageIndex: number) => void
+  onPageChange?: (pageIndex: number) => void
+  onNextPage?: (pageIndex: number) => void
+  onPreviousPage?: (pageIndex: number) => void
+  /**
+   * Callback when pagination initialization is complete
+   */
+  onPaginationReady?: () => void
+}
+export function TablePagination<TData>({
+  table,
+  pageSizeOptions = [10, 25, 50, 100],
+  defaultPageSize = pageSizeOptions[0],
+  isLoading,
+  isFetching,
+  disableNextPage,
+  disablePreviousPage,
+  totalCount,
+  onPageSizeChange,
+  onPageChange,
+  onNextPage,
+  onPreviousPage,
+  onPaginationReady,
+}: TablePaginationProps<TData>) {
+  const resolvedDefaultPageSize = defaultPageSize ?? 10
+  const { pageIndex, pageSize } = table.getState().pagination
+
+  // Use totalCount if provided (server-side), otherwise use filtered row model (client-side)
+  const totalRows = totalCount ?? table.getFilteredRowModel().rows.length
+  const startItem = totalRows === 0 ? 0 : pageIndex * pageSize + 1
+  const endItem = Math.min((pageIndex + 1) * pageSize, totalRows)
+  const totalPages = table.getPageCount()
+  const currentPage = pageIndex + 1
+
+  const [pageInput, setPageInput] = React.useState<string | null>(null)
+  const displayValue = pageInput ?? currentPage.toString()
+
+  // Disable nav during any in-flight load (initial OR background fetch) so
+  // users can't advance the cursor while the next page is still resolving.
+  const canNextPage = table.getCanNextPage()
+  const isDisabled = isLoading || isFetching
+  const canGoNext = !disableNextPage && !isDisabled && canNextPage
+  const canGoPrevious =
+    !disablePreviousPage && !isDisabled && table.getCanPreviousPage()
+
+  // Set default page size on initial render
+  React.useEffect(() => {
+    if (pageSize !== resolvedDefaultPageSize) {
+      table.setPageSize(resolvedDefaultPageSize)
+    }
+    onPaginationReady?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handlePageSizeChange = React.useCallback(
+    // Base UI selects pass null on clear; Radix never does
+    (value: string | null) => {
+      if (!value) return
+      const newPageSize = Number(value)
+      const newPageIndex = Math.floor((pageIndex * pageSize) / newPageSize)
+      table.setPageSize(newPageSize)
+      onPageSizeChange?.(newPageSize, newPageIndex)
+    },
+    [table, pageIndex, pageSize, onPageSizeChange],
+  )
+
+  const handlePageInputChange = React.useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      setPageInput(e.target.value)
+    },
+    [],
+  )
+
+  const handlePageInputBlur = React.useCallback(() => {
+    const page = parseInt(pageInput ?? "", 10)
+    if (!Number.isNaN(page) && page >= 1 && page <= totalPages) {
+      const newPageIndex = page - 1
+      table.setPageIndex(newPageIndex)
+      onPageChange?.(newPageIndex)
+    }
+    setPageInput(null)
+  }, [pageInput, totalPages, table, onPageChange])
+
+  const handlePageInputKeyDown = React.useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Enter") {
+        e.currentTarget.blur()
+      }
+    },
+    [],
+  )
+
+  const handlePreviousPage = React.useCallback(() => {
+    const newPageIndex = pageIndex - 1
+    table.previousPage()
+    onPreviousPage?.(newPageIndex)
+  }, [table, pageIndex, onPreviousPage])
+
+  const handleNextPage = React.useCallback(() => {
+    const newPageIndex = pageIndex + 1
+    table.nextPage()
+    onNextPage?.(newPageIndex)
+  }, [table, pageIndex, onNextPage])
+
+  // Show loading skeleton while initializing
+  if (isLoading) {
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-2">
+        <div className="flex items-center space-x-2">
+          <Skeleton className="h-8 w-24" />
+          <Skeleton className="h-8 w-16" />
+        </div>
+        <Skeleton className="h-8 w-32" />
+        <div className="flex items-center space-x-4">
+          <div className="flex items-center space-x-2">
+            <Skeleton className="h-8 w-12" />
+            <Skeleton className="h-8 w-20" />
+          </div>
+          <div className="flex items-center space-x-1">
+            <Skeleton className="h-8 w-8" />
+            <Skeleton className="h-8 w-8" />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <nav
+      className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-2"
+      aria-label="Table pagination"
+    >
+      <div className="flex items-center space-x-2">
+        <span
+          className="text-sm whitespace-nowrap text-muted-foreground"
+          id="pagination-page-size-label"
+        >
+          Items per page
+        </span>
+        <Select
+          value={`${Number(pageSize) === 0 ? resolvedDefaultPageSize : Number(pageSize)}`}
+          onValueChange={handlePageSizeChange}
+          disabled={Boolean(isLoading)}
+        >
+          <SelectTrigger
+            size="sm"
+            className="w-16 focus:ring-0"
+            aria-label="Select page size"
+            aria-labelledby="pagination-page-size-label"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {pageSizeOptions?.map(size => (
+              <SelectItem key={size} value={`${size}`}>
+                {size}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div
+        className="flex-1 text-right text-sm whitespace-nowrap text-muted-foreground md:text-center"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {totalRows === 0
+          ? "0 items"
+          : `${startItem}-${endItem} of ${totalRows} items`}
+      </div>
+
+      <div className="ml-auto flex items-center space-x-4">
+        <div className="flex items-center space-x-2 text-sm text-muted-foreground">
+          <label htmlFor="page-number-input" className="sr-only">
+            Page number
+          </label>
+          <Input
+            id="page-number-input"
+            type="number"
+            min="1"
+            max={totalPages}
+            value={displayValue}
+            onChange={handlePageInputChange}
+            onBlur={handlePageInputBlur}
+            onKeyDown={handlePageInputKeyDown}
+            className="h-8 min-w-12 text-center"
+            style={{
+              width: `${Math.max(String(totalPages).length, 2) + 1}ch`,
+            }}
+            disabled={totalPages === 0 || isLoading || isFetching}
+            aria-label={`Page ${currentPage} of ${totalPages}`}
+          />
+          <span className="whitespace-nowrap" aria-hidden="true">
+            of {Math.max(1, totalPages)} pages
+          </span>
+        </div>
+
+        <div className="flex items-center space-x-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 p-0"
+            onClick={handlePreviousPage}
+            disabled={!canGoPrevious}
+            aria-label={`Go to previous page, page ${pageIndex}`}
+            title="Go to previous page"
+          >
+            <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 p-0"
+            onClick={handleNextPage}
+            disabled={!canGoNext}
+            aria-label={`Go to next page, page ${pageIndex + 2}`}
+            title="Go to next page"
+          >
+            <ChevronRight className="h-4 w-4" aria-hidden="true" />
+          </Button>
+        </div>
+      </div>
+    </nav>
+  )
+}
+
+/**
+ * @required displayName is required for auto feature detection
+ * @see "feature-detection.ts"
+ */
+
+TablePagination.displayName = "TablePagination"

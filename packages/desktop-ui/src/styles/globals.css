@@ -70,6 +70,27 @@
 
   --success: oklch(0.52 0.09 163);
   --warning: oklch(0.66 0.11 75);
+  --chart-background: var(--berry-bg);
+  --chart-foreground: var(--berry-text);
+  --chart-foreground-muted: var(--berry-text-secondary);
+  --chart-line-primary: var(--berry-accent);
+  --chart-line-secondary: var(--berry-text-tertiary);
+  --chart-crosshair: var(--berry-border-strong);
+  --chart-grid: var(--berry-border-subtle);
+  --chart-brush-border: var(--chart-grid);
+  --chart-tooltip-background: var(--popover);
+  --chart-tooltip-foreground: var(--popover-foreground);
+  --chart-tooltip-muted: var(--muted-foreground);
+  --chart-marker-background: var(--card);
+  --chart-marker-border: var(--border);
+  --chart-marker-foreground: var(--foreground);
+  --chart-label: var(--berry-text-secondary);
+  --chart-scale-01: oklch(0.98 0.003 106);
+  --chart-scale-02: oklch(0.92 0.008 106);
+  --chart-scale-03: oklch(0.82 0.015 106);
+  --chart-scale-04: oklch(0.68 0.02 106);
+  --chart-scale-05: oklch(0.55 0.025 106);
+  --chart-scale-pattern-color: oklch(0.96 0.005 106);
 }
 
 .dark {
@@ -108,13 +129,36 @@
 
   --success: oklch(0.7 0.1 163);
   --warning: oklch(0.75 0.11 78);
+  --chart-background: var(--berry-bg);
+  --chart-foreground: var(--berry-text);
+  --chart-foreground-muted: var(--berry-text-secondary);
+  --chart-line-primary: var(--berry-accent);
+  --chart-line-secondary: var(--berry-text-tertiary);
+  --chart-crosshair: var(--berry-border-strong);
+  --chart-grid: var(--berry-border-subtle);
+  --chart-brush-border: var(--chart-grid);
+  --chart-tooltip-background: var(--popover);
+  --chart-tooltip-foreground: var(--popover-foreground);
+  --chart-tooltip-muted: var(--muted-foreground);
+  --chart-marker-background: var(--card);
+  --chart-marker-border: var(--border);
+  --chart-marker-foreground: var(--foreground);
+  --chart-label: var(--berry-text-secondary);
+  --chart-scale-01: oklch(0.28 0.03 270);
+  --chart-scale-02: oklch(0.38 0.04 270);
+  --chart-scale-03: oklch(0.48 0.05 270);
+  --chart-scale-04: oklch(0.58 0.06 270);
+  --chart-scale-05: oklch(0.68 0.07 270);
+  --chart-scale-pattern-color: oklch(0.145 0 0);
 }
 
 @theme inline {
   /* Codex's main-text stack (SF Pro on macOS): the native system font. */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-serif: "Source Serif 4", "Times New Roman", Times, Georgia, serif;
-  --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-mono:
+    ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
 
   /* Berry type scale: denser than
      Tailwind defaults — text-base is 14px, sm 12px, xs 11px. */
@@ -170,6 +214,27 @@
   --color-sidebar-ring: var(--sidebar-ring);
   --color-success: var(--success);
   --color-warning: var(--warning);
+  --color-chart-scale-pattern-color: var(--chart-scale-pattern-color);
+  --color-chart-scale-05: var(--chart-scale-05);
+  --color-chart-scale-04: var(--chart-scale-04);
+  --color-chart-scale-03: var(--chart-scale-03);
+  --color-chart-scale-02: var(--chart-scale-02);
+  --color-chart-scale-01: var(--chart-scale-01);
+  --color-chart-label: var(--chart-label);
+  --color-chart-marker-foreground: var(--chart-marker-foreground);
+  --color-chart-marker-border: var(--chart-marker-border);
+  --color-chart-marker-background: var(--chart-marker-background);
+  --color-chart-tooltip-muted: var(--chart-tooltip-muted);
+  --color-chart-tooltip-foreground: var(--chart-tooltip-foreground);
+  --color-chart-tooltip-background: var(--chart-tooltip-background);
+  --color-chart-grid: var(--chart-grid);
+  --color-chart-crosshair: var(--chart-crosshair);
+  --color-chart-foreground-muted: var(--chart-foreground-muted);
+  --color-chart-foreground: var(--chart-foreground);
+  --color-chart-background: var(--chart-background);
+  --chart-brush-border: var(--chart-brush-border);
+  --chart-line-secondary: var(--chart-line-secondary);
+  --chart-line-primary: var(--chart-line-primary);
 }
 
 @layer base {
@@ -188,8 +253,10 @@
     /* Codex body weight: 445 on SF Pro's variable axis (rounds to 400 on
        fonts without a variable weight axis). */
     font-weight: 445;
+    font-synthesis: none;
     overscroll-behavior: none;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
   }
 }
