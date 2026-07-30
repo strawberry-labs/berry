@@ -1,5 +1,11 @@
 {
 	admin off
+	# Direct binary uploads intermittently stalled over HTTP/3 between Chromium
+	# and the MinIO reverse proxy. Keep the public edge on the mature HTTP/1.1
+	# and HTTP/2 paths until the QUIC upload path is proven safe.
+	servers {
+		protocols h1 h2
+	}
 }
 
 {$BERRY_DOMAIN} {

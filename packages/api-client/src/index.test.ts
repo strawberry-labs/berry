@@ -571,6 +571,37 @@ describe("BerryApiClient", () => {
     expect(Math.max(...progress)).toBe(6);
     expect(JSON.stringify(fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://api.berry.test")))).not.toContain("data:");
   });
+
+  it("times out stalled object-storage parts and aborts the multipart upload", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000111";
+    const uploadId = "00000000-0000-7000-8000-000000000112";
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/files/uploads")) {
+        return json({ fileId, uploadId, partSize: 5 * 1024 * 1024, partCount: 1, expiresAt: "2026-07-22T10:00:00.000Z" });
+      }
+      if (url.endsWith(`/v1/files/${fileId}/uploads/${uploadId}/parts`)) {
+        return json({ parts: [{ partNumber: 1, url: "https://files.berry.test/stalled-part" }] });
+      }
+      if (url === "https://files.berry.test/stalled-part") {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      if (url.endsWith(`/v1/files/${fileId}/uploads/${uploadId}`) && init?.method === "DELETE") return json({ ok: true });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.uploadFile(
+      new File([new Uint8Array([1, 2, 3])], "stalled.docx"),
+      { partTimeoutMs: 5 },
+    )).rejects.toThrow("File upload timed out. Check your connection and try again.");
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `https://api.berry.test/v1/files/${fileId}/uploads/${uploadId}`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
 });
 
 function json(body: unknown): Response {

@@ -48,6 +48,8 @@ describe("self-host compose deployment", () => {
     expect(caddyfile).toContain("not path /v1/sessions/*/events /v1/tasks/*/events");
     expect(caddyfile).toContain('Cache-Control "no-cache, no-transform"');
     expect(caddyfile).toContain("flush_interval -1");
+    expect(caddyfile).toContain("protocols h1 h2");
+    expect(compose).not.toContain('"443:443/udp"');
   });
 
   it("uses direct E2B in production while keeping Docker and Router seams available", () => {

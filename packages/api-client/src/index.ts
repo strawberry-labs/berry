@@ -749,7 +749,7 @@ export class BerryApiClient {
     return this.#request("/v1/files/uploads", MultipartUploadInitiateSchema, { method: "POST", body: input });
   }
 
-  async uploadFile(file: File, input: { taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference"; concurrency?: number; onProgress?: (progress: { uploadedBytes: number; totalBytes: number; ratio: number }) => void; signal?: AbortSignal } = {}): Promise<StoredFile> {
+  async uploadFile(file: File, input: { taskId?: string; sessionId?: string; workspaceId?: string; workspaceVisibility?: "project" | "task_only"; origin?: "user_upload" | "image_generation" | "browser_capture"; associationRole?: "input" | "output" | "reference"; concurrency?: number; partTimeoutMs?: number; onProgress?: (progress: { uploadedBytes: number; totalBytes: number; ratio: number }) => void; signal?: AbortSignal } = {}): Promise<StoredFile> {
     const upload = await this.initiateFileUpload({
       name: file.name,
       mediaType: file.type || "application/octet-stream",
@@ -772,6 +772,12 @@ export class BerryApiClient {
     let uploadedBytes = 0;
     let cursor = 0;
     const controller = new AbortController();
+    const requestedPartTimeoutMs = input.partTimeoutMs;
+    const partTimeoutMs = typeof requestedPartTimeoutMs === "number"
+      && Number.isFinite(requestedPartTimeoutMs)
+      && requestedPartTimeoutMs > 0
+      ? Math.floor(requestedPartTimeoutMs)
+      : 300_000;
     const abortFromCaller = () => controller.abort(input.signal?.reason);
     input.signal?.addEventListener("abort", abortFromCaller, { once: true });
     if (input.signal?.aborted) abortFromCaller();
@@ -781,7 +787,25 @@ export class BerryApiClient {
         if (controller.signal.aborted) throw new DOMException("Upload aborted", "AbortError");
         const start = (partNumber - 1) * upload.partSize;
         const end = Math.min(file.size, start + upload.partSize);
-        const response = await this.#fetch(urls.get(partNumber)!, { method: "PUT", body: file.slice(start, end), signal: controller.signal });
+        const partController = new AbortController();
+        const abortPart = () => partController.abort(controller.signal.reason);
+        const timeoutError = new Error("File upload timed out. Check your connection and try again.");
+        controller.signal.addEventListener("abort", abortPart, { once: true });
+        const timeout = globalThis.setTimeout(() => partController.abort(timeoutError), partTimeoutMs);
+        let response: Response;
+        try {
+          response = await this.#fetch(urls.get(partNumber)!, {
+            method: "PUT",
+            body: file.slice(start, end),
+            signal: partController.signal,
+          });
+        } catch (error) {
+          if (partController.signal.reason === timeoutError) throw timeoutError;
+          throw error;
+        } finally {
+          globalThis.clearTimeout(timeout);
+          controller.signal.removeEventListener("abort", abortPart);
+        }
         if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, await response.text());
         const etag = response.headers.get("etag");
         if (!etag) throw new Error("Object storage did not expose the ETag response header");
