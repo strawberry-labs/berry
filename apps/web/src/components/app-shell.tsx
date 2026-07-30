@@ -80,6 +80,61 @@ const TaskFileLibraryDialog = React.lazy(async () => ({
   default: (await import("./library/task-file-library-dialog")).TaskFileLibraryDialog,
 }));
 
+type StreamEvent = Parameters<typeof reduceStream>[1];
+
+export function reduceDurableTurnState(
+  previous: TurnState | undefined,
+  event: StreamEvent,
+): TurnState | null {
+  const turnId = event.kind === "turn.start" ? event.turnId : previous?.turnId ?? null;
+  if (!turnId) return null;
+  const base: TurnState = previous ?? {
+    active: true,
+    turnId,
+    bufferedEvents: [],
+    replayOnly: false,
+    owner: null,
+    runState: "queued",
+    waitingReason: null,
+    nextAction: null,
+    error: null,
+  };
+  if (event.kind === "turn.start") {
+    return { ...base, active: true, turnId, runState: "queued", nextAction: "Waiting for a worker slot", error: null };
+  }
+  if (event.kind === "message.start" || event.kind === "message.delta" || event.kind === "message.end") {
+    return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Generating a response" };
+  }
+  if (event.kind === "tool.start" || event.kind === "tool.update" || event.kind === "tool.end") {
+    return { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Running the current tool" };
+  }
+  if (event.kind === "approval.request") {
+    return { ...base, active: true, runState: "waiting", waitingReason: "approval", nextAction: "Review the pending action to continue" };
+  }
+  if (event.kind === "question.request") {
+    return { ...base, active: true, runState: "waiting", waitingReason: "user_input", nextAction: "Answer the question below to continue" };
+  }
+  if (event.kind === "approval.resolved" || event.kind === "question.answered") {
+    return { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Resuming the durable run" };
+  }
+  if (event.kind === "session.note" && event.note === "compacted") {
+    return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Continuing with compacted context" };
+  }
+  if (event.kind === "error") {
+    return { ...base, error: event.message };
+  }
+  if (event.kind === "turn.end") {
+    return {
+      ...base,
+      active: false,
+      runState: event.status,
+      waitingReason: null,
+      nextAction: null,
+    };
+  }
+  return base;
+}
+
 export interface ShellData {
   config: WebConfig;
   tasks: Task[];
@@ -633,49 +688,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const updateDurableStateFromEvent = React.useCallback((
     sessionId: string,
-    event: Parameters<typeof reduceStream>[1],
+    event: StreamEvent,
   ) => {
     setDurableStatesBySession((current) => {
-      const previous = current[sessionId];
-      const turnId = event.kind === "turn.start" ? event.turnId : previous?.turnId ?? null;
-      if (!turnId) return current;
-      const base: TurnState = previous ?? {
-        active: true,
-        turnId,
-        bufferedEvents: [],
-        replayOnly: false,
-        owner: null,
-        runState: "queued",
-        waitingReason: null,
-        nextAction: null,
-        error: null,
-      };
-      let next = base;
-      if (event.kind === "turn.start") {
-        next = { ...base, active: true, turnId, runState: "queued", nextAction: "Waiting for a worker slot", error: null };
-      } else if (event.kind === "message.start" || event.kind === "message.delta" || event.kind === "message.end") {
-        next = { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Generating a response" };
-      } else if (event.kind === "tool.start" || event.kind === "tool.update" || event.kind === "tool.end") {
-        next = { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Running the current tool" };
-      } else if (event.kind === "approval.request") {
-        next = { ...base, active: true, runState: "waiting", waitingReason: "approval", nextAction: "Review the pending action to continue" };
-      } else if (event.kind === "question.request") {
-        next = { ...base, active: true, runState: "waiting", waitingReason: "user_input", nextAction: "Answer the question below to continue" };
-      } else if (event.kind === "approval.resolved" || event.kind === "question.answered") {
-        next = { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Resuming the durable run" };
-      } else if (event.kind === "session.note" && event.note === "compacted") {
-        next = { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Continuing with compacted context" };
-      } else if (event.kind === "error") {
-        next = { ...base, error: event.message };
-      } else if (event.kind === "turn.end") {
-        next = {
-          ...base,
-          active: false,
-          runState: event.status,
-          waitingReason: null,
-          nextAction: null,
-        };
-      }
+      const next = reduceDurableTurnState(current[sessionId], event);
+      if (!next) return current;
       return { ...current, [sessionId]: next };
     });
   }, []);
@@ -886,7 +903,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       stopSessionConnection(sessionId);
       const error = cause instanceof Error ? cause : new Error("Unable to start the turn");
       updateSessionStream(sessionId, { kind: "error", message: error.message });
-      updateSessionStream(sessionId, { kind: "turn.end", turnId: `failed_${Date.now()}`, status: "failed" });
+      const terminalEvent = { kind: "turn.end", turnId: `failed_${Date.now()}`, status: "failed" } as const;
+      updateSessionStream(sessionId, terminalEvent);
+      updateDurableStateFromEvent(sessionId, terminalEvent);
       throw error;
     } finally {
       setStartingSessions((current) => {
@@ -895,7 +914,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         return next;
       });
     }
-  }, [applyDurableState, attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, stopSessionConnection, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -907,13 +926,19 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       }
       stopSessionConnection(sessionId);
       activeSessionsRef.current.delete(sessionId);
-      updateSessionStream(sessionId, { kind: "turn.end", turnId: streamsBySession[sessionId]?.turnId ?? `cancelled_${Date.now()}`, status: "cancelled" });
+      const terminalEvent = {
+        kind: "turn.end",
+        turnId: streamsBySession[sessionId]?.turnId ?? `cancelled_${Date.now()}`,
+        status: "cancelled",
+      } as const;
+      updateSessionStream(sessionId, terminalEvent);
+      updateDurableStateFromEvent(sessionId, terminalEvent);
       await refreshSessionMessages(sessionId);
       handleQueueTurnEndRef.current(sessionId, "cancelled");
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "Unable to stop the active turn");
     }
-  }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
+  }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateDurableStateFromEvent, updateSessionStream]);
 
   const recoverDurableTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;

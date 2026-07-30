@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
-import { initialCloudContent, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { initialCloudContent, reduceDurableTurnState, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 
 describe("cloud shell bootstrap", () => {
   it("does not issue live requests for fixture task and session identifiers", () => {
@@ -56,5 +56,21 @@ describe("cloud shell bootstrap", () => {
     expect(shouldShowComposerProjectSwitcher([])).toBe(true);
     expect(shouldShowComposerProjectSwitcher([{ role: "user" }])).toBe(false);
     expect(shouldShowComposerProjectSwitcher([{ role: "assistant" }])).toBe(false);
+  });
+
+  it("clears durable activity for manually terminated turns", () => {
+    const active = reduceDurableTurnState(undefined, { kind: "turn.start", turnId: "turn_1" });
+    expect(active).toMatchObject({ active: true, runState: "queued" });
+
+    const cancelled = reduceDurableTurnState(
+      active ?? undefined,
+      { kind: "turn.end", turnId: "turn_1", status: "cancelled" },
+    );
+    expect(cancelled).toMatchObject({
+      active: false,
+      runState: "cancelled",
+      waitingReason: null,
+      nextAction: null,
+    });
   });
 });
