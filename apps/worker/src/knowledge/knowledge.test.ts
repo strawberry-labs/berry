@@ -108,6 +108,19 @@ describe("knowledge ingestion and ranking", () => {
     expect(derivativeInsert?.sql).toContain("jsonb_build_object('contentHash', $6::text)");
   });
 
+  it("schedules a fresh extraction wake-up for every reindex request", async () => {
+    const executor = new FakeExecutor();
+    const repository = new SqlKnowledgeRepository(executor);
+
+    await repository.resetForReindex(tenantId, sourceId, "revision-1");
+    await repository.resetForReindex(tenantId, sourceId, "revision-1");
+
+    const wakeUps = executor.calls.filter((call) => call.sql.includes("INSERT INTO runtime_outbox"));
+    expect(wakeUps).toHaveLength(2);
+    expect(wakeUps[0]?.params[3]).not.toBe(wakeUps[1]?.params[3]);
+    expect(wakeUps.every((call) => String(call.params[3]).startsWith(`knowledge.extract:${sourceId}:revision-1:reindex-`))).toBe(true);
+  });
+
   it("writes large chunk and embedding sets in bounded SQL batches", async () => {
     class ExistingSourceExecutor extends FakeExecutor {
       override async query<T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> {

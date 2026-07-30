@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { redactSecrets } from "@berry/router-client";
 import type { TextChunk } from "./services.js";
 import type { SqlExecutor } from "../sql-repositories.js";
@@ -314,7 +314,7 @@ export class SqlKnowledgeRepository {
         WHERE tenant_id = $1::uuid AND id = $2::uuid
           AND source_revision = $3 AND tombstoned_at IS NULL
       `, [tenantId, sourceId, revision]);
-      await this.enqueue(executor, tenantId, "knowledge.extract", sourceId, revision, "reindex");
+      await this.enqueue(executor, tenantId, "knowledge.extract", sourceId, revision, `reindex-${randomUUID()}`);
     });
   }
 
