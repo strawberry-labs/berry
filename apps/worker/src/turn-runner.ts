@@ -33,6 +33,7 @@ import {
   type CompactionJobResult,
   type SessionCompactionRunner,
 } from "./compaction.js";
+import { durableAttachmentPrompt } from "./durable-attachments.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 const TERMINAL_STATES = new Set<TurnRunState>([
@@ -704,6 +705,10 @@ export class DurableTurnRunner {
           status: "failed",
           summary: "The tool outcome is ambiguous and requires operator review.",
         },
+        terminalAssistant: {
+          status: "failed",
+          error: "Something interrupted this response. Retry to continue.",
+        },
         error: "ambiguous_non_idempotent_tool",
         nextAction: "Review the tool outcome and choose retry, mark complete, or cancel",
         taskStatus: "failed",
@@ -830,7 +835,7 @@ export class DurableTurnRunner {
     try {
       result = await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
     } catch (error) {
-      if (error instanceof DurableTurnRetryableError || step.retryClass === "non_idempotent_manual") {
+      if (error instanceof DurableTurnRetryableError) {
         throw error;
       }
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000);
@@ -2685,7 +2690,18 @@ function contentText(value: unknown): string {
   if (!Array.isArray(value)) return "";
   return value.map((part) => {
     const item = record(part);
-    return typeof item?.text === "string" ? item.text : "";
+    if (typeof item?.text === "string") return item.text;
+    if (item?.type !== "attachment") return "";
+    const attachment = record(item.content);
+    const fileId = stringValue(attachment?.fileId);
+    const name = stringValue(attachment?.name);
+    if (!fileId || !name) return "";
+    return durableAttachmentPrompt({
+      fileId,
+      name,
+      mediaType: stringValue(attachment?.mediaType),
+      size: numberValue(attachment?.size),
+    });
   }).filter(Boolean).join("\n");
 }
 

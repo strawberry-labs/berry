@@ -915,25 +915,23 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     }
   }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateSessionStream]);
 
-  const recoverDurableTurn = React.useCallback(async (action: "retry" | "mark-complete" | "cancel") => {
+  const recoverDurableTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
     const runId = sessionId ? durableStatesBySession[sessionId]?.turnId : null;
     if (!client || !sessionId || !runId) throw new Error("The durable run is no longer available.");
-    const result = await client.recoverTurn(runId, action);
+    const result = await client.recoverTurn(runId, "retry");
     if (!result.ok) throw new Error("The recovery action was not accepted. Refresh the task and review its current state.");
     const state = await client.turnState(sessionId);
     applyDurableState(sessionId, state, state.active);
     if (state.active) {
       activeSessionsRef.current.add(sessionId);
       void attachSessionStream(sessionId).catch(() => undefined);
-      toast.success(action === "retry" ? "Tool retry queued" : "Run resumed");
       return;
     }
     activeSessionsRef.current.delete(sessionId);
     stopSessionConnection(sessionId);
     resetSessionStream(sessionId);
     await refreshSessionMessages(sessionId);
-    toast.success("Run cancelled");
   }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, client, durableStatesBySession, refreshSessionMessages, resetSessionStream, stopSessionConnection]);
 
   // Edit-and-resubmit: optimistically truncate the local thread at the edited
@@ -1855,21 +1853,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onEditGeneratedImage={editGeneratedImage}
               onRegenerateGeneratedImage={regenerateGeneratedImage}
               editTurn={activeTask.activeSessionId ? editTurn : undefined}
-              continueTurn={activeTask.activeSessionId ? continueTurn : undefined}
+              continueTurn={activeTask.activeSessionId
+                ? durableState?.runState === "recovery_required"
+                  ? recoverDurableTurn
+                  : continueTurn
+                : undefined}
+              recoveryRequired={durableState?.runState === "recovery_required"}
               cancelTurn={cancelTurn}
               onViewTaskFiles={() => setTaskFilesOpen(true)}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
             />
-            <DurableRunStatus
-              state={durableState}
-              onRecover={async (action) => {
-                try {
-                  await recoverDurableTurn(action);
-                } catch (cause) {
-                  toast.error(cause instanceof Error ? cause.message : "Unable to recover the durable run");
-                }
-              }}
-            />
+            <DurableRunStatus state={durableState} />
             <Composer
               config={config}
               activeTask={activeTask}

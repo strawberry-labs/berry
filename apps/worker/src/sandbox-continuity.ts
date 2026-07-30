@@ -16,6 +16,7 @@ import {
   type SandboxProvider,
 } from "@berry/sandbox-contract";
 import type { JsonValue } from "@berry/shared";
+import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import type {
@@ -48,8 +49,17 @@ interface SnapshotRecord {
   sequence: number;
 }
 
+interface SandboxInputFile {
+  fileId: string;
+  name: string;
+  mediaType: string;
+  sizeBytes: number;
+  objectKey: string;
+}
+
 export interface SandboxSnapshotRepository {
   loadRun(tenantId: string, runId: string): Promise<SnapshotRun>;
+  inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]>;
   latest(tenantId: string, runId: string): Promise<SnapshotRecord | null>;
   persist(input: {
     run: SnapshotRun;
@@ -70,6 +80,7 @@ export interface SandboxSnapshotRepository {
 export interface SandboxSnapshotObjectStore {
   put(key: string, body: Uint8Array): Promise<void>;
   get(key: string): Promise<Uint8Array>;
+  getSource(key: string): Promise<Uint8Array>;
 }
 
 export class SandboxContinuityManager implements DurableTurnToolExecutor {
@@ -222,6 +233,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         });
       }
     }
+    await this.stageInputFiles(snapshot, handle.sandbox_id);
     await this.repository.recordSandbox({
       tenantId: snapshot.tenantId,
       runId: snapshot.id,
@@ -230,6 +242,36 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       state: handle.status,
     });
     return { provider: handle.provider, id: handle.sandbox_id, state: handle.status };
+  }
+
+  private async stageInputFiles(snapshot: DurableTurnSnapshot, sandboxId: string): Promise<void> {
+    const files = await this.repository.inputFiles(snapshot.tenantId, snapshot.id);
+    if (files.length === 0) return;
+    if (!this.objects) throw new Error("Input file object storage is not configured");
+    for (const file of files) {
+      const bytes = await this.objects.getSource(file.objectKey);
+      if (bytes.byteLength !== file.sizeBytes) {
+        throw new Error(`Input file ${file.name} is incomplete`);
+      }
+      const path = durableAttachmentPath({ fileId: file.fileId, name: file.name });
+      for await (const event of this.provider.exec({
+        sandbox_id: sandboxId,
+        request_id: `${snapshot.id}:stage:${file.fileId}`,
+        command: ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))],
+        timeout_ms: 30_000,
+      })) {
+        if (event.kind === "error") throw new Error(event.message);
+        if (event.kind === "exit" && event.exit_code !== 0) {
+          throw new Error(`Unable to prepare the sandbox directory for ${file.name}`);
+        }
+      }
+      await this.provider.files.write({
+        sandbox_id: sandboxId,
+        path,
+        content: Buffer.from(bytes).toString("base64"),
+        encoding: "base64",
+      });
+    }
   }
 
   private async capture(sandboxId: string): Promise<SnapshotArchive> {
@@ -280,6 +322,30 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
       sandboxId: row.sandbox_id,
       sessionLeafId: row.session_leaf_id,
     };
+  }
+
+  async inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]> {
+    const rows = await this.executor.query<SandboxInputFileRow>(
+      `
+SELECT f.id AS file_id,f.display_name,f.media_type,f.size_bytes,f.object_key
+FROM turn_runs r
+JOIN file_associations a
+  ON a.tenant_id=r.tenant_id AND a.message_id=r.request_message_id AND a.role='input'
+JOIN files f
+  ON f.tenant_id=a.tenant_id AND f.id=a.file_id
+WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
+  AND f.status='available' AND f.deleted_at IS NULL
+ORDER BY a.created_at ASC,f.id ASC
+      `.trim(),
+      [tenantId, runId],
+    );
+    return rows.map((row) => ({
+      fileId: row.file_id,
+      name: row.display_name,
+      mediaType: row.media_type,
+      sizeBytes: Number(row.size_bytes),
+      objectKey: row.object_key,
+    }));
   }
 
   async latest(tenantId: string, runId: string): Promise<SnapshotRecord | null> {
@@ -394,6 +460,15 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
       Key: `${this.prefix}/${key}`,
     }));
     if (!result.Body) throw new Error("Sandbox snapshot object has no body");
+    return result.Body.transformToByteArray();
+  }
+
+  async getSource(key: string): Promise<Uint8Array> {
+    const result = await this.client.send(new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    }));
+    if (!result.Body) throw new Error("Input file object has no body");
     return result.Body.transformToByteArray();
   }
 }
@@ -557,4 +632,12 @@ interface SnapshotRow {
   object_key: string;
   content_hash: string;
   sequence: number | string;
+}
+
+interface SandboxInputFileRow {
+  file_id: string;
+  display_name: string;
+  media_type: string;
+  size_bytes: number | string;
+  object_key: string;
 }

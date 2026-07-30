@@ -18,7 +18,7 @@ function state(patch: Partial<TurnState>): TurnState {
 }
 
 describe("runPresentation", () => {
-  it("shows explicit recovery actions only for ambiguous non-idempotent work", () => {
+  it("keeps recovery errors out of the global status area", () => {
     const view = runPresentation(state({
       active: false,
       owner: null,
@@ -26,14 +26,12 @@ describe("runPresentation", () => {
       error: "The tool result is ambiguous.",
     }));
 
-    expect(view.label).toBe("Recovery required");
-    expect(view.recoveryActions).toEqual(["retry", "mark-complete", "cancel"]);
+    expect(view.visible).toBe(false);
   });
 
   it("shows waiting states that require user action", () => {
     expect(runPresentation(state({ runState: "waiting", waitingReason: "user_input" }))).toMatchObject({
       label: "Waiting for your answer",
-      recoveryActions: [],
     });
   });
 

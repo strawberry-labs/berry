@@ -330,9 +330,11 @@ describe("DurableTurnService", () => {
 
   it("continues model execution after an operator marks an ambiguous tool call complete", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const queries: string[] = [];
     const executor: SqlExecutor = {
       execute: async (sql, params = []) => { executions.push({ sql, params }); },
       query: async <T>(sql: string) => {
+        queries.push(sql);
         if (sql.includes("FROM turn_runs r JOIN tasks")) {
           return [{
             id: runId,
@@ -342,6 +344,7 @@ describe("DurableTurnService", () => {
             tool_call_step_id: stepId,
             tool_call_name: "mcp__BerryCrawl__search",
             tool_call_input: { query: "today's AI news" },
+            version: 3,
           }] as T[];
         }
         if (sql.includes("FROM session_entries") && sql.includes("is_leaf_marker=true")) {
@@ -372,5 +375,6 @@ describe("DurableTurnService", () => {
       sql.startsWith("UPDATE turn_runs") && sql.includes("state='calling_model'")
     )).toBe(true);
     expect(executions.some(({ sql }) => sql.includes("'turn.resume'"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("FOR UPDATE OF r"))).toBe(true);
   });
 });

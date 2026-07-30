@@ -120,6 +120,10 @@ export interface BerryThreadViewProps {
   showQuestions?: boolean;
   /** Show the elapsed turn clock before the provider emits its first work item. */
   showPendingTurnActivity?: boolean;
+  /** Host-owned fallback for an interrupted latest turn not yet projected as a message part. */
+  latestTurnError?: string;
+  /** Allow the host to expose retry for a durable recovery state on older projections. */
+  forceContinuableLatestTurn?: boolean;
   /** Native desktop keeps the rail 16px from its window edge; web uses 12px. */
   navigatorInset?: number;
   adapter?: BerryThreadAdapter;
@@ -143,6 +147,8 @@ export function BerryThreadView({
   showTodos = true,
   showQuestions = true,
   showPendingTurnActivity = false,
+  latestTurnError,
+  forceContinuableLatestTurn = false,
   navigatorInset = 12,
   adapter = {},
 }: BerryThreadViewProps) {
@@ -300,10 +306,13 @@ export function BerryThreadView({
                       adapter={adapter}
                       writingBlockParts={writingBlockParts}
                       conversationImageParts={conversationImageParts}
+                      {...(groupIndex === renderedTurnGroups.length - 1 && latestTurnError
+                        ? { inlineError: latestTurnError }
+                        : {})}
                       canContinue={
                         groupIndex === renderedTurnGroups.length - 1
                         && !stream.turnActive
-                        && isContinuableAssistantTurn(group.assistants)
+                        && (forceContinuableLatestTurn || isContinuableAssistantTurn(group.assistants))
                       }
                     />
                   </MessageScrollerItem>
@@ -507,6 +516,7 @@ function BerryAssistantTurnGroup({
   density,
   adapter,
   canContinue,
+  inlineError,
   writingBlockParts,
   conversationImageParts,
 }: {
@@ -517,6 +527,7 @@ function BerryAssistantTurnGroup({
   density: "full" | "compact";
   adapter: BerryThreadAdapter;
   canContinue: boolean;
+  inlineError?: string;
   writingBlockParts: Map<string, MessageDraftPartResolution>;
   conversationImageParts: MessagePart[];
 }) {
@@ -642,6 +653,9 @@ function BerryAssistantTurnGroup({
         {artifacts.length > 0 ? (
           <BerryTurnArtifacts artifacts={artifacts} adapter={adapter} />
         ) : null}
+        {inlineError && !merged.some((segment) => segment.kind === "error") ? (
+          <BerryAssistantErrorBlock>{inlineError}</BerryAssistantErrorBlock>
+        ) : null}
         {canContinue && adapter.onContinueInterruptedTurn ? (
           <BerryContinueInterruptedTurn onContinue={adapter.onContinueInterruptedTurn} />
         ) : null}
@@ -710,7 +724,7 @@ function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void |
     try {
       await onContinue();
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to continue this turn");
+      toast.error(cause instanceof Error ? cause.message : "Unable to retry this turn");
       setContinuing(false);
     }
   };
@@ -722,15 +736,15 @@ function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void |
     >
       <Button
         type="button"
-        variant="outline"
-        size="lg"
-        aria-label="Continue from existing work"
+        variant="ghost"
+        size="sm"
+        aria-label="Retry this response"
         disabled={continuing}
         onClick={() => void continueTurn()}
-        className="h-10 rounded-xl border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-3 text-[13px] text-[var(--berry-text-primary)] shadow-none hover:bg-[var(--berry-hover)] active:scale-[0.96]"
+        className="h-10 rounded-lg px-2.5 text-[12px] text-[var(--berry-text-secondary)] shadow-none transition-[background-color,color,scale] hover:bg-[var(--berry-hover)] hover:text-[var(--berry-text-primary)] active:scale-[0.96]"
       >
         <RefreshCw className={cn("size-3.5", continuing && "animate-spin motion-reduce:animate-none")} />
-        {continuing ? "Continuing…" : "Continue"}
+        {continuing ? "Retrying…" : "Retry"}
       </Button>
     </div>
   );
@@ -838,7 +852,7 @@ export function BerryAssistantMarkdownBlock({ children, live = false }: { childr
 
 export function BerryAssistantErrorBlock({ children }: { children: string }) {
   return (
-    <div className="max-w-[1360px] rounded-[14px] bg-destructive/10 px-3.5 py-3 text-sm text-destructive shadow-[var(--berry-ring-subtle)]">
+    <div role="alert" className="max-w-[980px] text-[13px] leading-5 text-destructive">
       {children}
     </div>
   );

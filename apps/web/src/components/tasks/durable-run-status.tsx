@@ -1,73 +1,43 @@
 import * as React from "react";
 import type { TurnState } from "@berry/shared";
-import { AlertTriangle, CheckCircle2, Clock3, RotateCcw, Square } from "lucide-react";
-import { Button } from "@berry/desktop-ui/components/ui/button";
+import { Clock3 } from "lucide-react";
 
 export type RunPresentation = {
   visible: boolean;
   label: string;
   detail: string;
-  tone: "neutral" | "warning" | "danger";
-  recoveryActions: Array<"retry" | "mark-complete" | "cancel">;
+  tone: "neutral" | "warning";
 };
 
 export function runPresentation(
   state: TurnState | null | undefined,
 ): RunPresentation {
-  if (!state?.turnId) return { visible: false, label: "", detail: "", tone: "neutral", recoveryActions: [] };
-  if (state.runState === "recovery_required") {
-    return {
-      visible: true,
-      label: "Recovery required",
-      detail: state.error ?? "A non-idempotent action may have completed before the worker stopped. Review the result before continuing.",
-      tone: "danger",
-      recoveryActions: ["retry", "mark-complete", "cancel"],
-    };
+  if (!state?.turnId || !state.active) {
+    return { visible: false, label: "", detail: "", tone: "neutral" };
   }
-  if (!state.active) return { visible: false, label: "", detail: "", tone: "neutral", recoveryActions: [] };
   if (state.runState === "waiting") {
     const userInput = state.waitingReason === "user_input";
     return {
       visible: true,
       label: userInput ? "Waiting for your answer" : "Waiting for approval",
-      detail: state.nextAction ?? (userInput ? "Answer the question below to continue." : "Review the pending action to continue."),
+      detail: state.nextAction ?? (userInput
+        ? "Answer the question below to continue."
+        : "Review the pending action to continue."),
       tone: "warning",
-      recoveryActions: [],
     };
   }
-  return { visible: false, label: "", detail: "", tone: "neutral", recoveryActions: [] };
+  return { visible: false, label: "", detail: "", tone: "neutral" };
 }
 
-export function DurableRunStatus({
-  state,
-  onRecover,
-}: {
+export function DurableRunStatus({ state }: {
   state: TurnState | null | undefined;
-  onRecover: (action: "retry" | "mark-complete" | "cancel") => Promise<void>;
 }) {
   const view = runPresentation(state);
-  const [pending, setPending] = React.useState<string | null>(null);
   if (!view.visible) return null;
-  const Icon = view.tone === "danger" ? AlertTriangle : Clock3;
-  const recover = async (action: "retry" | "mark-complete" | "cancel") => {
-    setPending(action);
-    try {
-      await onRecover(action);
-    } finally {
-      setPending(null);
-    }
-  };
   return (
     <aside className="durable-run-status" data-tone={view.tone} role="status" aria-live="polite">
-      <Icon aria-hidden="true" />
+      <Clock3 aria-hidden="true" />
       <div><strong>{view.label}</strong><span>{view.detail}</span></div>
-      {view.recoveryActions.length > 0 ? (
-        <div className="durable-run-actions">
-          <Button size="sm" variant="outline" disabled={pending !== null} onClick={() => void recover("retry")}><RotateCcw />Retry tool</Button>
-          <Button size="sm" disabled={pending !== null} onClick={() => void recover("mark-complete")}><CheckCircle2 />Mark complete</Button>
-          <Button size="sm" variant="ghost" disabled={pending !== null} onClick={() => void recover("cancel")}><Square />Cancel run</Button>
-        </div>
-      ) : null}
     </aside>
   );
 }

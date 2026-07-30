@@ -68,7 +68,11 @@ describe("E2BSandboxProvider", () => {
     expect(second.sandbox_id).toBe(first.sandbox_id);
     expect(file.content).toBe("durable");
     expect(client.connectCount).toBeGreaterThan(0);
-    expect(client.lastCreate?.options.network).toEqual({ allowPublicTraffic: false, allowOut: ["registry.npmjs.org"] });
+    expect(client.lastCreate?.options.network).toEqual({
+      allowPublicTraffic: false,
+      allowOut: ["registry.npmjs.org"],
+      denyOut: ["0.0.0.0/0"],
+    });
   });
 
   it("does not reuse a sandbox from an older template or workspace root", async () => {

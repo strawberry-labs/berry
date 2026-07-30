@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import {
+  ALL_TRAFFIC,
   Sandbox,
   SandboxNotFoundError,
   type SandboxApiOpts,
@@ -615,7 +616,13 @@ function networkOptions(egress: "on" | "off" | "unrestricted", allowedDomains: s
   denyOut?: string[] | undefined;
 } {
   if (egress === "off") return { allowPublicTraffic: false, denyOut: ["0.0.0.0/0"] };
-  if (allowedDomains.length > 0) return { allowPublicTraffic: false, allowOut: allowedDomains };
+  if (allowedDomains.length > 0) {
+    return {
+      allowPublicTraffic: false,
+      allowOut: allowedDomains,
+      denyOut: [ALL_TRAFFIC],
+    };
+  }
   return { allowPublicTraffic: false };
 }
 

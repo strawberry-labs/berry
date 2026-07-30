@@ -1051,11 +1051,12 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
         tool_call_step_id: string | null;
         tool_call_name: string | null;
         tool_call_input: unknown;
+        version: number | string;
       }>(
         `
 SELECT r.id,r.session_id,r.task_id,tc.id AS tool_call_id,
        tc.step_id AS tool_call_step_id,tc.tool_name AS tool_call_name,
-       tc.input AS tool_call_input
+       tc.input AS tool_call_input,r.version
 FROM turn_runs r JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
 LEFT JOIN LATERAL (
   SELECT id,step_id,tool_name,input FROM tool_calls
@@ -1064,7 +1065,7 @@ LEFT JOIN LATERAL (
 ) tc ON true
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid AND t.user_id=$3::uuid
   AND r.state='recovery_required'
-FOR UPDATE
+FOR UPDATE OF r
         `.trim(),
         [tenantId, runId, userId],
       );
@@ -1251,7 +1252,7 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed'
           `
 UPDATE turn_runs
 SET state='executing_tool',error=NULL,next_action='Retry tool after explicit operator confirmation',
-    completed_at=NULL,updated_at=now()
+    completed_at=NULL,version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
           `.trim(),
           [tenantId, runId],
@@ -1294,7 +1295,7 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
         [
           tenantId,
           runId,
-          `${runId}:operator:${action}`,
+          `${runId}:operator:${action}:${Number(recovered.version) + 1}`,
           JSON.stringify({ tenantId, runId, reason: "operator-recovery" }),
         ],
       );

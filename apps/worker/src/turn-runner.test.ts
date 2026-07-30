@@ -218,6 +218,24 @@ describe("durable turn runner", () => {
     )).toBe(true);
   });
 
+  it("feeds a known non-idempotent tool exception back to the model", async () => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => { throw new Error("Command exited with 2: file not found"); },
+    }, { owner: "worker-command-failure" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({
+      state: "calling_model",
+    });
+    expect(repository.current.state).toBe("calling_model");
+    expect(repository.current.error).toBeNull();
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "failed",
+      error: "Command exited with 2: file not found",
+    });
+  });
+
   it("settles a denied tool and continues the remaining tool calls", async () => {
     const denied = toolStep("pending", "idempotent", true);
     const remaining = { ...toolStep("pending", "read_only", false), id: randomUUID(), sequence: 2 };
@@ -308,8 +326,27 @@ describe("durable turn runner", () => {
       }),
     });
     const deltas: Array<{ delta: string; channel: "text" | "reasoning" }> = [];
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.entries[0]!.payload = {
+      type: "message",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "Compare the CVs" },
+          {
+            type: "attachment",
+            content: {
+              fileId: "00000000-0000-7000-8000-000000000099",
+              name: "candidate.pdf",
+              mediaType: "application/pdf",
+              size: 2048,
+            },
+          },
+        ],
+      },
+    };
     const result = await model.call(
-      snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]),
+      current,
       modelStep("pending", 1),
       {
         messageId: randomUUID(),
@@ -331,6 +368,9 @@ describe("durable turn runner", () => {
     );
 
     expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
+    expect(request?.messages.find((message) => message.role === "user")?.content).toContain(
+      "Sandbox path: /workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
+    );
     expect(deltas.filter((item) => item.channel === "text").map((item) => item.delta).join("")).toBe("Searching");
     expect(deltas.filter((item) => item.channel === "reasoning").map((item) => item.delta).join("")).toBe("Need current sources.");
     expect(result).toMatchObject({
