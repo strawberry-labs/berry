@@ -19,6 +19,7 @@ import { FilePlatformService } from "../../api/dist/files/file-platform.service.
 import { DurableTurnService } from "../../api/dist/runtime/durable-turn.service.js";
 import { PgSqlExecutor as WorkerPgSqlExecutor } from "../dist/pg-executor.js";
 import { RuntimeOutboxDispatcher } from "../dist/outbox.js";
+import { SqlSandboxSnapshotRepository } from "../dist/sandbox-continuity.js";
 import { DurableTurnRunner, SqlDurableTurnRepository } from "../dist/turn-runner.js";
 
 const required = (name) => {
@@ -389,6 +390,38 @@ async function verifyUploadSizeEnforcement() {
     [ids.tenantA, indexedSource.rows[0]?.knowledge_source_id],
   );
   assert.equal(extractionWake.rowCount, 1);
+
+  const requestMessageId = randomUUID();
+  const stagingRunId = randomUUID();
+  await admin.query(
+    `INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+     VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'user','complete')`,
+    [requestMessageId, ids.tenantA, ids.session, ids.task],
+  );
+  await admin.query(
+    `INSERT INTO file_associations (
+       tenant_id,file_id,task_id,session_id,message_id,role,created_by_user_id
+     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,'input',$6::uuid)`,
+    [ids.tenantA, valid.fileId, ids.task, ids.session, requestMessageId, ids.user],
+  );
+  await admin.query(
+    `INSERT INTO turn_runs (
+       id,tenant_id,user_id,workspace_id,task_id,session_id,request_message_id,state
+     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7::uuid,'completed')`,
+    [stagingRunId, ids.tenantA, ids.user, ids.workspace, ids.task, ids.session, requestMessageId],
+  );
+  const sandboxRepository = new SqlSandboxSnapshotRepository(workerExecutor);
+  const stagedInputs = await workerExecutor.runWithTenant(
+    ids.tenantA,
+    () => sandboxRepository.inputFiles(ids.tenantA, stagingRunId),
+  );
+  assert.deepEqual(stagedInputs, [{
+    fileId: valid.fileId,
+    name: "valid.txt",
+    mediaType: "text/plain",
+    sizeBytes: 5,
+    objectKey: validStorage.objectKey,
+  }]);
 
   const mismatch = await service.initiateUpload(ids.tenantA, ids.user, {
     name: "mismatch.txt",

@@ -391,7 +391,13 @@ JOIN file_associations a
 JOIN files f
   ON f.tenant_id=a.tenant_id AND f.id=a.file_id
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
-  AND f.status='available' AND f.deleted_at IS NULL
+  AND f.status IN ('processing', 'available', 'failed')
+  AND f.deleted_at IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM file_uploads u
+    WHERE u.tenant_id=f.tenant_id AND u.file_id=f.id AND u.status='completed'
+  )
 ORDER BY a.created_at ASC,f.id ASC
       `.trim(),
       [tenantId, runId],
