@@ -8,6 +8,75 @@ import {
 import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 
 describe("SandboxContinuityManager", () => {
+  it("executes every sandbox-backed durable tool contract", async () => {
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({
+        sandbox_id: "sandbox-contract",
+        provider: "e2b",
+        status: "running",
+      })),
+      exec: async function* () {
+        yield { kind: "stdout", data: "command output" };
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
+      files: {
+        read: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          content: "file contents",
+          size_bytes: 13,
+        })),
+        write: vi.fn(async (input: { path: string; content: string }) => ({
+          path: input.path,
+          size_bytes: Buffer.byteLength(input.content),
+          mtime: null,
+        })),
+        list: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          entries: [{
+            path: `${input.path}/file.txt`,
+            type: "file",
+            size_bytes: 13,
+            mtime: null,
+          }],
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, {
+      image: "berry-sandbox",
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read_file", {
+      path: "/workspace/file.txt",
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace/file.txt", content: "file contents" },
+    });
+    await expect(manager.execute(snapshot(), toolStep("list_files", {
+      path: "/workspace",
+      recursive: true,
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace", entries: [expect.objectContaining({ type: "file" })] },
+    });
+    await expect(manager.execute(snapshot(), toolStep("write_file", {
+      path: "/workspace/result.txt",
+      content: "done",
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace/result.txt", sizeBytes: 4 },
+    });
+    await expect(manager.execute(snapshot(), toolStep("run_command", {
+      command: "printf done",
+    }))).resolves.toMatchObject({
+      output: { command: "printf done", exitCode: 0, output: "command output" },
+    });
+  });
+
   it("stages message-associated input files before the first tool runs", async () => {
     const staged = new Map<string, Uint8Array[]>();
     const provider = {
@@ -97,6 +166,24 @@ function listFilesStep(): DurableTurnStep {
     type: "tool.list_files",
     state: "pending",
     input: { toolName: "list_files", arguments: { path: "/workspace", recursive: true } },
+    output: null,
+    retryClass: "read_only",
+    idempotencyKey: null,
+    attempt: 0,
+    error: null,
+  };
+}
+
+function toolStep(name: string, argumentsValue: Record<string, unknown>): DurableTurnStep {
+  return {
+    id: "00000000-0000-7000-8000-000000000010",
+    sequence: 1,
+    type: `tool.${name}`,
+    state: "pending",
+    input: {
+      toolName: name,
+      arguments: argumentsValue,
+    },
     output: null,
     retryClass: "read_only",
     idempotencyKey: null,

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   AgentStreamEventSchema,
   latestAssistantStreamDraft,
+  MessageDraftSchema,
   PromptManifestSchema,
   SessionCheckpointV2Schema,
   type AgentStreamEvent,
@@ -145,12 +146,6 @@ export interface DurableTurnMutation {
       id: string;
       name: string;
       input: JsonValue;
-    }>;
-    citations?: ReadonlyArray<{
-      sourceId: string;
-      chunkId: string | null;
-      label: string;
-      href: string | null;
     }>;
   };
   terminalAssistant?: {
@@ -563,7 +558,6 @@ export class DurableTurnRunner {
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
         generationMs: Math.max(1, Date.now() - modelStartedAt),
-        citations: groundingCitations(snapshot.groundingContext),
         toolCalls: result.toolCalls.map((call) => ({
           id: call.id,
           name: call.name,
@@ -852,7 +846,8 @@ export class DurableTurnRunner {
     const toolStartedAt = Date.now();
     let result: TurnToolResult;
     try {
-      result = await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
+      result = builtInPresentationToolResult(toolName, step.input.arguments)
+        ?? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
     } catch (error) {
       if (error instanceof DurableTurnRetryableError) {
         throw error;
@@ -1924,7 +1919,12 @@ function durableToolPolicy(name: string, permissionMode: string): {
   requiresApproval: boolean;
   approvalKind: NonNullable<TurnModelToolIntent["approvalKind"]>;
 } {
-  if (name === "read_file" || name === "list_files" || name === "ask_user_question") {
+  if (
+    name === "read_file"
+    || name === "list_files"
+    || name === "ask_user_question"
+    || name === "compose_message"
+  ) {
     return { retryClass: "read_only", requiresApproval: false, approvalKind: "file-edit" };
   }
   if (name === "write_file") {
@@ -1974,24 +1974,15 @@ function durableQuestionItems(value: unknown): DurableQuestionItem[] {
   return (batch.length > 0 ? batch : legacy ? [legacy] : []).slice(0, 5);
 }
 
-function groundingCitations(
-  grounding: Record<string, unknown>,
-): Array<{ sourceId: string; chunkId: string | null; label: string; href: string | null }> {
-  if (!Array.isArray(grounding.citations)) return [];
-  const seen = new Set<string>();
-  return grounding.citations.flatMap((raw) => {
-    const citation = record(raw);
-    const sourceId = stringValue(citation?.sourceId);
-    const label = stringValue(citation?.label);
-    if (!sourceId || !label || seen.has(sourceId)) return [];
-    seen.add(sourceId);
-    return [{
-      sourceId,
-      chunkId: stringValue(citation?.chunkId),
-      label: label.slice(0, 500),
-      href: stringValue(citation?.href),
-    }];
-  }).slice(0, 12);
+function builtInPresentationToolResult(name: string, value: unknown): TurnToolResult | undefined {
+  if (name !== "compose_message") return undefined;
+  const draft = MessageDraftSchema.parse(value);
+  const noun = draft.kind === "email" ? "email" : "message";
+  const summary = `Prepared ${draft.variants.length} ${noun} ${draft.variants.length === 1 ? "draft" : "drafts"} in an editable writing block.`;
+  return {
+    output: JSON.parse(JSON.stringify({ text: summary, draft })) as JsonValue,
+    summary,
+  };
 }
 
 const DURABLE_STABLE_SYSTEM_PROMPT = [
@@ -2000,6 +1991,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "Use the tools declared for this turn when workspace inspection, changes, or current information are required.",
   "For requests about current web information, call an available MCP research or search tool before answering. Never claim browsing is unavailable when a relevant tool is declared.",
   "When the user explicitly asks you to remember or forget a durable personal fact or preference, call remember_memory or forget_memory when that tool is declared. Confirm the change only after the tool succeeds.",
+  "When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call compose_message so it renders as an editable writing block. Use one variant unless genuinely different strategies are useful, reuse the same draft id for revisions, and do not repeat the draft body in prose after the tool succeeds.",
   "Explain the final result clearly.",
 ].join("\n\n");
 
@@ -2153,6 +2145,69 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
             },
           },
           multi: { type: "boolean" },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "compose_message",
+      description: "Render an email, SMS, Slack/LinkedIn-style message, or other drafted text as an editable writing block in the conversation. Use a stable id and reuse it when revising the same draft.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "kind", "variants"],
+        properties: {
+          id: {
+            type: "string",
+            minLength: 1,
+            maxLength: 128,
+            description: "Stable artifact id; reuse this exact id for follow-up revisions",
+          },
+          kind: {
+            type: "string",
+            enum: ["email", "textMessage", "other"],
+            description: "Message channel; controls subject and launch actions",
+          },
+          summaryTitle: {
+            type: "string",
+            minLength: 1,
+            maxLength: 120,
+            description: "Short title for the draft",
+          },
+          variants: {
+            type: "array",
+            minItems: 1,
+            maxItems: 6,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["label", "body"],
+              properties: {
+                label: {
+                  type: "string",
+                  minLength: 1,
+                  maxLength: 80,
+                  description: "A concise, goal-oriented 2–4 word label",
+                },
+                body: {
+                  type: "string",
+                  maxLength: 100_000,
+                  description: "Complete message body",
+                },
+                subject: {
+                  type: "string",
+                  maxLength: 1_000,
+                  description: "Email subject; omit for non-email drafts",
+                },
+                active: {
+                  type: "boolean",
+                  description: "Select this variant initially",
+                },
+              },
+            },
+          },
         },
       },
     },
@@ -2517,17 +2572,6 @@ ON CONFLICT (message_id,ordinal) DO NOTHING
         }),
         ordinal,
       ],
-    );
-    ordinal += 1;
-  }
-  for (const citation of message.citations ?? []) {
-    await executor.execute(
-      `
-INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
-VALUES ($1::uuid,$2::uuid,'citation',$3::jsonb,$4)
-ON CONFLICT (message_id,ordinal) DO NOTHING
-      `.trim(),
-      [snapshot.tenantId, message.id, JSON.stringify(citation), ordinal],
     );
     ordinal += 1;
   }

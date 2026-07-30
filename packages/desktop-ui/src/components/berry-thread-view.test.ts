@@ -110,3 +110,33 @@ describe("structured writing block projection", () => {
     ]);
   });
 });
+
+describe("citation projection", () => {
+  it("omits legacy citation parts from the conversation UI", () => {
+    const message = assistant("complete", "assistant_with_sources");
+    message.parts = [
+      {
+        ...message.parts[0]!,
+        id: "answer_part",
+        kind: "text",
+        content: "Grounded answer",
+      },
+      {
+        ...message.parts[0]!,
+        id: "citation_part",
+        kind: "citation",
+        position: 1,
+        content: {
+          sourceId: "source_1",
+          chunkId: "chunk_1",
+          label: "Internal document, page 1",
+          href: "/v1/files/source_1",
+        },
+      },
+    ];
+
+    expect(partitionAssistantParts(message.parts).segments).toEqual([
+      expect.objectContaining({ kind: "text", text: "Grounded answer" }),
+    ]);
+  });
+});

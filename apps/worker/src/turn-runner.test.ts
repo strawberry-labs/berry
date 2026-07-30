@@ -236,6 +236,91 @@ describe("durable turn runner", () => {
     });
   });
 
+  it("advertises compose_message as a no-approval presentation tool", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let composePolicy: unknown;
+    let toolNames: string[] = [];
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        toolNames = context.tools.map((tool) => tool.function.name);
+        composePolicy = context.policyForTool("compose_message");
+        return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-compose-definition" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+
+    expect(toolNames).toEqual([
+      "ask_user_question",
+      "compose_message",
+      "read_file",
+      "list_files",
+      "write_file",
+      "run_command",
+    ]);
+    expect(composePolicy).toEqual({
+      retryClass: "read_only",
+      requiresApproval: false,
+      approvalKind: "file-edit",
+    });
+  });
+
+  it("executes compose_message inside the durable runner and persists its editable draft", async () => {
+    const draftStep = {
+      ...toolStep("pending", "read_only", false),
+      type: "tool.compose_message",
+      input: {
+        toolCallId: "compose_call_1",
+        toolName: "compose_message",
+        arguments: {
+          id: "daily-brief",
+          kind: "email",
+          summaryTitle: "Daily brief",
+          variants: [{
+            label: "Professional",
+            subject: "Daily brief",
+            body: "Hello team,\n\nHere is today's brief.",
+            active: true,
+          }],
+        },
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    } satisfies DurableTurnStep;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), draftStep]));
+    let externalToolCalls = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        externalToolCalls += 1;
+        throw new Error("compose_message must not reach the sandbox executor");
+      },
+    }, { owner: "worker-compose-execution" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+
+    expect(externalToolCalls).toBe(0);
+    expect(repository.mutations.find((mutation) => mutation.toolResultMessage)?.toolResultMessage)
+      .toMatchObject({
+        name: "compose_message",
+        status: "completed",
+        output: {
+          draft: {
+            id: "daily-brief",
+            kind: "email",
+            variants: [{
+              label: "Professional",
+              subject: "Daily brief",
+              body: "Hello team,\n\nHere is today's brief.",
+            }],
+          },
+        },
+      });
+  });
+
   it("settles a denied tool and continues the remaining tool calls", async () => {
     const denied = toolStep("pending", "idempotent", true);
     const remaining = { ...toolStep("pending", "read_only", false), id: randomUUID(), sequence: 2 };
@@ -415,6 +500,9 @@ describe("durable turn runner", () => {
     );
 
     expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
+    expect(request?.messages[0]?.content).toContain(
+      "call compose_message so it renders as an editable writing block",
+    );
     expect(request?.messages.find((message) => message.role === "user")?.content).toContain(
       "Sandbox path: /workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
@@ -480,12 +568,14 @@ describe("durable turn runner", () => {
     expect(update).toContain("CASE WHEN $4::tool_call_status IN");
     expect(statements.some((sql) => sql.includes("'tool-call'"))).toBe(true);
     expect(statements.some((sql) => sql.includes("'tool-result'"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("'citation'"))).toBe(false);
   });
 });
 
 class FakeTurnRepository implements DurableTurnRepository {
   events: AgentStreamEvent[] = [];
   outbox: Array<{ eventType: string; dedupeKey: string }> = [];
+  mutations: DurableTurnMutation[] = [];
 
   constructor(public current: MutableSnapshot) {}
 
@@ -508,6 +598,7 @@ class FakeTurnRepository implements DurableTurnRepository {
 
   async commit(snapshotValue: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void> {
     expect(this.current.state).toBe(mutation.expectedState);
+    this.mutations.push(mutation);
     for (const patch of mutation.steps ?? []) {
       const index = this.current.steps.findIndex((step) => step.sequence === patch.sequence);
       const previous = index >= 0 ? this.current.steps[index]! : null;
