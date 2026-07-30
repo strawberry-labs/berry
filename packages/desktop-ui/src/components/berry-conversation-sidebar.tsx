@@ -389,7 +389,7 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
   onShare?: ((task: Task) => void | Promise<void>) | undefined;
   indented?: boolean;
 }) {
-  if (tasks.length === 0) return <SidebarStatus label={emptyLabel} indented={indented} />;
+  if (tasks.length === 0) return <SidebarStatus label={emptyLabel} indented={indented} listItem />;
   return (
     <>
       {tasks.map((task) => {
@@ -466,11 +466,12 @@ function ShowMoreRow({ count, onClick, indented = false }: { count: number; onCl
   );
 }
 
-function SidebarStatus({ label, loading = false, error = false, indented = false }: { label: string; loading?: boolean; error?: boolean; indented?: boolean }) {
-  return (
-    <p className={cn("berry-sidebar-empty flex items-center gap-2 px-2 py-1.5 text-xs text-sidebar-foreground/55", indented && "pl-8", error && "text-destructive")} role={error ? "alert" : "status"}>
+function SidebarStatus({ label, loading = false, error = false, indented = false, listItem = false }: { label: string; loading?: boolean; error?: boolean; indented?: boolean; listItem?: boolean }) {
+  const content = (
+    <div className={cn("berry-sidebar-empty flex items-center gap-2 px-2 py-1.5 text-xs text-sidebar-foreground/55", indented && "pl-8", error && "text-destructive")} role={error ? "alert" : "status"}>
       {loading ? <CircularActivitySpinner size={14} label={label} /> : null}
       <span>{label}</span>
-    </p>
+    </div>
   );
+  return listItem ? <SidebarMenuItem>{content}</SidebarMenuItem> : content;
 }

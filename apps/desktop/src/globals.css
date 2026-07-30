@@ -909,14 +909,14 @@
     padding-top: 12px;
   }
 
-  /* Codex placeholder: theme placeholder color at 50% opacity, single
-     ellipsized line so it never wraps into a clipped second row. */
+  /* Keep the placeholder subdued but WCAG-readable on both composer surfaces,
+     and ellipsize it so it never wraps into a clipped second row. */
   .berry-prompt-placeholder {
     top: 13px;
     right: 16px;
     left: 16px;
     overflow: hidden;
-    color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+    color: var(--berry-text-tertiary);
     font-size: 16px;
     line-height: 24px;
     white-space: nowrap;
@@ -925,6 +925,10 @@
 
   .berry-composer-thread .berry-prompt-placeholder {
     top: 12px;
+  }
+
+  .berry-composer-model-label {
+    color: var(--berry-text-tertiary);
   }
 
   /* Atomic mention token (Berry prompt-mention): colored per category via the

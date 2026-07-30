@@ -341,6 +341,8 @@ async function verifyTenantIsolationAndDurableTurn() {
 }
 
 async function verifyUploadSizeEnforcement() {
+  const previousProjectKnowledge = process.env.BERRY_PROJECT_KNOWLEDGE_ENABLED;
+  process.env.BERRY_PROJECT_KNOWLEDGE_ENABLED = "true";
   const service = new FilePlatformService(apiDatabase, {
     client: s3,
     presignClient: s3,
@@ -351,11 +353,14 @@ async function verifyUploadSizeEnforcement() {
     partSize: 5 * 1024 * 1024,
     presignSeconds: 60,
   });
+  if (previousProjectKnowledge === undefined) delete process.env.BERRY_PROJECT_KNOWLEDGE_ENABLED;
+  else process.env.BERRY_PROJECT_KNOWLEDGE_ENABLED = previousProjectKnowledge;
 
   const valid = await service.initiateUpload(ids.tenantA, ids.user, {
     name: "valid.txt",
     mediaType: "text/plain",
     size: 5,
+    taskId: ids.task,
   });
   const validStorage = await uploadStorage(valid.fileId, Buffer.from("berry"));
   uploadedKeys.push(validStorage.objectKey);
@@ -364,7 +369,26 @@ async function verifyUploadSizeEnforcement() {
     ETag: validStorage.etag,
   }]);
   assert.equal(completed.size, 5);
-  assert.equal(completed.status, "available");
+  assert.equal(completed.status, "processing");
+  const indexedSource = await admin.query(
+    `SELECT ks.id::text AS knowledge_source_id,ks.source_id,ks.index_status,wf.visibility,wf.originating_task_id::text
+     FROM knowledge_sources ks
+     JOIN workspace_files wf
+       ON wf.tenant_id=ks.tenant_id
+      AND wf.workspace_id=ks.workspace_id
+      AND wf.file_id::text=ks.source_id
+     WHERE ks.tenant_id=$1::uuid AND ks.source_id=$2`,
+    [ids.tenantA, valid.fileId],
+  );
+  assert.equal(indexedSource.rows[0]?.source_id, valid.fileId);
+  assert.equal(indexedSource.rows[0]?.index_status, "pending");
+  assert.equal(indexedSource.rows[0]?.visibility, "task_only");
+  assert.equal(indexedSource.rows[0]?.originating_task_id, ids.task);
+  const extractionWake = await admin.query(
+    "SELECT event_type FROM runtime_outbox WHERE tenant_id=$1::uuid AND event_type='knowledge.extract' AND aggregate_id=$2",
+    [ids.tenantA, indexedSource.rows[0]?.knowledge_source_id],
+  );
+  assert.equal(extractionWake.rowCount, 1);
 
   const mismatch = await service.initiateUpload(ids.tenantA, ids.user, {
     name: "mismatch.txt",

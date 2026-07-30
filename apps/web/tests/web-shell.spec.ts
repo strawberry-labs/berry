@@ -51,6 +51,12 @@ test("dark mode uses the approved surfaces and neutral menu highlights", async (
       composerMonoOverrides: document.querySelector<HTMLElement>(".berry-composer-root")!.querySelectorAll(".font-mono").length,
       modelFamily: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-model-label")!).fontFamily,
       modelWeight: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-model-label")!).fontWeight,
+      modelColor: getComputedStyle(document.querySelector<HTMLElement>(".berry-composer-model-label")!).color,
+      placeholderColor: getComputedStyle(document.querySelector<HTMLElement>(".berry-prompt-placeholder")!).color,
+      invalidListChildCount: [...document.querySelectorAll("ul")].reduce(
+        (count, list) => count + [...list.children].filter((child) => !["LI", "SCRIPT", "TEMPLATE"].includes(child.tagName)).length,
+        0,
+      ),
     };
   });
 
@@ -66,6 +72,9 @@ test("dark mode uses the approved surfaces and neutral menu highlights", async (
     composer: "rgb(45, 45, 45)",
     userMessage: "rgb(36, 36, 36)",
     composerMonoOverrides: 0,
+    modelColor: "rgb(148, 148, 148)",
+    placeholderColor: "rgb(148, 148, 148)",
+    invalidListChildCount: 0,
   });
 });
 

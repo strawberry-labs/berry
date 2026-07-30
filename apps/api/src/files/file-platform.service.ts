@@ -326,7 +326,7 @@ export class FilePlatformService {
             content_hash, title, visibility, extraction_status, index_status,
             extractor_version, chunker_version, metadata
           )
-          SELECT $1::uuid, $2::uuid, wf.workspace_id, 'file', $3, $4, $5, f.display_name,
+          SELECT $1::uuid, $2::uuid, wf.workspace_id, 'file', $3::uuid::text, $4, $5, f.display_name,
                  wf.visibility, 'pending', 'pending', 'tika-v1', 'recursive-v1',
                  jsonb_strip_nulls(jsonb_build_object(
                    'fileId', f.id,
