@@ -73,6 +73,40 @@ describe("knowledge ingestion and ranking", () => {
     expect(executor.calls.at(-1)?.params).toEqual([tenantId, sourceId, "revision-1"]);
   });
 
+  it("casts metadata parameters before passing them to polymorphic JSON builders", async () => {
+    const executor = new FakeExecutor();
+    const repository = new SqlKnowledgeRepository(executor);
+    await repository.saveExtraction({
+      tenantId,
+      source: {
+        id: sourceId,
+        tenantId,
+        workspaceId: "00000000-0000-7000-8000-000000000003",
+        userId: null,
+        sourceType: "file",
+        sourceId: "00000000-0000-7000-8000-000000000004",
+        revision: "revision-1",
+        contentHash: "source-hash",
+        title: "Fixture source",
+        visibility: "project",
+        status: "extracting",
+        mediaType: "text/plain",
+        bucket: "test",
+        objectKey: "fixture.txt",
+        derivativeObjectKey: null,
+        inlineText: null,
+        tombstonedAt: null,
+      },
+      derivativeObjectKey: "fixture.extract.txt",
+      mediaType: "text/plain; charset=utf-8",
+      sizeBytes: 12,
+      contentHash: "extracted-hash",
+    });
+
+    const derivativeInsert = executor.calls.find((call) => call.sql.includes("INSERT INTO file_derivatives"));
+    expect(derivativeInsert?.sql).toContain("jsonb_build_object('contentHash', $6::text)");
+  });
+
   it("writes large chunk and embedding sets in bounded SQL batches", async () => {
     class ExistingSourceExecutor extends FakeExecutor {
       override async query<T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> {

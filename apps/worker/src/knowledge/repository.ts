@@ -86,7 +86,7 @@ export class SqlKnowledgeRepository {
           generator_version, metadata
         ) VALUES (
           $1::uuid, $2::uuid, 'text_extract', 'available', $3, $4, $5,
-          'tika-v1', jsonb_build_object('contentHash', $6)
+          'tika-v1', jsonb_build_object('contentHash', $6::text)
         )
         ON CONFLICT (file_id, kind, generator_version) DO UPDATE SET
           status = 'available', object_key = EXCLUDED.object_key,
@@ -369,7 +369,7 @@ export class SqlKnowledgeRepository {
         ) VALUES (
           $1::uuid, $2::uuid, $3::uuid, 'task_outcome', $4, $5, $6, $7,
           0.8, 'project', 'available', 'chunking', 'task-outcome-v1',
-          'recursive-v1', jsonb_build_object('sessionId', $8, 'inlineText', $9)
+          'recursive-v1', jsonb_build_object('sessionId', $8::text, 'inlineText', $9::text)
         )
         ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
         DO UPDATE SET content_hash = EXCLUDED.content_hash, title = EXCLUDED.title,

@@ -21,6 +21,9 @@ import { PgSqlExecutor as WorkerPgSqlExecutor } from "../dist/pg-executor.js";
 import { RuntimeOutboxDispatcher } from "../dist/outbox.js";
 import { SqlSandboxSnapshotRepository } from "../dist/sandbox-continuity.js";
 import { DurableTurnRunner, SqlDurableTurnRepository } from "../dist/turn-runner.js";
+import { KnowledgeProcessor } from "../dist/knowledge/processor.js";
+import { SqlKnowledgeRepository } from "../dist/knowledge/repository.js";
+import { DocumentExtractor, KnowledgeChunker, S3KnowledgeObjectStore } from "../dist/knowledge/services.js";
 
 const required = (name) => {
   const value = process.env[name]?.trim();
@@ -86,7 +89,7 @@ try {
   await seedRuntime();
   await verifyTenantIsolationAndDurableTurn();
   await verifyUploadSizeEnforcement();
-  console.log("[integration] durable runtime, RLS, billing, SSE, Redis, S3 upload limits, and Tika are production-ready");
+  console.log("[integration] durable runtime, RLS, billing, SSE, Redis, S3 upload limits, and knowledge ingestion are production-ready");
 } finally {
   await Promise.allSettled(uploadedKeys.map((Key) => s3.send(new DeleteObjectCommand({ Bucket: s3Bucket, Key }))));
   await admin.query("DELETE FROM tenants WHERE id = ANY($1::uuid[])", [[ids.tenantA, ids.tenantB]]).catch(() => undefined);
@@ -372,7 +375,7 @@ async function verifyUploadSizeEnforcement() {
   assert.equal(completed.size, 5);
   assert.equal(completed.status, "processing");
   const indexedSource = await admin.query(
-    `SELECT ks.id::text AS knowledge_source_id,ks.source_id,ks.index_status,wf.visibility,wf.originating_task_id::text
+    `SELECT ks.id::text AS knowledge_source_id,ks.source_id,ks.source_revision,ks.index_status,wf.visibility,wf.originating_task_id::text
      FROM knowledge_sources ks
      JOIN workspace_files wf
        ON wf.tenant_id=ks.tenant_id
@@ -390,6 +393,47 @@ async function verifyUploadSizeEnforcement() {
     [ids.tenantA, indexedSource.rows[0]?.knowledge_source_id],
   );
   assert.equal(extractionWake.rowCount, 1);
+
+  const knowledgeProcessor = new KnowledgeProcessor({
+    repository: new SqlKnowledgeRepository(workerExecutor),
+    objects: new S3KnowledgeObjectStore(s3, 512),
+    extractor: new DocumentExtractor(tikaUrl),
+    chunker: new KnowledgeChunker(16, 2),
+    embeddings: null,
+  });
+  const knowledgePayload = {
+    tenantId: ids.tenantA,
+    sourceId: indexedSource.rows[0]?.knowledge_source_id,
+    revision: indexedSource.rows[0]?.source_revision,
+  };
+  await knowledgeProcessor.process("knowledge.extract", knowledgePayload);
+  await knowledgeProcessor.process("knowledge.chunk", knowledgePayload);
+  const indexedKnowledge = await admin.query(
+    `SELECT ks.extraction_status,ks.index_status,ks.vector_ready,wf.index_status AS workspace_index_status,
+            count(kc.id)::int AS chunk_count,min(kc.text_content) AS text_content
+     FROM knowledge_sources ks
+     JOIN workspace_files wf
+       ON wf.tenant_id=ks.tenant_id
+      AND wf.workspace_id=ks.workspace_id
+      AND wf.file_id::text=ks.source_id
+     LEFT JOIN knowledge_chunks kc ON kc.source_id=ks.id
+     WHERE ks.tenant_id=$1::uuid AND ks.id=$2::uuid
+     GROUP BY ks.extraction_status,ks.index_status,ks.vector_ready,wf.index_status`,
+    [ids.tenantA, knowledgePayload.sourceId],
+  );
+  assert.deepEqual(indexedKnowledge.rows[0], {
+    extraction_status: "available",
+    index_status: "indexed",
+    vector_ready: false,
+    workspace_index_status: "indexed",
+    chunk_count: 1,
+    text_content: "berry",
+  });
+  const derivative = await admin.query(
+    "SELECT object_key FROM file_derivatives WHERE tenant_id=$1::uuid AND file_id=$2::uuid AND kind='text_extract'",
+    [ids.tenantA, valid.fileId],
+  );
+  if (derivative.rows[0]?.object_key) uploadedKeys.push(derivative.rows[0].object_key);
 
   const requestMessageId = randomUUID();
   const stagingRunId = randomUUID();
