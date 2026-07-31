@@ -30,7 +30,7 @@ describe("OrganizationCapabilitiesService", () => {
     effective = await service.effective(tenantId, userId);
     expect(effective.skills.map((skill) => skill.name)).toContain("Available");
     expect(effective.skills.map((skill) => skill.name)).not.toContain("Default");
-    expect(effective.skills.find((skill) => skill.name === "Available")?.filePath).toBe("/workspace/.berry/managed-skills/available/SKILL.md");
+    expect(effective.skills.find((skill) => skill.name === "Available")?.filePath).toBe("/managed-skills/available/SKILL.md");
     await service.upsert(tenantId, { kind: "skill", capabilityId: "available", name: "Available", assignment: "blocked", config: {} });
     expect((await service.effective(tenantId, userId)).skills.map((skill) => skill.name)).not.toContain("Available");
   });

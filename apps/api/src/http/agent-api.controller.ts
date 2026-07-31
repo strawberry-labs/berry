@@ -807,6 +807,7 @@ export class AgentApiController {
               name: skill.name,
               description: skill.description,
               content: skill.content,
+              filePath: skill.filePath,
               disableModelInvocation: skill.disableModelInvocation,
             })),
             attachments: (request.attachments ?? []).map((attachment) => ({

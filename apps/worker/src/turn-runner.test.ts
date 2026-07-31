@@ -268,6 +268,58 @@ describe("durable turn runner", () => {
     });
   });
 
+  it("persists requested question batches and emits the popup event before waiting", async () => {
+    const questionStep = {
+      ...toolStep("pending", "read_only", false),
+      type: "tool.ask_user_question",
+      input: {
+        toolCallId: "question_call_1",
+        toolName: "ask_user_question",
+        arguments: {
+          questions: [
+            {
+              question: "Which tone should I use?",
+              options: [
+                { label: "Formal", description: "Use a formal business tone." },
+                { label: "Warm", description: "Use a warmer personal tone." },
+              ],
+            },
+            {
+              question: "When should it take effect?",
+              options: [],
+            },
+          ],
+        },
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    } satisfies DurableTurnStep;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [
+      admittedStep(),
+      questionStep,
+    ]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), noTools(), {
+      owner: "worker-question",
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "waiting" });
+
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "question.request",
+      toolCallId: "question_call_1",
+      question: "Which tone should I use?",
+      questions: [
+        expect.objectContaining({ question: "Which tone should I use?" }),
+        expect.objectContaining({ question: "When should it take effect?" }),
+      ],
+    }));
+    expect(repository.current.state).toBe("waiting");
+    expect(repository.outbox).toContainEqual(expect.objectContaining({
+      eventType: "sandbox.snapshot",
+    }));
+  });
+
   it("executes compose_message inside the durable runner and persists its editable draft", async () => {
     const draftStep = {
       ...toolStep("pending", "read_only", false),
@@ -503,8 +555,14 @@ describe("durable turn runner", () => {
     expect(request?.messages[0]?.content).toContain(
       "call compose_message so it renders as an editable writing block",
     );
+    expect(request?.messages[0]?.content).toContain(
+      "call ask_user_question so the frontend renders the interactive question UI",
+    );
     expect(request?.messages.find((message) => message.role === "user")?.content).toContain(
       "Sandbox path: /workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
+    );
+    expect(request?.messages.find((message) => message.role === "user")?.content).toContain(
+      "read_file extracts its text",
     );
     expect(deltas.filter((item) => item.channel === "text").map((item) => item.delta).join("")).toBe("Searching");
     expect(deltas.filter((item) => item.channel === "reasoning").map((item) => item.delta).join("")).toBe("Need current sources.");

@@ -39,3 +39,39 @@ describe("image generation stream state", () => {
     ]);
   });
 });
+
+describe("question stream state", () => {
+  it("keeps a durable question batch available for the web composer popup", () => {
+    let state = reduceStream(IDLE, { kind: "turn.start", turnId: "turn_1" });
+    state = reduceStream(state, {
+      kind: "question.request",
+      questionId: "question_1",
+      toolCallId: "tool_1",
+      question: "Which tone should I use?",
+      options: [{ label: "Formal", description: "Business tone" }],
+      multi: false,
+      questions: [
+        {
+          question: "Which tone should I use?",
+          options: [{ label: "Formal", description: "Business tone" }],
+          multi: false,
+        },
+        {
+          question: "When should it take effect?",
+          options: [],
+          multi: false,
+        },
+      ],
+    });
+
+    expect(state.turnActive).toBe(true);
+    expect(state.question).toEqual(expect.objectContaining({
+      questionId: "question_1",
+      toolCallId: "tool_1",
+      questions: [
+        expect.objectContaining({ question: "Which tone should I use?" }),
+        expect.objectContaining({ question: "When should it take effect?" }),
+      ],
+    }));
+  });
+});

@@ -1991,6 +1991,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "Use the tools declared for this turn when workspace inspection, changes, or current information are required.",
   "For requests about current web information, call an available MCP research or search tool before answering. Never claim browsing is unavailable when a relevant tool is declared.",
   "When the user explicitly asks you to remember or forget a durable personal fact or preference, call remember_memory or forget_memory when that tool is declared. Confirm the change only after the tool succeeds.",
+  "When the user explicitly asks you to ask questions, collect requirements, or clarify choices, call ask_user_question so the frontend renders the interactive question UI. Do not print the questionnaire as ordinary prose.",
   "When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call compose_message so it renders as an editable writing block. Use one variant unless genuinely different strategies are useful, reuse the same draft id for revisions, and do not repeat the draft body in prose after the tool succeeds.",
   "Explain the final result clearly.",
 ].join("\n\n");
@@ -2081,11 +2082,12 @@ function durableSkillInstructions(value: unknown): string {
     const name = stringValue(skill.name)?.slice(0, 128);
     const description = stringValue(skill.description)?.slice(0, 2_000);
     const content = stringValue(skill.content);
+    const filePath = stringValue(skill.filePath)?.slice(0, 1_000);
     if (!name || !content || remaining <= 0) return [];
     const body = content.slice(0, remaining);
     remaining -= body.length;
     return [
-      `<skill name=${JSON.stringify(name)}>\n${description ? `${description}\n\n` : ""}${body}\n</skill>`,
+      `<skill name=${JSON.stringify(name)}${filePath ? ` source=${JSON.stringify(filePath)}` : ""}>\n${description ? `${description}\n\n` : ""}${body}\n</skill>`,
     ];
   });
   return skills.length > 0
@@ -2098,7 +2100,7 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "ask_user_question",
-      description: "Ask the user for one or more necessary decisions and suspend the durable turn until they answer.",
+      description: "Show the frontend's interactive question UI for up to five tightly related decisions, then suspend the durable turn until the user answers. Always use this tool when the user explicitly asks you to ask them questions; do not write those questions as ordinary prose.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2216,7 +2218,7 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "read_file",
-      description: "Read a UTF-8 file under /workspace.",
+      description: "Read text under /workspace or the read-only /managed-skills tree. PDFs are converted to extracted text automatically; binary images and office files return safe metadata instead of being decoded as UTF-8.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2229,7 +2231,7 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "list_files",
-      description: "List files under a workspace path.",
+      description: "List files under /workspace or the read-only /managed-skills tree.",
       parameters: {
         type: "object",
         additionalProperties: false,

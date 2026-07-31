@@ -102,7 +102,33 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const args = objectValue(step.input.arguments);
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "read_file") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "");
+      const path = safeReadablePath(stringValue(args.path) ?? "");
+      const mediaType = binaryMediaType(path);
+      if (mediaType === "application/pdf") {
+        const content = await extractPdfText(this.provider, sandbox.id, path, step);
+        return {
+          output: {
+            path,
+            content,
+            mediaType,
+            extractedText: true,
+          },
+          summary: `Extracted text from ${path}`,
+          sandbox,
+        };
+      }
+      if (mediaType) {
+        return {
+          output: {
+            path,
+            binary: true,
+            mediaType,
+            content: `This is a binary ${mediaType} file. It was not decoded as UTF-8. Use an image- or document-capable skill/tool, or run_command with an appropriate inspection utility.`,
+          },
+          summary: `Identified ${path} as a binary ${mediaType} file`,
+          sandbox,
+        };
+      }
       const result = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
       return {
         output: { path: result.path, content: result.content, sizeBytes: result.size_bytes },
@@ -111,7 +137,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "list_files") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "/workspace");
+      const path = safeReadablePath(stringValue(args.path) ?? "/workspace");
       const result = await this.provider.files.list({
         sandbox_id: sandbox.id,
         path,
@@ -653,13 +679,80 @@ function excludedSnapshotPath(path: string, root: string): boolean {
 }
 
 function safeWorkspacePath(value: string): string {
+  return safeSandboxPath(value, ["workspace"], "Sandbox writes must remain under /workspace");
+}
+
+function safeReadablePath(value: string): string {
+  return safeSandboxPath(
+    value,
+    ["workspace", "managed-skills"],
+    "Sandbox reads must remain under /workspace or /managed-skills",
+  );
+}
+
+function safeSandboxPath(value: string, roots: readonly string[], errorMessage: string): string {
   const normalized = value.trim().replaceAll("\\", "/");
   const absolute = normalized.startsWith("/") ? normalized : `/workspace/${normalized}`;
   const parts = absolute.split("/").filter(Boolean);
-  if (parts[0] !== "workspace" || parts.includes("..") || parts.includes(".")) {
-    throw new Error("Sandbox paths must remain under /workspace");
+  if (!parts[0] || !roots.includes(parts[0]) || parts.includes("..") || parts.includes(".")) {
+    throw new Error(errorMessage);
   }
   return `/${parts.join("/")}`;
+}
+
+async function extractPdfText(
+  provider: SandboxProvider,
+  sandboxId: string,
+  path: string,
+  step: DurableTurnStep,
+): Promise<string> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  let exitCode: number | null = null;
+  for await (const event of provider.exec({
+    sandbox_id: sandboxId,
+    request_id: `${step.idempotencyKey ?? step.id}:pdf-text`,
+    command: ["pdftotext", "-layout", path, "-"],
+    cwd: "/workspace",
+    timeout_ms: 120_000,
+  })) {
+    if (event.kind === "stdout") stdout.push(event.data);
+    else if (event.kind === "stderr") stderr.push(event.data);
+    else if (event.kind === "exit") exitCode = event.exit_code;
+    else if (event.kind === "error") throw new Error(event.message);
+  }
+  const content = stdout.join("").slice(0, 1_000_000);
+  if (exitCode !== 0) {
+    throw new Error(`PDF text extraction exited with ${exitCode ?? "unknown"}: ${stderr.join("").slice(-4_000)}`);
+  }
+  return content || "[The PDF contains no extractable text. It may be scanned and require OCR.]";
+}
+
+function binaryMediaType(path: string): string | null {
+  const extension = path.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? "";
+  return ({
+    pdf: "application/pdf",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    bmp: "image/bmp",
+    tif: "image/tiff",
+    tiff: "image/tiff",
+    doc: "application/msword",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xls: "application/vnd.ms-excel",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ppt: "application/vnd.ms-powerpoint",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    zip: "application/zip",
+    gz: "application/gzip",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    mp4: "video/mp4",
+    mov: "video/quicktime",
+  } as Record<string, string>)[extension] ?? null;
 }
 
 function objectValue(value: unknown): Record<string, unknown> {

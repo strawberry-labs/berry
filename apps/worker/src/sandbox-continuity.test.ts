@@ -77,6 +77,90 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+  it("reads managed skill references without making the managed tree writable", async () => {
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: "# Brand system",
+      size_bytes: 14,
+    }));
+    const manager = managerWithProvider({
+      read,
+      write: vi.fn(),
+      list: vi.fn(async (input: { path: string }) => ({
+        path: input.path,
+        entries: [],
+      })),
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read_file", {
+      path: "/managed-skills/aesg-branding/references/brand-system.md",
+    }))).resolves.toMatchObject({
+      output: {
+        path: "/managed-skills/aesg-branding/references/brand-system.md",
+        content: "# Brand system",
+      },
+    });
+    await expect(manager.execute(snapshot(), toolStep("list_files", {
+      path: "/managed-skills/aesg-branding/references",
+    }))).resolves.toMatchObject({
+      output: { path: "/managed-skills/aesg-branding/references" },
+    });
+    await expect(manager.execute(snapshot(), toolStep("write_file", {
+      path: "/managed-skills/aesg-branding/references/brand-system.md",
+      content: "changed",
+    }))).rejects.toThrow("Sandbox writes must remain under /workspace");
+  });
+
+  it("extracts PDF text instead of decoding PDF bytes as UTF-8", async () => {
+    const read = vi.fn();
+    const manager = managerWithProvider({
+      read,
+      write: vi.fn(),
+      list: vi.fn(),
+    }, async function* (input: { command: string[] }) {
+      expect(input.command).toEqual([
+        "pdftotext",
+        "-layout",
+        "/workspace/inputs/file-id/reference.pdf",
+        "-",
+      ]);
+      yield { kind: "stdout", data: "Page one text\fPage two text" };
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read_file", {
+      path: "/workspace/inputs/file-id/reference.pdf",
+    }))).resolves.toMatchObject({
+      output: {
+        path: "/workspace/inputs/file-id/reference.pdf",
+        content: "Page one text\fPage two text",
+        mediaType: "application/pdf",
+        extractedText: true,
+      },
+    });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("returns binary metadata instead of sending image bytes through the UTF-8 reader", async () => {
+    const read = vi.fn();
+    const manager = managerWithProvider({
+      read,
+      write: vi.fn(),
+      list: vi.fn(),
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read_file", {
+      path: "/workspace/tmp/rendered/page-1.png",
+    }))).resolves.toMatchObject({
+      output: {
+        path: "/workspace/tmp/rendered/page-1.png",
+        binary: true,
+        mediaType: "image/png",
+      },
+    });
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it("stages message-associated input files before the first tool runs", async () => {
     const staged = new Map<string, Uint8Array[]>();
     const provider = {
@@ -190,4 +274,32 @@ function toolStep(name: string, argumentsValue: Record<string, unknown>): Durabl
     attempt: 0,
     error: null,
   };
+}
+
+function managerWithProvider(
+  files: unknown,
+  exec: unknown = async function* () {
+    yield { kind: "exit", exit_code: 0, signal: null };
+  },
+): SandboxContinuityManager {
+  const provider = {
+    kind: "e2b",
+    create: vi.fn(async () => ({
+      sandbox_id: "sandbox-contract",
+      provider: "e2b",
+      status: "running",
+    })),
+    exec,
+    files,
+  } as unknown as SandboxProvider;
+  const repository = {
+    loadRun: vi.fn(),
+    latest: vi.fn(async () => null),
+    inputFiles: vi.fn(async () => []),
+    persist: vi.fn(),
+    recordSandbox: vi.fn(async () => undefined),
+  } satisfies SandboxSnapshotRepository;
+  return new SandboxContinuityManager(provider, repository, null, {
+    image: "berry-sandbox",
+  });
 }
