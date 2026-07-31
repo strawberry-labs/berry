@@ -7,7 +7,7 @@ import {
   MemoryOperationSchema,
   normalizeMemoryStableKey,
 } from "@berry/shared";
-import type { ChatToolDefinition } from "@berry/router-client";
+import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
 import { z } from "zod";
 import type {
   DurableToolPolicy,
@@ -102,6 +102,10 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     return await this.enabled(snapshot)
       ? [...inherited, ...PERSONAL_MEMORY_TOOL_DEFINITIONS]
       : inherited;
+  }
+
+  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
+    return this.base.modelContent?.(snapshot) ?? [];
   }
 
   policy(

@@ -2724,10 +2724,8 @@ code, pre {
   background: var(--berry-card-bg);
   font-size: 12px;
 }
-.durable-run-status[data-tone="warning"] { border-color: var(--berry-warning); }
 .durable-run-status[data-tone="danger"] { border-color: var(--berry-danger); background: var(--berry-danger-soft); }
 .durable-run-status > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--berry-text-tertiary); }
-.durable-run-status[data-tone="warning"] > svg { color: var(--berry-warning); }
 .durable-run-status[data-tone="danger"] > svg { color: var(--berry-danger); }
 .durable-run-status > div:nth-child(2) { display: grid; min-width: 0; flex: 1; gap: 1px; }
 .durable-run-status strong { color: var(--berry-text-primary); font-size: 12px; font-weight: 620; }

@@ -15,6 +15,7 @@ import {
   type DockerStreamEvent,
   type SandboxProvider,
 } from "@berry/sandbox-contract";
+import type { ChatContentPart } from "@berry/router-client";
 import type { JsonValue } from "@berry/shared";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
@@ -25,6 +26,11 @@ import type {
   DurableTurnToolExecutor,
   TurnToolResult,
 } from "./turn-runner.js";
+
+const MAX_SNAPSHOT_ARCHIVE_BYTES = 384 * 1024 * 1024;
+const MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_MODEL_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
+const MAX_MODEL_IMAGES = 5;
 
 interface SnapshotArchive {
   version: 1;
@@ -57,9 +63,28 @@ interface SandboxInputFile {
   objectKey: string;
 }
 
+interface SandboxOutputFile {
+  fileId: string;
+  name: string;
+  mediaType: string;
+  sizeBytes: number;
+  objectKey: string;
+}
+
 export interface SandboxSnapshotRepository {
   loadRun(tenantId: string, runId: string): Promise<SnapshotRun>;
   inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]>;
+  persistOutput(input: {
+    snapshot: DurableTurnSnapshot;
+    fileId: string;
+    name: string;
+    mediaType: string;
+    sizeBytes: number;
+    sha256: string;
+    bucket: string;
+    objectKey: string;
+    etag: string | null;
+  }): Promise<SandboxOutputFile>;
   latest(tenantId: string, runId: string): Promise<SnapshotRecord | null>;
   persist(input: {
     run: SnapshotRun;
@@ -79,6 +104,11 @@ export interface SandboxSnapshotRepository {
 
 export interface SandboxSnapshotObjectStore {
   put(key: string, body: Uint8Array): Promise<void>;
+  putArtifact(key: string, body: Uint8Array, mediaType: string): Promise<{
+    bucket: string;
+    key: string;
+    etag: string | null;
+  }>;
   get(key: string): Promise<Uint8Array>;
   getSource(key: string): Promise<Uint8Array>;
   streamSource?(key: string, maxBytes: number): AsyncIterable<Uint8Array>;
@@ -96,6 +126,63 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       maxInputBytes?: number;
     },
   ) {}
+
+  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
+    const requestedSandboxImages = requestedSandboxImagePaths(snapshot);
+    const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
+      .filter((file) => file.mediaType.startsWith("image/"));
+    if (requestedSandboxImages.length === 0 && attachedImages.length === 0) return [];
+
+    const parts: ChatContentPart[] = [];
+    let totalBytes = 0;
+    const append = (mediaType: string, bytes: Uint8Array): boolean => {
+      if (
+        parts.length >= MAX_MODEL_IMAGES
+        || bytes.byteLength === 0
+        || bytes.byteLength > MAX_MODEL_IMAGE_BYTES
+        || totalBytes + bytes.byteLength > MAX_MODEL_IMAGE_TOTAL_BYTES
+      ) {
+        return false;
+      }
+      parts.push({
+        type: "image_url",
+        image_url: {
+          url: `data:${mediaType};base64,${Buffer.from(bytes).toString("base64")}`,
+        },
+      });
+      totalBytes += bytes.byteLength;
+      return true;
+    };
+
+    if (requestedSandboxImages.length > 0) {
+      const sandbox = await this.ensureSandbox(snapshot);
+      for (const path of requestedSandboxImages) {
+        if (parts.length >= MAX_MODEL_IMAGES) break;
+        const mediaType = binaryMediaType(path);
+        if (!mediaType?.startsWith("image/")) continue;
+        const source = await this.provider.files.read({
+          sandbox_id: sandbox.id,
+          path,
+          encoding: "base64",
+        });
+        append(mediaType, Buffer.from(source.content, "base64"));
+      }
+    }
+
+    if (attachedImages.length > 0) {
+      if (!this.objects) throw new Error("Input image object storage is not configured");
+      for (const file of attachedImages) {
+        if (parts.length >= MAX_MODEL_IMAGES) break;
+        if (file.sizeBytes > MAX_MODEL_IMAGE_BYTES) continue;
+        const bytes = await this.objects.getSource(file.objectKey);
+        if (bytes.byteLength !== file.sizeBytes) {
+          throw new Error(`Input image ${file.name} is incomplete`);
+        }
+        append(file.mediaType, bytes);
+      }
+    }
+    return parts;
+  }
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const sandbox = await this.ensureSandbox(snapshot);
@@ -123,7 +210,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             path,
             binary: true,
             mediaType,
-            content: `This is a binary ${mediaType} file. It was not decoded as UTF-8. Use an image- or document-capable skill/tool, or run_command with an appropriate inspection utility.`,
+            ...(mediaType.startsWith("image/") ? { visionPath: path } : {}),
+            content: mediaType.startsWith("image/")
+              ? `This ${mediaType} image will be attached to the next model request for visual inspection.`
+              : `This is a binary ${mediaType} file. It was not decoded as UTF-8. Use a document-capable skill/tool, or run_command with an appropriate inspection utility.`,
           },
           summary: `Identified ${path} as a binary ${mediaType} file`,
           sandbox,
@@ -169,6 +259,58 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return {
         output: { path: result.path, sizeBytes: result.size_bytes, mtime: result.mtime },
         summary: `Wrote ${result.path}`,
+        sandbox,
+      };
+    }
+    if (toolName === "persist_artifact") {
+      if (!this.objects) throw new Error("Artifact object storage is not configured");
+      const path = safeOutputPath(stringValue(args.path) ?? "");
+      const source = await this.provider.files.read({
+        sandbox_id: sandbox.id,
+        path,
+        encoding: "base64",
+      });
+      const bytes = Buffer.from(source.content, "base64");
+      const maxBytes = this.options.maxInputBytes ?? 100 * 1024 * 1024;
+      if (bytes.byteLength === 0) throw new Error("Cannot persist an empty artifact");
+      if (bytes.byteLength > maxBytes) throw new Error(`Artifact exceeds the ${maxBytes}-byte output limit`);
+      const name = safeArtifactName(stringValue(args.name) ?? path.split("/").at(-1) ?? "artifact");
+      const mediaType = stringValue(args.media_type)
+        ?? binaryMediaType(name)
+        ?? "application/octet-stream";
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const stored = await this.objects.putArtifact(
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/original/${name}`,
+        bytes,
+        mediaType,
+      );
+      const output = await this.repository.persistOutput({
+        snapshot,
+        fileId: step.id,
+        name,
+        mediaType,
+        sizeBytes: bytes.byteLength,
+        sha256,
+        bucket: stored.bucket,
+        objectKey: stored.key,
+        etag: stored.etag,
+      });
+      return {
+        output: {
+          text: `Persisted artifact: ${name}`,
+          artifact: {
+            kind: "file",
+            path: `/v1/files/${output.fileId}/content`,
+            name: output.name,
+            mediaType: output.mediaType,
+            size: output.sizeBytes,
+            storage: "s3",
+            key: output.objectKey,
+            fileId: output.fileId,
+          },
+          path: `/v1/files/${output.fileId}/content`,
+        },
+        summary: `Persisted ${name}`,
         sandbox,
       };
     }
@@ -343,11 +485,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       command: [
         "sh",
         "-c",
-        'printf "%s" "$2" | base64 -d >> "$1"',
+        'base64 -d >> "$1"',
         "berry-stage",
         path,
-        Buffer.from(chunk).toString("base64"),
       ],
+      // Keep attachment bytes out of argv. A 256 KiB chunk expands beyond
+      // Linux's per-argument limit when base64 encoded, which prevented E2B
+      // from starting the staging process at all.
+      stdin: Buffer.from(chunk).toString("base64"),
       timeout_ms: 30_000,
     })) {
       if (event.kind === "error") throw new Error(event.message);
@@ -377,6 +522,19 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     files.sort((left, right) => left.path.localeCompare(right.path));
     return { version: 1, createdAt: new Date().toISOString(), files };
   }
+}
+
+function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot): string[] {
+  const paths = snapshot.steps.flatMap((step) => {
+    if (step.state !== "completed") return [];
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName !== "read_file") return [];
+    const output = objectValue(step.output);
+    const path = stringValue(output.visionPath);
+    if (!path || path.startsWith("/workspace/inputs/")) return [];
+    return binaryMediaType(path)?.startsWith("image/") ? [path] : [];
+  });
+  return [...new Set(paths)].slice(-MAX_MODEL_IMAGES).reverse();
 }
 
 export class SqlSandboxSnapshotRepository implements SandboxSnapshotRepository {
@@ -419,10 +577,16 @@ JOIN files f
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
   AND f.status IN ('processing', 'available', 'failed')
   AND f.deleted_at IS NULL
-  AND EXISTS (
-    SELECT 1
-    FROM file_uploads u
-    WHERE u.tenant_id=f.tenant_id AND u.file_id=f.id AND u.status='completed'
+  AND (
+    EXISTS (
+      SELECT 1
+      FROM file_uploads u
+      WHERE u.tenant_id=f.tenant_id AND u.file_id=f.id AND u.status='completed'
+    )
+    OR (
+      f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact')
+      AND f.status='available'
+    )
   )
 ORDER BY a.created_at ASC,f.id ASC
       `.trim(),
@@ -435,6 +599,82 @@ ORDER BY a.created_at ASC,f.id ASC
       sizeBytes: Number(row.size_bytes),
       objectKey: row.object_key,
     }));
+  }
+
+  async persistOutput(input: {
+    snapshot: DurableTurnSnapshot;
+    fileId: string;
+    name: string;
+    mediaType: string;
+    sizeBytes: number;
+    sha256: string;
+    bucket: string;
+    objectKey: string;
+    etag: string | null;
+  }): Promise<SandboxOutputFile> {
+    const run = async (executor: SqlExecutor): Promise<SandboxOutputFile> => {
+      const rows = await executor.query<{ id: string }>(
+        `
+INSERT INTO files (
+  id,tenant_id,owner_user_id,original_name,display_name,media_type,size_bytes,
+  sha256,bucket,object_key,etag,origin,status,metadata
+) VALUES (
+  $1::uuid,$2::uuid,$3::uuid,$4,$4,$5,$6,$7,$8,$9,$10,
+  'sandbox_output','available',$11::jsonb
+)
+ON CONFLICT (tenant_id,object_key) DO UPDATE SET
+  owner_user_id=excluded.owner_user_id,
+  display_name=excluded.display_name,
+  media_type=excluded.media_type,
+  size_bytes=excluded.size_bytes,
+  sha256=excluded.sha256,
+  etag=excluded.etag,
+  status='available',
+  metadata=excluded.metadata,
+  updated_at=now()
+RETURNING id
+        `.trim(),
+        [
+          input.fileId,
+          input.snapshot.tenantId,
+          input.snapshot.userId,
+          input.name,
+          input.mediaType,
+          input.sizeBytes,
+          input.sha256,
+          input.bucket,
+          input.objectKey,
+          input.etag,
+          JSON.stringify({ source: "durable-sandbox", runId: input.snapshot.id }),
+        ],
+      );
+      const fileId = rows[0]?.id;
+      if (!fileId) throw new Error("Unable to register the sandbox artifact");
+      await executor.execute(
+        `
+INSERT INTO file_associations (
+  tenant_id,file_id,task_id,session_id,turn_id,role,created_by_user_id
+) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,'output',$6::uuid)
+ON CONFLICT DO NOTHING
+        `.trim(),
+        [
+          input.snapshot.tenantId,
+          fileId,
+          input.snapshot.taskId,
+          input.snapshot.sessionId,
+          input.snapshot.id,
+          input.snapshot.userId,
+        ],
+      );
+      return {
+        fileId,
+        name: input.name,
+        mediaType: input.mediaType,
+        sizeBytes: input.sizeBytes,
+        objectKey: input.objectKey,
+      };
+    };
+    return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
   }
 
   async latest(tenantId: string, runId: string): Promise<SnapshotRecord | null> {
@@ -545,14 +785,37 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     }));
   }
 
+  async putArtifact(key: string, body: Uint8Array, mediaType: string): Promise<{
+    bucket: string;
+    key: string;
+    etag: string | null;
+  }> {
+    const objectKey = key.startsWith(`${this.prefix}/`) ? key : `${this.prefix}/${key}`;
+    const result = await this.client.send(new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: objectKey,
+      Body: body,
+      ContentType: mediaType,
+    }));
+    return {
+      bucket: this.bucket,
+      key: objectKey,
+      etag: result.ETag?.replaceAll("\"", "") ?? null,
+    };
+  }
+
   async get(key: string): Promise<Uint8Array> {
-    return this.getSource(key);
+    return this.readObject(this.snapshotKey(key), MAX_SNAPSHOT_ARCHIVE_BYTES, "Sandbox snapshot");
   }
 
   async getSource(key: string): Promise<Uint8Array> {
+    return this.readObject(key, this.maxSourceBytes, "Input file");
+  }
+
+  private async readObject(key: string, maxBytes: number, label: string): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let total = 0;
-    for await (const chunk of this.streamSource(key, this.maxSourceBytes)) {
+    for await (const chunk of this.streamKey(key, maxBytes, label)) {
       chunks.push(chunk);
       total += chunk.byteLength;
     }
@@ -566,21 +829,29 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
   }
 
   async *streamSource(key: string, maxBytes: number): AsyncIterable<Uint8Array> {
+    yield* this.streamKey(key, maxBytes, "Input file");
+  }
+
+  private async *streamKey(key: string, maxBytes: number, label: string): AsyncIterable<Uint8Array> {
     const result = await this.client.send(new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
     }));
-    if (!result.Body) throw new Error("Input file object has no body");
+    if (!result.Body) throw new Error(`${label} object has no body`);
     if (result.ContentLength !== undefined && result.ContentLength > maxBytes) {
-      throw new Error(`Input file object exceeds the ${maxBytes}-byte sandbox limit`);
+      throw new Error(`${label} object exceeds the ${maxBytes}-byte sandbox limit`);
     }
     let total = 0;
     for await (const raw of result.Body as AsyncIterable<Uint8Array>) {
       const chunk = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
       total += chunk.byteLength;
-      if (total > maxBytes) throw new Error(`Input file object exceeds the ${maxBytes}-byte sandbox limit`);
+      if (total > maxBytes) throw new Error(`${label} object exceeds the ${maxBytes}-byte sandbox limit`);
       yield chunk;
     }
+  }
+
+  private snapshotKey(key: string): string {
+    return key.startsWith(`${this.prefix}/`) ? key : `${this.prefix}/${key}`;
   }
 }
 
@@ -688,6 +959,23 @@ function safeReadablePath(value: string): string {
     ["workspace", "managed-skills"],
     "Sandbox reads must remain under /workspace or /managed-skills",
   );
+}
+
+function safeOutputPath(value: string): string {
+  const path = safeWorkspacePath(value);
+  if (!path.startsWith("/workspace/outputs/") && !path.startsWith("/workspace/output/")) {
+    throw new Error("Artifacts must be created under /workspace/outputs");
+  }
+  return path;
+}
+
+function safeArtifactName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/[\\/\0]/g, "-")
+    .replace(/[^\p{L}\p{N}._() -]+/gu, "-")
+    .replace(/\s+/g, " ")
+    .slice(0, 180) || "artifact";
 }
 
 function safeSandboxPath(value: string, roots: readonly string[], errorMessage: string): string {

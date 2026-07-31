@@ -32,6 +32,7 @@ describe("runPresentation", () => {
   it("shows waiting states that require user action", () => {
     expect(runPresentation(state({ runState: "waiting", waitingReason: "user_input" }))).toMatchObject({
       label: "Waiting for your answer",
+      tone: "neutral",
     });
   });
 

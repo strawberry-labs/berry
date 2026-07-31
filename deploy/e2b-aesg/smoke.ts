@@ -1,32 +1,42 @@
 import { Sandbox } from "e2b";
+import { createHash } from "node:crypto";
 
-const templateId = process.env.E2B_TEMPLATE_ID;
+const templateId = process.env.E2B_TEMPLATE_ID ?? process.env.BERRY_E2B_TEMPLATE_ID;
 if (!templateId) {
-  throw new Error("Set E2B_TEMPLATE_ID to the newly built template ID");
+  throw new Error("Set E2B_TEMPLATE_ID or BERRY_E2B_TEMPLATE_ID to the template ID");
 }
 
 const sandbox = await Sandbox.create(templateId, { timeoutMs: 180_000 });
 try {
-  const dependencyCheck = [
-    "set -eu",
-    "test -d /managed-skills/aesg-branding",
-    "test -f /managed-skills/docx/scripts/create_aesg_docx.py",
-    "test -f /managed-skills/pdf/scripts/create_aesg_pdf.py",
-    "test -f /managed-skills/xlsx/scripts/create_aesg_xlsx.py",
-    "test -f /managed-skills/pptx/scripts/create_aesg_pptx.py",
-    "test \"$(fc-match -f '%{family}' Verdana)\" = Verdana",
-    "python -c \"import docx,pptx,openpyxl,reportlab,pypdf\"",
-    "soffice --version",
-    "pdfinfo -v",
-    "qpdf --version",
-  ].join(" && ");
-  const dependencyResult = await sandbox.commands.run(dependencyCheck, {
-    timeoutMs: 120_000,
-  });
-  if (dependencyResult.exitCode !== 0) {
-    throw new Error(
-      `dependency smoke test failed\n${dependencyResult.stdout}\n${dependencyResult.stderr}`,
-    );
+  const runChecked = async (label: string, command: string, timeoutMs = 120_000) => {
+    try {
+      return await sandbox.commands.run(command, { timeoutMs });
+    } catch (error) {
+      const result = (error as {
+        result?: { exitCode?: number; stdout?: string; stderr?: string; error?: string };
+      }).result;
+      throw new Error(
+        `${label} failed (exit ${result?.exitCode ?? "unknown"})\n`
+        + `${result?.stdout ?? ""}\n${result?.stderr ?? result?.error ?? String(error)}`,
+      );
+    }
+  };
+  const dependencyChecks = [
+    ["AESG branding skill", "test -d /managed-skills/aesg-branding"],
+    ["DOCX skill", "test -f /managed-skills/docx/scripts/create_aesg_docx.py"],
+    ["PDF skill", "test -f /managed-skills/pdf/scripts/create_aesg_pdf.py"],
+    ["XLSX skill", "test -f /managed-skills/xlsx/scripts/create_aesg_xlsx.py"],
+    ["PPTX skill", "test -f /managed-skills/pptx/scripts/create_aesg_pptx.py"],
+    ["Verdana font", "test \"$(fc-match -f '%{family}' Verdana)\" = Verdana"],
+    ["Python artifact libraries", "python -c \"import docx,pptx,openpyxl,reportlab,pypdf\""],
+    ["LibreOffice", "soffice --version"],
+    ["Poppler", "pdfinfo -v"],
+    ["QPDF", "qpdf --version"],
+  ] as const;
+  const dependencyOutput: string[] = [];
+  for (const [label, command] of dependencyChecks) {
+    const result = await runChecked(label, command);
+    if (result.stdout) dependencyOutput.push(result.stdout);
   }
 
   const specs = {
@@ -114,22 +124,45 @@ try {
     "test \"$(find /workspace/outputs -maxdepth 1 -type f | wc -l)\" -eq 4",
     "test -z \"$(find /workspace/outputs -maxdepth 1 -type f ! \\( -name '*.docx' -o -name '*.pdf' -o -name '*.xlsx' -o -name '*.pptx' \\) -print -quit)\"",
   ].join(" && ");
-  const generationResult = await sandbox.commands.run(generationCheck, {
-    timeoutMs: 180_000,
-  });
-  if (generationResult.exitCode !== 0) {
-    throw new Error(
-      `artifact smoke test failed\n${generationResult.stdout}\n${generationResult.stderr}`,
-    );
+  const generationResult = await runChecked(
+    "Artifact generation",
+    generationCheck,
+    180_000,
+  );
+
+  const stagedBytes = Buffer.alloc(256 * 1024, 0xa5);
+  const stagedBase64 = stagedBytes.toString("base64");
+  const stageHandle = await sandbox.commands.run(
+    "mkdir -p /workspace/inputs/smoke && sh -c 'base64 -d > \"$1\"' berry-stage /workspace/inputs/smoke/large.bin",
+    {
+      background: true,
+      stdin: true,
+      timeoutMs: 120_000,
+    },
+  );
+  if (!("pid" in stageHandle)) throw new Error("E2B did not return a staging command handle");
+  await stageHandle.sendStdin(stagedBase64);
+  await stageHandle.closeStdin();
+  const stageResult = await stageHandle.wait();
+  if (stageResult.exitCode !== 0) {
+    throw new Error(`streaming attachment staging failed\n${stageResult.stdout}\n${stageResult.stderr}`);
   }
+  const stagedHash = createHash("sha256").update(stagedBytes).digest("hex");
+  await runChecked("Runtime reads", [
+    "set -eu",
+    `test "$(sha256sum /workspace/inputs/smoke/large.bin | cut -d' ' -f1)" = "${stagedHash}"`,
+    "pdftotext -layout /workspace/outputs/aesg-smoke.pdf - | grep -q 'AESG Sandbox Validation'",
+    "grep -q 'AESG' /managed-skills/aesg-branding/references/brand-system.md",
+  ].join(" && "), 120_000);
 
   console.log(
     JSON.stringify(
       {
         ok: true,
         templateId,
-        dependencies: dependencyResult.stdout,
+        dependencies: dependencyOutput.join("\n"),
         artifacts: generationResult.stdout,
+        runtimeReads: "large streamed input, PDF text, and managed skill reference verified",
       },
       null,
       2,

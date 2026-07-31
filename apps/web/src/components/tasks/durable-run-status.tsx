@@ -6,7 +6,7 @@ export type RunPresentation = {
   visible: boolean;
   label: string;
   detail: string;
-  tone: "neutral" | "warning";
+  tone: "neutral";
 };
 
 export function runPresentation(
@@ -23,7 +23,7 @@ export function runPresentation(
       detail: state.nextAction ?? (userInput
         ? "Answer the question below to continue."
         : "Review the pending action to continue."),
-      tone: "warning",
+      tone: "neutral",
     };
   }
   return { visible: false, label: "", detail: "", tone: "neutral" };

@@ -167,4 +167,40 @@ describe("DockerSandboxProvider", () => {
       status: "stopped",
     });
   });
+
+  it("reads binary files as base64 inside the container without UTF-8 corruption", async () => {
+    const executor = new FakeDockerExecutor();
+    executor.nextRun = [
+      { stdout: "container_123\n", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "AP+AQQ==", stderr: "", exitCode: 0 },
+    ];
+    const provider = new DockerSandboxProvider({
+      executor,
+      imageAllowlist: ["berry/python:*"],
+    });
+    const sandbox = await provider.create({
+      request_id: "req_binary",
+      tenant_id: tenantId,
+      image: "berry/python:3.12",
+    });
+
+    await expect(provider.files.read({
+      sandbox_id: sandbox.sandbox_id,
+      path: "/workspace/binary.pdf",
+      encoding: "base64",
+    })).resolves.toMatchObject({
+      content: "AP+AQQ==",
+      size_bytes: 4,
+    });
+    expect(executor.runs[2]?.args).toEqual([
+      "exec",
+      "berry-sandbox-req_binary",
+      "base64",
+      "-w",
+      "0",
+      "--",
+      "/workspace/binary.pdf",
+    ]);
+  });
 });

@@ -7,7 +7,7 @@ import {
   NetworkPolicySchema,
   type JsonValue,
 } from "@berry/shared";
-import type { ChatToolDefinition } from "@berry/router-client";
+import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
 import type {
   DurableToolPolicy,
   DurableTurnSnapshot,
@@ -59,6 +59,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         },
       }));
     return [...inherited, ...mcpTools];
+  }
+
+  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
+    return this.base.modelContent?.(snapshot) ?? [];
   }
 
   policy(

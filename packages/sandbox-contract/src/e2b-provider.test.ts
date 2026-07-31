@@ -109,6 +109,24 @@ describe("E2BSandboxProvider", () => {
     ]));
   });
 
+  it("streams large command input through stdin instead of argv", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const sandbox = await provider.create({ request_id: "stdin", tenant_id: TENANT_ID, image: "base" });
+    const stdin = "A".repeat(256 * 1024);
+
+    await collectSandboxExecEvents(provider.exec({
+      sandbox_id: sandbox.sandbox_id,
+      request_id: "stdin-exec",
+      command: ["sh", "-c", "base64 -d > /workspace/input.bin"],
+      stdin,
+    }));
+
+    const handle = client.sandboxes.get(sandbox.sandbox_id)?.sandbox.lastCommandHandle;
+    expect(handle?.stdin).toBe(stdin);
+    expect(handle?.stdinClosed).toBe(true);
+  });
+
   it("loads direct E2B configuration from server environment", () => {
     const config = sandboxProviderConfigFromEnv({
       BERRY_SANDBOX_PROVIDER: "e2b",
@@ -217,6 +235,7 @@ class FakeE2BClient implements E2BSandboxClient {
 class FakeSandbox implements E2BSandboxLike {
   readonly filesByPath = new Map<string, { content: Uint8Array; modifiedTime: Date }>();
   onPause: (() => void) | undefined;
+  lastCommandHandle: FakeCommandHandle | undefined;
   readonly files: E2BSandboxLike["files"];
   readonly commands: E2BSandboxLike["commands"];
 
@@ -242,7 +261,10 @@ class FakeSandbox implements E2BSandboxLike {
     };
     this.commands = {
       run: async (command, options) => {
-        if (options?.background) return new FakeCommandHandle(command, options, this.blockCommands);
+        if (options?.background) {
+          this.lastCommandHandle = new FakeCommandHandle(command, options, this.blockCommands);
+          return this.lastCommandHandle;
+        }
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     };
@@ -266,6 +288,8 @@ class FakeSandbox implements E2BSandboxLike {
 
 class FakeCommandHandle implements E2BCommandHandleLike {
   readonly pid = 42;
+  stdin = "";
+  stdinClosed = false;
   #killed = false;
   #resolveKilled: (() => void) | undefined;
 
@@ -289,8 +313,12 @@ class FakeCommandHandle implements E2BCommandHandleLike {
     return true;
   }
 
-  async sendStdin(): Promise<void> {}
-  async closeStdin(): Promise<void> {}
+  async sendStdin(data: string): Promise<void> {
+    this.stdin += data;
+  }
+  async closeStdin(): Promise<void> {
+    this.stdinClosed = true;
+  }
 }
 
 function fileInfo(path: string, size: number, modifiedTime: Date): E2BFileInfoLike {

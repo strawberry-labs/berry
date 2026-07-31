@@ -191,9 +191,11 @@ export class DockerSandboxProvider implements SandboxProvider {
 
   async readFile(input: SandboxFileReadInput): Promise<SandboxFileReadResult> {
     const parsed = SandboxFileReadInputSchema.parse(input);
-    const result = await this.#executor.run(["exec", this.#containerName(parsed.sandbox_id), "cat", parsed.path]);
+    const result = await this.#executor.run(parsed.encoding === "base64"
+      ? ["exec", this.#containerName(parsed.sandbox_id), "base64", "-w", "0", "--", parsed.path]
+      : ["exec", this.#containerName(parsed.sandbox_id), "cat", parsed.path]);
     assertDockerOk(result, "read sandbox file");
-    const content = parsed.encoding === "base64" ? Buffer.from(result.stdout, "utf8").toString("base64") : result.stdout;
+    const content = result.stdout;
     return SandboxFileReadResultSchema.parse({
       path: parsed.path,
       encoding: parsed.encoding,

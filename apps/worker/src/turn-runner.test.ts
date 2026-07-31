@@ -260,6 +260,7 @@ describe("durable turn runner", () => {
       "list_files",
       "write_file",
       "run_command",
+      "persist_artifact",
     ]);
     expect(composePolicy).toEqual({
       retryClass: "read_only",
@@ -542,6 +543,10 @@ describe("durable turn runner", () => {
             parameters: { type: "object" },
           },
         }],
+        additionalUserContent: [{
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,AQID" },
+        }],
         emitDelta: async (delta, channel) => { deltas.push({ delta, channel }); },
         policyForTool: () => ({
           retryClass: "read_only",
@@ -558,12 +563,18 @@ describe("durable turn runner", () => {
     expect(request?.messages[0]?.content).toContain(
       "call ask_user_question so the frontend renders the interactive question UI",
     );
-    expect(request?.messages.find((message) => message.role === "user")?.content).toContain(
+    const userContent = request?.messages.find((message) => message.role === "user")?.content;
+    expect(Array.isArray(userContent)).toBe(true);
+    expect(JSON.stringify(userContent)).toContain(
       "Sandbox path: /workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
-    expect(request?.messages.find((message) => message.role === "user")?.content).toContain(
+    expect(JSON.stringify(userContent)).toContain(
       "read_file extracts its text",
     );
+    expect(userContent).toContainEqual({
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,AQID" },
+    });
     expect(deltas.filter((item) => item.channel === "text").map((item) => item.delta).join("")).toBe("Searching");
     expect(deltas.filter((item) => item.channel === "reasoning").map((item) => item.delta).join("")).toBe("Need current sources.");
     expect(result).toMatchObject({

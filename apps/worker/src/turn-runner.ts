@@ -17,6 +17,7 @@ import {
   OpenAIChatCompletionsClient,
   parseKimiToolCalls,
   RouterClientError,
+  type ChatContentPart,
   type ChatMessage,
   type ChatToolCall,
   type ChatToolDefinition,
@@ -248,6 +249,7 @@ export interface DurableToolPolicy {
 export interface DurableModelCallContext {
   messageId: string;
   tools: readonly ChatToolDefinition[];
+  additionalUserContent?: readonly ChatContentPart[];
   emitDelta(delta: string, channel: "text" | "reasoning"): Promise<void>;
   policyForTool(name: string): DurableToolPolicy;
 }
@@ -268,6 +270,7 @@ export interface TurnToolResult {
 
 export interface DurableTurnToolExecutor {
   definitions?(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]>;
+  modelContent?(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
   execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult>;
 }
@@ -454,13 +457,17 @@ export class DurableTurnRunner {
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
     const result = await this.withHeartbeat(snapshot, async () => {
-      const extensionTools = await this.tools.definitions?.(snapshot) ?? [];
+      const [extensionTools, additionalUserContent] = await Promise.all([
+        this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
+        this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
+      ]);
       const definitions = [...DURABLE_TOOL_DEFINITIONS, ...extensionTools];
       const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
       try {
         return await this.model.call(snapshot, step, {
           messageId,
           tools: definitions,
+          additionalUserContent,
           emitDelta: (delta, channel) => writer.write(delta, channel),
           policyForTool: (name) => this.tools.policy?.(snapshot, name, permissionMode)
             ?? durableToolPolicy(name, permissionMode),
@@ -1525,7 +1532,10 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     step: DurableTurnStep,
     context: DurableModelCallContext,
   ): Promise<TurnModelResult> {
-    const { messages, stableSystemPrompt } = modelMessages(snapshot);
+    const { messages, stableSystemPrompt } = modelMessages(
+      snapshot,
+      context.additionalUserContent,
+    );
     const model = stringValue(snapshot.runtimeRequest.model) ?? this.modelName;
     const currentManifest = PromptManifestSchema.safeParse(snapshot.promptManifest);
     const cachePlan = planDurablePromptCache({
@@ -1934,6 +1944,13 @@ function durableToolPolicy(name: string, permissionMode: string): {
       approvalKind: "file-edit",
     };
   }
+  if (name === "persist_artifact") {
+    return {
+      retryClass: "idempotent_with_key",
+      requiresApproval: false,
+      approvalKind: "file-edit",
+    };
+  }
   return {
     retryClass: "non_idempotent_manual",
     requiresApproval: permissionMode !== "full-access",
@@ -1993,10 +2010,14 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "When the user explicitly asks you to remember or forget a durable personal fact or preference, call remember_memory or forget_memory when that tool is declared. Confirm the change only after the tool succeeds.",
   "When the user explicitly asks you to ask questions, collect requirements, or clarify choices, call ask_user_question so the frontend renders the interactive question UI. Do not print the questionnaire as ordinary prose.",
   "When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call compose_message so it renders as an editable writing block. Use one variant unless genuinely different strategies are useful, reuse the same draft id for revisions, and do not repeat the draft body in prose after the tool succeeds.",
+  "When you create a final downloadable file, save it under /workspace/outputs and call persist_artifact before saying it is ready.",
   "Explain the final result clearly.",
 ].join("\n\n");
 
-function modelMessages(snapshot: DurableTurnSnapshot): {
+function modelMessages(
+  snapshot: DurableTurnSnapshot,
+  additionalUserContent: readonly ChatContentPart[] = [],
+): {
   messages: ChatMessage[];
   stableSystemPrompt: string;
 } {
@@ -2069,6 +2090,23 @@ function modelMessages(snapshot: DurableTurnSnapshot): {
         ? "Continue the task from the portable checkpoint and persisted state."
         : stringValue(snapshot.runtimeRequest.input) ?? "Continue the task.",
     });
+  }
+  if (additionalUserContent.length > 0) {
+    let lastUserIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "user") {
+        lastUserIndex = index;
+        break;
+      }
+    }
+    const lastUser = messages[lastUserIndex];
+    if (lastUser) {
+      const text = contentText(lastUser.content);
+      lastUser.content = [
+        ...(text ? [{ type: "text" as const, text }] : []),
+        ...additionalUserContent,
+      ];
+    }
   }
   return { messages, stableSystemPrompt };
 }
@@ -2271,6 +2309,23 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
         properties: {
           command: { type: "string" },
           timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000 },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "persist_artifact",
+      description: "Publish one completed file from /workspace/outputs into durable task storage so the user can open and download it.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path"],
+        properties: {
+          path: { type: "string", description: "Completed file path under /workspace/outputs" },
+          name: { type: "string", description: "Optional user-facing filename" },
+          media_type: { type: "string", description: "Optional MIME type; inferred from the filename when omitted" },
         },
       },
     },
