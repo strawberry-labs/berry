@@ -16,6 +16,18 @@ type Draft = ComposerQuestionAnswer & {
   mode: "choice" | "custom" | "skipped";
 };
 
+export function updateCustomAnswerDraft(
+  drafts: Record<number, Draft>,
+  index: number,
+  question: string,
+  answer: string,
+): Record<number, Draft> {
+  return {
+    ...drafts,
+    [index]: { question, answer, selectedOptions: [], skipped: false, mode: "custom" },
+  };
+}
+
 function promptItems(question: QuestionPrompt) {
   return question.questions.length > 0
     ? question.questions
@@ -228,7 +240,12 @@ export function ComposerQuestionOverlay({
               value={draft?.answer ?? ""}
               disabled={pending}
               placeholder="Enter your own answer"
-              onChange={(event) => setDrafts((currentDrafts) => ({ ...currentDrafts, [current]: { question: prompt.question, answer: event.currentTarget.value, selectedOptions: [], skipped: false, mode: "custom" } }))}
+              onChange={(event) => {
+                // React clears SyntheticEvent.currentTarget after this handler.
+                // Capture the value before the state updater may run concurrently.
+                const answer = event.currentTarget.value;
+                setDrafts((currentDrafts) => updateCustomAnswerDraft(currentDrafts, current, prompt.question, answer));
+              }}
             />
           ) : <button type="button" className="berry-composer-question-custom-label" disabled={pending} onClick={selectCustom}>Or enter your own choice</button>}
           {isCustom && draft?.answer.trim() ? <Button type="button" variant="secondary" size="sm" className="berry-composer-question-custom-next" disabled={pending} onClick={() => advance({ ...draft, answer: draft.answer.trim() })}>{current === items.length - 1 ? "Send" : "Next"}</Button> : null}

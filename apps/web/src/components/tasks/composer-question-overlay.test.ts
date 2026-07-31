@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { questionAnswerTranscript, questionToolAnswer } from "./composer-question-overlay.tsx";
+import { questionAnswerTranscript, questionToolAnswer, updateCustomAnswerDraft } from "./composer-question-overlay.tsx";
 
 describe("question answer summaries", () => {
   const answers = [
@@ -13,5 +13,17 @@ describe("question answer summaries", () => {
 
   it("keeps skipped answers explicit for the agent tool result", () => {
     expect(questionToolAnswer(answers)).toBe("Which environment?: Production\nWhat should be omitted?: Skipped");
+  });
+
+  it("stores a captured custom answer without retaining the React input event", () => {
+    expect(updateCustomAnswerDraft({}, 0, "Monthly allowance?", "SAR 5,000")).toEqual({
+      0: {
+        question: "Monthly allowance?",
+        answer: "SAR 5,000",
+        selectedOptions: [],
+        skipped: false,
+        mode: "custom",
+      },
+    });
   });
 });
