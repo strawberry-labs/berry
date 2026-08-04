@@ -1,5 +1,6 @@
 import * as React from "react";
 import {
+  Activity,
   Check,
   Copy,
   Download,
@@ -539,6 +540,160 @@ function ResourceAccessScreen({
   );
 }
 
+/* --------------------------------------------------------------- providers */
+function ProvidersScreen({
+  client,
+  tenantId,
+  permissions,
+}: ManagementScreenProps) {
+  const canWrite = permissions.includes("models:write");
+  const r = useResource(
+    `model-providers:${tenantId}`,
+    async () =>
+      client
+        ? Promise.all([
+            client.listOrganizationModelProviders(tenantId),
+            client.listOrgModels(tenantId, { includeBlocked: true }),
+          ])
+        : [[], []],
+    [[], []] as any,
+  );
+  const [providers, models] = r.data;
+  const [open, setOpen] = React.useState(false);
+  const [enabled, setEnabled] = React.useState(true);
+  const [message, setMessage] = React.useState("");
+  const [testError, setTestError] = React.useState("");
+  const [testingProviderId, setTestingProviderId] = React.useState<string | null>(null);
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const optional = (name: string) => String(form.get(name) ?? "").trim() || null;
+    await client?.upsertOrganizationModelProvider(tenantId, {
+      providerId: String(form.get("providerId")).trim(),
+      displayName: String(form.get("displayName")).trim(),
+      kind: String(form.get("kind")) as any,
+      apiType: String(form.get("apiType")) as any,
+      baseUrl: String(form.get("baseUrl")).trim().replace(/\/$/, ""),
+      endpointPath: optional("endpointPath"),
+      modelsPath: optional("modelsPath"),
+      authType: String(form.get("authType")) as any,
+      credentialRef: optional("credentialRef"),
+      defaultModel: optional("defaultModel"),
+      enabled,
+    });
+    setOpen(false);
+    setMessage("Provider configuration saved without storing a raw API key.");
+    r.retry();
+  };
+
+  const testProvider = async (providerId: string) => {
+    if (!client) return;
+    setMessage("");
+    setTestError("");
+    setTestingProviderId(providerId);
+    try {
+      await client.testOrganizationModelProvider(tenantId, providerId);
+      setMessage("Provider passed its guarded health check and is active for organization runtime traffic.");
+      r.retry();
+    } catch (error) {
+      setTestError(error instanceof Error ? error.message : "Provider activation failed.");
+      r.retry();
+    } finally {
+      setTestingProviderId(null);
+    }
+  };
+
+  return (
+    <ManagementPage
+      title="Providers"
+      description="Register Berry Router, direct cloud providers, and local inference endpoints. Provider secrets stay in deployment secret storage."
+      eyebrow="AI & tools"
+      actions={canWrite ? <Button onClick={() => setOpen(true)}><Plus />Add provider</Button> : null}
+    >
+      {message ? <SuccessMessage>{message}</SuccessMessage> : null}
+      {testError ? <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">{testError}</p> : null}
+      <AsyncState
+        loading={r.loading}
+        error={r.error}
+        onRetry={r.retry}
+        empty={providers.length === 0}
+        emptyTitle="No organization providers"
+        emptyText="Berry can start without a model provider. Register one here when the deployment is ready for live inference."
+      >
+        <MetricGrid items={[
+          { label: "Registered", value: formatNumber(providers.length) },
+          { label: "Enabled", value: formatNumber(providers.filter((item: any) => item.enabled).length) },
+          { label: "Configured models", value: formatNumber(models.length) },
+          { label: "Needs activation", value: formatNumber(providers.filter((item: any) => item.status === "configured").length), status: providers.some((item: any) => item.status === "error") ? "danger" : "warning" },
+        ]} />
+        <Section
+          title="Provider registry"
+          description="Configured means the metadata is saved. Active means the runtime has resolved its credential and passed a guarded health check."
+        >
+          <DataTable
+            label="Organization model providers"
+            columns={["Provider", "Protocol", "Base URL", "Credential", "Default model", "State", "Updated", "Actions"]}
+            rows={providers.map((provider: any) => [
+              <span><b>{provider.displayName}</b><small>{provider.providerId} · {humanize(provider.kind)}</small></span>,
+              humanize(provider.apiType),
+              <span className="max-w-72 break-all font-mono text-xs">{provider.baseUrl}</span>,
+              provider.authType === "none" ? "Keyless" : provider.credentialRef ?? "Missing reference",
+              provider.defaultModel ?? "—",
+              <StatusPill tone={provider.status === "active" ? "good" : provider.status === "error" ? "danger" : provider.status === "configured" ? "warning" : "neutral"}>{provider.status}</StatusPill>,
+              formatDateTime(provider.updatedAt),
+              canWrite ? <Button variant="secondary" disabled={!provider.enabled || testingProviderId === provider.providerId} onClick={() => void testProvider(provider.providerId)}><Activity />{testingProviderId === provider.providerId ? "Testing…" : "Test & activate"}</Button> : "—",
+            ])}
+          />
+        </Section>
+        <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          Raw API keys are intentionally not accepted here. Set the referenced secret in deployment storage, allowlist the provider host with BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS, then run Test &amp; activate.
+        </p>
+      </AsyncState>
+      <ManagementDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Add model provider"
+        description="Save connection metadata and a secret reference. This form never accepts or returns the provider API key itself."
+        size="lg"
+        footer={<><Button type="button" variant="secondary" onClick={() => setOpen(false)}>Cancel</Button><Button type="submit" form="provider-form"><Save />Save provider</Button></>}
+      >
+        <form id="provider-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submit}>
+          <label>Display name<Input name="displayName" autoFocus placeholder="OpenAI production" required /></label>
+          <label>Provider ID<Input name="providerId" pattern="[A-Za-z0-9._-]+" placeholder="openai-production" required /></label>
+          <label>Provider kind<FormSelect name="kind" defaultValue="openai-compatible" options={[
+            { value: "berry-router", label: "Berry Router" },
+            { value: "openai", label: "OpenAI" },
+            { value: "anthropic", label: "Anthropic" },
+            { value: "openai-compatible", label: "OpenAI-compatible" },
+            { value: "ollama", label: "Ollama" },
+            { value: "lm-studio", label: "LM Studio" },
+            { value: "local", label: "Other local" },
+            { value: "custom", label: "Custom" },
+          ]} /></label>
+          <label>API protocol<FormSelect name="apiType" defaultValue="openai-chat-completions" options={[
+            { value: "openai-chat-completions", label: "OpenAI chat completions" },
+            { value: "openai-responses", label: "OpenAI responses" },
+            { value: "anthropic-messages", label: "Anthropic messages" },
+          ]} /></label>
+          <label className="sm:col-span-2">Base URL<Input name="baseUrl" type="url" placeholder="https://api.openai.com/v1" required /></label>
+          <label>Request path<Input name="endpointPath" placeholder="/chat/completions" /></label>
+          <label>Models path<Input name="modelsPath" placeholder="/models" /></label>
+          <label>Authentication<FormSelect name="authType" defaultValue="bearer" options={[
+            { value: "bearer", label: "Bearer secret" },
+            { value: "x-api-key", label: "x-api-key secret" },
+            { value: "optional-bearer", label: "Optional bearer" },
+            { value: "none", label: "No authentication" },
+          ]} /></label>
+          <label>Credential reference<Input name="credentialRef" pattern="[A-Za-z0-9_.:/-]+" placeholder="env:BERRY_OPENAI_API_KEY" /></label>
+          <label>Default model<Input name="defaultModel" placeholder="gpt-5.4" /></label>
+          <label className="flex-row items-center justify-between rounded-lg border border-border px-3 py-2.5 text-sm text-foreground">Enabled<ManagementSwitch checked={enabled} onCheckedChange={setEnabled} aria-label="Provider enabled" /></label>
+        </form>
+      </ManagementDialog>
+    </ManagementPage>
+  );
+}
+
 /* ------------------------------------------------------------------ models */
 function ModelsScreen({
   client,
@@ -554,18 +709,35 @@ function ModelsScreen({
         ? Promise.all([
             client.listOrgModels(tenantId, { includeBlocked: true }),
             client.listOrgModelDefaults(tenantId),
+            client.listOrganizationModelProviders(tenantId),
+            client.listOrgAiAccessRules(tenantId),
+            client.listOrgMembers(tenantId),
+            client.listDepartments(tenantId),
           ])
-        : [config.modelPolicies as any[], config.modelDefaults as any[]],
-    [[], []] as any,
+        : [
+            config.modelPolicies as any[],
+            config.modelDefaults as any[],
+            [],
+            [],
+            [],
+            config.departments.filter((item) => item.tenantId === tenantId),
+          ],
+    [[], [], [], [], [], []] as any,
   );
-  const [models, defaults]: [any[], any[]] = r.data;
+  const [models, defaults, registeredProviders, accessRules, members, departments]: [any[], any[], any[], any[], any[], any[]] = r.data;
   const [query, setQuery] = React.useState("");
   const [provider, setProvider] = React.useState("all");
   const [status, setStatus] = React.useState("all");
   const [active, setActive] = React.useState<number | null>(null);
   const [draft, setDraft] = React.useState<any>(null);
   const [message, setMessage] = React.useState("");
-  const providers = [...new Set((models ?? []).map((m) => m.providerId))];
+  const [adding, setAdding] = React.useState(false);
+  const [addingRule, setAddingRule] = React.useState(false);
+  const [ruleScope, setRuleScope] = React.useState<"org" | "department" | "user">("department");
+  const providers = [...new Set([
+    ...(registeredProviders ?? []).map((item) => item.providerId),
+    ...(models ?? []).map((m) => m.providerId),
+  ])];
   const rows = (models ?? []).filter(
     (m) =>
       `${m.displayName ?? ""} ${m.model}`
@@ -573,6 +745,18 @@ function ModelsScreen({
         .includes(query.toLowerCase()) &&
       (provider === "all" || m.providerId === provider) &&
       (status === "all" || m.status === status),
+  );
+  const modelNames = new Map(
+    (models ?? []).map((item) => [
+      `${item.providerId}:${item.model}`,
+      item.displayName || item.model,
+    ]),
+  );
+  const memberNames = new Map(
+    (members ?? []).map((item) => [item.userId, item.name || item.email || item.userId]),
+  );
+  const departmentNames = new Map(
+    (departments ?? []).map((item) => [item.id, item.name || item.id]),
   );
   const detail = active != null ? rows[active] : null;
   React.useEffect(() => {
@@ -594,6 +778,22 @@ function ModelsScreen({
         ? [...new Set([...(d.modeAllow ?? []), mode])]
         : (d.modeAllow ?? []).filter((x: string) => x !== mode),
     }));
+  const setCost = (key: "input" | "output" | "cacheRead" | "cacheWrite", value: string) =>
+    setDraft((current: any) => ({
+      ...current,
+      capabilities: {
+        ...(current.capabilities ?? {}),
+        cost: { ...(current.capabilities?.cost ?? {}), [key]: value === "" ? undefined : Number(value) },
+      },
+    }));
+  const setContext = (key: "windowTokens" | "maxOutputTokens", value: string) =>
+    setDraft((current: any) => ({
+      ...current,
+      capabilities: {
+        ...(current.capabilities ?? {}),
+        context: { ...(current.capabilities?.context ?? {}), [key]: value === "" ? undefined : Number(value) },
+      },
+    }));
   const save = async () => {
     if (!draft) return;
     await client?.upsertOrgModelPolicy(tenantId, {
@@ -603,10 +803,16 @@ function ModelsScreen({
       status: draft.status,
       enforce: draft.enforce,
       modeAllow: draft.modeAllow,
+      apiType: draft.apiType ?? null,
+      capabilities: draft.capabilities ?? {},
     });
     r.setData([
       (models ?? []).map((m) => (m.id === draft.id ? { ...m, ...draft } : m)),
       defaults,
+      registeredProviders,
+      accessRules,
+      members,
+      departments,
     ]);
     setMessage("Model policy saved and recorded in the audit log.");
   };
@@ -628,14 +834,72 @@ function ModelsScreen({
         updatedAt: new Date().toISOString(),
       },
     ];
-    r.setData([models, next]);
+    r.setData([models, next, registeredProviders, accessRules, members, departments]);
     setMessage(`Set as the ${mode} default and recorded in the audit log.`);
+  };
+  const addModel = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const number = (name: string) => {
+      const value = String(form.get(name) ?? "");
+      return value === "" ? undefined : Number(value);
+    };
+    await client?.upsertOrgModelPolicy(tenantId, {
+      providerId: String(form.get("providerId")),
+      model: String(form.get("model")),
+      displayName: String(form.get("displayName")) || null,
+      apiType: String(form.get("apiType")) as any,
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+      capabilities: {
+        cost: { input: number("inputPrice"), output: number("outputPrice"), cacheRead: number("cacheReadPrice"), cacheWrite: number("cacheWritePrice") },
+        context: { windowTokens: number("contextWindow"), maxOutputTokens: number("maxOutput") },
+      },
+    });
+    setAdding(false);
+    setMessage("Model added with its pricing and context metadata.");
+    r.retry();
+  };
+  const addAccessRule = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const scopeType = String(form.get("scopeType")) as "org" | "department" | "user";
+    const scopeId = scopeType === "org" ? tenantId : String(form.get("scopeId"));
+    const input = {
+      scopeType,
+      scopeId,
+      resourceType: "model" as const,
+      resourceId: String(form.get("resourceId")),
+      effect: String(form.get("effect")) as "allowed" | "blocked",
+    };
+    const saved = await client?.upsertOrgAiAccessRule(tenantId, input);
+    const nextRule = saved ?? {
+      id: crypto.randomUUID(),
+      tenantId,
+      ...input,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const nextRules = [
+      nextRule,
+      ...(accessRules ?? []).filter((rule) =>
+        rule.scopeType !== input.scopeType
+        || rule.scopeId !== input.scopeId
+        || rule.resourceType !== input.resourceType
+        || rule.resourceId !== input.resourceId
+      ),
+    ];
+    r.setData([models, defaults, registeredProviders, nextRules, members, departments]);
+    setAddingRule(false);
+    setMessage("Scoped model access saved and recorded in the audit log.");
   };
   return (
     <ManagementPage
       title="Models"
-      description="Control which models are available and set the defaults for Chat and Code."
-      eyebrow="AI controls"
+      description="Add provider models, record token pricing and context limits, control availability, and set Chat or Code defaults."
+      eyebrow="AI & tools"
+      actions={canWrite ? <><Button variant="secondary" onClick={() => setAddingRule(true)}><ShieldCheck />Access rule</Button><Button onClick={() => setAdding(true)}><Plus />Add model</Button></> : null}
     >
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
         <section
@@ -821,6 +1085,22 @@ function ModelsScreen({
                   aria-label="Enforce policy"
                 />
               </label>
+              <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
+                <legend>Pricing (USD per 1M tokens)</legend>
+                <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:text-muted-foreground">
+                  <label>Input<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.input ?? ""} onChange={(event) => setCost("input", event.currentTarget.value)} /></label>
+                  <label>Output<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.output ?? ""} onChange={(event) => setCost("output", event.currentTarget.value)} /></label>
+                  <label>Cache read<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.cacheRead ?? ""} onChange={(event) => setCost("cacheRead", event.currentTarget.value)} /></label>
+                  <label>Cache write<Input type="number" min="0" step="0.0001" value={draft.capabilities?.cost?.cacheWrite ?? ""} onChange={(event) => setCost("cacheWrite", event.currentTarget.value)} /></label>
+                </div>
+              </fieldset>
+              <fieldset className="grid gap-3 border-0 p-0" disabled={!canWrite}>
+                <legend>Context limits</legend>
+                <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:text-muted-foreground">
+                  <label>Context window<Input type="number" min="1" step="1" value={draft.capabilities?.context?.windowTokens ?? ""} onChange={(event) => setContext("windowTokens", event.currentTarget.value)} /></label>
+                  <label>Maximum output<Input type="number" min="1" step="1" value={draft.capabilities?.context?.maxOutputTokens ?? ""} onChange={(event) => setContext("maxOutputTokens", event.currentTarget.value)} /></label>
+                </div>
+              </fieldset>
               {draft.capabilities && Object.keys(draft.capabilities).length ? (
                 <>
                   <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -863,7 +1143,66 @@ function ModelsScreen({
             </DetailDrawer>
           ) : null}
         </div>
+        <Section
+          title="Scoped model access"
+          description="Organization blocks are absolute. A member exception can override their primary department default only when the organization policy permits the model."
+        >
+          <DataTable
+            label="Scoped model access rules"
+            columns={["Model", "Scope", "Target", "Effect", "Updated"]}
+            rows={(accessRules ?? []).filter((rule) => rule.resourceType === "model").map((rule) => [
+              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"><b>{modelNames.get(rule.resourceId) ?? rule.resourceId}</b><small>{rule.resourceId}</small></span>,
+              humanize(rule.scopeType),
+              rule.scopeType === "org"
+                ? "Entire organization"
+                : rule.scopeType === "department"
+                  ? departmentNames.get(rule.scopeId) ?? rule.scopeId
+                  : memberNames.get(rule.scopeId) ?? rule.scopeId,
+              <StatusPill tone={rule.effect === "allowed" ? "good" : "danger"}>{humanize(rule.effect)}</StatusPill>,
+              formatDate(rule.updatedAt),
+            ])}
+          />
+        </Section>
       </AsyncState>
+      <ManagementDialog
+        open={adding}
+        onOpenChange={setAdding}
+        title="Add model"
+        description="Register a model identifier and the pricing Berry will use for cost estimates and usage reporting."
+        size="lg"
+        footer={<><Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button><Button type="submit" form="add-model-form"><Save />Add model</Button></>}
+      >
+        <form id="add-model-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={addModel}>
+          <label>Provider<FormSelect name="providerId" options={providers.map((item) => ({ value: String(item), label: String(item) }))} required /></label>
+          <label>Model ID<Input name="model" placeholder="gpt-5.4" autoFocus required /></label>
+          <label>Display name<Input name="displayName" placeholder="GPT-5.4" /></label>
+          <label>API protocol<FormSelect name="apiType" defaultValue="openai-chat-completions" options={[{ value: "openai-chat-completions", label: "OpenAI chat completions" }, { value: "openai-responses", label: "OpenAI responses" }, { value: "anthropic-messages", label: "Anthropic messages" }]} /></label>
+          <label>Input price / 1M tokens<Input name="inputPrice" type="number" min="0" step="0.0001" /></label>
+          <label>Output price / 1M tokens<Input name="outputPrice" type="number" min="0" step="0.0001" /></label>
+          <label>Cache-read price / 1M<Input name="cacheReadPrice" type="number" min="0" step="0.0001" /></label>
+          <label>Cache-write price / 1M<Input name="cacheWritePrice" type="number" min="0" step="0.0001" /></label>
+          <label>Context window<Input name="contextWindow" type="number" min="1" step="1" /></label>
+          <label>Maximum output<Input name="maxOutput" type="number" min="1" step="1" /></label>
+        </form>
+      </ManagementDialog>
+      <ManagementDialog
+        open={addingRule}
+        onOpenChange={setAddingRule}
+        title="Add model access rule"
+        description="Set the normal department policy or a specific member exception. Organization blocks remain the final ceiling."
+        footer={<><Button type="button" variant="secondary" onClick={() => setAddingRule(false)}>Cancel</Button><Button type="submit" form="add-model-access-rule-form"><Save />Save rule</Button></>}
+      >
+        <form id="add-model-access-rule-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={addAccessRule}>
+          <label className="sm:col-span-2">Model<FormSelect name="resourceId" options={(models ?? []).map((item) => ({ value: `${item.providerId}:${item.model}`, label: `${item.displayName || item.model} · ${item.providerId}` }))} required /></label>
+          <label>Scope<FormSelect name="scopeType" value={ruleScope} onChange={(value) => setRuleScope(value as typeof ruleScope)} options={[{ value: "department", label: "Department default" }, { value: "user", label: "Member exception" }, { value: "org", label: "Organization ceiling" }]} /></label>
+          {ruleScope === "org" ? (
+            <label>Target<Input value="Entire organization" disabled /></label>
+          ) : (
+            <label>Target<FormSelect name="scopeId" options={(ruleScope === "department" ? departments : members).map((item) => ({ value: String(ruleScope === "department" ? item.id : item.userId), label: ruleScope === "department" ? String(item.name) : `${item.name || item.email} · ${item.email}` }))} required /></label>
+          )}
+          <label className="sm:col-span-2">Policy<FormSelect name="effect" defaultValue="blocked" options={[{ value: "allowed", label: "Allow" }, { value: "blocked", label: "Block" }]} /></label>
+        </form>
+      </ManagementDialog>
     </ManagementPage>
   );
 }
@@ -2001,22 +2340,32 @@ function ManagedPolicyScreen({
 }
 
 /* -------------------------------------------------------------- audit log */
-function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
+function AuditLogScreen({ client, config, tenantId, permissions }: ManagementScreenProps) {
   const r = useResource(
     `audit:${tenantId}`,
     async () =>
       client
-        ? client.listAuditEvents(tenantId, { limit: 100 })
-        : config.auditEvents.filter((x) => x.tenantId === tenantId),
-    [] as any[],
+        ? Promise.all([
+            client.listAuditEvents(tenantId, { limit: 100 }),
+            permissions.includes("members:read") ? client.listOrgMembers(tenantId) : Promise.resolve([]),
+          ])
+        : [config.auditEvents.filter((x) => x.tenantId === tenantId), []],
+    [[], []] as any,
   );
+  const [events, members]: [any[], any[]] = r.data;
+  const memberById = new Map((members ?? []).map((member) => [member.userId, member]));
+  const actorLabel = (actorUserId: string | null) => {
+    if (!actorUserId) return "System";
+    const member = memberById.get(actorUserId);
+    return member ? member.name || member.email : actorUserId;
+  };
   const [query, setQuery] = React.useState("");
   const [category, setCategory] = React.useState("all");
   const [active, setActive] = React.useState<number | null>(null);
-  const categories = [...new Set(r.data.map((x: any) => x.category))];
-  const rows = r.data.filter(
+  const categories = [...new Set(events.map((x: any) => x.category))];
+  const rows = events.filter(
     (x: any) =>
-      `${x.action} ${x.actorUserId ?? ""} ${x.targetId ?? ""}`
+      `${x.action} ${x.category} ${actorLabel(x.actorUserId)} ${memberById.get(x.actorUserId)?.email ?? ""} ${x.targetId ?? ""} ${x.workspaceId ?? ""} ${x.taskId ?? ""} ${x.sessionId ?? ""}`
         .toLowerCase()
         .includes(query.toLowerCase()) &&
       (category === "all" || x.category === category),
@@ -2026,7 +2375,8 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
     const header = [
       "sequence",
       "ts",
-      "actor",
+      "actorName",
+      "actorUserId",
       "category",
       "action",
       "targetType",
@@ -2036,12 +2386,13 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
       [
         x.sequence,
         x.ts ?? x.createdAt,
+        actorLabel(x.actorUserId),
         x.actorUserId ?? "system",
         x.category,
         x.action,
         x.targetType ?? "",
         x.targetId ?? "",
-      ].join(","),
+      ].map((value) => `"${String(value).replaceAll('"', '""')}"`).join(","),
     );
     const csv = [header.join(","), ...body].join("\n");
     const a = document.createElement("a");
@@ -2091,13 +2442,14 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
         >
           <DataTable
             label="Audit events"
-            columns={["Time", "Actor", "Action", "Target", "Sequence"]}
+            columns={["Time", "Actor", "Category", "Action", "Target", "Context", "Sequence"]}
             onRowSelect={setActive}
             activeRow={active}
             rowLabel={(i) => `${rows[i].category} ${rows[i].action}`}
             rows={rows.map((x: any) => [
               formatDateTime(x.ts ?? x.createdAt),
-              x.actorUserId ?? "System",
+              <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"><b>{actorLabel(x.actorUserId)}</b><small>{memberById.get(x.actorUserId)?.email ?? x.actorUserId ?? "Service initiated"}</small></span>,
+              humanize(x.category),
               <span className="grid min-w-0 gap-0.5 [&_b]:truncate [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
                 <b>{humanize(x.action)}</b>
                 <small>
@@ -2107,6 +2459,7 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
               x.targetId
                 ? `${humanize(x.targetType ?? "")}: ${x.targetId}`
                 : "—",
+              x.workspaceId ? `Workspace ${x.workspaceId}` : x.taskId ? `Task ${x.taskId}` : x.sessionId ? `Session ${x.sessionId}` : "Organization",
               <code>#{x.sequence}</code>,
             ])}
           />
@@ -2124,13 +2477,19 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
                   term: "Time",
                   detail: formatDateTime(detail.ts ?? detail.createdAt),
                 },
-                { term: "Actor", detail: detail.actorUserId ?? "System" },
+                { term: "Actor", detail: actorLabel(detail.actorUserId) },
+                { term: "Actor ID", detail: detail.actorUserId ?? "System" },
                 {
                   term: "Target",
                   detail: detail.targetId
                     ? `${humanize(detail.targetType ?? "")}: ${detail.targetId}`
                     : "—",
                 },
+                { term: "Event ID", detail: detail.id },
+                { term: "Workspace", detail: detail.workspaceId ?? "—" },
+                { term: "Task", detail: detail.taskId ?? "—" },
+                { term: "Session", detail: detail.sessionId ?? "—" },
+                { term: "Retained until", detail: formatDateTime(detail.expiresAt) },
               ]}
             />
             {detail.before || detail.after ? (
@@ -2171,7 +2530,7 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
                       term: "Previous hash",
                       detail: (
                         <code className="inline-flex items-center gap-1 font-mono text-xs">
-                          {String(detail.previousHash ?? "—").slice(0, 24)}…
+                          <span className="break-all">{String(detail.previousHash ?? "—")}</span>
                         </code>
                       ),
                     },
@@ -2179,7 +2538,7 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
                       term: "Event hash",
                       detail: (
                         <code className="inline-flex items-center gap-1 font-mono text-xs">
-                          {String(detail.eventHash).slice(0, 24)}…
+                          <span className="break-all">{String(detail.eventHash)}</span>
                         </code>
                       ),
                     },
@@ -2198,6 +2557,7 @@ function AuditLogScreen({ client, config, tenantId }: ManagementScreenProps) {
 const PERMISSION_FOR: Record<string, OrgPermission> = {
   roles: "rbac:read",
   "resource-access": "acl:read",
+  providers: "models:read",
   models: "models:read",
   "skills-mcp": "org:read",
   "feature-access": "feature_flags:read",
@@ -2217,6 +2577,8 @@ export function AdminCatalogScreen({
       return <RolesScreen {...props} />;
     case "resource-access":
       return <ResourceAccessScreen {...props} />;
+    case "providers":
+      return <ProvidersScreen {...props} />;
     case "models":
       return <ModelsScreen {...props} />;
     case "skills-mcp":

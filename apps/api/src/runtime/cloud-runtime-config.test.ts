@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SELF_HOST_TENANT_ID } from "@berry/db";
 import { CloudRuntimeConfigService, createCloudRuntimeConfigFromEnv } from "./cloud-runtime-config.ts";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -64,7 +65,7 @@ describe("cloud runtime configuration", () => {
     expect(config.provider?.completionFallback).toBeUndefined();
   });
 
-  it("removes declared cache controls from the inline rollback path when disabled", () => {
+  it("removes declared cache controls from the inline rollback path when disabled", async () => {
     const service = new CloudRuntimeConfigService({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_DEFAULT_MODEL: "model-a",
@@ -81,7 +82,8 @@ describe("cloud runtime configuration", () => {
       }]),
     });
 
-    expect(service.resolve({}).provider.models?.[0]?.capabilities?.promptCaching).toBeUndefined();
+    const resolved = await service.resolve(SELF_HOST_TENANT_ID, {});
+    expect(resolved.provider.models?.[0]?.capabilities?.promptCaching).toBeUndefined();
   });
 
   it("rejects an unknown completion transport", () => {

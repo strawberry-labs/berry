@@ -45,6 +45,10 @@ import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { MemoryService } from "../memory/memory.service.ts";
 import { DurableTurnService } from "../runtime/durable-turn.service.ts";
+import {
+  ENTERPRISE_IDENTITY_REPOSITORY,
+  type EnterpriseIdentityRepository,
+} from "../identity/identity.repository.ts";
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -213,7 +217,14 @@ export class AgentApiController {
     @Inject(MemoryService) private readonly memory: MemoryService,
     @Inject(ContextAssemblyService) private readonly contextAssembly: ContextAssemblyService,
     @Inject(DurableTurnService) private readonly durableTurns: DurableTurnService,
+    @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
   ) {}
+
+  async #primaryDepartmentId(tenantId: string, userId: string | null): Promise<string | null> {
+    if (!userId) return null;
+    const membership = await this.identity.getMembership(tenantId, userId);
+    return membership?.primaryDepartmentId ?? membership?.departmentIds[0] ?? null;
+  }
 
   #queueProjectionWrite(sessionId: string, write: () => Promise<unknown>): void {
     const previous = this.#projectionWrites.get(sessionId) ?? Promise.resolve();
@@ -229,7 +240,7 @@ export class AgentApiController {
 
   @Get("/models/catalog")
   async modelCatalog(@Req() httpRequest: AuthenticatedRequest) {
-    const catalog = this.runtimeConfig.catalog();
+    const catalog = await this.runtimeConfig.catalog(tenantIdFromRequest(httpRequest));
     if (!catalog) return null;
     const effective = await this.organizationCapabilities.effective(tenantIdFromRequest(httpRequest), httpRequest.auth?.user.id ?? "");
     return { ...catalog, skills: [...catalog.skills, ...effective.skills.map((skill) => ({ id: skill.filePath, name: skill.name, description: skill.description, enabled: true }))], mcpServers: [...catalog.mcpServers, ...effective.mcpServers.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : [])] };
@@ -256,11 +267,31 @@ export class AgentApiController {
     const requestId = `image_${randomUUID()}`;
     const actualCostMicros = BigInt(image.costMicros);
     const startedAt = Date.now();
+    const userId = httpRequest.auth?.user.id ?? null;
+    const departmentId = await this.#primaryDepartmentId(
+      tenantId,
+      userId,
+    );
+    const modelDecision = await this.modelGovernance.resolve({
+      tenantId,
+      mode: "chat",
+      providerId: image.providerId,
+      model: image.model,
+      userId,
+      departmentId,
+    });
+    if (!modelDecision.allowed) {
+      throw new ForbiddenException({
+        code: "model_governance_blocked",
+        message: modelGovernanceMessage(modelDecision.reason),
+        decision: modelDecision,
+      });
+    }
     await this.budgets.reserve({
       tenantId,
       requestId,
-      userId: httpRequest.auth?.user.id ?? null,
-      departmentId: null,
+      userId,
+      departmentId,
       taskId: null,
       sessionId: null,
       feature: "image.generate",
@@ -281,6 +312,7 @@ export class AgentApiController {
           image,
           request,
           actualCostMicros: 0n,
+          departmentId,
           startedAt,
           status: "failed",
         })),
@@ -295,6 +327,7 @@ export class AgentApiController {
         image,
         request,
         actualCostMicros,
+        departmentId,
         startedAt,
         status: "completed",
       })),
@@ -544,7 +577,7 @@ export class AgentApiController {
     const request = parseBody(ContextStatsRequestSchema, body);
     const { session } = await this.ownedSession(httpRequest, sessionId);
     const model = request.model ?? session.model ?? undefined;
-    const catalog = this.runtimeConfig.catalog();
+    const catalog = await this.runtimeConfig.catalog(tenantIdFromRequest(httpRequest));
     const selectedModel = model ?? catalog?.defaultModel;
     const modelMetadata = catalog?.models.find((candidate) => candidate.id === selectedModel);
     const contextWindow = resolveModelCapabilities(modelMetadata).context?.windowTokens
@@ -604,8 +637,12 @@ export class AgentApiController {
     }
     const tenantId = tenantIdFromRequest(httpRequest);
     const requestId = `model_${randomUUID()}`;
-    const baseRuntime = this.runtimeConfig.resolve(request);
-    const effectiveRuntime = await this.organizationCapabilities.effective(tenantId, httpRequest.auth?.user.id ?? "");
+    const baseRuntime = await this.runtimeConfig.resolve(tenantId, request);
+    const userId = httpRequest.auth?.user.id ?? null;
+    const [effectiveRuntime, departmentId] = await Promise.all([
+      this.organizationCapabilities.effective(tenantId, userId ?? ""),
+      this.#primaryDepartmentId(tenantId, userId),
+    ]);
     const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
     const providerId = resolvedRuntime.provider.id;
     const mode = conversationKindFromTask(task);
@@ -614,6 +651,8 @@ export class AgentApiController {
       mode,
       providerId,
       model: request.model ?? null,
+      userId,
+      departmentId,
     });
     if (!modelDecision.allowed) {
       throw new ForbiddenException({
@@ -734,7 +773,7 @@ export class AgentApiController {
       tenantId,
       requestId,
       userId: httpRequest.auth?.user.id ?? null,
-      departmentId: null,
+      departmentId,
       taskId: task.id,
       sessionId,
       feature: "model",
@@ -1033,7 +1072,7 @@ export class AgentApiController {
               this.usageRepository.ingestInternal(tenantId, {
                 requestId,
                 userId: httpRequest.auth?.user.id ?? null,
-                departmentId: null,
+                departmentId,
                 workspaceId: governedRequest.workspaceId ?? task.workspaceId,
                 taskId: task.id,
                 sessionId,
@@ -1545,6 +1584,9 @@ function modelGovernanceMessage(reason: string): string {
   if (reason === "model_blocked") return "The requested model is blocked by organization policy.";
   if (reason === "mode_not_allowed") return "The requested model is not allowed for this mode.";
   if (reason === "not_in_enforced_allowlist") return "The requested model is not in the organization allow-list.";
+  if (reason === "blocked_by_organization_rule") return "The requested model is blocked for this organization.";
+  if (reason === "blocked_by_department_rule") return "The requested model is blocked for your department.";
+  if (reason === "blocked_by_user_rule") return "The requested model is blocked for your account.";
   return "The requested model is not allowed by organization policy.";
 }
 
@@ -1575,13 +1617,14 @@ function imageUsageEvent(input: {
   image: { providerId: string; model: string };
   request: { prompt: string; size?: string | undefined };
   actualCostMicros: bigint;
+  departmentId: string | null;
   startedAt: number;
   status: "completed" | "failed";
 }) {
   return {
     requestId: input.requestId,
     userId: input.httpRequest.auth?.user.id ?? null,
-    departmentId: null,
+    departmentId: input.departmentId,
     workspaceId: null,
     taskId: null,
     sessionId: null,

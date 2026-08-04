@@ -6,6 +6,7 @@ import {
   Button,
   DataTable,
   DetailDrawer,
+  FormSelect,
   Input,
   ManagementPage,
   MetricGrid,
@@ -33,6 +34,15 @@ const VIEWS = [
 ] as const;
 type View = (typeof VIEWS)[number];
 
+type UsageFilters = {
+  memberId: string;
+  departmentId: string;
+  model: string;
+  provider: string;
+  feature: string;
+  status: string;
+};
+
 export function AnalyticsScreen({
   client,
   config,
@@ -55,13 +65,25 @@ export function AnalyticsScreen({
     ).slice(0, 10),
     to: (search.get("to") ?? new Date().toISOString()).slice(0, 10),
   });
+  const [filters, setFilters] = React.useState<UsageFilters>({
+    memberId: search.get("memberId") ?? "",
+    departmentId: search.get("departmentId") ?? "",
+    model: search.get("model") ?? "",
+    provider: search.get("provider") ?? "",
+    feature: search.get("feature") ?? "",
+    status: search.get("status") ?? "",
+  });
   const query: UsageAnalyticsQuery = {
     from: `${range.from}T00:00:00.000Z`,
     to: `${range.to}T23:59:59.999Z`,
+    ...Object.fromEntries(
+      Object.entries(filters).filter(([, value]) => value.length > 0),
+    ),
     limit: 50,
-  };
+  } as UsageAnalyticsQuery;
+  const queryKey = JSON.stringify(query);
   const analytics = useResource(
-    `analytics:${tenantId}:${query.from}:${query.to}`,
+    `analytics:${tenantId}:${queryKey}`,
     async () =>
       client
         ? client.usageAnalytics(tenantId, query)
@@ -71,7 +93,7 @@ export function AnalyticsScreen({
     null as any,
   );
   const requests = useResource(
-    `requests:${tenantId}:${query.from}:${query.to}`,
+    `requests:${tenantId}:${view}:${queryKey}`,
     async () =>
       client && view === "requests"
         ? client.usageRequests(tenantId, query)
@@ -84,16 +106,38 @@ export function AnalyticsScreen({
       client && view === "reports" ? client.savedAnalyticsViews(tenantId) : [],
     [] as any[],
   );
+  const directory = useResource(
+    `usage-directory:${tenantId}`,
+    async () =>
+      client
+        ? Promise.all([
+            client.listOrgMembers(tenantId),
+            client.listDepartments(tenantId),
+          ])
+        : [[], config.departments.filter((item) => item.tenantId === tenantId)],
+    [[], []] as any,
+  );
   const [detail, setDetail] = React.useState<UsageRequestDetail | null>(null);
 
-  function update(nextView: View, nextRange = range) {
+  function update(
+    nextView: View,
+    nextRange = range,
+    nextFilters = filters,
+  ) {
     setView(nextView);
     setRange(nextRange);
+    setFilters(nextFilters);
     const params = new URLSearchParams();
     params.set("view", nextView);
     params.set("from", `${nextRange.from}T00:00:00.000Z`);
     params.set("to", `${nextRange.to}T23:59:59.999Z`);
+    for (const [key, value] of Object.entries(nextFilters)) {
+      if (value) params.set(key, value);
+    }
     history.replaceState(null, "", `${location.pathname}?${params}`);
+  }
+  function updateFilter(key: keyof UsageFilters, value: string) {
+    update(view, range, { ...filters, [key]: value === "all" ? "" : value });
   }
   async function openRequest(requestId: string) {
     if (client) setDetail(await client.usageRequestDetail(tenantId, requestId));
@@ -106,16 +150,19 @@ export function AnalyticsScreen({
         0,
       )
     : 0;
-  const cacheReuseRate =
-    data && data.totals.tokens > 0
-      ? Math.min(1, data.performance.cacheReadTokens / data.totals.tokens)
+  const cacheHitRate =
+    data && data.performance.cacheEligibleRequests > 0
+      ? data.performance.cacheHitRequests /
+        data.performance.cacheEligibleRequests
       : null;
+  const [members, departments] = directory.data as [any[], any[]];
+  const hasFilters = Object.values(filters).some(Boolean);
 
   return (
     <ManagementPage
-      title="Analytics"
-      description="Operational billed usage, adoption, performance, request attribution, and explainable anomalies."
-      eyebrow="Finance"
+      title="Usage"
+      description="Inspect organization spend, tokens, cache behavior, models, people, and individual redacted requests from one filterable view."
+      eyebrow="Usage & billing"
       actions={
         permissions.includes("usage:export") ? (
           <Button
@@ -174,6 +221,55 @@ export function AnalyticsScreen({
           </label>
         </div>
       </Toolbar>
+      <Toolbar>
+        <div className="grid flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-6 [&>label]:grid [&>label]:min-w-0 [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
+          <UsageFilter
+            label="Person"
+            value={filters.memberId}
+            onChange={(value) => updateFilter("memberId", value)}
+            options={members.map((member) => ({ value: member.userId, label: member.name || member.email }))}
+          />
+          <UsageFilter
+            label="Department"
+            value={filters.departmentId}
+            onChange={(value) => updateFilter("departmentId", value)}
+            options={departments.map((department) => ({ value: department.id, label: department.name }))}
+          />
+          <UsageFilter
+            label="Provider"
+            value={filters.provider}
+            onChange={(value) => updateFilter("provider", value)}
+            options={breakdownOptions(data?.breakdowns.providers, filters.provider)}
+          />
+          <UsageFilter
+            label="Model"
+            value={filters.model}
+            onChange={(value) => updateFilter("model", value)}
+            options={breakdownOptions(data?.breakdowns.models, filters.model)}
+          />
+          <UsageFilter
+            label="Feature"
+            value={filters.feature}
+            onChange={(value) => updateFilter("feature", value)}
+            options={breakdownOptions(data?.breakdowns.features, filters.feature)}
+          />
+          <UsageFilter
+            label="Status"
+            value={filters.status}
+            onChange={(value) => updateFilter("status", value)}
+            options={breakdownOptions(data?.breakdowns.statuses, filters.status)}
+          />
+        </div>
+        {hasFilters ? (
+          <Button
+            variant="ghost"
+            onClick={() => update(view, range, emptyUsageFilters())}
+          >
+            <X />
+            Clear filters
+          </Button>
+        ) : null}
+      </Toolbar>
       <AsyncState
         loading={analytics.loading}
         error={analytics.error}
@@ -186,14 +282,36 @@ export function AnalyticsScreen({
             <MetricGrid
               items={[
                 {
-                  label: "Billed spend",
+                  label: "Total cost",
                   value: formatMoney(data.totals.billedCostMicros),
                 },
                 {
                   label: "Requests",
                   value: formatNumber(data.totals.requests),
                 },
-                { label: "Tokens", value: formatNumber(data.totals.tokens) },
+                {
+                  label: "Input tokens",
+                  value: formatNumber(data.totals.inputTokens),
+                },
+                {
+                  label: "Output tokens",
+                  value: formatNumber(data.totals.outputTokens),
+                },
+                {
+                  label: "Cache-read tokens",
+                  value: formatNumber(data.performance.cacheReadTokens),
+                },
+                {
+                  label: "Cache-write tokens",
+                  value: formatNumber(data.performance.cacheWriteTokens),
+                },
+                {
+                  label: "Cache hit rate",
+                  value:
+                    cacheHitRate == null
+                      ? "—"
+                      : `${Math.round(cacheHitRate * 100)}%`,
+                },
                 {
                   label: "Success rate",
                   value:
@@ -273,7 +391,7 @@ export function AnalyticsScreen({
                   >
                     <HealthRings
                       successRate={data.totals.successRate}
-                      cacheRate={cacheReuseRate}
+                      cacheRate={cacheHitRate}
                       attributionRate={
                         data.totals.requests
                           ? attributedRequests / data.totals.requests
@@ -481,21 +599,29 @@ export function AnalyticsScreen({
                   label="Redacted request records"
                   columns={[
                     "Time",
+                    "Person",
+                    "Department",
                     "Request",
                     "Feature",
-                    "Model",
+                    "Model / provider",
                     "Status",
-                    "Tokens",
+                    "Input",
+                    "Output",
+                    "Cache read",
                     "Billed",
                     "Latency",
-                    "Reservation",
                   ]}
                   rows={(requests.data?.items ?? []).map((row: any) => [
                     new Date(row.ts).toLocaleString(),
+                    <span>
+                      <b>{row.userName || row.userEmail || "Unattributed"}</b>
+                      <small>{row.userEmail ?? compactId(row.userId)}</small>
+                    </span>,
+                    row.departmentName ?? compactId(row.departmentId),
                     <Button
                       variant="ghost"
                       className="grid h-auto max-w-80 justify-start gap-0.5 p-0 text-left [&_b]:truncate [&_small]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"
-                      onClick={() => openRequest(row.requestId)}
+                      onClick={() => openRequest(row.id)}
                     >
                       <b>{row.requestId}</b>
                       <small>
@@ -503,7 +629,10 @@ export function AnalyticsScreen({
                       </small>
                     </Button>,
                     row.feature,
-                    row.model ?? "—",
+                    <span>
+                      <b>{row.model ?? "Unknown model"}</b>
+                      <small>{row.provider ?? "Unknown provider"}</small>
+                    </span>,
                     <StatusPill
                       tone={
                         ["completed", "success", "succeeded"].includes(
@@ -515,10 +644,11 @@ export function AnalyticsScreen({
                     >
                       {row.status}
                     </StatusPill>,
-                    formatNumber(row.tokensIn + row.tokensOut),
+                    formatNumber(row.tokensIn),
+                    formatNumber(row.tokensOut),
+                    formatNumber(row.cacheReadTokens),
                     formatMoney(row.billedCostMicros),
                     duration(row.latencyMs),
-                    row.reservationStatus ?? "—",
                   ])}
                 />
               </AsyncState>
@@ -576,6 +706,63 @@ export function AnalyticsScreen({
   );
 }
 
+function UsageFilter({
+  label: filterLabel,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: Array<{ value: string; label: string }>;
+}) {
+  return (
+    <label>
+      {filterLabel}
+      <FormSelect
+        value={value || "all"}
+        onChange={onChange}
+        options={[
+          { value: "all", label: `All ${filterLabel.toLowerCase()}` },
+          ...options,
+        ]}
+      />
+    </label>
+  );
+}
+
+function breakdownOptions(
+  rows: Array<{ id: string | null; label: string }> | undefined,
+  current: string,
+): Array<{ value: string; label: string }> {
+  const options = new Map<string, string>();
+  for (const row of rows ?? []) {
+    if (row.id) options.set(row.id, row.label);
+  }
+  if (current && !options.has(current)) options.set(current, current);
+  return [...options].map(([value, optionLabel]) => ({
+    value,
+    label: optionLabel,
+  }));
+}
+
+function emptyUsageFilters(): UsageFilters {
+  return {
+    memberId: "",
+    departmentId: "",
+    model: "",
+    provider: "",
+    feature: "",
+    status: "",
+  };
+}
+
+function compactId(value: string | null): string {
+  if (!value) return "Unattributed";
+  return value.length <= 8 ? value : `${value.slice(0, 8)}…`;
+}
+
 function Breakdown({
   title,
   rows,
@@ -592,14 +779,21 @@ function Breakdown({
         columns={[
           title.slice(0, -1),
           "Requests",
-          "Tokens",
+          "Input",
+          "Output",
+          "Cache read",
           "Billed",
           ...(performance ? ["Error rate", "P95 latency"] : []),
         ]}
         rows={rows.map((row) => [
-          row.label,
+          <span>
+            <b>{row.name ?? row.label}</b>
+            {row.email ? <small>{row.email}</small> : null}
+          </span>,
           formatNumber(row.requests),
-          formatNumber(row.tokens),
+          formatNumber(row.inputTokens),
+          formatNumber(row.outputTokens),
+          formatNumber(row.cacheReadTokens),
           formatMoney(row.billedCostMicros),
           ...(performance
             ? [

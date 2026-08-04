@@ -75,6 +75,30 @@ describe("Enterprise identity API", () => {
     });
     expect(created.body).not.toHaveProperty("password");
 
+    const department = await request(app.getHttpServer())
+      .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/departments`)
+      .set(authHeader())
+      .send({ name: "Research" })
+      .expect(201);
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/members/${created.body.userId}`)
+      .set(authHeader())
+      .send({
+        role: "admin",
+        status: "disabled",
+        departmentIds: [department.body.id],
+        primaryDepartmentId: department.body.id,
+      })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({
+          role: "admin",
+          status: "disabled",
+          primaryDepartmentId: department.body.id,
+          departmentIds: [department.body.id],
+        });
+      });
+
     await request(app.getHttpServer())
       .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/members`)
       .set(authHeader())

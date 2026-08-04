@@ -72,7 +72,25 @@ export class PostgresManagementRepository implements ManagementRepository {
   getExecution(t:string){return this.getJsonPolicy(t,"execution_network_policies",ExecutionNetworkPolicySchema,executionDefaults(t));} setExecution(t:string,i:PolicyInput<ExecutionNetworkPolicy>){return this.setJsonPolicy(t,"execution_network_policies",ExecutionNetworkPolicySchema,{...i,tenantId:t,updatedAt:now()});}
   getAuthentication(t:string){return this.getJsonPolicy(t,"authentication_policies",AuthenticationPolicySchema,authenticationDefaults(t));} setAuthentication(t:string,i:PolicyInput<AuthenticationPolicy>){return this.setJsonPolicy(t,"authentication_policies",AuthenticationPolicySchema,{...i,tenantId:t,updatedAt:now()});}
   getData(t:string){return this.getJsonPolicy(t,"data_governance_policies",DataGovernancePolicySchema,dataDefaults(t));} setData(t:string,i:PolicyInput<DataGovernancePolicy>){return this.setJsonPolicy(t,"data_governance_policies",DataGovernancePolicySchema,{...i,tenantId:t,updatedAt:now()});}
-  getProfile(t:string){return this.database.withTenant(t,async db=>{const r=(await db.query<any>("SELECT p.*,t.name tenant_name,t.slug tenant_slug,t.deployment_mode,NULLIF(t.settings->>'region','') region FROM organization_profiles p RIGHT JOIN tenants t ON t.id=p.tenant_id WHERE t.id=$1::uuid",[t]))[0];const domains=(await db.query<any>("SELECT * FROM organization_domains WHERE tenant_id=$1::uuid ORDER BY domain",[t])).map(domainRow);return r?profileRow(r,domains):profileDefaults(t);});}
+  getProfile(t:string){return this.database.withTenant(t,async db=>{const r=(await db.query<any>(`SELECT
+    t.id tenant_id,
+    t.name tenant_name,
+    t.slug tenant_slug,
+    t.deployment_mode,
+    NULLIF(t.settings->>'region','') region,
+    p.logo_url,
+    COALESCE(p.timezone,'UTC') timezone,
+    COALESCE(p.language,'en') language,
+    p.support_email,
+    p.security_email,
+    COALESCE(p.announcements,'[]'::jsonb) announcements,
+    p.terms_url,
+    p.privacy_url,
+    COALESCE(p.branding,'{}'::jsonb) branding,
+    COALESCE(p.updated_at,t.updated_at) updated_at
+   FROM tenants t
+   LEFT JOIN organization_profiles p ON p.tenant_id=t.id
+   WHERE t.id=$1::uuid`,[t]))[0];const domains=(await db.query<any>("SELECT * FROM organization_domains WHERE tenant_id=$1::uuid ORDER BY domain",[t])).map(domainRow);return r?profileRow(r,domains):profileDefaults(t);});}
   setProfile(t:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){return this.database.withTenant(t,async db=>{await db.execute("UPDATE tenants SET name=$2,slug=$3,updated_at=now() WHERE id=$1::uuid",[t,i.name,i.slug]);await db.execute(`INSERT INTO organization_profiles (tenant_id,logo_url,timezone,language,support_email,security_email,announcements,terms_url,privacy_url,branding) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb) ON CONFLICT (tenant_id) DO UPDATE SET logo_url=excluded.logo_url,timezone=excluded.timezone,language=excluded.language,support_email=excluded.support_email,security_email=excluded.security_email,announcements=excluded.announcements,terms_url=excluded.terms_url,privacy_url=excluded.privacy_url,branding=excluded.branding,updated_at=now()`,[t,i.logoUrl,i.timezone,i.language,i.supportEmail,i.securityEmail,JSON.stringify(i.announcements),i.termsUrl,i.privacyUrl,JSON.stringify(i.branding)]);return this.getProfile(t);});}
   listServiceAccounts(t:string){return this.database.withTenant(t,async db=>(await db.query<any>("SELECT * FROM service_accounts WHERE tenant_id=$1::uuid ORDER BY created_at DESC",[t])).map(accountRow));}
   createServiceAccount(t:string,u:string,i:ServiceAccountCreate,h:string,last4:string){return this.database.withTenant(t,async db=>accountRow((await db.query<any>("INSERT INTO service_accounts (tenant_id,name,permissions,department_id,resource_restrictions,token_hash,token_last4,expires_at,created_by) VALUES ($1::uuid,$2,$3::jsonb,$4::uuid,$5::jsonb,$6,$7,$8,$9::uuid) RETURNING *",[t,i.name,JSON.stringify(i.permissions),i.departmentId??null,JSON.stringify(i.resourceRestrictions),h,last4,i.expiresAt??null,u]))[0]));}
@@ -82,7 +100,7 @@ export class PostgresManagementRepository implements ManagementRepository {
 }
 
 const executionDefaults=(t:string)=>ExecutionNetworkPolicySchema.parse({tenantId:t,sandboxEnabled:true,codeExecutionEnabled:true,approvalRequired:true,outboundNetwork:"allowlist",allowedDomains:[],blockedDomains:[],allowedToolClasses:[],maxRunSeconds:900,maxConcurrency:5,requestsPerMinute:60,tokenQuota:null,sandboxMinuteQuota:null,updatedAt:now()});
-const authenticationDefaults=(t:string)=>AuthenticationPolicySchema.parse({tenantId:t,mfaRequired:false,sessionMaxAgeMinutes:10080,idleTimeoutMinutes:120,trustedDevicesAllowed:true,allowedLoginMethods:["password","oidc","saml"],allowedDomains:[],emergencyLocalOwnerEnabled:true,updatedAt:now()});
+const authenticationDefaults=(t:string)=>AuthenticationPolicySchema.parse({tenantId:t,mfaRequired:false,sessionMaxAgeMinutes:10080,idleTimeoutMinutes:120,trustedDevicesAllowed:true,allowedLoginMethods:["password"],allowedDomains:[],emergencyLocalOwnerEnabled:true,updatedAt:now()});
 const dataDefaults=(t:string)=>DataGovernancePolicySchema.parse({tenantId:t,conversationRetentionDays:365,temporaryChatHours:24,retentionByDataType:{conversation:365,files:365},residency:"deployment-default",piiFilterMode:"warn",credentialFilterMode:"block",moderationHookConfigured:false,legalHoldEnabled:false,updatedAt:now()});
 const profileDefaults=(t:string)=>OrganizationProfileSchema.parse({tenantId:t,name:"Berry organization",slug:t,logoUrl:null,timezone:"UTC",language:"en",supportEmail:null,securityEmail:null,deploymentMode:"self-hosted",region:null,announcements:[],termsUrl:null,privacyUrl:null,branding:{},domains:[],updatedAt:now()});
 function now(){return new Date().toISOString();} function iso(v:any){return v instanceof Date?v.toISOString():new Date(v).toISOString();}

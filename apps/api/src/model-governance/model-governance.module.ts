@@ -5,13 +5,17 @@ import {
   type EnterpriseIdentityRepository,
 } from "../identity/identity.repository.ts";
 import type { EnterpriseIdentityModuleOptions } from "../identity/identity.module.ts";
-import { ModelGovernanceController } from "./model-governance.controller.ts";
+import { ModelGovernanceController, ModelProviderController } from "./model-governance.controller.ts";
 import {
   InMemoryModelGovernanceRepository,
   MODEL_GOVERNANCE_SERVICE,
   ModelGovernanceService,
   type ModelGovernanceRepository,
 } from "./model-governance.service.ts";
+import {
+  DefaultOrganizationProviderRuntime,
+  ORGANIZATION_PROVIDER_RUNTIME,
+} from "./organization-provider-runtime.service.ts";
 
 export type ModelGovernanceServiceProvider =
   | { useValue: ModelGovernanceService }
@@ -52,9 +56,19 @@ export class ModelGovernanceModule {
 
     return {
       module: ModelGovernanceModule,
-      controllers: [ModelGovernanceController],
-      providers: [identityProvider, ...(repositoryProvider ? [repositoryProvider] : []), serviceProvider],
-      exports: [MODEL_GOVERNANCE_SERVICE],
+      controllers: [ModelGovernanceController, ModelProviderController],
+      providers: [
+        identityProvider,
+        ...(repositoryProvider ? [repositoryProvider] : []),
+        serviceProvider,
+        {
+          provide: ORGANIZATION_PROVIDER_RUNTIME,
+          inject: [MODEL_GOVERNANCE_SERVICE],
+          useFactory: (models: ModelGovernanceService) =>
+            new DefaultOrganizationProviderRuntime(models, process.env),
+        },
+      ],
+      exports: [MODEL_GOVERNANCE_SERVICE, ORGANIZATION_PROVIDER_RUNTIME],
     };
   }
 }

@@ -6,6 +6,10 @@ import { BillingModule, type BillingModuleOptions } from "../billing/billing.mod
 import { BudgetModule, type BudgetModuleOptions } from "../budget/budget.module.ts";
 import { EnterpriseIdentityModule, type EnterpriseIdentityModuleOptions } from "../identity/identity.module.ts";
 import { ModelGovernanceModule, type ModelGovernanceModuleOptions } from "../model-governance/model-governance.module.ts";
+import {
+  ORGANIZATION_PROVIDER_RUNTIME,
+  type OrganizationProviderRuntime,
+} from "../model-governance/organization-provider-runtime.service.ts";
 import { PolicyDistributionModule, type PolicyDistributionModuleOptions } from "../policy-distribution/policy-distribution.module.ts";
 import { SessionHostModule } from "../runtime/session-host.module.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
@@ -128,7 +132,12 @@ export class AgentApiModule {
             ]),
         ApiEventStreamService,
         CompanionPushService,
-        CloudRuntimeConfigService,
+        {
+          provide: CloudRuntimeConfigService,
+          inject: [ORGANIZATION_PROVIDER_RUNTIME],
+          useFactory: (organizationProviders: OrganizationProviderRuntime) =>
+            new CloudRuntimeConfigService(process.env, organizationProviders),
+        },
       ],
       exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, DurableTurnService, ApiEventStreamService, CompanionPushService],
     };

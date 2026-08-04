@@ -9,6 +9,7 @@ import {
   DepartmentSchema,
   EffectivePermissionsSchema,
   FeatureFlagSchema,
+  OrgMembershipSchema,
   OrganizationSchema,
   ResourceAclSchema,
   RolePermissionSetSchema,
@@ -20,6 +21,7 @@ import {
   type FeatureFlag,
   type JsonValue,
   type OrgMembership,
+  type OrgMembershipUpdate,
   type OrgPermission,
   type Organization,
   type ResourceAcl,
@@ -124,6 +126,7 @@ export interface EnterpriseIdentityRepository {
   resolveOrganizationByHost(host: string): Promise<Organization | null>;
   listMemberships(tenantId: string): Promise<OrgMembership[]>;
   createMembership(input: CreateOrgMemberInput): Promise<OrgMembership>;
+  updateMembership(tenantId: string, userId: string, input: OrgMembershipUpdate): Promise<OrgMembership>;
   getMembership(tenantId: string, userId: string): Promise<OrgMembership | null>;
   getEffectivePermissions(tenantId: string, userId: string): Promise<EffectivePermissions>;
   authorize(userId: string, tenantId: string, permission: OrgPermission, resource?: AuthorizationResource | undefined): Promise<boolean>;
@@ -267,6 +270,30 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
     };
     this.#memberships.set(`${input.tenantId}:${membership.userId}`, membership);
     return membership;
+  }
+
+  async updateMembership(tenantId: string, userId: string, input: OrgMembershipUpdate): Promise<OrgMembership> {
+    const current = await this.getMembership(tenantId, userId);
+    if (!current) throw new Error("Organization member not found");
+    const departmentIds = input.departmentIds ?? current.departmentIds;
+    const primaryDepartmentId = input.primaryDepartmentId !== undefined
+      ? input.primaryDepartmentId
+      : current.primaryDepartmentId ?? null;
+    if (primaryDepartmentId && !departmentIds.includes(primaryDepartmentId)) {
+      throw new Error("Primary department must be one of the member's departments");
+    }
+    if (departmentIds.some((id) => ![...this.#departments.values()].some((department) => department.tenantId === tenantId && department.id === id))) {
+      throw new Error("Unknown organization department");
+    }
+    const updated = OrgMembershipSchema.parse({
+      ...current,
+      ...input,
+      departmentIds: [...new Set(departmentIds)],
+      primaryDepartmentId,
+      updatedAt: new Date().toISOString(),
+    });
+    this.#memberships.set(`${tenantId}:${userId}`, updated);
+    return updated;
   }
 
   async getEffectivePermissions(tenantId: string, userId: string): Promise<EffectivePermissions> {
@@ -479,13 +506,13 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
 
   async getMembership(tenantId: string, userId: string): Promise<OrgMembership | null> {
     const rows = await this.database.withTenant(tenantId, (executor) => executor.query<MembershipRow>(`
-      SELECT tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.external_id, tm.source, tm.joined_at, tm.updated_at,
+      SELECT tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.primary_department_id, tm.external_id, tm.source, tm.joined_at, tm.updated_at,
         COALESCE(jsonb_agg(dm.department_id) FILTER (WHERE dm.department_id IS NOT NULL), '[]'::jsonb) AS department_ids
       FROM tenant_memberships tm
       JOIN users u ON u.id = tm.user_id
       LEFT JOIN department_memberships dm ON dm.tenant_id = tm.tenant_id AND dm.user_id = tm.user_id
       WHERE tm.tenant_id = $1::uuid AND tm.user_id = $2::uuid
-      GROUP BY tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.external_id, tm.source, tm.joined_at, tm.updated_at
+      GROUP BY tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.primary_department_id, tm.external_id, tm.source, tm.joined_at, tm.updated_at
       LIMIT 1
     `, [tenantId, userId]));
     return rows[0] ? membershipFromRow(rows[0]) : null;
@@ -493,13 +520,13 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
 
   async listMemberships(tenantId: string): Promise<OrgMembership[]> {
     const rows = await this.database.withTenant(tenantId, (executor) => executor.query<MembershipRow>(`
-      SELECT tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.external_id, tm.source, tm.joined_at, tm.updated_at,
+      SELECT tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.primary_department_id, tm.external_id, tm.source, tm.joined_at, tm.updated_at,
         COALESCE(jsonb_agg(dm.department_id) FILTER (WHERE dm.department_id IS NOT NULL), '[]'::jsonb) AS department_ids
       FROM tenant_memberships tm
       JOIN users u ON u.id = tm.user_id
       LEFT JOIN department_memberships dm ON dm.tenant_id = tm.tenant_id AND dm.user_id = tm.user_id
       WHERE tm.tenant_id = $1::uuid
-      GROUP BY tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.external_id, tm.source, tm.joined_at, tm.updated_at
+      GROUP BY tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.primary_department_id, tm.external_id, tm.source, tm.joined_at, tm.updated_at
       ORDER BY u.email ASC
     `, [tenantId]));
     return rows.map(membershipFromRow);
@@ -536,6 +563,64 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
       return createdUserId;
     });
     return (await this.getMembership(input.tenantId, userId))!;
+  }
+
+  async updateMembership(tenantId: string, userId: string, input: OrgMembershipUpdate): Promise<OrgMembership> {
+    const current = await this.getMembership(tenantId, userId);
+    if (!current) throw new Error("Organization member not found");
+    const departmentIds = [...new Set(input.departmentIds ?? current.departmentIds)];
+    const primaryDepartmentId = input.primaryDepartmentId !== undefined
+      ? input.primaryDepartmentId
+      : current.primaryDepartmentId ?? null;
+    if (primaryDepartmentId && !departmentIds.includes(primaryDepartmentId)) {
+      throw new Error("Primary department must be one of the member's departments");
+    }
+    await this.database.withTenant(tenantId, async (executor) => {
+      if (input.departmentIds !== undefined) {
+        const valid = departmentIds.length === 0 ? [] : await executor.query<{ id: string }>(
+          "SELECT id::text id FROM departments WHERE tenant_id=$1::uuid AND status='active' AND id=ANY($2::uuid[])",
+          [tenantId, departmentIds],
+        );
+        if (valid.length !== departmentIds.length) throw new Error("Unknown organization department");
+        await executor.execute(
+          "DELETE FROM department_memberships WHERE tenant_id=$1::uuid AND user_id=$2::uuid",
+          [tenantId, userId],
+        );
+        if (departmentIds.length > 0) {
+          await executor.execute(
+            `INSERT INTO department_memberships (tenant_id,department_id,user_id,role,source)
+             SELECT $1::uuid,id,$2::uuid,'member','manual'
+             FROM departments WHERE tenant_id=$1::uuid AND id=ANY($3::uuid[])`,
+            [tenantId, userId, departmentIds],
+          );
+        }
+      }
+      await executor.execute(
+        `UPDATE tenant_memberships SET
+           status=CASE WHEN $3::boolean THEN $4 ELSE status END,
+           role=CASE WHEN $5::boolean THEN $6 ELSE role END,
+           primary_department_id=CASE WHEN $7::boolean THEN $8::uuid ELSE primary_department_id END,
+           updated_at=now()
+         WHERE tenant_id=$1::uuid AND user_id=$2::uuid`,
+        [
+          tenantId,
+          userId,
+          input.status !== undefined,
+          input.status ?? null,
+          input.role !== undefined,
+          input.role ?? null,
+          input.primaryDepartmentId !== undefined || input.departmentIds !== undefined,
+          primaryDepartmentId,
+        ],
+      );
+      if (input.status !== undefined && input.status !== "active") {
+        await executor.execute(
+          "DELETE FROM auth_sessions WHERE user_id=$1::uuid",
+          [userId],
+        );
+      }
+    });
+    return (await this.getMembership(tenantId, userId))!;
   }
 
   async getEffectivePermissions(tenantId: string, userId: string): Promise<EffectivePermissions> {
@@ -831,6 +916,7 @@ type MembershipRow = {
   name: string;
   status: "active" | "disabled" | "deprovisioned";
   role: string;
+  primary_department_id: string | null;
   department_ids: unknown;
   external_id: string | null;
   source: "manual" | "sso" | "scim";
@@ -904,6 +990,7 @@ function membershipFromRow(row: MembershipRow): OrgMembership {
     status: row.status,
     role: row.role,
     departmentIds: stringArray(row.department_ids),
+    primaryDepartmentId: row.primary_department_id,
     externalId: row.external_id,
     source: row.source,
     joinedAt: toIso(row.joined_at),

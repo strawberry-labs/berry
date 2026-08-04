@@ -16,6 +16,7 @@ import { BudgetService, InMemoryBudgetHotCounters, InMemoryBudgetRepository } fr
 import { InMemoryModelGovernanceRepository, ModelGovernanceService } from "../model-governance/model-governance.service.ts";
 import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
+import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -536,6 +537,40 @@ describe("AgentApiController", () => {
     expect(startTurn).not.toHaveBeenCalled();
   });
 
+  it("blocks disallowed image models before budget reservation and generation", async () => {
+    const generateImage = vi.fn(async () => ({ model: "image-model", data: [{ b64_json: "image" }] }));
+    const runtimeConfig = {
+      imageGenerationInfo: () => ({ providerId: "provider", model: "image-model", costMicros: "10" }),
+      generateImage,
+    } as unknown as CloudRuntimeConfigService;
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "provider",
+      model: "image-model",
+      status: "blocked",
+      enforce: true,
+      modeAllow: ["chat"],
+    });
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig,
+    });
+
+    await request(app.getHttpServer())
+      .post("/v1/images/generations")
+      .set(authHeader())
+      .send({ prompt: "A governed image" })
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({
+          code: "model_governance_blocked",
+          decision: { reason: "model_blocked", allowed: false },
+        });
+      });
+    expect(generateImage).not.toHaveBeenCalled();
+  });
+
   it("reserves and reconciles successful model turns", async () => {
     const budget = new BudgetService({
       repository: new InMemoryBudgetRepository([{
@@ -826,6 +861,19 @@ describe("AgentApiController", () => {
     await request(app.getHttpServer()).get("/v1/tasks").set(authHeader()).expect(200);
   });
 
+  it("rejects authenticated sessions after organization membership is deactivated", async () => {
+    app = await createApp(fakeSessionHost(), { membershipActive: false });
+
+    await request(app.getHttpServer())
+      .get("/v1/tasks")
+      .set(authHeader())
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({ code: "organization_membership_inactive" });
+      });
+    await request(app.getHttpServer()).get("/v1/auth/config").expect(200);
+  });
+
   it("keeps Better Auth discovery public", async () => {
     app = await createApp(fakeSessionHost());
 
@@ -858,7 +906,7 @@ describe("AgentApiController", () => {
   });
 });
 
-async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined } = {}): Promise<INestApplication> {
+async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined; runtimeConfig?: CloudRuntimeConfigService | undefined; membershipActive?: boolean | undefined } = {}): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [
       CloudDatabaseModule.register({
@@ -870,7 +918,7 @@ async function createApp(sessionHost: SessionHost, options: { budget?: BudgetSer
       }),
       AgentApiModule.register({
       sessionHost: { useValue: sessionHost },
-      auth: { useValue: fakeAuthRuntime() },
+      auth: { useValue: fakeAuthRuntime(options.membershipActive ?? true) },
       ...(options.taskStore ? { taskStore: { useValue: options.taskStore } } : {}),
       ...(options.budget ? { budget: { service: { useValue: options.budget } } } : {}),
       ...(options.modelGovernance ? { modelGovernance: { service: { useValue: options.modelGovernance } } } : {}),
@@ -879,6 +927,8 @@ async function createApp(sessionHost: SessionHost, options: { budget?: BudgetSer
   })
     .overrideProvider(FilePlatformService)
     .useValue(fakeFilePlatformService)
+    .overrideProvider(CloudRuntimeConfigService)
+    .useValue(options.runtimeConfig ?? new CloudRuntimeConfigService())
     .compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
@@ -898,7 +948,7 @@ function authHeader(token = "berry-test-session") {
   return { Authorization: `Bearer ${token}` };
 }
 
-function fakeAuthRuntime(): BerryAuthRuntime {
+function fakeAuthRuntime(membershipActive = true): BerryAuthRuntime {
   const getSession: BerryAuthRuntime["getSession"] = async (headers) => {
     if (headers.authorization === "Bearer berry-other-session") {
       return {
@@ -935,6 +985,7 @@ function fakeAuthRuntime(): BerryAuthRuntime {
       if (!session) throw new UnauthorizedException("Authentication required");
       return session;
     },
+    authorizeSession: async () => membershipActive,
     handleNodeRequest: async (_req, res) => {
       res.statusCode = 200;
       res.end(JSON.stringify({ ok: true }));

@@ -4,6 +4,7 @@ import {
   EffectivePermissionsSchema,
   FeatureFlagSchema,
   OrgMembershipSchema,
+  OrgMembershipUpdateSchema,
   OrgPermissionSchema,
   OrganizationSchema,
   ResourceAclPrincipalTypeSchema,
@@ -93,13 +94,13 @@ export class IdentityController {
 
   @Get("/:tenantId/members")
   async listMembers(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string) {
-    await this.requirePermission(request, tenantId, "org:admin");
+    await this.requirePermission(request, tenantId, "members:read");
     return z.array(OrgMembershipSchema).parse(await this.repository.listMemberships(tenantId));
   }
 
   @Post("/:tenantId/members")
   async createMember(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
-    await this.requirePermission(request, tenantId, "org:admin");
+    await this.requirePermission(request, tenantId, "members:write");
     const parsed = parseBody(CreateOrgMemberRequestSchema, body);
     try {
       const membership = OrgMembershipSchema.parse(await this.repository.createMembership({ tenantId, ...parsed }));
@@ -111,6 +112,39 @@ export class IdentityController {
       }
       throw cause;
     }
+  }
+
+  @Put("/:tenantId/members/:userId")
+  async updateMember(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Body() body: unknown,
+  ) {
+    await this.requirePermission(request, tenantId, "members:write");
+    const parsed = parseBody(OrgMembershipUpdateSchema, body);
+    const current = await this.repository.getMembership(tenantId, userId);
+    if (!current) throw new BadRequestException("Organization member not found");
+    if (current.role === "owner" && (parsed.role !== undefined || parsed.status && parsed.status !== "active")) {
+      throw new BadRequestException("The organization owner cannot be demoted, blocked, or offboarded here");
+    }
+    if (request.auth?.user.id === userId && parsed.status && parsed.status !== "active") {
+      throw new BadRequestException("You cannot block or offboard your own account");
+    }
+    const departmentIds = parsed.departmentIds ?? current.departmentIds;
+    const primaryDepartmentId = parsed.primaryDepartmentId !== undefined
+      ? parsed.primaryDepartmentId
+      : current.primaryDepartmentId ?? null;
+    const validDepartments = new Set((await this.repository.listDepartments(tenantId)).map((department) => department.id));
+    if (departmentIds.some((departmentId) => !validDepartments.has(departmentId))) {
+      throw new BadRequestException("One or more selected departments do not belong to this organization");
+    }
+    if (primaryDepartmentId && !departmentIds.includes(primaryDepartmentId)) {
+      throw new BadRequestException("Primary department must be included in the member's departments");
+    }
+    const membership = OrgMembershipSchema.parse(await this.repository.updateMembership(tenantId, userId, parsed));
+    await this.auditAdminMutation(request, tenantId, "identity", "member-updated", "user", userId, membership);
+    return membership;
   }
 
   @Get("/:tenantId/departments")

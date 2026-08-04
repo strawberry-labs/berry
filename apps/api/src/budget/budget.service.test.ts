@@ -1,12 +1,15 @@
 import { SELF_HOST_TENANT_ID } from "@berry/db";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BudgetService,
   InMemoryBudgetHotCounters,
   InMemoryBudgetRepository,
+  PostgresBudgetRepository,
+  allowanceCycleWindow,
   budgetEstimateFromRequest,
   usageCostMicros,
 } from "./budget.service.ts";
+import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
 
 describe("BudgetService", () => {
   it("enforces request and token quotas using the most restrictive applicable scope", async () => {
@@ -135,6 +138,139 @@ describe("BudgetService", () => {
     expect(usageCostMicros({ ...usage, costRawMicros: "7" }, 99n, {})).toBe(7n);
     expect(usageCostMicros(usage, 99n, { cost: { input: 0, output: 0 } })).toBe(0n);
     expect(usageCostMicros(usage, 99n, {})).toBe(99n);
+  });
+
+  it("computes anchored monthly cycles in the organization timezone", () => {
+    const window = allowanceCycleWindow(
+      { timezone: "Asia/Dubai", anchorDay: 15 },
+      new Date("2026-08-04T12:00:00.000Z"),
+    );
+    expect(window.start.toISOString()).toBe("2026-07-14T20:00:00.000Z");
+    expect(window.end.toISOString()).toBe("2026-08-14T20:00:00.000Z");
+  });
+
+  it("makes a current-cycle member top-up enforceable immediately", async () => {
+    const repository = new InMemoryBudgetRepository([
+      activeLimit("user", "user_1", "5"),
+    ]);
+    const service = new BudgetService({
+      repository,
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+
+    await service.reserve({
+      tenantId: SELF_HOST_TENANT_ID,
+      requestId: "before-top-up",
+      userId: "user_1",
+      taskId: null,
+      sessionId: null,
+      feature: "model",
+      estimatedCostMicros: "5",
+    });
+    await service.createAllowanceAdjustment({
+      tenantId: SELF_HOST_TENANT_ID,
+      userId: "user_1",
+      amountMicros: "3",
+      reason: "Approved temporary increase",
+      idempotencyKey: "top-up-test-1",
+      createdBy: "owner_1",
+    });
+
+    await expect(
+      service.reserve({
+        tenantId: SELF_HOST_TENANT_ID,
+        requestId: "after-top-up",
+        userId: "user_1",
+        taskId: null,
+        sessionId: null,
+        feature: "model",
+        estimatedCostMicros: "3",
+      }),
+    ).resolves.toMatchObject({ allowed: true });
+    await expect(service.allowanceBalance(SELF_HOST_TENANT_ID, "user_1"))
+      .resolves.toMatchObject({
+        baseLimitMicros: "5",
+        adjustmentMicros: "3",
+        effectiveLimitMicros: "8",
+        availableMicros: "0",
+      });
+  });
+
+  it("loads balances for many members with one grouped spend query", async () => {
+    const repository = new InMemoryBudgetRepository([
+      activeLimit("user", "user_1", "10"),
+      activeLimit("user", "user_2", "20"),
+    ]);
+    const groupedSpend = vi.spyOn(repository, "currentUserSpendForUsers");
+    const service = new BudgetService({
+      repository,
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+
+    await expect(service.allowanceBalances(SELF_HOST_TENANT_ID, ["user_1", "user_2"]))
+      .resolves.toMatchObject([
+        { userId: "user_1", baseLimitMicros: "10" },
+        { userId: "user_2", baseLimitMicros: "20" },
+      ]);
+    expect(groupedSpend).toHaveBeenCalledOnce();
+    expect(groupedSpend.mock.calls[0]?.[1]).toEqual(["user_1", "user_2"]);
+  });
+
+  it("attributes reconciliation deltas to the reservation's original cycle", async () => {
+    const createdAt = "2026-07-31T23:59:59.000Z";
+    const reservation = {
+      id: "00000000-0000-7000-8000-000000000301",
+      tenant_id: SELF_HOST_TENANT_ID,
+      request_id: "cycle-boundary-request",
+      user_id: "00000000-0000-7000-8000-000000000201",
+      department_id: null,
+      task_id: null,
+      session_id: null,
+      feature: "model",
+      provider: "router",
+      model: "model-a",
+      estimated_cost_micros: "10",
+      reserved_micros: "10",
+      actual_cost_micros: null,
+      status: "reserved",
+      block_reason: null,
+      metadata: {},
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    const execute = vi.fn(async (_sql: string, _params?: readonly unknown[]) => undefined);
+    const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.startsWith("SELECT * FROM budget_reservations")) return [reservation];
+      if (sql.includes("UPDATE budget_reservations")) {
+        return [{ ...reservation, actual_cost_micros: "4", status: "reconciled" }];
+      }
+      if (sql.includes("FROM allowance_cycle_settings")) return [];
+      if (sql.includes("FROM credit_ledger_entries")) return [{ total: "10" }];
+      return [];
+    });
+    const executor: SqlExecutor = {
+      execute,
+      query: query as SqlExecutor["query"],
+      transaction: async (callback) => callback(executor),
+    };
+    const repository = new PostgresBudgetRepository(new CloudDatabaseService(executor));
+
+    await repository.reconcile({
+      tenantId: SELF_HOST_TENANT_ID,
+      requestId: "cycle-boundary-request",
+      actualCostMicros: "4",
+    });
+
+    const monthlyLedgerRead = query.mock.calls.find(([sql, params]) =>
+      sql.includes("FROM credit_ledger_entries")
+      && params?.[3] === "2026-07-01T00:00:00.000Z",
+    );
+    expect(monthlyLedgerRead?.[1]?.[4]).toBe("2026-08-01T00:00:00.000Z");
+    const reconcileWrites = execute.mock.calls.filter(([sql]) => sql.includes("'reconcile'"));
+    expect(reconcileWrites).toHaveLength(2);
+    expect(reconcileWrites.every(([, params]) => params?.[8] === createdAt)).toBe(true);
   });
 });
 

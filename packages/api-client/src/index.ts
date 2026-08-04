@@ -14,6 +14,11 @@ import {
   BillingMeterEventCreateSchema,
   BillingMeterEventSchema,
   BudgetLimitSchema,
+  AllowanceAdjustmentCreateSchema,
+  AllowanceAdjustmentSchema,
+  AllowanceBalanceSchema,
+  AllowanceCycleSettingsSchema,
+  AllowanceCycleSettingsUpsertSchema,
   AllowanceDefaultAssignmentSchema,
   AllowanceDefaultUpsertSchema,
   AllowanceProfileSchema,
@@ -114,6 +119,11 @@ import {
   type BillingInvoice,
   type BillingMeterEvent,
   type BudgetLimit,
+  type AllowanceAdjustment,
+  type AllowanceAdjustmentCreate,
+  type AllowanceBalance,
+  type AllowanceCycleSettings,
+  type AllowanceCycleSettingsUpsert,
   type AllowanceDefaultAssignment,
   type AllowanceDefaultUpsert,
   type AllowanceProfile,
@@ -193,7 +203,12 @@ import {
   type OrgModelDefault,
   type OrgModelPolicy,
   type Organization,
+  type OrganizationModelProvider,
+  type OrganizationModelProviderUpsert,
+  type OrgAiAccessRule,
+  type OrgAiAccessRuleUpsert,
   type OrgMembership,
+  type OrgMembershipUpdate,
   type PermissionMode,
   type ReasoningLevel,
   type ResourceAcl,
@@ -980,6 +995,13 @@ export class BerryApiClient {
     });
   }
 
+  async updateOrgMember(tenantId: string, userId: string, input: OrgMembershipUpdate): Promise<OrgMembership> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}`, OrgMembershipSchema, {
+      method: "PUT",
+      body: input,
+    });
+  }
+
   async listDepartments(tenantId: string): Promise<Department[]> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/departments`, z.array(DepartmentSchema));
   }
@@ -1077,6 +1099,36 @@ export class BerryApiClient {
 
   async blockedAllowanceRequests(tenantId: string, input: { cursor?: string; limit?: number } = {}): Promise<BlockedRequestPage> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/blocked${usageQuery(input)}`, BlockedRequestPageSchema);
+  }
+
+  async allowanceCycle(tenantId: string): Promise<AllowanceCycleSettings> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/cycle`, AllowanceCycleSettingsSchema);
+  }
+
+  async updateAllowanceCycle(tenantId: string, input: AllowanceCycleSettingsUpsert): Promise<AllowanceCycleSettings> {
+    AllowanceCycleSettingsUpsertSchema.parse(input);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/cycle`, AllowanceCycleSettingsSchema, { method: "PUT", body: input });
+  }
+
+  async allowanceBalances(tenantId: string): Promise<AllowanceBalance[]> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/balances`, z.array(AllowanceBalanceSchema));
+  }
+
+  async allowanceBalance(tenantId: string, userId: string): Promise<AllowanceBalance> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/balance/${encodeURIComponent(userId)}`, AllowanceBalanceSchema);
+  }
+
+  async myAllowanceBalance(tenantId: string): Promise<AllowanceBalance> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/me`, AllowanceBalanceSchema);
+  }
+
+  async allowanceAdjustments(tenantId: string, userId?: string): Promise<AllowanceAdjustment[]> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/adjustments${usageQuery({ userId })}`, z.array(AllowanceAdjustmentSchema));
+  }
+
+  async createAllowanceAdjustment(tenantId: string, input: AllowanceAdjustmentCreate): Promise<AllowanceAdjustment> {
+    AllowanceAdjustmentCreateSchema.parse(input);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/adjustments`, AllowanceAdjustmentSchema, { method: "POST", body: input });
   }
 
   async ingestUsageEvent(tenantId: string, input: CloudUsageIngestRequest): Promise<CloudUsageEventRecord> {
@@ -1196,6 +1248,35 @@ export class BerryApiClient {
     if (filter.includeBlocked) params.set("includeBlocked", "true");
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models${suffix}`, z.array(OrgModelPolicySchema));
+  }
+
+  async listOrganizationModelProviders(tenantId: string): Promise<OrganizationModelProvider[]> {
+    return this.#requestTyped(`/v1/orgs/${encodeURIComponent(tenantId)}/providers`);
+  }
+
+  async upsertOrganizationModelProvider(tenantId: string, input: OrganizationModelProviderUpsert): Promise<OrganizationModelProvider> {
+    return this.#requestTyped(`/v1/orgs/${encodeURIComponent(tenantId)}/providers`, { method: "PUT", body: input });
+  }
+
+  async testOrganizationModelProvider(tenantId: string, providerId: string): Promise<OrganizationModelProvider> {
+    return this.#requestTyped(`/v1/orgs/${encodeURIComponent(tenantId)}/providers/${encodeURIComponent(providerId)}/test`, { method: "POST" });
+  }
+
+  async listOrgAiAccessRules(
+    tenantId: string,
+    resource?: { resourceType: OrgAiAccessRule["resourceType"]; resourceId: string } | undefined,
+  ): Promise<OrgAiAccessRule[]> {
+    const params = new URLSearchParams();
+    if (resource) {
+      params.set("resourceType", resource.resourceType);
+      params.set("resourceId", resource.resourceId);
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return this.#requestTyped(`/v1/orgs/${encodeURIComponent(tenantId)}/models/access-rules${suffix}`);
+  }
+
+  async upsertOrgAiAccessRule(tenantId: string, input: OrgAiAccessRuleUpsert): Promise<OrgAiAccessRule> {
+    return this.#requestTyped(`/v1/orgs/${encodeURIComponent(tenantId)}/models/access-rules`, { method: "PUT", body: input });
   }
 
   async upsertOrgModelPolicy(tenantId: string, input: UpsertOrgModelPolicyRequest): Promise<OrgModelPolicy> {
@@ -1346,6 +1427,12 @@ export class BerryApiClient {
       throw new BerryApiError(`Berry API request failed with ${response.status}`, response.status, body);
     }
     return schema.parse(body);
+  }
+
+  async #requestTyped<T>(path: string, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<T> {
+    const { response, body } = await this.#rawRequest(path, init);
+    if (!response.ok) throw new BerryApiError(`Berry API request failed with ${response.status}`, response.status, body);
+    return body as T;
   }
 
   #resolveFileUrls(file: StoredFile): StoredFile {

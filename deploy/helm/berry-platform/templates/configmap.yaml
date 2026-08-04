@@ -23,6 +23,8 @@ data:
   BERRY_ROUTER_CHAT_COMPLETIONS_PATH: {{ .Values.router.chatCompletionsPath | quote }}
   BERRY_ROUTER_DEFAULT_MODEL: {{ .Values.router.defaultModel | quote }}
   BERRY_ROUTER_MODELS_JSON: {{ .Values.router.modelsJson | quote }}
+  BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS: {{ .Values.router.organizationProviderAllowedHosts | quote }}
+  BERRY_ORGANIZATION_PROVIDER_ALLOW_INSECURE_HTTP: {{ .Values.router.organizationProviderAllowInsecureHttp | quote }}
   BERRY_SANDBOX_PROVIDER: {{ .Values.sandbox.provider | quote }}
   BERRY_SANDBOX_IMAGE: {{ .Values.sandbox.templateId | quote }}
   BERRY_E2B_TEMPLATE_ID: {{ .Values.sandbox.templateId | quote }}

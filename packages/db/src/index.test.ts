@@ -172,7 +172,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]);
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {
@@ -241,7 +241,7 @@ describe("cloud postgres schema", () => {
   });
 
   it("removes public access to selecting an arbitrary tenant context", () => {
-    expect(cloudMigrations.at(-1)).toMatchObject({ id: 35, name: "tenant_context_execute_hardening_v1" });
+    expect(cloudMigrations.find((migration) => migration.id === 35)).toMatchObject({ id: 35, name: "tenant_context_execute_hardening_v1" });
     expect(TENANT_CONTEXT_EXECUTE_HARDENING_MIGRATION).toContain("FROM PUBLIC");
   });
 

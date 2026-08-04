@@ -51,6 +51,7 @@ export interface BerryAuthRuntime {
   setupOwner?(input: unknown): Promise<BerryOwnerSetupResult>;
   getSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession | null>;
   requireSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession>;
+  authorizeSession?(session: BerryAuthSession): Promise<boolean>;
   handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void>;
   close?(): Promise<void>;
 }
@@ -407,6 +408,29 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
     return session;
   }
 
+  async authorizeSession(session: BerryAuthSession): Promise<boolean> {
+    if (!this.pool) return true;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT berry_set_tenant_id($1::uuid)", [this.tenantId]);
+      const result = await client.query<{ active: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM tenant_memberships
+           WHERE tenant_id = $1::uuid AND user_id = $2::uuid AND status = 'active'
+         ) AS active`,
+        [this.tenantId, session.user.id],
+      );
+      await client.query("COMMIT");
+      return result.rows[0]?.active === true;
+    } catch (cause) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw cause;
+    } finally {
+      client.release();
+    }
+  }
+
   async handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     await this.nodeHandler(req, res);
   }
@@ -437,6 +461,10 @@ export class BerryAuthService implements BerryAuthRuntime, OnModuleDestroy {
 
   requireSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession> {
     return this.runtime.requireSession(headers);
+  }
+
+  authorizeSession(session: BerryAuthSession): Promise<boolean> {
+    return this.runtime.authorizeSession?.(session) ?? Promise.resolve(true);
   }
 
   handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {

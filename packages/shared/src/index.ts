@@ -301,12 +301,28 @@ export const OrgMembershipSchema = z.object({
   status: z.enum(["active", "disabled", "deprovisioned"]).default("active"),
   role: z.string().default("member"),
   departmentIds: z.array(z.string()).default([]),
+  primaryDepartmentId: z.string().nullable().optional(),
   externalId: z.string().nullable().default(null),
   source: z.enum(["manual", "sso", "scim"]).default("manual"),
   joinedAt: ISODateSchema,
   updatedAt: ISODateSchema,
 });
 export type OrgMembership = z.infer<typeof OrgMembershipSchema>;
+export const OrgMembershipUpdateSchema = z.object({
+  status: z.enum(["active", "disabled", "deprovisioned"]).optional(),
+  role: z.enum(["admin", "member"]).optional(),
+  departmentIds: z.array(z.string()).optional(),
+  primaryDepartmentId: z.string().nullable().optional(),
+}).strict().superRefine((value, context) => {
+  if (value.primaryDepartmentId && value.departmentIds && !value.departmentIds.includes(value.primaryDepartmentId)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["primaryDepartmentId"],
+      message: "Primary department must be included in departmentIds",
+    });
+  }
+});
+export type OrgMembershipUpdate = z.infer<typeof OrgMembershipUpdateSchema>;
 
 export const OrgPermissionSchema = z.enum([
   "org:read",
@@ -1179,6 +1195,36 @@ export const ModelProviderSchema = z.object({
 });
 export type ModelProvider = z.infer<typeof ModelProviderSchema>;
 
+export const OrganizationModelProviderSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  providerId: z.string(),
+  displayName: z.string(),
+  kind: ModelProviderKindSchema,
+  apiType: ModelApiTypeSchema,
+  baseUrl: z.string().url(),
+  endpointPath: z.string().nullable(),
+  modelsPath: z.string().nullable(),
+  authType: ProviderAuthTypeSchema,
+  credentialRef: z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_.:/-]+$/).nullable(),
+  defaultModel: z.string().nullable(),
+  enabled: z.boolean(),
+  status: z.enum(["configured", "active", "error", "disabled"]),
+  lastTestedAt: ISODateSchema.nullable(),
+  createdAt: ISODateSchema,
+  updatedAt: ISODateSchema,
+});
+export type OrganizationModelProvider = z.infer<typeof OrganizationModelProviderSchema>;
+export const OrganizationModelProviderUpsertSchema = OrganizationModelProviderSchema.omit({
+  id: true,
+  tenantId: true,
+  status: true,
+  lastTestedAt: true,
+  createdAt: true,
+  updatedAt: true,
+}).strict();
+export type OrganizationModelProviderUpsert = z.infer<typeof OrganizationModelProviderUpsertSchema>;
+
 export const OrgModelPolicyStatusSchema = z.enum(["allowed", "blocked"]);
 export type OrgModelPolicyStatus = z.infer<typeof OrgModelPolicyStatusSchema>;
 
@@ -1211,6 +1257,30 @@ export const OrgModelPolicySchema = z.object({
 });
 export type OrgModelPolicy = z.infer<typeof OrgModelPolicySchema>;
 
+export const OrgAiAccessScopeSchema = z.enum(["org", "department", "user"]);
+export type OrgAiAccessScope = z.infer<typeof OrgAiAccessScopeSchema>;
+export const OrgAiAccessResourceSchema = z.enum(["model", "feature", "skill", "mcp", "execution"]);
+export type OrgAiAccessResource = z.infer<typeof OrgAiAccessResourceSchema>;
+export const OrgAiAccessRuleSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  scopeType: OrgAiAccessScopeSchema,
+  scopeId: z.string(),
+  resourceType: OrgAiAccessResourceSchema,
+  resourceId: z.string(),
+  effect: z.enum(["allowed", "blocked"]),
+  createdAt: ISODateSchema,
+  updatedAt: ISODateSchema,
+});
+export type OrgAiAccessRule = z.infer<typeof OrgAiAccessRuleSchema>;
+export const OrgAiAccessRuleUpsertSchema = OrgAiAccessRuleSchema.omit({
+  id: true,
+  tenantId: true,
+  createdAt: true,
+  updatedAt: true,
+}).strict();
+export type OrgAiAccessRuleUpsert = z.infer<typeof OrgAiAccessRuleUpsertSchema>;
+
 export const OrgModelDefaultSchema = z.object({
   tenantId: z.string(),
   mode: LegacyConversationKindSchema,
@@ -1233,6 +1303,7 @@ export const ModelGovernanceDecisionSchema = z.object({
   reason: z.string(),
   policy: OrgModelPolicySchema.nullable(),
   default: OrgModelDefaultSchema.nullable(),
+  accessRule: OrgAiAccessRuleSchema.nullable().default(null),
 });
 export type ModelGovernanceDecision = z.infer<typeof ModelGovernanceDecisionSchema>;
 
@@ -3141,7 +3212,7 @@ export const UsageSeriesPointSchema = z.object({
   successes: z.number().int().nonnegative(), failures: z.number().int().nonnegative(),
 });
 export const UsageBreakdownRowSchema = z.object({
-  dimension: z.string(), id: z.string().nullable(), label: z.string(), billedCostMicros: z.string(), requests: z.number().int().nonnegative(),
+  dimension: z.string(), id: z.string().nullable(), label: z.string(), name: z.string().optional(), email: z.string().email().optional(), billedCostMicros: z.string(), requests: z.number().int().nonnegative(),
   tokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative().default(0), outputTokens: z.number().int().nonnegative().default(0),
   cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
   errorRate: z.number().min(0).max(1).nullable(), latencyP50Ms: z.number().nonnegative().nullable(), latencyP95Ms: z.number().nonnegative().nullable(),
@@ -3168,6 +3239,7 @@ export type UsageAnalytics = z.infer<typeof UsageAnalyticsSchema>;
 
 export const UsageRequestSummarySchema = z.object({
   id: z.string(), requestId: z.string(), ts: ISODateSchema, userId: z.string().nullable(), departmentId: z.string().nullable(), workspaceId: z.string().nullable(),
+  userName: z.string().nullable().optional(), userEmail: z.string().email().nullable().optional(), departmentName: z.string().nullable().optional(),
   agentId: z.string().nullable(), feature: z.string(), provider: z.string().nullable(), model: z.string().nullable(), status: z.string(),
   tokensIn: z.number().int().nonnegative(), tokensOut: z.number().int().nonnegative(), tokensCached: z.number().int().nonnegative(),
   cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
@@ -3248,6 +3320,55 @@ export type BulkLimitResult = z.infer<typeof BulkLimitResultSchema>;
 export const LimitTraceEntrySchema = z.object({ limitId: z.string(), scopeType: BudgetScopeTypeSchema, scopeId: z.string(), metric: QuotaMetricSchema, value: z.string(), active: z.boolean(), winning: z.boolean(), reason: z.string() });
 export const EffectiveLimitSchema = z.object({ tenantId: z.string(), userId: z.string(), metric: QuotaMetricSchema, period: z.enum(["day", "month"]), effectiveValue: z.string().nullable(), used: z.string(), reserved: z.string(), available: z.string().nullable(), projected: z.string().nullable(), status: z.enum(["healthy", "warning", "blocked", "unlimited"]), trace: z.array(LimitTraceEntrySchema) });
 export type EffectiveLimit = z.infer<typeof EffectiveLimitSchema>;
+export const AllowanceCycleSettingsSchema = z.object({
+  tenantId: z.string(),
+  timezone: z.string().min(1).max(100),
+  anchorDay: z.number().int().min(1).max(28),
+  updatedBy: z.string().nullable().default(null),
+  updatedAt: ISODateSchema,
+});
+export type AllowanceCycleSettings = z.infer<typeof AllowanceCycleSettingsSchema>;
+export const AllowanceCycleSettingsUpsertSchema = AllowanceCycleSettingsSchema.pick({
+  timezone: true,
+  anchorDay: true,
+}).strict();
+export type AllowanceCycleSettingsUpsert = z.infer<typeof AllowanceCycleSettingsUpsertSchema>;
+export const AllowanceAdjustmentSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  userId: z.string(),
+  amountMicros: z.string().regex(/^-?\d+$/),
+  reason: z.string(),
+  idempotencyKey: z.string(),
+  cycleStart: ISODateSchema,
+  cycleEnd: ISODateSchema,
+  createdBy: z.string(),
+  createdAt: ISODateSchema,
+});
+export type AllowanceAdjustment = z.infer<typeof AllowanceAdjustmentSchema>;
+export const AllowanceAdjustmentCreateSchema = z.object({
+  userId: z.string().min(1),
+  amountMicros: z.string().regex(/^[1-9]\d*$/),
+  reason: z.string().trim().min(3).max(500),
+  idempotencyKey: z.string().min(8).max(200),
+}).strict();
+export type AllowanceAdjustmentCreate = z.infer<typeof AllowanceAdjustmentCreateSchema>;
+export const AllowanceBalanceSchema = z.object({
+  tenantId: z.string(),
+  userId: z.string(),
+  userName: z.string().nullable().default(null),
+  userEmail: z.string().email().nullable().default(null),
+  cycleStart: ISODateSchema,
+  cycleEnd: ISODateSchema,
+  baseLimitMicros: z.string().nullable(),
+  adjustmentMicros: z.string(),
+  effectiveLimitMicros: z.string().nullable(),
+  usedMicros: z.string(),
+  reservedMicros: z.string(),
+  availableMicros: z.string().nullable(),
+  status: z.enum(["healthy", "warning", "blocked", "unlimited"]),
+});
+export type AllowanceBalance = z.infer<typeof AllowanceBalanceSchema>;
 export const BlockedRequestSummarySchema = z.object({ id: z.string(), requestId: z.string(), userId: z.string().nullable(), departmentId: z.string().nullable(), feature: z.string(), reason: z.string(), limitId: z.string().nullable(), estimatedCostMicros: z.string(), ts: ISODateSchema });
 export const BlockedRequestPageSchema = CursorPageSchema.extend({ items: z.array(BlockedRequestSummarySchema) });
 export type BlockedRequestPage = z.infer<typeof BlockedRequestPageSchema>;

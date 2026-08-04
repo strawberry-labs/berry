@@ -87,6 +87,29 @@ import { cn } from "@berry/desktop-ui/lib/utils";
 
 export { Button, Checkbox, Input, Select, Switch, Textarea };
 
+type ManagementPageTabsValue = {
+  activeTab: string;
+  ariaLabel: string;
+  onTabChange: (tab: string) => void;
+  tabs: readonly { id: string; label: string }[];
+};
+
+const ManagementPageTabsContext = React.createContext<ManagementPageTabsValue | null>(null);
+
+export function ManagementPageTabsProvider({
+  value,
+  children,
+}: {
+  value: ManagementPageTabsValue;
+  children: ReactNode;
+}) {
+  return (
+    <ManagementPageTabsContext.Provider value={value}>
+      {children}
+    </ManagementPageTabsContext.Provider>
+  );
+}
+
 export function ManagementPage({
   title,
   description,
@@ -102,6 +125,7 @@ export function ManagementPage({
   children: ReactNode;
   status?: ReactNode;
 }) {
+  const pageTabs = React.useContext(ManagementPageTabsContext);
   return (
     <main className="mx-auto flex w-full min-w-0 max-w-[1120px] flex-col gap-5 px-5 pb-16 pt-[calc(var(--berry-titlebar-height)+1rem)] md:px-7 md:py-8">
       <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -124,6 +148,23 @@ export function ManagementPage({
           </div>
         ) : null}
       </header>
+      {pageTabs && pageTabs.tabs.length > 1 ? (
+        <Tabs value={pageTabs.activeTab} onValueChange={pageTabs.onTabChange}>
+          <div className="scroll-fade overflow-x-auto border-b border-border">
+            <TabsList
+              variant="line"
+              aria-label={pageTabs.ariaLabel}
+              className="min-w-max px-0"
+            >
+              {pageTabs.tabs.map((tab) => (
+                <TabsTrigger key={tab.id} value={tab.id} className="px-3">
+                  {tab.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </div>
+        </Tabs>
+      ) : null}
       {status}
       <div className="grid min-w-0 gap-4">{children}</div>
     </main>

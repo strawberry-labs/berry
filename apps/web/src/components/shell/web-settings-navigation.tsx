@@ -13,6 +13,7 @@ import {
   ADMIN_NAV,
   PERSONAL_NAV,
   PLATFORM_NAV,
+  adminAreaForTab,
   visibleNavigationGroups,
   type ManagementKind,
 } from "../management/management-navigation";
@@ -112,7 +113,9 @@ function NavigationGroup({
       <SidebarMenu>
         {group.items.map((item) => {
           const Icon = item.icon;
-          const active = kind === activeKind && item.id === activeTab;
+          const effectiveActiveTab =
+            kind === "admin" ? adminAreaForTab(activeTab).id : activeTab;
+          const active = kind === activeKind && item.id === effectiveActiveTab;
           return (
             <SidebarMenuItem key={`${kind}:${item.id}`}>
               <SidebarMenuButton

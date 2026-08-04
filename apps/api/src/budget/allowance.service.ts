@@ -39,6 +39,16 @@ export class AllowanceService {
   listDefaults(tenantId: string) { return this.repository.listDefaults(tenantId); }
   upsertDefault(tenantId: string, input: AllowanceDefaultInput) { return this.repository.upsertDefault(tenantId, input); }
   blocked(tenantId: string, cursor: string | undefined, limit: number) { return this.repository.blocked(tenantId, cursor, limit); }
+  cycle(tenantId: string) { return this.budgets.getAllowanceCycle(tenantId); }
+  updateCycle(tenantId: string, timezone: string, anchorDay: number, updatedBy: string) {
+    return this.budgets.upsertAllowanceCycle({ tenantId, timezone, anchorDay, updatedBy });
+  }
+  createAdjustment(tenantId: string, userId: string, amountMicros: string, reason: string, idempotencyKey: string, createdBy: string) {
+    return this.budgets.createAllowanceAdjustment({ tenantId, userId, amountMicros, reason, idempotencyKey, createdBy });
+  }
+  listAdjustments(tenantId: string, userId?: string) { return this.budgets.listAllowanceAdjustments(tenantId, userId); }
+  balance(tenantId: string, userId: string) { return this.budgets.allowanceBalance(tenantId, userId); }
+  balances(tenantId: string, userIds: string[]) { return this.budgets.allowanceBalances(tenantId, userIds); }
 
   async bulk(tenantId: string, input: BulkLimitMutation): Promise<BulkLimitResult> {
     const previous = await this.repository.claimBulk(tenantId, input.idempotencyKey);

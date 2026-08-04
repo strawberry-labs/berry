@@ -31,7 +31,7 @@ describe("cloud shell bootstrap", () => {
 
   it("shows only administration screens allowed by the active role", () => {
     const visible = visibleNavigationGroups(ADMIN_NAV, ["org:read", "members:read"]);
-    expect(visible.flatMap((group) => group.items.map((item) => item.id))).toEqual(["overview", "members", "skills-mcp"]);
+    expect(visible.flatMap((group) => group.items.map((item) => item.id))).toEqual(["overview", "people", "ai-tools"]);
   });
 
   it("redirects legacy memory navigation into personalization", () => {

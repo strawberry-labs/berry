@@ -1295,6 +1295,21 @@ export const billingAutoRefillConfigs = pgTable("billing_auto_refill_configs", {
   currency: text("currency").notNull().default("usd"), idempotencyKey: text("idempotency_key"), updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }), updatedAt,
 });
 
+export const organizationAiAccessRules = pgTable("organization_ai_access_rules", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  scopeType: text("scope_type").notNull(),
+  scopeId: text("scope_id").notNull(),
+  resourceType: text("resource_type").notNull(),
+  resourceId: text("resource_id").notNull(),
+  effect: text("effect").notNull().default("allowed"),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("organization_ai_access_rules_scope_resource_unique").on(table.tenantId, table.scopeType, table.scopeId, table.resourceType, table.resourceId),
+  index("organization_ai_access_rules_tenant_resource_idx").on(table.tenantId, table.resourceType, table.resourceId),
+]);
+
 export const savedAnalyticsViews = pgTable("saved_analytics_views", {
   id: uuid("id").primaryKey().defaultRandom(), tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   ownerUserId: uuid("owner_user_id").notNull().references(() => users.id, { onDelete: "cascade" }), name: text("name").notNull(),
@@ -3507,6 +3522,105 @@ CREATE POLICY personalization_profiles_tenant_isolation ON personalization_profi
   WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+export const ALLOWANCE_CYCLES_MIGRATION = `
+ALTER TABLE tenant_memberships
+  ADD COLUMN IF NOT EXISTS primary_department_id uuid REFERENCES departments(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS allowance_cycle_settings (
+  tenant_id uuid PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+  timezone text NOT NULL DEFAULT 'UTC',
+  anchor_day integer NOT NULL DEFAULT 1 CHECK (anchor_day BETWEEN 1 AND 28),
+  updated_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS allowance_adjustments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  amount_micros numeric(20, 0) NOT NULL CHECK (amount_micros > 0),
+  reason text NOT NULL,
+  idempotency_key text NOT NULL,
+  cycle_start timestamptz NOT NULL,
+  cycle_end timestamptz NOT NULL,
+  created_by uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, idempotency_key),
+  CHECK (cycle_end > cycle_start)
+);
+CREATE INDEX IF NOT EXISTS allowance_adjustments_tenant_user_cycle_idx
+  ON allowance_adjustments (tenant_id, user_id, cycle_start, cycle_end);
+
+ALTER TABLE allowance_cycle_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE allowance_cycle_settings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS allowance_cycle_settings_tenant_isolation ON allowance_cycle_settings;
+CREATE POLICY allowance_cycle_settings_tenant_isolation ON allowance_cycle_settings
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+
+ALTER TABLE allowance_adjustments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE allowance_adjustments FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS allowance_adjustments_tenant_isolation ON allowance_adjustments;
+CREATE POLICY allowance_adjustments_tenant_isolation ON allowance_adjustments
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
+export const ORGANIZATION_MODEL_PROVIDERS_MIGRATION = `
+CREATE TABLE IF NOT EXISTS organization_model_providers (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  provider_id text NOT NULL,
+  display_name text NOT NULL,
+  kind text NOT NULL,
+  api_type text NOT NULL,
+  base_url text NOT NULL,
+  endpoint_path text,
+  models_path text,
+  auth_type text NOT NULL,
+  credential_ref text,
+  default_model text,
+  enabled boolean NOT NULL DEFAULT false,
+  status text NOT NULL DEFAULT 'configured' CHECK (status IN ('configured','active','error','disabled')),
+  last_tested_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, provider_id)
+);
+CREATE INDEX IF NOT EXISTS organization_model_providers_tenant_status_idx
+  ON organization_model_providers (tenant_id, status, display_name);
+ALTER TABLE organization_model_providers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE organization_model_providers FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS organization_model_providers_tenant_isolation ON organization_model_providers;
+CREATE POLICY organization_model_providers_tenant_isolation ON organization_model_providers
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
+export const ORGANIZATION_AI_ACCESS_RULES_MIGRATION = `
+CREATE TABLE IF NOT EXISTS organization_ai_access_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  scope_type text NOT NULL CHECK (scope_type IN ('org','department','user')),
+  scope_id text NOT NULL,
+  resource_type text NOT NULL CHECK (resource_type IN ('model','feature','skill','mcp','execution')),
+  resource_id text NOT NULL,
+  effect text NOT NULL CHECK (effect IN ('allowed','blocked')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id,scope_type,scope_id,resource_type,resource_id),
+  CHECK (scope_type <> 'org' OR scope_id = tenant_id::text)
+);
+CREATE INDEX IF NOT EXISTS organization_ai_access_rules_tenant_resource_idx
+  ON organization_ai_access_rules (tenant_id,resource_type,resource_id);
+ALTER TABLE organization_ai_access_rules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE organization_ai_access_rules FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS organization_ai_access_rules_tenant_isolation ON organization_ai_access_rules;
+CREATE POLICY organization_ai_access_rules_tenant_isolation ON organization_ai_access_rules
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -3602,4 +3716,7 @@ export const cloudMigrations = [
   { id: 34, name: "knowledge_vector_hnsw_v1", sql: KNOWLEDGE_VECTOR_HNSW_MIGRATION },
   { id: 35, name: "tenant_context_execute_hardening_v1", sql: TENANT_CONTEXT_EXECUTE_HARDENING_MIGRATION },
   { id: 36, name: "personalization_profiles_v1", sql: PERSONALIZATION_PROFILE_MIGRATION },
+  { id: 37, name: "allowance_cycles_v1", sql: ALLOWANCE_CYCLES_MIGRATION },
+  { id: 38, name: "organization_model_providers_v1", sql: ORGANIZATION_MODEL_PROVIDERS_MIGRATION },
+  { id: 39, name: "organization_ai_access_rules_v1", sql: ORGANIZATION_AI_ACCESS_RULES_MIGRATION },
 ] as const;

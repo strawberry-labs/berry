@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -280,6 +280,20 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
     ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
     : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
+  const [allowance, setAllowance] = React.useState<AllowanceBalance | null>(null);
+  const [allowanceLoading, setAllowanceLoading] = React.useState(false);
+  const refreshAllowance = React.useCallback(() => {
+    if (!client || !activeOrganizationId || !user) {
+      setAllowance(null);
+      return;
+    }
+    setAllowanceLoading(true);
+    void client.myAllowanceBalance(activeOrganizationId)
+      .then(setAllowance)
+      .catch(() => setAllowance(null))
+      .finally(() => setAllowanceLoading(false));
+  }, [activeOrganizationId, client, user]);
+  React.useEffect(() => refreshAllowance(), [refreshAllowance]);
   React.useEffect(() => {
     if (!client) return;
     let cancelled = false;
@@ -1756,6 +1770,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             activeTaskId={activeTask?.id ?? null}
             loadError={resourceErrors.workspaces || resourceErrors.tasks}
             user={user}
+            allowance={allowance}
+            allowanceLoading={allowanceLoading}
+            onRefreshAllowance={refreshAllowance}
             onNewTask={() => {
               navigateHome();
             }}
@@ -1795,6 +1812,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             } : null}
             onSkills={() => navigateToSettings("skills")}
             onLibrary={() => navigateToLibrary("all")}
+            onUsage={() => navigateToSettings("usage")}
             onSettings={() => navigateToSettings("general")}
             onSignOut={() => void signOut()}
           />

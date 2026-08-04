@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useNavigate } from "@tanstack/react-router";
 import { Download, Plus, Save, Search } from "lucide-react";
 import {
   AsyncState,
@@ -9,6 +10,7 @@ import {
   Input,
   ManagementDialog,
   ManagementPage,
+  ManagementPageTabsProvider,
   MetricGrid,
   PermissionDenied,
   SearchInput,
@@ -32,28 +34,60 @@ import { OrganizationProfileScreen } from "./organization-profile-screen";
 import { ReportsAlertsScreen } from "./reports-alerts-screen";
 import { AnalyticsScreen } from "./analytics-screen";
 import { AdminCatalogScreen } from "./admin-catalog-screens";
+import {
+  adminAreaForTab,
+  resolvedAdminTab,
+} from "./management-navigation";
 export function AdminScreen({
   tab,
   ...p
 }: ManagementScreenProps & { tab: string }) {
-  const read = permissionFor(tab);
+  const navigate = useNavigate();
+  const area = adminAreaForTab(tab);
+  const resolvedTab = resolvedAdminTab(tab, p.permissions);
+  const read = permissionFor(resolvedTab);
   if (read && !p.permissions.includes(read as any))
-    return <PermissionDenied label={titleFor(tab)} />;
-  if (tab === "overview") return <Overview {...p} />;
-  if (tab === "members") return <Members {...p} />;
-  if (tab === "departments") return <Departments {...p} />;
-  if (tab === "analytics") return <AnalyticsScreen {...p} />;
-  if (tab === "spend-limits") return <SpendLimits {...p} />;
-  if (tab === "credits-billing") return <Billing {...p} />;
-  if (tab === "reports-alerts") return <ReportsAlertsScreen {...p} />;
-  if (tab === "execution-network")
-    return <PolicyScreen kind="execution" {...p} />;
-  if (tab === "authentication")
-    return <PolicyScreen kind="authentication" {...p} />;
-  if (tab === "data-governance") return <PolicyScreen kind="data" {...p} />;
-  if (tab === "service-accounts") return <ServiceAccounts {...p} />;
-  if (tab === "profile-domains") return <OrganizationProfileScreen {...p} />;
-  return <AdminCatalogScreen tab={tab} {...p} />;
+    return <PermissionDenied label={titleFor(resolvedTab)} />;
+
+  const visibleTabs = area.tabs.filter(
+    (item) => !item.permission || p.permissions.includes(item.permission),
+  );
+  const screen = (() => {
+    if (resolvedTab === "overview") return <Overview {...p} />;
+    if (resolvedTab === "members") return <Members {...p} />;
+    if (resolvedTab === "departments") return <Departments {...p} />;
+    if (resolvedTab === "analytics") return <AnalyticsScreen {...p} />;
+    if (resolvedTab === "spend-limits") return <SpendLimits {...p} />;
+    if (resolvedTab === "credits-billing") return <Billing {...p} />;
+    if (resolvedTab === "reports-alerts") return <ReportsAlertsScreen {...p} />;
+    if (resolvedTab === "execution-network")
+      return <PolicyScreen kind="execution" {...p} />;
+    if (resolvedTab === "authentication")
+      return <PolicyScreen kind="authentication" {...p} />;
+    if (resolvedTab === "data-governance") return <PolicyScreen kind="data" {...p} />;
+    if (resolvedTab === "service-accounts") return <ServiceAccounts {...p} />;
+    if (resolvedTab === "profile-domains") return <OrganizationProfileScreen {...p} />;
+    return <AdminCatalogScreen tab={resolvedTab} {...p} />;
+  })();
+
+  return (
+    <ManagementPageTabsProvider
+      value={{
+        activeTab: resolvedTab,
+        ariaLabel: `${area.label} sections`,
+        tabs: visibleTabs,
+        onTabChange: (nextTab) => {
+          void navigate({
+            to: "/admin/$tab",
+            params: { tab: nextTab },
+            search: {},
+          });
+        },
+      }}
+    >
+      {screen}
+    </ManagementPageTabsProvider>
+  );
 }
 function Overview({ client, config, tenantId }: ManagementScreenProps) {
   const now = new Date(),
@@ -278,13 +312,63 @@ function Members({
   tenantId,
   permissions,
 }: ManagementScreenProps) {
+  const navigate = useNavigate();
   const [query, setQuery] = React.useState(""),
     [open, setOpen] = React.useState(false),
     [message, setMessage] = React.useState("");
+  const [editing, setEditing] = React.useState<any>(null);
+  const [editRole, setEditRole] = React.useState("member");
+  const [editStatus, setEditStatus] = React.useState("active");
+  const [editDepartments, setEditDepartments] = React.useState<Set<string>>(new Set());
+  const [editPrimaryDepartment, setEditPrimaryDepartment] = React.useState("none");
   const r = useResource(
     `members:${tenantId}`,
     async () => (client ? client.listOrgMembers(tenantId) : []),
     [] as any[],
+  );
+  const departments = useResource(
+    `member-departments:${tenantId}`,
+    async () =>
+      client
+        ? client.listDepartments(tenantId)
+        : config.departments.filter((item) => item.tenantId === tenantId),
+    [] as any[],
+  );
+  const now = new Date();
+  const usageFrom = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
+  ).toISOString();
+  const usage = useResource(
+    `member-usage:${tenantId}:${usageFrom}`,
+    async () =>
+      client && permissions.includes("usage:read")
+        ? client.usageAnalytics(tenantId, {
+            from: usageFrom,
+            to: new Date().toISOString(),
+            limit: 100,
+          })
+        : null,
+    null as any,
+  );
+  const balances = useResource(
+    `member-balances:${tenantId}`,
+    async () => client && permissions.includes("budgets:read") ? client.allowanceBalances(tenantId) : [],
+    [] as any[],
+  );
+  const departmentNames = new Map<string, string>(
+    departments.data.map((department: any) => [department.id, department.name]),
+  );
+  const memberSpend = new Map<string, string>(
+    (
+      usage.data?.breakdowns?.members ??
+      usage.data?.breakdowns?.users ??
+      []
+    ).flatMap((row: any) =>
+      row.id ? [[row.id, row.billedCostMicros] as const] : [],
+    ),
+  );
+  const memberBalance = new Map<string, any>(
+    balances.data.map((balance: any) => [balance.userId, balance]),
   );
   const rows = r.data.filter((m: any) =>
     `${m.name} ${m.email} ${m.role}`
@@ -295,26 +379,65 @@ function Members({
     e.preventDefault();
     if (!client) return;
     const f = new FormData(e.currentTarget);
-    await client.createOrgMember(tenantId, {
+    const created = await client.createOrgMember(tenantId, {
       email: String(f.get("email")),
       name: String(f.get("name")),
       password: String(f.get("password")),
       role: String(f.get("role")) as any,
     });
+    const departmentId = String(f.get("primaryDepartmentId"));
+    if (departmentId && departmentId !== "none") {
+      await client.updateOrgMember(tenantId, created.userId, {
+        departmentIds: [departmentId],
+        primaryDepartmentId: departmentId,
+      });
+    }
     setOpen(false);
-    setMessage("Member invited and the default allowance profile was applied.");
+    setMessage("Member account created and the default allowance profile was applied.");
     r.retry();
+  };
+  const openMember = (member: any) => {
+    setEditing(member);
+    setEditRole(member.role);
+    setEditStatus(member.status);
+    setEditDepartments(new Set(member.departmentIds ?? []));
+    setEditPrimaryDepartment(member.primaryDepartmentId ?? "none");
+  };
+  const toggleDepartment = (departmentId: string) => {
+    setEditDepartments((current) => {
+      const next = new Set(current);
+      if (next.has(departmentId)) {
+        next.delete(departmentId);
+        if (editPrimaryDepartment === departmentId) setEditPrimaryDepartment("none");
+      } else {
+        next.add(departmentId);
+        if (editPrimaryDepartment === "none") setEditPrimaryDepartment(departmentId);
+      }
+      return next;
+    });
+  };
+  const saveMember = async () => {
+    if (!client || !editing) return;
+    const updated = await client.updateOrgMember(tenantId, editing.userId, {
+      role: editRole as "admin" | "member",
+      status: editStatus as "active" | "disabled" | "deprovisioned",
+      departmentIds: [...editDepartments],
+      primaryDepartmentId: editPrimaryDepartment === "none" ? null : editPrimaryDepartment,
+    });
+    r.setData(r.data.map((member: any) => member.userId === updated.userId ? updated : member));
+    setEditing(null);
+    setMessage(editStatus === "disabled" ? "Member blocked. Existing usage history was preserved." : editStatus === "deprovisioned" ? "Member offboarded. Access was revoked and history was preserved." : "Member access and primary department updated.");
   };
   return (
     <ManagementPage
       title="Members"
-      description="Search, invite, and administer organization members. SCIM-managed identities remain locked."
+      description="Find people by name or email, review current-month spend, and administer local organization accounts."
       eyebrow="People"
       actions={
         permissions.includes("members:write") ? (
           <Button onClick={() => setOpen(true)}>
             <Plus />
-            Invite member
+            Add member
           </Button>
         ) : null
       }
@@ -331,8 +454,8 @@ function Members({
       <ManagementDialog
         open={open}
         onOpenChange={setOpen}
-        title="Invite member"
-        description="Create a Berry account and apply the selected organization role. SCIM-managed identities should be provisioned through your identity provider."
+        title="Add member"
+        description="Create a local Berry account and apply the selected organization role. Email invitations are not sent in the current no-SSO mode."
         footer={
           <>
             <Button
@@ -343,7 +466,7 @@ function Members({
               Cancel
             </Button>
             <Button type="submit" form="invite-member-form">
-              Send invitation
+              Create account
             </Button>
           </>
         }
@@ -373,11 +496,47 @@ function Members({
               options={[
                 { value: "member", label: "Member" },
                 { value: "admin", label: "Admin" },
-                { value: "owner", label: "Owner" },
               ]}
             />
           </label>
+          <label>
+            Primary department
+            <FormSelect
+              name="primaryDepartmentId"
+              defaultValue="none"
+              options={[{ value: "none", label: "No department" }, ...departments.data.map((department: any) => ({ value: department.id, label: department.name }))]}
+            />
+          </label>
         </form>
+      </ManagementDialog>
+      <ManagementDialog
+        open={Boolean(editing)}
+        onOpenChange={(next) => { if (!next) setEditing(null); }}
+        title={editing?.name || "Manage member"}
+        description={editing ? `${editing.email} · Set role, access status, and primary department.` : ""}
+        size="lg"
+        footer={<><Button type="button" variant="secondary" onClick={() => setEditing(null)}>Cancel</Button><Button type="button" onClick={() => void saveMember()} disabled={editing?.role === "owner"}><Save />Save member</Button></>}
+      >
+        {editing ? (
+          <div className="grid gap-4">
+            {editing.role === "owner" ? <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">The organization owner cannot be demoted, blocked, or offboarded from this screen.</p> : null}
+            <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
+              <label>Role<FormSelect value={editRole} onChange={setEditRole} disabled={editing.role === "owner"} options={[{ value: "member", label: "Member" }, { value: "admin", label: "Admin" }]} /></label>
+              <label>Account access<FormSelect value={editStatus} onChange={setEditStatus} disabled={editing.role === "owner"} options={[{ value: "active", label: "Active" }, { value: "disabled", label: "Blocked" }, { value: "deprovisioned", label: "Offboarded" }]} /></label>
+            </div>
+            <fieldset className="grid gap-2 border-0 p-0" disabled={editing.role === "owner"}>
+              <legend className="mb-1 text-xs font-semibold">Departments</legend>
+              {departments.data.map((department: any) => (
+                <label key={department.id} className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+                  <Checkbox checked={editDepartments.has(department.id)} onCheckedChange={() => toggleDepartment(department.id)} />
+                  {department.name}
+                </label>
+              ))}
+            </fieldset>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Primary department<FormSelect value={editPrimaryDepartment} onChange={setEditPrimaryDepartment} disabled={editing.role === "owner"} options={[{ value: "none", label: "No primary department" }, ...departments.data.filter((department: any) => editDepartments.has(department.id)).map((department: any) => ({ value: department.id, label: department.name }))]} /></label>
+            <p className="text-xs text-muted-foreground">Blocked and offboarded members cannot authorize new requests. Their audit and usage history remains available.</p>
+          </div>
+        ) : null}
       </ManagementDialog>
       <AsyncState
         loading={r.loading}
@@ -387,18 +546,39 @@ function Members({
       >
         <DataTable
           label="Members"
-          columns={["Member", "Role", "Departments", "Source", "Status"]}
+          columns={["Member", "Role", "Departments", "Spend this month", "Allowance cycle", "Source", "Status", ""]}
           rows={rows.map((m: any) => [
-            <span>
+            <Button
+              variant="ghost"
+              className="grid h-auto justify-start gap-0 p-0 text-left"
+              onClick={() =>
+                void navigate({
+                  to: "/admin/$tab",
+                  params: { tab: "analytics" },
+                  search: { view: "people", memberId: m.userId },
+                })
+              }
+            >
               <b>{m.name}</b>
               <small>{m.email}</small>
-            </span>,
+            </Button>,
             m.role,
-            (m.departmentIds ?? []).join(", ") || "—",
+            (m.departmentIds ?? [])
+              .map((id: string) => departmentNames.get(id) ?? id.slice(0, 8))
+              .join(", ") || "—",
+            usage.loading
+              ? "Loading…"
+              : formatMoney(memberSpend.get(m.userId) ?? "0"),
+            balances.loading
+              ? "Loading…"
+              : memberBalance.get(m.userId)?.effectiveLimitMicros === null
+                ? `${formatMoney(memberBalance.get(m.userId)?.usedMicros ?? "0")} · Unlimited`
+                : `${formatMoney(memberBalance.get(m.userId)?.usedMicros ?? "0")} / ${formatMoney(memberBalance.get(m.userId)?.effectiveLimitMicros ?? "0")}`,
             m.source,
             <StatusPill tone={m.status === "active" ? "good" : "warning"}>
               {m.status}
             </StatusPill>,
+            permissions.includes("members:write") ? <Button variant="secondary" onClick={() => openMember(m)}>Manage</Button> : null,
           ])}
         />
       </AsyncState>
@@ -664,163 +844,231 @@ function Analytics({ client, tenantId }: ManagementScreenProps) {
 }
 function SpendLimits({ client, tenantId, permissions }: ManagementScreenProps) {
   const r = useResource(
-    `limits:${tenantId}`,
+    `allowances:${tenantId}`,
     async () =>
       client
         ? Promise.all([
             client.listBudgetLimits(tenantId),
             client.listAllowanceProfiles(tenantId),
+            client.allowanceCycle(tenantId),
+            client.allowanceBalances(tenantId),
+            client.listOrgMembers(tenantId),
+            client.listDepartments(tenantId),
+            client.allowanceAdjustments(tenantId),
           ])
-        : [[], []],
-    [] as any,
+        : [[], [], null, [], [], [], []],
+    [[], [], null, [], [], [], []] as any,
   );
+  const [limits, profiles, cycle, balances, members, departments, adjustments] = r.data;
   const [success, setSuccess] = React.useState("");
-  const [open, setOpen] = React.useState(false);
-  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const f = new FormData(e.currentTarget);
+  const [assignOpen, setAssignOpen] = React.useState(false);
+  const [topUpOpen, setTopUpOpen] = React.useState(false);
+  const [cycleOpen, setCycleOpen] = React.useState(false);
+  const [scopeType, setScopeType] = React.useState<"user" | "department" | "org">("user");
+  const [topUpUserId, setTopUpUserId] = React.useState("");
+  const canWrite = permissions.includes("budgets:write");
+  const memberNames = new Map(members.map((item: any) => [item.userId, item.name || item.email]));
+  const departmentNames = new Map(departments.map((item: any) => [item.id, item.name]));
+  const totalUsed = balances.reduce((sum: bigint, item: any) => sum + BigInt(item.usedMicros), 0n);
+  const totalAvailable = balances.reduce(
+    (sum: bigint, item: any) => sum + BigInt(item.availableMicros ?? 0),
+    0n,
+  );
+
+  const submitAllowance = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const scopeId = scopeType === "org" ? tenantId : String(form.get("scopeId"));
     await client?.bulkUpsertAllowanceLimits(tenantId, {
       idempotencyKey: crypto.randomUUID(),
-      reason: String(f.get("reason")),
+      reason: String(form.get("reason")),
       dryRun: false,
-      items: [
-        {
-          scopeType: String(f.get("scopeType")) as any,
-          scopeId: String(f.get("scopeId")),
-          period: String(f.get("period")) as any,
-          softLimitMicros: String(Math.round(Number(f.get("soft")) * 1e6)),
-          hardLimitMicros: String(Math.round(Number(f.get("hard")) * 1e6)),
-          requestLimit: Number(f.get("requests")) || null,
-          tokenLimit: Number(f.get("tokens")) || null,
-          sandboxMinuteLimit: Number(f.get("sandbox")) || null,
-        },
-      ],
+      items: [{
+        scopeType,
+        scopeId,
+        period: String(form.get("period")) as "day" | "month",
+        softLimitMicros: String(Math.round(Number(form.get("soft")) * 1e6)),
+        hardLimitMicros: String(Math.round(Number(form.get("hard")) * 1e6)),
+        requestLimit: Number(form.get("requests")) || null,
+        tokenLimit: Number(form.get("tokens")) || null,
+        sandboxMinuteLimit: Number(form.get("sandbox")) || null,
+      }],
     });
-    setOpen(false);
-    setSuccess("Allowance applied and recorded in the audit log.");
+    setAssignOpen(false);
+    setSuccess("Allowance updated. New requests use it immediately.");
     r.retry();
   };
+
+  const submitTopUp = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await client?.createAllowanceAdjustment(tenantId, {
+      userId: String(form.get("userId")),
+      amountMicros: String(Math.round(Number(form.get("amount")) * 1e6)),
+      reason: String(form.get("reason")),
+      idempotencyKey: crypto.randomUUID(),
+    });
+    setTopUpOpen(false);
+    setSuccess("Top-up added to this member’s current cycle and enforcement limit.");
+    r.retry();
+  };
+
+  const submitCycle = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await client?.updateAllowanceCycle(tenantId, {
+      timezone: String(form.get("timezone")),
+      anchorDay: Number(form.get("anchorDay")),
+    });
+    setCycleOpen(false);
+    setSuccess("Allowance cycle updated for subsequent balance and enforcement checks.");
+    r.retry();
+  };
+
+  const targetOptions = scopeType === "user"
+    ? members.map((member: any) => ({ value: member.userId, label: member.name || member.email }))
+    : departments.map((department: any) => ({ value: department.id, label: department.name }));
+
   return (
     <ManagementPage
-      title="Spend limits"
-      description="Organization credits stay pooled. Members and departments receive restrictive allowances—not wallets."
-      eyebrow="Finance"
-      actions={
-        permissions.includes("budgets:write") ? (
-          <Button onClick={() => setOpen(true)}>
+      title="Allowances"
+      description="Set enforceable member allowances and department guardrails, then review spend and add audited current-cycle top-ups."
+      eyebrow="Usage & billing"
+      actions={canWrite ? (
+        <>
+          <Button variant="secondary" onClick={() => setCycleOpen(true)}>Configure cycle</Button>
+          <Button variant="secondary" onClick={() => { setTopUpUserId(members[0]?.userId ?? ""); setTopUpOpen(true); }}>
+            <Plus />
+            Top up member
+          </Button>
+          <Button onClick={() => setAssignOpen(true)}>
             <Plus />
             Assign allowance
           </Button>
-        ) : null
-      }
+        </>
+      ) : null}
     >
       {success ? <SuccessMessage>{success}</SuccessMessage> : null}
-      <Section
-        title="Effective hierarchy"
-        description="The most restrictive applicable organization, department, or user rule wins."
-      >
-        <DataTable
-          label="Spend limits"
-          columns={[
-            "Scope",
-            "Period",
-            "Soft",
-            "Hard",
-            "Requests",
-            "Tokens",
-            "Sandbox minutes",
-            "Updated",
-          ]}
-          rows={(r.data[0] ?? []).map((x: any) => [
-            `${x.scopeType}: ${x.scopeId}`,
-            x.period,
-            formatMoney(x.softLimitMicros),
-            formatMoney(x.hardLimitMicros),
-            x.requestLimit ?? "—",
-            x.tokenLimit ?? "—",
-            x.sandboxMinuteLimit ?? "—",
-            new Date(x.updatedAt).toLocaleDateString(),
-          ])}
-        />
-      </Section>
-      <ManagementDialog
-        open={open}
-        onOpenChange={setOpen}
-        title="Assign allowance"
-        description="Set the most restrictive applicable allowance for an organization, department, or member. The update is atomic and recorded in the audit log."
-        size="lg"
-        footer={
-          <>
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => setOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" form="assign-allowance-form">
-              <Save />
-              Apply allowance
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="assign-allowance-form"
-          className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
-          onSubmit={submit}
+      <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
+        <MetricGrid items={[
+          { label: "Used this cycle", value: formatMoney(totalUsed) },
+          { label: "Available", value: formatMoney(totalAvailable) },
+          { label: "Members with limits", value: formatNumber(balances.filter((item: any) => item.effectiveLimitMicros !== null).length) },
+          { label: "Needs attention", value: formatNumber(balances.filter((item: any) => item.status === "warning" || item.status === "blocked").length), status: balances.some((item: any) => item.status === "blocked") ? "danger" : "warning" },
+        ]} />
+        <Section
+          title="Allowance cycle"
+          description="Monthly anchors use local organization time. Days 1–28 avoid short-month ambiguity."
         >
-          <label>
-            Scope
-            <FormSelect
-              name="scopeType"
-              defaultValue="user"
-              options={[
-                { value: "user", label: "User" },
-                { value: "department", label: "Department" },
-                { value: "org", label: "Organization" },
-              ]}
-            />
-          </label>
-          <label>
-            Scope ID
-            <Input name="scopeId" autoFocus required />
-          </label>
-          <label>
-            Period
-            <FormSelect
-              name="period"
-              defaultValue="month"
-              options={[
-                { value: "month", label: "Monthly" },
-                { value: "day", label: "Daily" },
-              ]}
-            />
-          </label>
-          <label>
-            Soft limit (USD)
-            <Input name="soft" type="number" min="0" step=".01" required />
-          </label>
-          <label>
-            Hard limit (USD)
-            <Input name="hard" type="number" min="0" step=".01" required />
-          </label>
-          <label>
-            Request quota
-            <Input name="requests" type="number" min="0" />
-          </label>
-          <label>
-            Token quota
-            <Input name="tokens" type="number" min="0" />
-          </label>
-          <label>
-            Sandbox minutes
-            <Input name="sandbox" type="number" min="0" step=".1" />
-          </label>
-          <label className="sm:col-span-2">
-            Audit reason
-            <Input name="reason" minLength={3} required />
-          </label>
+          <DataTable
+            label="Allowance cycle"
+            columns={["Timezone", "Anchor", "Current cycle", "Next reset"]}
+            rows={cycle ? [[
+              cycle.timezone,
+              `Day ${cycle.anchorDay}`,
+              balances[0] ? `${new Date(balances[0].cycleStart).toLocaleDateString()} – ${new Date(balances[0].cycleEnd).toLocaleDateString()}` : "—",
+              balances[0] ? formatDateTime(balances[0].cycleEnd) : "—",
+            ]] : []}
+          />
+        </Section>
+        <Section
+          title="Member balances"
+          description="Available balance is the member’s nominal Berry allowance, not cash held with the model provider."
+        >
+          <DataTable
+            label="Member allowance balances"
+            columns={["Member", "Base", "Top-ups", "Used", "Available", "State", "Reset", ""]}
+            rows={balances.map((item: any) => [
+              <span><b>{item.userName || item.userEmail || memberNames.get(item.userId) || "Unknown member"}</b><small>{item.userEmail ?? item.userId}</small></span>,
+              item.baseLimitMicros === null ? "Unlimited" : formatMoney(item.baseLimitMicros),
+              formatMoney(item.adjustmentMicros),
+              formatMoney(BigInt(item.usedMicros) + BigInt(item.reservedMicros)),
+              item.availableMicros === null ? "Unlimited" : formatMoney(item.availableMicros),
+              <StatusPill tone={item.status === "healthy" ? "good" : item.status === "blocked" ? "danger" : item.status === "warning" ? "warning" : "neutral"}>{item.status}</StatusPill>,
+              new Date(item.cycleEnd).toLocaleDateString(),
+              canWrite ? <Button variant="ghost" onClick={() => { setTopUpUserId(item.userId); setTopUpOpen(true); }}>Top up</Button> : null,
+            ])}
+          />
+        </Section>
+        <Section
+          title="Assigned limits and aggregate guardrails"
+          description="User limits define member allowances. Department and organization rows are independent aggregate safety ceilings."
+        >
+          <DataTable
+            label="Assigned allowance limits"
+            columns={["Scope", "Period", "Soft", "Hard", "Requests", "Tokens", "Updated"]}
+            rows={limits.map((item: any) => [
+              `${human(item.scopeType)}: ${item.scopeType === "user" ? memberNames.get(item.scopeId) ?? item.scopeId : item.scopeType === "department" ? departmentNames.get(item.scopeId) ?? item.scopeId : "Emergency organization guardrail"}`,
+              item.period,
+              formatMoney(item.softLimitMicros),
+              formatMoney(item.hardLimitMicros),
+              item.requestLimit ?? "—",
+              item.tokenLimit ?? "—",
+              new Date(item.updatedAt).toLocaleDateString(),
+            ])}
+          />
+        </Section>
+        <Section title="Current-cycle top-up history" description="Top-ups are append-only and include an administrator reason.">
+          <DataTable
+            label="Allowance adjustments"
+            columns={["Member", "Amount", "Reason", "Cycle", "Created"]}
+            rows={adjustments.map((item: any) => [
+              memberNames.get(item.userId) ?? item.userId,
+              formatMoney(item.amountMicros),
+              item.reason,
+              `${new Date(item.cycleStart).toLocaleDateString()} – ${new Date(item.cycleEnd).toLocaleDateString()}`,
+              formatDateTime(item.createdAt),
+            ])}
+          />
+        </Section>
+        {profiles.length ? <p className="text-xs text-muted-foreground">{profiles.length} reusable allowance {profiles.length === 1 ? "profile" : "profiles"} configured.</p> : null}
+      </AsyncState>
+
+      <ManagementDialog
+        open={assignOpen}
+        onOpenChange={setAssignOpen}
+        title="Assign allowance or guardrail"
+        description="User limits are personal allowances. Department and organization limits cap aggregate spend independently."
+        size="lg"
+        footer={<><Button type="button" variant="secondary" onClick={() => setAssignOpen(false)}>Cancel</Button><Button type="submit" form="assign-allowance-form"><Save />Apply allowance</Button></>}
+      >
+        <form id="assign-allowance-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitAllowance}>
+          <label>Scope<FormSelect value={scopeType} onChange={(value) => setScopeType(value as typeof scopeType)} options={[{ value: "user", label: "Member allowance" }, { value: "department", label: "Department aggregate guardrail" }, { value: "org", label: "Emergency organization guardrail" }]} /></label>
+          {scopeType !== "org" ? <label>{scopeType === "user" ? "Member" : "Department"}<FormSelect name="scopeId" options={targetOptions} placeholder={`Select ${scopeType}`} required /></label> : <p className="self-end rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">Applies to all organization spend as an emergency ceiling.</p>}
+          <label>Period<FormSelect name="period" defaultValue="month" options={[{ value: "month", label: "Monthly cycle" }, { value: "day", label: "Daily" }]} /></label>
+          <label>Soft limit (USD)<Input name="soft" type="number" min="0" step=".01" required /></label>
+          <label>Hard limit (USD)<Input name="hard" type="number" min="0" step=".01" required /></label>
+          <label>Request quota<Input name="requests" type="number" min="0" /></label>
+          <label>Token quota<Input name="tokens" type="number" min="0" /></label>
+          <label>Sandbox minutes<Input name="sandbox" type="number" min="0" step=".1" /></label>
+          <label className="sm:col-span-2">Audit reason<Input name="reason" minLength={3} required /></label>
+        </form>
+      </ManagementDialog>
+
+      <ManagementDialog
+        open={topUpOpen}
+        onOpenChange={setTopUpOpen}
+        title="Top up member"
+        description="Add a one-time amount to this member’s current monthly cycle. Department guardrails still apply."
+        footer={<><Button type="button" variant="secondary" onClick={() => setTopUpOpen(false)}>Cancel</Button><Button type="submit" form="top-up-allowance-form">Add top-up</Button></>}
+      >
+        <form id="top-up-allowance-form" className="grid gap-3 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitTopUp}>
+          <label>Member<FormSelect name="userId" value={topUpUserId} onChange={setTopUpUserId} options={members.map((member: any) => ({ value: member.userId, label: member.name || member.email }))} required /></label>
+          <label>Top-up amount (USD)<Input name="amount" type="number" min="0.01" step=".01" autoFocus required /></label>
+          <label>Reason<Input name="reason" minLength={3} maxLength={500} required /></label>
+        </form>
+      </ManagementDialog>
+
+      <ManagementDialog
+        open={cycleOpen}
+        onOpenChange={setCycleOpen}
+        title="Configure monthly cycle"
+        description="Choose the organization timezone and reset day. The anchor is limited to days 1–28."
+        footer={<><Button type="button" variant="secondary" onClick={() => setCycleOpen(false)}>Cancel</Button><Button type="submit" form="allowance-cycle-form">Save cycle</Button></>}
+      >
+        <form id="allowance-cycle-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={submitCycle}>
+          <label>Timezone<Input name="timezone" defaultValue={cycle?.timezone ?? "UTC"} placeholder="Asia/Dubai" required /></label>
+          <label>Anchor day<Input name="anchorDay" type="number" min="1" max="28" defaultValue={cycle?.anchorDay ?? 1} required /></label>
         </form>
       </ManagementDialog>
     </ManagementPage>
@@ -1158,6 +1406,11 @@ function PolicyScreen({
       }
       eyebrow="Security & data"
     >
+      {kind === "authentication" ? (
+        <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          Berry is currently in No SSO mode. Local password accounts and the protected owner recovery path are active; OIDC, SAML, JIT provisioning, Google Directory sync, and SCIM remain disabled until the deferred identity roadmap is implemented end to end.
+        </p>
+      ) : null}
       <AsyncState
         loading={r.loading}
         error={r.error}
@@ -1419,6 +1672,7 @@ function permissionFor(tab: string) {
       departments: "departments:read",
       roles: "rbac:read",
       "resource-access": "acl:read",
+      providers: "models:read",
       models: "models:read",
       "feature-access": "feature_flags:read",
       "execution-network": "guardrails:read",

@@ -141,8 +141,11 @@ router:
   chatCompletionsPath: /chat/completions
   defaultModel: berry/auto
   modelsJson: "[]"
+  organizationProviderAllowedHosts: ""
+  organizationProviderAllowInsecureHttp: "false"
   existingSecret: berry-router
   apiKeyKey: BERRY_ROUTER_API_KEY
+  organizationProviderCredentialsKey: BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON
 
 sandbox:
   provider: e2b

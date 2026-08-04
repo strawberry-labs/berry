@@ -14,6 +14,7 @@ Defaults are intentionally local-only:
 - `DEPLOYMENT_MODE=self-hosted` selects the public deployment model. Helm accepts `managed`, `dedicated`, or `self-hosted`; the app maps these to the internal tenant modes `shared`, `dedicated`, and `selfhost`.
 - `BERRY_AUTH_MODE=better-auth` is used everywhere. `BERRY_SETUP_OWNER_EMAIL` and `BERRY_SETUP_TOKEN` protect the one-time first-owner setup; `BERRY_AUTH_SIGNUP_ENABLED` controls only later self-service member signup.
 - `BERRY_API_MODEL_MODE=fixture` streams deterministic model output without paid provider credentials.
+- Organization providers saved in Settings become runtime-eligible only after a guarded health check. Set `BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS` to an exact comma-separated host allowlist. Credential references resolve from API environment variables or from the server-only `BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON` object; raw keys are never saved in Berry's database.
 - `BERRY_PERSONAL_MEMORY_PROVIDER=mem0` runs the open-source Mem0 package inside
   the stack. Set the internal API key, its dedicated PostgreSQL password, and
   OpenAI-compatible LLM/embedding settings before startup.

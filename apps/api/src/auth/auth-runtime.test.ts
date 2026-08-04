@@ -4,6 +4,39 @@ import { describe, expect, it, vi } from "vitest";
 import { createBetterAuthOptions, RealBetterAuthRuntime, type BerryAuthDescription } from "./auth-runtime.ts";
 
 describe("Better Auth runtime config", () => {
+  it("authorizes sessions only while the configured organization membership is active", async () => {
+    const query = vi.fn(async (sql: string) => ({
+      rows: sql.includes("SELECT EXISTS") ? [{ active: false }] : [],
+    }));
+    const release = vi.fn();
+    const runtime = new RealBetterAuthRuntime(
+      { handler: vi.fn() } as never,
+      baseDescription(),
+      { connect: vi.fn(async () => ({ query, release })) } as unknown as Pool,
+    );
+
+    await expect(runtime.authorizeSession({
+      session: { id: "session_1", userId: "00000000-0000-7000-8000-000000000201" },
+      user: {
+        id: "00000000-0000-7000-8000-000000000201",
+        email: "member@example.test",
+        name: "Member",
+        emailVerified: true,
+      },
+    })).resolves.toBe(false);
+    expect(query).toHaveBeenCalledWith("SELECT berry_set_tenant_id($1::uuid)", [
+      "00000000-0000-7000-8000-000000000001",
+    ]);
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("status = 'active'"),
+      [
+        "00000000-0000-7000-8000-000000000001",
+        "00000000-0000-7000-8000-000000000201",
+      ],
+    );
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it("enables email/password and maps Better Auth storage onto cloud tables", () => {
     const { authOptions, description } = createBetterAuthOptions({ env: { NODE_ENV: "test", BERRY_AUTH_BASE_URL: "https://berry.example.test" } });
 

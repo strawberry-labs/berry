@@ -9,7 +9,12 @@ import {
   UsageAnalyticsSchema,
   UsageRequestDetailSchema,
   UsageRequestPageSchema,
+  type Department,
+  type OrgMembership,
   type OrgPermission,
+  type UsageAnalytics,
+  type UsageRequestDetail,
+  type UsageRequestPage,
 } from "@berry/shared";
 import { z } from "zod";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
@@ -76,28 +81,43 @@ export class UsageController {
   @Get("/analytics")
   async analytics(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
     await this.requirePermission(request, tenantId, "usage:read");
-    return UsageAnalyticsSchema.parse(await this.usage.analytics(tenantId, analyticsQuery(query)));
+    const [analytics, directory] = await Promise.all([
+      this.usage.analytics(tenantId, analyticsQuery(query)),
+      this.directory(tenantId),
+    ]);
+    return UsageAnalyticsSchema.parse(enrichAnalytics(analytics, directory));
   }
 
   @Get("/requests")
   async requests(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
     await this.requirePermission(request, tenantId, "usage:read");
-    return UsageRequestPageSchema.parse(await this.usage.requestPage(tenantId, analyticsQuery(query)));
+    const [page, directory] = await Promise.all([
+      this.usage.requestPage(tenantId, analyticsQuery(query)),
+      this.directory(tenantId),
+    ]);
+    return UsageRequestPageSchema.parse(enrichRequestPage(page, directory));
   }
 
   @Get("/requests/:id")
   async requestDetail(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Param("id") id: string) {
     await this.requirePermission(request, tenantId, "usage:read");
-    const detail = await this.usage.requestDetail(tenantId, id);
+    const [detail, directory] = await Promise.all([
+      this.usage.requestDetail(tenantId, id),
+      this.directory(tenantId),
+    ]);
     if (!detail) throw new NotFoundException("Usage request not found");
-    return UsageRequestDetailSchema.parse(detail);
+    return UsageRequestDetailSchema.parse(enrichRequest(detail, directory));
   }
 
   @Get("/me")
   async myUsage(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
     await this.requirePermission(request, tenantId, "org:read");
     const parsed = analyticsQuery(query);
-    return UsageAnalyticsSchema.parse(await this.usage.analytics(tenantId, { ...parsed, memberId: request.auth!.user.id }));
+    const [analytics, directory] = await Promise.all([
+      this.usage.analytics(tenantId, { ...parsed, memberId: request.auth!.user.id }),
+      this.directory(tenantId),
+    ]);
+    return UsageAnalyticsSchema.parse(enrichAnalytics(analytics, directory));
   }
 
   @Get("/me/requests")
@@ -120,6 +140,81 @@ export class UsageController {
     const allowed = await this.identity.authorize(request.auth!.user.id, tenantId, permission);
     if (!allowed) throw new ForbiddenException(`Missing organization permission: ${permission}`);
   }
+
+  private async directory(tenantId: string): Promise<UsageDirectory> {
+    const [memberships, departments] = await Promise.all([
+      this.identity.listMemberships(tenantId),
+      this.identity.listDepartments(tenantId),
+    ]);
+    return { memberships, departments };
+  }
+}
+
+type UsageDirectory = {
+  memberships: OrgMembership[];
+  departments: Department[];
+};
+
+function enrichAnalytics(
+  analytics: UsageAnalytics,
+  directory: UsageDirectory,
+): UsageAnalytics {
+  const members = new Map(directory.memberships.map((member) => [member.userId, member]));
+  const departments = new Map(directory.departments.map((department) => [department.id, department]));
+  return {
+    ...analytics,
+    breakdowns: Object.fromEntries(
+      Object.entries(analytics.breakdowns).map(([key, rows]) => [
+        key,
+        rows.map((row) => {
+          if (!row.id) return { ...row, label: "Unattributed" };
+          if (row.dimension === "member") {
+            const member = members.get(row.id);
+            return member
+              ? {
+                  ...row,
+                  name: member.name || undefined,
+                  email: member.email,
+                  label: member.name || member.email,
+                }
+              : { ...row, label: `Unknown member · ${shortId(row.id)}` };
+          }
+          if (row.dimension === "department") {
+            const department = departments.get(row.id);
+            return department
+              ? { ...row, name: department.name, label: department.name }
+              : { ...row, label: `Unknown department · ${shortId(row.id)}` };
+          }
+          return row;
+        }),
+      ]),
+    ),
+  };
+}
+
+function enrichRequestPage(
+  page: UsageRequestPage,
+  directory: UsageDirectory,
+): UsageRequestPage {
+  return { ...page, items: page.items.map((item) => enrichRequest(item, directory)) };
+}
+
+function enrichRequest<TRequest extends UsageRequestDetail | UsageRequestPage["items"][number]>(
+  request: TRequest,
+  directory: UsageDirectory,
+): TRequest {
+  const member = directory.memberships.find((item) => item.userId === request.userId);
+  const department = directory.departments.find((item) => item.id === request.departmentId);
+  return {
+    ...request,
+    userName: member?.name || null,
+    userEmail: member?.email ?? null,
+    departmentName: department?.name ?? null,
+  };
+}
+
+function shortId(value: string): string {
+  return value.length <= 8 ? value : value.slice(0, 8);
 }
 
 function usageFilter(query: unknown, defaultLimit?: number): UsageEventFilter {

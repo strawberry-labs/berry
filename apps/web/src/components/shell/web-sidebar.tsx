@@ -1,6 +1,6 @@
 import * as React from "react";
-import { LogOut } from "lucide-react";
-import type { OrgPermission, Task, Workspace } from "@berry/shared";
+import { DollarSign, LogOut } from "lucide-react";
+import type { AllowanceBalance, OrgPermission, Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -18,6 +18,8 @@ import {
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@berry/desktop-ui/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { Input } from "@berry/desktop-ui/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@berry/desktop-ui/components/ui/popover";
+import { Progress } from "@berry/desktop-ui/components/ui/progress";
 import {
   Sidebar,
   SidebarFooter,
@@ -81,7 +83,7 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, management, loadError, user, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onSettings, onSignOut }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onUsage, onSettings, onSignOut }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -99,6 +101,9 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   } | null;
   loadError: string;
   user: SignedInUser | null;
+  allowance: AllowanceBalance | null;
+  allowanceLoading: boolean;
+  onRefreshAllowance: () => void;
   onNewTask: () => void;
   onCreateProject: () => void;
   onSelectWorkspace: (id: string) => void;
@@ -116,6 +121,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   onRevealProject: (workspace: Workspace) => void | Promise<void>;
   onSkills: () => void;
   onLibrary: () => void;
+  onUsage: () => void;
   onSettings: () => void;
   onSignOut: () => void;
 }) {
@@ -161,13 +167,60 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
       />}
       <SidebarFooter className="berry-sidebar-footer">
         <div className="flex items-center gap-2">
-          <div className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2"><span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><BerryLogo className="size-full" alt="" /></span><span className="min-w-0 truncate text-sm font-semibold">{user?.name || user?.email || "Berry Cloud"}</span></div>
+          <Popover onOpenChange={(open) => { if (open) onRefreshAllowance(); }}>
+            <PopoverTrigger asChild>
+              <button type="button" className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2 text-left" aria-label="Open account and allowance">
+                <span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><BerryLogo className="size-full" alt="" /></span>
+                <span className="min-w-0 truncate text-sm font-semibold">{user?.name || user?.email || "Berry Cloud"}</span>
+              </button>
+            </PopoverTrigger>
+            <PopoverContent side="top" align="start" sideOffset={8} className="w-72 p-3">
+              <div className="grid gap-3">
+                <div className="min-w-0">
+                  <strong className="block truncate text-sm">{user?.name || "Berry account"}</strong>
+                  <span className="block truncate text-xs text-muted-foreground">{user?.email}</span>
+                </div>
+                <div className="grid gap-2 rounded-lg border border-border bg-muted/30 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-xs text-muted-foreground">Available this cycle</span>
+                    <strong className="text-sm tabular-nums">{allowanceLoading ? "…" : allowance?.availableMicros === null ? "Unlimited" : formatCurrencyMicros(allowance?.availableMicros)}</strong>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-xs text-muted-foreground">Used</span>
+                    <strong className="text-sm tabular-nums">{allowanceLoading ? "…" : formatCurrencyMicros(allowance ? String(BigInt(allowance.usedMicros) + BigInt(allowance.reservedMicros)) : null)}</strong>
+                  </div>
+                  {allowance?.effectiveLimitMicros ? <Progress value={allowanceProgress(allowance)} aria-label={`${Math.round(allowanceProgress(allowance))}% of allowance used`} /> : null}
+                  <span className="text-[11px] text-muted-foreground">{allowance ? `Resets ${new Date(allowance.cycleEnd).toLocaleDateString()}` : "Allowance information is unavailable."}</span>
+                </div>
+                <Button variant="ghost" className="justify-start" onClick={onUsage}>
+                  <DollarSign />
+                  View personal usage
+                </Button>
+              </div>
+            </PopoverContent>
+          </Popover>
           <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" aria-current={management ? "page" : undefined} data-active={management ? "true" : undefined} className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button>
           {user ? <Button variant="ghost" size="icon-sm" onClick={onSignOut} aria-label="Sign out" className="berry-sidebar-mini-control"><LogOut size={15} /></Button> : null}
         </div>
       </SidebarFooter>
     </Sidebar>
   );
+}
+
+function formatCurrencyMicros(value: string | null | undefined): string {
+  if (value == null) return "—";
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Number(value) / 1_000_000);
+}
+
+function allowanceProgress(allowance: AllowanceBalance): number {
+  if (!allowance.effectiveLimitMicros || allowance.effectiveLimitMicros === "0") return 0;
+  const consumed = Number(allowance.usedMicros) + Number(allowance.reservedMicros);
+  return Math.min(100, (consumed / Number(allowance.effectiveLimitMicros)) * 100);
 }
 
 function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveChats, onRemove, onReveal }: {

@@ -16,6 +16,7 @@ import {
   type RemoteModel,
 } from "@berry/shared";
 import { z } from "zod";
+import type { OrganizationProviderRuntime } from "../model-governance/organization-provider-runtime.service.ts";
 
 const RequestProviderSchema = z.object({
   id: z.string().min(1),
@@ -82,11 +83,41 @@ export interface ResolvedCloudTurnConfig {
 export class CloudRuntimeConfigService {
   readonly config: CloudRuntimeConfig;
 
-  constructor(env: NodeJS.ProcessEnv = process.env) {
+  constructor(
+    env: NodeJS.ProcessEnv = process.env,
+    private readonly organizationProviders?: OrganizationProviderRuntime,
+  ) {
     this.config = createCloudRuntimeConfigFromEnv(env);
   }
 
-  resolve(request: { provider?: unknown; apiKey?: string | undefined; model?: string | undefined }): ResolvedCloudTurnConfig {
+  async resolve(
+    tenantId: string,
+    request: { provider?: unknown; apiKey?: string | undefined; model?: string | undefined },
+  ): Promise<ResolvedCloudTurnConfig> {
+    if (this.organizationProviders) {
+      try {
+        const organizationProvider = await this.organizationProviders.resolve(tenantId, {
+          providerId: requestProviderId(request.provider),
+          model: request.model,
+        });
+        if (organizationProvider) {
+          return {
+            provider: this.config.promptCacheEnabled
+              ? organizationProvider.provider
+              : withoutPromptCaching(organizationProvider.provider),
+            apiKey: organizationProvider.apiKey,
+            mcpServers: this.config.mcpServers,
+            extraSkills: this.config.extraSkills,
+            networkPolicy: this.config.networkPolicy,
+            providerMaxOutputTokens: this.config.providerMaxOutputTokens,
+          };
+        }
+      } catch (cause) {
+        throw new ServiceUnavailableException(
+          cause instanceof Error ? cause.message : "Organization provider is unavailable",
+        );
+      }
+    }
     if (this.config.provider) {
       return {
         provider: this.config.promptCacheEnabled
@@ -114,8 +145,17 @@ export class CloudRuntimeConfigService {
     };
   }
 
-  catalog(): { providerId: string; name: string; defaultModel: string; models: RemoteModel[]; skills: Array<{ id: string; name: string; description: string; enabled: true }>; mcpServers: Array<{ id: string; name: string; url: string; auth: "none" | "bearer"; enabled: boolean }> } | null {
-    const provider = this.config.provider;
+  async catalog(tenantId: string): Promise<{ providerId: string; name: string; defaultModel: string; models: RemoteModel[]; skills: Array<{ id: string; name: string; description: string; enabled: true }>; mcpServers: Array<{ id: string; name: string; url: string; auth: "none" | "bearer"; enabled: boolean }> } | null> {
+    let provider = this.config.provider;
+    if (this.organizationProviders) {
+      try {
+        provider = (await this.organizationProviders.resolve(tenantId))?.provider ?? provider;
+      } catch (cause) {
+        throw new ServiceUnavailableException(
+          cause instanceof Error ? cause.message : "Organization provider catalog is unavailable",
+        );
+      }
+    }
     if (!provider) return null;
     return {
       providerId: provider.id,
@@ -225,6 +265,12 @@ export class CloudRuntimeConfigService {
       costMicros: image.costMicros,
     };
   }
+}
+
+function requestProviderId(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const id = (value as Record<string, unknown>).id;
+  return typeof id === "string" && id.trim() ? id.trim() : undefined;
 }
 
 function imageProviderErrorMessage(payload: string): string | null {

@@ -1,8 +1,11 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { ForbiddenException, Inject, Injectable } from "@nestjs/common";
 import type { CanActivate, ExecutionContext } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import type { IncomingMessage } from "node:http";
-import { BERRY_AUTH_PUBLIC } from "./auth.decorators.ts";
+import {
+  BERRY_AUTH_INACTIVE_MEMBERSHIP_ALLOWED,
+  BERRY_AUTH_PUBLIC,
+} from "./auth.decorators.ts";
 import { BerryAuthService, type BerryAuthSession } from "./auth-runtime.ts";
 
 export type AuthenticatedRequest = IncomingMessage & {
@@ -26,6 +29,16 @@ export class BerryAuthGuard implements CanActivate {
 
     const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
     const session = await this.auth.requireSession(request.headers);
+    const inactiveMembershipAllowed = this.reflector.getAllAndOverride<boolean>(
+      BERRY_AUTH_INACTIVE_MEMBERSHIP_ALLOWED,
+      [context.getHandler(), context.getClass()],
+    );
+    if (!inactiveMembershipAllowed && !await this.auth.authorizeSession(session)) {
+      throw new ForbiddenException({
+        code: "organization_membership_inactive",
+        message: "Your organization membership is not active",
+      });
+    }
     request.auth = session;
     request.user = session.user;
     return true;
