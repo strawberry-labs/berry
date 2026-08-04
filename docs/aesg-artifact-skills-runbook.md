@@ -702,7 +702,7 @@ environment file.
 
 ### Repository
 
-- [ ] Five skills exist and pass skill validation.
+- [ ] Six skills exist and pass skill validation.
 - [ ] Canonical commands use `/managed-skills`.
 - [ ] No source PII or proposal content is packaged.
 - [ ] Verdana files remain untracked.
@@ -725,7 +725,7 @@ environment file.
 - [ ] New immutable E2B template ID recorded.
 - [ ] Environment file backed up.
 - [ ] API recreated with the new template ID.
-- [ ] Five organization skills synced with expected hashes.
+- [ ] Six organization skills synced with expected hashes.
 - [ ] Previous template ID and backups retained for rollback.
 
 ## 9. Historical reference
