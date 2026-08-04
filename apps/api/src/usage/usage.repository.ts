@@ -108,8 +108,12 @@ export class InMemoryUsageRepository implements UsageRepository {
   }
 
   async listEvents(tenantId: string, filter: UsageEventFilter = {}): Promise<CloudUsageEventRecord[]> {
-    return [...this.#events.values()].filter((event) => event.tenantId === tenantId && matchesUsageFilter(event, filter))
-      .sort((a, b) => a.ts.localeCompare(b.ts));
+    const cursor = parseRequestCursor(filter.cursor);
+    const events = [...this.#events.values()]
+      .filter((event) => event.tenantId === tenantId && matchesUsageFilter(event, filter))
+      .sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))
+      .filter((event) => !cursor || event.ts > cursor.ts || (event.ts === cursor.ts && event.id > cursor.id));
+    return filter.limit ? events.slice(0, filter.limit) : events;
   }
 
   async listRollups(tenantId: string, filter: UsageEventFilter = {}): Promise<CloudUsageRollup[]> {
@@ -153,10 +157,10 @@ export class PostgresUsageRepository implements UsageRepository {
 
   async listEvents(tenantId: string, filter: UsageEventFilter = {}): Promise<CloudUsageEventRecord[]> {
     return this.database.withTenant(tenantId, async (executor) => {
-      const { where, params } = usageWhere(tenantId, filter);
+      const query = usageEventQuery(tenantId, filter, "asc");
       const rows = await executor.query<UsageEventRow>(
-        `SELECT * FROM usage_events ${where} ORDER BY ts ASC LIMIT 1000`,
-        params,
+        `SELECT * FROM usage_events ${query.where} ORDER BY ts ASC,id ASC${query.limitClause}`,
+        query.params,
       );
       return rows.map(usageEventFromRow);
     });
@@ -199,7 +203,19 @@ export class PostgresUsageRepository implements UsageRepository {
   }
 
   async requestPage(tenantId: string, query: UsageAnalyticsQuery, forceUserId?: string): Promise<UsageRequestPage> {
-    return requestPageFromEvents(await this.listEvents(tenantId, { ...queryFilter(query), userId: forceUserId ?? query.memberId, limit: Math.min(1000, query.limit + 1) }), query);
+    return this.database.withTenant(tenantId, async (executor) => {
+      const eventQuery = usageEventQuery(tenantId, {
+        ...queryFilter(query),
+        userId: forceUserId ?? query.memberId,
+        cursor: query.cursor,
+        limit: query.limit + 1,
+      }, "desc");
+      const rows = await executor.query<UsageEventRow>(
+        `SELECT * FROM usage_events ${eventQuery.where} ORDER BY ts DESC,id DESC${eventQuery.limitClause}`,
+        eventQuery.params,
+      );
+      return requestPageFromOrderedEvents(rows.map(usageEventFromRow), query.limit);
+    });
   }
 
   async requestDetail(tenantId: string, id: string, forceUserId?: string): Promise<UsageRequestDetail | null> {
@@ -417,7 +433,7 @@ function queryFilter(query: UsageAnalyticsQuery): UsageEventFilter {
   return {
     from: new Date(query.from), to: new Date(query.to), feature: query.feature, userId: query.memberId,
     departmentId: query.departmentId, model: query.model, provider: query.provider, status: query.status,
-    workspaceId: query.workspaceId, agentId: query.agentId, cursor: query.cursor, limit: query.limit,
+    workspaceId: query.workspaceId, agentId: query.agentId,
   };
 }
 
@@ -433,8 +449,14 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
   const sandboxMinutes = events.reduce((sum, event) => sum + sandboxMinutesFor(event.sandboxUsage), 0);
   return UsageAnalyticsSchema.parse({
     tenantId, from: query.from, to: query.to,
-    totals: { billedCostMicros: totalCost.toString(), requests: events.length, tokens, successRate: events.length ? successes / events.length : null, projectedMonthEndMicros: events.length ? projection.toString() : null },
-    series: usageSeries(events),
+    totals: {
+      billedCostMicros: totalCost.toString(), requests: events.length, tokens,
+      inputTokens: events.reduce((sum, event) => sum + event.tokensIn, 0),
+      outputTokens: events.reduce((sum, event) => sum + event.tokensOut, 0),
+      successRate: events.length ? successes / events.length : null,
+      projectedMonthEndMicros: events.length ? projection.toString() : null,
+    },
+    series: usageSeries(events, query),
     breakdowns: {
       departments: breakdown(events, "department", (event) => event.departmentId),
       members: breakdown(events, "member", (event) => event.userId),
@@ -451,6 +473,8 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
       cachedTokens: events.reduce((sum, event) => sum + event.tokensCached, 0),
       cacheReadTokens: events.reduce((sum, event) => sum + event.cacheReadTokens, 0),
       cacheWriteTokens: events.reduce((sum, event) => sum + event.cacheWriteTokens, 0),
+      cacheEligibleRequests: events.filter((event) => event.cacheEligible).length,
+      cacheHitRequests: events.filter((event) => event.cacheEligible && event.cacheReadTokens > 0).length,
       sandboxMinutes,
     },
     anomalies: explainAnomalies(events, query),
@@ -458,10 +482,11 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
   });
 }
 
-function usageSeries(events: CloudUsageEventRecord[]) {
+function usageSeries(events: CloudUsageEventRecord[], query: UsageAnalyticsQuery) {
+  const bucketMs = usageBucketMs(new Date(query.from), new Date(query.to));
   const points = new Map<string, { ts: string; billedCostMicros: string; requests: number; tokens: number; successes: number; failures: number }>();
   for (const event of events) {
-    const ts = `${event.ts.slice(0, 10)}T00:00:00.000Z`;
+    const ts = new Date(Math.floor(new Date(event.ts).getTime() / bucketMs) * bucketMs).toISOString();
     const point = points.get(ts) ?? { ts, billedCostMicros: "0", requests: 0, tokens: 0, successes: 0, failures: 0 };
     point.billedCostMicros = (BigInt(point.billedCostMicros) + BigInt(event.costBilledMicros)).toString();
     point.requests += 1;
@@ -486,6 +511,10 @@ function breakdown(events: CloudUsageEventRecord[], dimension: string, key: (eve
       dimension, id: id === "unattributed" ? null : id, label: id, requests: group.length,
       billedCostMicros: group.reduce((sum, event) => sum + BigInt(event.costBilledMicros), 0n).toString(),
       tokens: group.reduce((sum, event) => sum + event.tokensIn + event.tokensOut, 0),
+      inputTokens: group.reduce((sum, event) => sum + event.tokensIn, 0),
+      outputTokens: group.reduce((sum, event) => sum + event.tokensOut, 0),
+      cacheReadTokens: group.reduce((sum, event) => sum + event.cacheReadTokens, 0),
+      cacheWriteTokens: group.reduce((sum, event) => sum + event.cacheWriteTokens, 0),
       errorRate: group.length ? failures / group.length : null, latencyP50Ms: percentile(latency, 0.5), latencyP95Ms: percentile(latency, 0.95),
     };
   }).sort((a, b) => BigInt(a.billedCostMicros) > BigInt(b.billedCostMicros) ? -1 : 1);
@@ -516,10 +545,18 @@ function requestPageFromEvents(events: CloudUsageEventRecord[], query: UsageAnal
   const sorted = [...events].sort((a, b) => b.ts.localeCompare(a.ts) || b.id.localeCompare(a.id));
   const cursorIndex = query.cursor ? sorted.findIndex((event) => requestCursor(event) === query.cursor) : -1;
   const start = cursorIndex >= 0 ? cursorIndex + 1 : 0;
-  const window = sorted.slice(start, start + query.limit + 1);
-  const hasMore = window.length > query.limit;
-  const items = window.slice(0, query.limit).map(requestSummaryFromEvent);
-  return UsageRequestPageSchema.parse({ items, hasMore, nextCursor: hasMore && window[query.limit - 1] ? requestCursor(window[query.limit - 1]!) : null });
+  return requestPageFromOrderedEvents(sorted.slice(start, start + query.limit + 1), query.limit);
+}
+
+function requestPageFromOrderedEvents(events: CloudUsageEventRecord[], limit: number): UsageRequestPage {
+  const hasMore = events.length > limit;
+  const pageEvents = events.slice(0, limit);
+  const last = pageEvents.at(-1);
+  return UsageRequestPageSchema.parse({
+    items: pageEvents.map(requestSummaryFromEvent),
+    hasMore,
+    nextCursor: hasMore && last ? requestCursor(last) : null,
+  });
 }
 
 function requestSummaryFromEvent(event: CloudUsageEventRecord) {
@@ -531,9 +568,28 @@ function requestSummaryFromEvent(event: CloudUsageEventRecord) {
     tokensIn: event.tokensIn, tokensOut: event.tokensOut, tokensCached: event.tokensCached,
     cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens,
     cacheEligible: event.cacheEligible, cacheMissReason: event.cacheMissReason,
+    finishReason: metadataString(event.metadata, "finishReason"),
     billedCostMicros: event.costBilledMicros, latencyMs: event.latencyMs, ttftMs: event.ttftMs,
     reservationStatus: status,
   };
+}
+
+function usageBucketMs(from: Date, to: Date): number {
+  const duration = Math.max(60_000, to.getTime() - from.getTime());
+  if (duration <= 30 * 60_000) return 60_000;
+  if (duration <= 3 * 3_600_000) return 5 * 60_000;
+  if (duration <= 24 * 3_600_000) return 30 * 60_000;
+  if (duration <= 7 * 86_400_000) return 6 * 3_600_000;
+  if (duration <= 35 * 86_400_000) return 86_400_000;
+  if (duration <= 100 * 86_400_000) return 3 * 86_400_000;
+  if (duration <= 370 * 86_400_000) return 30 * 86_400_000;
+  return 90 * 86_400_000;
+}
+
+function metadataString(value: JsonValue, key: string): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value[key];
+  return typeof candidate === "string" ? candidate : null;
 }
 
 function requestDetailFromEvent(event: CloudUsageEventRecord): UsageRequestDetail {
@@ -546,6 +602,15 @@ function requestDetailFromEvent(event: CloudUsageEventRecord): UsageRequestDetai
 }
 
 function requestCursor(event: CloudUsageEventRecord): string { return `${event.ts}|${event.id}`; }
+function parseRequestCursor(cursor: string | undefined): { ts: string; id: string } | null {
+  if (!cursor) return null;
+  const separator = cursor.lastIndexOf("|");
+  if (separator <= 0) return null;
+  const ts = cursor.slice(0, separator);
+  const id = cursor.slice(separator + 1);
+  if (Number.isNaN(new Date(ts).getTime()) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return null;
+  return { ts: new Date(ts).toISOString(), id };
+}
 function redactRequestId(value: string): string { return value.length <= 12 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`; }
 function isSuccess(status: string): boolean { return ["completed", "success", "succeeded"].includes(status); }
 function percentile(values: number[], ratio: number): number | null { return values.length ? values[Math.min(values.length - 1, Math.max(0, Math.ceil(values.length * ratio) - 1))]! : null; }
@@ -653,6 +718,28 @@ function usageWhere(tenantId: string, filter: UsageEventFilter): { where: string
     clauses.push(`${column} $${params.length}${column.endsWith("=") && (column.startsWith("user_id") || column.startsWith("department_id") || column.startsWith("workspace_id")) ? "::uuid" : ""}`);
   }
   return { where: `WHERE ${clauses.join(" AND ")}`, params };
+}
+
+function usageEventQuery(
+  tenantId: string,
+  filter: UsageEventFilter,
+  direction: "asc" | "desc",
+): { where: string; params: unknown[]; limitClause: string } {
+  const query = usageWhere(tenantId, filter);
+  const cursor = parseRequestCursor(filter.cursor);
+  if (cursor) {
+    query.params.push(cursor.ts, cursor.id);
+    const timestampParam = `$${query.params.length - 1}::timestamptz`;
+    const idParam = `$${query.params.length}::uuid`;
+    const operator = direction === "asc" ? ">" : "<";
+    query.where += ` AND (ts ${operator} ${timestampParam} OR (ts = ${timestampParam} AND id ${operator} ${idParam}))`;
+  }
+  let limitClause = "";
+  if (filter.limit !== undefined) {
+    query.params.push(filter.limit);
+    limitClause = ` LIMIT $${query.params.length}`;
+  }
+  return { ...query, limitClause };
 }
 
 function utcDayStart(value: Date): Date {

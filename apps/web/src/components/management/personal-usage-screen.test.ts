@@ -22,6 +22,7 @@ function request(patch: Partial<UsageRequestSummary>): UsageRequestSummary {
     cacheWriteTokens: 0,
     cacheEligible: true,
     cacheMissReason: "first_request",
+    finishReason: "stop",
     billedCostMicros: "100",
     latencyMs: 100,
     ttftMs: 25,

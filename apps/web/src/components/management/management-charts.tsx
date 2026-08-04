@@ -18,6 +18,9 @@ import { XAxis as BklitXAxis } from "@berry/desktop-ui/components/charts/x-axis"
 function compactDateLabel(value: string) {
   const date = new Date(value.includes("T") ? value : `${value}T00:00:00Z`);
   if (Number.isNaN(date.getTime())) return value;
+  if (date.getUTCHours() !== 0 || date.getUTCMinutes() !== 0) {
+    return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  }
   return date.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
@@ -196,7 +199,7 @@ export function OutcomeBars({
 
   return (
     <figure className="settings-chart-series">
-      <figcaption>Request outcomes</figcaption>
+      <figcaption className="sr-only">Request outcomes</figcaption>
       {chartPoints.length ? (
         <BklitBarChart
           data={chartPoints}
@@ -392,4 +395,54 @@ export function HealthRings({
       )}
     </figure>
   );
+}
+
+export function ModelSpendRings({
+  rows,
+  format,
+}: {
+  rows: Array<{ label: string; value: number }>;
+  format: (value: number) => string;
+}) {
+  const visible = aggregateModelSpendRows(rows);
+  const total = visible.reduce((sum, row) => sum + row.value, 0);
+  const colors = [ringCssVars.ring1, ringCssVars.ring2, ringCssVars.ring3, ringCssVars.ring4, ringCssVars.ring5];
+  const data = visible.map((row, index) => ({
+    label: row.label,
+    value: total > 0 ? Math.round((row.value / total) * 1000) / 10 : 0,
+    maxValue: 100,
+    color: colors[index]!,
+  }));
+
+  return <figure className="settings-chart-series">
+    <figcaption className="sr-only">Model spend distribution</figcaption>
+    {data.length ? <>
+      <div className="mx-auto h-56 w-full max-w-64">
+        <RingChart data={data} className="h-full w-full" strokeWidth={11} ringGap={6} baseInnerRadius={48}>
+          {data.map((_, index) => <Ring key={index} index={index} showGlow={false} />)}
+          <RingCenter defaultLabel="Model share" suffix="%" />
+        </RingChart>
+      </div>
+      <div className="mt-2 grid gap-1.5 text-xs text-muted-foreground">
+        {visible.map((row, index) => <span key={`${row.label}:${index}`} className="flex items-center justify-between gap-3">
+          <span className="inline-flex min-w-0 items-center gap-1.5"><i className="size-2 shrink-0 rounded-full" style={{ backgroundColor: colors[index] }} aria-hidden /><span className="truncate">{row.label}</span></span>
+          <span className="shrink-0 tabular-nums text-foreground">{data[index]?.value ?? 0}% · {format(row.value)}</span>
+        </span>)}
+      </div>
+    </> : <p className="text-xs text-muted-foreground">No model spend in this period.</p>}
+  </figure>;
+}
+
+export function aggregateModelSpendRows(
+  rows: Array<{ label: string; value: number }>,
+  maximumRows = 5,
+): Array<{ label: string; value: number }> {
+  const positive = rows.filter((row) => row.value > 0).sort((left, right) => right.value - left.value);
+  const limit = Math.max(2, Math.floor(maximumRows));
+  if (positive.length <= limit) return positive;
+  const named = positive.slice(0, limit - 1);
+  return [
+    ...named,
+    { label: "Other", value: positive.slice(limit - 1).reduce((sum, row) => sum + row.value, 0) },
+  ];
 }

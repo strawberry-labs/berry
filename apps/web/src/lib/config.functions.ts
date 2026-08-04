@@ -33,7 +33,7 @@ export const loadWebBootstrap = createServerFn({ method: "GET" }).handler(async 
     });
     if (!response.ok) return { config, user: null, sessionResolved: false };
     const session = await response.json() as {
-      user?: { id?: unknown; email?: unknown; name?: unknown } | null;
+      user?: { id?: unknown; email?: unknown; name?: unknown; image?: unknown } | null;
     } | null;
     const user = session?.user;
     if (!user || typeof user.id !== "string" || typeof user.email !== "string") {
@@ -45,6 +45,7 @@ export const loadWebBootstrap = createServerFn({ method: "GET" }).handler(async 
         id: user.id,
         email: user.email,
         name: typeof user.name === "string" ? user.name : null,
+        image: typeof user.image === "string" ? user.image : null,
       },
       sessionResolved: true,
     };

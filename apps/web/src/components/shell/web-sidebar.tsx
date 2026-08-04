@@ -33,16 +33,15 @@ import type { SignedInUser } from "./auth-boundary";
 import type { ManagementKind } from "../management/management-navigation";
 import { WebSettingsNavigation } from "./web-settings-navigation";
 
-export type SettingsTab = "general" | "prompts" | "providers" | "mcp" | "skills" | "privacy" | "usage" | "archived" | "governance" | "platform";
+export type SettingsTab = "general" | "account" | "personalization" | "mcp" | "skills" | "usage" | "archived" | "governance" | "platform";
 
 export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
-  { id: "general", label: "Appearance & behavior" },
-  { id: "providers", label: "Model defaults" },
+  { id: "general", label: "General" },
+  { id: "account", label: "Account" },
+  { id: "personalization", label: "Personalization" },
   { id: "skills", label: "Skills" },
   { id: "mcp", label: "MCP servers" },
-  { id: "prompts", label: "Instructions & prompts" },
-  { id: "privacy", label: "Privacy & local data" },
-  { id: "usage", label: "Personal usage" },
+  { id: "usage", label: "Usage" },
   { id: "archived", label: "Archived chats" },
   { id: "governance", label: "Organization administration" },
   { id: "platform", label: "Platform administration" },

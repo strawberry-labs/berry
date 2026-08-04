@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, messageAttachmentContent, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -50,6 +50,7 @@ import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
 import { ManagementRouteProvider } from "./management/management-route-context";
+import { armCompletionSound, notifyBackgroundProgress, notifyTaskCompleted } from "@/lib/task-notifications";
 
 function generatedImageTitle(prompt: string): string {
   const title = prompt
@@ -182,6 +183,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const searchReturnFocusRef = React.useRef<HTMLElement | null>(null);
   const [connectionState, setConnectionState] = React.useState<"online" | "offline" | "reconnecting">("online");
   const [tasks, setTasks] = React.useState(bootstrapContent.tasks);
+  React.useEffect(() => armCompletionSound(), []);
+  const [personalization, setPersonalization] = React.useState<PersonalizationProfile>(() => PersonalizationProfileSchema.parse({}));
+  const tasksRef = React.useRef(tasks);
+  React.useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   const [followUpsBySession, setFollowUpsBySession] = React.useState<Record<string, QueuedFollowUp[]>>({});
   const [threadScrollRequest, setThreadScrollRequest] = React.useState<{ sessionId: string; id: number } | null>(null);
   const followUpsBySessionRef = React.useRef(followUpsBySession);
@@ -275,6 +280,24 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
     ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
     : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
+  React.useEffect(() => {
+    if (!client) return;
+    let cancelled = false;
+    void client.personalizationProfile()
+      .then(async (profile) => {
+        const legacyInstructions = window.localStorage.getItem("berry.web.customInstructions")?.trim() ?? "";
+        const next = !profile.customInstructions && legacyInstructions
+          ? await client.updatePersonalizationProfile({ ...profile, customInstructions: legacyInstructions })
+          : profile;
+        if (cancelled) return;
+        setPersonalization(next);
+        if (legacyInstructions && next.customInstructions === legacyInstructions) window.localStorage.removeItem("berry.web.customInstructions");
+      })
+      .catch((cause) => {
+        if (!cancelled) setResourceError("settings", cause instanceof Error ? cause.message : "Unable to load personalization");
+      });
+    return () => { cancelled = true; };
+  }, [client, setResourceError]);
   React.useEffect(() => {
     if (!client || !activeOrganizationId) {
       setEffectiveOrgPermissions(fallbackOrgPermissions);
@@ -749,7 +772,24 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           if (cursor) lastEventCursorBySessionRef.current.set(sessionId, cursor);
           updateSessionStream(sessionId, event);
           updateDurableStateFromEvent(sessionId, event);
+          const streamedTask = tasksRef.current.find((task) => task.activeSessionId === sessionId);
+          if (event.kind === "tool.start" && streamedTask) {
+            notifyBackgroundProgress({
+              sessionId,
+              taskId: streamedTask.id,
+              taskTitle: streamedTask.title,
+              detail: event.title || event.name || "Berry started the next step.",
+            });
+          }
           if (event.kind !== "turn.end") return;
+          if (event.status === "completed" && streamedTask) {
+            notifyTaskCompleted({
+              completionId: `${sessionId}:${event.turnId}`,
+              sessionId,
+              taskId: streamedTask.id,
+              taskTitle: streamedTask.title,
+            });
+          }
           setTasks((current) => current.map((task) => task.activeSessionId === sessionId ? { ...task, status: event.status } : task));
           terminal = true;
           activeSessionsRef.current.delete(sessionId);
@@ -1923,6 +1963,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               planProgress={planProgressFromConversation(messages, stream)}
               question={stream.question}
               showProjectSwitcher={shouldShowComposerProjectSwitcher(messages)}
+              personalization={personalization}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
               runTurn={runTurn}
@@ -1995,6 +2036,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onEditingFollowUpChange={setEditingFollowUp}
                 onSteerMessage={steerActiveTurn}
                 showProjectSwitcher
+                personalization={personalization}
                 onCreateTask={createTask}
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}
@@ -2016,7 +2058,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         {surface === "settings" ? (
           <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
             <React.Suspense fallback={<LazySurfaceFallback label="Loading settings" />}>
-              <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask, onUsePrompt: (prompt) => { window.localStorage.setItem("berry.web.pendingPrompt", prompt); navigateHome(); } }}>
+              <ManagementRouteProvider value={{ config, client, tenantId: activeOrganizationId, userId: user?.id ?? null, user, personalization, onPersonalizationChange: setPersonalization, permissions: effectiveOrgPermissions, tasks, workspaces, onArchiveTask: archiveTask, onDeleteTask: deleteTask, onRestoreTask: restoreTask }}>
                 <Outlet />
               </ManagementRouteProvider>
             </React.Suspense>

@@ -9,6 +9,7 @@ import {
   ManagementDialog,
   ManagementPage,
   ManagementSwitch,
+  FormSelect,
   Section,
   StatusPill,
   formatDate,
@@ -43,7 +44,7 @@ export function withoutMemory(
   return items.filter((item) => item.id !== memoryId);
 }
 
-export function MemorySettingsScreen({ client }: ManagementScreenProps) {
+export function MemorySettingsScreen({ client, embedded = false }: ManagementScreenProps & { embedded?: boolean }) {
   const resource = useResource<MemoryResource>(
     "personal-memory",
     async () => {
@@ -245,45 +246,22 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
   );
   const groups = groupActiveMemories(filtered);
   const disabled = !data.settings.memoryEnabled;
+  const actions = <>
+    <Button variant="secondary" onClick={() => void exportMemory()} disabled={!client || busy === "export"}><Download />Export</Button>
+    <Button onClick={openCreate} disabled={!client || disabled}><Plus />Add memory</Button>
+  </>;
 
-  return (
-    <ManagementPage
-      title="Memory"
-      description="Control the personal facts and working preferences Berry may recall across your chats and projects."
-      eyebrow="Personalization"
-      actions={
-        <>
-          <Button
-            variant="secondary"
-            onClick={() => void exportMemory()}
-            disabled={!client || busy === "export"}
-          >
-            <Download />
-            Export
-          </Button>
-          <Button onClick={openCreate} disabled={!client || disabled}>
-            <Plus />
-            Add memory
-          </Button>
-        </>
-      }
-    >
+  const screenContent = (
       <AsyncState
         loading={resource.loading}
         error={resource.error}
         onRetry={resource.retry}
       >
-        <Section
-          title="Recall controls"
-          description="These settings apply only to your authenticated account."
-        >
+        <Section>
           <div className="grid divide-y divide-border [&>label]:flex [&>label]:items-center [&>label]:justify-between [&>label]:gap-4 [&>label]:py-3 [&>label>span]:grid [&>label>span]:gap-0.5 [&_b]:text-sm [&_small]:text-xs [&_small]:text-muted-foreground">
             <label>
               <span>
                 <b>Use personal memory</b>
-                <small>
-                  Recall active facts and preferences in future chats.
-                </small>
               </span>
               <ManagementSwitch
                 checked={data.settings.memoryEnabled}
@@ -297,10 +275,6 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
             <label>
               <span>
                 <b>Learn from completed chats</b>
-                <small>
-                  Propose durable facts after a turn. Explicit entries always
-                  take priority.
-                </small>
               </span>
               <ManagementSwitch
                 checked={data.settings.implicitMemoryEnabled}
@@ -347,12 +321,18 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
         >
           <div className="memory-editor">
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-              Kind
-              <Input
+              Category
+              <FormSelect
                 value={kind}
-                maxLength={80}
-                autoFocus
-                onChange={(event) => setKind(event.currentTarget.value)}
+                onChange={setKind}
+                options={[
+                  { value: "profile", label: "Profile" },
+                  { value: "preference", label: "Preference" },
+                  { value: "communication_style", label: "Communication style" },
+                  { value: "accessibility", label: "Accessibility" },
+                  { value: "working_convention", label: "Working convention" },
+                  ...(!["profile", "preference", "communication_style", "accessibility", "working_convention"].includes(kind) ? [{ value: kind, label: humanize(kind) }] : []),
+                ]}
               />
             </label>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
@@ -538,8 +518,9 @@ export function MemorySettingsScreen({ client }: ManagementScreenProps) {
           </div>
         </Section>
       </AsyncState>
-    </ManagementPage>
   );
+  if (embedded) return <div className="grid min-w-0 gap-4"><div className="flex flex-wrap justify-end gap-2">{actions}</div>{screenContent}</div>;
+  return <ManagementPage title="Memory" description="Review the durable context Berry can recall." actions={actions}>{screenContent}</ManagementPage>;
 }
 
 function humanize(value: string): string {

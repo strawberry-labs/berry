@@ -1,5 +1,6 @@
 import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Req } from "@nestjs/common";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
+import { PersonalizationProfileSchema } from "@berry/shared";
 import { z } from "zod";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { PERSONAL_CAPABILITIES, PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
@@ -10,10 +11,13 @@ const ToggleSchema = z.object({ enabled: z.boolean().optional(), trusted: z.bool
 const McpInputSchema = z.object({ name: z.string().trim().min(1).max(100), url: z.string().url(), transport: z.enum(["http-sse", "streamable-http"]), auth: z.enum(["none", "bearer", "oauth"]), credential: z.string().min(1).max(16_384).optional(), enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict();
 const OAuthStartSchema = z.object({ redirectUri: z.string().url() }).strict();
 const OAuthCompleteSchema = z.object({ state: z.string().min(20), code: z.string().min(1).max(16_384) }).strict();
+const PersonalizationInputSchema = PersonalizationProfileSchema.pick({ nickname: true, occupation: true, about: true, customInstructions: true }).strict();
 
 @Controller("/v1/me")
 export class PersonalCapabilitiesController {
   constructor(@Inject(PERSONAL_CAPABILITIES) private readonly capabilities: PersonalCapabilitiesService) {}
+  @Get("/personalization") personalization(@Req() request: AuthenticatedRequest) { return this.capabilities.personalization(tenant(), user(request)); }
+  @Patch("/personalization") updatePersonalization(@Req() request: AuthenticatedRequest, @Body() body: unknown) { return this.capabilities.updatePersonalization(tenant(), user(request), parse(PersonalizationInputSchema, body)); }
   @Get("/skills") listSkills(@Req() request: AuthenticatedRequest) { return this.capabilities.listSkills(tenant(), user(request)); }
   @Post("/skills/review") async reviewSkill(@Body() body: unknown) { return (await this.capabilities.previewSkill(parse(SkillInputSchema, body))).review; }
   @Post("/skills") saveSkill(@Req() request: AuthenticatedRequest, @Body() body: unknown) { return this.capabilities.saveSkill(tenant(), user(request), parse(SkillSaveSchema, body)); }

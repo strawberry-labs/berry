@@ -17,6 +17,7 @@ apps/desktop/src-tauri/gen/
 # Environment and local secrets
 .env
 .env.*
+credentials.env
 !.env.example
 !deploy/.env.production.example
 

@@ -3488,6 +3488,25 @@ export const TENANT_CONTEXT_EXECUTE_HARDENING_MIGRATION = `
 REVOKE ALL ON FUNCTION berry_set_tenant_id(uuid) FROM PUBLIC;
 `.trim();
 
+export const PERSONALIZATION_PROFILE_MIGRATION = `
+CREATE TABLE IF NOT EXISTS personalization_profiles (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id text NOT NULL,
+  nickname text NOT NULL DEFAULT '',
+  occupation text NOT NULL DEFAULT '',
+  about text NOT NULL DEFAULT '',
+  custom_instructions text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+ALTER TABLE personalization_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE personalization_profiles FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS personalization_profiles_tenant_isolation ON personalization_profiles;
+CREATE POLICY personalization_profiles_tenant_isolation ON personalization_profiles
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -3582,4 +3601,5 @@ export const cloudMigrations = [
   { id: 33, name: "self_hosted_embedding_profile_v2", sql: SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION },
   { id: 34, name: "knowledge_vector_hnsw_v1", sql: KNOWLEDGE_VECTOR_HNSW_MIGRATION },
   { id: 35, name: "tenant_context_execute_hardening_v1", sql: TENANT_CONTEXT_EXECUTE_HARDENING_MIGRATION },
+  { id: 36, name: "personalization_profiles_v1", sql: PERSONALIZATION_PROFILE_MIGRATION },
 ] as const;

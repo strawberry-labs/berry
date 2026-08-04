@@ -2,8 +2,8 @@ import * as React from "react";
 import type { ManagementScreenProps } from "./management-context";
 import { GeneralSettingsScreen } from "./general-settings-screen";
 
-const ModelSettingsScreen = React.lazy(async () => ({
-  default: (await import("./model-settings-screen")).ModelSettingsScreen,
+const AccountSettingsScreen = React.lazy(async () => ({
+  default: (await import("./account-settings-screen")).AccountSettingsScreen,
 }));
 const PersonalSkillsScreen = React.lazy(async () => ({
   default: (await import("./personal-capability-screens")).PersonalSkillsScreen,
@@ -11,14 +11,8 @@ const PersonalSkillsScreen = React.lazy(async () => ({
 const PersonalMcpScreen = React.lazy(async () => ({
   default: (await import("./personal-capability-screens")).PersonalMcpScreen,
 }));
-const PromptsSettingsScreen = React.lazy(async () => ({
-  default: (await import("./prompts-settings-screen")).PromptsSettingsScreen,
-}));
-const MemorySettingsScreen = React.lazy(async () => ({
-  default: (await import("./memory-settings-screen")).MemorySettingsScreen,
-}));
-const PrivacySettingsScreen = React.lazy(async () => ({
-  default: (await import("./privacy-settings-screen")).PrivacySettingsScreen,
+const PersonalizationSettingsScreen = React.lazy(async () => ({
+  default: (await import("./personalization-settings-screen")).PersonalizationSettingsScreen,
 }));
 const PersonalUsageScreen = React.lazy(async () => ({
   default: (await import("./personal-usage-screen")).PersonalUsageScreen,
@@ -29,12 +23,10 @@ const ArchivedChatsScreen = React.lazy(async () => ({
 
 export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps & { tab: string }) {
   if (tab === "general") return <GeneralSettingsScreen />;
-  if (tab === "providers") return <ModelSettingsScreen {...props} />;
+  if (tab === "account") return <AccountSettingsScreen {...props} />;
+  if (tab === "personalization") return <PersonalizationSettingsScreen {...props} />;
   if (tab === "skills") return <PersonalSkillsScreen {...props} />;
   if (tab === "mcp") return <PersonalMcpScreen {...props} />;
-  if (tab === "prompts") return <PromptsSettingsScreen onUsePrompt={props.onUsePrompt} />;
-  if (tab === "memory") return <MemorySettingsScreen {...props} />;
-  if (tab === "privacy") return <PrivacySettingsScreen {...props} />;
   if (tab === "usage") return <PersonalUsageScreen {...props} />;
   if (tab === "archived") return <ArchivedChatsScreen {...props} />;
   return <GeneralSettingsScreen />;

@@ -1,7 +1,7 @@
 import * as React from "react";
 import { ArrowUp, Plus, Square } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
-import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -68,6 +68,7 @@ export function Composer({
   planProgress,
   question,
   showProjectSwitcher,
+  personalization,
 }: {
   config: WebConfig;
   activeTask: Task | null;
@@ -104,6 +105,7 @@ export function Composer({
   planProgress?: PlanProgress | null;
   question?: QuestionPrompt | null;
   showProjectSwitcher: boolean;
+  personalization: PersonalizationProfile;
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -362,8 +364,8 @@ export function Composer({
     const task = activeTask ?? await onCreateTask({ title: input.slice(0, 42) });
     if (!task?.activeSessionId) return;
     const sessionId = task.activeSessionId;
-    const customInstructions = variant === "home" ? window.localStorage.getItem("berry.web.customInstructions")?.trim() : "";
-    const runtimeInput = customInstructions ? `${input}\n\nUser instructions:\n${customInstructions}` : input;
+    const profileContext = variant === "home" ? personalizationRuntimeContext(personalization) : "";
+    const runtimeInput = profileContext ? `${input}\n\nExplicit user profile context:\n${profileContext}` : input;
     setBusy(true);
     setUploadError("");
     const optimisticMessageId = onUserMessage(input, sessionId, task.id, attachments);
@@ -403,7 +405,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
+  }, [activeTask, attachments, client, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length) return;
@@ -618,6 +620,15 @@ export function Composer({
       {uploadError ? <p className="composer-error" role="alert">{uploadError}</p> : null}
     </div>
   );
+}
+
+function personalizationRuntimeContext(profile: PersonalizationProfile): string {
+  return [
+    profile.nickname.trim() ? `Nickname: ${profile.nickname.trim()}` : "",
+    profile.occupation.trim() ? `Occupation: ${profile.occupation.trim()}` : "",
+    profile.about.trim() ? `About: ${profile.about.trim()}` : "",
+    profile.customInstructions.trim() ? `Custom instructions: ${profile.customInstructions.trim()}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {

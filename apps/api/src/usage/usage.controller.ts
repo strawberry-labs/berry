@@ -51,7 +51,7 @@ export class UsageController {
   @Get("/events")
   async listEvents(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
     await this.requirePermission(request, tenantId, "usage:read");
-    return z.array(CloudUsageEventRecordSchema).parse((await this.usage.listEvents(tenantId, usageFilter(query))).map(redactUsageEvent));
+    return z.array(CloudUsageEventRecordSchema).parse((await this.usage.listEvents(tenantId, usageFilter(query, 100))).map(redactUsageEvent));
   }
 
   @Get("/rollups")
@@ -122,7 +122,7 @@ export class UsageController {
   }
 }
 
-function usageFilter(query: unknown): UsageEventFilter {
+function usageFilter(query: unknown, defaultLimit?: number): UsageEventFilter {
   const parsed = parseBody(UsageQuerySchema, query);
   return {
     from: parsed.from ? new Date(parsed.from) : undefined,
@@ -136,7 +136,7 @@ function usageFilter(query: unknown): UsageEventFilter {
     workspaceId: parsed.workspaceId,
     agentId: parsed.agentId,
     cursor: parsed.cursor,
-    limit: parsed.limit,
+    limit: parsed.limit ?? defaultLimit,
   };
 }
 

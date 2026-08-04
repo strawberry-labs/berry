@@ -34,21 +34,16 @@ describe("cloud shell bootstrap", () => {
     expect(visible.flatMap((group) => group.items.map((item) => item.id))).toEqual(["overview", "members", "skills-mcp"]);
   });
 
-  it("keeps memory on the personal settings surface", () => {
-    expect(parseCloudShellLocation("/settings/memory")).toEqual({ kind: "settings", tab: "memory" });
+  it("redirects legacy memory navigation into personalization", () => {
+    expect(parseCloudShellLocation("/settings/memory")).toEqual({ kind: "settings", tab: "personalization" });
   });
 
-  it("keeps personal settings grouped and ordered by user intent", () => {
+  it("keeps personal settings flat and ordered by user intent", () => {
     expect(PERSONAL_NAV.map((group) => ({
       label: group.label,
       items: group.items.map((item) => [item.id, item.label]),
     }))).toEqual([
-      { label: "Preferences", items: [["general", "Appearance & behavior"], ["providers", "Model defaults"]] },
-      { label: "Personalization", items: [["prompts", "Instructions & prompts"], ["memory", "Memory"]] },
-      { label: "Tools & connections", items: [["skills", "Skills"], ["mcp", "MCP servers"]] },
-      { label: "Privacy & local data", items: [["privacy", "Privacy & local data"]] },
-      { label: "Usage", items: [["usage", "Personal usage"]] },
-      { label: "History", items: [["archived", "Archived chats"]] },
+      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived chats"]] },
     ]);
   });
 

@@ -2,7 +2,7 @@ import * as React from "react";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 
-export type SignedInUser = { id: string; email: string; name?: string | null };
+export type SignedInUser = { id: string; email: string; name?: string | null; image?: string | null };
 
 export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }: {
   baseUrl: string;

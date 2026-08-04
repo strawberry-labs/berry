@@ -81,6 +81,7 @@ import {
   HostPushEventSchema,
   MessageSchema,
   MemoryItemSchema,
+  PersonalizationProfileSchema,
   ModelGovernanceDecisionSchema,
   MobileDeviceRegistrationCreateSchema,
   MobileDeviceRegistrationSchema,
@@ -181,6 +182,7 @@ import {
   type HostPushEvent,
   type Message,
   type MemoryItem,
+  type PersonalizationProfile,
   type ModelGovernanceDecision,
   type MobileDeviceRegistration,
   type MobileDeviceRegistrationCreate,
@@ -687,6 +689,14 @@ export class BerryApiClient {
     limit?: number;
   } = {}): Promise<{ items: MemoryItem[]; nextCursor: string | null }> {
     return this.#request(`/v1/memory${usageQuery(input)}`, MemoryPageSchema);
+  }
+
+  async personalizationProfile(): Promise<PersonalizationProfile> {
+    return this.#request("/v1/me/personalization", PersonalizationProfileSchema);
+  }
+
+  async updatePersonalizationProfile(input: Pick<PersonalizationProfile, "nickname" | "occupation" | "about" | "customInstructions">): Promise<PersonalizationProfile> {
+    return this.#request("/v1/me/personalization", PersonalizationProfileSchema, { method: "PATCH", body: input });
   }
 
   async getMemory(memoryId: string): Promise<MemoryItem> {

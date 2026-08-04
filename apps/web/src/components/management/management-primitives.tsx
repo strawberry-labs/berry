@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import * as React from "react";
 import type { ReactNode } from "react";
+import type { LucideIcon } from "lucide-react";
 import { Badge } from "@berry/desktop-ui/components/ui/badge";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import {
@@ -213,30 +214,36 @@ export function PermissionDenied({
 
 export function MetricGrid({
   items,
+  compact = false,
 }: {
   items: Array<{
     label: string;
     value: string;
+    exactValue?: string;
     hint?: string;
     status?: "good" | "warning" | "danger";
+    icon?: LucideIcon;
   }>;
+  compact?: boolean;
 }) {
   return (
     <section
-      className="grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-4"
+      className="grid min-w-0 gap-3 [grid-template-columns:repeat(auto-fit,minmax(145px,1fr))]"
       aria-label="Summary metrics"
     >
-      {items.map((item) => (
+      {items.map((item) => {
+        const Icon = item.icon;
+        return (
         <Card
           key={item.label}
           className="min-w-0 gap-0 py-0 shadow-none"
           data-status={item.status}
         >
-          <CardContent className="grid gap-1 px-4 py-4">
-            <span className="text-xs font-medium text-muted-foreground">
-              {item.label}
+          <CardContent className={cn("grid gap-1 px-4", compact ? "py-3" : "py-4")}>
+            <span className="flex items-center justify-between gap-2 text-xs font-medium text-muted-foreground">
+              <span>{item.label}</span>{Icon ? <Icon className="size-3.5 shrink-0" aria-hidden /> : null}
             </span>
-            <strong className="text-xl font-semibold tracking-tight text-foreground tabular-nums">
+            <strong className={cn("font-semibold tracking-tight text-foreground tabular-nums", compact ? "text-lg" : "text-xl")} title={item.exactValue} aria-label={item.exactValue ?? item.value}>
               {item.value}
             </strong>
             {item.hint ? (
@@ -246,7 +253,7 @@ export function MetricGrid({
             ) : null}
           </CardContent>
         </Card>
-      ))}
+      );})}
     </section>
   );
 }
@@ -257,16 +264,16 @@ export function Section({
   actions,
   children,
 }: {
-  title: string;
+  title?: string;
   description?: string;
   actions?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <Card className="min-w-0 gap-0 overflow-hidden py-0 shadow-none">
-      <CardHeader className="flex flex-row items-start justify-between gap-4 border-b border-border px-4 py-4">
+      {title || description || actions ? <CardHeader className="flex flex-row items-start justify-between gap-4 border-b border-border px-4 py-4">
         <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground">{title}</h2>
+          {title ? <h2 className="text-sm font-semibold text-foreground">{title}</h2> : null}
           {description ? (
             <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
               {description}
@@ -278,7 +285,7 @@ export function Section({
             {actions}
           </div>
         ) : null}
-      </CardHeader>
+      </CardHeader> : null}
       <CardContent className="min-w-0 px-4 py-4">{children}</CardContent>
     </Card>
   );

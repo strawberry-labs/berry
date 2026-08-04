@@ -1,4 +1,4 @@
-export const USER_SETTINGS_TABS = ["general", "providers", "skills", "mcp", "prompts", "memory", "privacy", "usage", "archived"] as const;
+export const USER_SETTINGS_TABS = ["general", "account", "personalization", "skills", "mcp", "usage", "archived"] as const;
 export type UserSettingsTab = (typeof USER_SETTINGS_TABS)[number];
 export const ARTIFACT_LIBRARY_TABS = ["all", "images", "documents"] as const;
 export type ArtifactLibraryTab = (typeof ARTIFACT_LIBRARY_TABS)[number];
@@ -17,7 +17,14 @@ export function parseCloudShellLocation(pathname: string): CloudShellLocation {
   const parts = pathname.split("/").filter(Boolean).map(decodeURIComponent);
   if (parts[0] === "tasks" && parts[1]) return { kind: "task", taskId: parts[1] };
   if (parts[0] === "settings") {
-    const tab = USER_SETTINGS_TABS.find((candidate) => candidate === parts[1]) ?? "general";
+    const legacyTab = parts[1] === "prompts" || parts[1] === "memory"
+      ? "personalization"
+      : parts[1] === "privacy"
+        ? "account"
+        : parts[1] === "providers"
+          ? "general"
+          : parts[1];
+    const tab = USER_SETTINGS_TABS.find((candidate) => candidate === legacyTab) ?? "general";
     return { kind: "settings", tab };
   }
   if (parts[0] === "library") {

@@ -1,14 +1,16 @@
 import * as React from "react";
 import type { BerryApiClient } from "@berry/api-client";
-import type { OrgPermission, Task, Workspace } from "@berry/shared";
+import type { OrgPermission, PersonalizationProfile, Task, Workspace } from "@berry/shared";
 import type { WebConfig } from "@/lib/config";
 export type ManagementScreenProps = {
   client: BerryApiClient | null;
   config: WebConfig;
   tenantId: string;
   userId: string | null;
+  user: { id: string; email: string; name?: string | null; image?: string | null } | null;
+  personalization: PersonalizationProfile;
+  onPersonalizationChange: (profile: PersonalizationProfile) => void;
   permissions: OrgPermission[];
-  onUsePrompt: (prompt: string) => void;
   tasks: Task[];
   workspaces: Workspace[];
   onArchiveTask: (task: Task, archived: boolean) => Promise<void>;

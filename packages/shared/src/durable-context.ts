@@ -42,6 +42,15 @@ export const MemoryItemSchema = z.object({
 });
 export type MemoryItem = z.infer<typeof MemoryItemSchema>;
 
+export const PersonalizationProfileSchema = z.object({
+  nickname: z.string().max(80).default(""),
+  occupation: z.string().max(160).default(""),
+  about: z.string().max(4_000).default(""),
+  customInstructions: z.string().max(12_000).default(""),
+  updatedAt: DateTimeSchema.nullable().default(null),
+});
+export type PersonalizationProfile = z.infer<typeof PersonalizationProfileSchema>;
+
 export const MemoryOperationSchema = z.object({
   operation: MemoryOperationKindSchema,
   stableKey: z.string().min(1).max(240),

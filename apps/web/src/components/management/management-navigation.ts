@@ -1,33 +1,21 @@
 import type { OrgPermission } from "@berry/shared";
 import {
-  Activity, Blocks, Boxes, Brain, Building2, CreditCard, Database, FileClock, Flag, GitBranch,
+  Activity, Blocks, Boxes, Building2, CreditCard, Database, FileClock, Flag, GitBranch,
   KeyRound, Landmark, LayoutDashboard, LineChart, ListChecks, Lock, MessageSquareText,
-  Network, Puzzle, ScrollText, ShieldCheck, SlidersHorizontal, Terminal, UserCog, Users, Wallet,
+  Network, Puzzle, ScrollText, SlidersHorizontal, Sparkles, Terminal, User, UserCog, Users, Wallet,
   type LucideIcon,
 } from "lucide-react";
 export type ManagementKind = "settings" | "admin" | "platform";
 export type NavItem = { id: string; label: string; icon: LucideIcon; permission?: OrgPermission };
 export type NavGroup = { label: string; items: NavItem[] };
 export const PERSONAL_NAV: NavGroup[] = [
-  { label: "Preferences", items: [
-    { id: "general", label: "Appearance & behavior", icon: SlidersHorizontal },
-    { id: "providers", label: "Model defaults", icon: Boxes },
-  ] },
-  { label: "Personalization", items: [
-    { id: "prompts", label: "Instructions & prompts", icon: Terminal },
-    { id: "memory", label: "Memory", icon: Brain },
-  ] },
-  { label: "Tools & connections", items: [
+  { label: "", items: [
+    { id: "general", label: "General", icon: SlidersHorizontal },
+    { id: "account", label: "Account", icon: User },
+    { id: "personalization", label: "Personalization", icon: Sparkles },
     { id: "skills", label: "Skills", icon: Puzzle },
     { id: "mcp", label: "MCP servers", icon: Network },
-  ] },
-  { label: "Privacy & local data", items: [
-    { id: "privacy", label: "Privacy & local data", icon: ShieldCheck },
-  ] },
-  { label: "Usage", items: [
-    { id: "usage", label: "Personal usage", icon: LineChart },
-  ] },
-  { label: "History", items: [
+    { id: "usage", label: "Usage", icon: LineChart },
     { id: "archived", label: "Archived chats", icon: MessageSquareText },
   ] },
 ];

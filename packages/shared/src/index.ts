@@ -3142,12 +3142,15 @@ export const UsageSeriesPointSchema = z.object({
 });
 export const UsageBreakdownRowSchema = z.object({
   dimension: z.string(), id: z.string().nullable(), label: z.string(), billedCostMicros: z.string(), requests: z.number().int().nonnegative(),
-  tokens: z.number().int().nonnegative(), errorRate: z.number().min(0).max(1).nullable(), latencyP50Ms: z.number().nonnegative().nullable(), latencyP95Ms: z.number().nonnegative().nullable(),
+  tokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative().default(0), outputTokens: z.number().int().nonnegative().default(0),
+  cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
+  errorRate: z.number().min(0).max(1).nullable(), latencyP50Ms: z.number().nonnegative().nullable(), latencyP95Ms: z.number().nonnegative().nullable(),
 });
 export const UsagePerformanceSummarySchema = z.object({
   latencyP50Ms: z.number().nonnegative().nullable(), latencyP95Ms: z.number().nonnegative().nullable(), ttftP50Ms: z.number().nonnegative().nullable(),
   ttftP95Ms: z.number().nonnegative().nullable(), cachedTokens: z.number().int().nonnegative(),
   cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
+  cacheEligibleRequests: z.number().int().nonnegative().default(0), cacheHitRequests: z.number().int().nonnegative().default(0),
   sandboxMinutes: z.number().nonnegative(),
 });
 export const UsageAnomalySchema = z.object({
@@ -3157,7 +3160,7 @@ export const UsageAnomalySchema = z.object({
 });
 export const UsageAnalyticsSchema = z.object({
   tenantId: z.string(), from: ISODateSchema, to: ISODateSchema,
-  totals: z.object({ billedCostMicros: z.string(), requests: z.number().int().nonnegative(), tokens: z.number().int().nonnegative(), successRate: z.number().min(0).max(1).nullable(), projectedMonthEndMicros: z.string().nullable() }),
+  totals: z.object({ billedCostMicros: z.string(), requests: z.number().int().nonnegative(), tokens: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative().default(0), outputTokens: z.number().int().nonnegative().default(0), successRate: z.number().min(0).max(1).nullable(), projectedMonthEndMicros: z.string().nullable() }),
   series: z.array(UsageSeriesPointSchema), breakdowns: z.record(z.array(UsageBreakdownRowSchema)), performance: UsagePerformanceSummarySchema,
   anomalies: z.array(UsageAnomalySchema), unavailableDimensions: z.array(z.string()).default([]),
 });
@@ -3169,6 +3172,7 @@ export const UsageRequestSummarySchema = z.object({
   tokensIn: z.number().int().nonnegative(), tokensOut: z.number().int().nonnegative(), tokensCached: z.number().int().nonnegative(),
   cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0),
   cacheEligible: z.boolean().default(false), cacheMissReason: z.string().nullable().default(null),
+  finishReason: z.string().nullable().default(null),
   billedCostMicros: z.string(), latencyMs: z.number().int().nonnegative().nullable(), ttftMs: z.number().int().nonnegative().nullable(),
   reservationStatus: BudgetReservationStatusSchema.nullable(),
 });

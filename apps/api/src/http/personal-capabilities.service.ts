@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { BadRequestException, NotFoundException } from "@nestjs/common";
 import type { AgentSkill, McpServerSpec } from "@berry/local-agent";
-import type { PersonalMcpServer, PersonalSkill, PersonalSkillReview } from "@berry/shared";
+import { PersonalizationProfileSchema, type PersonalizationProfile, type PersonalMcpServer, type PersonalSkill, type PersonalSkillReview } from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 
@@ -17,9 +17,37 @@ export class PersonalCapabilitiesService {
   readonly #mcp = new Map<string, PersonalMcpServer>();
   readonly #secrets = new Map<string, string>();
   readonly #oauth = new Map<string, { tenantId: string; userId: string; serverId: string; expiresAt: number; complete: boolean }>();
+  readonly #profiles = new Map<string, PersonalizationProfile>();
   readonly #loaded = new Set<string>();
 
   constructor(private readonly database?: CloudDatabaseService) {}
+
+  async personalization(tenantId: string, userId: string): Promise<PersonalizationProfile> {
+    await this.#load(tenantId, userId);
+    return this.#profiles.get(`${tenantId}:${userId}`) ?? PersonalizationProfileSchema.parse({});
+  }
+
+  async updatePersonalization(
+    tenantId: string,
+    userId: string,
+    input: Pick<PersonalizationProfile, "nickname" | "occupation" | "about" | "customInstructions">,
+  ): Promise<PersonalizationProfile> {
+    const profile = PersonalizationProfileSchema.parse({ ...input, updatedAt: new Date().toISOString() });
+    if (this.database) {
+      await this.database.withTenant(tenantId, (db) => db.execute(`
+        INSERT INTO personalization_profiles (tenant_id, user_id, nickname, occupation, about, custom_instructions, updated_at)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::timestamptz)
+        ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+          nickname=EXCLUDED.nickname,
+          occupation=EXCLUDED.occupation,
+          about=EXCLUDED.about,
+          custom_instructions=EXCLUDED.custom_instructions,
+          updated_at=EXCLUDED.updated_at
+      `, [tenantId, userId, profile.nickname, profile.occupation, profile.about, profile.customInstructions, profile.updatedAt]));
+    }
+    this.#profiles.set(`${tenantId}:${userId}`, profile);
+    return profile;
+  }
 
   async listSkills(tenantId: string, userId: string) { await this.#load(tenantId, userId); return [...this.#skills.values()].filter((item) => owns(item, tenantId, userId)); }
 
@@ -103,12 +131,14 @@ export class PersonalCapabilitiesService {
 
   async #load(tenantId: string, userId: string) {
     const key = `${tenantId}:${userId}`; if (!this.database || this.#loaded.has(key)) return; this.#loaded.add(key);
-    const [skills, servers] = await Promise.all([
+    const [skills, servers, profiles] = await Promise.all([
       this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personal_skills WHERE user_id = $1", [userId])),
       this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personal_mcp_servers WHERE user_id = $1", [userId])),
+      this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personalization_profiles WHERE user_id = $1 LIMIT 1", [userId])),
     ]);
     for (const row of skills) { const item = skillRow(row); this.#skills.set(item.id, item); }
     for (const row of servers) { const item = mcpRow(row, false); this.#mcp.set(item.id, item); }
+    if (profiles[0]) this.#profiles.set(key, PersonalizationProfileSchema.parse({ nickname:str(profiles[0],"nickname"),occupation:str(profiles[0],"occupation"),about:str(profiles[0],"about"),customInstructions:str(profiles[0],"custom_instructions"),updatedAt:date(profiles[0],"updated_at") }));
   }
   async #persistSkill(skill: PersonalSkill) { if (!this.database) return; await this.database.withTenant(skill.tenantId, (db) => db.execute(`INSERT INTO personal_skills (id, tenant_id, user_id, name, description, content, enabled, trusted, source, source_url, version, hash, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,content=EXCLUDED.content,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,source=EXCLUDED.source,source_url=EXCLUDED.source_url,version=EXCLUDED.version,hash=EXCLUDED.hash,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [skill.id,skill.tenantId,skill.userId,skill.name,skill.description,skill.content,skill.enabled,skill.trusted,skill.source,skill.sourceUrl,skill.version,skill.hash,JSON.stringify(skill.diagnostics),skill.createdAt,skill.updatedAt])); }
   async #persistMcp(server: PersonalMcpServer) { if (!this.database) return; await this.database.withTenant(server.tenantId, (db) => db.execute(`INSERT INTO personal_mcp_servers (id, tenant_id, user_id, name, url, transport, auth, credential_ref, enabled, trusted, health, tool_count, last_checked_at, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::timestamptz,$14::jsonb,$15::timestamptz,$16::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,transport=EXCLUDED.transport,auth=EXCLUDED.auth,credential_ref=EXCLUDED.credential_ref,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,health=EXCLUDED.health,tool_count=EXCLUDED.tool_count,last_checked_at=EXCLUDED.last_checked_at,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [server.id,server.tenantId,server.userId,server.name,server.url,server.transport,server.auth,server.credentialRef,server.enabled,server.trusted,server.health,server.toolCount,server.lastCheckedAt,JSON.stringify(server.diagnostics),server.createdAt,server.updatedAt])); }
