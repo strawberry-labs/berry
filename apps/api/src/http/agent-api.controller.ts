@@ -15,6 +15,7 @@ import {
   MobileDeviceRegistrationCreateSchema,
   PermissionModeSchema,
   QuestionAnswerSchema,
+  ReasoningLevelSchema,
   resolveModelCapabilities,
   TaskStatusSchema,
   TurnStateSchema,
@@ -132,7 +133,7 @@ const StartTurnRequestSchema = z.object({
   provider: z.any(),
   model: z.string().optional(),
   apiKey: z.string().optional(),
-  reasoning: z.enum(["off", "low", "medium", "high"]).optional(),
+  reasoning: ReasoningLevelSchema.optional(),
   attachments: z.array(AttachmentInputSchema).max(100).optional(),
   // Edit-and-resubmit: rewind the session to before this user message, drop it
   // and everything after, persist the new input as the user message, and run

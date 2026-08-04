@@ -526,7 +526,7 @@ describe("router client", () => {
       apiKey: "key",
     });
     await client.complete({
-      reasoningEffort: "medium",
+      reasoningEffort: "xhigh",
       messages: [
         {
           role: "user",
@@ -537,7 +537,7 @@ describe("router client", () => {
         },
       ],
     });
-    expect(requestBody.reasoning_effort).toBe("medium");
+    expect(requestBody.reasoning_effort).toBe("xhigh");
     expect(requestBody.messages).toEqual([
       {
         role: "user",

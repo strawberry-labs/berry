@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ModelCapabilitiesSchema } from "@berry/shared";
 
 const ProviderConfigSchema = z.object({
   id: z.string(),
@@ -8,6 +9,7 @@ const ProviderConfigSchema = z.object({
   models: z.array(z.object({
     id: z.string(),
     name: z.string(),
+    capabilities: ModelCapabilitiesSchema.optional(),
   })).default([]),
   enabled: z.boolean().default(true),
 });

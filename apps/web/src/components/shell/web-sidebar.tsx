@@ -30,10 +30,12 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@berry/desktop-ui/components/ui/sidebar";
-import { Archive, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
+import { Archive, ArrowUp as Upload, CirclePlus, Ellipsis, FolderOpen, LayoutAlignLeft, Pencil, PencilEdit02Icon, Pin, PinOff, Search, Settings as SettingsIcon, Trash2, Wand2 } from "@berry/desktop-ui/lib/icons";
 import type { SignedInUser } from "./auth-boundary";
 import type { ManagementKind } from "../management/management-navigation";
 import { WebSettingsNavigation } from "./web-settings-navigation";
+
+const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-dialog").then((module) => ({ default: module.ProjectUploadDialog })));
 
 export type SettingsTab = "general" | "account" | "personalization" | "mcp" | "skills" | "usage" | "archived" | "governance" | "platform";
 
@@ -83,7 +85,7 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onSkills, onLibrary, onUsage, onSettings, onSignOut }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onUsage, onSettings, onSignOut }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -119,6 +121,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   onArchiveProjectChats: (workspace: Workspace, tasks: Task[]) => void | Promise<void>;
   onRemoveProject: (workspace: Workspace) => void | Promise<void>;
   onRevealProject: (workspace: Workspace) => void | Promise<void>;
+  onUploadToProject: (workspace: Workspace, file: File, onProgress: (ratio: number) => void) => Promise<void>;
   onSkills: () => void;
   onLibrary: () => void;
   onUsage: () => void;
@@ -154,7 +157,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
         onNewProjectConversation={(workspace) => onSelectWorkspace(workspace.id)}
         onAfterNavigate={() => { if (isMobile) setOpenMobile(false); }}
         formatAge={timeAgo}
-        renderProjectAction={(workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveChats={onArchiveProjectChats} onRemove={onRemoveProject} onReveal={onRevealProject} />}
+        renderProjectAction={(workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveChats={onArchiveProjectChats} onRemove={onRemoveProject} onReveal={onRevealProject} onUpload={onUploadToProject} />}
         commands={(
           <>
             <SidebarMenu className="berry-sidebar-commands">
@@ -223,7 +226,7 @@ function allowanceProgress(allowance: AllowanceBalance): number {
   return Math.min(100, (consumed / Number(allowance.effectiveLimitMicros)) * 100);
 }
 
-function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveChats, onRemove, onReveal }: {
+function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveChats, onRemove, onReveal, onUpload }: {
   workspace: Workspace;
   tasks: Task[];
   onTogglePinned: (workspace: Workspace) => void | Promise<void>;
@@ -231,11 +234,13 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
   onArchiveChats: (workspace: Workspace, tasks: Task[]) => void | Promise<void>;
   onRemove: (workspace: Workspace) => void | Promise<void>;
   onReveal: (workspace: Workspace) => void | Promise<void>;
+  onUpload: (workspace: Workspace, file: File, onProgress: (ratio: number) => void) => Promise<void>;
 }) {
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [renameValue, setRenameValue] = React.useState(workspace.name);
   const [archiveOpen, setArchiveOpen] = React.useState(false);
   const [removeOpen, setRemoveOpen] = React.useState(false);
+  const [uploadOpen, setUploadOpen] = React.useState(false);
 
   React.useEffect(() => setRenameValue(workspace.name), [workspace.name]);
 
@@ -250,6 +255,7 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
         <DropdownMenuContent side="top" align="start" sideOffset={8} collisionPadding={12} className="berry-chat-actions-menu">
           <DropdownMenuItem onSelect={() => void onTogglePinned(workspace)}>{workspace.pinned ? <PinOff /> : <Pin />}{workspace.pinned ? "Unpin project" : "Pin project"}</DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void onReveal(workspace)}><FolderOpen />Reveal in Finder</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setUploadOpen(true)}><Upload />Upload to project</DropdownMenuItem>
           <DropdownMenuItem onSelect={() => { setRenameValue(workspace.name); setRenameOpen(true); }}><Pencil />Rename project</DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem disabled={tasks.length === 0} onSelect={() => setArchiveOpen(true)}><Archive />Archive chats</DropdownMenuItem>
@@ -257,6 +263,8 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
           <DropdownMenuItem variant="destructive" onSelect={() => setRemoveOpen(true)}><Trash2 />Remove</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+
+      {uploadOpen ? <React.Suspense fallback={null}><ProjectUploadDialog open workspace={workspace} onOpenChange={setUploadOpen} onUpload={onUpload} /></React.Suspense> : null}
 
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent className="sm:max-w-sm">

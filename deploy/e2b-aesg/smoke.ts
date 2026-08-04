@@ -23,12 +23,13 @@ try {
   };
   const dependencyChecks = [
     ["AESG branding skill", "test -d /managed-skills/aesg-branding"],
+    ["CV Creator skill", "test -f /managed-skills/cv-creator/scripts/generate_cv_from_spec.py"],
     ["DOCX skill", "test -f /managed-skills/docx/scripts/create_aesg_docx.py"],
     ["PDF skill", "test -f /managed-skills/pdf/scripts/create_aesg_pdf.py"],
     ["XLSX skill", "test -f /managed-skills/xlsx/scripts/create_aesg_xlsx.py"],
     ["PPTX skill", "test -f /managed-skills/pptx/scripts/create_aesg_pptx.py"],
     ["Verdana font", "test \"$(fc-match -f '%{family}' Verdana)\" = Verdana"],
-    ["Python artifact libraries", "python -c \"import docx,pptx,openpyxl,reportlab,pypdf\""],
+    ["Python artifact libraries", "python -c \"import docx,docxtpl,pptx,openpyxl,reportlab,pypdf\""],
     ["LibreOffice", "soffice --version"],
     ["Poppler", "pdfinfo -v"],
     ["QPDF", "qpdf --version"],
@@ -98,6 +99,38 @@ try {
         },
       ],
     },
+    cv: {
+      source_filename: "cv-creator-smoke.pdf",
+      name: "Jordan Rahman",
+      role: "Sustainability Consultant",
+      overview: "Sustainability consultant experienced in environmental performance, project coordination, and certification delivery.",
+      work_experience: [
+        {
+          start_date: "2022",
+          end_date: "Present",
+          role: "Sustainability Consultant",
+          organisation: "AESG",
+          location: "Dubai, UAE",
+          description: "",
+        },
+      ],
+      key_expertise: ["Sustainability advisory", "Green building certifications"],
+      qualifications: ["MSc Sustainable Design, 2021"],
+      memberships: [],
+      selected_projects: [
+        {
+          name: "Regional mixed-use development",
+          duration: "2023 - Present",
+          role: "Sustainability Consultant",
+          client: "",
+          location: "Riyadh, KSA",
+          description: "Supported sustainability coordination, performance reviews, and certification documentation across the design programme.",
+          bullets: [],
+        },
+      ],
+      confirm_no_work_experience: false,
+      confirm_no_selected_projects: false,
+    },
   };
 
   await sandbox.commands.run("mkdir -p /workspace/tmp/smoke /workspace/outputs");
@@ -117,11 +150,17 @@ try {
     `python ${skillRoot}/pdf/scripts/create_aesg_pdf.py --spec /workspace/tmp/smoke/pdf.json --output /workspace/outputs/aesg-smoke.pdf`,
     `python ${skillRoot}/xlsx/scripts/create_aesg_xlsx.py --spec /workspace/tmp/smoke/xlsx.json --output /workspace/outputs/aesg-smoke.xlsx`,
     `python ${skillRoot}/pptx/scripts/create_aesg_pptx.py --spec /workspace/tmp/smoke/pptx.json --output /workspace/outputs/aesg-smoke.pptx`,
+    "python -c \"from PIL import Image; Image.new('RGB', (640, 800), (96, 128, 144)).save('/workspace/tmp/smoke/cv-photo.jpg', 'JPEG')\"",
+    `python ${skillRoot}/cv-creator/scripts/generate_cv_from_spec.py --spec /workspace/tmp/smoke/cv.json --photo /workspace/tmp/smoke/cv-photo.jpg --batch-root /workspace/tmp/smoke/cv-batch --deliverables-dir /workspace/outputs`,
     `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/aesg-smoke.docx`,
     `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/aesg-smoke.pdf`,
     `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/aesg-smoke.xlsx`,
     `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/aesg-smoke.pptx`,
-    "test \"$(find /workspace/outputs -maxdepth 1 -type f | wc -l)\" -eq 4",
+    `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/cv-creator-smoke_portrait.docx`,
+    `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/cv-creator-smoke_landscape.docx`,
+    `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/cv-creator-smoke_portrait.pptx`,
+    `python ${skillRoot}/aesg-branding/scripts/validate_artifact.py /workspace/outputs/cv-creator-smoke_landscape.pptx`,
+    "test \"$(find /workspace/outputs -maxdepth 1 -type f | wc -l)\" -eq 8",
     "test -z \"$(find /workspace/outputs -maxdepth 1 -type f ! \\( -name '*.docx' -o -name '*.pdf' -o -name '*.xlsx' -o -name '*.pptx' \\) -print -quit)\"",
   ].join(" && ");
   const generationResult = await runChecked(

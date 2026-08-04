@@ -28,9 +28,49 @@ interface PendingFileUpload {
   ratio: number;
   state: "uploading" | "error";
   error?: string;
+  pastedText?: string;
+  pastedTextMode?: Exclude<PastedTextMode, "native">;
+}
+
+export interface PastedTextPresentation {
+  text: string;
+  title: string;
+  mode: Exclude<PastedTextMode, "native">;
+}
+
+interface PastedTextDraft extends PastedTextPresentation {
+  attachmentId: string;
+  name: string;
+}
+
+export const PASTED_TEXT_ATTACHMENT_THRESHOLD = 2_000;
+export const PASTED_TEXT_INLINE_LIMIT = 40_000;
+export type PastedTextMode = "native" | "inline" | "file";
+
+export function prunePastedTextPresentations(
+  presentations: Record<string, PastedTextPresentation>,
+  attachments: readonly AttachmentInput[],
+  queuedFollowUps: readonly QueuedFollowUp[],
+): Record<string, PastedTextPresentation> {
+  const liveIds = new Set<string>();
+  for (const attachment of attachments) {
+    if (attachment.id) liveIds.add(attachment.id);
+  }
+  for (const followUp of queuedFollowUps) {
+    for (const attachment of followUp.attachments) {
+      if (attachment.id) liveIds.add(attachment.id);
+    }
+  }
+  const entries = Object.entries(presentations);
+  const retained = entries.filter(([id]) => liveIds.has(id));
+  return retained.length === entries.length
+    ? presentations
+    : Object.fromEntries(retained);
 }
 
 const CREATE_IMAGE_TOKEN = "__berry_create_image__";
+const PastedTextEditorDialog = React.lazy(() => import("./pasted-text-editor-dialog").then((module) => ({ default: module.PastedTextEditorDialog })));
+const ComposerAttachmentPill = React.lazy(() => import("./composer-attachment-pill").then((module) => ({ default: module.ComposerAttachmentPill })));
 
 export function Composer({
   config,
@@ -112,6 +152,10 @@ export function Composer({
   const working = busy || streaming;
   const [attachments, setAttachments] = React.useState<AttachmentInput[]>([]);
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
+  const [pastedTextPresentations, setPastedTextPresentations] = React.useState<Record<string, PastedTextPresentation>>({});
+  const [pastedTextDraft, setPastedTextDraft] = React.useState<PastedTextDraft | null>(null);
+  const [savingPastedText, setSavingPastedText] = React.useState(false);
+  const [pastedTextError, setPastedTextError] = React.useState("");
   const [uploadError, setUploadError] = React.useState("");
   const [fileDragActive, setFileDragActive] = React.useState(false);
   const [createImageMode, setCreateImageMode] = React.useState(false);
@@ -121,6 +165,7 @@ export function Composer({
   const fileDragDepthRef = React.useRef(0);
   const editorRef = React.useRef<PromptEditorHandle>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const pastedTextCountRef = React.useRef(0);
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[] } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
@@ -190,6 +235,11 @@ export function Composer({
     );
     return () => window.clearInterval(interval);
   }, [client, contextSessionId, refreshContextStats, streaming]);
+  React.useEffect(() => {
+    setPastedTextPresentations((current) => (
+      prunePastedTextPresentations(current, attachments, queuedFollowUps)
+    ));
+  }, [attachments, queuedFollowUps]);
   const onMentionSelected = React.useCallback((item: { id: string; value: string; label: string }) => {
     if (!item.id.startsWith("file:")) return;
     const reference: AttachmentInput = {
@@ -224,9 +274,15 @@ export function Composer({
     window.requestAnimationFrame(() => editorRef.current?.insertText(pending));
   }, []);
   const composerModels = React.useMemo(
-    () => config.providers.flatMap((provider) => provider.models.map((item) => ({ id: item.id, label: item.name ?? item.id }))).filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index),
+    () => config.providers.flatMap((provider) => provider.models.map((item) => ({ id: item.id, label: item.name ?? item.id, capabilities: item.capabilities }))).filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index),
     [config.providers],
   );
+  const selectedComposerModel = composerModels.find((item) => item.id === model);
+  const reasoningLevels = React.useMemo(() => reasoningLevelsForModel(selectedComposerModel), [selectedComposerModel]);
+
+  React.useEffect(() => {
+    if (!reasoningLevels.includes(reasoning)) onReasoningChange(reasoningLevels[0] ?? "off");
+  }, [onReasoningChange, reasoning, reasoningLevels]);
 
   const editQueuedFollowUp = React.useCallback((followUp: QueuedFollowUp) => {
     if (savingQueuedEdit || editingFollowUp) return;
@@ -407,13 +463,20 @@ export function Composer({
     }
   }, [activeTask, attachments, client, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
 
-  const addFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
+  const addFiles = React.useCallback(async (files: FileList | readonly File[] | null, options: { pastedText?: string; pastedTextMode?: Exclude<PastedTextMode, "native"> } = {}) => {
     if (!files?.length) return;
     setUploadError("");
     try {
       const selected = Array.from(files);
       if (attachments.length + pendingUploads.length + selected.length > 100) throw new Error("Attach no more than 100 files to one message.");
-      const queued = selected.map((file): PendingFileUpload => ({ id: globalThis.crypto.randomUUID(), file, uploadedBytes: 0, ratio: 0, state: "uploading" }));
+      const queued = selected.map((file, index): PendingFileUpload => ({
+        id: globalThis.crypto.randomUUID(),
+        file,
+        uploadedBytes: 0,
+        ratio: 0,
+        state: "uploading",
+        ...(index === 0 && options.pastedText ? { pastedText: options.pastedText, pastedTextMode: options.pastedTextMode } : {}),
+      }));
       setPendingUploads((current) => [...current, ...queued]);
       await mapWithConcurrency(queued, 2, async (pending) => {
         try {
@@ -429,9 +492,20 @@ export function Composer({
                 mediaType: stored.mediaType,
                 size: stored.size,
                 sourceKind: "object-storage",
+                previewUrl: stored.previewUrl,
               } satisfies AttachmentInput;
             })
             : await fileToAttachment(pending.file);
+          if (pending.pastedText && pending.pastedTextMode && attachment.id) {
+            setPastedTextPresentations((current) => ({
+              ...current,
+              [attachment.id!]: {
+                text: pending.pastedText!,
+                title: pastedTextTitle(pending.pastedText!),
+                mode: pending.pastedTextMode!,
+              },
+            }));
+          }
           setAttachments((current) => [...current, attachment].slice(0, 100));
           setPendingUploads((current) => current.filter((item) => item.id !== pending.id));
           return attachment;
@@ -450,12 +524,75 @@ export function Composer({
 
   const handlePaste = React.useCallback((event: ClipboardEvent) => {
     const files = filesFromDataTransfer(event.clipboardData);
-    if (files.length === 0) return false;
+    if (files.length > 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      void addFiles(files);
+      return true;
+    }
+    const pastedText = event.clipboardData?.getData("text/plain") ?? "";
+    const pastedMode = pastedTextMode(pastedText);
+    if (pastedMode === "native") return false;
     event.preventDefault();
     event.stopPropagation();
-    void addFiles(files);
+    pastedTextCountRef.current += 1;
+    const count = pastedTextCountRef.current;
+    const name = count === 1 ? "Pasted text.txt" : `Pasted text (${count}).txt`;
+    void addFiles([new File([pastedText], name, { type: "text/plain" })], { pastedText, pastedTextMode: pastedMode });
     return true;
   }, [addFiles]);
+
+  const showPastedTextInEditor = React.useCallback((attachmentId: string) => {
+    const presentation = pastedTextPresentations[attachmentId];
+    if (!presentation || presentation.mode !== "inline") return;
+    setAttachments((current) => current.filter((attachment) => attachment.id !== attachmentId));
+    setPastedTextPresentations((current) => {
+      const next = { ...current };
+      delete next[attachmentId];
+      return next;
+    });
+    editorRef.current?.insertText(presentation.text);
+  }, [pastedTextPresentations]);
+
+  const savePastedTextDraft = React.useCallback(async () => {
+    if (!pastedTextDraft) return;
+    setSavingPastedText(true);
+    setPastedTextError("");
+    try {
+      const file = new File([pastedTextDraft.text], pastedTextDraft.name, { type: "text/plain" });
+      const replacement: AttachmentInput = client
+        ? await client.uploadFile(file, {
+          ...(activeTask ? { taskId: activeTask.id, ...(activeTask.activeSessionId ? { sessionId: activeTask.activeSessionId } : {}) } : {}),
+        }).then((stored) => ({
+          id: stored.id,
+          fileId: stored.id,
+          name: stored.name,
+          mediaType: stored.mediaType,
+          size: stored.size,
+          sourceKind: "object-storage",
+          previewUrl: stored.previewUrl,
+        }))
+        : await fileToAttachment(file);
+      setAttachments((current) => current.map((attachment) => attachment.id === pastedTextDraft.attachmentId ? replacement : attachment));
+      setPastedTextPresentations((current) => {
+        const next = { ...current };
+        delete next[pastedTextDraft.attachmentId];
+        if (replacement.id) {
+          next[replacement.id] = {
+            text: pastedTextDraft.text,
+            title: pastedTextTitle(pastedTextDraft.text),
+            mode: pastedTextDraft.text.length <= PASTED_TEXT_INLINE_LIMIT ? "inline" : "file",
+          };
+        }
+        return next;
+      });
+      setPastedTextDraft(null);
+    } catch (cause) {
+      setPastedTextError(cause instanceof Error ? cause.message : "Unable to save pasted text");
+    } finally {
+      setSavingPastedText(false);
+    }
+  }, [activeTask, client, pastedTextDraft]);
 
   const handleDragEnter = React.useCallback<React.DragEventHandler<HTMLDivElement>>((event) => {
     if (!hasFilePayload(event.dataTransfer)) return;
@@ -486,7 +623,24 @@ export function Composer({
     void addFiles(filesFromDataTransfer(event.dataTransfer));
   }, [addFiles]);
 
+  const removeAttachment = React.useCallback((attachment: AttachmentInput, index: number) => {
+    setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index));
+    if (!attachment.id) return;
+    setPastedTextPresentations((current) => {
+      const next = { ...current };
+      delete next[attachment.id!];
+      return next;
+    });
+  }, []);
+
+  const openPastedTextFile = React.useCallback((attachment: AttachmentInput, presentation: PastedTextPresentation) => {
+    if (!attachment.id || presentation.mode !== "file") return;
+    setPastedTextError("");
+    setPastedTextDraft({ attachmentId: attachment.id, name: attachment.name, ...presentation });
+  }, []);
+
   return (
+    <>
     <div className={variant === "thread" ? "berry-thread-composer-wrap mx-auto max-w-full pb-5" : "w-full"}>
       <BerryComposerFrame
         variant={variant}
@@ -550,7 +704,7 @@ export function Composer({
         {attachments.length > 0 || pendingUploads.length > 0 ? (
           <AttachmentGroup className="px-3 pt-2">
             {pendingUploads.map((upload) => (
-              <Attachment size="sm" state={upload.state} style={{ width: 280, maxWidth: "100%" }} className="flex-nowrap rounded-[22px] border-0 bg-card shadow-[var(--berry-ring-subtle)]" key={upload.id}>
+              <Attachment size="sm" state={upload.state} className="max-w-[360px] flex-nowrap rounded-[22px] border-0 bg-card shadow-[var(--berry-ring-subtle)]" key={upload.id}>
                 <AttachmentMedia className="!w-10 rounded-full bg-transparent">
                   {upload.state === "error" ? <FileTypeIcon path={upload.file.name} className="size-10" /> : null}
                   {upload.state === "uploading" ? <UploadProgressRing ratio={upload.ratio} /> : null}
@@ -562,15 +716,20 @@ export function Composer({
                 {upload.state === "error" ? <AttachmentActions><AttachmentAction aria-label={`Remove ${upload.file.name}`} onClick={() => setPendingUploads((current) => current.filter((item) => item.id !== upload.id))}>×</AttachmentAction></AttachmentActions> : null}
               </Attachment>
             ))}
-            {attachments.map((attachment, index) => (
-              <Attachment size="sm" style={{ width: 280, maxWidth: "100%" }} className="flex-nowrap rounded-[22px] border-0 bg-card shadow-[var(--berry-ring-subtle)]" key={attachment.id ?? `${attachment.name}-${index}`}>
-                <AttachmentMedia className="!w-10 rounded-full bg-transparent">
-                  <FileTypeIcon path={attachment.name} className="size-10" />
-                </AttachmentMedia>
-                <AttachmentContent><AttachmentTitle>{attachment.name}</AttachmentTitle><AttachmentDescription>{formatFileSize(attachment.size)}</AttachmentDescription></AttachmentContent>
-                <AttachmentActions><AttachmentAction aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}>×</AttachmentAction></AttachmentActions>
-              </Attachment>
-            ))}
+            {attachments.map((attachment, index) => {
+              const presentation = attachment.id ? pastedTextPresentations[attachment.id] : undefined;
+              return (
+                <React.Suspense key={attachment.id ?? `${attachment.name}-${index}`} fallback={null}>
+                  <ComposerAttachmentPill
+                    attachment={attachment}
+                    presentation={presentation}
+                    onRemove={() => removeAttachment(attachment, index)}
+                    onShowInline={() => { if (attachment.id) showPastedTextInEditor(attachment.id); }}
+                    onOpenFile={() => { if (presentation) openPastedTextFile(attachment, presentation); }}
+                  />
+                </React.Suspense>
+              );
+            })}
           </AttachmentGroup>
         ) : null}
         <div className="berry-composer-editor relative flex-1">
@@ -590,8 +749,8 @@ export function Composer({
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem className="berry-create-image-menu-item" onClick={enableCreateImageMode}><ImagePlus /><strong className="berry-create-image-menu-label">Create image</strong></DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           <span className="min-w-0 flex-1" />
           {contextSessionId ? <ContextWindowRing stats={contextStats} /> : null}
-          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{composerModels.find((item) => item.id === model)?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => onModelChange(item.id)}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
-          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoning[0]!.toUpperCase() + reasoning.slice(1)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Reasoning</DropdownMenuLabel>{(["off", "low", "medium", "high"] as const).map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span className="capitalize">{level}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
+          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{selectedComposerModel?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => { onModelChange(item.id); const nextLevels = reasoningLevelsForModel(item); if (!nextLevels.includes(reasoning)) onReasoningChange(nextLevels[0] ?? "off"); }}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
+          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoningLabel(reasoning)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Reasoning for {selectedComposerModel?.label ?? "model"}</DropdownMenuLabel>{reasoningLevels.map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span>{reasoningLabel(level)}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           {working && !editingFollowUp ? (
             <Button
               size="icon-lg"
@@ -619,6 +778,20 @@ export function Composer({
       </BerryComposerFrame>
       {uploadError ? <p className="composer-error" role="alert">{uploadError}</p> : null}
     </div>
+    {pastedTextDraft ? (
+      <React.Suspense fallback={null}>
+        <PastedTextEditorDialog
+          name={pastedTextDraft.name}
+          text={pastedTextDraft.text}
+          saving={savingPastedText}
+          error={pastedTextError}
+          onTextChange={(next) => setPastedTextDraft((current) => current ? { ...current, text: next } : current)}
+          onClose={() => setPastedTextDraft(null)}
+          onSave={() => void savePastedTextDraft()}
+        />
+      </React.Suspense>
+    ) : null}
+    </>
   );
 }
 
@@ -629,6 +802,32 @@ function personalizationRuntimeContext(profile: PersonalizationProfile): string 
     profile.about.trim() ? `About: ${profile.about.trim()}` : "",
     profile.customInstructions.trim() ? `Custom instructions: ${profile.customInstructions.trim()}` : "",
   ].filter(Boolean).join("\n");
+}
+
+export function pastedTextMode(text: string): PastedTextMode {
+  if (text.length < PASTED_TEXT_ATTACHMENT_THRESHOLD) return "native";
+  return text.length <= PASTED_TEXT_INLINE_LIMIT ? "inline" : "file";
+}
+
+function pastedTextTitle(text: string): string {
+  const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "Pasted text";
+  return firstLine.replace(/\s+/g, " ").slice(0, 120);
+}
+
+export function reasoningLevelsForModel(model: {
+  id: string;
+  label?: string | undefined;
+  capabilities?: { reasoning?: boolean | undefined; reasoningEfforts?: ReasoningLevel[] | undefined } | undefined;
+} | undefined): ReasoningLevel[] {
+  if (!model) return ["off", "low", "medium", "high"];
+  if (model.capabilities?.reasoningEfforts?.length) return [...model.capabilities.reasoningEfforts];
+  if (model.capabilities?.reasoning === false) return ["off"];
+  if (/glm[-_. ]?5(?:\.2|[-_.]?2)/i.test(`${model.id} ${model.label ?? ""}`)) return ["high", "xhigh"];
+  return ["off", "low", "medium", "high"];
+}
+
+function reasoningLabel(level: ReasoningLevel): string {
+  return level === "xhigh" ? "Extra high" : level[0]!.toUpperCase() + level.slice(1);
 }
 
 function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
@@ -667,7 +866,7 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
             />
           </button>
         </TooltipTrigger>
-        <TooltipContent side="top" className="berry-context-tooltip">
+        <TooltipContent side="top" className="berry-context-tooltip" showArrow={false}>
           <div className="berry-context-tooltip-content">
             {stats && usedPercent !== null ? (
               <>

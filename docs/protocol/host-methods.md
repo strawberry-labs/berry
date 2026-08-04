@@ -8686,6 +8686,20 @@ Result:
                     "reasoning": {
                       "type": "boolean"
                     },
+                    "reasoningEfforts": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "off",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh"
+                        ]
+                      },
+                      "minItems": 1
+                    },
                     "json": {
                       "type": "boolean"
                     },
@@ -9417,6 +9431,20 @@ Result:
                     "reasoning": {
                       "type": "boolean"
                     },
+                    "reasoningEfforts": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "off",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh"
+                        ]
+                      },
+                      "minItems": 1
+                    },
                     "json": {
                       "type": "boolean"
                     },
@@ -9719,6 +9747,20 @@ Result:
               },
               "reasoning": {
                 "type": "boolean"
+              },
+              "reasoningEfforts": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh"
+                  ]
+                },
+                "minItems": 1
               },
               "json": {
                 "type": "boolean"
@@ -10034,6 +10076,20 @@ Result:
                   },
                   "reasoning": {
                     "type": "boolean"
+                  },
+                  "reasoningEfforts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "off",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh"
+                      ]
+                    },
+                    "minItems": 1
                   },
                   "json": {
                     "type": "boolean"
@@ -17221,6 +17277,12 @@ Params:
                 "minimum": 0
               },
               "dataUrl": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "previewUrl": {
                 "type": [
                   "string",
                   "null"

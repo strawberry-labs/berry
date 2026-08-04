@@ -7,6 +7,8 @@ build/
 coverage/
 *.tsbuildinfo
 .expo/
+__pycache__/
+*.py[cod]
 
 # Rust/Tauri output
 target/
@@ -48,3 +50,7 @@ apps/desktop/playwright-report/
 # Sidecar build output
 apps/desktop/src-tauri/binaries/
 artifacts/
+
+# Local generated review reports and PDF QA intermediates
+output/pdf/
+tmp/pdfs/

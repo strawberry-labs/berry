@@ -316,6 +316,14 @@ describe("mobile companion schemas", () => {
 });
 
 describe("model capability metadata", () => {
+  it("keeps model-specific reasoning efforts including extra high", () => {
+    const model = RemoteModelSchema.parse({
+      id: "glm-5.2",
+      capabilities: { reasoning: true, reasoningEfforts: ["high", "xhigh"] },
+    });
+    expect(resolveModelCapabilities(model).reasoningEfforts).toEqual(["high", "xhigh"]);
+  });
+
   it("validates context and cost hints and resolves manual overrides first", () => {
     const model = RemoteModelSchema.parse({
       id: "test-model",

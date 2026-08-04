@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -270,7 +270,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   React.useEffect(() => {
     const storedReasoning = window.localStorage.getItem("berry.web.reasoning");
     const storedModel = window.localStorage.getItem("berry.web.model");
-    if (storedReasoning === "off" || storedReasoning === "low" || storedReasoning === "medium" || storedReasoning === "high") setReasoning(storedReasoning);
+    if (storedReasoning === "off" || storedReasoning === "low" || storedReasoning === "medium" || storedReasoning === "high" || storedReasoning === "xhigh") setReasoning(storedReasoning);
     if (storedModel) setModel(storedModel);
   }, []);
   const updateReasoning = React.useCallback((next: ReasoningLevel) => { setReasoning(next); window.localStorage.setItem("berry.web.reasoning", next); }, []);
@@ -566,7 +566,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (catalogResult.status === "fulfilled" && catalogResult.value) {
           const catalog = catalogResult.value;
           setProviderId(catalog.providerId);
-          setModelOptions(catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id })));
+          setModelOptions(catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id, capabilities: resolveModelCapabilities(item) })));
           setModel((current) => catalog.models.some((item) => item.id === current) ? current : catalog.defaultModel);
           setConfig((current) => WebConfigSchema.parse({
             ...current,
@@ -575,7 +575,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               name: catalog.name,
               kind: "berry-router",
               defaultModel: catalog.defaultModel,
-              models: catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id })),
+              models: catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id, capabilities: resolveModelCapabilities(item) })),
               enabled: true,
             }],
             skills: catalog.skills,
@@ -1222,6 +1222,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     toast.message(`Reveal in Finder is available in the desktop app for ${workspace.name}.`);
   }, []);
 
+  const uploadToProject = React.useCallback(async (workspace: Workspace, file: File, onProgress: (ratio: number) => void) => {
+    if (!client) throw new Error("Project uploads require a connected Berry deployment.");
+    await client.uploadFile(file, {
+      workspaceId: workspace.id,
+      workspaceVisibility: "project",
+      onProgress: ({ ratio }) => onProgress(ratio),
+    });
+  }, [client]);
+
   const restoreTask = React.useCallback(async (task: Task) => {
     const previous = task;
     setTasks((current) => current.map((item) => item.id === task.id ? { ...item, deletedAt: null } : item));
@@ -1796,6 +1805,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             onArchiveProjectChats={archiveProjectChats}
             onRemoveProject={removeProject}
             onRevealProject={revealProject}
+            onUploadToProject={uploadToProject}
             onSelectChats={() => {
               if (generalWorkspace) setActiveWorkspaceId(generalWorkspace.id);
               navigateHome();

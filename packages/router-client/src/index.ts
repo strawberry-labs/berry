@@ -133,7 +133,7 @@ export interface ChatCompletionOptions {
   messages: ChatMessage[];
   tools?: ChatToolDefinition[];
   toolChoice?: ChatToolChoice;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high";
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;

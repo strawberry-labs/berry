@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generated": "2026-07-24",
+  "generated": "2026-08-04",
   "sources": [
     {
       "path": "templates/AESG_Letterhead_Dubai.docx",
@@ -16,6 +16,31 @@
       "path": "templates/AESG_Presentation_16x9.pptx",
       "sha256": "bf91eb1b7525a48c240d7899f6d4f7adec23da119c83d21caff2575b467ea327",
       "purpose": "Retained standard 16:9 slide master, layouts, artwork, and layout library"
+    },
+    {
+      "path": "../../cv-creator/assets/templates/v3/aesg_cv_portrait_v3.docx",
+      "sha256": "eefcaa7a99d47aa3cbdd2e33d31ad056a7f83abc96cf73dd43ba7f7c48e975d8",
+      "purpose": "Sanitized AESG V3 portrait CV DOCX template with organization-only author metadata"
+    },
+    {
+      "path": "../../cv-creator/assets/templates/v3/aesg_cv_landscape_v3.docx",
+      "sha256": "e37e649acba2a927f83a1deb8b2979326a61ab181a694fafc8d4e67585b08724",
+      "purpose": "Sanitized AESG V3 landscape CV DOCX template with organization-only author metadata"
+    },
+    {
+      "path": "../../cv-creator/assets/templates/v3/aesg_cv_portrait_v3.pptx",
+      "sha256": "bd80f65ef6f3b811e753f13f95b926995f7ca22916903d73fee8ef94a0ca0610",
+      "purpose": "Sanitized AESG V3 portrait CV PPTX template with organization-only author metadata"
+    },
+    {
+      "path": "../../cv-creator/assets/templates/v3/aesg_cv_landscape_v3.pptx",
+      "sha256": "88817b104c5695d7f06b683523ee376817df447ff07eb5e3ab08427164468088",
+      "purpose": "Sanitized AESG V3 landscape CV PPTX template with organization-only author metadata"
+    },
+    {
+      "path": "../../cv-creator/assets/templates/v3/aesg_logo_white.png",
+      "sha256": "9d328232b37a02cee0974993f6c316f4b7fd5967a95d42b6d1fb39c78a3b7251",
+      "purpose": "Approved white AESG logo used by the CV templates and renderers"
     },
     {
       "path": "extracted/aesg-logo-primary.jpg",

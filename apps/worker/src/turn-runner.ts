@@ -1786,8 +1786,8 @@ function longestMarkerPrefixSuffix(value: string, marker: string): number {
   return 0;
 }
 
-function reasoningEffort(value: unknown): "minimal" | "low" | "medium" | "high" | undefined {
-  return value === "minimal" || value === "low" || value === "medium" || value === "high"
+function reasoningEffort(value: unknown): "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh"
     ? value
     : undefined;
 }

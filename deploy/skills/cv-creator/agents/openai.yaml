@@ -1,0 +1,4 @@
+interface:
+  display_name: "CV Creator"
+  short_description: "Create four AESG CV files from structured data"
+  default_prompt: "Use $cv-creator to create the four standard AESG CV files from my supplied CV or profile details."

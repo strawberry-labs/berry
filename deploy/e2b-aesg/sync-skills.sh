@@ -82,6 +82,7 @@ SQL
 }
 
 sync_skill "aesg-branding" "AESG branding" "AESG brand authority, retained templates, assets, and artifact QA"
+sync_skill "cv-creator" "CV Creator" "Create four AESG CV files from structured data and a profile photo"
 sync_skill "docx" "AESG Word documents" "Fast AESG DOCX generation and editing"
 sync_skill "pdf" "AESG PDF documents" "Fast AESG PDF generation, editing, and validation"
 sync_skill "xlsx" "AESG Excel workbooks" "Fast AESG XLSX generation, formulas, charts, and validation"

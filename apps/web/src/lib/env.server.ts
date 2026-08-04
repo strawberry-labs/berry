@@ -543,8 +543,8 @@ const DEFAULT_CONFIG: WebConfig = {
       kind: "router",
       defaultModel: "kimi-2.6",
       models: [
-        { id: "kimi-2.6", name: "Kimi 2.6" },
-        { id: "glm-5.2", name: "GLM 5.2" },
+        { id: "kimi-2.6", name: "Kimi 2.6", capabilities: { reasoning: true } },
+        { id: "glm-5.2", name: "GLM 5.2", capabilities: { reasoning: true, reasoningEfforts: ["high", "xhigh"] } },
       ],
       enabled: true,
     },

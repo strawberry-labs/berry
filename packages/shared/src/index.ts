@@ -1014,7 +1014,7 @@ export const ApprovalDecisionSchema = z.object({
 });
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
 
-export const ReasoningLevelSchema = z.enum(["off", "low", "medium", "high"]);
+export const ReasoningLevelSchema = z.enum(["off", "low", "medium", "high", "xhigh"]);
 export type ReasoningLevel = z.infer<typeof ReasoningLevelSchema>;
 
 export const TerminalSessionSchema = z.object({
@@ -1087,6 +1087,7 @@ export const ModelCapabilitiesSchema = z.object({
   tools: z.boolean().optional(),
   vision: z.boolean().optional(),
   reasoning: z.boolean().optional(),
+  reasoningEfforts: z.array(ReasoningLevelSchema).min(1).optional(),
   json: z.boolean().optional(),
   context: ModelContextHintsSchema.optional(),
   cost: ModelCostHintsSchema.optional(),
@@ -2492,6 +2493,7 @@ export const AttachmentInputSchema = z.object({
   mediaType: z.string(),
   size: z.number().int().nonnegative(),
   dataUrl: z.string().nullable().optional(),
+  previewUrl: z.string().nullable().optional(),
   textContent: z.string().nullable().optional(),
   localPath: z.string().nullable().optional(),
   sourceKind: z.string().nullable().optional(),

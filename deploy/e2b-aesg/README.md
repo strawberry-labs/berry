@@ -1,9 +1,13 @@
 # AESG artifact sandbox
 
 This is the reproducible E2B image used by the AESG Berry deployment. It
-contains the five managed skills under `deploy/skills`, retained sanitized
+contains the six managed skills under `deploy/skills`, retained sanitized
 templates, deterministic generators, Office/PDF renderers, and exact licensed
 Verdana files supplied at build time.
+
+For the complete create-from-scratch, modification, deployment, and rollback
+workflow, read
+[the AESG artifact skills runbook](../../docs/aesg-artifact-skills-runbook.md).
 
 `build.ts` creates an ignored, minimal `.build-context` containing only those
 skills, the dependency lock, and the four font files. The E2B uploader never
@@ -45,4 +49,4 @@ deploy/e2b-aesg/node_modules/.bin/tsx deploy/e2b-aesg/build.ts
 
 The alias must be a new version. Never overwrite the active production alias.
 Run `smoke.ts` against the returned template ID before changing
-`E2B_TEMPLATE`.
+`BERRY_E2B_TEMPLATE_ID`.
