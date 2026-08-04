@@ -9,6 +9,7 @@ import {
   numeric,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -1284,6 +1285,18 @@ export const allowanceDefaultAssignments = pgTable("allowance_default_assignment
   departmentId: uuid("department_id").references(() => departments.id, { onDelete: "cascade" }), priority: integer("priority").notNull().default(0), createdAt, updatedAt,
 }, (table) => [uniqueIndex("allowance_defaults_tenant_role_department_unique").on(table.tenantId, table.role, table.departmentId)]);
 
+export const allowanceMemberOverrides = pgTable("allowance_member_overrides", {
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  amountMicros: numeric("amount_micros", { precision: 20, scale: 0 }).notNull(),
+  updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  primaryKey({ columns: [table.tenantId, table.userId] }),
+  index("allowance_member_overrides_tenant_idx").on(table.tenantId),
+]);
+
 export const allowanceBulkOperations = pgTable("allowance_bulk_operations", {
   id: uuid("id").primaryKey().defaultRandom(), tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   idempotencyKey: text("idempotency_key").notNull(), result: jsonObject("result"), createdAt,
@@ -1447,7 +1460,7 @@ export const cloudSchema = {
   auditSettings,
   auditExportConfigs,
   mobileDevices,
-  allowanceProfiles, allowanceDefaultAssignments, allowanceBulkOperations, billingAutoRefillConfigs, savedAnalyticsViews, reportSchedules, reportRuns,
+  allowanceProfiles, allowanceDefaultAssignments, allowanceMemberOverrides, allowanceBulkOperations, billingAutoRefillConfigs, savedAnalyticsViews, reportSchedules, reportRuns,
   alertDestinations, alertRules, alertEvents, deliveryAttempts, executionNetworkPolicies, authenticationPolicies,
   dataGovernancePolicies, organizationProfiles, organizationDomains, serviceAccounts, platformRolloutRules, platformOperatorAuditEvents,
 };
@@ -3566,6 +3579,267 @@ CREATE POLICY allowance_adjustments_tenant_isolation ON allowance_adjustments
   WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+export const ALLOWANCE_BASE_HIERARCHY_MIGRATION = `
+ALTER TABLE allowance_default_assignments
+  DROP CONSTRAINT IF EXISTS allowance_default_assignments_check;
+
+CREATE TABLE IF NOT EXISTS allowance_member_overrides (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  amount_micros numeric(20, 0) NOT NULL CHECK (amount_micros > 0),
+  updated_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS allowance_member_overrides_tenant_idx
+  ON allowance_member_overrides (tenant_id);
+
+${tenantRlsSql("allowance_member_overrides")}
+
+INSERT INTO allowance_member_overrides (tenant_id, user_id, amount_micros)
+SELECT tenant_id, scope_id::uuid, hard_limit_micros
+FROM budget_limits
+WHERE scope_type = 'user'
+  AND period = 'month'
+  AND status = 'active'
+  AND hard_limit_micros > 0
+  AND scope_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+ON CONFLICT (tenant_id, user_id) DO NOTHING;
+
+INSERT INTO allowance_profiles (
+  tenant_id, name, description, period, soft_limit_micros,
+  hard_limit_micros, threshold_percentages, status
+)
+SELECT
+  id,
+  'Organization default allowance',
+  '$20 monthly base allowance for organization members',
+  'month',
+  16000000,
+  20000000,
+  '[80,100]'::jsonb,
+  'active'
+FROM tenants
+ON CONFLICT (tenant_id, name) DO NOTHING;
+
+INSERT INTO allowance_default_assignments (
+  tenant_id, profile_id, role, department_id, priority
+)
+SELECT p.tenant_id, p.id, NULL, NULL, 0
+FROM allowance_profiles p
+WHERE p.name = 'Organization default allowance'
+ON CONFLICT (tenant_id, role, department_id) DO UPDATE
+SET profile_id = COALESCE(allowance_default_assignments.profile_id, excluded.profile_id),
+    updated_at = now();
+
+CREATE OR REPLACE FUNCTION refresh_member_base_allowance(
+  p_tenant_id uuid,
+  p_user_id uuid
+) RETURNS void AS $$
+DECLARE
+  member_role text;
+  member_department_id uuid;
+  override_amount numeric(20, 0);
+  selected_profile allowance_profiles%ROWTYPE;
+BEGIN
+  SELECT
+    tm.role,
+    COALESCE(
+      (
+        SELECT dm.department_id
+        FROM department_memberships dm
+        WHERE dm.tenant_id = tm.tenant_id
+          AND dm.user_id = tm.user_id
+          AND dm.department_id = tm.primary_department_id
+        LIMIT 1
+      ),
+      (
+        SELECT dm.department_id
+        FROM department_memberships dm
+        WHERE dm.tenant_id = tm.tenant_id AND dm.user_id = tm.user_id
+        ORDER BY dm.created_at, dm.department_id
+        LIMIT 1
+      )
+    )
+  INTO member_role, member_department_id
+  FROM tenant_memberships tm
+  WHERE tm.tenant_id = p_tenant_id
+    AND tm.user_id = p_user_id
+    AND tm.status = 'active';
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO allowance_profiles (
+    tenant_id, name, description, period, soft_limit_micros,
+    hard_limit_micros, threshold_percentages, status
+  ) VALUES (
+    p_tenant_id,
+    'Organization default allowance',
+    '$20 monthly base allowance for organization members',
+    'month',
+    16000000,
+    20000000,
+    '[80,100]'::jsonb,
+    'active'
+  )
+  ON CONFLICT (tenant_id, name) DO NOTHING;
+
+  INSERT INTO allowance_default_assignments (
+    tenant_id, profile_id, role, department_id, priority
+  )
+  SELECT p_tenant_id, p.id, NULL, NULL, 0
+  FROM allowance_profiles p
+  WHERE p.tenant_id = p_tenant_id
+    AND p.name = 'Organization default allowance'
+  ON CONFLICT (tenant_id, role, department_id) DO UPDATE
+  SET profile_id = COALESCE(allowance_default_assignments.profile_id, excluded.profile_id),
+      updated_at = now();
+
+  SELECT amount_micros
+  INTO override_amount
+  FROM allowance_member_overrides
+  WHERE tenant_id = p_tenant_id AND user_id = p_user_id;
+
+  IF override_amount IS NOT NULL THEN
+    INSERT INTO budget_limits (
+      tenant_id, scope_type, scope_id, period, soft_limit_micros,
+      hard_limit_micros, request_limit, token_limit,
+      sandbox_minute_limit, threshold_percentages, status
+    ) VALUES (
+      p_tenant_id, 'user', p_user_id::text, 'month',
+      floor(override_amount * 0.8), override_amount,
+      NULL, NULL, NULL, '[80,100]'::jsonb, 'active'
+    )
+    ON CONFLICT (tenant_id, scope_type, scope_id, period) DO UPDATE
+    SET soft_limit_micros = excluded.soft_limit_micros,
+        hard_limit_micros = excluded.hard_limit_micros,
+        status = 'active',
+        updated_at = now();
+    RETURN;
+  END IF;
+
+  SELECT p.*
+  INTO selected_profile
+  FROM allowance_default_assignments d
+  JOIN allowance_profiles p
+    ON p.id = d.profile_id
+   AND p.tenant_id = d.tenant_id
+   AND p.status = 'active'
+   AND p.period = 'month'
+  WHERE d.tenant_id = p_tenant_id
+    AND (
+      (
+        member_department_id IS NOT NULL
+        AND d.department_id = member_department_id
+        AND (d.role IS NULL OR d.role = member_role)
+      )
+      OR (d.department_id IS NULL AND d.role = member_role)
+      OR (d.department_id IS NULL AND d.role IS NULL)
+    )
+  ORDER BY
+    CASE
+      WHEN d.department_id = member_department_id THEN 3
+      WHEN d.role = member_role THEN 2
+      ELSE 1
+    END DESC,
+    d.priority DESC,
+    d.updated_at DESC
+  LIMIT 1;
+
+  IF selected_profile.id IS NULL
+    OR selected_profile.hard_limit_micros IS NULL
+    OR selected_profile.hard_limit_micros <= 0 THEN
+    UPDATE budget_limits
+    SET status = 'disabled', updated_at = now()
+    WHERE tenant_id = p_tenant_id
+      AND scope_type = 'user'
+      AND scope_id = p_user_id::text
+      AND period = 'month';
+    RETURN;
+  END IF;
+
+  INSERT INTO budget_limits (
+    tenant_id, scope_type, scope_id, period, soft_limit_micros,
+    hard_limit_micros, request_limit, token_limit,
+    sandbox_minute_limit, threshold_percentages, status
+  ) VALUES (
+    p_tenant_id, 'user', p_user_id::text, selected_profile.period,
+    COALESCE(selected_profile.soft_limit_micros, floor(selected_profile.hard_limit_micros * 0.8)),
+    selected_profile.hard_limit_micros,
+    selected_profile.request_limit,
+    selected_profile.token_limit,
+    selected_profile.sandbox_minute_limit,
+    selected_profile.threshold_percentages,
+    'active'
+  )
+  ON CONFLICT (tenant_id, scope_type, scope_id, period) DO UPDATE
+  SET soft_limit_micros = excluded.soft_limit_micros,
+      hard_limit_micros = excluded.hard_limit_micros,
+      request_limit = excluded.request_limit,
+      token_limit = excluded.token_limit,
+      sandbox_minute_limit = excluded.sandbox_minute_limit,
+      threshold_percentages = excluded.threshold_percentages,
+      status = 'active',
+      updated_at = now();
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION apply_default_allowance_to_membership()
+RETURNS trigger AS $$
+BEGIN
+  PERFORM refresh_member_base_allowance(NEW.tenant_id, NEW.user_id);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tenant_membership_default_allowance ON tenant_memberships;
+CREATE TRIGGER tenant_membership_default_allowance
+AFTER INSERT OR UPDATE OF role, status, primary_department_id
+ON tenant_memberships
+FOR EACH ROW
+WHEN (NEW.status = 'active')
+EXECUTE FUNCTION apply_default_allowance_to_membership();
+
+CREATE OR REPLACE FUNCTION refresh_allowance_after_department_membership()
+RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM refresh_member_base_allowance(OLD.tenant_id, OLD.user_id);
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'UPDATE'
+    AND (OLD.tenant_id, OLD.user_id) IS DISTINCT FROM (NEW.tenant_id, NEW.user_id) THEN
+    PERFORM refresh_member_base_allowance(OLD.tenant_id, OLD.user_id);
+  END IF;
+  PERFORM refresh_member_base_allowance(NEW.tenant_id, NEW.user_id);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS department_membership_default_allowance ON department_memberships;
+CREATE TRIGGER department_membership_default_allowance
+AFTER INSERT OR UPDATE OR DELETE
+ON department_memberships
+FOR EACH ROW
+EXECUTE FUNCTION refresh_allowance_after_department_membership();
+
+DO $$
+DECLARE membership record;
+BEGIN
+  FOR membership IN
+    SELECT tenant_id, user_id
+    FROM tenant_memberships
+    WHERE status = 'active'
+  LOOP
+    PERFORM refresh_member_base_allowance(membership.tenant_id, membership.user_id);
+  END LOOP;
+END;
+$$;
+`.trim();
+
 export const ORGANIZATION_MODEL_PROVIDERS_MIGRATION = `
 CREATE TABLE IF NOT EXISTS organization_model_providers (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3719,4 +3993,5 @@ export const cloudMigrations = [
   { id: 37, name: "allowance_cycles_v1", sql: ALLOWANCE_CYCLES_MIGRATION },
   { id: 38, name: "organization_model_providers_v1", sql: ORGANIZATION_MODEL_PROVIDERS_MIGRATION },
   { id: 39, name: "organization_ai_access_rules_v1", sql: ORGANIZATION_AI_ACCESS_RULES_MIGRATION },
+  { id: 40, name: "allowance_base_hierarchy_v1", sql: ALLOWANCE_BASE_HIERARCHY_MIGRATION },
 ] as const;

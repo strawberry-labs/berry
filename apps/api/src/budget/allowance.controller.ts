@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, ForbiddenException, Get, Inject,
 import {
   AllowanceAdjustmentCreateSchema, AllowanceAdjustmentSchema, AllowanceBalanceSchema,
   AllowanceCycleSettingsSchema, AllowanceCycleSettingsUpsertSchema, AllowanceDefaultUpsertSchema, AllowanceProfileSchema, AllowanceProfileUpsertSchema, BlockedRequestPageSchema,
-  BulkLimitMutationSchema, BulkLimitResultSchema, EffectiveLimitSchema, OrgPermissionSchema, QuotaMetricSchema,
+  BulkLimitMutationSchema, BulkLimitResultSchema, EffectiveLimitSchema, MemberAllowanceBaseUpsertSchema, OrgPermissionSchema, QuotaMetricSchema,
   type OrgPermission,
 } from "@berry/shared";
 import { z } from "zod";
@@ -24,7 +24,7 @@ export class AllowanceController {
   @Put("/profiles/:id") async updateProfile(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Param("id") id:string,@Body() body:unknown){await this.require(req,tenantId,"budgets:write");const input=parse(AllowanceProfileUpsertSchema,body);const row=await this.allowances.upsertProfile(tenantId,id,{...input,status:input.status??"active"});await this.record(req,tenantId,"allowance-profile-upserted",row.id,row);return AllowanceProfileSchema.parse(row);}
   @Get("/defaults") async defaults(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string){await this.require(req,tenantId,"budgets:read");return this.allowances.listDefaults(tenantId);}
   @Put("/defaults") async setDefault(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Body() body:unknown){await this.require(req,tenantId,"budgets:write");const input=parse(AllowanceDefaultUpsertSchema,body);const row=await this.allowances.upsertDefault(tenantId,input);await this.record(req,tenantId,"allowance-default-upserted",row.id,row);return row;}
-  @Post("/limits/bulk") async bulk(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Body() body:unknown){await this.require(req,tenantId,"budgets:write");const input=parse(BulkLimitMutationSchema,body);const result=BulkLimitResultSchema.parse(await this.allowances.bulk(tenantId,input));if(!input.dryRun)await this.record(req,tenantId,"allowance-bulk-applied",input.idempotencyKey,result);return result;}
+  @Post("/limits/bulk") async bulk(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Body() body:unknown){await this.require(req,tenantId,"budgets:write");const input=parse(BulkLimitMutationSchema,body);const result=BulkLimitResultSchema.parse(await this.allowances.bulk(tenantId,input,req.auth!.user.id));if(!input.dryRun)await this.record(req,tenantId,"allowance-bulk-applied",input.idempotencyKey,result);return result;}
   @Post("/limits/import") async importCsv(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Body() body:unknown){return this.bulk(req,tenantId,body);}
   @Get("/limits/export.csv") async exportCsv(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string){await this.require(req,tenantId,"budgets:read");const rows=await this.allowances.listProfiles(tenantId);return ["name,period,soft_limit_micros,hard_limit_micros,request_limit,token_limit,sandbox_minute_limit,status",...rows.map((row)=>[row.name,row.period,row.softLimitMicros??"",row.hardLimitMicros??"",row.requestLimit??"",row.tokenLimit??"",row.sandboxMinuteLimit??"",row.status].join(","))].join("\n");}
   @Get("/effective/:userId") async effective(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Param("userId") userId:string,@Query() query:unknown){await this.require(req,tenantId,"budgets:read");const parsed=parse(EffectiveQuerySchema,query);const member=await this.identity.getMembership(tenantId,userId);if(!member)throw new BadRequestException("Member not found");return EffectiveLimitSchema.parse(await this.allowances.effective(tenantId,userId,member.departmentIds,parsed.metric,parsed.period));}
@@ -50,6 +50,15 @@ export class AllowanceController {
     await this.require(req,tenantId,"budgets:read");
     const member=await this.identity.getMembership(tenantId,userId);if(!member)throw new BadRequestException("Member not found");
     return AllowanceBalanceSchema.parse({...await this.allowances.balance(tenantId,userId),userName:member.name||null,userEmail:member.email});
+  }
+  @Put("/members/:userId/base") async updateMemberBase(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string,@Param("userId") userId:string,@Body() body:unknown){
+    await this.require(req,tenantId,"budgets:write");
+    const member=await this.identity.getMembership(tenantId,userId);if(!member)throw new BadRequestException("Member not found");
+    const input=parse(MemberAllowanceBaseUpsertSchema,body);
+    const balance=await this.allowances.setMemberBase(tenantId,userId,input.amountMicros,req.auth!.user.id);
+    const result=AllowanceBalanceSchema.parse({...balance,userName:member.name||null,userEmail:member.email});
+    await this.record(req,tenantId,"allowance-member-base-updated",userId,{amountMicros:input.amountMicros,balance:result});
+    return result;
   }
   @Get("/me") async myBalance(@Req() req:AuthenticatedRequest,@Param("tenantId") tenantId:string){
     await this.require(req,tenantId,"org:read");

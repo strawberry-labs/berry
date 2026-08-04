@@ -23,6 +23,7 @@ import {
   AllowanceDefaultUpsertSchema,
   AllowanceProfileSchema,
   AllowanceProfileUpsertSchema,
+  MemberAllowanceBaseUpsertSchema,
   BlockedRequestPageSchema,
   BulkLimitMutationSchema,
   BulkLimitResultSchema,
@@ -128,6 +129,7 @@ import {
   type AllowanceDefaultUpsert,
   type AllowanceProfile,
   type AllowanceProfileUpsert,
+  type MemberAllowanceBaseUpsert,
   type BlockedRequestPage,
   type BulkLimitMutation,
   type BulkLimitResult,
@@ -1116,6 +1118,11 @@ export class BerryApiClient {
 
   async allowanceBalance(tenantId: string, userId: string): Promise<AllowanceBalance> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/balance/${encodeURIComponent(userId)}`, AllowanceBalanceSchema);
+  }
+
+  async updateMemberAllowanceBase(tenantId: string, userId: string, input: MemberAllowanceBaseUpsert): Promise<AllowanceBalance> {
+    MemberAllowanceBaseUpsertSchema.parse(input);
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/allowances/members/${encodeURIComponent(userId)}/base`, AllowanceBalanceSchema, { method: "PUT", body: input });
   }
 
   async myAllowanceBalance(tenantId: string): Promise<AllowanceBalance> {

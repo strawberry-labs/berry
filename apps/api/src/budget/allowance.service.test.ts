@@ -30,8 +30,8 @@ describe("allowance provisioning", () => {
     const input = { idempotencyKey: "bulk-key-123", reason: "Quarterly allocation", dryRun: false, items: [
       { scopeType: "user" as const, scopeId: "user_2", period: "month" as const, softLimitMicros: "900", hardLimitMicros: "1000", tokenLimit: 20000 },
     ] };
-    const first = await allowances.bulk(tenantId, input);
-    const repeated = await allowances.bulk(tenantId, { ...input, items: [{ ...input.items[0]!, hardLimitMicros: "9999" }] });
+    const first = await allowances.bulk(tenantId, input, userId);
+    const repeated = await allowances.bulk(tenantId, { ...input, items: [{ ...input.items[0]!, hardLimitMicros: "9999" }] }, userId);
     expect(first).toEqual(repeated);
     expect(first.results).toEqual([{ scopeType: "user", scopeId: "user_2", status: "applied", message: null }]);
     expect((await budgets.listLimits(tenantId)).find((limit) => limit.scopeId === "user_2")).toMatchObject({ hardLimitMicros: "1000", tokenLimit: 20000 });

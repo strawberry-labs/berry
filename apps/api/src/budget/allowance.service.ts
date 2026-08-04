@@ -46,11 +46,14 @@ export class AllowanceService {
   createAdjustment(tenantId: string, userId: string, amountMicros: string, reason: string, idempotencyKey: string, createdBy: string) {
     return this.budgets.createAllowanceAdjustment({ tenantId, userId, amountMicros, reason, idempotencyKey, createdBy });
   }
+  setMemberBase(tenantId: string, userId: string, amountMicros: string | null, updatedBy: string) {
+    return this.budgets.setMemberAllowanceBase(tenantId, userId, amountMicros, updatedBy);
+  }
   listAdjustments(tenantId: string, userId?: string) { return this.budgets.listAllowanceAdjustments(tenantId, userId); }
   balance(tenantId: string, userId: string) { return this.budgets.allowanceBalance(tenantId, userId); }
   balances(tenantId: string, userIds: string[]) { return this.budgets.allowanceBalances(tenantId, userIds); }
 
-  async bulk(tenantId: string, input: BulkLimitMutation): Promise<BulkLimitResult> {
+  async bulk(tenantId: string, input: BulkLimitMutation, updatedBy: string): Promise<BulkLimitResult> {
     const previous = await this.repository.claimBulk(tenantId, input.idempotencyKey);
     if (previous) return previous;
     const profiles = new Map((await this.repository.listProfiles(tenantId)).map((profile) => [profile.id, profile]));
@@ -68,6 +71,9 @@ export class AllowanceService {
         continue;
       }
       if (!input.dryRun) {
+        if (item.scopeType === "user" && item.period === "month" && hard !== null && BigInt(hard) > 0n) {
+          await this.budgets.setMemberAllowanceBase(tenantId, item.scopeId, hard, updatedBy);
+        }
         await this.budgets.upsertLimit({
           tenantId, scopeType: item.scopeType, scopeId: item.scopeId, period: item.period,
           softLimitMicros: soft ?? hard ?? "0", hardLimitMicros: hard ?? "0",
@@ -134,11 +140,17 @@ export class PostgresAllowanceRepository implements AllowanceRepository {
     const rows = await db.query<ProfileRow>(`INSERT INTO allowance_profiles (id,tenant_id,name,description,period,soft_limit_micros,hard_limit_micros,request_limit,token_limit,sandbox_minute_limit,threshold_percentages,status)
       VALUES (COALESCE($2::uuid,gen_random_uuid()),$1::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)
       ON CONFLICT (tenant_id,name) DO UPDATE SET description=excluded.description,period=excluded.period,soft_limit_micros=excluded.soft_limit_micros,hard_limit_micros=excluded.hard_limit_micros,request_limit=excluded.request_limit,token_limit=excluded.token_limit,sandbox_minute_limit=excluded.sandbox_minute_limit,threshold_percentages=excluded.threshold_percentages,status=excluded.status,updated_at=now() RETURNING *`,
-      [tenantId,id,input.name,input.description,input.period,input.softLimitMicros,input.hardLimitMicros,input.requestLimit,input.tokenLimit,input.sandboxMinuteLimit,JSON.stringify(input.thresholdPercentages),input.status]); return profileFromRow(rows[0]!);
+      [tenantId,id,input.name,input.description,input.period,input.softLimitMicros,input.hardLimitMicros,input.requestLimit,input.tokenLimit,input.sandboxMinuteLimit,JSON.stringify(input.thresholdPercentages),input.status]);
+    await refreshActiveMemberAllowances(db, tenantId);
+    return profileFromRow(rows[0]!);
   }); }
   listDefaults(tenantId: string) { return this.database.withTenant(tenantId, async (db) => (await db.query<DefaultRow>("SELECT * FROM allowance_default_assignments WHERE tenant_id=$1::uuid ORDER BY priority DESC", [tenantId])).map(defaultFromRow)); }
-  upsertDefault(tenantId: string, input: AllowanceDefaultInput) { return this.database.withTenant(tenantId, async (db) => { const rows = await db.query<DefaultRow>(`INSERT INTO allowance_default_assignments (tenant_id,profile_id,role,department_id,priority) VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5)
-    ON CONFLICT (tenant_id,role,department_id) DO UPDATE SET profile_id=excluded.profile_id,priority=excluded.priority,updated_at=now() RETURNING *`, [tenantId,input.profileId,input.role,input.departmentId,input.priority]); return defaultFromRow(rows[0]!); }); }
+  upsertDefault(tenantId: string, input: AllowanceDefaultInput) { return this.database.withTenant(tenantId, async (db) => {
+    const rows = await db.query<DefaultRow>(`INSERT INTO allowance_default_assignments (tenant_id,profile_id,role,department_id,priority) VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5)
+      ON CONFLICT (tenant_id,role,department_id) DO UPDATE SET profile_id=excluded.profile_id,priority=excluded.priority,updated_at=now() RETURNING *`, [tenantId,input.profileId,input.role,input.departmentId,input.priority]);
+    await refreshActiveMemberAllowances(db, tenantId);
+    return defaultFromRow(rows[0]!);
+  }); }
   claimBulk(tenantId: string, key: string, result?: BulkLimitResult) { return this.database.withTenant(tenantId, async (db) => {
     if (result) await db.execute("INSERT INTO allowance_bulk_operations (tenant_id,idempotency_key,result) VALUES ($1::uuid,$2,$3::jsonb) ON CONFLICT (tenant_id,idempotency_key) DO NOTHING", [tenantId,key,JSON.stringify(result)]);
     const rows = await db.query<{ result: unknown }>("SELECT result FROM allowance_bulk_operations WHERE tenant_id=$1::uuid AND idempotency_key=$2", [tenantId,key]); return rows[0] ? BulkLimitResultSchema.parse(rows[0].result) : null;
@@ -157,6 +169,7 @@ function decimalAdd(a:string,b:string){ return String(Number(a)+Number(b)); }
 function decimalSubtract(a:string,b:string){ return String(Number(a)-Number(b)); }
 function decimalMultiply(a:string,b:number){ return String(Number(a)*b); }
 function decimalMaxZero(a:string){ return String(Math.max(0,Number(a))); }
+async function refreshActiveMemberAllowances(db:SqlExecutor,tenantId:string){await db.execute("SELECT refresh_member_base_allowance($1::uuid,user_id) FROM tenant_memberships WHERE tenant_id=$1::uuid AND status='active'",[tenantId]);}
 async function usageFromDatabase(db:SqlExecutor,tenantId:string,userId:string,metric:QuotaMetric,period:"day"|"month") { const since=period==="day"?"date_trunc('day',now())":"date_trunc('month',now())"; if(metric==="cost"){ const rows=await db.query<{used:string;reserved:string}>(`SELECT COALESCE(sum(CASE WHEN status='reconciled' THEN actual_cost_micros ELSE 0 END),0)::text used,COALESCE(sum(CASE WHEN status='reserved' THEN reserved_micros ELSE 0 END),0)::text reserved FROM budget_reservations WHERE tenant_id=$1::uuid AND user_id=$2::uuid AND created_at>=${since}`,[tenantId,userId]); return rows[0]??{used:"0",reserved:"0"}; } const column=metric==="tokens"?"tokens_in + tokens_out":metric==="sandbox_minutes"?"COALESCE((sandbox_usage->>'minutes')::numeric,0)":"1"; const rows=await db.query<{used:string}>(`SELECT COALESCE(sum(${column}),0)::text used FROM usage_events WHERE tenant_id=$1::uuid AND user_id=$2::uuid AND ts>=${since}`,[tenantId,userId]); return {used:rows[0]?.used??"0",reserved:"0"}; }
 function profileFromRow(row:ProfileRow){return AllowanceProfileSchema.parse({id:row.id,tenantId:row.tenant_id,name:row.name,description:row.description,period:row.period,softLimitMicros:row.soft_limit_micros===null?null:String(row.soft_limit_micros),hardLimitMicros:row.hard_limit_micros===null?null:String(row.hard_limit_micros),requestLimit:row.request_limit,tokenLimit:row.token_limit,sandboxMinuteLimit:row.sandbox_minute_limit===null?null:Number(row.sandbox_minute_limit),thresholdPercentages:row.threshold_percentages,status:row.status,createdAt:iso(row.created_at),updatedAt:iso(row.updated_at)});}
 function defaultFromRow(row:DefaultRow){return AllowanceDefaultAssignmentSchema.parse({id:row.id,tenantId:row.tenant_id,profileId:row.profile_id,role:row.role,departmentId:row.department_id,priority:row.priority,createdAt:iso(row.created_at),updatedAt:iso(row.updated_at)});}

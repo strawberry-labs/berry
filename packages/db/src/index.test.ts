@@ -15,6 +15,7 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   APPEND_ONLY_SQL,
+  ALLOWANCE_BASE_HIERARCHY_MIGRATION,
   AUDIT_PLATFORM_MIGRATION,
   AUDIT_PLATFORM_TABLES,
   AUDIT_PLATFORM_TENANT_SCOPED_TABLES,
@@ -172,7 +173,17 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]);
+  });
+
+  it("adds inherited organization, department, and member base allowances", () => {
+    expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS allowance_member_overrides");
+    expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("Organization default allowance");
+    expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("20000000");
+    expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("refresh_member_base_allowance");
+    expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("department_membership_default_allowance");
+    expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("ALTER TABLE allowance_member_overrides ENABLE ROW LEVEL SECURITY");
+    expect(cloudMigrations.find((migration) => migration.id === 40)).toMatchObject({ id: 40, name: "allowance_base_hierarchy_v1" });
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {

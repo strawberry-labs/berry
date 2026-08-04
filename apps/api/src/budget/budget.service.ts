@@ -33,6 +33,12 @@ export type UserAllowanceSpend = {
   reservedMicros: string;
 };
 
+type AllowanceBaseAttribution = {
+  userId: string;
+  source: "organization" | "department" | "member" | "unlimited";
+  sourceId: string | null;
+};
+
 export type BudgetLimitInput = Omit<BudgetLimit, "id" | "updatedAt" | "requestLimit" | "tokenLimit" | "sandboxMinuteLimit" | "thresholdPercentages"> & {
   requestLimit?: number | null | undefined;
   tokenLimit?: number | null | undefined;
@@ -104,6 +110,16 @@ export interface BudgetRepository {
     cycleStart: string,
     cycleEnd: string,
   ): Promise<UserAllowanceSpend[]>;
+  setMemberAllowanceBase(
+    tenantId: string,
+    userId: string,
+    amountMicros: string | null,
+    updatedBy: string,
+  ): Promise<void>;
+  allowanceBaseAttributions(
+    tenantId: string,
+    userIds: string[],
+  ): Promise<AllowanceBaseAttribution[]>;
 }
 
 export interface BudgetHotCounters {
@@ -199,6 +215,24 @@ export class BudgetService {
     return this.options.repository.listAllowanceAdjustments(tenantId, userId);
   }
 
+  async setMemberAllowanceBase(
+    tenantId: string,
+    userId: string,
+    amountMicros: string | null,
+    updatedBy: string,
+  ): Promise<AllowanceBalance> {
+    if (amountMicros !== null && BigInt(amountMicros) <= 0n) {
+      throw new RangeError("Member allowance must be greater than zero");
+    }
+    await this.options.repository.setMemberAllowanceBase(
+      tenantId,
+      userId,
+      amountMicros,
+      updatedBy,
+    );
+    return this.allowanceBalance(tenantId, userId);
+  }
+
   async allowanceBalance(tenantId: string, userId: string): Promise<AllowanceBalance> {
     const balances = await this.allowanceBalances(tenantId, [userId]);
     return balances[0]!;
@@ -211,7 +245,7 @@ export class BudgetService {
     const window = allowanceCycleWindow(cycle);
     const cycleStart = window.start.toISOString();
     const cycleEnd = window.end.toISOString();
-    const [limits, adjustments, usageRows] = await Promise.all([
+    const [limits, adjustments, usageRows, attributions] = await Promise.all([
       this.listLimits(tenantId),
       this.listAllowanceAdjustments(tenantId),
       this.options.repository.currentUserSpendForUsers(
@@ -220,8 +254,10 @@ export class BudgetService {
         cycleStart,
         cycleEnd,
       ),
+      this.options.repository.allowanceBaseAttributions(tenantId, uniqueUserIds),
     ]);
     const usageByUser = new Map(usageRows.map((usage) => [usage.userId, usage]));
+    const attributionByUser = new Map(attributions.map((item) => [item.userId, item]));
     const adjustmentsByUser = new Map<string, bigint>();
     for (const adjustment of adjustments) {
       if (adjustment.cycleStart !== cycleStart || adjustment.cycleEnd !== cycleEnd) continue;
@@ -230,15 +266,27 @@ export class BudgetService {
         (adjustmentsByUser.get(adjustment.userId) ?? 0n) + BigInt(adjustment.amountMicros),
       );
     }
-    return uniqueUserIds.map((userId) => allowanceBalanceForUser({
-      tenantId,
-      userId,
-      cycleStart,
-      cycleEnd,
-      limits,
-      adjustment: adjustmentsByUser.get(userId) ?? 0n,
-      usage: usageByUser.get(userId) ?? { userId, usedMicros: "0", reservedMicros: "0" },
-    }));
+    return uniqueUserIds.map((userId) => {
+      const balance = allowanceBalanceForUser({
+        tenantId,
+        userId,
+        cycleStart,
+        cycleEnd,
+        limits,
+        adjustment: adjustmentsByUser.get(userId) ?? 0n,
+        usage: usageByUser.get(userId) ?? { userId, usedMicros: "0", reservedMicros: "0" },
+      });
+      const attribution = attributionByUser.get(userId);
+      return AllowanceBalanceSchema.parse({
+        ...balance,
+        baseSource: balance.baseLimitMicros === null
+          ? "unlimited"
+          : attribution?.source ?? "member",
+        baseSourceId: balance.baseLimitMicros === null
+          ? null
+          : attribution?.sourceId ?? userId,
+      });
+    });
   }
 }
 
@@ -285,6 +333,8 @@ function allowanceBalanceForUser(input: {
       reservedMicros: reserved.toString(),
       availableMicros: available?.toString() ?? null,
       status,
+      baseSource: base === null ? "unlimited" : "member",
+      baseSourceId: base === null ? null : input.userId,
     });
 }
 
@@ -371,6 +421,42 @@ export class InMemoryBudgetRepository implements BudgetRepository {
     const limit = BudgetLimitSchema.parse({ ...input, id: current?.id ?? randomUUID(), updatedAt: now });
     this.#limits.set(key, limit);
     return limit;
+  }
+
+  async setMemberAllowanceBase(
+    tenantId: string,
+    userId: string,
+    amountMicros: string | null,
+    _updatedBy: string,
+  ): Promise<void> {
+    const limitKey = `${tenantId}:user:${userId}:month`;
+    if (amountMicros === null) {
+      this.#limits.delete(limitKey);
+      return;
+    }
+    await this.upsertLimit({
+      tenantId,
+      scopeType: "user",
+      scopeId: userId,
+      period: "month",
+      softLimitMicros: (BigInt(amountMicros) * 8n / 10n).toString(),
+      hardLimitMicros: amountMicros,
+      status: "active",
+    });
+  }
+
+  async allowanceBaseAttributions(
+    tenantId: string,
+    userIds: string[],
+  ): Promise<AllowanceBaseAttribution[]> {
+    return userIds.map((userId) => {
+      const hasBase = this.#limits.has(`${tenantId}:user:${userId}:month`);
+      return {
+        userId,
+        source: hasBase ? "member" as const : "unlimited" as const,
+        sourceId: hasBase ? userId : null,
+      };
+    });
   }
 
   async getAllowanceCycle(tenantId: string): Promise<AllowanceCycleSettings> {
@@ -613,6 +699,125 @@ export class PostgresBudgetRepository implements BudgetRepository {
       [input.tenantId, input.scopeType, input.scopeId, input.period, input.softLimitMicros, input.hardLimitMicros, input.requestLimit ?? null, input.tokenLimit ?? null, input.sandboxMinuteLimit ?? null, JSON.stringify(input.thresholdPercentages ?? [80, 100]), input.status],
     ));
     return budgetLimitFromRow(rows[0]!);
+  }
+
+  setMemberAllowanceBase(
+    tenantId: string,
+    userId: string,
+    amountMicros: string | null,
+    updatedBy: string,
+  ): Promise<void> {
+    return this.database.withTenant(tenantId, async (executor) => {
+      if (amountMicros === null) {
+        await executor.execute(
+          "DELETE FROM allowance_member_overrides WHERE tenant_id = $1::uuid AND user_id = $2::uuid",
+          [tenantId, userId],
+        );
+      } else {
+        await executor.execute(
+          `INSERT INTO allowance_member_overrides (tenant_id, user_id, amount_micros, updated_by)
+           VALUES ($1::uuid, $2::uuid, $3, $4::uuid)
+           ON CONFLICT (tenant_id, user_id) DO UPDATE
+           SET amount_micros = excluded.amount_micros,
+               updated_by = excluded.updated_by,
+               updated_at = now()`,
+          [tenantId, userId, amountMicros, updatedBy],
+        );
+      }
+      await executor.execute(
+        "SELECT refresh_member_base_allowance($1::uuid, $2::uuid)",
+        [tenantId, userId],
+      );
+    });
+  }
+
+  allowanceBaseAttributions(
+    tenantId: string,
+    userIds: string[],
+  ): Promise<AllowanceBaseAttribution[]> {
+    if (userIds.length === 0) return Promise.resolve([]);
+    return this.database.withTenant(tenantId, async (executor) => {
+      const rows = await executor.query<{
+        user_id: string;
+        source: AllowanceBaseAttribution["source"];
+        source_id: string | null;
+      }>(
+        `SELECT
+           tm.user_id,
+           CASE
+             WHEN member_override.user_id IS NOT NULL THEN 'member'
+             WHEN selected_default.department_id IS NOT NULL THEN 'department'
+             WHEN selected_default.profile_id IS NOT NULL THEN 'organization'
+             ELSE 'unlimited'
+           END AS source,
+           CASE
+             WHEN member_override.user_id IS NOT NULL THEN tm.user_id::text
+             WHEN selected_default.department_id IS NOT NULL THEN selected_default.department_id::text
+             WHEN selected_default.profile_id IS NOT NULL THEN tm.tenant_id::text
+             ELSE NULL
+           END AS source_id
+         FROM tenant_memberships tm
+         LEFT JOIN allowance_member_overrides member_override
+           ON member_override.tenant_id = tm.tenant_id
+          AND member_override.user_id = tm.user_id
+         LEFT JOIN LATERAL (
+           SELECT COALESCE(
+             (
+               SELECT dm.department_id
+               FROM department_memberships dm
+               WHERE dm.tenant_id = tm.tenant_id
+                 AND dm.user_id = tm.user_id
+                 AND dm.department_id = tm.primary_department_id
+               LIMIT 1
+             ),
+             (
+               SELECT dm.department_id
+               FROM department_memberships dm
+               WHERE dm.tenant_id = tm.tenant_id AND dm.user_id = tm.user_id
+               ORDER BY dm.created_at, dm.department_id
+               LIMIT 1
+             )
+           ) AS department_id
+         ) member_department ON true
+         LEFT JOIN LATERAL (
+           SELECT d.profile_id, d.department_id, d.role
+           FROM allowance_default_assignments d
+           JOIN allowance_profiles p
+            ON p.id = d.profile_id
+            AND p.tenant_id = d.tenant_id
+            AND p.status = 'active'
+            AND p.period = 'month'
+            AND p.hard_limit_micros > 0
+           WHERE d.tenant_id = tm.tenant_id
+             AND (
+               (
+                 member_department.department_id IS NOT NULL
+                 AND d.department_id = member_department.department_id
+                 AND (d.role IS NULL OR d.role = tm.role)
+               )
+               OR (d.department_id IS NULL AND d.role = tm.role)
+               OR (d.department_id IS NULL AND d.role IS NULL)
+             )
+           ORDER BY
+             CASE
+               WHEN d.department_id = member_department.department_id THEN 3
+               WHEN d.role = tm.role THEN 2
+               ELSE 1
+             END DESC,
+             d.priority DESC,
+             d.updated_at DESC
+           LIMIT 1
+         ) selected_default ON true
+         WHERE tm.tenant_id = $1::uuid
+           AND tm.user_id = ANY($2::uuid[])`,
+        [tenantId, userIds],
+      );
+      return rows.map((row) => ({
+        userId: row.user_id,
+        source: row.source,
+        sourceId: row.source_id,
+      }));
+    });
   }
 
   getAllowanceCycle(tenantId: string): Promise<AllowanceCycleSettings> {

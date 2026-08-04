@@ -197,6 +197,41 @@ describe("BudgetService", () => {
       });
   });
 
+  it("sets and clears a recurring member base override", async () => {
+    const repository = new InMemoryBudgetRepository();
+    const service = new BudgetService({
+      repository,
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+
+    await service.setMemberAllowanceBase(
+      SELF_HOST_TENANT_ID,
+      "user_1",
+      "20000000",
+      "owner_1",
+    );
+    await expect(service.allowanceBalance(SELF_HOST_TENANT_ID, "user_1"))
+      .resolves.toMatchObject({
+        baseLimitMicros: "20000000",
+        baseSource: "member",
+        baseSourceId: "user_1",
+      });
+
+    await service.setMemberAllowanceBase(
+      SELF_HOST_TENANT_ID,
+      "user_1",
+      null,
+      "owner_1",
+    );
+    await expect(service.allowanceBalance(SELF_HOST_TENANT_ID, "user_1"))
+      .resolves.toMatchObject({
+        baseLimitMicros: null,
+        baseSource: "unlimited",
+        baseSourceId: null,
+      });
+  });
+
   it("loads balances for many members with one grouped spend query", async () => {
     const repository = new InMemoryBudgetRepository([
       activeLimit("user", "user_1", "10"),

@@ -3355,6 +3355,12 @@ export const AllowanceAdjustmentCreateSchema = z.object({
   idempotencyKey: z.string().min(8).max(200),
 }).strict();
 export type AllowanceAdjustmentCreate = z.infer<typeof AllowanceAdjustmentCreateSchema>;
+export const MemberAllowanceBaseUpsertSchema = z.object({
+  amountMicros: z.string().regex(/^[1-9]\d*$/).nullable(),
+}).strict();
+export type MemberAllowanceBaseUpsert = z.infer<typeof MemberAllowanceBaseUpsertSchema>;
+export const AllowanceBaseSourceSchema = z.enum(["organization", "department", "member", "unlimited"]);
+export type AllowanceBaseSource = z.infer<typeof AllowanceBaseSourceSchema>;
 export const AllowanceBalanceSchema = z.object({
   tenantId: z.string(),
   userId: z.string(),
@@ -3369,6 +3375,8 @@ export const AllowanceBalanceSchema = z.object({
   reservedMicros: z.string(),
   availableMicros: z.string().nullable(),
   status: z.enum(["healthy", "warning", "blocked", "unlimited"]),
+  baseSource: AllowanceBaseSourceSchema.default("unlimited"),
+  baseSourceId: z.string().nullable().default(null),
 });
 export type AllowanceBalance = z.infer<typeof AllowanceBalanceSchema>;
 export const BlockedRequestSummarySchema = z.object({ id: z.string(), requestId: z.string(), userId: z.string().nullable(), departmentId: z.string().nullable(), feature: z.string(), reason: z.string(), limitId: z.string().nullable(), estimatedCostMicros: z.string(), ts: ISODateSchema });
