@@ -94,7 +94,7 @@ export function mcpServerSpecsFromJson(
       env: server.env,
       enabled: server.enabled,
       trusted: server.trusted,
-      credentialKey: server.credentialKey ?? null,
+      credentialKey: server.credentialKey ?? (server.credentialEnv ? `env:${server.credentialEnv}` : null),
       ...(server.cachedTools ? {
         cachedTools: server.cachedTools.map((tool) => ({
           name: tool.name,

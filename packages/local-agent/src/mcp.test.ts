@@ -146,7 +146,10 @@ describe("McpToolSource", () => {
     }]), { BERRYCRAWL_API_KEY: "secret-from-worker" });
     const source = new McpToolSource({ servers });
 
-    expect(servers[0]).toMatchObject({ credential: "secret-from-worker" });
+    expect(servers[0]).toMatchObject({
+      credential: "secret-from-worker",
+      credentialKey: "env:BERRYCRAWL_API_KEY",
+    });
     expect(source.approvalHints("mcp__BerryCrawl__search")).toEqual({
       readOnly: true,
       destructive: false,

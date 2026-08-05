@@ -38,7 +38,11 @@ describe("cloud runtime configuration", () => {
       defaultModel: "kimi-2.6",
     });
     expect(config.apiKey).toBe("router-secret");
-    expect(config.mcpServers[0]).toMatchObject({ credential: "crawl-secret", trusted: true });
+    expect(config.mcpServers[0]).toMatchObject({
+      credential: "crawl-secret",
+      credentialKey: "env:BERRYCRAWL_API_KEY",
+      trusted: true,
+    });
     expect(config.extraSkills[0]).toMatchObject({ name: "research", scope: "registered" });
     expect(config.networkPolicy).toEqual({ egress: "on", allowedDomains: ["crawl.example.test", "registry.npmjs.org"] });
     expect(config.provider?.completionTransport).toBe("stream");
