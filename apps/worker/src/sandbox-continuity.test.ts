@@ -682,7 +682,7 @@ describe("SandboxContinuityManager", () => {
 
     expect(objects.streamSource).toHaveBeenCalledWith(
       "artifacts/tenants/t/files/candidate.pdf",
-      100 * 1024 * 1024,
+      350 * 1024 * 1024,
     );
     const path = "/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf";
     const stagedBytes = Buffer.concat(staged.get(path)!.map((chunk) => Buffer.from(chunk)));

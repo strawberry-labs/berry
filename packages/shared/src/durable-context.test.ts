@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_SANDBOX_INPUT_MAX_BYTES,
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
+  durableContextConfigFromEnv,
   openDurableSecret,
   sealDurableSecret,
 } from "./durable-context.js";
@@ -9,6 +11,11 @@ import {
 const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 describe("durable capability contract", () => {
+  it("allows files up to 350 MiB to be staged into a sandbox by default", () => {
+    expect(durableContextConfigFromEnv({}).sandboxInputMaxBytes)
+      .toBe(DEFAULT_SANDBOX_INPUT_MAX_BYTES);
+  });
+
   it("round-trips admitted secrets without storing plaintext", async () => {
     const sealed = await sealDurableSecret("provider-secret", key);
     expect(JSON.stringify(sealed)).not.toContain("provider-secret");

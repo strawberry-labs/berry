@@ -54,7 +54,7 @@ durableContext:
   snapshotIntervalSeconds: 900
   maxInputBytes: "104857600"
   maxOutputBytes: "26214400"
-  sandboxInputMaxBytes: "104857600"
+  sandboxInputMaxBytes: "367001600"
 
 mem0:
   enabled: true

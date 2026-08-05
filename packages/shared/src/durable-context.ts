@@ -604,6 +604,8 @@ const EnvPositiveIntegerSchema = z.preprocess(
   z.number().int().positive(),
 );
 
+export const DEFAULT_SANDBOX_INPUT_MAX_BYTES = 350 * 1024 * 1024;
+
 export const DurableContextConfigSchema = z.object({
   memoryEnabled: EnvBooleanSchema.default(true),
   implicitMemoryEnabled: EnvBooleanSchema.default(true),
@@ -622,7 +624,7 @@ export const DurableContextConfigSchema = z.object({
   sandboxSnapshotIntervalSeconds: EnvPositiveIntegerSchema.default(900),
   knowledgeMaxInputBytes: EnvPositiveIntegerSchema.default(104857600),
   knowledgeMaxOutputBytes: EnvPositiveIntegerSchema.default(26214400),
-  sandboxInputMaxBytes: EnvPositiveIntegerSchema.default(104857600),
+  sandboxInputMaxBytes: EnvPositiveIntegerSchema.default(DEFAULT_SANDBOX_INPUT_MAX_BYTES),
 }).superRefine((value, context) => {
   if (value.knowledgeChunkOverlapTokens >= value.knowledgeChunkTokens) {
     context.addIssue({

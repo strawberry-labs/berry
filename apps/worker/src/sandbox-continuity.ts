@@ -16,7 +16,7 @@ import {
   type SandboxProvider,
 } from "@berry/sandbox-contract";
 import type { ChatContentPart, ImageGenerationResult } from "@berry/router-client";
-import type { JsonValue } from "@berry/shared";
+import { DEFAULT_SANDBOX_INPUT_MAX_BYTES, type JsonValue } from "@berry/shared";
 import { parsePatch, type PatchHunk } from "@berry/local-agent";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
@@ -425,7 +425,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         encoding: "base64",
       });
       const bytes = Buffer.from(source.content, "base64");
-      const maxBytes = this.options.maxInputBytes ?? 100 * 1024 * 1024;
+      const maxBytes = this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES;
       if (bytes.byteLength === 0) throw new Error("Cannot persist an empty artifact");
       if (bytes.byteLength > maxBytes) throw new Error(`Artifact exceeds the ${maxBytes}-byte output limit`);
       const name = safeArtifactName(stringValue(args.name) ?? path.split("/").at(-1) ?? "artifact");
@@ -665,7 +665,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (files.length === 0) return;
     if (!this.objects) throw new Error("Input file object storage is not configured");
     for (const file of files) {
-      const maxInputBytes = this.options.maxInputBytes ?? 100 * 1024 * 1024;
+      const maxInputBytes = this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES;
       if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
       const path = durableAttachmentPath({ fileId: file.fileId, name: file.name });
       for await (const event of this.provider.exec({
@@ -1055,7 +1055,7 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     private readonly client: S3Client,
     private readonly bucket: string,
     private readonly prefix: string,
-    private readonly maxSourceBytes = 100 * 1024 * 1024,
+    private readonly maxSourceBytes = DEFAULT_SANDBOX_INPUT_MAX_BYTES,
   ) {}
 
   static fromEnv(env: NodeJS.ProcessEnv): S3SandboxSnapshotObjectStore | null {
@@ -1073,7 +1073,7 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
       }),
       bucket,
       (env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
-      positiveInteger(env.BERRY_SANDBOX_INPUT_MAX_BYTES, 100 * 1024 * 1024),
+      positiveInteger(env.BERRY_SANDBOX_INPUT_MAX_BYTES, DEFAULT_SANDBOX_INPUT_MAX_BYTES),
     );
   }
 

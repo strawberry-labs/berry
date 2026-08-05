@@ -1625,6 +1625,17 @@ Result:
             "null"
           ]
         },
+        "startedAt": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "replayOnly": {
           "type": "boolean",
           "default": false
