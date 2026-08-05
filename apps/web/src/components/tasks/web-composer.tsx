@@ -133,11 +133,11 @@ export function Composer({
   onCreateProject: () => void;
   model: string;
   onModelChange: (model: string) => void;
-  onUserMessage: (text: string, sessionId: string, taskId: string, attachments?: AttachmentInput[]) => string | void;
+  onUserMessage: (text: string, sessionId: string, taskId: string, attachments?: AttachmentInput[], messageId?: string) => string | void;
   onUserMessagePersisted: (sessionId: string, optimisticMessageId: string, message: Message) => void;
   onAssistantMessage: (text: string, sessionId: string, taskId: string) => void;
   onEvent: (sessionId: string, event: Parameters<typeof reduceStream>[1]) => void;
-  runTurn: (task: Task, params: { input: string; requestMessageId?: string | undefined; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
+  runTurn: (task: Task, params: { input: string; messageInput?: string | undefined; requestMessageId?: string | undefined; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
   onCancel: () => void;
   onContinueTurn?: (() => Promise<void>) | undefined;
   variant: "home" | "thread";
@@ -461,25 +461,19 @@ export function Composer({
     const runtimeInput = profileContext ? `${input}\n\nExplicit user profile context:\n${profileContext}` : input;
     setBusy(true);
     setUploadError("");
-    const optimisticMessageId = onUserMessage(input, sessionId, task.id, attachments);
+    const requestMessageId = globalThis.crypto.randomUUID();
+    onUserMessage(input, sessionId, task.id, attachments, requestMessageId);
     setText("");
     setCreateImageMode(false);
     editorRef.current?.clear();
     try {
       if (client) {
-        const persistedUserMessage = await client.appendMessage(sessionId, {
-          role: "user",
-          parts: [
-            { kind: "text", content: input },
-            ...attachments.map((attachment) => ({ kind: "attachment" as const, content: messageAttachmentContent(attachment) })),
-          ],
-        });
-        if (optimisticMessageId) onUserMessagePersisted(sessionId, optimisticMessageId, persistedUserMessage);
         const sent = attachments;
         setAttachments([]);
         await runTurn(task, {
           input: runtimeInput,
-          requestMessageId: persistedUserMessage.id,
+          ...(runtimeInput !== input ? { messageInput: input } : {}),
+          requestMessageId,
           ...(sent.length > 0 ? { attachments: sent } : {}),
         });
       } else {

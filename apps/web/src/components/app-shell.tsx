@@ -912,7 +912,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const runTurn = React.useCallback(async (
     task: Task,
     params:
-      | { input: string; requestMessageId?: string | undefined; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
+      | { input: string; messageInput?: string | undefined; requestMessageId?: string | undefined; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
       | { continueInterruptedTurn: true; input?: undefined; attachments?: undefined; replaceFromMessageId?: undefined },
   ) => {
     if (!client || !task.activeSessionId) return;
@@ -949,6 +949,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           ? { continueInterruptedTurn: true as const }
           : {
             input: params.input,
+            ...(params.messageInput ? { messageInput: params.messageInput } : {}),
             ...(params.requestMessageId ? { requestMessageId: params.requestMessageId } : {}),
             ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
             ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
@@ -988,6 +989,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       const terminalEvent = { kind: "turn.end", turnId: `failed_${Date.now()}`, status: "failed" } as const;
       updateSessionStream(sessionId, terminalEvent);
       updateDurableStateFromEvent(sessionId, terminalEvent);
+      await refreshSessionMessages(sessionId).catch(() => undefined);
       throw error;
     } finally {
       setStartingSessions((current) => {
@@ -996,7 +998,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         return next;
       });
     }
-  }, [applyDurableState, attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -1065,14 +1067,16 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       return parsed.success ? [parsed.data] : [];
     });
     const attachments = [...imageAttachments, ...fileAttachments];
+    const replacementMessageId = globalThis.crypto.randomUUID();
     requestThreadBottom(sessionId);
     replaceSessionMessages(sessionId, (current) => {
       const index = current.findIndex((item) => item.id === target.id);
       const kept = index === -1 ? current : current.slice(0, index);
-      return [...kept, optimisticUserMessage(sessionId, text, attachments)];
+      return [...kept, optimisticUserMessage(sessionId, text, attachments, replacementMessageId)];
     });
     await runTurn(activeTask, {
       input: text,
+      requestMessageId: replacementMessageId,
       ...(attachments.length > 0 ? { attachments } : {}),
       replaceFromMessageId: target.id,
     });
@@ -2023,8 +2027,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                   : continueTurn
                 : undefined}
               runTurn={runTurn}
-              onUserMessage={(text, sessionId, taskId, attachments) => {
-                const user = optimisticUserMessage(sessionId, text, attachments);
+              onUserMessage={(text, sessionId, taskId, attachments, messageId) => {
+                const user = optimisticUserMessage(sessionId, text, attachments, messageId);
                 const nextTitle = text.trim().slice(0, 42);
                 requestThreadBottom(sessionId);
                 replaceSessionMessages(sessionId, (current) => [...current, user]);
@@ -2096,8 +2100,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onCreateTask={createTask}
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}
-                onUserMessage={(text, sessionId, _taskId, attachments) => {
-                  const user = optimisticUserMessage(sessionId, text, attachments);
+                onUserMessage={(text, sessionId, _taskId, attachments, messageId) => {
+                  const user = optimisticUserMessage(sessionId, text, attachments, messageId);
                   replaceSessionMessages(sessionId, [user]);
                   return user.id;
                 }}
@@ -2208,8 +2212,8 @@ function ProjectCreationDialog({
  * API, approvals/questions resolve over HTTP, and fork stays desktop-only.
  */
 
-function optimisticUserMessage(sessionId: string, text: string, attachments: AttachmentInput[] | undefined): Message {
-  const id = `${OPTIMISTIC_MESSAGE_ID_PREFIX}${globalThis.crypto.randomUUID()}`;
+function optimisticUserMessage(sessionId: string, text: string, attachments: AttachmentInput[] | undefined, messageId?: string): Message {
+  const id = messageId ?? `${OPTIMISTIC_MESSAGE_ID_PREFIX}${globalThis.crypto.randomUUID()}`;
   const user = message(id, sessionId, "user", text);
   if (!attachments?.length) return user;
   user.parts = [

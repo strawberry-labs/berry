@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Headers, Inject, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
+import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Inject, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import {
@@ -135,6 +135,7 @@ function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "t
 
 const StartTurnRequestSchema = z.object({
   input: z.string().min(1).optional(),
+  messageInput: z.string().min(1).optional(),
   requestMessageId: z.string().uuid().optional(),
   continueInterruptedTurn: z.boolean().optional(),
   workspacePath: z.string().min(1),
@@ -148,11 +149,14 @@ const StartTurnRequestSchema = z.object({
   // Edit-and-resubmit: rewind the session to before this user message, drop it
   // and everything after, persist the new input as the user message, and run
   // the turn from that point (mirrors the desktop host's agent.turn).
-  replaceFromMessageId: z.string().min(1).optional(),
+  replaceFromMessageId: z.string().uuid().optional(),
 }).passthrough().superRefine((request, context) => {
   if (request.continueInterruptedTurn) {
     if (request.input !== undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["input"], message: "A continued turn must not include new user input" });
+    }
+    if (request.messageInput !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["messageInput"], message: "A continued turn must not include a new visible message" });
     }
     if (request.attachments !== undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["attachments"], message: "A continued turn must not include new attachments" });
@@ -822,8 +826,21 @@ export class AgentApiController {
       model: string | null;
     } | undefined;
     let assistantErrorPersisted = false;
-    if (request.replaceFromMessageId) {
-      await this.rewindForEdit(tenantId, sessionId, request.replaceFromMessageId, request.input ?? "", request.attachments);
+    if (!this.durableTurns.enabled && request.replaceFromMessageId) {
+      await this.rewindForEdit(
+        tenantId,
+        sessionId,
+        request.replaceFromMessageId,
+        request.messageInput ?? request.input ?? "",
+        request.attachments,
+        request.requestMessageId,
+      );
+    } else if (!this.durableTurns.enabled && !request.continueInterruptedTurn && request.requestMessageId) {
+      await this.store.appendMessage(sessionId, {
+        id: request.requestMessageId,
+        role: "user",
+        parts: userMessageParts(request.messageInput ?? request.input ?? "", request.attachments),
+      });
     }
     if (this.durableTurns.enabled) {
       try {
@@ -899,7 +916,9 @@ export class AgentApiController {
           sessionId,
           requestId,
           ...(request.requestMessageId ? { requestMessageId: request.requestMessageId } : {}),
+          ...(request.replaceFromMessageId ? { replaceFromMessageId: request.replaceFromMessageId } : {}),
           input: request.continueInterruptedTurn ? "" : request.input ?? "",
+          ...(request.messageInput ? { messageInput: request.messageInput } : {}),
           ...(request.attachments ? { attachments: request.attachments } : {}),
           ...(request.continueInterruptedTurn ? { continueInterruptedTurn: true } : {}),
           runtimeRequest,
@@ -1187,6 +1206,7 @@ export class AgentApiController {
     replaceFromMessageId: string,
     input: string,
     attachments: z.infer<typeof AttachmentInputSchema>[] | undefined,
+    replacementMessageId?: string,
   ): Promise<void> {
     const messages = await this.store.listMessages(sessionId);
     const targetIndex = messages.findIndex((message) => message.id === replaceFromMessageId);
@@ -1203,8 +1223,11 @@ export class AgentApiController {
         await this.durableTurns.rewindJournalBefore(tenantId, sessionId, replaceFromMessageId);
       }
       await this.store.deleteMessagesFrom(sessionId, replaceFromMessageId);
+    } else {
+      throw new ConflictException("The message being edited is stale or no longer exists");
     }
     await this.store.appendMessage(sessionId, {
+      ...(replacementMessageId ? { id: replacementMessageId } : {}),
       role: "user",
       parts: userMessageParts(input, attachments),
     });

@@ -23,7 +23,9 @@ export interface DurableTurnAdmission {
   sessionId: string;
   requestId: string;
   requestMessageId?: string;
+  replaceFromMessageId?: string;
   input: string;
+  messageInput?: string;
   attachments?: AttachmentInput[];
   continueInterruptedTurn?: boolean;
   runtimeRequest: Record<string, unknown>;
@@ -86,6 +88,9 @@ LIMIT 1
         throw new ConflictException("This session already has an active turn");
       }
 
+      if (!input.continueInterruptedTurn && input.replaceFromMessageId) {
+        await rewindProjectionForEdit(executor, input);
+      }
       const requestMessageId = input.continueInterruptedTurn
         ? await continuableRequestMessageId(executor, input)
         : await ensureUserMessage(executor, input);
@@ -187,23 +192,7 @@ WHERE tenant_id=$1::uuid AND id=$4::uuid
     await this.database.withTenant(tenantId, async (executor) => {
       const operation = async (transaction: SqlExecutor) => {
         await syncMessageJournal(transaction, { tenantId, sessionId });
-        const target = await transaction.query<{ parent_entry_id: string | null }>(
-          `SELECT parent_entry_id FROM session_entries
-           WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND entry_id=$3
-           LIMIT 1 FOR UPDATE`,
-          [tenantId, sessionId, messageId],
-        );
-        if (!target[0]) return;
-        const leafId = target[0].parent_entry_id;
-        await transaction.execute(
-          "UPDATE session_entries SET is_leaf_marker=COALESCE(entry_id=$3,false) WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND (is_leaf_marker=true OR entry_id=$3)",
-          [tenantId, sessionId, leafId],
-        );
-        await transaction.execute(
-          `UPDATE sessions SET runtime_metadata=runtime_metadata || jsonb_build_object('leafId',$3::text),updated_at=now()
-           WHERE tenant_id=$1::uuid AND id=$2::uuid`,
-          [tenantId, sessionId, leafId],
-        );
+        await rewindJournalBeforeExecutor(transaction, tenantId, sessionId, messageId);
       };
       if (executor.transaction) await executor.transaction(operation);
       else await operation(executor);
@@ -1451,8 +1440,8 @@ LIMIT 1
       `.trim(),
       [input.tenantId, input.sessionId, input.taskId, input.requestMessageId],
     );
-    if (!requested[0]) throw new Error("The submitted user message does not belong to this session");
-    return requested[0].id;
+    if (requested[0]) return requested[0].id;
+    return insertUserMessage(executor, input, input.requestMessageId);
   }
   const rows = await executor.query<{ id: string }>(
     `
@@ -1469,10 +1458,17 @@ WHERE m.tenant_id=$1::uuid AND m.session_id=$2::uuid AND m.role='user'
 ORDER BY m.sequence_id DESC
 LIMIT 1
     `.trim(),
-    [input.tenantId, input.sessionId, input.input],
+    [input.tenantId, input.sessionId, input.messageInput ?? input.input],
   );
   if (rows[0]) return rows[0].id;
-  const id = randomUUID();
+  return insertUserMessage(executor, input, randomUUID());
+}
+
+async function insertUserMessage(
+  executor: SqlExecutor,
+  input: DurableTurnAdmission,
+  id: string,
+): Promise<string> {
   await executor.execute(
     `
 INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
@@ -1485,7 +1481,7 @@ VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'user','complete')
 INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
 VALUES ($1::uuid,$2::uuid,'text',$3::jsonb,0)
     `.trim(),
-    [input.tenantId, id, JSON.stringify(input.input)],
+    [input.tenantId, id, JSON.stringify(input.messageInput ?? input.input)],
   );
   for (const [index, attachment] of (input.attachments ?? []).entries()) {
     await executor.execute(
@@ -1497,6 +1493,64 @@ VALUES ($1::uuid,$2::uuid,'attachment',$3::jsonb,$4)
     );
   }
   return id;
+}
+
+async function rewindProjectionForEdit(
+  executor: SqlExecutor,
+  input: DurableTurnAdmission,
+): Promise<void> {
+  const messageId = input.replaceFromMessageId!;
+  const target = await executor.query<{ sequence_id: number | string }>(
+    `
+SELECT sequence_id
+FROM messages
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND task_id=$3::uuid
+  AND id=$4::uuid AND role='user'
+LIMIT 1
+FOR UPDATE
+    `.trim(),
+    [input.tenantId, input.sessionId, input.taskId, messageId],
+  );
+  if (!target[0]) {
+    throw new ConflictException("The message being edited is stale or no longer exists");
+  }
+  await syncMessageJournal(executor, input);
+  if (!await rewindJournalBeforeExecutor(executor, input.tenantId, input.sessionId, messageId)) {
+    throw new ConflictException("The message being edited has no durable history entry");
+  }
+  await executor.execute(
+    `
+DELETE FROM messages
+WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND sequence_id >= $3
+    `.trim(),
+    [input.tenantId, input.sessionId, target[0].sequence_id],
+  );
+}
+
+async function rewindJournalBeforeExecutor(
+  executor: SqlExecutor,
+  tenantId: string,
+  sessionId: string,
+  messageId: string,
+): Promise<boolean> {
+  const target = await executor.query<{ parent_entry_id: string | null }>(
+    `SELECT parent_entry_id FROM session_entries
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND entry_id=$3
+     LIMIT 1 FOR UPDATE`,
+    [tenantId, sessionId, messageId],
+  );
+  if (!target[0]) return false;
+  const leafId = target[0].parent_entry_id;
+  await executor.execute(
+    "UPDATE session_entries SET is_leaf_marker=COALESCE(entry_id=$3,false) WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND (is_leaf_marker=true OR entry_id=$3)",
+    [tenantId, sessionId, leafId],
+  );
+  await executor.execute(
+    `UPDATE sessions SET runtime_metadata=runtime_metadata || jsonb_build_object('leafId',$3::text),updated_at=now()
+     WHERE tenant_id=$1::uuid AND id=$2::uuid`,
+    [tenantId, sessionId, leafId],
+  );
+  return true;
 }
 
 async function projectTerminalAssistant(

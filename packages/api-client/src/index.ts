@@ -288,6 +288,8 @@ interface StartTurnRequestBase {
 export type StartTurnRequest = StartTurnRequestBase & (
   | {
     input: string;
+    /** Visible user-authored text when runtime input contains injected context. */
+    messageInput?: string | undefined;
     /** Exact persisted user message that this turn consumes. */
     requestMessageId?: string | undefined;
     continueInterruptedTurn?: false | undefined;
@@ -299,6 +301,7 @@ export type StartTurnRequest = StartTurnRequestBase & (
     /** Resume the interrupted assistant turn without appending another user message. */
     continueInterruptedTurn: true;
     input?: undefined;
+    messageInput?: undefined;
     requestMessageId?: undefined;
     attachments?: undefined;
     replaceFromMessageId?: undefined;

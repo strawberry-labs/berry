@@ -169,6 +169,111 @@ describe("DurableTurnService", () => {
     expect(executions.some((sql) => sql.startsWith("INSERT INTO messages"))).toBe(false);
   });
 
+  it("creates the client-selected user message inside durable admission", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 1 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "request_atomic_message",
+      requestMessageId: userId,
+      input: "Create this message atomically.",
+      runtimeRequest: {},
+      groundingContext: {},
+    });
+
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("INSERT INTO messages"),
+      params: [userId, tenantId, sessionId, taskId],
+    }));
+  });
+
+  it("rewinds and replaces an edited message in the admission transaction", async () => {
+    const replacementId = "00000000-0000-7000-8000-000000000009";
+    const parentEntryId = "00000000-0000-7000-8000-000000000010";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("SELECT sequence_id") && sql.includes("FOR UPDATE")) return [{ sequence_id: 42 }] as T[];
+        if (sql.includes("SELECT parent_entry_id FROM session_entries")) return [{ parent_entry_id: parentEntryId }] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 43 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "request_edit",
+      requestMessageId: replacementId,
+      replaceFromMessageId: userId,
+      input: "Edited prompt",
+      runtimeRequest: {},
+      groundingContext: {},
+    });
+
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("DELETE FROM messages"),
+      params: [tenantId, sessionId, 42],
+    }));
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("INSERT INTO messages"),
+      params: [replacementId, tenantId, sessionId, taskId],
+    }));
+    expect(executions.find(({ sql }) => sql.includes("DELETE FROM messages"))?.sql)
+      .toContain("sequence_id >= $3");
+  });
+
+  it("rejects a stale edit without appending another user message", async () => {
+    const executions: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { executions.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "request_stale_edit",
+      requestMessageId: "00000000-0000-7000-8000-000000000009",
+      replaceFromMessageId: userId,
+      input: "Edited prompt",
+      runtimeRequest: {},
+      groundingContext: {},
+    })).rejects.toThrow("stale or no longer exists");
+
+    expect(executions.some((sql) => sql.startsWith("INSERT INTO messages"))).toBe(false);
+    expect(executions.some((sql) => sql.startsWith("INSERT INTO turn_runs"))).toBe(false);
+  });
+
   it("rewinds the active journal leaf without deleting the abandoned branch", async () => {
     const parentEntryId = "00000000-0000-7000-8000-000000000009";
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];

@@ -730,6 +730,52 @@ describe("durable turn runner", () => {
     expect(statements.some((sql) => sql.includes("'citation'"))).toBe(false);
   });
 
+  it("updates an existing durable step with contiguous PostgreSQL parameters", async () => {
+    const step = modelStep("running", 1);
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+          return [{ state: "calling_model", cancelled_at: null }] as T[];
+        }
+        if (sql.startsWith("INSERT INTO turn_steps")) return [] as T[];
+        if (sql.startsWith("SELECT id,sequence,idempotency_key")) {
+          return [{ id: step.id, sequence: step.sequence, idempotency_key: step.idempotencyKey }] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql, params = []) => {
+        statements.push({ sql, params });
+      },
+    };
+    const current = snapshot("calling_model", [admittedStep(), { ...step, state: "pending" }]);
+    current.leaseOwner = "worker-step-update";
+
+    await new SqlDurableTurnRepository(executor).commit(current, {
+      expectedState: "calling_model",
+      nextState: "calling_model",
+      steps: [{
+        id: step.id,
+        sequence: step.sequence,
+        type: step.type,
+        state: "running",
+        input: step.input,
+        retryClass: step.retryClass,
+        idempotencyKey: step.idempotencyKey,
+        incrementAttempt: true,
+      }],
+      keepLease: true,
+    });
+
+    const update = statements.find(({ sql }) => sql.startsWith("UPDATE turn_steps"));
+    expect(update?.sql).toContain("SET state=$4");
+    expect(update?.sql).toContain("session_entry_id=COALESCE($11,session_entry_id)");
+    expect(update?.sql).not.toMatch(/\$1[2-9]/);
+    expect(update?.params).toHaveLength(11);
+    expect(update?.params[3]).toBe("running");
+    expect(update?.params[8]).toBe(true);
+  });
+
   it("treats a duplicate step idempotency key as a replay instead of failing the turn", async () => {
     const persistedId = randomUUID();
     const replayId = randomUUID();

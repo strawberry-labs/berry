@@ -3158,23 +3158,36 @@ LIMIT 1
     }
     persistedStepId = persisted.id;
     if (!isIdempotentReplay) {
+      const updateParameters = [
+        persistedStepId,
+        snapshot.tenantId,
+        snapshot.id,
+        step.state,
+        JSON.stringify(step.input ?? {}),
+        step.output === undefined || step.output === null ? null : JSON.stringify(step.output),
+        step.retryClass ?? null,
+        step.idempotencyKey ?? null,
+        step.incrementAttempt ?? false,
+        step.error ?? null,
+        step.sessionEntryId ?? null,
+      ];
       await executor.execute(
         `
 UPDATE turn_steps
-SET state=$6,
-    input=COALESCE($7::jsonb,input),
-    output=COALESCE($8::jsonb,output),
-    retry_class=COALESCE($9,retry_class),
-    idempotency_key=COALESCE($10,idempotency_key),
-    attempt=attempt + CASE WHEN $11::boolean THEN 1 ELSE 0 END,
-    error=$12,
-    session_entry_id=COALESCE($13,session_entry_id),
-    started_at=COALESCE(started_at,CASE WHEN $6='running' THEN now() ELSE NULL END),
-    completed_at=CASE WHEN $6 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END,
+SET state=$4,
+    input=COALESCE($5::jsonb,input),
+    output=COALESCE($6::jsonb,output),
+    retry_class=COALESCE($7,retry_class),
+    idempotency_key=COALESCE($8,idempotency_key),
+    attempt=attempt + CASE WHEN $9::boolean THEN 1 ELSE 0 END,
+    error=$10,
+    session_entry_id=COALESCE($11,session_entry_id),
+    started_at=COALESCE(started_at,CASE WHEN $4='running' THEN now() ELSE NULL END),
+    completed_at=CASE WHEN $4 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END,
     updated_at=now()
 WHERE tenant_id=$2::uuid AND run_id=$3::uuid AND id=$1::uuid
         `.trim(),
-        parameters,
+        updateParameters,
       );
     }
   }
