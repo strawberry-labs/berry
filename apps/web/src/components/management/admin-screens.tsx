@@ -414,6 +414,7 @@ function Members({
       setAddMode(null);
       setMessage("Member account created and the default allowance profile was applied.");
       r.retry();
+      balances.retry();
     } catch (error) {
       setManualError(error instanceof Error ? error.message : "Member creation failed.");
     } finally {
@@ -488,6 +489,7 @@ function Members({
     if (createdCount) {
       setMessage(`${createdCount} ${createdCount === 1 ? "member was" : "members were"} imported.`);
       r.retry();
+      balances.retry();
     }
   };
   const copyCreatedCredentials = async () => {
