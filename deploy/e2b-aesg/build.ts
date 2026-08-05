@@ -97,8 +97,8 @@ if (process.env.AESG_PREPARE_ONLY === "1") {
 }
 
 const result = await Template.build(template, alias, {
-  cpuCount: 4,
-  memoryMB: 8192,
+  cpuCount: 2,
+  memoryMB: 2048,
   onBuildLogs: defaultBuildLogger(),
 });
 console.log(

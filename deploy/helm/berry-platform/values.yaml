@@ -157,7 +157,7 @@ sandbox:
   ttlSeconds: 300
   keepMemoryOnPause: false
   cpuCount: 2
-  memoryMiB: 4096
+  memoryMiB: 2048
   diskMiB: 10240
   estimatedHourlyCostMicros: 0
   minimumExecCostMicros: 0
