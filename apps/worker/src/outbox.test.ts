@@ -8,6 +8,29 @@ const runId = "00000000-0000-7000-8000-000000000002";
 const outboxId = "00000000-0000-7000-8000-000000000003";
 
 describe("RuntimeOutboxDispatcher", () => {
+  it("ignores pending maintenance work when deciding whether a run needs recovery", async () => {
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      execute: vi.fn(async (sql: string) => {
+        statements.push(sql);
+      }),
+      query: async <T>(): Promise<readonly T[]> => [],
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: vi.fn() as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-test",
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+
+    const recovery = statements.find((sql) => sql.includes("':recovery:'"));
+    expect(recovery).toContain("pending.event_type IN ('turn.execute','turn.resume')");
+  });
+
   it("backfills cleanup snapshots for terminal runs with billable sandboxes", async () => {
     const statements: string[] = [];
     const executor: SqlExecutor = {

@@ -74,6 +74,7 @@ export class RuntimeOutboxDispatcher {
             SELECT 1 FROM runtime_outbox pending
             WHERE pending.tenant_id=r.tenant_id
               AND pending.aggregate_id=r.id::text
+              AND pending.event_type IN ('turn.execute','turn.resume')
               AND pending.completed_at IS NULL
           )
         ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
