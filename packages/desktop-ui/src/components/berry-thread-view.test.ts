@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@berry/shared";
-import { collectMessageDraftParts, isContinuableAssistantTurn, partitionAssistantParts } from "./berry-thread-view";
+import {
+  collectMessageDraftParts,
+  isContinuableAssistantTurn,
+  latestArtifactToolCallIds,
+  partitionAssistantParts,
+} from "./berry-thread-view";
 
 function assistant(status: Message["status"], id: string): Message {
   const createdAt = "2026-07-27T05:20:55.000Z";
@@ -108,6 +113,65 @@ describe("structured writing block projection", () => {
         }),
       }),
     ]);
+  });
+});
+
+describe("artifact batch projection", () => {
+  it("shows only the latest assistant publication batch", () => {
+    const messages: Message[] = [];
+    const appendBatch = (prefix: string, names: string[]) => {
+      const callMessage = assistant("complete", `${prefix}_calls`);
+      callMessage.parts = names.map((name, index) => ({
+        ...callMessage.parts[0]!,
+        id: `${prefix}_call_part_${index}`,
+        kind: "tool-call" as const,
+        position: index,
+        content: {
+          toolCallId: `${prefix}_call_${index}`,
+          name: "persist_artifact",
+          arguments: { path: `/workspace/outputs/${name}` },
+        },
+      }));
+      messages.push(callMessage);
+      names.forEach((name, index) => {
+        const resultMessage = assistant("complete", `${prefix}_result_${index}`);
+        resultMessage.parts = [{
+          ...resultMessage.parts[0]!,
+          id: `${prefix}_result_part_${index}`,
+          kind: "tool-result",
+          content: {
+            toolCallId: `${prefix}_call_${index}`,
+            name: "persist_artifact",
+            status: "completed",
+            output: {
+              artifact: {
+                name,
+                path: `/v1/files/${prefix}-${index}`,
+                mediaType: "image/png",
+              },
+            },
+          },
+        }];
+        messages.push(resultMessage);
+      });
+    };
+
+    appendBatch("first", ["old-a.png", "old-b.png"]);
+    messages.push(assistant("complete", "more_work"));
+    appendBatch("latest", ["new-a.png", "new-b.png", "new-c.png"]);
+
+    const visible = latestArtifactToolCallIds(messages);
+    const projected = partitionAssistantParts(
+      messages.flatMap((message) => message.parts),
+      new Map(),
+      visible,
+    );
+
+    expect([...visible ?? []]).toEqual(["latest_call_0", "latest_call_1", "latest_call_2"]);
+    expect(projected.segments.flatMap((segment) => segment.kind === "artifact" ? [segment.name] : []))
+      .toEqual(["new-a.png", "new-b.png", "new-c.png"]);
+    expect(projected.segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []))
+      .toHaveLength(5);
   });
 });
 

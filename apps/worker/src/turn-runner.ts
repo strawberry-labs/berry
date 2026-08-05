@@ -1502,8 +1502,16 @@ FOR UPDATE
       if (locked[0].cancelled_at && mutation.nextState !== "cancelled") {
         throw new DurableTurnRetryableError("Turn was cancelled before state persistence");
       }
-      for (const step of mutation.steps ?? []) await upsertStep(executor, snapshot, step);
-      for (const tool of mutation.toolCalls ?? []) await insertToolCall(executor, snapshot, tool);
+      const persistedStepIds = new Map<string, string>();
+      for (const step of mutation.steps ?? []) {
+        persistedStepIds.set(step.id, await upsertStep(executor, snapshot, step));
+      }
+      for (const tool of mutation.toolCalls ?? []) {
+        await insertToolCall(executor, snapshot, {
+          ...tool,
+          stepId: persistedStepIds.get(tool.stepId) ?? tool.stepId,
+        });
+      }
       if (mutation.approval) await insertApproval(executor, snapshot, mutation.approval);
       if (mutation.question) await insertQuestion(executor, snapshot, mutation.question);
       const appendedEntries = await appendEntries(executor, snapshot, mutation.entries ?? []);
@@ -2500,8 +2508,23 @@ async function upsertStep(
   executor: SqlExecutor,
   snapshot: DurableTurnSnapshot,
   step: DurableStepMutation,
-): Promise<void> {
-  await executor.execute(
+): Promise<string> {
+  const parameters = [
+    step.id,
+    snapshot.tenantId,
+    snapshot.id,
+    step.sequence,
+    step.type,
+    step.state,
+    JSON.stringify(step.input ?? {}),
+    step.output === undefined || step.output === null ? null : JSON.stringify(step.output),
+    step.retryClass ?? null,
+    step.idempotencyKey ?? null,
+    step.incrementAttempt ?? false,
+    step.error ?? null,
+    step.sessionEntryId ?? null,
+  ];
+  const inserted = await executor.query<{ id: string }>(
     `
 INSERT INTO turn_steps (
   id,tenant_id,run_id,sequence,step_type,state,input,output,retry_class,
@@ -2512,35 +2535,62 @@ INSERT INTO turn_steps (
   CASE WHEN $6='running' THEN now() ELSE NULL END,
   CASE WHEN $6 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END
 )
-ON CONFLICT (tenant_id,run_id,sequence) DO UPDATE SET
-  state=excluded.state,
-  input=COALESCE(excluded.input,turn_steps.input),
-  output=COALESCE(excluded.output,turn_steps.output),
-  retry_class=COALESCE(excluded.retry_class,turn_steps.retry_class),
-  idempotency_key=COALESCE(excluded.idempotency_key,turn_steps.idempotency_key),
-  attempt=turn_steps.attempt + CASE WHEN $11::boolean THEN 1 ELSE 0 END,
-  error=excluded.error,
-  session_entry_id=COALESCE(excluded.session_entry_id,turn_steps.session_entry_id),
-  started_at=COALESCE(turn_steps.started_at,excluded.started_at),
-  completed_at=excluded.completed_at,
-  updated_at=now()
+ON CONFLICT DO NOTHING
+RETURNING id
     `.trim(),
-    [
-      step.id,
-      snapshot.tenantId,
-      snapshot.id,
-      step.sequence,
-      step.type,
-      step.state,
-      JSON.stringify(step.input ?? {}),
-      step.output === undefined || step.output === null ? null : JSON.stringify(step.output),
-      step.retryClass ?? null,
-      step.idempotencyKey ?? null,
-      step.incrementAttempt ?? false,
-      step.error ?? null,
-      step.sessionEntryId ?? null,
-    ],
+    parameters,
   );
+  let persistedStepId = inserted[0]?.id;
+  if (!persistedStepId) {
+    const existing = await executor.query<{
+      id: string;
+      sequence: number | string;
+      idempotency_key: string | null;
+    }>(
+      `
+SELECT id,sequence,idempotency_key
+FROM turn_steps
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND (sequence=$4 OR ($3::text IS NOT NULL AND idempotency_key=$3))
+ORDER BY CASE WHEN $3::text IS NOT NULL AND idempotency_key=$3 THEN 0 ELSE 1 END
+LIMIT 1
+      `.trim(),
+      [snapshot.tenantId, snapshot.id, step.idempotencyKey ?? null, step.sequence],
+    );
+    const persisted = existing[0];
+    if (!persisted) {
+      throw new DurableTurnRetryableError(`Step ${step.sequence} conflicted but its persisted row could not be resolved`);
+    }
+    const isIdempotentReplay = Boolean(
+      step.idempotencyKey
+      && persisted.idempotency_key === step.idempotencyKey
+      && persisted.id !== step.id,
+    );
+    if (!isIdempotentReplay && persisted.id !== step.id) {
+      throw new DurableTurnRetryableError(`Step sequence ${step.sequence} is already owned by another durable operation`);
+    }
+    persistedStepId = persisted.id;
+    if (!isIdempotentReplay) {
+      await executor.execute(
+        `
+UPDATE turn_steps
+SET state=$6,
+    input=COALESCE($7::jsonb,input),
+    output=COALESCE($8::jsonb,output),
+    retry_class=COALESCE($9,retry_class),
+    idempotency_key=COALESCE($10,idempotency_key),
+    attempt=attempt + CASE WHEN $11::boolean THEN 1 ELSE 0 END,
+    error=$12,
+    session_entry_id=COALESCE($13,session_entry_id),
+    started_at=COALESCE(started_at,CASE WHEN $6='running' THEN now() ELSE NULL END),
+    completed_at=CASE WHEN $6 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END,
+    updated_at=now()
+WHERE tenant_id=$2::uuid AND run_id=$3::uuid AND id=$1::uuid
+        `.trim(),
+        parameters,
+      );
+    }
+  }
   if (step.type.startsWith("tool.")) {
     const toolStatus = step.state === "running"
       ? "running"
@@ -2568,12 +2618,13 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND step_id=$3::uuid
       [
         snapshot.tenantId,
         snapshot.id,
-        step.id,
+        persistedStepId,
         toolStatus,
         step.output === undefined || step.output === null ? null : JSON.stringify(step.output),
       ],
     );
   }
+  return persistedStepId;
 }
 
 async function insertToolCall(

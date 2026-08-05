@@ -618,10 +618,14 @@ describe("durable turn runner", () => {
 
   it("casts persisted tool statuses to the PostgreSQL enum", async () => {
     const statements: string[] = [];
+    const tool = toolStep("completed", "read_only", false);
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
         if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
           return [{ state: "executing_tool", cancelled_at: null }] as T[];
+        }
+        if (sql.startsWith("INSERT INTO turn_steps")) {
+          return [{ id: tool.id }] as T[];
         }
         throw new Error(`Unexpected query: ${sql}`);
       },
@@ -631,7 +635,6 @@ describe("durable turn runner", () => {
     };
     const current = snapshot("executing_tool", [admittedStep()]);
     current.leaseOwner = "worker-sql";
-    const tool = toolStep("completed", "read_only", false);
 
     await new SqlDurableTurnRepository(executor).commit(current, {
       expectedState: "executing_tool",
@@ -662,6 +665,52 @@ describe("durable turn runner", () => {
     expect(statements.some((sql) => sql.includes("'tool-call'"))).toBe(true);
     expect(statements.some((sql) => sql.includes("'tool-result'"))).toBe(true);
     expect(statements.some((sql) => sql.includes("'citation'"))).toBe(false);
+  });
+
+  it("treats a duplicate step idempotency key as a replay instead of failing the turn", async () => {
+    const persistedId = randomUUID();
+    const replayId = randomUUID();
+    const idempotencyKey = `${runId}:model:95`;
+    const queries: string[] = [];
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        queries.push(sql);
+        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+          return [{ state: "executing_tool", cancelled_at: null }] as T[];
+        }
+        if (sql.startsWith("INSERT INTO turn_steps")) return [];
+        if (sql.startsWith("SELECT id,sequence,idempotency_key")) {
+          return [{ id: persistedId, sequence: 210, idempotency_key: idempotencyKey }] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql: string) => {
+        statements.push(sql);
+      },
+    };
+    const current = snapshot("executing_tool", [admittedStep()]);
+    current.leaseOwner = "worker-replay";
+
+    await new SqlDurableTurnRepository(executor).commit(current, {
+      expectedState: "executing_tool",
+      nextState: "calling_model",
+      steps: [{
+        id: replayId,
+        sequence: 210,
+        type: "model.call",
+        state: "pending",
+        input: { iteration: 95 },
+        retryClass: "idempotent_with_key",
+        idempotencyKey,
+      }],
+      keepLease: true,
+    });
+
+    expect(queries.find((sql) => sql.startsWith("INSERT INTO turn_steps")))
+      .toContain("ON CONFLICT DO NOTHING");
+    expect(statements.some((sql) => sql.startsWith("UPDATE turn_steps"))).toBe(false);
+    expect(statements.some((sql) => sql.startsWith("UPDATE turn_runs"))).toBe(true);
   });
 });
 

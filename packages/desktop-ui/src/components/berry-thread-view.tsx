@@ -541,7 +541,12 @@ function BerryAssistantTurnGroup({
     .map((part) => String(part.content))
     .join("\n");
 
-  const { segments, totalMs } = partitionAssistantParts(allParts, writingBlockParts);
+  const visibleArtifactToolCallIds = latestArtifactToolCallIds(messages);
+  const { segments, totalMs } = partitionAssistantParts(
+    allParts,
+    writingBlockParts,
+    visibleArtifactToolCallIds,
+  );
   // Merge tool runs that were split across adjacent assistant messages.
   const merged: typeof segments = [];
   for (const segment of segments) {
@@ -886,6 +891,7 @@ export function BerryActivityStackBlock({ children }: { children: React.ReactNod
 export function partitionAssistantParts(
   parts: MessagePart[],
   writingBlockParts: Map<string, MessageDraftPartResolution> = new Map(),
+  visibleArtifactToolCallIds?: ReadonlySet<string>,
 ): {
   segments: MessageSegment[];
   totalMs: number;
@@ -969,7 +975,11 @@ export function partitionAssistantParts(
         continue;
       }
       upsertTool(id, meta, part.kind === "tool-result");
-      if (part.kind === "tool-result" && meta.name === "persist_artifact") {
+      if (
+        part.kind === "tool-result"
+        && meta.name === "persist_artifact"
+        && (!visibleArtifactToolCallIds || visibleArtifactToolCallIds.has(id))
+      ) {
         const result = meta.output && typeof meta.output === "object" && !Array.isArray(meta.output)
           ? (meta.output as Record<string, unknown>)
           : undefined;
@@ -1004,6 +1014,43 @@ export function partitionAssistantParts(
   const tools = [...toolMap.values()];
   const totalMs = tools.reduce((sum, tool) => sum + (tool.durationMs ?? 0), 0);
   return { segments, totalMs, hadTools: tools.length > 0 };
+}
+
+/**
+ * A durable user turn can contain many model/tool iterations. Each model
+ * message that calls persist_artifact declares one publication batch. Only
+ * the latest batch with settled results belongs in the visible response;
+ * earlier batches remain available in the task files and activity history.
+ */
+export function latestArtifactToolCallIds(messages: Message[]): ReadonlySet<string> | undefined {
+  const completed = new Set<string>();
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.kind !== "tool-result") continue;
+      const meta = part.content && typeof part.content === "object" && !Array.isArray(part.content)
+        ? part.content as Record<string, unknown>
+        : undefined;
+      if (meta?.name !== "persist_artifact" || meta.status !== "completed") continue;
+      const toolCallId = typeof meta.toolCallId === "string" ? meta.toolCallId : undefined;
+      if (toolCallId) completed.add(toolCallId);
+    }
+  }
+
+  let latest: Set<string> | undefined;
+  for (const message of messages) {
+    const batch = new Set<string>();
+    for (const part of message.parts) {
+      if (part.kind !== "tool-call") continue;
+      const meta = part.content && typeof part.content === "object" && !Array.isArray(part.content)
+        ? part.content as Record<string, unknown>
+        : undefined;
+      if (meta?.name !== "persist_artifact") continue;
+      const toolCallId = typeof meta.toolCallId === "string" ? meta.toolCallId : part.id;
+      if (completed.has(toolCallId)) batch.add(toolCallId);
+    }
+    if (batch.size > 0) latest = batch;
+  }
+  return latest;
 }
 
 export interface MessageDraftPartResolution {
