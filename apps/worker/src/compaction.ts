@@ -324,18 +324,41 @@ WHERE s.tenant_id = $1::uuid AND s.id = $2::uuid AND s.task_id = $3::uuid
     if (!session) throw new CompactionTerminalError("Session does not exist or does not belong to the requested task");
     const entries = await this.executor.query<EntryRow>(
       `
-SELECT entry_id, parent_entry_id, entry_type, sequence, payload, is_leaf_marker, created_at
-FROM session_entries
-WHERE tenant_id = $1::uuid AND session_id = $2::uuid
-ORDER BY sequence ASC
+WITH RECURSIVE leaf AS (
+  SELECT entry_id,parent_entry_id,entry_type,sequence,payload,is_leaf_marker,created_at
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC LIMIT 1
+), active_entries AS (
+  SELECT * FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id,parent.entry_type,parent.sequence,parent.payload,parent.is_leaf_marker,parent.created_at
+  FROM session_entries parent
+  JOIN active_entries child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
+SELECT * FROM active_entries ORDER BY sequence ASC
       `.trim(),
       [input.tenantId, input.sessionId],
     );
     const checkpoints = await this.executor.query<CheckpointRow>(
       `
+WITH RECURSIVE leaf AS (
+  SELECT entry_id,parent_entry_id FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC LIMIT 1
+), active_entries AS (
+  SELECT * FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id
+  FROM session_entries parent
+  JOIN active_entries child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
 SELECT id, kind, source_leaf_id, covered_entry_start, covered_entry_end, checkpoint, created_at
 FROM session_checkpoints
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND schema_version = 2
+  AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM active_entries))
 ORDER BY created_at ASC, id ASC
       `.trim(),
       [input.tenantId, input.sessionId],

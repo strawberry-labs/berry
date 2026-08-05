@@ -1,7 +1,17 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { BadRequestException, NotFoundException } from "@nestjs/common";
 import type { AgentSkill, McpServerSpec } from "@berry/local-agent";
-import { PersonalizationProfileSchema, type PersonalizationProfile, type PersonalMcpServer, type PersonalSkill, type PersonalSkillReview } from "@berry/shared";
+import {
+  DurableSecretEnvelopeSchema,
+  openDurableSecret,
+  PersonalizationProfileSchema,
+  sealDurableSecret,
+  type DurableSecretEnvelope,
+  type PersonalizationProfile,
+  type PersonalMcpServer,
+  type PersonalSkill,
+  type PersonalSkillReview,
+} from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 
@@ -16,11 +26,15 @@ export class PersonalCapabilitiesService {
   readonly #skills = new Map<string, PersonalSkill>();
   readonly #mcp = new Map<string, PersonalMcpServer>();
   readonly #secrets = new Map<string, string>();
+  readonly #secretEnvelopes = new Map<string, DurableSecretEnvelope>();
   readonly #oauth = new Map<string, { tenantId: string; userId: string; serverId: string; expiresAt: number; complete: boolean }>();
   readonly #profiles = new Map<string, PersonalizationProfile>();
   readonly #loaded = new Set<string>();
 
-  constructor(private readonly database?: CloudDatabaseService) {}
+  constructor(
+    private readonly database?: CloudDatabaseService,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+  ) {}
 
   async personalization(tenantId: string, userId: string): Promise<PersonalizationProfile> {
     await this.#load(tenantId, userId);
@@ -86,12 +100,22 @@ export class PersonalCapabilitiesService {
     const existing = input.id ? this.#server(input.id, tenantId, userId) : null;
     const now = new Date().toISOString();
     const credentialRef = input.auth === "none" ? null : existing?.credentialRef ?? `secret_mcp_${randomUUID()}`;
-    if (input.credential && credentialRef) this.#secrets.set(credentialRef, input.credential);
+    if (input.auth === "none" && existing?.credentialRef) {
+      this.#secrets.delete(existing.credentialRef);
+      this.#secretEnvelopes.delete(existing.credentialRef);
+    }
+    if (input.credential && credentialRef) {
+      this.#secrets.set(credentialRef, input.credential);
+      if (this.database) {
+        const key = this.#durableSecretKey();
+        this.#secretEnvelopes.set(credentialRef, await sealDurableSecret(input.credential, key));
+      }
+    }
     const server: PersonalMcpServer = { id: existing?.id ?? `mcp_${randomUUID()}`, tenantId, userId, name: input.name.trim(), url, transport: input.transport, auth: input.auth, credentialRef, credentialConfigured: credentialRef ? this.#secrets.has(credentialRef) : false, enabled: input.enabled ?? existing?.enabled ?? true, trusted: input.trusted ?? existing?.trusted ?? false, health: existing?.health ?? "unknown", toolCount: existing?.toolCount ?? 0, lastCheckedAt: existing?.lastCheckedAt ?? null, diagnostics: existing?.diagnostics ?? [], createdAt: existing?.createdAt ?? now, updatedAt: now };
     this.#mcp.set(server.id, server); await this.#persistMcp(server); return server;
   }
   async updateMcp(tenantId: string, userId: string, id: string, input: ToggleInput): Promise<PersonalMcpServer> { await this.#load(tenantId, userId); const current = this.#server(id, tenantId, userId); const next: PersonalMcpServer = { ...current, ...(input.enabled !== undefined ? { enabled: input.enabled } : {}), ...(input.trusted !== undefined ? { trusted: input.trusted } : {}), updatedAt: new Date().toISOString() }; this.#mcp.set(id, next); await this.#persistMcp(next); return next; }
-  async deleteMcp(tenantId: string, userId: string, id: string) { await this.#load(tenantId, userId); const server = this.#server(id, tenantId, userId); if (server.credentialRef) this.#secrets.delete(server.credentialRef); this.#mcp.delete(id); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM personal_mcp_servers WHERE id = $1 AND user_id = $2", [id, userId])); return { ok: true }; }
+  async deleteMcp(tenantId: string, userId: string, id: string) { await this.#load(tenantId, userId); const server = this.#server(id, tenantId, userId); if (server.credentialRef) { this.#secrets.delete(server.credentialRef); this.#secretEnvelopes.delete(server.credentialRef); } this.#mcp.delete(id); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM personal_mcp_servers WHERE id = $1 AND user_id = $2", [id, userId])); return { ok: true }; }
 
   async healthMcp(tenantId: string, userId: string, id: string): Promise<PersonalMcpServer> {
     await this.#load(tenantId, userId);
@@ -116,13 +140,21 @@ export class PersonalCapabilitiesService {
     const flow = this.#oauth.get(state);
     if (!flow || flow.expiresAt < Date.now() || flow.tenantId !== tenantId || flow.userId !== userId) throw new BadRequestException("OAuth state is invalid or expired");
     const server = this.#server(flow.serverId, tenantId, userId); if (!server.credentialRef) throw new BadRequestException("OAuth credential reference is missing");
-    this.#secrets.set(server.credentialRef, token); flow.complete = true; const next = { ...server, credentialConfigured: true, updatedAt: new Date().toISOString() }; this.#mcp.set(server.id, next); await this.#persistMcp(next); return next;
+    this.#secrets.set(server.credentialRef, token); if (this.database) this.#secretEnvelopes.set(server.credentialRef, await sealDurableSecret(token, this.#durableSecretKey())); flow.complete = true; const next = { ...server, credentialConfigured: true, updatedAt: new Date().toISOString() }; this.#mcp.set(server.id, next); await this.#persistMcp(next); return next;
   }
   pollOAuth(tenantId: string, userId: string, state: string) { const flow = this.#oauth.get(state); if (!flow || flow.expiresAt < Date.now() || flow.tenantId !== tenantId || flow.userId !== userId) throw new BadRequestException("OAuth state is invalid or expired"); return { status: flow.complete ? "complete" as const : "pending" as const, serverId: flow.complete ? flow.serverId : null }; }
 
   async runtime(tenantId: string, userId: string): Promise<{ skills: AgentSkill[]; mcpServers: McpServerSpec[] }> {
     const skills = (await this.listSkills(tenantId, userId)).filter((item) => item.enabled && item.trusted).map((item) => ({ name: item.name, description: item.description, content: item.content, filePath: `/personal-skills/${item.id}/SKILL.md`, scope: "registered" as const, disableModelInvocation: false, resources: [] }));
-    const mcpServers = (await this.listMcp(tenantId, userId)).filter((item) => item.enabled && item.trusted).map((item) => ({ id: item.id, name: item.name, transport: item.transport, command: null, args: [], url: item.url, env: {}, enabled: true, trusted: true, credentialKey: item.credentialRef, ...(item.credentialRef && this.#secrets.get(item.credentialRef) ? { credential: this.#secrets.get(item.credentialRef)! } : {}) }));
+    const enabledMcp = (await this.listMcp(tenantId, userId)).filter((item) => item.enabled && item.trusted);
+    for (const item of enabledMcp) {
+      if (item.auth !== "none" && item.credentialRef && !this.#secrets.has(item.credentialRef)) {
+        throw new BadRequestException(
+          `Credential for personal MCP server ${item.name} cannot be opened; configure BERRY_DURABLE_CAPABILITY_KEY consistently on the API and Worker`,
+        );
+      }
+    }
+    const mcpServers = enabledMcp.map((item) => ({ id: item.id, name: item.name, transport: item.transport, command: null, args: [], url: item.url, env: {}, enabled: true, trusted: true, credentialKey: item.credentialRef, ...(item.credentialRef && this.#secrets.get(item.credentialRef) ? { credential: this.#secrets.get(item.credentialRef)! } : {}) }));
     return { skills, mcpServers };
   }
 
@@ -137,11 +169,30 @@ export class PersonalCapabilitiesService {
       this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personalization_profiles WHERE user_id = $1 LIMIT 1", [userId])),
     ]);
     for (const row of skills) { const item = skillRow(row); this.#skills.set(item.id, item); }
-    for (const row of servers) { const item = mcpRow(row, false); this.#mcp.set(item.id, item); }
+    for (const row of servers) {
+      const envelope = durableEnvelope(row.credential_envelope);
+      const item = mcpRow(row, Boolean(envelope));
+      if (item.credentialRef && envelope) {
+        this.#secretEnvelopes.set(item.credentialRef, envelope);
+        const key = this.env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+        if (key) this.#secrets.set(item.credentialRef, await openDurableSecret(envelope, key));
+      }
+      this.#mcp.set(item.id, item);
+    }
     if (profiles[0]) this.#profiles.set(key, PersonalizationProfileSchema.parse({ nickname:str(profiles[0],"nickname"),occupation:str(profiles[0],"occupation"),about:str(profiles[0],"about"),customInstructions:str(profiles[0],"custom_instructions"),updatedAt:date(profiles[0],"updated_at") }));
   }
   async #persistSkill(skill: PersonalSkill) { if (!this.database) return; await this.database.withTenant(skill.tenantId, (db) => db.execute(`INSERT INTO personal_skills (id, tenant_id, user_id, name, description, content, enabled, trusted, source, source_url, version, hash, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,content=EXCLUDED.content,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,source=EXCLUDED.source,source_url=EXCLUDED.source_url,version=EXCLUDED.version,hash=EXCLUDED.hash,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [skill.id,skill.tenantId,skill.userId,skill.name,skill.description,skill.content,skill.enabled,skill.trusted,skill.source,skill.sourceUrl,skill.version,skill.hash,JSON.stringify(skill.diagnostics),skill.createdAt,skill.updatedAt])); }
-  async #persistMcp(server: PersonalMcpServer) { if (!this.database) return; await this.database.withTenant(server.tenantId, (db) => db.execute(`INSERT INTO personal_mcp_servers (id, tenant_id, user_id, name, url, transport, auth, credential_ref, enabled, trusted, health, tool_count, last_checked_at, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::timestamptz,$14::jsonb,$15::timestamptz,$16::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,transport=EXCLUDED.transport,auth=EXCLUDED.auth,credential_ref=EXCLUDED.credential_ref,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,health=EXCLUDED.health,tool_count=EXCLUDED.tool_count,last_checked_at=EXCLUDED.last_checked_at,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [server.id,server.tenantId,server.userId,server.name,server.url,server.transport,server.auth,server.credentialRef,server.enabled,server.trusted,server.health,server.toolCount,server.lastCheckedAt,JSON.stringify(server.diagnostics),server.createdAt,server.updatedAt])); }
+  async #persistMcp(server: PersonalMcpServer) { if (!this.database) return; const envelope = server.credentialRef ? this.#secretEnvelopes.get(server.credentialRef) : undefined; await this.database.withTenant(server.tenantId, (db) => db.execute(`INSERT INTO personal_mcp_servers (id, tenant_id, user_id, name, url, transport, auth, credential_ref, credential_envelope, enabled, trusted, health, tool_count, last_checked_at, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14::timestamptz,$15::jsonb,$16::timestamptz,$17::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,transport=EXCLUDED.transport,auth=EXCLUDED.auth,credential_ref=EXCLUDED.credential_ref,credential_envelope=EXCLUDED.credential_envelope,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,health=EXCLUDED.health,tool_count=EXCLUDED.tool_count,last_checked_at=EXCLUDED.last_checked_at,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [server.id,server.tenantId,server.userId,server.name,server.url,server.transport,server.auth,server.credentialRef,envelope ? JSON.stringify(envelope) : null,server.enabled,server.trusted,server.health,server.toolCount,server.lastCheckedAt,JSON.stringify(server.diagnostics),server.createdAt,server.updatedAt])); }
+
+  #durableSecretKey(): string {
+    const key = this.env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+    if (!key) {
+      throw new BadRequestException(
+        "Authenticated MCP credentials require BERRY_DURABLE_CAPABILITY_KEY when database persistence is enabled",
+      );
+    }
+    return key;
+  }
 }
 
 function owns(item: { tenantId: string; userId: string }, tenantId: string, userId: string) { return item.tenantId === tenantId && item.userId === userId; }
@@ -157,3 +208,4 @@ function date(row: Record<string, unknown>, key: string) { const result = value(
 function jsonStrings(row: Record<string, unknown>, key: string) { const result = value(row, key); return Array.isArray(result) ? result.map(String) : typeof result === "string" ? JSON.parse(result) as string[] : []; }
 function skillRow(row: Record<string, unknown>): PersonalSkill { return { id:str(row,"id"),tenantId:str(row,"tenant_id"),userId:str(row,"user_id"),name:str(row,"name"),description:str(row,"description"),content:str(row,"content"),enabled:bool(row,"enabled"),trusted:bool(row,"trusted"),source:str(row,"source") as PersonalSkill["source"],sourceUrl:nullable(row,"source_url"),version:nullable(row,"version"),hash:str(row,"hash"),diagnostics:jsonStrings(row,"diagnostics"),createdAt:date(row,"created_at"),updatedAt:date(row,"updated_at")}; }
 function mcpRow(row: Record<string, unknown>, credentialConfigured: boolean): PersonalMcpServer { return { id:str(row,"id"),tenantId:str(row,"tenant_id"),userId:str(row,"user_id"),name:str(row,"name"),url:str(row,"url"),transport:str(row,"transport") as PersonalMcpServer["transport"],auth:str(row,"auth") as PersonalMcpServer["auth"],credentialRef:nullable(row,"credential_ref"),credentialConfigured,enabled:bool(row,"enabled"),trusted:bool(row,"trusted"),health:str(row,"health") as PersonalMcpServer["health"],toolCount:Number(value(row,"tool_count") ?? 0),lastCheckedAt:nullable(row,"last_checked_at"),diagnostics:jsonStrings(row,"diagnostics"),createdAt:date(row,"created_at"),updatedAt:date(row,"updated_at")}; }
+function durableEnvelope(value: unknown): DurableSecretEnvelope | null { try { const parsed = DurableSecretEnvelopeSchema.safeParse(typeof value === "string" ? JSON.parse(value) : value); return parsed.success ? parsed.data : null; } catch { return null; } }

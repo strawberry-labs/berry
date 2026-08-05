@@ -12,6 +12,7 @@ export const ORGANIZATION_PROVIDER_RUNTIME = Symbol("ORGANIZATION_PROVIDER_RUNTI
 export type ResolvedOrganizationProvider = {
   provider: BerryModelProviderInfo;
   apiKey: string | undefined;
+  credentialRef: string | null;
 };
 
 export interface OrganizationProviderRuntime {
@@ -61,6 +62,7 @@ export class DefaultOrganizationProviderRuntime implements OrganizationProviderR
     return {
       provider: providerInfo(selected, policies, input.model),
       apiKey: resolveCredential(selected, this.env),
+      credentialRef: selected.credentialRef,
     };
   }
 

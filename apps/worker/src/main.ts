@@ -52,6 +52,19 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
       ttlSeconds: Number(env.BERRY_SANDBOX_TTL_SECONDS ?? 3600),
       maxInputBytes: durableConfig.sandboxInputMaxBytes,
+      ...(env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim() && env.BERRY_ROUTER_IMAGE_MODEL?.trim()
+        ? {
+            imageGeneration: {
+              endpoint: env.BERRY_ROUTER_IMAGE_GENERATIONS_URL?.trim()
+                || joinRouterUrl(env.BERRY_ROUTER_INFERENCE_BASE_URL, env.BERRY_ROUTER_IMAGE_GENERATIONS_PATH || "/images/generations"),
+              editsEndpoint: env.BERRY_ROUTER_IMAGE_EDITS_URL?.trim()
+                || joinRouterUrl(env.BERRY_ROUTER_INFERENCE_BASE_URL, env.BERRY_ROUTER_IMAGE_EDITS_PATH || "/images/edits"),
+              ...(env.BERRY_ROUTER_API_KEY?.trim() ? { apiKey: env.BERRY_ROUTER_API_KEY.trim() } : {}),
+              model: env.BERRY_ROUTER_IMAGE_MODEL.trim(),
+              responseFormat: env.BERRY_ROUTER_IMAGE_RESPONSE_FORMAT === "url" ? "url" as const : "b64_json" as const,
+            },
+          }
+        : {}),
     },
   );
   const knowledge = new KnowledgeProcessor({
@@ -154,6 +167,10 @@ function positiveInteger(value: string | undefined): number | undefined {
   if (!value?.trim()) return undefined;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function joinRouterUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

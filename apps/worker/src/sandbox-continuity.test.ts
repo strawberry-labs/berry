@@ -75,11 +75,53 @@ describe("SandboxContinuityManager", () => {
     }))).resolves.toMatchObject({
       output: { path: "/workspace/result.txt", sizeBytes: 4 },
     });
+    await expect(manager.execute(snapshot(), toolStep("edit_file", {
+      path: "/workspace/file.txt",
+      old_string: "file",
+      new_string: "updated",
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace/file.txt", replacements: 1 },
+    });
+    await expect(manager.execute(snapshot(), toolStep("apply_patch", {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: file.txt",
+        "@@",
+        "-file contents",
+        "+patched contents",
+        "*** End Patch",
+      ].join("\n"),
+    }))).resolves.toMatchObject({
+      output: expect.objectContaining({ updated: ["file.txt"] }),
+    });
+    await expect(manager.execute(snapshot(), toolStep("glob", {
+      path: "/workspace",
+      pattern: "**/*.ts",
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace", pattern: "**/*.ts", files: ["command output"] },
+    });
+    await expect(manager.execute(snapshot(), toolStep("grep", {
+      path: "/workspace",
+      pattern: "needle",
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace", pattern: "needle", matches: "command output" },
+    });
+    for (const toolName of ["git_status", "git_diff", "git_log", "git_checkpoint"]) {
+      await expect(manager.execute(snapshot(), toolStep(toolName, {
+        ...(toolName === "git_checkpoint" ? { message: "Checkpoint" } : {}),
+      }))).resolves.toMatchObject({
+        output: { command: toolName, output: "command output" },
+      });
+    }
     await expect(manager.execute(snapshot(), toolStep("run_command", {
       command: "printf done",
     }))).resolves.toMatchObject({
       output: { command: "printf done", exitCode: 0, output: "command output" },
     });
+    expect(provider.files.write).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/workspace/file.txt",
+      content: "updated contents",
+    }));
   });
 
   it("reads managed skill references without making the managed tree writable", async () => {
@@ -329,6 +371,185 @@ describe("SandboxContinuityManager", () => {
     await expect(manager.execute(snapshot(), toolStep("persist_artifact", {
       path: "/workspace/tmp/private.pdf",
     }))).rejects.toThrow("Artifacts must be created under /workspace/outputs");
+  });
+
+  it("automatically publishes unpersisted files from the output directory", async () => {
+    const bytes = Buffer.from("automatic artifact");
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          content: bytes.toString("base64"),
+          size_bytes: bytes.byteLength,
+          mtime: null,
+        })),
+        write: vi.fn(),
+        list: vi.fn(async () => ({
+          path: "/workspace/outputs",
+          entries: [{
+            path: "/workspace/outputs/summary.txt",
+            type: "file",
+            size_bytes: bytes.byteLength,
+            mtime: null,
+          }],
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(async (input: { fileId: string; name: string; mediaType: string; sizeBytes: number; objectKey: string }) => ({
+        fileId: input.fileId,
+        name: input.name,
+        mediaType: input.mediaType,
+        sizeBytes: input.sizeBytes,
+        objectKey: input.objectKey,
+      })),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(async (key: string) => ({ bucket: "berry", key, etag: "etag" })),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-artifact";
+    current.sandboxProvider = "e2b";
+    current.sandboxState = "running";
+    current.steps = [];
+
+    await expect(manager.finalize(current)).resolves.toEqual([
+      expect.objectContaining({
+        output: expect.objectContaining({
+          artifact: expect.objectContaining({ name: "summary.txt", mediaType: "text/plain" }),
+        }),
+      }),
+    ]);
+    expect(objects.putArtifact).toHaveBeenCalledWith(
+      expect.stringContaining("/auto/"),
+      bytes,
+      "text/plain",
+    );
+    expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({
+      sourcePath: "/workspace/outputs/summary.txt",
+    }));
+  });
+
+  it("generates, stages, and registers an admitted durable image", async () => {
+    const bytes = Buffer.from([137, 80, 78, 71]);
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({
+        sandbox_id: "sandbox-image",
+        provider: "e2b",
+        status: "running",
+      })),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(),
+        write: vi.fn(async (input: { path: string; content: string }) => ({
+          path: input.path,
+          size_bytes: Buffer.from(input.content, "base64").byteLength,
+          mtime: null,
+        })),
+        list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(async (input: { fileId: string; name: string; mediaType: string; sizeBytes: number; objectKey: string }) => ({
+        fileId: input.fileId,
+        name: input.name,
+        mediaType: input.mediaType,
+        sizeBytes: input.sizeBytes,
+        objectKey: input.objectKey,
+      })),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(async (key: string) => ({ bucket: "berry", key, etag: "etag" })),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      imageGeneration: {
+        endpoint: "https://images.example.test/v1/images/generations",
+        editsEndpoint: "https://images.example.test/v1/images/edits",
+        apiKey: "test-key",
+        model: "gpt-image-1",
+        responseFormat: "b64_json",
+      },
+    });
+    const current = snapshot();
+    current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
+    const originalFetch = globalThis.fetch;
+    const imageFetch = vi.fn(async () => new Response(JSON.stringify({
+      model: "gpt-image-1",
+      data: [{ b64_json: bytes.toString("base64"), revised_prompt: "A revised prompt" }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    globalThis.fetch = imageFetch;
+    const imageStep = {
+      ...toolStep("create_image", {
+        prompt: "A berry icon",
+        title: "Berry icon",
+        aspect_ratio: "16:9",
+      }),
+      retryClass: "non_idempotent_manual" as const,
+      idempotencyKey: "durable-image-step-key",
+    };
+
+    try {
+      await expect(manager.execute(current, imageStep)).resolves.toMatchObject({
+        output: {
+          image: {
+            fileId: "00000000-0000-7000-8000-000000000010",
+            title: "Berry icon",
+            width: 1536,
+            height: 1024,
+            revisedPrompt: "A revised prompt",
+          },
+          visionPath: "/workspace/outputs/Berry icon.png",
+        },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(globalThis.fetch).toBe(originalFetch);
+    expect(imageFetch).toHaveBeenCalledWith(
+      "https://images.example.test/v1/images/generations",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Idempotency-Key": "durable-image-step-key" }),
+      }),
+    );
+    expect(provider.files.write).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/workspace/outputs/Berry icon.png",
+      content: bytes.toString("base64"),
+      encoding: "base64",
+    }));
+    expect(objects.putArtifact).toHaveBeenCalledWith(
+      expect.stringContaining("/original/Berry icon.png"),
+      bytes,
+      "image/png",
+    );
+    expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({
+      origin: "image_generation",
+      sourcePath: "/workspace/outputs/Berry icon.png",
+    }));
   });
 
   it("stages message-associated input files before the first tool runs", async () => {

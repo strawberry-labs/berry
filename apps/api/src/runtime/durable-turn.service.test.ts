@@ -169,6 +169,165 @@ describe("DurableTurnService", () => {
     expect(executions.some((sql) => sql.startsWith("INSERT INTO messages"))).toBe(false);
   });
 
+  it("rewinds the active journal leaf without deleting the abandoned branch", async () => {
+    const parentEntryId = "00000000-0000-7000-8000-000000000009";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT parent_entry_id FROM session_entries")) {
+          return [{ parent_entry_id: parentEntryId }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.rewindJournalBefore(tenantId, sessionId, userId);
+
+    const journalExecutions = executions.filter(({ sql }) =>
+      sql.includes("session_entries") || sql.includes("UPDATE sessions SET runtime_metadata")
+    );
+    expect(journalExecutions).toHaveLength(2);
+    expect(journalExecutions[0]).toMatchObject({
+      sql: expect.stringContaining("SET is_leaf_marker=COALESCE(entry_id=$3,false)"),
+      params: [tenantId, sessionId, parentEntryId],
+    });
+    expect(journalExecutions[1]).toMatchObject({
+      sql: expect.stringContaining("jsonb_build_object('leafId',$3::text)"),
+      params: [tenantId, sessionId, parentEntryId],
+    });
+    expect(executions.every(({ sql }) => !sql.includes("DELETE FROM session_entries"))).toBe(true);
+  });
+
+  it("backfills a pre-rollout edit target before rewinding its durable branch", async () => {
+    const previousMessageId = "00000000-0000-7000-8000-000000000008";
+    const durableRootId = "00000000-0000-7000-8000-000000000009";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const queries: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        queries.push(sql);
+        if (sql.includes("LEFT JOIN message_parts p")) {
+          return [
+            {
+              message_id: previousMessageId,
+              sequence_id: 1,
+              role: "user",
+              status: "complete",
+              created_at: "2026-07-01T00:00:00.000Z",
+              type: "text",
+              content: "Earlier question",
+              ordinal: 0,
+            },
+            {
+              message_id: userId,
+              sequence_id: 2,
+              role: "user",
+              status: "complete",
+              created_at: "2026-07-02T00:00:00.000Z",
+              type: "text",
+              content: "Edited question",
+              ordinal: 0,
+            },
+          ] as T[];
+        }
+        if (sql.includes("COALESCE(MIN(sequence),0)")) {
+          return [{
+            minimum: 1,
+            maximum: 2,
+            first_created_at: "2026-08-01T00:00:00.000Z",
+            leaf_id: durableRootId,
+            root_id: durableRootId,
+          }] as T[];
+        }
+        if (sql.includes("SELECT parent_entry_id FROM session_entries")) {
+          return [{ parent_entry_id: previousMessageId }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.rewindJournalBefore(tenantId, sessionId, userId);
+
+    expect(queries[0]).toContain("LEFT JOIN message_parts p");
+    expect(queries[0]).toContain("tool_result_projection.content->>'toolCallId'");
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("INSERT INTO session_entries"),
+      params: expect.arrayContaining([userId, previousMessageId]),
+    }));
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("SET is_leaf_marker=COALESCE(entry_id=$3,false)"),
+      params: [tenantId, sessionId, previousMessageId],
+    }));
+  });
+
+  it("links pre-rollout messages into the active journal ancestry", async () => {
+    const historicalMessageId = "00000000-0000-7000-8000-000000000009";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("FROM turn_runs") && sql.includes("state NOT IN")) return [] as T[];
+        if (sql.includes("AND id=$4::uuid AND role='user'")) return [{ id: userId }] as T[];
+        if (sql.includes("LEFT JOIN message_parts")) {
+          return [{
+            message_id: historicalMessageId,
+            sequence_id: 1,
+            role: "assistant",
+            status: "complete",
+            created_at: "2026-07-01T00:00:00.000Z",
+            type: "text",
+            content: "Earlier conversation",
+            ordinal: 0,
+          }] as T[];
+        }
+        if (sql.includes("COALESCE(MIN(sequence),0)")) {
+          return [{
+            minimum: 1,
+            maximum: 1,
+            first_created_at: "2026-08-01T00:00:00.000Z",
+            leaf_id: userId,
+            root_id: userId,
+          }] as T[];
+        }
+        if (sql.includes("SELECT entry_id FROM session_entries") && sql.includes("entry_id=$3")) {
+          return [{ entry_id: userId }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "request_backfill",
+      requestMessageId: userId,
+      input: "Current message",
+      runtimeRequest: {},
+      groundingContext: {},
+    });
+
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("SET parent_entry_id=$4"),
+      params: [tenantId, sessionId, userId, historicalMessageId],
+    }));
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("INSERT INTO session_entries"),
+      params: expect.arrayContaining([historicalMessageId, 0]),
+    }));
+  });
+
   it("replays only the open model segment while keeping the latest durable cursor", async () => {
     const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {

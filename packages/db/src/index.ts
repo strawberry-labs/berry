@@ -2666,11 +2666,12 @@ CREATE INDEX IF NOT EXISTS personal_skills_owner_idx ON personal_skills (tenant_
 CREATE TABLE IF NOT EXISTS personal_mcp_servers (
   id text PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, user_id text NOT NULL,
   name text NOT NULL, url text NOT NULL, transport text NOT NULL CHECK (transport IN ('http-sse', 'streamable-http')),
-  auth text NOT NULL CHECK (auth IN ('none', 'bearer', 'oauth')), credential_ref text,
+  auth text NOT NULL CHECK (auth IN ('none', 'bearer', 'oauth')), credential_ref text, credential_envelope jsonb,
   enabled boolean NOT NULL DEFAULT true, trusted boolean NOT NULL DEFAULT false,
   health text NOT NULL DEFAULT 'unknown', tool_count integer NOT NULL DEFAULT 0, last_checked_at timestamptz,
   diagnostics jsonb NOT NULL DEFAULT '[]'::jsonb, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE personal_mcp_servers ADD COLUMN IF NOT EXISTS credential_envelope jsonb;
 CREATE INDEX IF NOT EXISTS personal_mcp_servers_owner_idx ON personal_mcp_servers (tenant_id, user_id);
 ALTER TABLE personal_skills ENABLE ROW LEVEL SECURITY; ALTER TABLE personal_skills FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS personal_skills_tenant_isolation ON personal_skills;

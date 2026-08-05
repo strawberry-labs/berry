@@ -135,11 +135,19 @@ router:
   chatCompletionsPath: /chat/completions
   defaultModel: berry/auto
   modelsJson: "[]"
+  imageGenerationsUrl: ""
+  imageGenerationsPath: /images/generations
+  imageEditsUrl: ""
+  imageEditsPath: /images/edits
+  imageModel: ""
+  imageResponseFormat: b64_json
+  imageCostMicros: "0"
   organizationProviderAllowedHosts: ""
   organizationProviderAllowInsecureHttp: "false"
   existingSecret: berry-router
   apiKeyKey: BERRY_ROUTER_API_KEY
   organizationProviderCredentialsKey: BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON
+  durableCapabilityKeyKey: BERRY_DURABLE_CAPABILITY_KEY
 
 sandbox:
   provider: e2b

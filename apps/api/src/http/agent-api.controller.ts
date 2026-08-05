@@ -7,6 +7,8 @@ import {
   AttachmentInputSchema,
   ContextStatsSchema,
   ConversationKindSchema,
+  DURABLE_BASE_BUILT_IN_TOOLS,
+  DurableTurnRuntimeRequestSchema,
   IMAGE_ASPECT_RATIO_DIMENSIONS,
   JsonValueSchema,
   messageAttachmentContent,
@@ -17,16 +19,24 @@ import {
   QuestionAnswerSchema,
   ReasoningLevelSchema,
   resolveModelCapabilities,
+  sealDurableSecret,
   TaskStatusSchema,
   TurnStateSchema,
   WorkspaceKindSchema,
   type AgentStreamEvent,
   type ConversationKind,
+  type DurableMcpServer,
+  type DurableProviderTransport,
   type ImageGenerationRequest,
   type JsonValue,
   type Message,
 } from "@berry/shared";
-import type { ApprovalDecisionKind, StartTurnOptions } from "@berry/local-agent";
+import type {
+  ApprovalDecisionKind,
+  BerryModelProviderInfo,
+  McpServerSpec,
+  StartTurnOptions,
+} from "@berry/local-agent";
 import { z } from "zod";
 import { Observable } from "rxjs";
 import { SessionHostService } from "../runtime/session-host.service.ts";
@@ -813,10 +823,74 @@ export class AgentApiController {
     } | undefined;
     let assistantErrorPersisted = false;
     if (request.replaceFromMessageId) {
-      await this.rewindForEdit(sessionId, request.replaceFromMessageId, request.input ?? "", request.attachments);
+      await this.rewindForEdit(tenantId, sessionId, request.replaceFromMessageId, request.input ?? "", request.attachments);
     }
     if (this.durableTurns.enabled) {
       try {
+        const imageInfo = this.runtimeConfig.imageGenerationInfo();
+        const imageDecision = imageInfo
+          ? await this.modelGovernance.resolve({
+              tenantId,
+              mode,
+              providerId: imageInfo.providerId,
+              model: imageInfo.model,
+              userId,
+              departmentId,
+            })
+          : null;
+        const [provider, mcpServers] = await Promise.all([
+          durableProviderTransport(
+            governedRequest.provider,
+            resolvedRuntime.apiKey,
+            resolvedRuntime.credentialRef,
+          ),
+          Promise.all(governedRequest.mcpServers
+            .filter((server) => server.enabled && server.trusted)
+            .map((server) => durableMcpServer(server))),
+        ]);
+        const builtInTools = [
+          ...DURABLE_BASE_BUILT_IN_TOOLS,
+          ...(imageInfo && imageDecision?.allowed ? ["create_image" as const] : []),
+          ...(governedRequest.extraSkills.some((skill) => !skill.disableModelInvocation)
+            ? ["activate_skill" as const]
+            : []),
+        ];
+        const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
+          capabilityVersion: 1,
+          providerId,
+          provider,
+          model: governedRequest.model ?? null,
+          conversationKind: mode,
+          workspacePath: request.workspacePath,
+          workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+          permissionMode: governedRequest.permissionMode ?? session.permissionMode,
+          reasoning: governedRequest.reasoning ?? "off",
+          continueInterruptedTurn: request.continueInterruptedTurn === true,
+          maxTokens: governedRequest.maxTokens ?? 8_000,
+          contextWindowTokens,
+          modelPricing: pricingSnapshot,
+          networkPolicy: governedRequest.networkPolicy,
+          builtInTools,
+          ...(imageInfo && imageDecision?.allowed ? { imageGeneration: imageInfo } : {}),
+          mcpServers,
+          extraSkills: governedRequest.extraSkills.map((skill) => ({
+            name: skill.name,
+            description: skill.description,
+            content: skill.content,
+            filePath: skill.filePath,
+            disableModelInvocation: skill.disableModelInvocation,
+            resources: skill.resources ?? [],
+          })),
+          attachments: (request.attachments ?? []).map((attachment) => ({
+            ...(attachment.id ? { id: attachment.id } : {}),
+            ...(attachment.fileId ? { fileId: attachment.fileId } : {}),
+            name: attachment.name,
+            mediaType: attachment.mediaType,
+            size: attachment.size,
+            ...(attachment.sourceKind !== undefined ? { sourceKind: attachment.sourceKind } : {}),
+          })),
+          ...(portableCheckpoint ? { portableCheckpoint } : {}),
+        });
         const admitted = await this.durableTurns.admit({
           tenantId,
           userId: httpRequest.auth!.user.id,
@@ -828,38 +902,7 @@ export class AgentApiController {
           input: request.continueInterruptedTurn ? "" : request.input ?? "",
           ...(request.attachments ? { attachments: request.attachments } : {}),
           ...(request.continueInterruptedTurn ? { continueInterruptedTurn: true } : {}),
-          runtimeRequest: {
-            providerId,
-            model: governedRequest.model ?? null,
-            workspacePath: request.workspacePath,
-            workspaceId: governedRequest.workspaceId ?? task.workspaceId,
-            permissionMode: governedRequest.permissionMode ?? session.permissionMode,
-            reasoning: governedRequest.reasoning ?? "off",
-            continueInterruptedTurn: request.continueInterruptedTurn === true,
-            maxTokens: governedRequest.maxTokens ?? 8_000,
-            contextWindowTokens,
-            modelPricing: pricingSnapshot,
-            networkPolicy: governedRequest.networkPolicy,
-            mcpServerIds: governedRequest.mcpServers
-              .filter((server) => server.enabled && server.trusted)
-              .map((server) => server.id),
-            extraSkills: governedRequest.extraSkills.map((skill) => ({
-              name: skill.name,
-              description: skill.description,
-              content: skill.content,
-              filePath: skill.filePath,
-              disableModelInvocation: skill.disableModelInvocation,
-            })),
-            attachments: (request.attachments ?? []).map((attachment) => ({
-              id: attachment.id,
-              fileId: attachment.fileId,
-              name: attachment.name,
-              mediaType: attachment.mediaType,
-              size: attachment.size,
-              sourceKind: attachment.sourceKind,
-            })),
-            ...(portableCheckpoint ? { portableCheckpoint } : {}),
-          },
+          runtimeRequest,
           groundingContext: groundingContext as unknown as JsonValue,
         });
         return { turnId: admitted.runId, sessionId };
@@ -1139,6 +1182,7 @@ export class AgentApiController {
    * fresh turn from that point — the same flow the desktop host runs.
    */
   private async rewindForEdit(
+    tenantId: string,
     sessionId: string,
     replaceFromMessageId: string,
     input: string,
@@ -1154,6 +1198,9 @@ export class AgentApiController {
         // The runtime session may not exist after a server restart; the turn
         // that follows starts from the truncated projection either way.
         await Promise.resolve(this.sessionHost.rewindForEdit(sessionId, ordinal)).catch(() => undefined);
+      }
+      if (this.durableTurns.enabled) {
+        await this.durableTurns.rewindJournalBefore(tenantId, sessionId, replaceFromMessageId);
       }
       await this.store.deleteMessagesFrom(sessionId, replaceFromMessageId);
     }
@@ -1433,6 +1480,86 @@ async function imageToolResult(result: {
     ...(revisedPrompt ? { revisedPrompt } : {}),
     data,
   };
+}
+
+async function durableProviderTransport(
+  provider: BerryModelProviderInfo,
+  apiKey: string | undefined,
+  credentialRef: string | undefined,
+): Promise<DurableProviderTransport> {
+  const secret = await durableCredential(apiKey, credentialRef);
+  const safeHeaders = provider.headers
+    ? Object.fromEntries(Object.entries(provider.headers).filter(([name]) =>
+        !["authorization", "proxy-authorization", "x-api-key"].includes(name.toLowerCase())
+      ))
+    : undefined;
+  return {
+    id: provider.id,
+    name: provider.name,
+    kind: provider.kind,
+    baseUrl: provider.baseUrl,
+    defaultModel: provider.defaultModel,
+    apiType: provider.apiType ?? "openai-chat-completions",
+    ...(provider.endpointPath !== undefined ? { endpointPath: provider.endpointPath } : {}),
+    ...(provider.modelsPath !== undefined ? { modelsPath: provider.modelsPath } : {}),
+    authType: provider.authType ?? "bearer",
+    ...(safeHeaders && Object.keys(safeHeaders).length > 0 ? { headers: safeHeaders } : {}),
+    ...(provider.capabilities ? { capabilities: provider.capabilities as unknown as Record<string, unknown> } : {}),
+    models: (provider.models ?? []) as unknown as Record<string, unknown>[],
+    ...(provider.completionTransport ? { completionTransport: provider.completionTransport } : {}),
+    ...(provider.completionFallback ? { completionFallback: provider.completionFallback } : {}),
+    ...secret,
+  };
+}
+
+async function durableMcpServer(server: McpServerSpec): Promise<DurableMcpServer> {
+  const secret = await durableCredential(server.credential ?? undefined, server.credentialKey ?? undefined);
+  const environment = server.transport === "stdio" && Object.keys(server.env).length > 0
+    ? await durableEncryptedSecret(JSON.stringify(server.env), "stdio MCP environment")
+    : undefined;
+  return {
+    id: server.id,
+    name: server.name,
+    transport: server.transport,
+    command: server.command,
+    args: server.args,
+    url: server.url,
+    // Stdio values frequently contain secrets, so only their encrypted
+    // envelope may cross the API/Worker durability boundary.
+    env: {},
+    ...(environment ? { environment } : {}),
+    enabled: server.enabled,
+    trusted: server.trusted,
+    credentialRef: secret.credentialRef ?? null,
+    ...(server.cachedTools ? { cachedTools: server.cachedTools } : {}),
+    ...(secret.credential ? { credential: secret.credential } : {}),
+  };
+}
+
+async function durableCredential(
+  secret: string | undefined,
+  credentialRef: string | undefined,
+): Promise<{ credentialRef?: string; credential?: Awaited<ReturnType<typeof sealDurableSecret>> }> {
+  if (!secret) return credentialRef ? { credentialRef } : {};
+  const encryptionKey = process.env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+  if (encryptionKey) {
+    return {
+      ...(credentialRef ? { credentialRef } : {}),
+      credential: await sealDurableSecret(secret, encryptionKey),
+    };
+  }
+  if (credentialRef) return { credentialRef };
+  throw new BadRequestException(
+    "Durable custom credentials require BERRY_DURABLE_CAPABILITY_KEY or a server-owned credential reference",
+  );
+}
+
+async function durableEncryptedSecret(secret: string, label: string) {
+  const encryptionKey = process.env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+  if (!encryptionKey) {
+    throw new BadRequestException(`Durable ${label} requires BERRY_DURABLE_CAPABILITY_KEY`);
+  }
+  return sealDurableSecret(secret, encryptionKey);
 }
 
 function normalizedGeneratedImages(output: Record<string, unknown> | null): Array<{

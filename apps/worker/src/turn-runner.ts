@@ -1,15 +1,31 @@
 import { randomUUID } from "node:crypto";
 import {
   DEFAULT_COMPACTION_SETTINGS,
+  formatSkillInvocation,
+  formatSkillsForSystemPrompt,
   shouldCompact,
 } from "@berry/harness";
 import {
+  conversationProfilePrompt,
+  createBerryModel,
+  createProviderStreamFn,
+  type BerryModelProviderInfo,
+  type BerryStreamFn,
+} from "@berry/local-agent";
+import {
   AgentStreamEventSchema,
+  DURABLE_BASE_BUILT_IN_TOOLS,
+  DurableTurnRuntimeRequestSchema,
+  openDurableSecret,
   latestAssistantStreamDraft,
   MessageDraftSchema,
   PromptManifestSchema,
   SessionCheckpointV2Schema,
   type AgentStreamEvent,
+  type DurableBuiltInToolName,
+  type DurableProviderTransport,
+  type DurableSkill,
+  type DurableTurnRuntimeRequest,
   type JsonValue,
   type PromptCachingCapabilities,
   type PromptManifest,
@@ -167,6 +183,16 @@ export interface DurableTurnMutation {
     summary?: string;
     durationMs?: number;
   };
+  toolResultMessages?: ReadonlyArray<{
+    id: string;
+    toolCallId: string;
+    name: string;
+    input: JsonValue;
+    status: "completed" | "failed" | "denied";
+    output?: JsonValue;
+    summary?: string;
+    durationMs?: number;
+  }>;
   toolCalls?: ReadonlyArray<{
     id: string;
     stepId: string;
@@ -278,6 +304,7 @@ export interface DurableTurnToolExecutor {
   modelContent?(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
   execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult>;
+  finalize?(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]>;
 }
 
 export class DurableTurnRunner {
@@ -461,7 +488,7 @@ export class DurableTurnRunner {
         this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
         this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
       ]);
-      const definitions = [...DURABLE_TOOL_DEFINITIONS, ...extensionTools];
+      const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
       const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
       try {
         return await this.model.call(snapshot, step, {
@@ -762,7 +789,7 @@ export class DurableTurnRunner {
           ],
           events: [{ kind: "tool.end", toolCallId, status: "denied", summary: `Approval ${approval.status}` }],
           toolResultMessage: {
-            id: randomUUID(),
+            id: entryId,
             toolCallId,
             name: toolName,
             input: (step.input.arguments ?? {}) as JsonValue,
@@ -853,7 +880,15 @@ export class DurableTurnRunner {
     const toolStartedAt = Date.now();
     let result: TurnToolResult;
     try {
-      result = builtInPresentationToolResult(toolName, step.input.arguments)
+      if (toolName === "create_image") {
+        const imageCost = durableRuntimeRequest(snapshot)?.imageGeneration?.costMicros;
+        if (!imageCost) throw new Error("Image generation was not admitted for this turn");
+        const imageBudget = await this.repository.reserveNextModelCall?.(snapshot, imageCost);
+        if (imageBudget && !imageBudget.allowed) {
+          throw new Error(imageBudget.reason ?? "Image generation was blocked by the spend limit");
+        }
+      }
+      result = builtInPresentationToolResult(snapshot, toolName, step.input.arguments)
         ?? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
     } catch (error) {
       if (error instanceof DurableTurnRetryableError) {
@@ -887,7 +922,7 @@ export class DurableTurnRunner {
           summary: message.slice(0, 2_000),
         }],
         toolResultMessage: {
-          id: randomUUID(),
+          id: entryId,
           toolCallId,
           name: toolName,
           input: (step.input.arguments ?? {}) as JsonValue,
@@ -943,14 +978,28 @@ export class DurableTurnRunner {
           idempotencyKey: `${snapshot.id}:model:${iteration}`,
         }] : []),
       ],
-      events: [{
-        kind: "tool.end",
-        toolCallId,
-        status: "completed",
-        summary: result.summary.slice(0, 2_000),
-      }],
+      events: [
+        {
+          kind: "tool.end",
+          toolCallId,
+          status: "completed",
+          summary: result.summary.slice(0, 2_000),
+        },
+        ...(toolName === "create_image" && durableRuntimeRequest(snapshot)?.imageGeneration
+          ? [AgentStreamEventSchema.parse({
+              kind: "usage",
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+              costRawMicros: durableRuntimeRequest(snapshot)!.imageGeneration!.costMicros,
+              model: durableRuntimeRequest(snapshot)!.imageGeneration!.model,
+              servedModel: durableRuntimeRequest(snapshot)!.imageGeneration!.model,
+              servedProvider: durableRuntimeRequest(snapshot)!.imageGeneration!.providerId,
+            })]
+          : []),
+      ],
       toolResultMessage: {
-        id: randomUUID(),
+        id: entryId,
         toolCallId,
         name: toolName,
         input: (step.input.arguments ?? {}) as JsonValue,
@@ -972,7 +1021,7 @@ export class DurableTurnRunner {
             role: "toolResult",
             toolCallId,
             toolName: stringValue(step.input.toolName) ?? step.type.slice(5),
-            content: [{ type: "text", text: JSON.stringify(result.output) }],
+            content: [{ type: "text", text: durableToolResultText(result.output) }],
             isError: false,
             timestamp: Date.now(),
           },
@@ -988,6 +1037,10 @@ export class DurableTurnRunner {
   }
 
   private async finalize(snapshot: DurableTurnSnapshot): Promise<void> {
+    const finalizedArtifacts = await this.withHeartbeat(
+      snapshot,
+      async () => this.tools.finalize?.(snapshot) ?? [],
+    );
     const lastAssistant = [...snapshot.entries].reverse().find((entry) => {
       const payload = record(entry.payload);
       return record(payload?.message)?.role === "assistant";
@@ -1006,6 +1059,15 @@ export class DurableTurnRunner {
         output: { completed: true },
       }],
       events: [{ kind: "turn.end", turnId: snapshot.id, status: "completed" }],
+      toolResultMessages: finalizedArtifacts.map((result) => ({
+        id: randomUUID(),
+        toolCallId: randomUUID(),
+        name: "persist_artifact",
+        input: {},
+        status: "completed" as const,
+        output: result.output,
+        summary: result.summary,
+      })),
       nextAction: null,
       waitingReason: null,
       taskStatus: "completed",
@@ -1399,7 +1461,23 @@ RETURNING *
         [input.tenantId, input.runId],
       ),
       this.executor.query<EntryRow>(
-        "SELECT entry_id,parent_entry_id,entry_type,sequence,payload FROM session_entries WHERE tenant_id = $1::uuid AND session_id = $2::uuid ORDER BY sequence ASC",
+        `
+WITH RECURSIVE leaf AS (
+  SELECT entry_id,parent_entry_id,entry_type,sequence,payload
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC LIMIT 1
+), active_entries AS (
+  SELECT * FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id,parent.entry_type,parent.sequence,parent.payload
+  FROM session_entries parent
+  JOIN active_entries child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
+SELECT entry_id,parent_entry_id,entry_type,sequence,payload
+FROM active_entries ORDER BY sequence ASC
+        `.trim(),
         [input.tenantId, run.session_id],
       ),
       this.executor.query<ApprovalRow>(
@@ -1419,10 +1497,23 @@ LIMIT 1
       ),
       this.executor.query<{ checkpoint: unknown; covered_entry_end: string | null }>(
         `
+WITH RECURSIVE leaf AS (
+  SELECT entry_id,parent_entry_id FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC LIMIT 1
+), active_entries AS (
+  SELECT * FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id
+  FROM session_entries parent
+  JOIN active_entries child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
 SELECT checkpoint,covered_entry_end
 FROM session_checkpoints
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
   AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+  AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM active_entries))
 ORDER BY created_at DESC,id DESC
 LIMIT 1
         `.trim(),
@@ -1518,6 +1609,9 @@ FOR UPDATE
       if (mutation.assistantMessage) await insertAssistantProjection(executor, snapshot, mutation.assistantMessage);
       if (mutation.toolResultMessage) {
         await insertToolResultProjection(executor, snapshot, mutation.toolResultMessage);
+      }
+      for (const result of mutation.toolResultMessages ?? []) {
+        await insertToolResultProjection(executor, snapshot, result);
       }
       if (mutation.terminalAssistant) {
         const terminalEntryIds = await insertTerminalAssistantProjection(
@@ -1825,6 +1919,221 @@ export class FixtureDurableTurnModel implements DurableTurnModel {
   }
 }
 
+/** Selects the exact provider transport admitted by the API for this turn. */
+export class SnapshotProviderDurableTurnModel implements DurableTurnModel {
+  constructor(
+    private readonly env: NodeJS.ProcessEnv,
+    private readonly legacy: DurableTurnModel | null,
+  ) {}
+
+  async call(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    context: DurableModelCallContext,
+  ): Promise<TurnModelResult> {
+    const runtime = durableRuntimeRequest(snapshot);
+    if (!runtime) {
+      if (!this.legacy) throw new Error("Legacy durable turns require the global Berry Router configuration");
+      return this.legacy.call(snapshot, step, context);
+    }
+    const provider = runtime.provider;
+    const apiKey = await resolveDurableCredential(provider, this.env);
+    const model = runtime.model ?? provider.defaultModel;
+    if (provider.apiType === "openai-chat-completions") {
+      return new RouterDurableTurnModel(
+        new OpenAIChatCompletionsClient({ provider: provider as never, apiKey }),
+        model,
+        {
+          provider: provider.id,
+          route: provider.endpointPath ?? provider.apiType,
+          capabilityForModel: (selectedModel) => promptCacheCapabilityFromEnv(this.env, selectedModel),
+        },
+      ).call(snapshot, step, context);
+    }
+    return callProviderStream(provider, apiKey, snapshot, context);
+  }
+}
+
+async function callProviderStream(
+  provider: DurableProviderTransport,
+  apiKey: string | undefined,
+  snapshot: DurableTurnSnapshot,
+  context: DurableModelCallContext,
+): Promise<TurnModelResult> {
+  const selectedModel = stringValue(snapshot.runtimeRequest.model) ?? provider.defaultModel;
+  const providerInfo = provider as BerryModelProviderInfo;
+  const model = createBerryModel(providerInfo, selectedModel, {
+    reasoning: reasoningEffort(snapshot.runtimeRequest.reasoning) !== undefined,
+    forceImages: true,
+  });
+  const built = modelMessages(snapshot, context.additionalUserContent);
+  const streamFn = createProviderStreamFn(providerInfo, apiKey, { cacheNamespace: snapshot.tenantId });
+  const completeSystemPrompt = built.messages
+    .filter((message) => message.role === "system")
+    .map((message) => contentText(message.content))
+    .filter(Boolean)
+    .join("\n\n") || built.stableSystemPrompt;
+  const piContext: Parameters<BerryStreamFn>[1] = {
+    systemPrompt: completeSystemPrompt,
+    messages: built.messages.flatMap((message) => chatMessageToPi(message, model)),
+    tools: context.tools.map((tool) => ({
+      name: tool.function.name,
+      description: tool.function.description ?? "",
+      parameters: tool.function.parameters as never,
+      execute: async () => ({ content: [{ type: "text", text: "Tool execution is handled by the durable runner." }], details: {} }),
+    })),
+  };
+  const effort = reasoningEffort(snapshot.runtimeRequest.reasoning);
+  const stream = await streamFn(model, piContext, {
+    sessionId: snapshot.sessionId,
+    temperature: 0,
+    maxTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
+    ...(effort ? { reasoning: effort } : {}),
+  });
+  for await (const event of stream) {
+    if (event.type === "text_delta") await context.emitDelta(event.delta, "text");
+    else if (event.type === "thinking_delta") await context.emitDelta(event.delta, "reasoning");
+  }
+  const assistant = await stream.result();
+  if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
+    throw new Error(assistant.errorMessage ?? `Provider stopped with ${assistant.stopReason}`);
+  }
+  const text = assistant.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
+  const reasoning = assistant.content.flatMap((part) => part.type === "thinking" ? [part.thinking] : []).join("");
+  const toolCalls = assistant.content.flatMap((part): TurnModelToolIntent[] => {
+    if (part.type !== "toolCall") return [];
+    const policy = context.policyForTool(part.name);
+    return [{
+      id: uuidFromToolCall(part.id),
+      name: part.name,
+      input: JSON.parse(JSON.stringify(part.arguments ?? {})) as JsonValue,
+      retryClass: policy.retryClass,
+      idempotencyKey: policy.retryClass === "idempotent_with_key"
+        ? `${snapshot.id}:tool:${part.id}`
+        : null,
+      requiresApproval: policy.requiresApproval,
+      approvalKind: policy.approvalKind,
+    }];
+  });
+  const usage = AgentStreamEventSchema.parse({
+    kind: "usage",
+    inputTokens: assistant.usage.input,
+    outputTokens: assistant.usage.output,
+    totalTokens: assistant.usage.totalTokens,
+    ...(["input", "output", "cacheRead", "cacheWrite"].some((field) =>
+      nonnegativeNumber((record(snapshot.runtimeRequest.modelPricing) ?? {})[field]) !== null
+    ) ? {
+        costRawMicros: usageCostMicros({
+          inputTokens: assistant.usage.input,
+          outputTokens: assistant.usage.output,
+          cacheReadTokens: assistant.usage.cacheRead,
+          cacheWriteTokens: assistant.usage.cacheWrite,
+        }, snapshot.runtimeRequest.modelPricing).toString(),
+      } : {}),
+    cacheReadTokens: assistant.usage.cacheRead,
+    cacheWriteTokens: assistant.usage.cacheWrite,
+    model: assistant.model,
+    servedModel: assistant.model,
+    servedProvider: assistant.provider,
+  }) as Extract<AgentStreamEvent, { kind: "usage" }>;
+  return {
+    text,
+    ...(reasoning ? { reasoning } : {}),
+    inputTokens: assistant.usage.input,
+    outputTokens: assistant.usage.output,
+    usage,
+    toolCalls,
+  };
+}
+
+function chatMessageToPi(
+  message: ChatMessage,
+  model: ReturnType<typeof createBerryModel>,
+): Parameters<BerryStreamFn>[1]["messages"] {
+  const timestamp = Date.now();
+  const content = chatContentToPi(message.content);
+  if (message.role === "system") return [];
+  if (message.role === "user") return [{ role: "user", content, timestamp }] as Parameters<BerryStreamFn>[1]["messages"];
+  if (message.role === "tool") {
+    return [{
+      role: "toolResult",
+      toolCallId: message.toolCallId ?? "unknown",
+      toolName: message.name ?? "tool",
+      content: typeof content === "string" ? [{ type: "text", text: content }] : content,
+      isError: false,
+      timestamp,
+    }] as unknown as Parameters<BerryStreamFn>[1]["messages"];
+  }
+  const assistantContent: Array<Record<string, unknown>> = [];
+  if (typeof content === "string" && content) assistantContent.push({ type: "text", text: content });
+  else if (Array.isArray(content)) assistantContent.push(...content);
+  for (const call of message.toolCalls ?? []) {
+    assistantContent.push({
+      type: "toolCall",
+      id: call.id,
+      name: call.function.name,
+      arguments: safeJson(call.function.arguments),
+    });
+  }
+  return [{
+    role: "assistant",
+    content: assistantContent,
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: message.toolCalls?.length ? "toolUse" : "stop",
+    timestamp,
+  }] as unknown as Parameters<BerryStreamFn>[1]["messages"];
+}
+
+function chatContentToPi(content: ChatMessage["content"]): string | Array<Record<string, unknown>> {
+  if (typeof content === "string") return content;
+  if (!content) return "";
+  return content.flatMap((part): Array<Record<string, unknown>> => {
+    if (part.type === "text") return [{ type: "text", text: part.text }];
+    const match = /^data:([^;,]+);base64,(.+)$/s.exec(part.image_url.url);
+    return match ? [{ type: "image", mimeType: match[1], data: match[2] }] : [];
+  });
+}
+
+async function resolveDurableCredential(
+  provider: DurableProviderTransport,
+  env: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  if (provider.credential) {
+    const key = env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+    if (!key) throw new Error("BERRY_DURABLE_CAPABILITY_KEY is required to open admitted provider credentials");
+    return openDurableSecret(provider.credential, key);
+  }
+  if (!provider.credentialRef) {
+    if (provider.authType === "none" || provider.authType === "optional-bearer") return undefined;
+    throw new Error(`Provider ${provider.id} has no admitted credential`);
+  }
+  const name = provider.credentialRef.startsWith("env:")
+    ? provider.credentialRef.slice(4)
+    : provider.credentialRef;
+  const direct = /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? env[name]?.trim() : undefined;
+  const configured = jsonStringMap(env.BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON)[name];
+  const credential = direct || configured;
+  if (credential) return credential;
+  if (provider.authType === "optional-bearer") return undefined;
+  throw new Error(`Credential reference ${provider.credentialRef} is not available to the durable Worker`);
+}
+
+function jsonStringMap(raw: string | undefined): Record<string, string> {
+  if (!raw?.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] =>
+      typeof entry[1] === "string" && Boolean(entry[1].trim())
+    ));
+  } catch {
+    throw new Error("BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON must be a JSON object");
+  }
+}
+
 export function createDurableTurnModel(env: NodeJS.ProcessEnv): DurableTurnModel {
   if (env.BERRY_API_MODEL_MODE !== "live") {
     return new FixtureDurableTurnModel(env.BERRY_API_FIXTURE_RESPONSE);
@@ -1832,28 +2141,28 @@ export function createDurableTurnModel(env: NodeJS.ProcessEnv): DurableTurnModel
   const baseUrl = env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim();
   const apiKey = env.BERRY_ROUTER_API_KEY?.trim();
   const model = env.BERRY_ROUTER_DEFAULT_MODEL?.trim();
-  if (!baseUrl || !apiKey || !model) {
-    throw new Error("Durable live turns require BERRY_ROUTER_INFERENCE_BASE_URL, BERRY_ROUTER_API_KEY, and BERRY_ROUTER_DEFAULT_MODEL");
-  }
-  return new RouterDurableTurnModel(
-    new OpenAIChatCompletionsClient({
-      provider: {
-        baseUrl,
-        defaultModel: model,
-        kind: "openai-compatible",
-        name: "Berry Router durable turn",
-        apiType: "openai-chat-completions",
-        endpointPath: env.BERRY_ROUTER_CHAT_COMPLETIONS_PATH?.trim() || "/chat/completions",
-      },
-      apiKey,
-    }),
-    model,
-    {
-      provider: env.BERRY_ROUTER_PROVIDER_ID?.trim() || "router",
-      route: env.BERRY_ROUTER_CHAT_COMPLETIONS_PATH?.trim() || "/chat/completions",
-      capabilityForModel: (selectedModel) => promptCacheCapabilityFromEnv(env, selectedModel),
-    },
-  );
+  const legacy = baseUrl && apiKey && model
+    ? new RouterDurableTurnModel(
+        new OpenAIChatCompletionsClient({
+          provider: {
+            baseUrl,
+            defaultModel: model,
+            kind: "openai-compatible",
+            name: "Berry Router durable turn",
+            apiType: "openai-chat-completions",
+            endpointPath: env.BERRY_ROUTER_CHAT_COMPLETIONS_PATH?.trim() || "/chat/completions",
+          },
+          apiKey,
+        }),
+        model,
+        {
+          provider: env.BERRY_ROUTER_PROVIDER_ID?.trim() || "router",
+          route: env.BERRY_ROUTER_CHAT_COMPLETIONS_PATH?.trim() || "/chat/completions",
+          capabilityForModel: (selectedModel) => promptCacheCapabilityFromEnv(env, selectedModel),
+        },
+      )
+    : null;
+  return new SnapshotProviderDurableTurnModel(env, legacy);
 }
 
 export class DurableTurnRetryableError extends Error {
@@ -2104,12 +2413,18 @@ function durableToolPolicy(name: string, permissionMode: string): {
   if (
     name === "read_file"
     || name === "list_files"
+    || name === "glob"
+    || name === "grep"
+    || name === "git_status"
+    || name === "git_diff"
+    || name === "git_log"
+    || name === "activate_skill"
     || name === "ask_user_question"
     || name === "compose_message"
   ) {
     return { retryClass: "read_only", requiresApproval: false, approvalKind: "file-edit" };
   }
-  if (name === "write_file") {
+  if (name === "write_file" || name === "edit_file" || name === "apply_patch") {
     return {
       retryClass: "idempotent",
       requiresApproval: !["auto-edit", "full-access"].includes(permissionMode),
@@ -2121,6 +2436,20 @@ function durableToolPolicy(name: string, permissionMode: string): {
       retryClass: "idempotent_with_key",
       requiresApproval: false,
       approvalKind: "file-edit",
+    };
+  }
+  if (name === "create_image") {
+    return {
+      retryClass: "non_idempotent_manual",
+      requiresApproval: false,
+      approvalKind: "file-edit",
+    };
+  }
+  if (name === "git_checkpoint") {
+    return {
+      retryClass: "non_idempotent_manual",
+      requiresApproval: true,
+      approvalKind: "shell",
     };
   }
   return {
@@ -2163,15 +2492,48 @@ function durableQuestionItems(value: unknown): DurableQuestionItem[] {
   return (batch.length > 0 ? batch : legacy ? [legacy] : []).slice(0, 5);
 }
 
-function builtInPresentationToolResult(name: string, value: unknown): TurnToolResult | undefined {
-  if (name !== "compose_message") return undefined;
-  const draft = MessageDraftSchema.parse(value);
-  const noun = draft.kind === "email" ? "email" : "message";
-  const summary = `Prepared ${draft.variants.length} ${noun} ${draft.variants.length === 1 ? "draft" : "drafts"} in an editable writing block.`;
-  return {
-    output: JSON.parse(JSON.stringify({ text: summary, draft })) as JsonValue,
-    summary,
-  };
+function builtInPresentationToolResult(
+  snapshot: DurableTurnSnapshot,
+  name: string,
+  value: unknown,
+): TurnToolResult | undefined {
+  if (name === "compose_message") {
+    const draft = MessageDraftSchema.parse(value);
+    const noun = draft.kind === "email" ? "email" : "message";
+    const summary = `Prepared ${draft.variants.length} ${noun} ${draft.variants.length === 1 ? "draft" : "drafts"} in an editable writing block.`;
+    return {
+      output: JSON.parse(JSON.stringify({ text: summary, draft })) as JsonValue,
+      summary,
+    };
+  }
+  if (name === "activate_skill") {
+    const requestedName = stringValue(record(value)?.name);
+    const skill = durableSkills(snapshot).find((candidate) => candidate.name === requestedName);
+    if (!skill) {
+      throw new Error(`Unknown or non-model-invocable skill: ${requestedName ?? "(missing)"}`);
+    }
+    const alreadyActive = snapshot.steps.some((step) =>
+      step.state === "completed"
+      && (stringValue(step.input.toolName) ?? step.type.slice(5)) === "activate_skill"
+      && stringValue(record(step.input.arguments)?.name) === skill.name
+    );
+    if (alreadyActive) {
+      return {
+        output: { skill: skill.name, alreadyActive: true, content: `<skill_already_active name=${JSON.stringify(skill.name)} />` },
+        summary: `${skill.name} is already active`,
+      };
+    }
+    return {
+      output: {
+        skill: skill.name,
+        alreadyActive: false,
+        location: skill.filePath,
+        content: formatSkillInvocation(skill),
+      },
+      summary: `Activated ${skill.name}`,
+    };
+  }
+  return undefined;
 }
 
 const DURABLE_STABLE_SYSTEM_PROMPT = [
@@ -2194,9 +2556,12 @@ function modelMessages(
   stableSystemPrompt: string;
 } {
   const checkpoint = snapshot.portableCheckpoint ?? snapshot.runtimeRequest.portableCheckpoint;
-  const skillInstructions = durableSkillInstructions(snapshot.runtimeRequest.extraSkills);
+  const runtime = durableRuntimeRequest(snapshot);
+  const skills = durableSkills(snapshot);
+  const skillInstructions = formatSkillsForSystemPrompt(skills);
   const stableSystemPrompt = [
     DURABLE_STABLE_SYSTEM_PROMPT,
+    conversationProfilePrompt(runtime?.conversationKind ?? "chat"),
     skillInstructions,
   ].filter(Boolean).join("\n\n");
   const dynamicSystem = [
@@ -2209,6 +2574,17 @@ function modelMessages(
     Object.keys(snapshot.groundingContext).length > 0
       ? `Dynamic grounding context:\n<untrusted_grounding>${JSON.stringify(snapshot.groundingContext)}</untrusted_grounding>`
       : "",
+    runtime
+      ? [
+          "Runtime environment:",
+          `- Workspace: ${runtime.workspacePath}`,
+          `- Permission mode: ${runtime.permissionMode}`,
+          `- Provider: ${runtime.provider.id}`,
+          `- Model: ${runtime.model ?? runtime.provider.defaultModel}`,
+          `- Reasoning: ${runtime.reasoning}`,
+        ].join("\n")
+      : "",
+    automaticDurableAttachmentSkill(skills, runtime?.attachments ?? []),
   ].filter(Boolean).join("\n\n");
   const system = [stableSystemPrompt, dynamicSystem].filter(Boolean).join("\n\n");
   const messages: ChatMessage[] = [{ role: "system", content: system }];
@@ -2216,7 +2592,9 @@ function modelMessages(
     const payload = record(entry.payload);
     const message = record(payload?.message);
     const role = stringValue(message?.role);
-    if (role === "user") {
+    if (role === "system") {
+      messages.push({ role: "system", content: contentText(message?.content) });
+    } else if (role === "user") {
       messages.push({ role: "user", content: contentText(message?.content) });
     } else if (role === "assistant") {
       const toolCalls = Array.isArray(message?.content)
@@ -2245,6 +2623,7 @@ function modelMessages(
       messages.push({
         role: "tool",
         toolCallId: stringValue(message?.toolCallId) ?? entry.entryId,
+        ...(stringValue(message?.toolName) ? { name: stringValue(message?.toolName)! } : {}),
         content: contentText(message?.content),
       });
     }
@@ -2283,29 +2662,96 @@ function modelMessages(
   return { messages, stableSystemPrompt };
 }
 
-function durableSkillInstructions(value: unknown): string {
-  if (!Array.isArray(value)) return "";
-  let remaining = 128_000;
-  const skills = value.flatMap((candidate) => {
-    const skill = record(candidate);
-    if (!skill || skill.disableModelInvocation === true) return [];
-    const name = stringValue(skill.name)?.slice(0, 128);
-    const description = stringValue(skill.description)?.slice(0, 2_000);
-    const content = stringValue(skill.content);
-    const filePath = stringValue(skill.filePath)?.slice(0, 1_000);
-    if (!name || !content || remaining <= 0) return [];
-    const body = content.slice(0, remaining);
-    remaining -= body.length;
-    return [
-      `<skill name=${JSON.stringify(name)}${filePath ? ` source=${JSON.stringify(filePath)}` : ""}>\n${description ? `${description}\n\n` : ""}${body}\n</skill>`,
-    ];
-  });
-  return skills.length > 0
-    ? `Registered skill instructions:\n\n${skills.join("\n\n")}`
-    : "";
+function durableRuntimeRequest(snapshot: DurableTurnSnapshot): DurableTurnRuntimeRequest | null {
+  const parsed = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
+  return parsed.success ? parsed.data : null;
 }
 
-const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
+function durableSkills(snapshot: DurableTurnSnapshot): DurableSkill[] {
+  const runtime = durableRuntimeRequest(snapshot);
+  if (runtime) return runtime.extraSkills.filter((skill) => !skill.disableModelInvocation);
+  if (!Array.isArray(snapshot.runtimeRequest.extraSkills)) return [];
+  return snapshot.runtimeRequest.extraSkills.flatMap((candidate) => {
+    const parsed = record(candidate);
+    if (!parsed || parsed.disableModelInvocation === true) return [];
+    const skill = {
+      name: stringValue(parsed.name),
+      description: typeof parsed.description === "string" ? parsed.description : "",
+      content: typeof parsed.content === "string" ? parsed.content : null,
+      filePath: stringValue(parsed.filePath),
+      disableModelInvocation: false,
+      resources: Array.isArray(parsed.resources) ? parsed.resources.filter((item): item is string => typeof item === "string") : [],
+    };
+    return skill.name && skill.content && skill.filePath ? [skill as DurableSkill] : [];
+  });
+}
+
+function durableToolResultText(output: JsonValue): string {
+  if (typeof output === "string") return output;
+  if (output && typeof output === "object" && !Array.isArray(output)) {
+    const content = output.content;
+    if (typeof content === "string") return content;
+    const text = output.text;
+    if (typeof text === "string") return text;
+  }
+  return JSON.stringify(output);
+}
+
+function automaticDurableAttachmentSkill(
+  skills: readonly DurableSkill[],
+  attachments: DurableTurnRuntimeRequest["attachments"],
+): string {
+  const installed = new Map(skills.map((skill) => [skill.name.toLowerCase(), skill]));
+  const selected = attachments.flatMap((attachment) => {
+    const name = attachment.name.toLowerCase();
+    const mediaType = attachment.mediaType.toLowerCase();
+    if (name.endsWith(".pdf") || mediaType === "application/pdf") return ["pdf"];
+    if (/\.(xlsx?|xlsm|csv)$/.test(name) || /spreadsheet|excel|csv/.test(mediaType)) return ["xlsx"];
+    if (/\.docx?$/.test(name) || /wordprocessingml|msword/.test(mediaType)) return ["docx"];
+    if (/\.pptx?$/.test(name) || /presentationml|powerpoint/.test(mediaType)) return ["pptx"];
+    return [];
+  }).map((name) => installed.get(name)).find((skill): skill is DurableSkill => Boolean(skill));
+  if (!selected) return "";
+  return formatSkillInvocation(selected, [
+    `The runtime activated the ${selected.name} skill automatically because the user attached a matching document.`,
+    "Do not call activate_skill for this skill again during this turn.",
+  ].join("\n"));
+}
+
+function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): ChatToolDefinition[] {
+  const runtime = durableRuntimeRequest(snapshot);
+  const enabled = new Set<DurableBuiltInToolName>(
+    runtime?.builtInTools
+      ?? [
+        ...DURABLE_BASE_BUILT_IN_TOOLS,
+        ...(durableSkills(snapshot).length > 0 ? ["activate_skill" as const] : []),
+      ],
+  );
+  const definitions = DURABLE_TOOL_DEFINITIONS.filter((definition) =>
+    enabled.has(definition.function.name as DurableBuiltInToolName)
+  );
+  const skills = durableSkills(snapshot);
+  if (enabled.has("activate_skill") && skills.length > 0) {
+    definitions.push({
+      type: "function",
+      function: {
+        name: "activate_skill",
+        description: "Load the full instructions for an available skill before performing a matching task.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name"],
+          properties: {
+            name: { type: "string", enum: skills.map((skill) => skill.name) },
+          },
+        },
+      },
+    });
+  }
+  return definitions;
+}
+
+export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
   {
     type: "function" as const,
     function: {
@@ -2472,6 +2918,70 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
   {
     type: "function" as const,
     function: {
+      name: "edit_file",
+      description: "Replace an exact string in a UTF-8 workspace file. The old string must match exactly.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path", "old_string", "new_string"],
+        properties: {
+          path: { type: "string" },
+          old_string: { type: "string" },
+          new_string: { type: "string" },
+          replace_all: { type: "boolean" },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "apply_patch",
+      description: "Apply a structured patch using the *** Begin Patch grammar.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["patch"],
+        properties: { patch: { type: "string" } },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "glob",
+      description: "Find workspace files whose relative path matches a glob pattern.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["pattern"],
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string" },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "grep",
+      description: "Search workspace file contents and return file, line, and column matches.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["pattern"],
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string" },
+          ignore_case: { type: "boolean" },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
       name: "run_command",
       description: "Run a shell command inside the durable workspace sandbox.",
       parameters: {
@@ -2498,6 +3008,54 @@ const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
           path: { type: "string", description: "Completed file path under /workspace/outputs" },
           name: { type: "string", description: "Optional user-facing filename" },
           media_type: { type: "string", description: "Optional MIME type; inferred from the filename when omitted" },
+        },
+      },
+    },
+  },
+  ...(["git_status", "git_diff", "git_log", "git_checkpoint"] as const).map((name): ChatToolDefinition => ({
+    type: "function",
+    function: {
+      name,
+      description: name === "git_status"
+        ? "Show the workspace Git status."
+        : name === "git_diff"
+          ? "Show unstaged Git changes, optionally restricted to a path."
+          : name === "git_log"
+            ? "Show recent Git commits."
+            : "Stage all changes and create a checkpoint commit. Use only when the user explicitly requests a commit.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: name === "git_diff"
+          ? { path: { type: "string" } }
+          : name === "git_log"
+            ? { limit: { type: "integer", minimum: 1, maximum: 100 } }
+            : name === "git_checkpoint"
+              ? { message: { type: "string" } }
+              : {},
+      },
+    },
+  })),
+  {
+    type: "function" as const,
+    function: {
+      name: "create_image",
+      description: "Generate or edit an image and publish it into the task. Use reference_image_paths for images already in the workspace.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["prompt"],
+        properties: {
+          prompt: { type: "string", minLength: 1, maxLength: 32_000 },
+          title: { type: "string", maxLength: 160 },
+          size: { type: "string" },
+          aspect_ratio: { type: "string", enum: ["1:1", "3:4", "4:3", "9:16", "16:9"] },
+          transparent_background: { type: "boolean" },
+          reference_image_paths: {
+            type: "array",
+            maxItems: 16,
+            items: { type: "string" },
+          },
         },
       },
     },
@@ -2882,6 +3440,17 @@ ON CONFLICT (message_id,ordinal) DO NOTHING
       }),
     ],
   );
+  const image = result.name === "create_image" ? record(record(result.output)?.image) : undefined;
+  if (image) {
+    await executor.execute(
+      `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'image',$3::jsonb,1)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+      `.trim(),
+      [snapshot.tenantId, result.id, JSON.stringify(image)],
+    );
+  }
 }
 
 async function insertTerminalAssistantProjection(

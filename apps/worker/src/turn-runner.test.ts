@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type { AgentStreamEvent, TurnRunState } from "@berry/shared";
+import { DURABLE_BASE_BUILT_IN_TOOLS, type AgentStreamEvent, type TurnRunState } from "@berry/shared";
 import {
   OpenAIChatCompletionsClient,
   type ChatCompletionChunk,
@@ -10,7 +10,9 @@ import {
   DurableTurnRunner,
   DurableTurnRetryableError,
   RouterDurableTurnModel,
+  SnapshotProviderDurableTurnModel,
   SqlDurableTurnRepository,
+  createDurableTurnModel,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -24,6 +26,11 @@ const tenantId = "00000000-0000-7000-8000-000000000001";
 const runId = "00000000-0000-7000-8000-000000000002";
 
 describe("durable turn runner", () => {
+  it("starts in live mode without a global router for snapshot-admitted providers", () => {
+    expect(createDurableTurnModel({ BERRY_API_MODEL_MODE: "live" }))
+      .toBeInstanceOf(SnapshotProviderDurableTurnModel);
+  });
+
   it("does not duplicate a completed step when the queue delivery repeats", async () => {
     const repository = new FakeTurnRepository(snapshot("queued", [admittedStep()]));
     let modelCalls = 0;
@@ -88,6 +95,8 @@ describe("durable turn runner", () => {
     expect(result.state).toBe("calling_model");
     expect(calls).toBe(1);
     expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("completed");
+    const completed = repository.mutations.find((mutation) => mutation.toolResultMessage);
+    expect(completed?.toolResultMessage?.id).toBe(completed?.entries?.[0]?.entryId);
   });
 
   it("moves an ambiguous running non-idempotent tool to recovery_required", async () => {
@@ -216,6 +225,8 @@ describe("durable turn runner", () => {
     expect(repository.current.steps.some((step) =>
       step.type === "model.call" && step.state === "pending"
     )).toBe(true);
+    const failed = repository.mutations.find((mutation) => mutation.toolResultMessage);
+    expect(failed?.toolResultMessage?.id).toBe(failed?.entries?.[0]?.entryId);
   });
 
   it("feeds a known non-idempotent tool exception back to the model", async () => {
@@ -242,28 +253,27 @@ describe("durable turn runner", () => {
       modelStep("pending", 1),
     ]));
     let composePolicy: unknown;
+    let imagePolicy: unknown;
     let toolNames: string[] = [];
     const runner = new DurableTurnRunner(repository, {
       call: async (_snapshot, _step, context) => {
         toolNames = context.tools.map((tool) => tool.function.name);
         composePolicy = context.policyForTool("compose_message");
+        imagePolicy = context.policyForTool("create_image");
         return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), { owner: "worker-compose-definition" });
 
     await runner.execute({ tenantId, runId, reason: "continue" });
 
-    expect(toolNames).toEqual([
-      "ask_user_question",
-      "compose_message",
-      "read_file",
-      "list_files",
-      "write_file",
-      "run_command",
-      "persist_artifact",
-    ]);
+    expect(toolNames).toEqual(DURABLE_BASE_BUILT_IN_TOOLS);
     expect(composePolicy).toEqual({
       retryClass: "read_only",
+      requiresApproval: false,
+      approvalKind: "file-edit",
+    });
+    expect(imagePolicy).toEqual({
+      retryClass: "non_idempotent_manual",
       requiresApproval: false,
       approvalKind: "file-edit",
     });
@@ -396,6 +406,8 @@ describe("durable turn runner", () => {
     expect((await runner.execute({ tenantId, runId, reason: "approval-resolved" })).state)
       .toBe("executing_tool");
     expect(repository.current.steps.find((step) => step.id === denied.id)?.state).toBe("failed");
+    const deniedMutation = repository.mutations.find((mutation) => mutation.toolResultMessage);
+    expect(deniedMutation?.toolResultMessage?.id).toBe(deniedMutation?.entries?.[0]?.entryId);
 
     expect((await runner.execute({ tenantId, runId, reason: "continue" })).state)
       .toBe("calling_model");

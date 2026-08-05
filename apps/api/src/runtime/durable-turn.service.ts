@@ -89,6 +89,7 @@ LIMIT 1
       const requestMessageId = input.continueInterruptedTurn
         ? await continuableRequestMessageId(executor, input)
         : await ensureUserMessage(executor, input);
+      await syncMessageJournal(executor, input);
       if (!input.continueInterruptedTurn) {
         await ensureInputFileAssociations(executor, input, requestMessageId);
         await ensureUserJournalEntry(executor, input, requestMessageId);
@@ -178,6 +179,34 @@ WHERE tenant_id=$1::uuid AND id=$4::uuid
         [input.tenantId, runId, requestMessageId, input.sessionId],
       );
       return { runId, sessionId: input.sessionId };
+    });
+  }
+
+  async rewindJournalBefore(tenantId: string, sessionId: string, messageId: string): Promise<void> {
+    if (!this.enabled) return;
+    await this.database.withTenant(tenantId, async (executor) => {
+      const operation = async (transaction: SqlExecutor) => {
+        await syncMessageJournal(transaction, { tenantId, sessionId });
+        const target = await transaction.query<{ parent_entry_id: string | null }>(
+          `SELECT parent_entry_id FROM session_entries
+           WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND entry_id=$3
+           LIMIT 1 FOR UPDATE`,
+          [tenantId, sessionId, messageId],
+        );
+        if (!target[0]) return;
+        const leafId = target[0].parent_entry_id;
+        await transaction.execute(
+          "UPDATE session_entries SET is_leaf_marker=COALESCE(entry_id=$3,false) WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND (is_leaf_marker=true OR entry_id=$3)",
+          [tenantId, sessionId, leafId],
+        );
+        await transaction.execute(
+          `UPDATE sessions SET runtime_metadata=runtime_metadata || jsonb_build_object('leafId',$3::text),updated_at=now()
+           WHERE tenant_id=$1::uuid AND id=$2::uuid`,
+          [tenantId, sessionId, leafId],
+        );
+      };
+      if (executor.transaction) await executor.transaction(operation);
+      else await operation(executor);
     });
   }
 
@@ -279,11 +308,24 @@ LIMIT 256
       const [entries, checkpoints, runs] = await Promise.all([
         executor.query<DurableContextEntryRow>(
           `
-WITH latest_checkpoint AS (
+WITH RECURSIVE leaf AS (
+  SELECT entry_id,parent_entry_id
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC LIMIT 1
+), ancestry AS (
+  SELECT * FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id
+  FROM session_entries parent
+  JOIN ancestry child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+), latest_checkpoint AS (
   SELECT covered_entry_end
   FROM session_checkpoints
   WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
     AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+    AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM ancestry))
   ORDER BY created_at DESC,id DESC
   LIMIT 1
 ),
@@ -297,6 +339,7 @@ active_entries AS (
   SELECT entry_id,sequence,payload,run_id
   FROM session_entries
   WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+    AND entry_id IN (SELECT entry_id FROM ancestry)
     AND entry_type='message'
     AND sequence>COALESCE((SELECT sequence FROM covered),0)
 ),
@@ -326,10 +369,22 @@ ORDER BY sequence ASC
         ),
         executor.query<DurableContextCheckpointRow>(
           `
+WITH RECURSIVE leaf AS (
+  SELECT entry_id,parent_entry_id FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC LIMIT 1
+), ancestry AS (
+  SELECT * FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id FROM session_entries parent
+  JOIN ancestry child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
 SELECT checkpoint,covered_entry_end
 FROM session_checkpoints
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
   AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+  AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM ancestry))
 ORDER BY created_at DESC,id DESC
 LIMIT 1
           `.trim(),
@@ -1667,6 +1722,7 @@ FOR UPDATE
       timestamp: Date.now(),
     },
     requestMessageId: messageId,
+    projectionSource: "messages",
   };
   await executor.execute(
     "UPDATE session_entries SET is_leaf_marker=false WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true",
@@ -1680,6 +1736,165 @@ INSERT INTO session_entries (
     `.trim(),
     [input.tenantId, input.sessionId, messageId, parentId, Number(sequence[0]?.value ?? 1), JSON.stringify(payload)],
   );
+}
+
+interface ProjectedMessagePartRow {
+  message_id: string;
+  sequence_id: number | string;
+  role: "system" | "user" | "assistant" | "tool";
+  status: string;
+  created_at: Date | string;
+  type: string | null;
+  content: unknown;
+  ordinal: number | string | null;
+}
+
+/** Reconciles ordinary message writes into the durable journal before every admitted turn. */
+async function syncMessageJournal(
+  executor: SqlExecutor,
+  input: Pick<DurableTurnAdmission, "tenantId" | "sessionId">,
+): Promise<void> {
+  const rows = await executor.query<ProjectedMessagePartRow>(
+    `
+SELECT m.id::text AS message_id,m.sequence_id,m.role::text,m.status::text,m.created_at,
+       p.type::text,p.content,p.ordinal
+FROM messages m
+LEFT JOIN message_parts p ON p.tenant_id=m.tenant_id AND p.message_id=m.id
+LEFT JOIN message_parts tool_result_projection
+  ON tool_result_projection.tenant_id=m.tenant_id
+  AND tool_result_projection.message_id=m.id
+  AND tool_result_projection.type='tool-result'
+LEFT JOIN session_entries e
+  ON e.tenant_id=m.tenant_id AND e.session_id=m.session_id
+  AND (
+    e.entry_id=m.id::text
+    OR (
+      tool_result_projection.content->>'toolCallId' IS NOT NULL
+      AND e.payload->'message'->>'role'='toolResult'
+      AND e.payload->'message'->>'toolCallId'=tool_result_projection.content->>'toolCallId'
+    )
+  )
+WHERE m.tenant_id=$1::uuid AND m.session_id=$2::uuid AND e.entry_id IS NULL
+ORDER BY m.sequence_id ASC,p.ordinal ASC NULLS LAST
+    `.trim(),
+    [input.tenantId, input.sessionId],
+  );
+  if (rows.length === 0) return;
+  const messages = new Map<string, { row: ProjectedMessagePartRow; parts: Array<{ type: string; content: unknown }> }>();
+  for (const row of rows) {
+    const message = messages.get(row.message_id) ?? { row, parts: [] };
+    if (row.type) message.parts.push({ type: row.type, content: row.content });
+    messages.set(row.message_id, message);
+  }
+  const bounds = await executor.query<{
+    minimum: number | string;
+    maximum: number | string;
+    first_created_at: Date | string | null;
+    leaf_id: string | null;
+    root_id: string | null;
+  }>(
+    `
+SELECT COALESCE(MIN(sequence),0) AS minimum,COALESCE(MAX(sequence),0) AS maximum,MIN(created_at) AS first_created_at,
+       (SELECT entry_id FROM session_entries leaf
+        WHERE leaf.tenant_id=$1::uuid AND leaf.session_id=$2::uuid AND leaf.is_leaf_marker=true
+        ORDER BY leaf.sequence DESC LIMIT 1) AS leaf_id,
+       (SELECT entry_id FROM session_entries root
+        WHERE root.tenant_id=$1::uuid AND root.session_id=$2::uuid AND root.parent_entry_id IS NULL
+        ORDER BY root.sequence ASC LIMIT 1) AS root_id
+FROM session_entries WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+    `.trim(),
+    [input.tenantId, input.sessionId],
+  );
+  const firstCreatedAt = bounds[0]?.first_created_at ? new Date(bounds[0].first_created_at).getTime() : null;
+  const before = [...messages.values()].filter((item) => firstCreatedAt !== null && new Date(item.row.created_at).getTime() < firstCreatedAt);
+  const after = [...messages.values()].filter((item) => !before.includes(item));
+  let beforeSequence = Number(bounds[0]?.minimum ?? 0) - before.length;
+  let afterSequence = Number(bounds[0]?.maximum ?? 0) + 1;
+  const insert = async (item: { row: ProjectedMessagePartRow; parts: Array<{ type: string; content: unknown }> }, sequence: number, parentId: string | null) => {
+    const content = projectMessageParts(item.parts);
+    const toolResult = item.parts.find((part) => part.type === "tool-result");
+    const role = toolResult || item.row.role === "tool" ? "toolResult" : item.row.role;
+    const toolResultContent = recordValue(toolResult?.content);
+    const payload = {
+      type: "message",
+      id: item.row.message_id,
+      parentId,
+      timestamp: new Date(item.row.created_at).toISOString(),
+      projectionSource: "messages",
+      message: {
+        role,
+        content,
+        ...(role === "toolResult" ? {
+          toolCallId: stringValue(toolResultContent?.toolCallId) ?? item.row.message_id,
+          toolName: stringValue(toolResultContent?.name) ?? "tool",
+        } : {}),
+        ...(item.row.status === "failed" ? { stopReason: "error" } : {}),
+        ...(item.row.status === "cancelled" ? { stopReason: "aborted" } : {}),
+        timestamp: new Date(item.row.created_at).getTime(),
+      },
+    };
+    await executor.execute(
+      `
+INSERT INTO session_entries (
+  tenant_id,session_id,entry_id,parent_entry_id,entry_type,sequence,payload,is_leaf_marker
+) VALUES ($1::uuid,$2::uuid,$3,$4,'message',$5,$6::jsonb,false)
+ON CONFLICT (tenant_id,session_id,entry_id) DO NOTHING
+      `.trim(),
+      [input.tenantId, input.sessionId, item.row.message_id, parentId, sequence, JSON.stringify(payload)],
+    );
+  };
+  let beforeParent: string | null = null;
+  for (const item of before) {
+    await insert(item, beforeSequence++, beforeParent);
+    beforeParent = item.row.message_id;
+  }
+  if (beforeParent && bounds[0]?.root_id) {
+    await executor.execute(
+      `UPDATE session_entries
+       SET parent_entry_id=$4,payload=jsonb_set(payload,'{parentId}',to_jsonb($4::text),true)
+       WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND entry_id=$3 AND parent_entry_id IS NULL`,
+      [input.tenantId, input.sessionId, bounds[0].root_id, beforeParent],
+    );
+  }
+  let afterParent = bounds[0]?.leaf_id ?? null;
+  for (const item of after) {
+    await insert(item, afterSequence++, afterParent);
+    afterParent = item.row.message_id;
+  }
+  const leaf = after.at(-1)?.row.message_id;
+  if (leaf) {
+    await executor.execute(
+      "UPDATE session_entries SET is_leaf_marker=(entry_id=$3) WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND (is_leaf_marker=true OR entry_id=$3)",
+      [input.tenantId, input.sessionId, leaf],
+    );
+  }
+}
+
+function projectMessageParts(parts: Array<{ type: string; content: unknown }>): Array<Record<string, unknown>> {
+  return parts.flatMap((part): Array<Record<string, unknown>> => {
+    const value = recordValue(part.content);
+    if (part.type === "tool-call") {
+      return [{ type: "toolCall", id: stringValue(value?.toolCallId) ?? stringValue(value?.id) ?? randomUUID(), name: stringValue(value?.name) ?? "tool", arguments: value?.arguments ?? {} }];
+    }
+    if (part.type === "tool-result") {
+      return [{ type: "text", text: durableProjectionText(value?.output ?? part.content) }];
+    }
+    if (part.type === "attachment") return [{ type: "attachment", content: part.content }];
+    if (part.type === "image" || part.type === "browser-screenshot") {
+      return [{ type: "text", text: `[Image artifact: ${stringValue(value?.title) ?? stringValue(value?.name) ?? stringValue(value?.fileId) ?? "image"}]` }];
+    }
+    if (part.type === "reasoning") return [{ type: "thinking", thinking: durableProjectionText(part.content) }];
+    return [{ type: "text", text: durableProjectionText(part.content) }];
+  });
+}
+
+function durableProjectionText(value: unknown): string {
+  if (typeof value === "string") return value;
+  const object = recordValue(value);
+  for (const field of ["text", "content", "code", "message", "summary"]) {
+    if (typeof object?.[field] === "string") return object[field] as string;
+  }
+  return JSON.stringify(value ?? "");
 }
 
 function findLatestProviderUsageIndex(entries: readonly DurableContextEntryRow[]): number {

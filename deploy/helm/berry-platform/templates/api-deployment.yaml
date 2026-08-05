@@ -100,6 +100,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.router.existingSecret }}
                   key: {{ .Values.router.apiKeyKey }}
+            - name: BERRY_DURABLE_CAPABILITY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.router.existingSecret }}
+                  key: {{ .Values.router.durableCapabilityKeyKey }}
+                  optional: true
             - name: BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON
               valueFrom:
                 secretKeyRef:

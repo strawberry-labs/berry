@@ -86,6 +86,25 @@ describe("cloud runtime configuration", () => {
     expect(resolved.provider.models?.[0]?.capabilities?.promptCaching).toBeUndefined();
   });
 
+  it("does not trust a client-supplied Worker credential reference", async () => {
+    const service = new CloudRuntimeConfigService({ BERRY_API_MODEL_MODE: "fixture" });
+
+    const resolved = await service.resolve(SELF_HOST_TENANT_ID, {
+      provider: {
+        id: "custom",
+        name: "Custom",
+        kind: "openai-compatible",
+        baseUrl: "https://provider.example.test/v1",
+        defaultModel: "model",
+        credentialRef: "env:BERRY_DURABLE_CAPABILITY_KEY",
+      },
+      apiKey: "client-secret",
+      model: "model",
+    });
+
+    expect(resolved.credentialRef).toBeUndefined();
+  });
+
   it("rejects an unknown completion transport", () => {
     expect(() => createCloudRuntimeConfigFromEnv({
       BERRY_ROUTER_COMPLETION_TRANSPORT: "instant",

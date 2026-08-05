@@ -203,7 +203,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
   const budgetService = createBudgetServiceFromEnv(env, new PostgresBudgetRepository(database));
   const contractProvider = createBudgetedContractSandboxProvider(env, budgetService);
   const runtime = createRuntimeSessionHost(env, contractProvider);
-  const personalCapabilities = new PersonalCapabilitiesService(database);
+  const personalCapabilities = new PersonalCapabilitiesService(database, env);
   const organizationCapabilities = new OrganizationCapabilitiesService(personalCapabilities, database);
   const auth = createAuthRuntime(env);
   return {

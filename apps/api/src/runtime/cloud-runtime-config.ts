@@ -63,6 +63,7 @@ export interface CloudRuntimeConfig {
   promptCacheEnabled: boolean;
   provider: BerryModelProviderInfo | null;
   apiKey: string | undefined;
+  credentialRef?: string | undefined;
   mcpServers: McpServerSpec[];
   extraSkills: AgentSkill[];
   networkPolicy: NetworkPolicy | undefined;
@@ -73,6 +74,7 @@ export interface CloudRuntimeConfig {
 export interface ResolvedCloudTurnConfig {
   provider: BerryModelProviderInfo;
   apiKey: string | undefined;
+  credentialRef?: string | undefined;
   mcpServers: McpServerSpec[];
   extraSkills: AgentSkill[];
   networkPolicy: NetworkPolicy | undefined;
@@ -106,6 +108,7 @@ export class CloudRuntimeConfigService {
               ? organizationProvider.provider
               : withoutPromptCaching(organizationProvider.provider),
             apiKey: organizationProvider.apiKey,
+            ...(organizationProvider.credentialRef ? { credentialRef: organizationProvider.credentialRef } : {}),
             mcpServers: this.config.mcpServers,
             extraSkills: this.config.extraSkills,
             networkPolicy: this.config.networkPolicy,
@@ -124,6 +127,7 @@ export class CloudRuntimeConfigService {
           ? this.config.provider
           : withoutPromptCaching(this.config.provider),
         apiKey: this.config.apiKey,
+        ...(this.config.credentialRef ? { credentialRef: this.config.credentialRef } : {}),
         mcpServers: this.config.mcpServers,
         extraSkills: this.config.extraSkills,
         networkPolicy: this.config.networkPolicy,
@@ -357,6 +361,11 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
     promptCacheEnabled: env.BERRY_PROMPT_CACHE_ENABLED?.trim().toLowerCase() !== "false",
     provider,
     apiKey: first(env.BERRY_ROUTER_API_KEY, env.BERRY_INFERENCE_API_KEY),
+    credentialRef: env.BERRY_ROUTER_API_KEY?.trim()
+      ? "env:BERRY_ROUTER_API_KEY"
+      : env.BERRY_INFERENCE_API_KEY?.trim()
+        ? "env:BERRY_INFERENCE_API_KEY"
+        : undefined,
     mcpServers,
     extraSkills: parseSkills(first(env.BERRY_CLOUD_SKILLS_JSON, decodeBase64(env.BERRY_CLOUD_SKILLS_BASE64))),
     networkPolicy,

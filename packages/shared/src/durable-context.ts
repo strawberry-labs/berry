@@ -311,6 +311,225 @@ export const SessionCheckpointV2Schema = z.object({
 });
 export type SessionCheckpointV2 = z.infer<typeof SessionCheckpointV2Schema>;
 
+/**
+ * Versioned, server-resolved capability contract consumed by the Durable
+ * Worker. Secrets are represented by references or encrypted envelopes; raw
+ * credentials must never be written to turn_runs.runtime_request.
+ */
+export const DurableSecretEnvelopeSchema = z.object({
+  version: z.literal(1),
+  algorithm: z.literal("AES-GCM"),
+  iv: z.string().min(1),
+  ciphertext: z.string().min(1),
+}).strict();
+export type DurableSecretEnvelope = z.infer<typeof DurableSecretEnvelopeSchema>;
+
+export async function sealDurableSecret(
+  plaintext: string,
+  encodedKey: string,
+): Promise<DurableSecretEnvelope> {
+  const key = await durableSecretKey(encodedKey, ["encrypt"]);
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(new ArrayBuffer(12)));
+  const ciphertext = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(plaintext),
+  );
+  return DurableSecretEnvelopeSchema.parse({
+    version: 1,
+    algorithm: "AES-GCM",
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
+  });
+}
+
+export async function openDurableSecret(
+  envelope: DurableSecretEnvelope,
+  encodedKey: string,
+): Promise<string> {
+  const parsed = DurableSecretEnvelopeSchema.parse(envelope);
+  const key = await durableSecretKey(encodedKey, ["decrypt"]);
+  const plaintext = await globalThis.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64ToBytes(parsed.iv) },
+    key,
+    base64ToBytes(parsed.ciphertext),
+  );
+  return new TextDecoder().decode(plaintext);
+}
+
+async function durableSecretKey(
+  encodedKey: string,
+  usages: KeyUsage[],
+): Promise<CryptoKey> {
+  const bytes = base64ToBytes(encodedKey.trim());
+  if (bytes.byteLength !== 32) {
+    throw new Error("BERRY_DURABLE_CAPABILITY_KEY must be a base64-encoded 32-byte key");
+  }
+  return globalThis.crypto.subtle.importKey(
+    "raw",
+    bytes,
+    { name: "AES-GCM" },
+    false,
+    usages,
+  );
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
+  let binary: string;
+  try {
+    binary = atob(value);
+  } catch {
+    throw new Error("Durable capability secret is not valid base64");
+  }
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+export const DurableBuiltInToolNameSchema = z.enum([
+  "ask_user_question",
+  "compose_message",
+  "read_file",
+  "list_files",
+  "write_file",
+  "edit_file",
+  "apply_patch",
+  "glob",
+  "grep",
+  "run_command",
+  "persist_artifact",
+  "git_status",
+  "git_diff",
+  "git_log",
+  "git_checkpoint",
+  "create_image",
+  "activate_skill",
+]);
+export type DurableBuiltInToolName = z.infer<typeof DurableBuiltInToolNameSchema>;
+
+export const DURABLE_BASE_BUILT_IN_TOOLS: readonly DurableBuiltInToolName[] = [
+  "ask_user_question",
+  "compose_message",
+  "read_file",
+  "list_files",
+  "write_file",
+  "edit_file",
+  "apply_patch",
+  "glob",
+  "grep",
+  "run_command",
+  "persist_artifact",
+  "git_status",
+  "git_diff",
+  "git_log",
+  "git_checkpoint",
+] as const;
+
+export const DurableProviderTransportSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  kind: z.string().min(1),
+  baseUrl: z.string().url(),
+  defaultModel: z.string().min(1),
+  apiType: z.enum(["openai-chat-completions", "openai-responses", "anthropic-messages"]).default("openai-chat-completions"),
+  endpointPath: z.string().nullable().optional(),
+  modelsPath: z.string().nullable().optional(),
+  authType: z.enum(["none", "bearer", "optional-bearer", "x-api-key"]).default("bearer"),
+  headers: z.record(z.string()).optional(),
+  capabilities: JsonObjectSchema.optional(),
+  models: z.array(JsonObjectSchema).default([]),
+  completionTransport: z.enum(["stream", "buffered"]).optional(),
+  completionFallback: z.literal("buffered").optional(),
+  credentialRef: z.string().min(1).optional(),
+  credential: DurableSecretEnvelopeSchema.optional(),
+}).strict();
+export type DurableProviderTransport = z.infer<typeof DurableProviderTransportSchema>;
+
+export const DurableMcpServerSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  transport: z.enum(["stdio", "http-sse", "streamable-http"]),
+  command: z.string().nullable().default(null),
+  args: z.array(z.string()).default([]),
+  url: z.string().url().nullable().default(null),
+  env: z.record(z.string()).default({}),
+  environment: DurableSecretEnvelopeSchema.optional(),
+  enabled: z.boolean().default(true),
+  trusted: z.boolean().default(true),
+  credentialRef: z.string().min(1).nullable().default(null),
+  credential: DurableSecretEnvelopeSchema.optional(),
+  cachedTools: z.array(z.object({
+    name: z.string().min(1),
+    description: z.string().nullable().default(null),
+    inputSchema: JsonObjectSchema,
+    annotations: z.object({
+      readOnlyHint: z.boolean().optional(),
+      destructiveHint: z.boolean().optional(),
+      idempotentHint: z.boolean().optional(),
+      openWorldHint: z.boolean().optional(),
+    }).optional(),
+  })).optional(),
+}).strict();
+export type DurableMcpServer = z.infer<typeof DurableMcpServerSchema>;
+
+export const DurableSkillSchema = z.object({
+  name: z.string().min(1).max(128),
+  description: z.string().max(2_000),
+  content: z.string().max(262_144),
+  filePath: z.string().max(1_000),
+  disableModelInvocation: z.boolean().default(false),
+  resources: z.array(z.string().max(1_000)).default([]),
+}).strict();
+export type DurableSkill = z.infer<typeof DurableSkillSchema>;
+
+export const DurableImageGenerationCapabilitySchema = z.object({
+  providerId: z.string().min(1),
+  model: z.string().min(1),
+  costMicros: z.string().regex(/^\d+$/),
+}).strict();
+export type DurableImageGenerationCapability = z.infer<typeof DurableImageGenerationCapabilitySchema>;
+
+export const DurableTurnRuntimeRequestSchema = z.object({
+  capabilityVersion: z.literal(1),
+  requestId: z.string().min(1).optional(),
+  input: z.string().default(""),
+  providerId: z.string().min(1),
+  provider: DurableProviderTransportSchema,
+  model: z.string().min(1).nullable(),
+  conversationKind: z.enum(["chat", "code"]).default("chat"),
+  workspacePath: z.string().min(1),
+  workspaceId: z.string().min(1),
+  permissionMode: z.string().min(1),
+  reasoning: z.string().min(1),
+  continueInterruptedTurn: z.boolean().default(false),
+  maxTokens: z.number().int().positive(),
+  contextWindowTokens: z.number().int().positive(),
+  modelPricing: JsonObjectSchema.default({}),
+  networkPolicy: JsonObjectSchema.optional(),
+  builtInTools: z.array(DurableBuiltInToolNameSchema),
+  imageGeneration: DurableImageGenerationCapabilitySchema.optional(),
+  mcpServers: z.array(DurableMcpServerSchema).default([]),
+  extraSkills: z.array(DurableSkillSchema).default([]),
+  attachments: z.array(z.object({
+    id: z.string().optional(),
+    fileId: z.string().uuid().optional(),
+    name: z.string(),
+    mediaType: z.string(),
+    size: z.number().int().nonnegative(),
+    sourceKind: z.string().nullable().optional(),
+  }).strict()).default([]),
+  portableCheckpoint: SessionCheckpointV2Schema.optional(),
+}).strict();
+export type DurableTurnRuntimeRequest = z.infer<typeof DurableTurnRuntimeRequestSchema>;
+
 export const TurnRunStateSchema = z.enum([
   "queued",
   "assembling_context",

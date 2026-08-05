@@ -4,7 +4,9 @@ import {
   type McpServerSpec,
 } from "@berry/local-agent/mcp";
 import {
+  DurableTurnRuntimeRequestSchema,
   NetworkPolicySchema,
+  openDurableSecret,
   type JsonValue,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
@@ -20,12 +22,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   readonly #source: McpToolSource;
   readonly #servers: readonly McpServerSpec[];
   readonly #ready: Promise<void>;
+  readonly #turnContexts = new Map<string, { source: McpToolSource; servers: readonly McpServerSpec[]; ready: Promise<void> }>();
 
   constructor(
     private readonly base: DurableTurnToolExecutor,
     servers: readonly McpServerSpec[],
     networkPolicy: ReturnType<typeof NetworkPolicySchema.parse> | undefined,
-    connectTimeoutMs = 10_000,
+    private readonly connectTimeoutMs = 10_000,
+    private readonly env: NodeJS.ProcessEnv = process.env,
   ) {
     this.#servers = servers;
     this.#source = new McpToolSource({
@@ -43,13 +47,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   }
 
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
+    const context = await this.#context(snapshot);
     const [inherited] = await Promise.all([
       this.base.definitions?.(snapshot) ?? Promise.resolve([]),
-      this.#ready,
+      context.ready,
     ]);
-    const allowed = this.#allowedServers(snapshot);
-    const mcpTools = this.#source.listTools()
-      .filter((tool) => this.#serverForTool(tool.name, allowed) !== undefined)
+    const mcpTools = context.source.listTools()
+      .filter((tool) => this.#serverForTool(tool.name, context.servers) !== undefined)
       .map((tool): ChatToolDefinition => ({
         type: "function",
         function: {
@@ -65,6 +69,18 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return this.base.modelContent?.(snapshot) ?? [];
   }
 
+  async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
+    try {
+      return await (this.base.finalize?.(snapshot) ?? []);
+    } finally {
+      const context = this.#turnContexts.get(snapshot.id);
+      if (context) {
+        this.#turnContexts.delete(snapshot.id);
+        await context.source.close();
+      }
+    }
+  }
+
   policy(
     snapshot: DurableTurnSnapshot,
     toolName: string,
@@ -73,7 +89,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     if (!toolName.startsWith("mcp__")) {
       return this.base.policy?.(snapshot, toolName, permissionMode);
     }
-    const server = this.#serverForTool(toolName, this.#allowedServers(snapshot));
+    const context = this.#turnContexts.get(snapshot.id);
+    const source = context?.source ?? this.#source;
+    const servers = context?.servers ?? this.#allowedServers(snapshot);
+    const server = this.#serverForTool(toolName, servers);
     if (!server) {
       return {
         retryClass: "non_idempotent_manual",
@@ -81,7 +100,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         approvalKind: "mcp",
       };
     }
-    const hints = this.#source.approvalHints(toolName);
+    const hints = source.approvalHints(toolName);
     const berryCrawl = server.id.toLowerCase() === "berrycrawl"
       || server.name.toLowerCase().includes("berrycrawl");
     if (hints?.readOnly || berryCrawl) {
@@ -115,12 +134,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (!toolName.startsWith("mcp__")) return this.base.execute(snapshot, step);
-    await this.#ready;
-    const allowed = this.#allowedServers(snapshot);
-    if (!this.#serverForTool(toolName, allowed)) {
+    const context = await this.#context(snapshot);
+    await context.ready;
+    if (!this.#serverForTool(toolName, context.servers)) {
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
     }
-    const tool = this.#source.listTools().find((candidate) => candidate.name === toolName);
+    const tool = context.source.listTools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error(`MCP tool ${toolName} is unavailable`);
     const callId = stringValue(step.input.toolCallId) ?? step.id;
     const result = await tool.execute(
@@ -130,10 +149,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const text = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n").slice(0, 120_000);
+    const parts = sanitizeMcpJournalValue(result.content);
     return {
       output: {
         content: text || "(no output)",
         tool: toolName,
+        details: sanitizeMcpJournalValue(result.details),
+        parts,
       },
       summary: text ? `${toolName} returned results` : `${toolName} completed`,
     };
@@ -141,6 +163,56 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
 
   async close(): Promise<void> {
     await this.#source.close();
+    await Promise.all([...this.#turnContexts.values()].map((context) => context.source.close()));
+  }
+
+  async #context(snapshot: DurableTurnSnapshot): Promise<{ source: McpToolSource; servers: readonly McpServerSpec[]; ready: Promise<void> }> {
+    const existing = this.#turnContexts.get(snapshot.id);
+    if (existing) return existing;
+    const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
+    if (!runtime.success) {
+      return { source: this.#source, servers: this.#allowedServers(snapshot), ready: this.#ready };
+    }
+    const servers = await Promise.all(runtime.data.mcpServers
+      .filter((server) => server.enabled && server.trusted)
+      .map(async (server): Promise<McpServerSpec> => {
+        const credential = await durableMcpCredential(server.credential, server.credentialRef, this.env);
+        const environment = await durableMcpEnvironment(server.environment, server.env, this.env);
+        return {
+          id: server.id,
+          name: server.name,
+          transport: server.transport,
+          command: server.command,
+          args: server.args,
+          url: server.url,
+          env: environment,
+          enabled: server.enabled,
+          trusted: server.trusted,
+          credentialKey: server.credentialRef,
+          ...(server.cachedTools ? { cachedTools: server.cachedTools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            ...(tool.annotations ? { annotations: compactMcpAnnotations(tool.annotations) } : {}),
+          })) } : {}),
+          ...(credential ? { credential } : {}),
+        };
+      }));
+    const policy = NetworkPolicySchema.safeParse(runtime.data.networkPolicy);
+    const source = new McpToolSource({
+      servers: [...servers],
+      ...(policy.success ? { networkPolicy: policy.data } : {}),
+      connectTimeoutMs: this.connectTimeoutMs,
+      log: (level, message) => {
+        const output = `[durable-mcp:${snapshot.id}] ${message}`;
+        if (level === "error") console.error(output);
+        else if (level === "warn") console.warn(output);
+        else console.info(output);
+      },
+    });
+    const context = { source, servers, ready: source.connect() };
+    this.#turnContexts.set(snapshot.id, context);
+    return context;
   }
 
   #allowedServers(snapshot: DurableTurnSnapshot): readonly McpServerSpec[] {
@@ -175,7 +247,44 @@ export function createDurableTurnToolsFromEnv(
     servers,
     networkPolicy,
     positiveInteger(env.BERRY_MCP_CONNECT_TIMEOUT_MS) ?? 10_000,
+    env,
   );
+}
+
+async function durableMcpCredential(
+  envelope: Parameters<typeof openDurableSecret>[0] | undefined,
+  reference: string | null,
+  env: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  if (envelope) {
+    const key = env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+    if (!key) throw new Error("BERRY_DURABLE_CAPABILITY_KEY is required to open admitted MCP credentials");
+    return openDurableSecret(envelope, key);
+  }
+  if (!reference) return undefined;
+  const name = reference.startsWith("env:") ? reference.slice(4) : reference;
+  const credential = /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? env[name]?.trim() : undefined;
+  if (!credential) throw new Error(`Credential reference ${reference} is not available to the durable Worker`);
+  return credential;
+}
+
+async function durableMcpEnvironment(
+  envelope: Parameters<typeof openDurableSecret>[0] | undefined,
+  fallback: Record<string, string>,
+  env: NodeJS.ProcessEnv,
+): Promise<Record<string, string>> {
+  if (!envelope) return fallback;
+  const key = env.BERRY_DURABLE_CAPABILITY_KEY?.trim();
+  if (!key) throw new Error("BERRY_DURABLE_CAPABILITY_KEY is required to open an admitted MCP environment");
+  const parsed = JSON.parse(await openDurableSecret(envelope, key)) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("The admitted MCP environment is invalid");
+  }
+  const entries = Object.entries(parsed);
+  if (!entries.every((entry): entry is [string, string] => typeof entry[1] === "string")) {
+    throw new Error("The admitted MCP environment must contain only string values");
+  }
+  return Object.fromEntries(entries);
 }
 
 function sanitizeName(name: string): string {
@@ -204,4 +313,54 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function jsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
+}
+
+const MCP_JOURNAL_STRING_LIMIT = 120_000;
+const MCP_JOURNAL_ARRAY_LIMIT = 256;
+const MCP_JOURNAL_OBJECT_LIMIT = 128;
+const MCP_JOURNAL_DEPTH_LIMIT = 8;
+const MCP_BINARY_FIELD = /^(?:b64_json|base64|blob|bytes|data)$/i;
+
+/** Removes binary MCP payloads and bounds structured metadata before journaling it. */
+export function sanitizeMcpJournalValue(value: unknown, depth = 0): JsonValue {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return value.slice(0, MCP_JOURNAL_STRING_LIMIT);
+  if (depth >= MCP_JOURNAL_DEPTH_LIMIT) return "[omitted: MCP metadata nesting limit reached]";
+  if (Array.isArray(value)) {
+    return value.slice(0, MCP_JOURNAL_ARRAY_LIMIT)
+      .map((item) => sanitizeMcpJournalValue(item, depth + 1));
+  }
+  const object = record(value);
+  if (!object) return String(value).slice(0, MCP_JOURNAL_STRING_LIMIT);
+  const type = stringValue(object.type);
+  if (type && type !== "text") {
+    return {
+      type,
+      omitted: "binary MCP content is not stored in the journal",
+      ...(stringValue(object.mimeType) ? { mimeType: stringValue(object.mimeType)! } : {}),
+      ...(stringValue(object.name) ? { name: stringValue(object.name)! } : {}),
+      ...(stringValue(object.uri) ? { uri: stringValue(object.uri)! } : {}),
+    };
+  }
+  const entries = Object.entries(object).slice(0, MCP_JOURNAL_OBJECT_LIMIT);
+  return Object.fromEntries(entries.map(([key, item]) => [
+    key,
+    MCP_BINARY_FIELD.test(key)
+      ? "[omitted: binary MCP content is not stored in the journal]"
+      : sanitizeMcpJournalValue(item, depth + 1),
+  ]));
+}
+
+function compactMcpAnnotations(value: {
+  readOnlyHint?: boolean | undefined;
+  destructiveHint?: boolean | undefined;
+  idempotentHint?: boolean | undefined;
+  openWorldHint?: boolean | undefined;
+}): NonNullable<NonNullable<McpServerSpec["cachedTools"]>[number]["annotations"]> {
+  return {
+    ...(value.readOnlyHint !== undefined ? { readOnlyHint: value.readOnlyHint } : {}),
+    ...(value.destructiveHint !== undefined ? { destructiveHint: value.destructiveHint } : {}),
+    ...(value.idempotentHint !== undefined ? { idempotentHint: value.idempotentHint } : {}),
+    ...(value.openWorldHint !== undefined ? { openWorldHint: value.openWorldHint } : {}),
+  };
 }

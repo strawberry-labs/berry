@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import {
@@ -15,8 +15,9 @@ import {
   type DockerStreamEvent,
   type SandboxProvider,
 } from "@berry/sandbox-contract";
-import type { ChatContentPart } from "@berry/router-client";
+import type { ChatContentPart, ImageGenerationResult } from "@berry/router-client";
 import type { JsonValue } from "@berry/shared";
+import { parsePatch, type PatchHunk } from "@berry/local-agent";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
@@ -80,7 +81,7 @@ interface SandboxOutputFile {
 export interface SandboxSnapshotRepository {
   loadRun(tenantId: string, runId: string): Promise<SnapshotRun>;
   continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null>;
-  inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]>;
+  inputFiles(tenantId: string, runId: string, scope?: "turn" | "session"): Promise<readonly SandboxInputFile[]>;
   persistOutput(input: {
     snapshot: DurableTurnSnapshot;
     fileId: string;
@@ -91,6 +92,8 @@ export interface SandboxSnapshotRepository {
     bucket: string;
     objectKey: string;
     etag: string | null;
+    origin?: "sandbox_output" | "image_generation";
+    sourcePath?: string;
   }): Promise<SandboxOutputFile>;
   latest(tenantId: string, runId: string): Promise<SnapshotRecord | null>;
   persist(input: {
@@ -131,12 +134,19 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       cwd?: string;
       ttlSeconds?: number;
       maxInputBytes?: number;
+      imageGeneration?: {
+        endpoint: string;
+        editsEndpoint: string;
+        apiKey?: string;
+        model: string;
+        responseFormat: "url" | "b64_json";
+      };
     },
   ) {}
 
   async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
     const requestedSandboxImages = requestedSandboxImagePaths(snapshot);
-    const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
+    const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn"))
       .filter((file) => file.mediaType.startsWith("image/"));
     if (requestedSandboxImages.length === 0 && attachedImages.length === 0) return [];
 
@@ -269,6 +279,143 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sandbox,
       };
     }
+    if (toolName === "edit_file") {
+      const path = safeWorkspacePath(stringValue(args.path) ?? "");
+      const oldString = stringValue(args.old_string, true);
+      const newString = stringValue(args.new_string, true) ?? "";
+      if (oldString === null || oldString.length === 0) throw new Error("edit_file requires a non-empty old_string");
+      const existing = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
+      const occurrences = existing.content.split(oldString).length - 1;
+      if (occurrences === 0) throw new Error(`old_string was not found in ${path}`);
+      if (occurrences > 1 && args.replace_all !== true) {
+        throw new Error(`old_string occurs ${occurrences} times in ${path}; set replace_all or provide more context`);
+      }
+      const content = args.replace_all === true
+        ? existing.content.split(oldString).join(newString)
+        : existing.content.replace(oldString, newString);
+      const written = await this.provider.files.write({ sandbox_id: sandbox.id, path, content, encoding: "utf8" });
+      return {
+        output: { path: written.path, replacements: args.replace_all === true ? occurrences : 1, sizeBytes: written.size_bytes },
+        summary: `Edited ${written.path}`,
+        sandbox,
+      };
+    }
+    if (toolName === "apply_patch") {
+      const patch = stringValue(args.patch, true);
+      if (!patch) throw new Error("apply_patch requires a patch");
+      const result = await applySandboxPatch(this.provider, sandbox.id, patch, step.id);
+      return { output: result, summary: "Applied workspace patch", sandbox };
+    }
+    if (toolName === "glob") {
+      const pattern = stringValue(args.pattern);
+      if (!pattern) throw new Error("glob requires a pattern");
+      const path = safeReadablePath(stringValue(args.path) ?? "/workspace");
+      const result = await sandboxCommand(this.provider, sandbox.id, step.id, [
+        "sh", "-c",
+        'root="$1"; pattern="$2"; if command -v rg >/dev/null 2>&1; then cd "$root" && rg --files -g "$pattern"; else find "$root" -type f -print; fi',
+        "berry-glob", path, pattern,
+      ], this.options.cwd ?? "/workspace");
+      const files = result.split("\n").filter(Boolean).slice(0, 10_000);
+      return { output: { path, pattern, files }, summary: `Matched ${files.length} files`, sandbox };
+    }
+    if (toolName === "grep") {
+      const pattern = stringValue(args.pattern, true);
+      if (!pattern) throw new Error("grep requires a pattern");
+      const path = safeReadablePath(stringValue(args.path) ?? "/workspace");
+      const result = await sandboxCommand(this.provider, sandbox.id, step.id, [
+        "sh", "-c",
+        'root="$1"; pattern="$2"; ignore="$3"; if command -v rg >/dev/null 2>&1; then [ "$ignore" = 1 ] && flag=-i || flag=; rg -n --column --color never $flag -- "$pattern" "$root" || [ $? -eq 1 ]; else grep -RIn -- "$pattern" "$root" || [ $? -eq 1 ]; fi',
+        "berry-grep", path, pattern, args.ignore_case === true ? "1" : "0",
+      ], this.options.cwd ?? "/workspace");
+      return { output: { path, pattern, matches: result.slice(0, 1_000_000) }, summary: `Searched ${path}`, sandbox };
+    }
+    if (toolName === "git_status" || toolName === "git_diff" || toolName === "git_log" || toolName === "git_checkpoint") {
+      const command = toolName === "git_status"
+        ? ["git", "status", "--short", "--branch"]
+        : toolName === "git_diff"
+          ? ["git", "diff", "--", ...(stringValue(args.path) ? [safeWorkspacePath(stringValue(args.path)!)] : [])]
+          : toolName === "git_log"
+            ? ["git", "log", `-${Math.min(100, Math.max(1, numberValue(args.limit) ?? 10))}`, "--oneline", "--decorate"]
+            : ["sh", "-c", 'git add -A && git commit -m "$1"', "berry-checkpoint", stringValue(args.message) ?? "Berry checkpoint"];
+      const output = await sandboxCommand(this.provider, sandbox.id, step.id, command, this.options.cwd ?? "/workspace");
+      return { output: { command: toolName, output }, summary: `${toolName} completed`, sandbox };
+    }
+    if (toolName === "create_image") {
+      const capability = objectValue(snapshot.runtimeRequest.imageGeneration);
+      const config = this.options.imageGeneration;
+      if (!config || !stringValue(capability.model)) throw new Error("Image generation is not configured for this durable turn");
+      const prompt = stringValue(args.prompt);
+      if (!prompt) throw new Error("create_image requires a prompt");
+      const references = Array.isArray(args.reference_image_paths)
+        ? args.reference_image_paths.filter((value): value is string => typeof value === "string").slice(0, 16)
+        : [];
+      const referenceImageUrls: string[] = [];
+      for (const reference of references) {
+        const path = safeReadablePath(reference);
+        const mediaType = binaryMediaType(path);
+        if (!mediaType?.startsWith("image/")) throw new Error(`Reference is not a supported image: ${path}`);
+        const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
+        referenceImageUrls.push(`data:${mediaType};base64,${source.content}`);
+      }
+      const generated = await generateDurableImage(config, {
+        prompt,
+        model: stringValue(capability.model) ?? config.model,
+        size: stringValue(args.size) ?? imageSizeForAspectRatio(stringValue(args.aspect_ratio)),
+        transparentBackground: args.transparent_background === true,
+        idempotencyKey: step.idempotencyKey ?? step.id,
+        ...(referenceImageUrls.length > 0 ? { referenceImageUrls } : {}),
+      });
+      const first = generated.data[0];
+      if (!first) throw new Error("The image provider returned no image");
+      const bytes = first.b64_json
+        ? Buffer.from(first.b64_json, "base64")
+        : await downloadGeneratedImage(first.url);
+      if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
+      const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp)$/i, "");
+      const path = `/workspace/outputs/${title}.png`;
+      await this.provider.files.write({ sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64" });
+      if (!this.objects) throw new Error("Artifact object storage is not configured");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const stored = await this.objects.putArtifact(
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/original/${title}.png`,
+        bytes,
+        "image/png",
+      );
+      const output = await this.repository.persistOutput({
+        snapshot,
+        fileId: step.id,
+        name: `${title}.png`,
+        mediaType: "image/png",
+        sizeBytes: bytes.byteLength,
+        sha256,
+        bucket: stored.bucket,
+        objectKey: stored.key,
+        etag: stored.etag,
+        origin: "image_generation",
+        sourcePath: path,
+      });
+      const dimensions = imageDimensions(stringValue(args.size) ?? imageSizeForAspectRatio(stringValue(args.aspect_ratio)));
+      const image = {
+        src: `/v1/files/${output.fileId}/content`,
+        downloadUrl: `/v1/files/${output.fileId}/content`,
+        fileId: output.fileId,
+        title,
+        prompt,
+        ...(first.revised_prompt ? { revisedPrompt: first.revised_prompt } : {}),
+        aspectRatio: stringValue(args.aspect_ratio) ?? "1:1",
+        width: dimensions.width,
+        height: dimensions.height,
+        mimeType: "image/png",
+        sizeBytes: output.sizeBytes,
+        transparentBackground: args.transparent_background === true,
+        generationId: step.id,
+      };
+      return {
+        output: { text: `Generated ${title}.png`, image, visionPath: path, artifact: { kind: "file", path: image.src, fileId: output.fileId, name: output.name, mediaType: output.mediaType, size: output.sizeBytes } },
+        summary: `Generated ${title}.png`,
+        sandbox,
+      };
+    }
     if (toolName === "persist_artifact") {
       if (!this.objects) throw new Error("Artifact object storage is not configured");
       const path = safeOutputPath(stringValue(args.path) ?? "");
@@ -301,6 +448,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         bucket: stored.bucket,
         objectKey: stored.key,
         etag: stored.etag,
+        sourcePath: path,
       });
       return {
         output: {
@@ -347,6 +495,52 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     throw new Error(`Unsupported durable tool: ${toolName}`);
+  }
+
+  async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
+    if (!snapshot.sandboxId || !this.objects) return [];
+    let listed;
+    try {
+      listed = await this.provider.files.list({ sandbox_id: snapshot.sandboxId, path: "/workspace/outputs", recursive: true });
+    } catch {
+      return [];
+    }
+    const explicitlyPersisted = new Set(snapshot.steps.flatMap((step) => {
+      if (step.state !== "completed") return [];
+      const name = stringValue(step.input.toolName) ?? step.type.slice(5);
+      if (name !== "persist_artifact" && name !== "create_image") return [];
+      const path = name === "persist_artifact"
+        ? stringValue(objectValue(step.input.arguments).path)
+        : stringValue(objectValue(step.output).visionPath);
+      return path ? [safeOutputPath(path)] : [];
+    }));
+    const results: TurnToolResult[] = [];
+    for (const entry of listed.entries) {
+      if (entry.type !== "file" || explicitlyPersisted.has(entry.path) || !isDurableArtifact(entry.path)) continue;
+      const path = safeOutputPath(entry.path);
+      const source = await this.provider.files.read({ sandbox_id: snapshot.sandboxId, path, encoding: "base64" });
+      const bytes = Buffer.from(source.content, "base64");
+      if (bytes.byteLength === 0) continue;
+      const name = safeArtifactName(path.split("/").at(-1) ?? "artifact");
+      const mediaType = durableArtifactMediaType(name);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const fileId = randomUUID();
+      const stored = await this.objects.putArtifact(
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${sha256}/${name}`,
+        bytes,
+        mediaType,
+      );
+      const output = await this.repository.persistOutput({
+        snapshot, fileId, name, mediaType, sizeBytes: bytes.byteLength, sha256,
+        bucket: stored.bucket, objectKey: stored.key, etag: stored.etag, sourcePath: path,
+      });
+      results.push({
+        output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
+        summary: `Published ${name}`,
+        sandbox: { provider: this.provider.kind, id: snapshot.sandboxId, state: snapshot.sandboxState ?? "running" },
+      });
+    }
+    return results;
   }
 
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
@@ -564,7 +758,7 @@ function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot): string[] {
   const paths = snapshot.steps.flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (toolName !== "read_file") return [];
+    if (toolName !== "read_file" && toolName !== "create_image") return [];
     const output = objectValue(step.output);
     const path = stringValue(output.visionPath);
     if (!path || path.startsWith("/workspace/inputs/")) return [];
@@ -651,7 +845,7 @@ LEFT JOIN LATERAL (
     };
   }
 
-  async inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]> {
+  async inputFiles(tenantId: string, runId: string, scope: "turn" | "session" = "session"): Promise<readonly SandboxInputFile[]> {
     const rows = await this.executor.query<SandboxInputFileRow>(
       `
 SELECT DISTINCT f.id AS file_id,f.display_name,f.media_type,f.size_bytes,f.object_key
@@ -659,6 +853,7 @@ FROM turn_runs r
 JOIN file_associations a
   ON a.tenant_id=r.tenant_id AND a.session_id=r.session_id AND a.role='input'
   AND a.created_at<=r.created_at
+  AND ($3::text='session' OR a.message_id=r.request_message_id)
 JOIN files f
   ON f.tenant_id=a.tenant_id AND f.id=a.file_id
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
@@ -677,7 +872,7 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
   )
 ORDER BY f.id ASC
       `.trim(),
-      [tenantId, runId],
+      [tenantId, runId, scope],
     );
     return rows.map((row) => ({
       fileId: row.file_id,
@@ -698,6 +893,8 @@ ORDER BY f.id ASC
     bucket: string;
     objectKey: string;
     etag: string | null;
+    origin?: "sandbox_output" | "image_generation";
+    sourcePath?: string;
   }): Promise<SandboxOutputFile> {
     const run = async (executor: SqlExecutor): Promise<SandboxOutputFile> => {
       const rows = await executor.query<{ id: string }>(
@@ -707,7 +904,7 @@ INSERT INTO files (
   sha256,bucket,object_key,etag,origin,status,metadata
 ) VALUES (
   $1::uuid,$2::uuid,$3::uuid,$4,$4,$5,$6,$7,$8,$9,$10,
-  'sandbox_output','available',$11::jsonb
+  $11,'available',$12::jsonb
 )
 ON CONFLICT (tenant_id,object_key) DO UPDATE SET
   owner_user_id=excluded.owner_user_id,
@@ -732,7 +929,8 @@ RETURNING id
           input.bucket,
           input.objectKey,
           input.etag,
-          JSON.stringify({ source: "durable-sandbox", runId: input.snapshot.id }),
+          input.origin ?? "sandbox_output",
+          JSON.stringify({ source: "durable-sandbox", runId: input.snapshot.id, ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}) }),
         ],
       );
       const fileId = rows[0]?.id;
@@ -1018,6 +1216,163 @@ class NodeDockerExecutor implements DockerCommandExecutor {
   }
 }
 
+async function sandboxCommand(
+  provider: SandboxProvider,
+  sandboxId: string,
+  requestId: string,
+  command: string[],
+  cwd: string,
+): Promise<string> {
+  const output: string[] = [];
+  let exitCode: number | null = null;
+  for await (const event of provider.exec({
+    sandbox_id: sandboxId,
+    request_id: requestId,
+    command,
+    cwd,
+    timeout_ms: 120_000,
+  })) {
+    if (event.kind === "stdout" || event.kind === "stderr") output.push(event.data);
+    else if (event.kind === "exit") exitCode = event.exit_code;
+    else if (event.kind === "error") throw new Error(event.message);
+  }
+  const text = output.join("").slice(0, 1_000_000);
+  if (exitCode !== 0) throw new Error(`Command exited with ${exitCode ?? "unknown"}: ${text.slice(-4_000)}`);
+  return text;
+}
+
+async function applySandboxPatch(
+  provider: SandboxProvider,
+  sandboxId: string,
+  patch: string,
+  requestId: string,
+): Promise<JsonValue> {
+  const operations = parsePatch(patch);
+  const result = { added: [] as string[], updated: [] as string[], deleted: [] as string[] };
+  for (const operation of operations) {
+    const target = safeWorkspacePath(operation.path);
+    if (operation.kind === "add") {
+      await provider.files.write({ sandbox_id: sandboxId, path: target, content: operation.content, encoding: "utf8" });
+      result.added.push(operation.path);
+      continue;
+    }
+    if (operation.kind === "delete") {
+      await sandboxCommand(provider, sandboxId, `${requestId}:delete`, ["rm", "--", target], "/workspace");
+      result.deleted.push(operation.path);
+      continue;
+    }
+    const existing = await provider.files.read({ sandbox_id: sandboxId, path: target, encoding: "utf8" });
+    const content = applyPatchHunks(operation.path, existing.content, operation.hunks);
+    const destination = operation.moveTo ? safeWorkspacePath(operation.moveTo) : target;
+    await provider.files.write({ sandbox_id: sandboxId, path: destination, content, encoding: "utf8" });
+    if (operation.moveTo) {
+      await sandboxCommand(provider, sandboxId, `${requestId}:move`, ["rm", "--", target], "/workspace");
+      result.updated.push(operation.moveTo);
+    } else {
+      result.updated.push(operation.path);
+    }
+  }
+  return result;
+}
+
+function applyPatchHunks(path: string, content: string, hunks: PatchHunk[]): string {
+  let lines = content.split("\n");
+  let searchFrom = 0;
+  for (const hunk of hunks) {
+    const anchor = hunk.removed.length > 0 ? hunk.removed : hunk.context;
+    if (anchor.length === 0) {
+      lines = [...lines, ...hunk.added];
+      continue;
+    }
+    const index = findLineSequence(lines, anchor, searchFrom);
+    if (index < 0) throw new Error(`Could not locate patch hunk in ${path}:\n${anchor.join("\n")}`);
+    if (hunk.removed.length > 0) {
+      lines.splice(index, hunk.removed.length, ...hunk.added);
+      searchFrom = index + hunk.added.length;
+    } else {
+      const insertAt = index + anchor.length;
+      lines.splice(insertAt, 0, ...hunk.added);
+      searchFrom = insertAt + hunk.added.length;
+    }
+  }
+  return lines.join("\n");
+}
+
+function findLineSequence(haystack: string[], needle: string[], from: number): number {
+  outer: for (let index = from; index <= haystack.length - needle.length; index += 1) {
+    for (let offset = 0; offset < needle.length; offset += 1) {
+      if (haystack[index + offset] !== needle[offset]) continue outer;
+    }
+    return index;
+  }
+  return from > 0 ? findLineSequence(haystack, needle, 0) : -1;
+}
+
+async function downloadGeneratedImage(url: string | undefined): Promise<Buffer> {
+  if (!url) throw new Error("The image provider returned no image payload");
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:") throw new Error("Generated image downloads must use HTTPS");
+  const response = await fetch(parsed, { signal: AbortSignal.timeout(120_000) });
+  if (!response.ok) throw new Error(`Unable to download generated image (${response.status})`);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function generateDurableImage(
+  config: NonNullable<ConstructorParameters<typeof SandboxContinuityManager>[3]["imageGeneration"]>,
+  input: {
+    prompt: string;
+    model: string;
+    size: string;
+    transparentBackground: boolean;
+    idempotencyKey: string;
+    referenceImageUrls?: string[];
+  },
+): Promise<ImageGenerationResult> {
+  const references = input.referenceImageUrls ?? [];
+  const upstreamModel = input.model.split("/").at(-1) ?? input.model;
+  const response = await fetch(references.length > 0 ? config.editsEndpoint : config.endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "Idempotency-Key": input.idempotencyKey,
+      ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      model: input.model,
+      prompt: input.prompt,
+      ...(references.length > 0 ? {
+        images: references.map((imageUrl) => ({ image_url: imageUrl })),
+        ...(!upstreamModel.startsWith("gpt-image-2") ? { input_fidelity: "high" } : {}),
+      } : {}),
+      n: 1,
+      size: input.size,
+      ...(!upstreamModel.startsWith("gpt-image-") ? { response_format: config.responseFormat } : {}),
+      background: input.transparentBackground ? "transparent" : "auto",
+      ...(input.transparentBackground ? { output_format: "png" } : {}),
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!response.ok) throw new Error(`Image provider request failed with ${response.status}: ${(await response.text()).slice(0, 2_000)}`);
+  const payload = await response.json() as ImageGenerationResult;
+  if (!Array.isArray(payload.data)) throw new Error("Image provider response did not include data");
+  return payload;
+}
+
+function imageSizeForAspectRatio(value: string | null): string {
+  if (value === "3:4" || value === "9:16") return "1024x1536";
+  if (value === "4:3" || value === "16:9") return "1536x1024";
+  return "1024x1024";
+}
+
+function imageDimensions(value: string): { width: number; height: number } {
+  const match = /^(\d+)x(\d+)$/.exec(value);
+  return {
+    width: Number(match?.[1] ?? 1024),
+    height: Number(match?.[2] ?? 1024),
+  };
+}
+
 function excludedSnapshotPath(path: string, root: string): boolean {
   const relative = path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path;
   const parts = relative.split("/");
@@ -1128,6 +1483,58 @@ function binaryMediaType(path: string): string | null {
     mp4: "video/mp4",
     mov: "video/quicktime",
   } as Record<string, string>)[extension] ?? null;
+}
+
+const DURABLE_ARTIFACT_MEDIA_TYPES: Record<string, string> = {
+  avif: "image/avif",
+  bmp: "image/bmp",
+  csv: "text/csv",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  epub: "application/epub+zip",
+  gif: "image/gif",
+  html: "text/html",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  json: "application/json",
+  md: "text/markdown",
+  mov: "video/quicktime",
+  mp3: "audio/mpeg",
+  mp4: "video/mp4",
+  odp: "application/vnd.oasis.opendocument.presentation",
+  ods: "application/vnd.oasis.opendocument.spreadsheet",
+  odt: "application/vnd.oasis.opendocument.text",
+  pdf: "application/pdf",
+  png: "image/png",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  rtf: "application/rtf",
+  svg: "image/svg+xml",
+  tar: "application/x-tar",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  tsv: "text/tab-separated-values",
+  txt: "text/plain",
+  wav: "audio/wav",
+  webm: "video/webm",
+  webp: "image/webp",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xml: "application/xml",
+  yaml: "application/yaml",
+  yml: "application/yaml",
+  zip: "application/zip",
+};
+
+function durableArtifactMediaType(path: string): string {
+  const extension = path.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? "";
+  return DURABLE_ARTIFACT_MEDIA_TYPES[extension] ?? "application/octet-stream";
+}
+
+function isDurableArtifact(path: string): boolean {
+  const name = path.split("/").at(-1) ?? "";
+  if (!name || name.startsWith(".") || name.endsWith("~")) return false;
+  return durableArtifactMediaType(name) !== "application/octet-stream";
 }
 
 function objectValue(value: unknown): Record<string, unknown> {
