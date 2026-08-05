@@ -32,6 +32,9 @@ const MAX_SNAPSHOT_ARCHIVE_BYTES = 384 * 1024 * 1024;
 const MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_MODEL_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_MODEL_IMAGES = 5;
+const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
+const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
+const STOPPED_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 
 interface SnapshotArchive {
   version: 1;
@@ -46,6 +49,7 @@ interface SnapshotRun {
   taskId: string;
   sandboxProvider: string | null;
   sandboxId: string | null;
+  sandboxState?: string | null;
   sessionLeafId: string | null;
 }
 
@@ -134,6 +138,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       cwd?: string;
       ttlSeconds?: number;
       maxInputBytes?: number;
+      terminalSnapshotTimeoutMs?: number;
+      terminalSuspendTimeoutMs?: number;
       imageGeneration?: {
         endpoint: string;
         editsEndpoint: string;
@@ -546,8 +552,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
     const run = await this.repository.loadRun(payload.tenantId, payload.runId);
     if (!run.sandboxId) return { noOp: true };
-    try {
-      const archive = await this.capture(run.sandboxId);
+    const terminal = payload.reason === "before-finalize";
+    if (terminal && run.sandboxState && STOPPED_SANDBOX_STATES.has(run.sandboxState)) {
+      return { noOp: true };
+    }
+    const preserve = async () => {
+      const archive = await this.capture(run.sandboxId!);
       const bytes = Buffer.from(JSON.stringify(archive));
       const contentHash = createHash("sha256")
         .update(JSON.stringify({ version: archive.version, files: archive.files }))
@@ -560,17 +570,30 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const record = await this.repository.persist({
         run,
         provider: run.sandboxProvider ?? this.provider.kind,
-        sandboxId: run.sandboxId,
+        sandboxId: run.sandboxId!,
         objectKey: key,
         contentHash,
       });
       return { noOp: false, snapshotId: record.id };
+    };
+    try {
+      return terminal
+        ? await withTimeout(
+            preserve(),
+            this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS,
+            "Terminal sandbox snapshot",
+          )
+        : await preserve();
     } finally {
-      if (payload.reason === "before-finalize" && this.provider.suspend) {
-        const result = await this.provider.suspend({
-          sandbox_id: run.sandboxId,
-          reason: "Terminal turn snapshot completed",
-        });
+      if (terminal && this.provider.suspend) {
+        const result = await withTimeout(
+          this.provider.suspend({
+            sandbox_id: run.sandboxId,
+            reason: "Terminal turn snapshot completed",
+          }),
+          this.options.terminalSuspendTimeoutMs ?? DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS,
+          "Terminal sandbox pause",
+        );
         await this.repository.recordSandbox({
           tenantId: payload.tenantId,
           runId: payload.runId,
@@ -789,7 +812,7 @@ export class SqlSandboxSnapshotRepository implements SandboxSnapshotRepository {
   async loadRun(tenantId: string, runId: string): Promise<SnapshotRun> {
     const rows = await this.executor.query<SnapshotRunRow>(
       `
-SELECT r.tenant_id,r.id AS run_id,r.session_id,r.task_id,r.sandbox_provider,r.sandbox_id,
+SELECT r.tenant_id,r.id AS run_id,r.session_id,r.task_id,r.sandbox_provider,r.sandbox_id,r.sandbox_state,
        (SELECT entry_id FROM session_entries e
         WHERE e.tenant_id=r.tenant_id AND e.session_id=r.session_id AND e.is_leaf_marker=true
         ORDER BY e.sequence DESC LIMIT 1) AS session_leaf_id
@@ -807,6 +830,7 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
       taskId: row.task_id,
       sandboxProvider: row.sandbox_provider,
       sandboxId: row.sandbox_id,
+      sandboxState: row.sandbox_state,
       sessionLeafId: row.session_leaf_id,
     };
   }
@@ -1602,6 +1626,23 @@ function mapSnapshot(row: SnapshotRow): SnapshotRecord {
   };
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 interface SnapshotRunRow {
   tenant_id: string;
   run_id: string;
@@ -1609,6 +1650,7 @@ interface SnapshotRunRow {
   task_id: string;
   sandbox_provider: string | null;
   sandbox_id: string | null;
+  sandbox_state: string | null;
   session_leaf_id: string | null;
 }
 

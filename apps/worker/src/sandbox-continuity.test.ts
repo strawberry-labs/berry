@@ -74,6 +74,92 @@ describe("SandboxContinuityManager", () => {
     }));
   });
 
+  it("does not reopen a terminal sandbox that is already paused", async () => {
+    const suspend = vi.fn();
+    const list = vi.fn();
+    const provider = {
+      kind: "e2b",
+      suspend,
+      files: { list, read: vi.fn(), write: vi.fn() },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(async () => ({
+        tenantId: "00000000-0000-7000-8000-000000000002",
+        runId: "00000000-0000-7000-8000-000000000001",
+        sessionId: "00000000-0000-7000-8000-000000000004",
+        taskId: "00000000-0000-7000-8000-000000000003",
+        sandboxProvider: "e2b",
+        sandboxId: "sandbox-terminal",
+        sandboxState: "paused",
+        sessionLeafId: null,
+      })),
+      continuity: vi.fn(),
+      latest: vi.fn(),
+      inputFiles: vi.fn(),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, {
+      image: "berry-sandbox",
+    });
+
+    await expect(manager.snapshot({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      reason: "before-finalize",
+    })).resolves.toEqual({ noOp: true });
+    expect(list).not.toHaveBeenCalled();
+    expect(suspend).not.toHaveBeenCalled();
+  });
+
+  it("pauses a terminal sandbox even when its final snapshot exceeds the deadline", async () => {
+    const suspend = vi.fn(async () => ({
+      sandbox_id: "sandbox-terminal",
+      destroyed: true,
+      status: "stopped" as const,
+    }));
+    const provider = {
+      kind: "e2b",
+      suspend,
+      files: {
+        list: vi.fn(() => new Promise(() => undefined)),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(async () => ({
+        tenantId: "00000000-0000-7000-8000-000000000002",
+        runId: "00000000-0000-7000-8000-000000000001",
+        sessionId: "00000000-0000-7000-8000-000000000004",
+        taskId: "00000000-0000-7000-8000-000000000003",
+        sandboxProvider: "e2b",
+        sandboxId: "sandbox-terminal",
+        sandboxState: "pause_requested",
+        sessionLeafId: null,
+      })),
+      continuity: vi.fn(),
+      latest: vi.fn(),
+      inputFiles: vi.fn(),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, {
+      image: "berry-sandbox",
+      terminalSnapshotTimeoutMs: 5,
+    });
+
+    await expect(manager.snapshot({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      reason: "before-finalize",
+    })).rejects.toThrow("Terminal sandbox snapshot timed out after 5ms");
+    expect(suspend).toHaveBeenCalledOnce();
+    expect(repository.recordSandbox).toHaveBeenCalledWith(expect.objectContaining({ state: "paused" }));
+  });
+
   it("executes every sandbox-backed durable tool contract", async () => {
     const provider = {
       kind: "e2b",
