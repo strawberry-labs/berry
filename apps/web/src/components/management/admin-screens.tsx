@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Download, Plus, Save, Search } from "lucide-react";
+import { Copy, Download, FileUp, Plus, Save, Search, UserPlus, Users } from "lucide-react";
 import {
   AsyncState,
   Button,
@@ -38,6 +38,15 @@ import {
   adminAreaForTab,
   resolvedAdminTab,
 } from "./management-navigation";
+import {
+  parseMemberImportCsv,
+  type MemberImportRow,
+} from "../../lib/member-import";
+
+type BulkMemberRow = MemberImportRow & {
+  status: "ready" | "creating" | "created" | "failed";
+  importError: string | undefined;
+};
 export function AdminScreen({
   tab,
   ...p
@@ -314,8 +323,15 @@ function Members({
 }: ManagementScreenProps) {
   const navigate = useNavigate();
   const [query, setQuery] = React.useState(""),
-    [open, setOpen] = React.useState(false),
+    [addMode, setAddMode] = React.useState<"choose" | "manual" | "bulk" | null>(null),
     [message, setMessage] = React.useState("");
+  const [manualError, setManualError] = React.useState("");
+  const [manualBusy, setManualBusy] = React.useState(false);
+  const [bulkRows, setBulkRows] = React.useState<BulkMemberRow[]>([]);
+  const [bulkFileName, setBulkFileName] = React.useState("");
+  const [bulkError, setBulkError] = React.useState("");
+  const [bulkImporting, setBulkImporting] = React.useState(false);
+  const [bulkNotice, setBulkNotice] = React.useState("");
   const [editing, setEditing] = React.useState<any>(null);
   const [editRole, setEditRole] = React.useState("member");
   const [editStatus, setEditStatus] = React.useState("active");
@@ -378,23 +394,114 @@ function Members({
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!client) return;
-    const f = new FormData(e.currentTarget);
-    const created = await client.createOrgMember(tenantId, {
-      email: String(f.get("email")),
-      name: String(f.get("name")),
-      password: String(f.get("password")),
-      role: String(f.get("role")) as any,
-    });
-    const departmentId = String(f.get("primaryDepartmentId"));
-    if (departmentId && departmentId !== "none") {
-      await client.updateOrgMember(tenantId, created.userId, {
-        departmentIds: [departmentId],
-        primaryDepartmentId: departmentId,
+    setManualBusy(true);
+    setManualError("");
+    try {
+      const f = new FormData(e.currentTarget);
+      const created = await client.createOrgMember(tenantId, {
+        email: String(f.get("email")),
+        name: String(f.get("name")),
+        password: String(f.get("password")),
+        role: String(f.get("role")) as any,
       });
+      const departmentId = String(f.get("primaryDepartmentId"));
+      if (departmentId && departmentId !== "none") {
+        await client.updateOrgMember(tenantId, created.userId, {
+          departmentIds: [departmentId],
+          primaryDepartmentId: departmentId,
+        });
+      }
+      setAddMode(null);
+      setMessage("Member account created and the default allowance profile was applied.");
+      r.retry();
+    } catch (error) {
+      setManualError(error instanceof Error ? error.message : "Member creation failed.");
+    } finally {
+      setManualBusy(false);
     }
-    setOpen(false);
-    setMessage("Member account created and the default allowance profile was applied.");
-    r.retry();
+  };
+  const chooseAddMode = (mode: "manual" | "bulk") => {
+    setManualError("");
+    setBulkError("");
+    setBulkNotice("");
+    setAddMode(mode);
+  };
+  const readBulkFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setBulkFileName(file.name);
+    setBulkError("");
+    setBulkNotice("");
+    try {
+      const parsed = parseMemberImportCsv(
+        await file.text(),
+        r.data.map((member: any) => String(member.email)),
+      );
+      setBulkRows(parsed.map((row) => ({
+        ...row,
+        status: row.error ? "failed" : "ready",
+        importError: row.error,
+      })));
+    } catch (error) {
+      setBulkRows([]);
+      setBulkError(error instanceof Error ? error.message : "Couldn’t read this CSV file.");
+    }
+  };
+  const importBulkMembers = async () => {
+    if (!client || bulkImporting) return;
+    const readyRows = bulkRows.filter((row) => row.status === "ready");
+    if (readyRows.length === 0) return;
+    setBulkImporting(true);
+    setBulkError("");
+    setBulkNotice("");
+    let createdCount = 0;
+    let failedCount = bulkRows.filter((row) => row.status === "failed").length;
+    for (const row of readyRows) {
+      setBulkRows((current) => current.map((item) =>
+        item.rowNumber === row.rowNumber ? { ...item, status: "creating" } : item,
+      ));
+      try {
+        await client.createOrgMember(tenantId, {
+          email: row.email,
+          name: row.name,
+          password: row.password,
+          role: "member",
+        });
+        createdCount += 1;
+        setBulkRows((current) => current.map((item) =>
+          item.rowNumber === row.rowNumber ? { ...item, status: "created", importError: undefined } : item,
+        ));
+      } catch (error) {
+        failedCount += 1;
+        const importError = error instanceof Error ? error.message : "Account creation failed.";
+        setBulkRows((current) => current.map((item) =>
+          item.rowNumber === row.rowNumber ? { ...item, status: "failed", importError } : item,
+        ));
+      }
+    }
+    setBulkImporting(false);
+    setBulkNotice(
+      failedCount
+        ? `${createdCount} ${createdCount === 1 ? "member" : "members"} created. ${failedCount} ${failedCount === 1 ? "row needs" : "rows need"} attention.`
+        : `${createdCount} ${createdCount === 1 ? "member" : "members"} created. Copy the temporary passwords before closing.`,
+    );
+    if (createdCount) {
+      setMessage(`${createdCount} ${createdCount === 1 ? "member was" : "members were"} imported.`);
+      r.retry();
+    }
+  };
+  const copyCreatedCredentials = async () => {
+    const credentials = bulkRows
+      .filter((row) => row.status === "created")
+      .map((row) => `${row.name}\t${row.email}\t${row.password}`)
+      .join("\n");
+    if (!credentials) return;
+    try {
+      await navigator.clipboard.writeText(`Name\tEmail\tTemporary password\n${credentials}`);
+      setBulkNotice("Created member credentials copied to the clipboard.");
+    } catch {
+      setBulkError("Clipboard access was blocked. Copy the passwords from the table below.");
+    }
   };
   const openMember = (member: any) => {
     setEditing(member);
@@ -435,7 +542,14 @@ function Members({
       eyebrow="People"
       actions={
         permissions.includes("members:write") ? (
-          <Button onClick={() => setOpen(true)}>
+          <Button onClick={() => {
+            setBulkRows([]);
+            setBulkFileName("");
+            setBulkError("");
+            setBulkNotice("");
+            setManualError("");
+            setAddMode("choose");
+          }}>
             <Plus />
             Add member
           </Button>
@@ -452,8 +566,34 @@ function Members({
       </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
       <ManagementDialog
-        open={open}
-        onOpenChange={setOpen}
+        open={addMode === "choose"}
+        onOpenChange={(next) => { if (!next) setAddMode(null); }}
+        title="Add members"
+        description="Create one member manually or import a CSV with multiple names and email addresses."
+        footer={<Button type="button" variant="secondary" onClick={() => setAddMode(null)}>Cancel</Button>}
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <button
+            type="button"
+            className="group grid min-h-32 gap-3 rounded-xl border border-border bg-card p-4 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={() => chooseAddMode("manual")}
+          >
+            <span className="flex size-9 items-center justify-center rounded-lg border border-border bg-muted/50 text-foreground"><UserPlus className="size-4" aria-hidden /></span>
+            <span><b className="block text-sm text-foreground">Add manually</b><small className="mt-1 block text-xs leading-5 text-muted-foreground">Enter account details, role, department, and a temporary password.</small></span>
+          </button>
+          <button
+            type="button"
+            className="group grid min-h-32 gap-3 rounded-xl border border-border bg-card p-4 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={() => chooseAddMode("bulk")}
+          >
+            <span className="flex size-9 items-center justify-center rounded-lg border border-border bg-muted/50 text-foreground"><Users className="size-4" aria-hidden /></span>
+            <span><b className="block text-sm text-foreground">Bulk import</b><small className="mt-1 block text-xs leading-5 text-muted-foreground">Upload a CSV. New accounts use the member role and no department.</small></span>
+          </button>
+        </div>
+      </ManagementDialog>
+      <ManagementDialog
+        open={addMode === "manual"}
+        onOpenChange={(next) => { if (!next && !manualBusy) setAddMode(null); }}
         title="Add member"
         description="Create a local Berry account and apply the selected organization role. Email invitations are not sent in the current no-SSO mode."
         footer={
@@ -461,12 +601,13 @@ function Members({
             <Button
               type="button"
               variant="secondary"
-              onClick={() => setOpen(false)}
+              onClick={() => setAddMode("choose")}
+              disabled={manualBusy}
             >
-              Cancel
+              Back
             </Button>
-            <Button type="submit" form="invite-member-form">
-              Create account
+            <Button type="submit" form="invite-member-form" disabled={manualBusy}>
+              {manualBusy ? "Creating…" : "Create account"}
             </Button>
           </>
         }
@@ -508,6 +649,68 @@ function Members({
             />
           </label>
         </form>
+        {manualError ? <p className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{manualError}</p> : null}
+      </ManagementDialog>
+      <ManagementDialog
+        open={addMode === "bulk"}
+        onOpenChange={(next) => { if (!next && !bulkImporting) setAddMode(null); }}
+        title="Bulk import members"
+        description="Upload a CSV with name and email columns. Passwords are generated in your browser; every account is created as a member with no department."
+        size="lg"
+        footer={
+          <>
+            {bulkRows.some((row) => row.status === "created") ? (
+              <Button type="button" variant="secondary" onClick={() => void copyCreatedCredentials()}>
+                <Copy aria-hidden />
+                Copy credentials
+              </Button>
+            ) : null}
+            <Button type="button" variant="secondary" onClick={() => setAddMode(bulkRows.some((row) => row.status === "created") ? null : "choose")} disabled={bulkImporting}>
+              {bulkRows.some((row) => row.status === "created") ? "Done" : "Back"}
+            </Button>
+            <Button type="button" onClick={() => void importBulkMembers()} disabled={bulkImporting || !bulkRows.some((row) => row.status === "ready")}>
+              <FileUp aria-hidden />
+              {bulkImporting ? "Importing…" : bulkRows.some((row) => row.status === "ready") ? `Import ${bulkRows.filter((row) => row.status === "ready").length} members` : "Import members"}
+            </Button>
+          </>
+        }
+      >
+        <div className="grid gap-4">
+          <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-border bg-muted/20 px-4 py-4 transition-colors hover:bg-muted/40 focus-within:ring-2 focus-within:ring-ring">
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-card"><FileUp className="size-4" aria-hidden /></span>
+            <span className="min-w-0 flex-1"><b className="block truncate text-sm text-foreground">{bulkFileName || "Choose a CSV file"}</b><small className="mt-0.5 block text-xs text-muted-foreground">Required headers: name, email. Extra columns are ignored.</small></span>
+            <span className="rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-foreground">Browse</span>
+            <input className="sr-only" type="file" accept=".csv,text/csv" onChange={(event) => void readBulkFile(event)} disabled={bulkImporting} />
+          </label>
+          {bulkError ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{bulkError}</p> : null}
+          {bulkNotice ? <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-foreground" role="status">{bulkNotice}</p> : null}
+          {bulkRows.length ? (
+            <div className="overflow-hidden rounded-xl border border-border">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/20 px-3 py-2">
+                <b className="text-xs text-foreground">Import preview</b>
+                <span className="text-[11px] text-muted-foreground">{bulkRows.filter((row) => row.status === "ready").length} ready · {bulkRows.filter((row) => row.status === "failed").length} need attention</span>
+              </div>
+              <div className="max-h-72 overflow-auto">
+                <table className="w-full min-w-[620px] text-left text-xs">
+                  <thead className="sticky top-0 bg-card text-[11px] text-muted-foreground"><tr><th className="px-3 py-2 font-medium">Row</th><th className="px-3 py-2 font-medium">Member</th><th className="px-3 py-2 font-medium">Temporary password</th><th className="px-3 py-2 font-medium">Status</th></tr></thead>
+                  <tbody className="divide-y divide-border">
+                    {bulkRows.map((row) => (
+                      <tr key={row.rowNumber}>
+                        <td className="px-3 py-2 text-muted-foreground">{row.rowNumber}</td>
+                        <td className="px-3 py-2"><b className="block font-medium text-foreground">{row.name || "Missing name"}</b><span className="text-muted-foreground">{row.email || "Missing email"}</span></td>
+                        <td className="px-3 py-2 font-mono text-[11px] text-foreground">{row.password || "—"}</td>
+                        <td className="max-w-52 px-3 py-2">
+                          {row.status === "created" ? <StatusPill tone="good">Created</StatusPill> : row.status === "creating" ? <StatusPill tone="neutral">Creating</StatusPill> : row.status === "ready" ? <StatusPill tone="neutral">Ready</StatusPill> : <span className="text-[11px] leading-4 text-destructive">{row.importError || "Failed"}</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
+          <p className="text-[11px] leading-4 text-muted-foreground">Password format: capitalized first name, @, then at least six random numbers. Generated passwords are at least 12 characters long.</p>
+        </div>
       </ManagementDialog>
       <ManagementDialog
         open={Boolean(editing)}
