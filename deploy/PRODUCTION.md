@@ -51,6 +51,21 @@ tightly scoped platform role. The long-lived services never receive the schema
 owner credential. Caddy obtains and renews the certificate after DNS resolves
 and ports 80/443 are reachable.
 
+For an existing installation created with the former 15-minute sandbox timeout,
+update only the non-secret TTL setting before the next deployment:
+
+```sh
+cd /opt/berry
+cp -a deploy/.env.production deploy/.env.production.bak-sandbox-ttl-300
+sed -i 's/^BERRY_SANDBOX_TTL_SECONDS=.*/BERRY_SANDBOX_TTL_SECONDS=300/' deploy/.env.production
+grep '^BERRY_SANDBOX_TTL_SECONDS=' deploy/.env.production
+```
+
+`deploy/server-deploy.sh` refuses values above 300 seconds. It never replaces
+the production environment file or prints its secrets. The API and worker also
+cap the effective runtime value at 300 seconds, so the first rollout is protected
+even though it begins under the previous deployment script.
+
 Use URL-safe hexadecimal values for the Postgres, MinIO, setup, and usage-webhook secrets because the Postgres password is interpolated into a connection URL and the setup key is printed in a URL fragment. Use a separate 36-byte base64 value for `BETTER_AUTH_SECRET`. The launcher refuses to start while any `REPLACE_WITH` placeholder remains.
 
 The launcher prints a one-time URL containing the setup key in the URL fragment, which is not sent in HTTP requests. Open it and create the configured owner account. Berry creates the owner, organization membership, default workspace ownership, and initial budgets in one locked database transaction. The database then reports setup complete, so the endpoint cannot create another owner even if the key is reused.

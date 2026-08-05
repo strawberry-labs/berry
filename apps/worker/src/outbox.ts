@@ -1,4 +1,9 @@
-import { BerryWorkerJobNameSchema, type BerryWorkerJobMap, type BerryWorkerJobName } from "./jobs.js";
+import {
+  BerryWorkerJobNameSchema,
+  SandboxSnapshotJobPayloadSchema,
+  type BerryWorkerJobMap,
+  type BerryWorkerJobName,
+} from "./jobs.js";
 import type { BerryQueueClient } from "./bullmq.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
@@ -13,11 +18,19 @@ type OutboxRow = {
 export class RuntimeOutboxDispatcher {
   #timer: NodeJS.Timeout | null = null;
   #running = false;
+  #nextTerminalCleanupAt = 0;
 
   constructor(
     private readonly executor: SqlExecutor,
     private readonly queue: BerryQueueClient,
-    private readonly options: { tenantId?: string; workerId: string; pollMs?: number; batchSize?: number },
+    private readonly options: {
+      tenantId?: string;
+      workerId: string;
+      pollMs?: number;
+      batchSize?: number;
+      terminalCleanupIntervalMs?: number;
+      terminalCleanupBatchSize?: number;
+    },
   ) {}
 
   start(): void {
@@ -39,6 +52,7 @@ export class RuntimeOutboxDispatcher {
     try {
       const rows: OutboxRow[] = [];
       const tenantIds = await this.tenantIds();
+      const runTerminalCleanup = this.terminalCleanupDue();
       for (const tenantId of tenantIds) {
         await this.withTenant(tenantId, (executor) => executor.execute(`
         INSERT INTO runtime_outbox (
@@ -64,32 +78,38 @@ export class RuntimeOutboxDispatcher {
           )
         ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       `, [tenantId]));
-        await this.withTenant(tenantId, (executor) => executor.execute(`
+        if (runTerminalCleanup) await this.withTenant(tenantId, (executor) => executor.execute(`
+        WITH candidates AS (
+          SELECT r.tenant_id,r.id,r.version
+          FROM turn_runs r
+          WHERE r.tenant_id=$1::uuid
+            AND r.state IN ('completed','failed','cancelled','recovery_required')
+            AND r.sandbox_id IS NOT NULL
+            AND COALESCE(r.sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')
+            AND NOT EXISTS (
+              SELECT 1 FROM runtime_outbox pending
+              WHERE pending.tenant_id=r.tenant_id
+                AND pending.aggregate_id=r.id::text
+                AND pending.event_type='sandbox.snapshot'
+                AND pending.completed_at IS NULL
+            )
+          ORDER BY r.updated_at ASC
+          LIMIT $2
+        )
         INSERT INTO runtime_outbox (
           tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at
         )
-        SELECT r.tenant_id,'sandbox.snapshot',r.id::text,
-               r.id::text || ':snapshot:terminal-cleanup:' || r.version::text,
+        SELECT candidates.tenant_id,'sandbox.snapshot',candidates.id::text,
+               candidates.id::text || ':snapshot:terminal-cleanup:' || candidates.version::text,
                jsonb_build_object(
-                 'tenantId',r.tenant_id::text,
-                 'runId',r.id::text,
+                 'tenantId',candidates.tenant_id::text,
+                 'runId',candidates.id::text,
                  'reason','before-finalize'
                ),
                now()
-        FROM turn_runs r
-        WHERE r.tenant_id=$1::uuid
-          AND r.state IN ('completed','failed','cancelled','recovery_required')
-          AND r.sandbox_id IS NOT NULL
-          AND COALESCE(r.sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed')
-          AND NOT EXISTS (
-            SELECT 1 FROM runtime_outbox pending
-            WHERE pending.tenant_id=r.tenant_id
-              AND pending.aggregate_id=r.id::text
-              AND pending.event_type='sandbox.snapshot'
-              AND pending.completed_at IS NULL
-          )
+        FROM candidates
         ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
-      `, [tenantId]));
+      `, [tenantId, this.options.terminalCleanupBatchSize ?? 25]));
         const remaining = (this.options.batchSize ?? 50) - rows.length;
         if (remaining <= 0) break;
         const claimed = await this.withTenant(tenantId, async (executor) => executor.query<OutboxRow>(`
@@ -128,12 +148,7 @@ export class RuntimeOutboxDispatcher {
             row.payload as BerryWorkerJobMap[typeof name],
             { jobId: outboxJobId(name, row.id) },
           );
-          await this.withTenant(row.tenant_id, (executor) => executor.execute(`
-            UPDATE runtime_outbox
-            SET completed_at = now(), lease_owner = NULL, lease_expires_at = NULL,
-                last_error = NULL, updated_at = now()
-            WHERE tenant_id = $1::uuid AND id = $2::uuid AND lease_owner = $3
-          `, [row.tenant_id, row.id, this.options.workerId]));
+          await this.complete(row, name);
           dispatched += 1;
         } catch (error) {
           await this.fail(row, error instanceof Error ? error.message : String(error), false);
@@ -143,6 +158,40 @@ export class RuntimeOutboxDispatcher {
     } finally {
       this.#running = false;
     }
+  }
+
+  private async complete(row: OutboxRow, name: BerryWorkerJobName): Promise<void> {
+    const snapshot = name === "sandbox.snapshot"
+      ? SandboxSnapshotJobPayloadSchema.safeParse(row.payload)
+      : null;
+    await this.withTenant(row.tenant_id, async (executor) => {
+      if (snapshot?.success && snapshot.data.reason === "before-finalize") {
+        await executor.execute(`
+          UPDATE turn_runs
+          SET sandbox_state='pause_requested',sandbox_heartbeat_at=now(),updated_at=now()
+          WHERE tenant_id=$1::uuid AND id=$2::uuid
+            AND state IN ('completed','failed','cancelled','recovery_required')
+            AND sandbox_id IS NOT NULL
+            AND COALESCE(sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')
+        `, [row.tenant_id, snapshot.data.runId]);
+      }
+      await executor.execute(`
+        UPDATE runtime_outbox
+        SET completed_at = now(), lease_owner = NULL, lease_expires_at = NULL,
+            last_error = NULL, updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid AND lease_owner = $3
+      `, [row.tenant_id, row.id, this.options.workerId]);
+    });
+  }
+
+  private terminalCleanupDue(): boolean {
+    const now = Date.now();
+    if (now < this.#nextTerminalCleanupAt) return false;
+    this.#nextTerminalCleanupAt = now + Math.max(
+      1_000,
+      this.options.terminalCleanupIntervalMs ?? 60_000,
+    );
+    return true;
   }
 
   private async fail(row: OutboxRow, reason: string, terminal: boolean): Promise<void> {

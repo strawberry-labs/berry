@@ -173,7 +173,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {
@@ -184,6 +184,14 @@ describe("cloud postgres schema", () => {
     expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("department_membership_default_allowance");
     expect(ALLOWANCE_BASE_HIERARCHY_MIGRATION).toContain("ALTER TABLE allowance_member_overrides ENABLE ROW LEVEL SECURITY");
     expect(cloudMigrations.find((migration) => migration.id === 40)).toMatchObject({ id: 40, name: "allowance_base_hierarchy_v1" });
+  });
+
+  it("indexes only terminal sandboxes that still need cleanup", () => {
+    const migration = cloudMigrations.find((candidate) => candidate.id === 41);
+    expect(migration).toMatchObject({ id: 41, name: "terminal_sandbox_cleanup_index_v1" });
+    expect(migration?.sql).toContain("turn_runs_terminal_sandbox_cleanup_idx");
+    expect(migration?.sql).toContain("sandbox_id IS NOT NULL");
+    expect(migration?.sql).toContain("'pause_requested'");
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {

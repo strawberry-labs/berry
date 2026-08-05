@@ -774,6 +774,11 @@ export const turnRuns = pgTable("turn_runs", {
 }, (table) => [
   index("turn_runs_claim_idx").on(table.tenantId, table.state, table.leaseExpiresAt),
   index("turn_runs_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("turn_runs_terminal_sandbox_cleanup_idx")
+    .on(table.tenantId, table.updatedAt)
+    .where(sql`${table.state} IN ('completed','failed','cancelled','recovery_required')
+      AND ${table.sandboxId} IS NOT NULL
+      AND COALESCE(${table.sandboxState},'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')`),
 ]);
 
 export const turnSteps = pgTable("turn_steps", {
@@ -3263,6 +3268,10 @@ CREATE TABLE turn_runs (
 );
 CREATE INDEX turn_runs_claim_idx ON turn_runs (tenant_id, state, lease_expires_at);
 CREATE INDEX turn_runs_session_idx ON turn_runs (tenant_id, session_id, created_at DESC);
+CREATE INDEX turn_runs_terminal_sandbox_cleanup_idx ON turn_runs (tenant_id, updated_at)
+  WHERE state IN ('completed','failed','cancelled','recovery_required')
+    AND sandbox_id IS NOT NULL
+    AND COALESCE(sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested');
 CREATE UNIQUE INDEX turn_runs_active_session_unique ON turn_runs (tenant_id, session_id)
   WHERE state NOT IN ('completed', 'failed', 'cancelled', 'recovery_required');
 
@@ -3896,6 +3905,13 @@ CREATE POLICY organization_ai_access_rules_tenant_isolation ON organization_ai_a
   WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+export const TERMINAL_SANDBOX_CLEANUP_INDEX_MIGRATION = `
+CREATE INDEX IF NOT EXISTS turn_runs_terminal_sandbox_cleanup_idx ON turn_runs (tenant_id, updated_at)
+  WHERE state IN ('completed','failed','cancelled','recovery_required')
+    AND sandbox_id IS NOT NULL
+    AND COALESCE(sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested');
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -3995,4 +4011,5 @@ export const cloudMigrations = [
   { id: 38, name: "organization_model_providers_v1", sql: ORGANIZATION_MODEL_PROVIDERS_MIGRATION },
   { id: 39, name: "organization_ai_access_rules_v1", sql: ORGANIZATION_AI_ACCESS_RULES_MIGRATION },
   { id: 40, name: "allowance_base_hierarchy_v1", sql: ALLOWANCE_BASE_HIERARCHY_MIGRATION },
+  { id: 41, name: "terminal_sandbox_cleanup_index_v1", sql: TERMINAL_SANDBOX_CLEANUP_INDEX_MIGRATION },
 ] as const;

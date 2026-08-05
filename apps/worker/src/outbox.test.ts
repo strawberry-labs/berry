@@ -30,7 +30,50 @@ describe("RuntimeOutboxDispatcher", () => {
     const cleanup = statements.find((sql) => sql.includes("snapshot:terminal-cleanup"));
     expect(cleanup).toContain("r.state IN ('completed','failed','cancelled','recovery_required')");
     expect(cleanup).toContain("r.sandbox_id IS NOT NULL");
+    expect(cleanup).toContain("LIMIT $2");
+    expect(cleanup).toContain("'pause_requested'");
     expect(cleanup).toContain("'reason','before-finalize'");
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+    expect(statements.filter((sql) => sql.includes("snapshot:terminal-cleanup"))).toHaveLength(1);
+  });
+
+  it("atomically marks terminal sandboxes as pause requested when dispatching their snapshot", async () => {
+    const statements: string[] = [];
+    let claimed = false;
+    const executor: SqlExecutor = {
+      execute: vi.fn(async (sql: string) => {
+        statements.push(sql);
+      }),
+      query: async <T>(sql: string): Promise<readonly T[]> => {
+        if (!claimed && sql.includes("RETURNING outbox.id")) {
+          claimed = true;
+          return [{
+            id: outboxId,
+            tenant_id: tenantId,
+            event_type: "sandbox.snapshot",
+            payload: { tenantId, runId, reason: "before-finalize" },
+            attempts: 1,
+          }] as T[];
+        }
+        return [];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const enqueue = vi.fn(async () => ({ id: "queued", name: "sandbox.snapshot" as const }));
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: enqueue as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-test",
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(1);
+
+    expect(statements.find((sql) => sql.includes("sandbox_state='pause_requested'")))
+      .toContain("state IN ('completed','failed','cancelled','recovery_required')");
+    expect(statements.at(-1)).toContain("UPDATE runtime_outbox");
   });
 
   it("uses the unique outbox row for the BullMQ job id", async () => {

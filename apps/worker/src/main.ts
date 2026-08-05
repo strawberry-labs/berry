@@ -50,7 +50,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     {
       image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
       cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
-      ttlSeconds: Number(env.BERRY_SANDBOX_TTL_SECONDS ?? 300),
+      ttlSeconds: Math.min(positiveInteger(env.BERRY_SANDBOX_TTL_SECONDS) ?? 300, 300),
       maxInputBytes: durableConfig.sandboxInputMaxBytes,
       ...(env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim() && env.BERRY_ROUTER_IMAGE_MODEL?.trim()
         ? {

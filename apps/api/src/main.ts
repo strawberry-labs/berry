@@ -219,7 +219,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
           provider: contractProvider,
           repository: new PostgresSandboxWorkspaceRepository(database),
           image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
-          ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 300),
+          ttlSeconds: sandboxTtlSeconds(env),
         }) },
         personalCapabilities: { useValue: personalCapabilities },
         organizationCapabilities: { useValue: organizationCapabilities },
@@ -307,7 +307,7 @@ function createRuntimeSessionHost(env: NodeJS.ProcessEnv, contractProvider: Cont
     tenantId: env.BERRY_TENANT_ID ?? SELF_HOST_TENANT_ID,
     image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
     cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
-    ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 300),
+    ttlSeconds: sandboxTtlSeconds(env),
     resources: {
       cpuCount: numberEnv(env.BERRY_SANDBOX_CPU_COUNT, 2),
       memoryMiB: numberEnv(env.BERRY_SANDBOX_MEMORY_MIB, 4096),
@@ -572,6 +572,11 @@ function csv(value: string): string[] {
 function numberEnv(value: string | undefined, fallback: number): number {
   const parsed = value ? Number(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function sandboxTtlSeconds(env: NodeJS.ProcessEnv): number {
+  const parsed = Number(env.BERRY_SANDBOX_TTL_SECONDS);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, 300) : 300;
 }
 
 function requiredEnv(env: NodeJS.ProcessEnv, name: string, fallback?: string): string {

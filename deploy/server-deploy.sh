@@ -21,6 +21,20 @@ if [ ! -f "$env_file" ]; then
   exit 1
 fi
 
+max_sandbox_ttl_seconds=300
+sandbox_ttl_seconds="$(sed -n 's/^BERRY_SANDBOX_TTL_SECONDS=//p' "$env_file" | tail -n 1)"
+case "$sandbox_ttl_seconds" in
+  ''|*[!0-9]*)
+    echo "BERRY_SANDBOX_TTL_SECONDS must be an integer between 1 and $max_sandbox_ttl_seconds in $env_file." >&2
+    exit 1
+    ;;
+esac
+if [ "$sandbox_ttl_seconds" -lt 1 ] || [ "$sandbox_ttl_seconds" -gt "$max_sandbox_ttl_seconds" ]; then
+  echo "BERRY_SANDBOX_TTL_SECONDS must be between 1 and $max_sandbox_ttl_seconds in $env_file; found $sandbox_ttl_seconds." >&2
+  echo "Back up the file and change only BERRY_SANDBOX_TTL_SECONDS. Deployment automation will not replace the production environment file." >&2
+  exit 1
+fi
+
 cd "$repo_dir"
 started_at="$(date +%s)"
 

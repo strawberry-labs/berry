@@ -13,6 +13,7 @@ const helmWorker = readFileSync(resolve(root, "deploy/helm/berry-platform/templa
 const helmHpa = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/hpa.yaml"), "utf8");
 const dedicatedRunbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md"), "utf8");
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
+const serverDeploy = readFileSync(resolve(root, "deploy/server-deploy.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
 const productionEnv = readFileSync(resolve(root, "deploy/.env.production.example"), "utf8");
 
@@ -150,8 +151,9 @@ const helmMem0 = readFileSync(resolve(root, "deploy/helm/berry-platform/template
 assertContains("deploy/helm/berry-platform/templates/*", `${helmConfig}\n${helmApi}\n${helmWeb}\n${helmWorker}\n${helmMem0}\n${helmHpa}`, requiredHelmTemplateSnippets);
 assertContains("deploy/dedicated-instance-runbook.md", dedicatedRunbook, ["DEPLOYMENT_MODE=dedicated", "helm upgrade --install berry", "kubectl -n berry-acme create secret generic berry-postgres", "kubectl -n berry-acme create secret generic berry-billing", "kubectl -n berry-acme create secret generic berry-e2b"]);
 assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy @api api:3000", "reverse_proxy web:3108", "header @immutable_assets Cache-Control \"public, max-age=31536000, immutable\""]);
-assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS=", "BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY="]);
-assertContains("deploy/PRODUCTION.md", productionRunbook, ["aesg-v2.berry.me", "pause/reconnect", "deploy/backup.sh"]);
+assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS=", "BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY=", "BERRY_SANDBOX_TTL_SECONDS=300"]);
+assertContains("deploy/PRODUCTION.md", productionRunbook, ["aesg-v2.berry.me", "pause/reconnect", "deploy/backup.sh", "bak-sandbox-ttl-300"]);
+assertContains("deploy/server-deploy.sh", serverDeploy, ["max_sandbox_ttl_seconds=300", "Deployment automation will not replace the production environment file"]);
 
 console.log("[compose] self-host deployment config OK");
 console.log("[helm] managed/dedicated/self-host chart config OK");
