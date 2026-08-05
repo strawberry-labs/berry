@@ -2285,6 +2285,8 @@ export const TurnStateSchema = z.object({
   bufferedEvents: z.array(AgentStreamEventSchema),
   /** Durable SSE cursor for the final buffered event, if one exists. */
   lastEventId: z.string().nullable().optional(),
+  /** Original durable run start time, used to keep elapsed-time UI stable across hydration. */
+  startedAt: z.string().datetime({ offset: true }).nullable().optional(),
   replayOnly: z.boolean().default(false),
   owner: z.string().nullable().optional(),
   runState: z.enum([

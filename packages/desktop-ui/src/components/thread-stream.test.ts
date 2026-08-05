@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { IDLE, MAX_RETAINED_LIVE_TIMELINE_ENTRIES, reduceStream, windowLiveTimeline, type TimelineEntry } from "./thread-stream";
 
 describe("live timeline rendering window", () => {
+  it("keeps a hydrated start time when replaying the same durable turn", () => {
+    const startedAt = Date.parse("2026-08-05T13:42:15.000Z");
+    const hydrated = { ...IDLE, turnId: "turn_1", turnStartedAt: startedAt };
+
+    expect(reduceStream(hydrated, { kind: "turn.start", turnId: "turn_1" }).turnStartedAt)
+      .toBe(startedAt);
+  });
+
   it("keeps the newest activity without deleting durable history", () => {
     const timeline: TimelineEntry[] = Array.from({ length: 5 }, (_, index) => ({
       kind: "note",

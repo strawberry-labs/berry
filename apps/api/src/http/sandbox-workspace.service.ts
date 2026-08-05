@@ -69,7 +69,7 @@ export class SandboxWorkspaceService {
     this.#provider = options.provider;
     this.#repository = options.repository ?? new InMemorySandboxWorkspaceRepository();
     this.#image = options.image ?? "node:22-bookworm";
-    this.#ttlSeconds = options.ttlSeconds ?? 3600;
+    this.#ttlSeconds = options.ttlSeconds ?? 300;
   }
 
   async ensure(tenantId: string, taskId: string, sessionId: string | null): Promise<CloudWorkspaceState> {

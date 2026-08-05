@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
-import { initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 
 describe("cloud shell bootstrap", () => {
   it("does not issue live requests for fixture task and session identifiers", () => {
@@ -67,6 +67,19 @@ describe("cloud shell bootstrap", () => {
       waitingReason: null,
       nextAction: null,
     });
+  });
+
+  it("hydrates the elapsed timer from the durable run start", () => {
+    const startedAt = "2026-08-05T13:42:15.000Z";
+    const stream = replayDurableStreamState({
+      active: true,
+      turnId: "turn_1",
+      startedAt,
+      bufferedEvents: [{ kind: "turn.start", turnId: "turn_1" }],
+      replayOnly: false,
+    });
+
+    expect(stream.turnStartedAt).toBe(Date.parse(startedAt));
   });
 
   it("offers composer continuation for failed, cancelled, and recoverable turns", () => {

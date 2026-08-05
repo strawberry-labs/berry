@@ -154,7 +154,7 @@ sandbox:
   templateId: base
   domain: ""
   requestTimeoutMs: 60000
-  ttlSeconds: 900
+  ttlSeconds: 300
   keepMemoryOnPause: false
   cpuCount: 2
   memoryMiB: 4096

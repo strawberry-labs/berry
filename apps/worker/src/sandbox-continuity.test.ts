@@ -11,6 +11,69 @@ import {
 import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 
 describe("SandboxContinuityManager", () => {
+  it("pauses a terminal E2B sandbox after preserving its durable snapshot", async () => {
+    const suspend = vi.fn(async () => ({
+      sandbox_id: "sandbox-terminal",
+      destroyed: true,
+      status: "stopped" as const,
+    }));
+    const provider = {
+      kind: "e2b",
+      suspend,
+      files: {
+        list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(async () => ({
+        tenantId: "00000000-0000-7000-8000-000000000002",
+        runId: "00000000-0000-7000-8000-000000000001",
+        sessionId: "00000000-0000-7000-8000-000000000004",
+        taskId: "00000000-0000-7000-8000-000000000003",
+        sandboxProvider: "e2b",
+        sandboxId: "sandbox-terminal",
+        sessionLeafId: null,
+      })),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(async () => ({
+        id: "snapshot-1",
+        objectKey: "sandbox-snapshots/terminal.json",
+        contentHash: "hash",
+        sequence: 1,
+      })),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(async () => undefined),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+    });
+
+    await expect(manager.snapshot({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      reason: "before-finalize",
+    })).resolves.toMatchObject({ noOp: false, snapshotId: "snapshot-1" });
+
+    expect(suspend).toHaveBeenCalledWith({
+      sandbox_id: "sandbox-terminal",
+      reason: "Terminal turn snapshot completed",
+    });
+    expect(repository.recordSandbox).toHaveBeenCalledWith(expect.objectContaining({
+      sandboxId: "sandbox-terminal",
+      state: "paused",
+    }));
+  });
+
   it("executes every sandbox-backed durable tool contract", async () => {
     const provider = {
       kind: "e2b",

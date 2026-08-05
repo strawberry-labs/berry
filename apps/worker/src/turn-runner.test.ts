@@ -79,6 +79,33 @@ describe("durable turn runner", () => {
     expect(repository.current.steps.find((step) => step.id === pending.id)?.state).toBe("completed");
   });
 
+  it("fails an exhausted model step instead of recovering forever", async () => {
+    const exhausted = { ...modelStep("running", 1), attempt: 3 };
+    const current = snapshot("calling_model", [admittedStep(), exhausted]);
+    current.error = "The provider stream ended before completion";
+    current.sandboxProvider = "e2b";
+    current.sandboxId = "sandbox-1";
+    current.sandboxState = "running";
+    const repository = new FakeTurnRepository(current);
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "", inputTokens: 0, outputTokens: 0, toolCalls: [] };
+      },
+    }, noTools());
+
+    const result = await runner.execute({ tenantId, runId, reason: "lease-recovery" });
+
+    expect(result.state).toBe("failed");
+    expect(modelCalls).toBe(0);
+    expect(repository.current.steps.find((step) => step.id === exhausted.id)?.state).toBe("failed");
+    expect(repository.outbox).toContainEqual(expect.objectContaining({
+      eventType: "sandbox.snapshot",
+      dedupeKey: `${runId}:snapshot:failed`,
+    }));
+  });
+
   it("resumes a running read-only tool safely", async () => {
     const tool = toolStep("running", "read_only", false);
     const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
@@ -101,7 +128,11 @@ describe("durable turn runner", () => {
 
   it("moves an ambiguous running non-idempotent tool to recovery_required", async () => {
     const tool = toolStep("running", "non_idempotent_manual", false);
-    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const current = snapshot("executing_tool", [admittedStep(), tool]);
+    current.sandboxProvider = "e2b";
+    current.sandboxId = "sandbox-1";
+    current.sandboxState = "running";
+    const repository = new FakeTurnRepository(current);
     let calls = 0;
     const runner = new DurableTurnRunner(repository, unusedModel(), {
       execute: async () => {
@@ -116,6 +147,26 @@ describe("durable turn runner", () => {
     expect(calls).toBe(0);
     expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("recovery_required");
     expect(repository.current.error).toBe("ambiguous_non_idempotent_tool");
+    expect(repository.outbox).toContainEqual(expect.objectContaining({
+      dedupeKey: `${runId}:snapshot:recovery-required`,
+    }));
+  });
+
+  it("snapshots a cancelled sandbox so the snapshot worker can pause it", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.cancelledAt = new Date().toISOString();
+    current.sandboxProvider = "e2b";
+    current.sandboxId = "sandbox-1";
+    current.sandboxState = "running";
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, unusedModel(), noTools());
+
+    const result = await runner.execute({ tenantId, runId, reason: "continue" });
+
+    expect(result.state).toBe("cancelled");
+    expect(repository.outbox).toContainEqual(expect.objectContaining({
+      dedupeKey: `${runId}:snapshot:cancelled`,
+    }));
   });
 
   it("releases the lease while waiting for approval and resumes after a durable wakeup", async () => {

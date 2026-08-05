@@ -219,7 +219,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
           provider: contractProvider,
           repository: new PostgresSandboxWorkspaceRepository(database),
           image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
-          ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 3600),
+          ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 300),
         }) },
         personalCapabilities: { useValue: personalCapabilities },
         organizationCapabilities: { useValue: organizationCapabilities },
@@ -307,7 +307,7 @@ function createRuntimeSessionHost(env: NodeJS.ProcessEnv, contractProvider: Cont
     tenantId: env.BERRY_TENANT_ID ?? SELF_HOST_TENANT_ID,
     image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
     cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
-    ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 3600),
+    ttlSeconds: numberEnv(env.BERRY_SANDBOX_TTL_SECONDS, 300),
     resources: {
       cpuCount: numberEnv(env.BERRY_SANDBOX_CPU_COUNT, 2),
       memoryMiB: numberEnv(env.BERRY_SANDBOX_MEMORY_MIB, 4096),

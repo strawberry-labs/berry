@@ -220,9 +220,10 @@ WHERE tenant_id=$1::uuid AND id=$4::uuid
         waiting_reason: string | null;
         next_action: string | null;
         error: string | null;
+        created_at: Date | string;
       }>(
         `
-SELECT id,state,lease_owner,waiting_reason,next_action,error FROM turn_runs
+SELECT id,state,lease_owner,waiting_reason,next_action,error,created_at FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
 ORDER BY created_at DESC
 LIMIT 1
@@ -282,6 +283,9 @@ LIMIT 256
         turnId: run.id,
         bufferedEvents,
         lastEventId: maximum === null ? null : `${run.id}:${maximum}`,
+        startedAt: run.created_at instanceof Date
+          ? run.created_at.toISOString()
+          : new Date(run.created_at).toISOString(),
         replayOnly: false,
         owner: run.lease_owner,
         runState: run.state,

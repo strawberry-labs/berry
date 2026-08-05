@@ -84,6 +84,24 @@ const TaskFileLibraryDialog = React.lazy(async () => ({
 
 type StreamEvent = Parameters<typeof reduceStream>[1];
 
+export function replayDurableStreamState(state: TurnState): StreamState {
+  const parsedStartedAt = state.startedAt ? Date.parse(state.startedAt) : Number.NaN;
+  const initialState: StreamState = state.active
+    && state.turnId
+    && Number.isFinite(parsedStartedAt)
+    ? { ...IDLE, turnId: state.turnId, turnStartedAt: parsedStartedAt }
+    : IDLE;
+  const replayEvents = state.active
+    && state.turnId
+    && !state.bufferedEvents.some((event) => event.kind === "turn.start")
+    ? [{ kind: "turn.start" as const, turnId: state.turnId, continuation: true }, ...state.bufferedEvents]
+    : state.bufferedEvents;
+  return replayEvents.reduce(
+    (streamState, event) => reduceStream(streamState, event),
+    initialState,
+  );
+}
+
 export function reduceDurableTurnState(
   previous: TurnState | undefined,
   event: StreamEvent,
@@ -727,17 +745,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     const pending = pendingStreamDeltasRef.current.get(sessionId);
     if (pending?.frameId !== null && pending?.frameId !== undefined) cancelAnimationFrame(pending.frameId);
     pendingStreamDeltasRef.current.delete(sessionId);
-    const replayEvents = state.active
-      && state.turnId
-      && !state.bufferedEvents.some((event) => event.kind === "turn.start")
-      ? [{ kind: "turn.start" as const, turnId: state.turnId, continuation: true }, ...state.bufferedEvents]
-      : state.bufferedEvents;
     setStreamsBySession((current) => ({
       ...current,
-      [sessionId]: replayEvents.reduce(
-        (streamState, event) => reduceStream(streamState, event),
-        IDLE,
-      ),
+      [sessionId]: replayDurableStreamState(state),
     }));
   }, []);
 

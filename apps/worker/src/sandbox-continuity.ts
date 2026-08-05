@@ -546,24 +546,40 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
     const run = await this.repository.loadRun(payload.tenantId, payload.runId);
     if (!run.sandboxId) return { noOp: true };
-    const archive = await this.capture(run.sandboxId);
-    const bytes = Buffer.from(JSON.stringify(archive));
-    const contentHash = createHash("sha256")
-      .update(JSON.stringify({ version: archive.version, files: archive.files }))
-      .digest("hex");
-    const prior = await this.repository.latest(payload.tenantId, payload.runId);
-    if (prior?.contentHash === contentHash) return { noOp: true, snapshotId: prior.id };
-    if (!this.objects) throw new Error("Sandbox snapshot object storage is not configured");
-    const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
-    await this.objects.put(key, bytes);
-    const record = await this.repository.persist({
-      run,
-      provider: run.sandboxProvider ?? this.provider.kind,
-      sandboxId: run.sandboxId,
-      objectKey: key,
-      contentHash,
-    });
-    return { noOp: false, snapshotId: record.id };
+    try {
+      const archive = await this.capture(run.sandboxId);
+      const bytes = Buffer.from(JSON.stringify(archive));
+      const contentHash = createHash("sha256")
+        .update(JSON.stringify({ version: archive.version, files: archive.files }))
+        .digest("hex");
+      const prior = await this.repository.latest(payload.tenantId, payload.runId);
+      if (prior?.contentHash === contentHash) return { noOp: true, snapshotId: prior.id };
+      if (!this.objects) throw new Error("Sandbox snapshot object storage is not configured");
+      const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
+      await this.objects.put(key, bytes);
+      const record = await this.repository.persist({
+        run,
+        provider: run.sandboxProvider ?? this.provider.kind,
+        sandboxId: run.sandboxId,
+        objectKey: key,
+        contentHash,
+      });
+      return { noOp: false, snapshotId: record.id };
+    } finally {
+      if (payload.reason === "before-finalize" && this.provider.suspend) {
+        const result = await this.provider.suspend({
+          sandbox_id: run.sandboxId,
+          reason: "Terminal turn snapshot completed",
+        });
+        await this.repository.recordSandbox({
+          tenantId: payload.tenantId,
+          runId: payload.runId,
+          provider: run.sandboxProvider ?? this.provider.kind,
+          sandboxId: run.sandboxId,
+          state: result.status === "missing" ? "missing" : "paused",
+        });
+      }
+    }
   }
 
   private async ensureSandbox(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
@@ -615,7 +631,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       session_id: snapshot.sessionId,
       image: stringValue(snapshot.runtimeRequest.sandboxImage) ?? this.options.image,
       cwd: this.options.cwd ?? "/workspace",
-      ttl_seconds: this.options.ttlSeconds ?? 3600,
+      ttl_seconds: this.options.ttlSeconds ?? 300,
       network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy),
       writable_roots: [this.options.cwd ?? "/workspace"],
       metadata: { runId: snapshot.id },

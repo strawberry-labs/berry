@@ -318,6 +318,7 @@ export class DurableTurnRunner {
       heartbeatMs?: number;
       snapshotIntervalSeconds?: number;
       contextWindowTokens?: number;
+      maxModelAttempts?: number;
       compactor?: SessionCompactionRunner;
     } = {},
   ) {}
@@ -436,6 +437,12 @@ export class DurableTurnRunner {
         nextAction: "Finalize the already completed model turn",
       });
       return "finalizing";
+    }
+    const maxModelAttempts = Math.max(1, this.options.maxModelAttempts ?? 3);
+    if (step.attempt >= maxModelAttempts) {
+      throw new DurableTurnTerminalError(
+        `Model request failed after ${step.attempt} attempts.`,
+      );
     }
     if (this.options.compactor && shouldCompactSnapshot(snapshot, this.options)) {
       await this.commitAndWake(snapshot, {
@@ -759,6 +766,17 @@ export class DurableTurnRunner {
         error: "ambiguous_non_idempotent_tool",
         nextAction: "Review the tool outcome and choose retry, mark complete, or cancel",
         taskStatus: "failed",
+        ...(snapshot.sandboxId ? {
+          outbox: [{
+            eventType: "sandbox.snapshot",
+            dedupeKey: `${snapshot.id}:snapshot:recovery-required`,
+            payload: {
+              tenantId: snapshot.tenantId,
+              runId: snapshot.id,
+              reason: "before-finalize",
+            },
+          }],
+        } : {}),
       });
       return "recovery_required";
     }
@@ -1125,6 +1143,17 @@ export class DurableTurnRunner {
       nextAction: null,
       waitingReason: null,
       taskStatus: "cancelled",
+      ...(snapshot.sandboxId ? {
+        outbox: [{
+          eventType: "sandbox.snapshot",
+          dedupeKey: `${snapshot.id}:snapshot:cancelled`,
+          payload: {
+            tenantId: snapshot.tenantId,
+            runId: snapshot.id,
+            reason: "before-finalize",
+          },
+        }],
+      } : {}),
     });
   }
 

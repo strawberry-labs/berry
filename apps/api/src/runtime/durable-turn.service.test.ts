@@ -342,6 +342,7 @@ describe("DurableTurnService", () => {
             waiting_reason: null,
             next_action: "Model request in progress",
             error: null,
+            created_at: "2026-08-05T13:42:15.000Z",
           }] as T[];
         }
         if (sql.includes("MAX(sequence) FILTER")) {
@@ -370,6 +371,7 @@ describe("DurableTurnService", () => {
     const state = await service.state(tenantId, sessionId);
 
     expect(state.lastEventId).toBe(`${runId}:12`);
+    expect(state.startedAt).toBe("2026-08-05T13:42:15.000Z");
     expect(state.bufferedEvents).toEqual([
       { kind: "message.start", messageId: questionId, role: "assistant" },
       { kind: "message.delta", messageId: questionId, delta: "Hello", channel: "text" },

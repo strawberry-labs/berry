@@ -64,6 +64,32 @@ export class RuntimeOutboxDispatcher {
           )
         ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       `, [tenantId]));
+        await this.withTenant(tenantId, (executor) => executor.execute(`
+        INSERT INTO runtime_outbox (
+          tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at
+        )
+        SELECT r.tenant_id,'sandbox.snapshot',r.id::text,
+               r.id::text || ':snapshot:terminal-cleanup:' || r.version::text,
+               jsonb_build_object(
+                 'tenantId',r.tenant_id::text,
+                 'runId',r.id::text,
+                 'reason','before-finalize'
+               ),
+               now()
+        FROM turn_runs r
+        WHERE r.tenant_id=$1::uuid
+          AND r.state IN ('completed','failed','cancelled','recovery_required')
+          AND r.sandbox_id IS NOT NULL
+          AND COALESCE(r.sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed')
+          AND NOT EXISTS (
+            SELECT 1 FROM runtime_outbox pending
+            WHERE pending.tenant_id=r.tenant_id
+              AND pending.aggregate_id=r.id::text
+              AND pending.event_type='sandbox.snapshot'
+              AND pending.completed_at IS NULL
+          )
+        ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+      `, [tenantId]));
         const remaining = (this.options.batchSize ?? 50) - rows.length;
         if (remaining <= 0) break;
         const claimed = await this.withTenant(tenantId, async (executor) => executor.query<OutboxRow>(`

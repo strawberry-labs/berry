@@ -229,7 +229,14 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
           turnStartedAt: state.turnStartedAt ?? Date.now(),
         };
       }
-      return { ...IDLE, turnActive: true, turnId: event.turnId, turnStartedAt: Date.now() };
+      return {
+        ...IDLE,
+        turnActive: true,
+        turnId: event.turnId,
+        turnStartedAt: state.turnId === event.turnId
+          ? state.turnStartedAt ?? Date.now()
+          : Date.now(),
+      };
     case "message.start":
       // Keep `reasoning` for the whole turn (it's cleared on turn.start). A turn
       // often emits a separate reasoning message then a text message; resetting

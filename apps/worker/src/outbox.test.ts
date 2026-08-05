@@ -8,6 +8,31 @@ const runId = "00000000-0000-7000-8000-000000000002";
 const outboxId = "00000000-0000-7000-8000-000000000003";
 
 describe("RuntimeOutboxDispatcher", () => {
+  it("backfills cleanup snapshots for terminal runs with billable sandboxes", async () => {
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      execute: vi.fn(async (sql: string) => {
+        statements.push(sql);
+      }),
+      query: async <T>(): Promise<readonly T[]> => [],
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: vi.fn() as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-test",
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+
+    const cleanup = statements.find((sql) => sql.includes("snapshot:terminal-cleanup"));
+    expect(cleanup).toContain("r.state IN ('completed','failed','cancelled','recovery_required')");
+    expect(cleanup).toContain("r.sandbox_id IS NOT NULL");
+    expect(cleanup).toContain("'reason','before-finalize'");
+  });
+
   it("uses the unique outbox row for the BullMQ job id", async () => {
     let claimed = false;
     const executor: SqlExecutor = {
