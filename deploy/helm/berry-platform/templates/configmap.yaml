@@ -73,14 +73,8 @@ data:
   BERRY_KNOWLEDGE_CHUNK_TOKENS: {{ .Values.durableContext.chunkTokens | quote }}
   BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS: {{ .Values.durableContext.chunkOverlapTokens | quote }}
   BERRY_RETRIEVAL_TOKEN_BUDGET: {{ .Values.durableContext.retrievalTokenBudget | quote }}
-  BERRY_COMPACTION_TRIGGER_TOKENS: {{ .Values.durableContext.compactionTriggerTokens | quote }}
   BERRY_RUN_LEASE_SECONDS: {{ .Values.durableContext.runLeaseSeconds | quote }}
   BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS: {{ .Values.durableContext.snapshotIntervalSeconds | quote }}
   BERRY_KNOWLEDGE_MAX_INPUT_BYTES: {{ .Values.durableContext.maxInputBytes | quote }}
   BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES: {{ .Values.durableContext.maxOutputBytes | quote }}
   BERRY_SANDBOX_INPUT_MAX_BYTES: {{ .Values.durableContext.sandboxInputMaxBytes | quote }}
-  BERRY_TURN_MAX_MODEL_ITERATIONS: {{ .Values.durableContext.maxModelIterations | quote }}
-  BERRY_TURN_MAX_TOOL_CALLS: {{ .Values.durableContext.maxToolCalls | quote }}
-  BERRY_TURN_MAX_TOTAL_TOKENS: {{ .Values.durableContext.maxTotalTokens | quote }}
-  BERRY_TURN_MAX_SPEND_MICROS: {{ .Values.durableContext.maxSpendMicros | quote }}
-  BERRY_TURN_MAX_WALL_TIME_SECONDS: {{ .Values.durableContext.maxWallTimeSeconds | quote }}

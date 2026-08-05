@@ -25,6 +25,8 @@ not create QA PDFs, contact sheets, rendered previews, or other QA artifacts.
   `/workspace/outputs`.
 - Use `/managed-skills` in every shell command. Never reference a protected
   `/.berry` path.
+- Run the bundled Python commands directly. Do not source or activate a virtual
+  environment; the managed runtime already provides their dependencies.
 - Do not install dependencies, copy bundled generators, rebuild templates, or
   write a replacement renderer.
 
@@ -33,7 +35,7 @@ not create QA PDFs, contact sheets, rendered previews, or other QA artifacts.
 Read the prompt and attachments first. Reuse every fact already supplied and
 never ask for it again. Determine whether the source is an existing CV/resume
 or facts supplied in chat, and locate a separate JPG/PNG headshot or a suitable
-image embedded in a supplied PDF.
+image embedded in a supplied PDF or DOCX.
 
 Default to all four outputs. Do not ask the user to choose format or
 orientation unless their request is genuinely ambiguous about wanting fewer
@@ -50,7 +52,7 @@ Treat these as blockers:
 - work experience, or explicit confirmation that there is none;
 - selected narrative projects, or explicit confirmation that there are none;
 - a real profile headshot, either attached separately or recoverable from the
-  source PDF.
+  source PDF or DOCX.
 
 For each work-experience record ask for start date, end date, role,
 organisation, and location. Description is optional because the current
@@ -80,12 +82,12 @@ CV content unless the user explicitly asks for editing. If a project has only
 metadata and no narrative description, ask for the missing narrative rather
 than manufacturing one.
 
-For attached CVs without a separate photo, recover the likely embedded
-headshot:
+For attached PDF or DOCX CVs without a separate photo, recover the likely
+embedded headshot before asking the user for another upload:
 
 ```bash
 python /managed-skills/cv-creator/scripts/extract_profile_photo.py \
-  /workspace/input/candidate.pdf \
+  /workspace/input/candidate.docx \
   --output /workspace/tmp/cv-creator/candidate/profile-photo.jpg
 ```
 

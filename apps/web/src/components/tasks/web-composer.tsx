@@ -166,6 +166,7 @@ export function Composer({
   const editorRef = React.useRef<PromptEditorHandle>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const pastedTextCountRef = React.useRef(0);
+  const uploadControllersRef = React.useRef(new Map<string, AbortController>());
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[] } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
@@ -311,6 +312,11 @@ export function Composer({
   React.useEffect(() => () => {
     if (editingFollowUpRef.current) onEditingFollowUpChange(null);
   }, [onEditingFollowUpChange]);
+
+  React.useEffect(() => () => {
+    for (const controller of uploadControllersRef.current.values()) controller.abort();
+    uploadControllersRef.current.clear();
+  }, []);
 
   const reorderQueuedFollowUps = React.useCallback((sessionId: string, orderedIds: string[]) => {
     if (!editingFollowUp || editingFollowUp.sessionId !== sessionId) {
@@ -477,12 +483,16 @@ export function Composer({
         state: "uploading",
         ...(index === 0 && options.pastedText ? { pastedText: options.pastedText, pastedTextMode: options.pastedTextMode } : {}),
       }));
+      for (const pending of queued) uploadControllersRef.current.set(pending.id, new AbortController());
       setPendingUploads((current) => [...current, ...queued]);
       await mapWithConcurrency(queued, 2, async (pending) => {
+        const controller = uploadControllersRef.current.get(pending.id);
         try {
+          if (!controller || controller.signal.aborted) return;
           const attachment: AttachmentInput = client
             ? await client.uploadFile(pending.file, {
               ...(activeTask ? { taskId: activeTask.id, ...(activeTask.activeSessionId ? { sessionId: activeTask.activeSessionId } : {}) } : {}),
+              signal: controller.signal,
               onProgress: ({ ratio, uploadedBytes }) => setPendingUploads((current) => current.map((item) => item.id === pending.id ? { ...item, ratio, uploadedBytes } : item)),
             }).then((stored) => {
               return {
@@ -496,6 +506,7 @@ export function Composer({
               } satisfies AttachmentInput;
             })
             : await fileToAttachment(pending.file);
+          if (controller.signal.aborted) return;
           if (pending.pastedText && pending.pastedTextMode && attachment.id) {
             setPastedTextPresentations((current) => ({
               ...current,
@@ -510,9 +521,15 @@ export function Composer({
           setPendingUploads((current) => current.filter((item) => item.id !== pending.id));
           return attachment;
         } catch (cause) {
+          if (controller?.signal.aborted) {
+            setPendingUploads((current) => current.filter((item) => item.id !== pending.id));
+            return;
+          }
           const message = cause instanceof Error ? cause.message : "Upload failed";
           setPendingUploads((current) => current.map((item) => item.id === pending.id ? { ...item, state: "error", error: message } : item));
           throw cause;
+        } finally {
+          uploadControllersRef.current.delete(pending.id);
         }
       });
     } catch (cause) {
@@ -521,6 +538,11 @@ export function Composer({
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }, [activeTask, attachments, client, pendingUploads.length]);
+
+  const dismissPendingUpload = React.useCallback((upload: PendingFileUpload) => {
+    uploadControllersRef.current.get(upload.id)?.abort();
+    setPendingUploads((current) => current.filter((item) => item.id !== upload.id));
+  }, []);
 
   const handlePaste = React.useCallback((event: ClipboardEvent) => {
     const files = filesFromDataTransfer(event.clipboardData);
@@ -711,9 +733,14 @@ export function Composer({
                 </AttachmentMedia>
                 <AttachmentContent>
                   <AttachmentTitle>{upload.file.name}</AttachmentTitle>
-                  <AttachmentDescription>{upload.state === "error" ? (upload.error ?? "Upload failed") : formatFileSize(upload.uploadedBytes)}</AttachmentDescription>
+                  <AttachmentDescription>{upload.state === "error" ? (upload.error ?? "Upload failed") : uploadProgressDescription(upload.uploadedBytes, upload.file.size)}</AttachmentDescription>
                 </AttachmentContent>
-                {upload.state === "error" ? <AttachmentActions><AttachmentAction aria-label={`Remove ${upload.file.name}`} onClick={() => setPendingUploads((current) => current.filter((item) => item.id !== upload.id))}>×</AttachmentAction></AttachmentActions> : null}
+                <AttachmentActions>
+                  <AttachmentAction
+                    aria-label={`${upload.state === "uploading" ? "Cancel upload" : "Remove"} ${upload.file.name}`}
+                    onClick={() => dismissPendingUpload(upload)}
+                  >×</AttachmentAction>
+                </AttachmentActions>
               </Attachment>
             ))}
             {attachments.map((attachment, index) => {
@@ -841,8 +868,8 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
   const usedPercent = formatContextPercent(percent);
   const leftPercentLabel = formatContextPercent(leftPercent);
   const tooltipLabel = stats && usedPercent !== null
-    ? `Context window: ${usedPercent}% used (${leftPercentLabel ?? "0"}% left)${used && total ? `, ${used} / ${total} tokens used` : ""}`
-    : "Calculating context window usage";
+    ? `Active context: ${usedPercent}% used (${leftPercentLabel ?? "0"}% left)${used && total ? `, ${used} / ${total} tokens used` : ""}`
+    : "Calculating active context usage";
 
   return (
     <TooltipProvider delayDuration={250}>
@@ -870,10 +897,11 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
           <div className="berry-context-tooltip-content">
             {stats && usedPercent !== null ? (
               <>
-                <span className="berry-context-tooltip-label">Context window</span>
+                <span className="berry-context-tooltip-label">Active context</span>
                 <span>{usedPercent}% used ({leftPercentLabel ?? "0"}% left)</span>
                 {used && total ? <span>{used} / {total} tokens used</span> : null}
                 {left ? <span className="berry-context-tooltip-label">{left} tokens remaining</span> : null}
+                <span>Retained task history; older detail becomes a checkpoint after compaction</span>
               </>
             ) : (
               <span className="berry-context-tooltip-label">Calculating context usage…</span>
@@ -913,6 +941,13 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} ${bytes === 1 ? "byte" : "bytes"}`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+export function uploadProgressDescription(uploadedBytes: number, totalBytes: number): string {
+  const total = formatFileSize(totalBytes);
+  if (uploadedBytes <= 0 || totalBytes <= 0) return `Uploading · ${total}`;
+  const percent = Math.min(100, Math.max(1, Math.round((uploadedBytes / totalBytes) * 100)));
+  return `Uploading ${percent}% · ${total}`;
 }
 
 export function filesFromDataTransfer(dataTransfer: Pick<DataTransfer, "files" | "items"> | null): File[] {

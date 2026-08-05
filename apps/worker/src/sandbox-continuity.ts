@@ -55,6 +55,12 @@ interface SnapshotRecord {
   sequence: number;
 }
 
+interface SessionContinuityRecord {
+  provider: string | null;
+  sandboxId: string | null;
+  snapshot: SnapshotRecord | null;
+}
+
 interface SandboxInputFile {
   fileId: string;
   name: string;
@@ -73,6 +79,7 @@ interface SandboxOutputFile {
 
 export interface SandboxSnapshotRepository {
   loadRun(tenantId: string, runId: string): Promise<SnapshotRun>;
+  continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null>;
   inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]>;
   persistOutput(input: {
     snapshot: DurableTurnSnapshot;
@@ -379,6 +386,34 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
     }
     const latest = await this.repository.latest(snapshot.tenantId, snapshot.id);
+    const continuity = await this.repository.continuity(snapshot.tenantId, snapshot.id);
+    if (
+      continuity?.sandboxId
+      && (!continuity.provider || continuity.provider === this.provider.kind)
+    ) {
+      try {
+        await this.provider.files.list({
+          sandbox_id: continuity.sandboxId,
+          path: this.options.cwd ?? "/workspace",
+          recursive: false,
+        });
+        await this.stageInputFiles(snapshot, continuity.sandboxId);
+        await this.repository.recordSandbox({
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          provider: continuity.provider ?? this.provider.kind,
+          sandboxId: continuity.sandboxId,
+          state: "running",
+        });
+        return {
+          provider: continuity.provider ?? this.provider.kind,
+          id: continuity.sandboxId,
+          state: "running",
+        };
+      } catch {
+        // The previous turn's sandbox expired. Restore its durable archive below.
+      }
+    }
     const handle = await this.provider.create({
       request_id: snapshot.id,
       tenant_id: snapshot.tenantId,
@@ -391,8 +426,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       writable_roots: [this.options.cwd ?? "/workspace"],
       metadata: { runId: snapshot.id },
     });
-    if (latest && this.objects) {
-      const archive = JSON.parse(Buffer.from(await this.objects.get(latest.objectKey)).toString("utf8")) as SnapshotArchive;
+    const restorePoint = latest ?? continuity?.snapshot ?? null;
+    if (restorePoint && this.objects) {
+      const archive = JSON.parse(Buffer.from(await this.objects.get(restorePoint.objectKey)).toString("utf8")) as SnapshotArchive;
       for (const file of archive.files) {
         await this.provider.files.write({
           sandbox_id: handle.sandbox_id,
@@ -565,13 +601,64 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
     };
   }
 
+  async continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null> {
+    const rows = await this.executor.query<SessionContinuityRow>(
+      `
+WITH current_run AS (
+  SELECT tenant_id,id,session_id,created_at
+  FROM turn_runs
+  WHERE tenant_id=$1::uuid AND id=$2::uuid
+)
+SELECT prior.sandbox_provider,prior.sandbox_id,
+       archived.id AS snapshot_id,archived.object_key,archived.content_hash,archived.sequence
+FROM current_run current_run_row
+LEFT JOIN LATERAL (
+  SELECT r.sandbox_provider,r.sandbox_id
+  FROM turn_runs r
+  WHERE r.tenant_id=current_run_row.tenant_id
+    AND r.session_id=current_run_row.session_id
+    AND r.id<>current_run_row.id
+    AND r.created_at<=current_run_row.created_at
+    AND r.sandbox_id IS NOT NULL
+  ORDER BY r.created_at DESC,r.id DESC
+  LIMIT 1
+) prior ON true
+LEFT JOIN LATERAL (
+  SELECT s.id,s.object_key,s.content_hash,s.sequence
+  FROM sandbox_snapshots s
+  WHERE s.tenant_id=current_run_row.tenant_id
+    AND s.session_id=current_run_row.session_id
+    AND s.status='complete'
+  ORDER BY s.completed_at DESC NULLS LAST,s.sequence DESC
+  LIMIT 1
+) archived ON true
+      `.trim(),
+      [tenantId, runId],
+    );
+    const row = rows[0];
+    if (!row || (!row.sandbox_id && !row.snapshot_id)) return null;
+    return {
+      provider: row.sandbox_provider,
+      sandboxId: row.sandbox_id,
+      snapshot: row.snapshot_id && row.object_key && row.content_hash && row.sequence !== null
+        ? mapSnapshot({
+          id: row.snapshot_id,
+          object_key: row.object_key,
+          content_hash: row.content_hash,
+          sequence: row.sequence,
+        })
+        : null,
+    };
+  }
+
   async inputFiles(tenantId: string, runId: string): Promise<readonly SandboxInputFile[]> {
     const rows = await this.executor.query<SandboxInputFileRow>(
       `
-SELECT f.id AS file_id,f.display_name,f.media_type,f.size_bytes,f.object_key
+SELECT DISTINCT f.id AS file_id,f.display_name,f.media_type,f.size_bytes,f.object_key
 FROM turn_runs r
 JOIN file_associations a
-  ON a.tenant_id=r.tenant_id AND a.message_id=r.request_message_id AND a.role='input'
+  ON a.tenant_id=r.tenant_id AND a.session_id=r.session_id AND a.role='input'
+  AND a.created_at<=r.created_at
 JOIN files f
   ON f.tenant_id=a.tenant_id AND f.id=a.file_id
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
@@ -588,7 +675,7 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
       AND f.status='available'
     )
   )
-ORDER BY a.created_at ASC,f.id ASC
+ORDER BY f.id ASC
       `.trim(),
       [tenantId, runId],
     );
@@ -1107,6 +1194,15 @@ interface SnapshotRow {
   object_key: string;
   content_hash: string;
   sequence: number | string;
+}
+
+interface SessionContinuityRow {
+  sandbox_provider: string | null;
+  sandbox_id: string | null;
+  snapshot_id: string | null;
+  object_key: string | null;
+  content_hash: string | null;
+  sequence: number | string | null;
 }
 
 interface SandboxInputFileRow {

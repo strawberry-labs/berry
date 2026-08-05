@@ -8,6 +8,7 @@ import {
   pastedTextMode,
   prunePastedTextPresentations,
   reasoningLevelsForModel,
+  uploadProgressDescription,
 } from "./web-composer.tsx";
 
 const file = { name: "project-brief.pdf", size: 128, type: "application/pdf" } as File;
@@ -80,5 +81,15 @@ describe("reasoningLevelsForModel", () => {
     expect(reasoningLevelsForModel({ id: "custom", capabilities: { reasoning: true, reasoningEfforts: ["low", "high"] } })).toEqual(["low", "high"]);
     expect(reasoningLevelsForModel({ id: "glm-5.2" })).toEqual(["high", "xhigh"]);
     expect(reasoningLevelsForModel({ id: "no-reasoning", capabilities: { reasoning: false } })).toEqual(["off"]);
+  });
+});
+
+describe("uploadProgressDescription", () => {
+  it("shows the total file size before the first upload part reports progress", () => {
+    expect(uploadProgressDescription(0, 2_206_180)).toBe("Uploading · 2.1 MB");
+  });
+
+  it("shows useful progress once bytes have been transferred", () => {
+    expect(uploadProgressDescription(1_103_090, 2_206_180)).toBe("Uploading 50% · 2.1 MB");
   });
 });

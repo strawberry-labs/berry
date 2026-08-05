@@ -23,19 +23,30 @@ describe("durable session compactor", () => {
       tenantId: job.tenantId,
       taskId: job.taskId,
       sessionId: job.sessionId,
-      sourceLeafId: "entry-1",
+      sourceLeafId: "entry-2",
       modelProviderId: null,
       model: null,
       modelAllowed: true,
-      entries: [{
-        entryId: "entry-1",
-        parentEntryId: null,
-        entryType: "message",
-        sequence: 1,
-        payload: { role: "user", content: "Implement durable compaction." },
-        isLeafMarker: true,
-        createdAt: "2026-07-28T12:00:00.000Z",
-      }],
+      entries: [
+        {
+          entryId: "entry-1",
+          parentEntryId: null,
+          entryType: "message",
+          sequence: 1,
+          payload: { role: "user", content: "Implement durable compaction." },
+          isLeafMarker: false,
+          createdAt: "2026-07-28T12:00:00.000Z",
+        },
+        {
+          entryId: "entry-2",
+          parentEntryId: "entry-1",
+          entryType: "message",
+          sequence: 2,
+          payload: { role: "assistant", content: "Working on it." },
+          isLeafMarker: true,
+          createdAt: "2026-07-28T12:01:00.000Z",
+        },
+      ],
       previousRolling: null,
       priorSegments: [],
       latestSegmentCoveredEnd: null,
@@ -62,7 +73,7 @@ describe("durable session compactor", () => {
         return { checkpoint: null, validationStatus: "fallback", attempts: 2 };
       },
     };
-    const compactor = new DurableSessionCompactor(repository, generator, { leaseOwner: "test-worker" });
+    const compactor = new DurableSessionCompactor(repository, generator, { leaseOwner: "test-worker", keepRecentTokens: 1 });
 
     const first = await compactor.compactSession(job);
     const replay = await compactor.compactSession(job);
@@ -79,7 +90,7 @@ describe("durable session compactor", () => {
       schema: "berry.session-checkpoint",
       version: 2,
       goal: "Implement durable compaction.",
-      currentLeafId: "entry-1",
+      currentLeafId: "entry-2",
       coveredEntryEnd: "entry-1",
     } satisfies Partial<SessionCheckpointV2>);
   });

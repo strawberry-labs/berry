@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
+  DEFAULT_COMPACTION_SETTINGS,
+  shouldCompact,
+} from "@berry/harness";
+import {
   AgentStreamEventSchema,
   latestAssistantStreamDraft,
   MessageDraftSchema,
@@ -213,6 +217,7 @@ export interface DurableTurnMutation {
 export interface DurableTurnRepository {
   claim(input: TurnExecuteJobPayload | TurnResumeJobPayload, owner: string, leaseSeconds: number): Promise<DurableTurnSnapshot | null>;
   heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number): Promise<boolean>;
+  reserveNextModelCall?(snapshot: DurableTurnSnapshot, estimatedCostMicros: string): Promise<{ allowed: boolean; reason: string | null }>;
   appendEvents(snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void>;
   commit(snapshot: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void>;
   release(snapshot: DurableTurnSnapshot, error?: string): Promise<void>;
@@ -285,14 +290,8 @@ export class DurableTurnRunner {
       leaseSeconds?: number;
       heartbeatMs?: number;
       snapshotIntervalSeconds?: number;
-      compactionTriggerTokens?: number;
       contextWindowTokens?: number;
       compactor?: SessionCompactionRunner;
-      maxModelIterations?: number;
-      maxToolCalls?: number;
-      maxTotalTokens?: number;
-      maxSpendMicros?: number;
-      maxWallTimeSeconds?: number;
     } = {},
   ) {}
 
@@ -308,13 +307,6 @@ export class DurableTurnRunner {
       if (TERMINAL_STATES.has(snapshot.state)) {
         await this.repository.release(snapshot);
         return { runId: snapshot.id, state: snapshot.state, noOp: true };
-      }
-      if (snapshot.state !== "finalizing" && snapshot.state !== "persisting_response") {
-        const limit = durableTurnLimit(snapshot, this.options);
-        if (limit) {
-          await this.finishAtLimit(snapshot, limit);
-          return { runId: snapshot.id, state: "completed" };
-        }
       }
       if (snapshot.state === "queued" || snapshot.state === "assembling_context") {
         await this.assemble(snapshot);
@@ -437,6 +429,14 @@ export class DurableTurnRunner {
         nextAction: "Create a portable checkpoint before the next model request",
       });
       return "compacting";
+    }
+    const budget = await this.repository.reserveNextModelCall?.(
+      snapshot,
+      estimateNextModelCallCost(snapshot).toString(),
+    );
+    if (budget && !budget.allowed) {
+      await this.finishForBudget(snapshot, budget.reason ?? "Your spend limit has been reached.");
+      return "completed";
     }
     const messageId = randomUUID();
     const modelStartedAt = Date.now();
@@ -981,18 +981,7 @@ export class DurableTurnRunner {
       ...(result.sandbox ? { sandbox: result.sandbox } : {}),
       nextAction: remaining ? "Execute the next tool step" : "Continue the model with persisted tool results",
       ...(result.sandbox ? {
-        outbox: [{
-          eventType: "sandbox.snapshot",
-          dedupeKey: `${snapshot.id}:snapshot:step:${step.id}`,
-          payload: {
-            tenantId: snapshot.tenantId,
-            runId: snapshot.id,
-            reason: "interval",
-          },
-          availableAt: new Date(
-            Date.now() + (this.options.snapshotIntervalSeconds ?? 900) * 1_000,
-          ).toISOString(),
-        }],
+        outbox: [scheduledSandboxSnapshot(snapshot, this.options.snapshotIntervalSeconds ?? 900)],
       } : {}),
     });
     return remaining ? "executing_tool" : "calling_model";
@@ -1132,31 +1121,31 @@ export class DurableTurnRunner {
     });
   }
 
-  private async finishAtLimit(snapshot: DurableTurnSnapshot, message: string): Promise<void> {
+  private async finishForBudget(snapshot: DurableTurnSnapshot, reason: string): Promise<void> {
+    const message = `I stopped because ${reason.charAt(0).toLowerCase()}${reason.slice(1)} Increase the applicable allowance, then continue this task.`;
     const messageId = randomUUID();
-    const entry = {
-      entryId: messageId,
-      entryType: "message",
-      payload: {
-        type: "message",
-        id: messageId,
-        parentId: snapshot.entries.at(-1)?.entryId ?? null,
-        timestamp: new Date().toISOString(),
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: message }],
-          stopReason: "stop",
-          timestamp: Date.now(),
-        },
-      } as JsonValue,
-    };
     await this.repository.commit(snapshot, {
       expectedState: snapshot.state,
       nextState: "completed",
       steps: snapshot.steps
         .filter((step) => step.state === "pending" || step.state === "running" || step.state === "waiting")
-        .map((step) => ({ ...step, state: "cancelled" as const, error: "durable_turn_limit_reached" })),
-      entries: [entry],
+        .map((step) => ({ ...step, state: "cancelled" as const, error: "budget_exceeded" })),
+      entries: [{
+        entryId: messageId,
+        entryType: "message",
+        payload: {
+          type: "message",
+          id: messageId,
+          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: message }],
+            stopReason: "stop",
+            timestamp: Date.now(),
+          },
+        } as JsonValue,
+      }],
       assistantMessage: {
         id: messageId,
         text: message,
@@ -1165,12 +1154,23 @@ export class DurableTurnRunner {
         outputTokens: Math.ceil(message.length / 4),
       },
       events: [
-        { kind: "session.note", note: "limit-reached", detail: message },
+        { kind: "session.note", note: "limit-reached", detail: reason },
         { kind: "turn.end", turnId: snapshot.id, status: "completed" },
       ],
       nextAction: null,
       waitingReason: null,
       taskStatus: "completed",
+      ...(snapshot.sandboxId ? {
+        outbox: [{
+          eventType: "sandbox.snapshot",
+          dedupeKey: `${snapshot.id}:snapshot:budget`,
+          payload: {
+            tenantId: snapshot.tenantId,
+            runId: snapshot.id,
+            reason: "before-finalize",
+          },
+        }],
+      } : {}),
     });
   }
 
@@ -1278,6 +1278,98 @@ class DurableMessageEventWriter {
 
 export class SqlDurableTurnRepository implements DurableTurnRepository {
   constructor(private readonly executor: SqlExecutor) {}
+
+  async reserveNextModelCall(
+    snapshot: DurableTurnSnapshot,
+    estimatedCostMicros: string,
+  ): Promise<{ allowed: boolean; reason: string | null }> {
+    const requestId = stringValue(snapshot.runtimeRequest.requestId);
+    if (!requestId) return { allowed: true, reason: null };
+    const operation = async (executor: SqlExecutor) => {
+      const reservations = await executor.query<BudgetReservationGuardRow>(
+        `SELECT id,user_id,department_id,reserved_micros::text,status
+         FROM budget_reservations
+         WHERE tenant_id=$1::uuid AND request_id=$2
+         FOR UPDATE`,
+        [snapshot.tenantId, requestId],
+      );
+      const reservation = reservations[0];
+      if (!reservation || reservation.status !== "reserved") return { allowed: true, reason: null };
+      const target = safeBigInt(snapshot.usageTotals.costMicros) + safeBigInt(estimatedCostMicros);
+      const reserved = safeBigInt(reservation.reserved_micros);
+      const additional = target - reserved;
+      if (additional <= 0n) return { allowed: true, reason: null };
+      const scopes = [
+        { type: "org", id: snapshot.tenantId },
+        ...(reservation.department_id ? [{ type: "department", id: reservation.department_id }] : []),
+        ...(reservation.user_id ? [{ type: "user", id: reservation.user_id }] : []),
+      ];
+      for (const scope of [...scopes].sort((left, right) => `${left.type}:${left.id}`.localeCompare(`${right.type}:${right.id}`))) {
+        await executor.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+          [`berry-budget:${snapshot.tenantId}:${scope.type}:${scope.id}`],
+        );
+      }
+      const settings = (await executor.query<AllowanceCycleGuardRow>(
+        "SELECT timezone,anchor_day FROM allowance_cycle_settings WHERE tenant_id=$1::uuid LIMIT 1",
+        [snapshot.tenantId],
+      ))[0] ?? { timezone: "UTC", anchor_day: 1 };
+      const limits = await executor.query<BudgetLimitGuardRow>(
+        `SELECT scope_type,scope_id,period,hard_limit_micros::text
+         FROM budget_limits
+         WHERE tenant_id=$1::uuid AND status='active' AND hard_limit_micros>0
+           AND ((scope_type='org' AND scope_id=$1::text)
+             OR (scope_type='department' AND scope_id=$2::text)
+             OR (scope_type='user' AND scope_id=$3::text))`,
+        [snapshot.tenantId, reservation.department_id, reservation.user_id],
+      );
+      for (const limit of limits) {
+        const window = durableBudgetPeriodWindow(
+          { timezone: settings.timezone, anchorDay: Number(settings.anchor_day) || 1 },
+          limit.period,
+        );
+        const spentRows = await executor.query<{ total: string }>(
+          `SELECT COALESCE(sum(amount_micros),0)::text AS total
+           FROM credit_ledger_entries
+           WHERE tenant_id=$1::uuid AND scope_type=$2 AND scope_id=$3
+             AND created_at>=$4::timestamptz AND created_at<$5::timestamptz`,
+          [snapshot.tenantId, limit.scope_type, limit.scope_id, window.start.toISOString(), window.end.toISOString()],
+        );
+        let hardLimit = safeBigInt(limit.hard_limit_micros);
+        if (limit.scope_type === "user" && reservation.user_id && limit.period === "month") {
+          const adjustments = await executor.query<{ total: string }>(
+            `SELECT COALESCE(sum(amount_micros),0)::text AS total
+             FROM allowance_adjustments
+             WHERE tenant_id=$1::uuid AND user_id=$2::uuid
+               AND cycle_start=$3::timestamptz AND cycle_end=$4::timestamptz`,
+            [snapshot.tenantId, reservation.user_id, window.start.toISOString(), window.end.toISOString()],
+          );
+          hardLimit += safeBigInt(adjustments[0]?.total);
+        }
+        if (safeBigInt(spentRows[0]?.total) + additional > hardLimit) {
+          return { allowed: false, reason: `${limit.scope_type} spend limit has been reached.` };
+        }
+      }
+      await executor.execute(
+        `UPDATE budget_reservations
+         SET estimated_cost_micros=estimated_cost_micros+$3::numeric,
+             reserved_micros=reserved_micros+$3::numeric,updated_at=now()
+         WHERE tenant_id=$1::uuid AND request_id=$2 AND status='reserved'`,
+        [snapshot.tenantId, requestId, additional.toString()],
+      );
+      for (const scope of scopes) {
+        await executor.execute(
+          `UPDATE credit_ledger_entries
+           SET amount_micros=amount_micros+$5::numeric,
+               balance_after_micros=balance_after_micros+$5::numeric
+           WHERE tenant_id=$1::uuid AND request_id=$2 AND scope_type=$3 AND scope_id=$4 AND kind='reserve'`,
+          [snapshot.tenantId, requestId, scope.type, scope.id, additional.toString()],
+        );
+      }
+      return { allowed: true, reason: null };
+    };
+    return this.executor.transaction ? this.executor.transaction(operation) : operation(this.executor);
+  }
 
   async claim(
     input: TurnExecuteJobPayload | TurnResumeJobPayload,
@@ -1796,44 +1888,6 @@ function modelIteration(steps: readonly DurableTurnStep[]): number {
   return steps.filter((step) => step.type === "model.call").length;
 }
 
-function durableTurnLimit(
-  snapshot: DurableTurnSnapshot,
-  options: {
-    maxModelIterations?: number;
-    maxToolCalls?: number;
-    maxTotalTokens?: number;
-    maxSpendMicros?: number;
-    maxWallTimeSeconds?: number;
-  },
-): string | null {
-  const maxModelIterations = options.maxModelIterations ?? 12;
-  const maxToolCalls = options.maxToolCalls ?? 48;
-  const maxTotalTokens = options.maxTotalTokens ?? 250_000;
-  const maxSpendMicros = BigInt(options.maxSpendMicros ?? 1_000_000);
-  const maxWallTimeSeconds = options.maxWallTimeSeconds ?? 1_800;
-  const nextModelIteration = snapshot.steps
-    .filter((step) => step.type === "model.call")
-    .reduce((highest, step) => Math.max(highest, numberValue(step.input.iteration) ?? 0), 0);
-  if (snapshot.state === "calling_model" && nextModelIteration > maxModelIterations) {
-    return "I stopped this response because it reached the model-step safety limit. Retry with a narrower request.";
-  }
-  const toolCalls = snapshot.steps.filter((step) => step.type.startsWith("tool.")).length;
-  if (snapshot.state === "executing_tool" && toolCalls > maxToolCalls) {
-    return "I stopped this response because it reached the tool-action safety limit. Retry with a narrower request.";
-  }
-  if (snapshot.usageTotals.totalTokens >= maxTotalTokens) {
-    return "I stopped this response because it reached the token safety limit. Continue in a new message.";
-  }
-  if (safeBigInt(snapshot.usageTotals.costMicros) >= maxSpendMicros) {
-    return "I stopped this response because it reached the spending safety limit. Continue in a new message.";
-  }
-  const createdAt = Date.parse(snapshot.createdAt);
-  if (Number.isFinite(createdAt) && Date.now() - createdAt >= maxWallTimeSeconds * 1_000) {
-    return "I stopped this response because it reached the execution-time safety limit. Retry to start a fresh run.";
-  }
-  return null;
-}
-
 function usageCostMicros(
   usage: {
     inputTokens: number;
@@ -1859,6 +1913,13 @@ function usageCostMicros(
   return BigInt(Math.max(0, micros));
 }
 
+function estimateNextModelCallCost(snapshot: DurableTurnSnapshot): bigint {
+  return usageCostMicros({
+    inputTokens: estimateActiveContextTokens(snapshot),
+    outputTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
+  }, snapshot.runtimeRequest.modelPricing);
+}
+
 function nonnegativeNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
@@ -1873,23 +1934,126 @@ function safeBigInt(value: unknown): bigint {
 
 function shouldCompactSnapshot(
   snapshot: DurableTurnSnapshot,
-  options: { compactionTriggerTokens?: number; contextWindowTokens?: number },
+  options: { contextWindowTokens?: number },
 ): boolean {
   const contextWindow = numberValue(snapshot.runtimeRequest.contextWindowTokens)
     ?? options.contextWindowTokens
-    ?? 200_000;
-  const maxOutput = numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000;
-  const reserveThreshold = Math.max(1, contextWindow - Math.max(16_384, maxOutput * 2));
-  const ratioThreshold = Math.max(1, Math.floor(contextWindow * 0.8));
-  const configuredThreshold = options.compactionTriggerTokens ?? 120_000;
-  const threshold = Math.max(1, Math.min(configuredThreshold, reserveThreshold, ratioThreshold));
-  return estimateUncompactedTokens(snapshot) >= threshold;
+    ?? 128_000;
+  return shouldCompact(
+    estimateActiveContextTokens(snapshot),
+    contextWindow,
+    DEFAULT_COMPACTION_SETTINGS,
+  );
 }
 
 function estimateUncompactedTokens(snapshot: DurableTurnSnapshot): number {
-  return uncompactedEntries(snapshot).reduce((total, entry) => {
+  return estimateEntriesTokens(uncompactedEntries(snapshot));
+}
+
+function estimateActiveContextTokens(snapshot: DurableTurnSnapshot): number {
+  const entries = uncompactedEntries(snapshot);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const message = record(record(entries[index]?.payload)?.message);
+    if (!message || message.stopReason === "aborted" || message.stopReason === "error") continue;
+    const usage = record(message.usage);
+    if (!usage) continue;
+    const total = numberValue(usage.totalTokens);
+    const input = numberValue(usage.input) ?? 0;
+    const output = numberValue(usage.output) ?? 0;
+    const providerTokens = total && total > 0 ? total : input + output;
+    if (providerTokens <= 0) continue;
+    return providerTokens + estimateEntriesTokens(entries.slice(index + 1));
+  }
+  return Math.ceil(JSON.stringify(modelMessages(snapshot).messages).length / 4);
+}
+
+function estimateEntriesTokens(entries: readonly DurableSessionEntry[]): number {
+  return entries.reduce((total, entry) => {
     return total + Math.ceil(JSON.stringify(entry.payload).length / 4);
   }, 0);
+}
+
+function scheduledSandboxSnapshot(
+  snapshot: DurableTurnSnapshot,
+  intervalSeconds: number,
+): NonNullable<DurableTurnMutation["outbox"]>[number] {
+  const intervalMs = Math.max(1, intervalSeconds) * 1_000;
+  const availableAtMs = Date.now() + intervalMs;
+  const bucket = Math.floor(availableAtMs / intervalMs);
+  return {
+    eventType: "sandbox.snapshot",
+    dedupeKey: `${snapshot.id}:snapshot:interval:${bucket}`,
+    payload: {
+      tenantId: snapshot.tenantId,
+      runId: snapshot.id,
+      reason: "interval",
+    },
+    availableAt: new Date(availableAtMs).toISOString(),
+  };
+}
+
+function durableBudgetPeriodWindow(
+  settings: { timezone: string; anchorDay: number },
+  period: "day" | "month",
+  at = new Date(),
+): { start: Date; end: Date } {
+  const local = durableBudgetLocalDateParts(at, settings.timezone);
+  if (period === "day") {
+    const next = new Date(Date.UTC(local.year, local.month - 1, local.day + 1));
+    return {
+      start: durableBudgetLocalMidnight(local.year, local.month, local.day, settings.timezone),
+      end: durableBudgetLocalMidnight(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), settings.timezone),
+    };
+  }
+  let year = local.year;
+  let month = local.month;
+  if (local.day < settings.anchorDay) {
+    month -= 1;
+    if (month === 0) {
+      month = 12;
+      year -= 1;
+    }
+  }
+  const next = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
+  return {
+    start: durableBudgetLocalMidnight(year, month, settings.anchorDay, settings.timezone),
+    end: durableBudgetLocalMidnight(next.year, next.month, settings.anchorDay, settings.timezone),
+  };
+}
+
+function durableBudgetLocalDateParts(value: Date, timezone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(value);
+  const number = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+  return {
+    year: number("year"),
+    month: number("month"),
+    day: number("day"),
+    hour: number("hour"),
+    minute: number("minute"),
+    second: number("second"),
+  };
+}
+
+function durableBudgetLocalMidnight(year: number, month: number, day: number, timezone: string): Date {
+  const desired = Date.UTC(year, month - 1, day);
+  let candidate = desired;
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    const actual = durableBudgetLocalDateParts(new Date(candidate), timezone);
+    const represented = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute, actual.second);
+    const difference = desired - represented;
+    candidate += difference;
+    if (difference === 0) break;
+  }
+  return new Date(candidate);
 }
 
 function uncompactedEntries(snapshot: DurableTurnSnapshot): readonly DurableSessionEntry[] {
@@ -3078,6 +3242,26 @@ function dateString(value: Date | string | null): string | null {
 
 function isRetryableStatus(status: number | undefined): boolean {
   return status === undefined || status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+interface BudgetReservationGuardRow {
+  id: string;
+  user_id: string | null;
+  department_id: string | null;
+  reserved_micros: string;
+  status: string;
+}
+
+interface AllowanceCycleGuardRow {
+  timezone: string;
+  anchor_day: number | string;
+}
+
+interface BudgetLimitGuardRow {
+  scope_type: "org" | "department" | "user";
+  scope_id: string;
+  period: "day" | "month";
+  hard_limit_micros: string;
 }
 
 interface RunRow {

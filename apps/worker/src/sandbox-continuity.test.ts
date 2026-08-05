@@ -47,6 +47,7 @@ describe("SandboxContinuityManager", () => {
     } as unknown as SandboxProvider;
     const repository = {
       loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
       latest: vi.fn(async () => null),
       inputFiles: vi.fn(async () => []),
       persistOutput: vi.fn(),
@@ -189,6 +190,7 @@ describe("SandboxContinuityManager", () => {
     } as unknown as SandboxProvider;
     const repository = {
       loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
       latest: vi.fn(async () => null),
       inputFiles: vi.fn(async () => [
         {
@@ -278,6 +280,7 @@ describe("SandboxContinuityManager", () => {
     } as unknown as SandboxProvider;
     const repository = {
       loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
       latest: vi.fn(async () => null),
       inputFiles: vi.fn(async () => []),
       persistOutput: vi.fn(async (input: { fileId: string; name: string; mediaType: string; sizeBytes: number; objectKey: string }) => ({
@@ -364,6 +367,7 @@ describe("SandboxContinuityManager", () => {
     } as unknown as SandboxProvider;
     const repository = {
       loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
       latest: vi.fn(async () => null),
       inputFiles: vi.fn(async () => [{
         fileId: "00000000-0000-7000-8000-000000000099",
@@ -402,6 +406,49 @@ describe("SandboxContinuityManager", () => {
     expect(stagedBytes.subarray(-2)).toEqual(Buffer.from([2, 3]));
     expect(result.output).toMatchObject({
       entries: [expect.objectContaining({ path })],
+    });
+  });
+
+  it("reuses the previous live sandbox for a follow-up turn in the same session", async () => {
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(),
+        write: vi.fn(),
+        list: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          entries: [],
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => ({
+        provider: "e2b",
+        sandboxId: "sandbox-from-previous-turn",
+        snapshot: null,
+      })),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, {
+      image: "berry-sandbox",
+    });
+
+    await manager.execute(snapshot(), listFilesStep());
+
+    expect(provider.create).not.toHaveBeenCalled();
+    expect(repository.recordSandbox).toHaveBeenCalledWith({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      provider: "e2b",
+      sandboxId: "sandbox-from-previous-turn",
+      state: "running",
     });
   });
 
@@ -452,6 +499,7 @@ describe("SandboxContinuityManager", () => {
     );
 
     expect(query).toContain("u.status='completed'");
+    expect(query).toContain("a.session_id=r.session_id");
     expect(query).toContain("f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact')");
     expect(query).toContain("f.status='available'");
   });
@@ -521,6 +569,7 @@ function managerWithProvider(
   } as unknown as SandboxProvider;
   const repository = {
     loadRun: vi.fn(),
+    continuity: vi.fn(async () => null),
     latest: vi.fn(async () => null),
     inputFiles: vi.fn(async () => []),
     persistOutput: vi.fn(),

@@ -140,7 +140,7 @@ describe("durable turn runner", () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
     repository.current.entries[0]!.payload = {
       type: "message",
-      message: { role: "user", content: "x".repeat(8_000) },
+      message: { role: "user", content: "x".repeat(16_000) },
     };
     let compactions = 0;
     let modelCalls = 0;
@@ -152,7 +152,7 @@ describe("durable turn runner", () => {
       },
     }, noTools(), {
       owner: "worker-compact",
-      compactionTriggerTokens: 100,
+      contextWindowTokens: 20_000,
       compactor: {
         compactSession: async () => {
           compactions += 1;
@@ -416,7 +416,7 @@ describe("durable turn runner", () => {
       .rejects.toBeInstanceOf(DurableTurnRetryableError);
   });
 
-  it("stops before an extra model iteration when the configured limit is reached", async () => {
+  it("continues beyond the former model-iteration limit", async () => {
     const current = snapshot("calling_model", [
       admittedStep(),
       { ...modelStep("completed", 1), input: { iteration: 1 } },
@@ -429,18 +429,14 @@ describe("durable turn runner", () => {
         calls += 1;
         return { text: "unexpected", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
-    }, noTools(), { maxModelIterations: 1 });
+    }, noTools());
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "completed" });
-    expect(calls).toBe(0);
-    expect(repository.events).toContainEqual(expect.objectContaining({
-      kind: "session.note",
-      note: "limit-reached",
-    }));
+      .resolves.toMatchObject({ state: "finalizing" });
+    expect(calls).toBe(1);
   });
 
-  it("stops before another tool after the cumulative token limit is reached", async () => {
+  it("continues tool work regardless of cumulative tokens spent in the turn", async () => {
     const current = snapshot("executing_tool", [admittedStep(), toolStep("pending", "read_only", false)]);
     current.usageTotals = {
       inputTokens: 90,
@@ -455,11 +451,39 @@ describe("durable turn runner", () => {
         calls += 1;
         return { output: {}, summary: "" };
       },
-    }, { maxTotalTokens: 100 });
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(calls).toBe(1);
+  });
+
+  it("stops at the user spend limit before starting another model call", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      requestId: "turn_budget_guard",
+      maxTokens: 100,
+      modelPricing: { input: 1, output: 1, cacheRead: 1, cacheWrite: 0 },
+    };
+    const repository = new FakeTurnRepository(current);
+    repository.budgetDecision = { allowed: false, reason: "user spend limit has been reached." };
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        calls += 1;
+        return { text: "unexpected", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools());
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
       .resolves.toMatchObject({ state: "completed" });
     expect(calls).toBe(0);
+    expect(safeBigIntForTest(repository.lastBudgetEstimate)).toBeGreaterThan(0n);
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "session.note",
+      note: "limit-reached",
+    }));
   });
 
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
@@ -645,6 +669,8 @@ class FakeTurnRepository implements DurableTurnRepository {
   events: AgentStreamEvent[] = [];
   outbox: Array<{ eventType: string; dedupeKey: string }> = [];
   mutations: DurableTurnMutation[] = [];
+  budgetDecision = { allowed: true, reason: null as string | null };
+  lastBudgetEstimate = "0";
 
   constructor(public current: MutableSnapshot) {}
 
@@ -659,6 +685,11 @@ class FakeTurnRepository implements DurableTurnRepository {
 
   async heartbeat(): Promise<boolean> {
     return true;
+  }
+
+  async reserveNextModelCall(_snapshot: DurableTurnSnapshot, estimatedCostMicros: string) {
+    this.lastBudgetEstimate = estimatedCostMicros;
+    return this.budgetDecision;
   }
 
   async appendEvents(_snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void> {
@@ -833,4 +864,8 @@ function unusedModel(): DurableTurnModel {
       throw new Error("model should not be called");
     },
   };
+}
+
+function safeBigIntForTest(value: string): bigint {
+  return BigInt(value || "0");
 }

@@ -259,7 +259,7 @@ async function verifyTenantIsolationAndDurableTurn() {
       new SqlDurableTurnRepository(workerExecutor),
       model,
       tools,
-      { owner: `restart-${wake}`, maxModelIterations: 4, maxToolCalls: 4, maxTotalTokens: 1_000, maxSpendMicros: 1_000, maxWallTimeSeconds: 60 },
+      { owner: `restart-${wake}` },
     );
     const result = await workerExecutor.runWithTenant(payload.tenantId, () => runner.execute(payload));
     state = result.state;

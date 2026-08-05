@@ -479,6 +479,7 @@ export class BerryApiClient {
   readonly #baseUrl: string;
   readonly #fetch: typeof fetch;
   readonly #headers: HeadersInit | undefined;
+  readonly #useXhrUploads: boolean;
 
   constructor(options: BerryApiClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -488,6 +489,7 @@ export class BerryApiClient {
     // invocation, so normalize every implementation through a bare call.
     this.#fetch = (...args) => fetchImpl(...args);
     this.#headers = options.headers;
+    this.#useXhrUploads = options.fetchImpl === undefined && typeof globalThis.XMLHttpRequest !== "undefined";
   }
 
   async createWorkspace(input: { name: string }): Promise<Workspace> {
@@ -796,7 +798,7 @@ export class BerryApiClient {
     )));
     const urls = new Map(signedBatches.flatMap((signed) => signed.parts).map((part) => [part.partNumber, part.url]));
     const completed: Array<{ partNumber: number; etag: string }> = [];
-    let uploadedBytes = 0;
+    const partProgress = new Map<number, number>();
     let cursor = 0;
     const controller = new AbortController();
     const requestedPartTimeoutMs = input.partTimeoutMs;
@@ -808,6 +810,15 @@ export class BerryApiClient {
     const abortFromCaller = () => controller.abort(input.signal?.reason);
     input.signal?.addEventListener("abort", abortFromCaller, { once: true });
     if (input.signal?.aborted) abortFromCaller();
+    const reportPartProgress = (partNumber: number, bytes: number) => {
+      partProgress.set(partNumber, bytes);
+      const uploadedBytes = [...partProgress.values()].reduce((total, value) => total + value, 0);
+      input.onProgress?.({
+        uploadedBytes,
+        totalBytes: file.size,
+        ratio: file.size === 0 ? 1 : Math.min(1, uploadedBytes / file.size),
+      });
+    };
     const worker = async () => {
       while (cursor < partNumbers.length) {
         const partNumber = partNumbers[cursor++]!;
@@ -819,13 +830,30 @@ export class BerryApiClient {
         const timeoutError = new Error("File upload timed out. Check your connection and try again.");
         controller.signal.addEventListener("abort", abortPart, { once: true });
         const timeout = globalThis.setTimeout(() => partController.abort(timeoutError), partTimeoutMs);
-        let response: Response;
+        let response: { ok: boolean; status: number; etag: string | null; body: string };
         try {
-          response = await this.#fetch(urls.get(partNumber)!, {
-            method: "PUT",
-            body: file.slice(start, end),
-            signal: partController.signal,
-          });
+          const body = file.slice(start, end);
+          if (this.#useXhrUploads) {
+            response = await uploadBlobWithXhr(
+              urls.get(partNumber)!,
+              body,
+              partController.signal,
+              partTimeoutMs,
+              (bytes) => reportPartProgress(partNumber, bytes),
+            );
+          } else {
+            const fetched = await this.#fetch(urls.get(partNumber)!, {
+              method: "PUT",
+              body,
+              signal: partController.signal,
+            });
+            response = {
+              ok: fetched.ok,
+              status: fetched.status,
+              etag: fetched.headers.get("etag"),
+              body: fetched.ok ? "" : await fetched.text(),
+            };
+          }
         } catch (error) {
           if (partController.signal.reason === timeoutError) throw timeoutError;
           throw error;
@@ -833,12 +861,11 @@ export class BerryApiClient {
           globalThis.clearTimeout(timeout);
           controller.signal.removeEventListener("abort", abortPart);
         }
-        if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, await response.text());
-        const etag = response.headers.get("etag");
+        if (!response.ok) throw new BerryApiError(`File part ${partNumber} failed with ${response.status}`, response.status, response.body);
+        const etag = response.etag;
         if (!etag) throw new Error("Object storage did not expose the ETag response header");
         completed.push({ partNumber, etag });
-        uploadedBytes += end - start;
-        input.onProgress?.({ uploadedBytes, totalBytes: file.size, ratio: file.size === 0 ? 1 : uploadedBytes / file.size });
+        reportPartProgress(partNumber, end - start);
       }
     };
     try {
@@ -1473,6 +1500,56 @@ export class BerryApiClient {
     const body = contentType.includes("application/json") ? await response.json() : await response.text();
     return { response, body };
   }
+}
+
+function uploadBlobWithXhr(
+  url: string,
+  body: Blob,
+  signal: AbortSignal,
+  timeoutMs: number,
+  onProgress: (uploadedBytes: number) => void,
+): Promise<{ ok: boolean; status: number; etag: string | null; body: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        etag: xhr.getResponseHeader("etag"),
+        body: typeof xhr.responseText === "string" ? xhr.responseText : "",
+      });
+    };
+    const abort = () => {
+      xhr.abort();
+      fail(signal.reason instanceof Error ? signal.reason : new DOMException("Upload aborted", "AbortError"));
+    };
+    xhr.open("PUT", url, true);
+    xhr.timeout = timeoutMs;
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(Math.min(body.size, event.loaded));
+    };
+    xhr.onload = succeed;
+    xhr.onerror = () => fail(new Error("File upload failed while sending data to object storage."));
+    xhr.ontimeout = () => fail(new Error("File upload timed out. Check your connection and try again."));
+    xhr.onabort = () => fail(signal.reason instanceof Error ? signal.reason : new DOMException("Upload aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    xhr.send(body);
+  });
 }
 
 function chunk<T>(values: readonly T[], size: number): T[][] {

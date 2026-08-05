@@ -50,17 +50,11 @@ durableContext:
   chunkTokens: 300
   chunkOverlapTokens: 50
   retrievalTokenBudget: 5000
-  compactionTriggerTokens: 120000
   runLeaseSeconds: 90
   snapshotIntervalSeconds: 900
   maxInputBytes: "104857600"
   maxOutputBytes: "26214400"
   sandboxInputMaxBytes: "104857600"
-  maxModelIterations: "12"
-  maxToolCalls: "48"
-  maxTotalTokens: "250000"
-  maxSpendMicros: "1000000"
-  maxWallTimeSeconds: "1800"
 
 mem0:
   enabled: true

@@ -1,5 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { IDLE, reduceStream } from "./thread-stream";
+import { IDLE, MAX_RETAINED_LIVE_TIMELINE_ENTRIES, reduceStream, windowLiveTimeline, type TimelineEntry } from "./thread-stream";
+
+describe("live timeline rendering window", () => {
+  it("keeps the newest activity without deleting durable history", () => {
+    const timeline: TimelineEntry[] = Array.from({ length: 5 }, (_, index) => ({
+      kind: "note",
+      note: "resumed",
+      text: `note-${index}`,
+    }));
+
+    expect(windowLiveTimeline(timeline, 2)).toEqual({
+      entries: timeline.slice(3),
+      omitted: 3,
+    });
+    expect(timeline).toHaveLength(5);
+  });
+
+  it("evicts old completed live items from browser memory but keeps running tools", () => {
+    let state = reduceStream(IDLE, { kind: "turn.start", turnId: "turn_long" });
+    state = reduceStream(state, { kind: "tool.start", toolCallId: "still-running", name: "shell" });
+    for (let index = 0; index < MAX_RETAINED_LIVE_TIMELINE_ENTRIES + 8; index += 1) {
+      state = reduceStream(state, {
+        kind: "session.note",
+        note: "resumed",
+        detail: `note-${index}`,
+      });
+    }
+
+    expect(state.timeline.length).toBeLessThanOrEqual(MAX_RETAINED_LIVE_TIMELINE_ENTRIES + 1);
+    expect(state.timelineOmitted).toBeGreaterThan(0);
+    expect(state.timeline).toContainEqual(expect.objectContaining({ kind: "tool", toolCallId: "still-running" }));
+  });
+});
 
 describe("image generation stream state", () => {
   it("keeps the newest partial for each batch request in request order", () => {

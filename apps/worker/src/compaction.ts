@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { DEFAULT_COMPACTION_SETTINGS } from "@berry/harness";
 import {
   applyCheckpointDeterminism,
   checkpointFallback,
@@ -105,6 +106,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       fallbackProvider?: string;
       fallbackModel?: string;
       maxInputCharacters?: number;
+      keepRecentTokens?: number;
     } = {},
   ) {}
 
@@ -126,7 +128,12 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         return { sessionId: input.sessionId, summary: "No session history to compact.", tokensBefore: 0, noOp: true };
       }
 
-      const segmentEntries = entriesAfter(state.entries, state.latestSegmentCoveredEnd);
+      const pendingEntries = entriesAfter(state.entries, state.latestSegmentCoveredEnd);
+      const selection = selectCompactionPrefix(
+        pendingEntries,
+        this.options.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+      );
+      const segmentEntries = selection.covered;
       const coveredEntryEnd = segmentEntries.at(-1)?.entryId ?? null;
       if (
         segmentEntries.length === 0
@@ -139,8 +146,9 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         return {
           sessionId: input.sessionId,
           summary: state.previousRolling?.narrative || "Checkpoint already covers the current leaf.",
-          tokensBefore: estimateTokens(state.entries),
-          tokensAfter: state.previousRolling ? estimateCheckpointTokens(state.previousRolling) : 0,
+          tokensBefore: estimateTokens(pendingEntries),
+          tokensAfter: (state.previousRolling ? estimateCheckpointTokens(state.previousRolling) : 0)
+            + estimateTokens(selection.retained),
           noOp: true,
         };
       }
@@ -185,8 +193,8 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       return {
         sessionId: input.sessionId,
         summary: rolling.narrative || rolling.nextAction || "Portable checkpoint created.",
-        tokensBefore: estimateTokens(state.entries),
-        tokensAfter: estimateCheckpointTokens(rolling),
+        tokensBefore: estimateTokens(pendingEntries),
+        tokensAfter: estimateCheckpointTokens(rolling) + estimateTokens(selection.retained),
         validationStatus: generated.validationStatus,
         segmentCheckpointId: persisted.segmentCheckpointId,
         rollingCheckpointId: persisted.rollingCheckpointId,
@@ -537,6 +545,54 @@ function entriesAfter(
   if (!coveredEnd) return entries;
   const index = entries.findIndex((entry) => entry.entryId === coveredEnd);
   return index < 0 ? entries : entries.slice(index + 1);
+}
+
+function selectCompactionPrefix(
+  entries: readonly CompactionEntryRecord[],
+  keepRecentTokens: number,
+): { covered: readonly CompactionEntryRecord[]; retained: readonly CompactionEntryRecord[] } {
+  if (entries.length < 2) return { covered: [], retained: entries };
+  const target = Math.max(1, Math.floor(keepRecentTokens));
+  let accumulated = 0;
+  let searchStart = entries.length - 1;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    accumulated += estimateTokens([entries[index]!]);
+    searchStart = index;
+    if (accumulated >= target) break;
+  }
+  let firstKept = -1;
+  for (let index = searchStart; index < entries.length; index += 1) {
+    const role = compactionEntryRole(entries[index]!.payload);
+    if (role === "user" || role === "assistant") {
+      firstKept = index;
+      break;
+    }
+  }
+  if (firstKept < 0) {
+    for (let index = searchStart - 1; index >= 0; index -= 1) {
+      const role = compactionEntryRole(entries[index]!.payload);
+      if (role === "user" || role === "assistant") {
+        firstKept = index;
+        break;
+      }
+    }
+  }
+  if (firstKept <= 0) return { covered: [], retained: entries };
+  return {
+    covered: entries.slice(0, firstKept),
+    retained: entries.slice(firstKept),
+  };
+}
+
+function compactionEntryRole(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.role === "string") return record.role;
+  const message = record.message;
+  if (!message || typeof message !== "object" || Array.isArray(message)) return null;
+  return typeof (message as Record<string, unknown>).role === "string"
+    ? (message as Record<string, unknown>).role as string
+    : null;
 }
 
 function extractDeterministicEvidence(

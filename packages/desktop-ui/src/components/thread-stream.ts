@@ -51,6 +51,23 @@ export interface TextEntry {
 
 export type TimelineEntry = ToolEntry | NoteEntry | ThoughtEntry | TextEntry;
 
+export const MAX_RENDERED_LIVE_TIMELINE_ENTRIES = 160;
+export const MAX_RETAINED_LIVE_TIMELINE_ENTRIES = 320;
+
+/** Keep an unbounded durable event history while limiting the live DOM that a
+ * single long-running turn can ask Chromium to lay out at once. */
+export function windowLiveTimeline(
+  timeline: TimelineEntry[],
+  maximum = MAX_RENDERED_LIVE_TIMELINE_ENTRIES,
+): { entries: TimelineEntry[]; omitted: number } {
+  const limit = Math.max(1, Math.floor(maximum));
+  if (timeline.length <= limit) return { entries: timeline, omitted: 0 };
+  return {
+    entries: timeline.slice(timeline.length - limit),
+    omitted: timeline.length - limit,
+  };
+}
+
 /** Append a reasoning delta: grow the trailing thought, or start a new one so
  * thoughts interleave with tool calls in arrival order (like the settled view). */
 export function appendReasoning(timeline: TimelineEntry[], delta: string): TimelineEntry[] {
@@ -88,6 +105,8 @@ export interface StreamState {
   reasoning: string;
   messageId: string | null;
   timeline: TimelineEntry[];
+  /** Count of old completed live-only items evicted from browser memory. */
+  timelineOmitted: number;
   approval: ApprovalPrompt | null;
   question: QuestionPrompt | null;
   error: string | null;
@@ -112,6 +131,7 @@ export const IDLE: StreamState = {
   reasoning: "",
   messageId: null,
   timeline: [],
+  timelineOmitted: 0,
   approval: null,
   question: null,
   error: null,
@@ -167,6 +187,29 @@ function mapToolEntry(
   });
 }
 
+function boundedTimeline(
+  state: StreamState,
+  timeline: TimelineEntry[],
+): Pick<StreamState, "timeline" | "timelineOmitted"> {
+  let excess = timeline.length - MAX_RETAINED_LIVE_TIMELINE_ENTRIES;
+  if (excess <= 0) return { timeline, timelineOmitted: state.timelineOmitted };
+  let omitted = 0;
+  const retained = timeline.filter((entry) => {
+    if (excess <= 0 || timelineEntryRunning(entry)) return true;
+    excess -= 1;
+    omitted += 1;
+    return false;
+  });
+  return { timeline: retained, timelineOmitted: state.timelineOmitted + omitted };
+}
+
+function timelineEntryRunning(entry: TimelineEntry): boolean {
+  return entry.kind === "tool" && (
+    entry.status === "running"
+    || (entry.children ?? []).some((child) => child.status === "running")
+  );
+}
+
 export function reduceStream(state: StreamState, event: AgentStreamEvent): StreamState {
   switch (event.kind) {
     case "turn.start":
@@ -199,7 +242,11 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
       };
     case "message.delta":
       return event.channel === "reasoning"
-        ? { ...state, reasoning: state.reasoning + event.delta, timeline: appendReasoning(state.timeline, event.delta) }
+        ? {
+            ...state,
+            reasoning: state.reasoning + event.delta,
+            ...boundedTimeline(state, appendReasoning(state.timeline, event.delta)),
+          }
         : { ...state, text: state.text + event.delta, sawText: true };
     case "tool.start": {
       const child: ToolEntry = {
@@ -231,7 +278,7 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
       const folded: TimelineEntry[] = state.text
         ? [...state.timeline, { kind: "text", id: `text-${state.timeline.length}`, text: state.text }]
         : state.timeline;
-      return { ...state, text: "", timeline: [...folded, child] };
+      return { ...state, text: "", ...boundedTimeline(state, [...folded, child]) };
     }
     case "tool.update":
       return {
@@ -262,16 +309,19 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
         }),
       };
     case "tool.end":
-      return {
-        ...state,
-        timeline: mapToolEntry(state.timeline, event.toolCallId, event.parentToolCallId, (entry) => ({
+      {
+        const timeline = mapToolEntry(state.timeline, event.toolCallId, event.parentToolCallId, (entry) => ({
           ...entry,
           status: event.status,
           summary: event.summary ?? entry.summary,
           output: entry.output ?? event.summary,
           durationMs: event.durationMs,
-        })),
+        }));
+      return {
+        ...state,
+        ...boundedTimeline(state, timeline),
       };
+      }
     case "approval.request":
       return {
         ...state,
@@ -315,7 +365,10 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
       // transcript. Older runtimes can still send this marker, but rendering
       // it duplicates the same action as a decorative divider.
       if (event.note === "steered") return state;
-      return { ...state, timeline: [...state.timeline, { kind: "note", note: event.note, text: event.detail ?? event.note }] };
+      return {
+        ...state,
+        ...boundedTimeline(state, [...state.timeline, { kind: "note", note: event.note, text: event.detail ?? event.note }]),
+      };
     case "mode.changed":
       // Legacy streams remain decodable, but presentation changes are user-driven.
       return state;

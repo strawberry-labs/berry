@@ -572,6 +572,58 @@ describe("BerryApiClient", () => {
     expect(JSON.stringify(fetchImpl.mock.calls.filter(([url]) => String(url).startsWith("https://api.berry.test")))).not.toContain("data:");
   });
 
+  it("reports byte progress through XMLHttpRequest in a browser", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000121";
+    const uploadId = "00000000-0000-7000-8000-000000000122";
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/files/uploads")) return json({ fileId, uploadId, partSize: 4, partCount: 1, expiresAt: "2026-07-22T10:00:00.000Z" });
+      if (url.endsWith(`/v1/files/${fileId}/uploads/${uploadId}/parts`)) return json({ parts: [{ partNumber: 1, url: "https://files.berry.test/part-1" }] });
+      if (url.endsWith(`/v1/files/${fileId}/uploads/${uploadId}/complete`)) {
+        return json({
+          id: fileId, name: "report.docx", originalName: "report.docx", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", detectedMediaType: null,
+          size: 4, sha256: null, origin: "user_upload", status: "available", createdAt: "2026-07-22T09:00:00.000Z",
+          updatedAt: "2026-07-22T09:00:01.000Z", taskIds: [], roles: ["input"],
+          downloadUrl: `/v1/files/${fileId}/content?download=1`, previewUrl: `/v1/files/${fileId}/content`,
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    class UploadXhr {
+      status = 200;
+      responseText = "";
+      timeout = 0;
+      upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      ontimeout: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      open() {}
+      getResponseHeader(name: string) { return name.toLowerCase() === "etag" ? '"etag-browser"' : null; }
+      send(body: Blob) {
+        this.upload.onprogress?.({ lengthComputable: true, loaded: 2, total: body.size } as ProgressEvent);
+        this.upload.onprogress?.({ lengthComputable: true, loaded: body.size, total: body.size } as ProgressEvent);
+        this.onload?.();
+      }
+      abort() { this.onabort?.(); }
+    }
+    vi.stubGlobal("fetch", fetchImpl);
+    vi.stubGlobal("XMLHttpRequest", UploadXhr);
+    try {
+      const progress: number[] = [];
+      const client = new BerryApiClient({ baseUrl: "https://api.berry.test" });
+      await expect(client.uploadFile(
+        new File([new Uint8Array([1, 2, 3, 4])], "report.docx"),
+        { onProgress: ({ uploadedBytes }) => progress.push(uploadedBytes) },
+      )).resolves.toMatchObject({ id: fileId });
+      expect(progress).toContain(2);
+      expect(progress.at(-1)).toBe(4);
+      expect(fetchImpl.mock.calls.some(([url]) => String(url).startsWith("https://files.berry.test"))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("times out stalled object-storage parts and aborts the multipart upload", async () => {
     const fileId = "00000000-0000-7000-8000-000000000111";
     const uploadId = "00000000-0000-7000-8000-000000000112";

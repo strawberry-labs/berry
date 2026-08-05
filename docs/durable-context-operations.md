@@ -171,19 +171,27 @@ authorized memory and project retrieval from Postgres.
 
 ## Compaction during long runs
 
-Before each durable model step, the worker estimates the journal content that
-is not already covered by the latest rolling checkpoint. It compacts when that
-estimate reaches the smallest of `BERRY_COMPACTION_TRIGGER_TOKENS` (120,000 by
-default), 80% of the selected model context window, or the context window minus
-the output reserve. Checkpoint generation heartbeats both the turn lease and
-its session-compaction lease.
+Before each durable model step, the worker follows the Pi harness policy: it
+starts from the latest valid provider-reported context usage, adds trailing
+journal entries conservatively, and compacts at the smaller of 85% of the
+selected model context window or the window minus the 16,384-token compaction
+reserve. As in Pi, it retains roughly the newest 20,000 tokens verbatim and
+summarizes the older valid prefix. Checkpoint generation heartbeats both the
+turn lease and its session-compaction lease.
 
 After the checkpoint transaction commits, the next worker delivery reloads the
 latest validated `SessionCheckpointV2` and sends only entries after its covered
 leaf. Invalid model output is repaired once and then replaced by the
 deterministic fallback; a failed summary never discards the prior rolling
-checkpoint or journal. Lower the configured trigger for smaller deployments,
-but keep enough headroom for the checkpoint and requested output.
+checkpoint or journal.
+
+Durable turns do not have model-iteration, tool-call, cumulative-token,
+per-turn spend, or wall-clock ceilings. They continue until the model finishes,
+the user cancels, a tool explicitly suspends or terminates the run, an actual
+error occurs, or an organization/department/user hard allowance is exhausted.
+Before each model request, the worker extends the existing budget reservation
+for the projected call under the applicable scope locks; this makes the normal
+account allowance, rather than a hidden turn budget, the spend boundary.
 
 ## Turn leases and recovery
 

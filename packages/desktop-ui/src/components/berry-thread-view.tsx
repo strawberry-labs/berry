@@ -39,6 +39,7 @@ import {
 import {
   classifyTurnSegments,
   groupLiveTimeline,
+  windowLiveTimeline,
   type ApprovalPrompt,
   type MessageSegment,
   type QuestionPrompt,
@@ -220,54 +221,67 @@ export function BerryThreadView({
     if (stream.turnActive && !stream.sawText) forgetTurnDisclosure(sessionId, liveTurnIndex);
   }, [sessionId, stream.turnActive, stream.sawText, liveTurnIndex]);
 
-  const liveSegments = groupLiveTimeline(stream.timeline);
+  const liveTimelineWindow = windowLiveTimeline(stream.timeline);
+  const omittedLiveActivity = stream.timelineOmitted + liveTimelineWindow.omitted;
+  const liveSegments = groupLiveTimeline(liveTimelineWindow.entries);
   const liveTimelineOnlyNotes = stream.timeline.length > 0 && stream.timeline.every((entry) => entry.kind === "note");
   let liveThoughtOrdinal = 0;
-  const liveActivityNodes = liveSegments.map((segment, index) => {
-    if (segment.kind === "tools") {
+  const liveActivityNodes = [
+    ...(omittedLiveActivity > 0 ? [(
+      <div
+        key="live-timeline-window"
+        className="px-1 text-[11px] text-[var(--berry-text-tertiary)]"
+        role="status"
+      >
+        {omittedLiveActivity} earlier live activity items are hidden to keep this tab responsive. They remain in task history.
+      </div>
+    )] : []),
+    ...liveSegments.map((segment, index) => {
+      if (segment.kind === "tools") {
+        return (
+          <ToolFlow
+            key={`tools-${segment.tools[0]?.toolCallId ?? index}`}
+            tools={segment.tools}
+            active={stream.turnActive}
+            latest={stream.turnActive && index === liveSegments.length - 1}
+            showTodos={showTodos}
+          />
+        );
+      }
+      if (segment.kind === "thought") {
+        // Berry `mnt`: the collapse key is the identity of the next rendered
+        // part after this thought (or the live answer once it starts streaming).
+        const next = liveSegments[index + 1];
+        const autoCollapseKey = next
+          ? next.kind === "tools"
+            ? `tools-${next.tools[0]?.toolCallId ?? index + 1}`
+            : next.kind === "note"
+              ? `note-${index + 1}`
+              : next.id
+          : stream.text.length > 0
+            ? "live-answer"
+            : null;
+        return (
+          <ThoughtRow
+            key={segment.id}
+            stateKey={`${liveTurnKey}:thought-${liveThoughtOrdinal++}`}
+            autoCollapseKey={autoCollapseKey}
+            active={stream.turnActive && stream.text.length === 0 && index === liveSegments.length - 1}
+            reasoning={segment.text}
+            collapseWhenInactive
+          />
+        );
+      }
+      if (segment.kind === "text") {
+        return <BerryAssistantMarkdownBlock key={segment.id}>{segment.text}</BerryAssistantMarkdownBlock>;
+      }
       return (
-        <ToolFlow
-          key={`tools-${segment.tools[0]?.toolCallId ?? index}`}
-          tools={segment.tools}
-          active={stream.turnActive}
-          latest={stream.turnActive && index === liveSegments.length - 1}
-          showTodos={showTodos}
-        />
+        <ActivityNote key={`note-${index}`} note={segment.note}>
+          {segment.text}
+        </ActivityNote>
       );
-    }
-    if (segment.kind === "thought") {
-      // Berry `mnt`: the collapse key is the identity of the next rendered
-      // part after this thought (or the live answer once it starts streaming).
-      const next = liveSegments[index + 1];
-      const autoCollapseKey = next
-        ? next.kind === "tools"
-          ? `tools-${next.tools[0]?.toolCallId ?? index + 1}`
-          : next.kind === "note"
-            ? `note-${index + 1}`
-            : next.id
-        : stream.text.length > 0
-          ? "live-answer"
-          : null;
-      return (
-        <ThoughtRow
-          key={segment.id}
-          stateKey={`${liveTurnKey}:thought-${liveThoughtOrdinal++}`}
-          autoCollapseKey={autoCollapseKey}
-          active={stream.turnActive && stream.text.length === 0 && index === liveSegments.length - 1}
-          reasoning={segment.text}
-          collapseWhenInactive
-        />
-      );
-    }
-    if (segment.kind === "text") {
-      return <BerryAssistantMarkdownBlock key={segment.id}>{segment.text}</BerryAssistantMarkdownBlock>;
-    }
-    return (
-      <ActivityNote key={`note-${index}`} note={segment.note}>
-        {segment.text}
-      </ActivityNote>
-    );
-  });
+    }),
+  ];
 
   const navContainerRef = React.useRef<HTMLDivElement>(null);
   const navigatorItems: NavigatorItem[] = renderedTurnGroups
@@ -337,7 +351,7 @@ export function BerryThreadView({
                           elapsedMs={stream.turnStartedAt ? now - stream.turnStartedAt : undefined}
                           liveAction={
                             stream.turnActive
-                              ? latestTurnAction(stream.timeline.filter((entry): entry is ToolEntry => entry.kind === "tool"))
+                              ? latestTurnAction(liveTimelineWindow.entries.filter((entry): entry is ToolEntry => entry.kind === "tool"))
                               : null
                           }
                         >
