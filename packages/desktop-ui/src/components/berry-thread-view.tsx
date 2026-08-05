@@ -1,6 +1,6 @@
 import * as React from "react";
 import { MessageAttachmentContentSchema, type ImageAspectRatio, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
-import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, RefreshCw, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
+import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 
 import {
@@ -81,8 +81,6 @@ export interface BerryThreadAdapter {
   onOpenArtifact?: (artifact: { name: string; path: string; mediaType?: string; size?: number }) => void | Promise<void>;
   /** Open the task-scoped file library. */
   onViewTaskFiles?: () => void;
-  /** Continue the latest failed assistant turn without appending another user message. */
-  onContinueInterruptedTurn?: () => void | Promise<void>;
   /** Post a new user turn that semantically edits a generated image. */
   onEditGeneratedImage?: (image: GeneratedImageView, instruction: string, annotations: ImageEditAnnotation[]) => void | Promise<void>;
   /** Recreate a generated image at a new aspect ratio. */
@@ -123,8 +121,6 @@ export interface BerryThreadViewProps {
   showPendingTurnActivity?: boolean;
   /** Host-owned fallback for an interrupted latest turn not yet projected as a message part. */
   latestTurnError?: string;
-  /** Allow the host to expose retry for a durable recovery state on older projections. */
-  forceContinuableLatestTurn?: boolean;
   /** Native desktop keeps the rail 16px from its window edge; web uses 12px. */
   navigatorInset?: number;
   adapter?: BerryThreadAdapter;
@@ -149,7 +145,6 @@ export function BerryThreadView({
   showQuestions = true,
   showPendingTurnActivity = false,
   latestTurnError,
-  forceContinuableLatestTurn = false,
   navigatorInset = 12,
   adapter = {},
 }: BerryThreadViewProps) {
@@ -323,11 +318,6 @@ export function BerryThreadView({
                       {...(groupIndex === renderedTurnGroups.length - 1 && latestTurnError
                         ? { inlineError: latestTurnError }
                         : {})}
-                      canContinue={
-                        groupIndex === renderedTurnGroups.length - 1
-                        && !stream.turnActive
-                        && (forceContinuableLatestTurn || isContinuableAssistantTurn(group.assistants))
-                      }
                     />
                   </MessageScrollerItem>
                 ) : null}
@@ -529,7 +519,6 @@ function BerryAssistantTurnGroup({
   showTodos,
   density,
   adapter,
-  canContinue,
   inlineError,
   writingBlockParts,
   conversationImageParts,
@@ -540,7 +529,6 @@ function BerryAssistantTurnGroup({
   showTodos: boolean;
   density: "full" | "compact";
   adapter: BerryThreadAdapter;
-  canContinue: boolean;
   inlineError?: string;
   writingBlockParts: Map<string, MessageDraftPartResolution>;
   conversationImageParts: MessagePart[];
@@ -668,9 +656,6 @@ function BerryAssistantTurnGroup({
         {inlineError && !merged.some((segment) => segment.kind === "error") ? (
           <BerryAssistantErrorBlock>{inlineError}</BerryAssistantErrorBlock>
         ) : null}
-        {canContinue && adapter.onContinueInterruptedTurn ? (
-          <BerryContinueInterruptedTurn onContinue={adapter.onContinueInterruptedTurn} />
-        ) : null}
         <MessageFooter className="gap-1 opacity-0 transition-[opacity] group-hover:opacity-100">
           {textContent ? (
             <Button
@@ -726,40 +711,6 @@ function BerryAssistantTurnGroup({
 export function isContinuableAssistantTurn(messages: Message[]): boolean {
   const latestAssistant = messages.at(-1);
   return latestAssistant?.status === "failed" || latestAssistant?.status === "cancelled";
-}
-
-function BerryContinueInterruptedTurn({ onContinue }: { onContinue: () => void | Promise<void> }) {
-  const [continuing, setContinuing] = React.useState(false);
-  const continueTurn = async () => {
-    if (continuing) return;
-    setContinuing(true);
-    try {
-      await onContinue();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to retry this turn");
-      setContinuing(false);
-    }
-  };
-
-  return (
-    <div
-      data-testid="continue-interrupted-turn"
-      className="flex max-w-[775px] items-center pt-1"
-    >
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        aria-label="Retry this response"
-        disabled={continuing}
-        onClick={() => void continueTurn()}
-        className="h-10 rounded-lg px-2.5 text-[12px] text-[var(--berry-text-secondary)] shadow-none transition-[background-color,color,scale] hover:bg-[var(--berry-hover)] hover:text-[var(--berry-text-primary)] active:scale-[0.96]"
-      >
-        <RefreshCw className={cn("size-3.5", continuing && "animate-spin motion-reduce:animate-none")} />
-        {continuing ? "Retrying…" : "Retry"}
-      </Button>
-    </div>
-  );
 }
 
 function summarizeActivity(segments: MessageSegment[]): string | undefined {

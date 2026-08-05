@@ -8,6 +8,7 @@ import {
   pastedTextMode,
   prunePastedTextPresentations,
   reasoningLevelsForModel,
+  resolveComposerPrimaryAction,
   uploadProgressDescription,
 } from "./web-composer.tsx";
 
@@ -91,5 +92,20 @@ describe("uploadProgressDescription", () => {
 
   it("shows useful progress once bytes have been transferred", () => {
     expect(uploadProgressDescription(1_103_090, 2_206_180)).toBe("Uploading 50% · 2.1 MB");
+  });
+});
+
+describe("resolveComposerPrimaryAction", () => {
+  it("stops while the assistant is running", () => {
+    expect(resolveComposerPrimaryAction(true, false, true)).toBe("stop");
+  });
+
+  it("sends when the composer contains a draft", () => {
+    expect(resolveComposerPrimaryAction(false, true, true)).toBe("send");
+  });
+
+  it("continues an interrupted turn only when the idle composer is empty", () => {
+    expect(resolveComposerPrimaryAction(false, false, true)).toBe("continue");
+    expect(resolveComposerPrimaryAction(false, false, false)).toBe("send");
   });
 });

@@ -80,6 +80,7 @@ import {
   PencilEdit02Icon as HugePencilEdit02Icon,
   PinIcon as HugePinIcon,
   PinOffIcon,
+  PlayIcon,
   Plug01Icon,
   PlusSignCircleIcon,
   PlusSignIcon,
@@ -190,6 +191,7 @@ export const GitBranch = make(GitBranchIcon);
 export const GitFork = make(GitForkIcon);
 export const Pin = make(HugePinIcon);
 export const PinOff = make(PinOffIcon);
+export const Play = make(PlayIcon);
 export const Pencil = make(Edit02Icon);
 export const PencilLine = make(Edit02Icon);
 export const PencilEdit02Icon = make(HugePencilEdit02Icon);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
-import { initialCloudContent, reduceDurableTurnState, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 
 describe("cloud shell bootstrap", () => {
   it("does not issue live requests for fixture task and session identifiers", () => {
@@ -67,5 +67,17 @@ describe("cloud shell bootstrap", () => {
       waitingReason: null,
       nextAction: null,
     });
+  });
+
+  it("offers composer continuation for failed, cancelled, and recoverable turns", () => {
+    expect(isInterruptedTurnAvailable("failed", undefined, [])).toBe(true);
+    expect(isInterruptedTurnAvailable("cancelled", undefined, [])).toBe(true);
+    expect(isInterruptedTurnAvailable(null, "recovery_required", [])).toBe(true);
+  });
+
+  it("does not revive a stale failed message after a newer turn completed", () => {
+    const staleFailure = [{ role: "assistant", status: "failed" }] as unknown as ShellData["messages"];
+    expect(isInterruptedTurnAvailable("completed", "completed", staleFailure)).toBe(false);
+    expect(isInterruptedTurnAvailable(null, undefined, staleFailure)).toBe(true);
   });
 });

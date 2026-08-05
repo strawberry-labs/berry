@@ -19,7 +19,7 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, continueTurn, recoveryRequired = false, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -33,7 +33,6 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
   onEditGeneratedImage?: ((image: GeneratedImageView, instruction: string, annotations: ImageEditAnnotation[]) => void | Promise<void>) | undefined;
   onRegenerateGeneratedImage?: ((image: GeneratedImageView, aspectRatio: "1:1" | "3:4" | "4:3" | "9:16" | "16:9") => void | Promise<void>) | undefined;
   editTurn?: ((message: Message, text: string) => Promise<void>) | undefined;
-  continueTurn?: (() => Promise<void>) | undefined;
   recoveryRequired?: boolean;
   cancelTurn: () => Promise<void>;
   onViewTaskFiles?: (() => void) | undefined;
@@ -73,7 +72,6 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         />
       ),
     } : {}),
-    ...(continueTurn ? { onContinueInterruptedTurn: continueTurn } : {}),
     ...(onEditGeneratedImage ? { onEditGeneratedImage } : {}),
     ...(onRegenerateGeneratedImage ? { onRegenerateGeneratedImage } : {}),
     ...(client ? {
@@ -113,7 +111,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
       },
       ...(onViewTaskFiles ? { onViewTaskFiles } : {}),
     } : {}),
-  }), [cancelTurn, client, config, continueTurn, editTurn, onEditGeneratedImage, onRegenerateGeneratedImage, onViewTaskFiles, taskId, taskTitles]);
+  }), [cancelTurn, client, config, editTurn, onEditGeneratedImage, onRegenerateGeneratedImage, onViewTaskFiles, taskId, taskTitles]);
   const activeImageTool = [...stream.timeline].reverse().find(
     (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "create_image" && entry.status === "running",
   );
@@ -164,7 +162,6 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         showPendingTurnActivity
         showReasoning={showReasoning}
         {...(recoveryRequired ? { latestTurnError: "Something interrupted this response." } : {})}
-        forceContinuableLatestTurn={recoveryRequired}
         adapter={adapter}
         liveContent={imageGenerationContent}
       />

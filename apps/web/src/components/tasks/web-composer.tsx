@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowUp, Plus, Square } from "lucide-react";
+import { ArrowUp, Play, Plus, Square } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
 import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
@@ -72,6 +72,18 @@ const CREATE_IMAGE_TOKEN = "__berry_create_image__";
 const PastedTextEditorDialog = React.lazy(() => import("./pasted-text-editor-dialog").then((module) => ({ default: module.PastedTextEditorDialog })));
 const ComposerAttachmentPill = React.lazy(() => import("./composer-attachment-pill").then((module) => ({ default: module.ComposerAttachmentPill })));
 
+export type ComposerPrimaryAction = "stop" | "send" | "continue";
+
+export function resolveComposerPrimaryAction(
+  working: boolean,
+  hasDraft: boolean,
+  continuationAvailable: boolean,
+): ComposerPrimaryAction {
+  if (working) return "stop";
+  if (!hasDraft && continuationAvailable) return "continue";
+  return "send";
+}
+
 export function Composer({
   config,
   activeTask,
@@ -89,6 +101,7 @@ export function Composer({
   onEvent,
   runTurn,
   onCancel,
+  onContinueTurn,
   variant,
   onCreateTask,
   streaming,
@@ -126,6 +139,7 @@ export function Composer({
   onEvent: (sessionId: string, event: Parameters<typeof reduceStream>[1]) => void;
   runTurn: (task: Task, params: { input: string; requestMessageId?: string | undefined; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
   onCancel: () => void;
+  onContinueTurn?: (() => Promise<void>) | undefined;
   variant: "home" | "thread";
   onCreateTask: (options?: { title?: string }) => Promise<Task | null>;
   streaming: boolean;
@@ -149,7 +163,8 @@ export function Composer({
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const working = busy || streaming;
+  const [continuing, setContinuing] = React.useState(false);
+  const working = busy || continuing || streaming;
   const [attachments, setAttachments] = React.useState<AttachmentInput[]>([]);
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
   const [pastedTextPresentations, setPastedTextPresentations] = React.useState<Record<string, PastedTextPresentation>>({});
@@ -347,11 +362,27 @@ export function Composer({
     });
   }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
 
+  const continueInterruptedTurn = React.useCallback(async () => {
+    if (!onContinueTurn || working || editingFollowUp || pendingUploads.length > 0) return;
+    setContinuing(true);
+    setUploadError("");
+    try {
+      await onContinueTurn();
+    } catch (cause) {
+      setUploadError(cause instanceof Error ? cause.message : "Unable to continue this response");
+    } finally {
+      setContinuing(false);
+    }
+  }, [editingFollowUp, onContinueTurn, pendingUploads.length, working]);
+
   const submit = React.useCallback(async (event?: KeyboardEvent | null) => {
     if (savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading")) return;
     const plainInput = text.replaceAll(CREATE_IMAGE_TOKEN, "").trim() || (attachments.length > 0 ? "Review the attached files." : "");
     const input = createImageMode ? `Create image\n${plainInput}` : plainInput;
-    if (!input) return;
+    if (!input) {
+      await continueInterruptedTurn();
+      return;
+    }
     if (editingFollowUp) {
       setSavingQueuedEdit(true);
       setUploadError("");
@@ -467,7 +498,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
+  }, [activeTask, attachments, client, continueInterruptedTurn, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null, options: { pastedText?: string; pastedTextMode?: Exclude<PastedTextMode, "native"> } = {}) => {
     if (!files?.length) return;
@@ -661,6 +692,15 @@ export function Composer({
     setPastedTextDraft({ attachmentId: attachment.id, name: attachment.name, ...presentation });
   }, []);
 
+  const hasDraft = text.trim().length > 0 || attachments.length > 0;
+  const uploadInProgress = pendingUploads.some((upload) => upload.state === "uploading");
+  const primaryAction = editingFollowUp
+    ? "send"
+    : resolveComposerPrimaryAction(working, hasDraft, Boolean(onContinueTurn) && pendingUploads.length === 0);
+  const primaryActionDisabled = savingQueuedEdit
+    || uploadInProgress
+    || (primaryAction === "send" && !hasDraft);
+
   return (
     <>
     <div className={variant === "thread" ? "berry-thread-composer-wrap mx-auto max-w-full pb-5" : "w-full"}>
@@ -778,8 +818,9 @@ export function Composer({
           {contextSessionId ? <ContextWindowRing stats={contextStats} /> : null}
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{selectedComposerModel?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => { onModelChange(item.id); const nextLevels = reasoningLevelsForModel(item); if (!nextLevels.includes(reasoning)) onReasoningChange(nextLevels[0] ?? "off"); }}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoningLabel(reasoning)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Reasoning for {selectedComposerModel?.label ?? "model"}</DropdownMenuLabel>{reasoningLevels.map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span>{reasoningLabel(level)}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
-          {working && !editingFollowUp ? (
+          {primaryAction === "stop" && !editingFollowUp ? (
             <Button
+              type="button"
               size="icon-lg"
               variant="secondary"
               onClick={onCancel}
@@ -790,14 +831,19 @@ export function Composer({
             </Button>
           ) : (
             <Button
+              type="button"
               size="icon-lg"
               variant="secondary"
-              disabled={savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading") || (!text.trim() && attachments.length === 0)}
-              onClick={() => void submit()}
-              aria-label={editingFollowUp ? "Save queued message" : "Send"}
+              disabled={primaryActionDisabled}
+              onClick={() => void (primaryAction === "continue" ? continueInterruptedTurn() : submit())}
+              aria-label={editingFollowUp ? "Save queued message" : primaryAction === "continue" ? "Continue response" : "Send"}
               className="berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45"
             >
-              <ArrowUp size={18} aria-hidden />
+              {primaryAction === "continue" ? (
+                <Play size={15} fill="currentColor" className="translate-x-px" aria-hidden />
+              ) : (
+                <ArrowUp size={18} aria-hidden />
+              )}
             </Button>
           )}
         </div>

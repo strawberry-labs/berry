@@ -12,6 +12,7 @@ import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, Att
 import {
   BerryThreadView,
   BerryUserEditorFrame,
+  isContinuableAssistantTurn,
   isImageMessagePart,
   type BerryThreadAdapter,
 } from "@berry/desktop-ui/components/berry-thread-view";
@@ -152,6 +153,18 @@ export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks"
 
 export function shouldRefreshAdministration(permissions: readonly OrgPermission[]): boolean {
   return permissions.includes("org:admin");
+}
+
+export function isInterruptedTurnAvailable(
+  streamEndStatus: StreamState["endStatus"],
+  runState: TurnState["runState"],
+  messages: Message[],
+): boolean {
+  const currentTerminalState = streamEndStatus ?? runState ?? null;
+  return currentTerminalState === "failed"
+    || currentTerminalState === "cancelled"
+    || currentTerminalState === "recovery_required"
+    || (currentTerminalState !== "completed" && isContinuableAssistantTurn(messages));
 }
 
 export function shouldShowComposerProjectSwitcher(messages: readonly unknown[]): boolean {
@@ -337,6 +350,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
   const durableState = activeSessionId ? durableStatesBySession[activeSessionId] : undefined;
   const turnBusy = activeSessionId ? startingSessions.has(activeSessionId) : false;
+  const interruptedTurnAvailable = isInterruptedTurnAvailable(
+    stream.endStatus,
+    durableState?.runState,
+    messages,
+  );
 
   const replaceSessionMessages = React.useCallback((sessionId: string, next: Message[] | ((current: Message[]) => Message[])) => {
     setMessagesBySession((current) => ({
@@ -1946,11 +1964,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onEditGeneratedImage={editGeneratedImage}
               onRegenerateGeneratedImage={regenerateGeneratedImage}
               editTurn={activeTask.activeSessionId ? editTurn : undefined}
-              continueTurn={activeTask.activeSessionId
-                ? durableState?.runState === "recovery_required"
-                  ? recoverDurableTurn
-                  : continueTurn
-                : undefined}
               recoveryRequired={durableState?.runState === "recovery_required"}
               cancelTurn={cancelTurn}
               onViewTaskFiles={() => setTaskFilesOpen(true)}
@@ -1994,6 +2007,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               personalization={personalization}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
+              onContinueTurn={activeTask.activeSessionId && interruptedTurnAvailable
+                ? durableState?.runState === "recovery_required"
+                  ? recoverDurableTurn
+                  : continueTurn
+                : undefined}
               runTurn={runTurn}
               onUserMessage={(text, sessionId, taskId, attachments) => {
                 const user = optimisticUserMessage(sessionId, text, attachments);

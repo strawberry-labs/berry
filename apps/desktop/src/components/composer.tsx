@@ -17,6 +17,7 @@ import {
   NotebookPen,
   Paperclip,
   PencilLine,
+  Play,
   Plus,
   SlashSquare,
   Square,
@@ -170,6 +171,7 @@ export function Composer({
   streaming = false,
   onSubmit,
   onCancel,
+  onContinue,
   allowSubmitWhileStreaming = false,
   autoFocus = true,
   className,
@@ -183,6 +185,7 @@ export function Composer({
   streaming?: boolean;
   onSubmit: (submission: ComposerSubmit) => void | Promise<void>;
   onCancel?: () => void;
+  onContinue?: (() => void | Promise<void>) | undefined;
   allowSubmitWhileStreaming?: boolean;
   autoFocus?: boolean;
   className?: string;
@@ -339,12 +342,19 @@ export function Composer({
 
   const [draggingFiles, setDraggingFiles] = React.useState(false);
   const [submitting, setSubmitting] = React.useState(false);
+  const [continuing, setContinuing] = React.useState(false);
+  const working = streaming || continuing;
   const canSubmit =
     (input.trim().length > 0 || hasReadyAttachment) &&
     !hasProcessingAttachment &&
     !submitting &&
-    (!streaming || allowSubmitWhileStreaming) &&
+    (!working || allowSubmitWhileStreaming) &&
     Boolean(activeWorkspace);
+  const canContinue = Boolean(onContinue)
+    && !working
+    && input.trim().length === 0
+    && attachments.length === 0
+    && !submitting;
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -368,6 +378,18 @@ export function Composer({
       toast.error(error instanceof Error ? error.message : "Could not send message");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const continueInterruptedTurn = async () => {
+    if (!onContinue || !canContinue) return;
+    setContinuing(true);
+    try {
+      await onContinue();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not continue response");
+    } finally {
+      setContinuing(false);
     }
   };
 
@@ -449,7 +471,7 @@ export function Composer({
             autoFocus={autoFocus}
             mentions={mentions}
             onChange={setInput}
-            onSubmit={() => void submit()}
+            onSubmit={() => void (canContinue ? continueInterruptedTurn() : submit())}
             onPasteEvent={handlePaste}
             placeholder={
               variant === "home"
@@ -543,8 +565,9 @@ export function Composer({
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {streaming ? (
+          {working ? (
             <Button
+              type="button"
               size="icon-lg"
               variant="secondary"
               onClick={onCancel}
@@ -555,14 +578,15 @@ export function Composer({
             </Button>
           ) : (
             <Button
+              type="button"
               size="icon-lg"
               variant="secondary"
-              disabled={!canSubmit}
-              onClick={() => void submit()}
-              aria-label="Send"
+              disabled={!canContinue && !canSubmit}
+              onClick={() => void (canContinue ? continueInterruptedTurn() : submit())}
+              aria-label={canContinue ? "Continue response" : "Send"}
               className="berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45"
             >
-              <ArrowUp02 />
+              {canContinue ? <Play className="translate-x-px" fill="currentColor" /> : <ArrowUp02 />}
             </Button>
           )}
           </div>

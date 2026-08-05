@@ -4,7 +4,6 @@ import type { CommandManifest, JsonValue, Message, ModelProvider, ReasoningLevel
 import {
   Archive,
   ArchiveRestore,
-  ArrowRight02,
   ChevronDown,
   CircleCheckIcon,
   CircleHelp,
@@ -627,21 +626,6 @@ export function TaskView({ taskId }: { taskId: string }) {
         />
       ) : null}
       <div className="berry-thread-composer-wrap mx-auto max-w-full px-4 pb-5">
-        {interruptedTurn && !stream.turnActive ? (
-          <div className="mb-2 flex justify-end">
-            <Button
-              type="button"
-              variant="secondary"
-              className="h-10 rounded-full px-4 transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96]"
-              disabled={startTurn.isPending}
-              onClick={() => void continueTurn()}
-              title={interruptedTurn === "cancelled" ? "Continue the stopped turn" : "Continue after the provider error"}
-            >
-              <ArrowRight02 />
-              Continue
-            </Button>
-          </div>
-        ) : null}
         <Composer
           variant="thread"
           autoFocus={false}
@@ -655,6 +639,7 @@ export function TaskView({ taskId }: { taskId: string }) {
           }
           streaming={stream.turnActive || startTurn.isPending || imageGeneration?.status === "generating"}
           onCancel={() => void host.call("agent.cancel", { sessionId })}
+          onContinue={interruptedTurn && !stream.turnActive ? continueTurn : undefined}
           allowSubmitWhileStreaming
           queuedFollowUps={queuedFollowUps}
           onSubmit={async (submission) => {
