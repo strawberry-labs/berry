@@ -28,16 +28,22 @@ function stableValue(value: unknown): unknown {
  * before the API has committed that message. Keep that optimistic message in
  * the thread until a matching persisted copy arrives.
  */
-export function reconcileFetchedSessionMessages(serverMessages: Message[], localMessages: Message[]): Message[] {
+export function reconcileFetchedSessionMessages(
+  serverMessages: Message[],
+  localMessages: Message[],
+  pendingMessageIds: ReadonlySet<string> = new Set(),
+): Message[] {
   // Use counts rather than a Set. Two identical prompts are two separate
   // turns; one persisted copy must only consume one optimistic copy.
+  const serverMessageIds = new Set(serverMessages.map((message) => message.id));
   const serverFingerprintCounts = new Map<string, number>();
   for (const serverMessage of serverMessages) {
     const key = fingerprint(serverMessage);
     serverFingerprintCounts.set(key, (serverFingerprintCounts.get(key) ?? 0) + 1);
   }
   const pendingLocalMessages = localMessages.filter((message) => {
-    if (!message.id.startsWith(OPTIMISTIC_MESSAGE_ID_PREFIX)) return false;
+    if (!message.id.startsWith(OPTIMISTIC_MESSAGE_ID_PREFIX) && !pendingMessageIds.has(message.id)) return false;
+    if (serverMessageIds.has(message.id)) return false;
     const key = fingerprint(message);
     const remaining = serverFingerprintCounts.get(key) ?? 0;
     if (remaining <= 0) return true;

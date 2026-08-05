@@ -9,6 +9,31 @@ describe("reconcileFetchedSessionMessages", () => {
     expect(reconcileFetchedSessionMessages([], [local])).toEqual([local]);
   });
 
+  it("keeps a UUID-backed durable prompt while its admission is pending", () => {
+    const requestMessageId = "ba2f8d43-c491-4318-b0dc-f60b7d4b8360";
+    const local = message(requestMessageId, "session_1", "user", "Review the attached file");
+
+    expect(reconcileFetchedSessionMessages([], [local], new Set([requestMessageId]))).toEqual([local]);
+  });
+
+  it("settles a UUID-backed durable prompt once the server returns it", () => {
+    const requestMessageId = "ba2f8d43-c491-4318-b0dc-f60b7d4b8360";
+    const local = message(requestMessageId, "session_1", "user", "Review the attached file");
+    const persisted = message(requestMessageId, "session_1", "user", "Review the attached file");
+
+    expect(reconcileFetchedSessionMessages(
+      [persisted],
+      [local],
+      new Set([requestMessageId]),
+    )).toEqual([persisted]);
+  });
+
+  it("does not preserve an absent settled UUID message", () => {
+    const settled = message("ba2f8d43-c491-4318-b0dc-f60b7d4b8360", "session_1", "user", "Old prompt");
+
+    expect(reconcileFetchedSessionMessages([], [settled])).toEqual([]);
+  });
+
   it("replaces the optimistic prompt with the persisted API message", () => {
     const local = message(`${OPTIMISTIC_MESSAGE_ID_PREFIX}1`, "session_1", "user", "Show the latest status");
     const persisted = message("msg_1", "session_1", "user", "Show the latest status");

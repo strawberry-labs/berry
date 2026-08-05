@@ -363,6 +363,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // paths cannot start two turns for the same prompt.
   const followUpSendInFlightRef = React.useRef(new Set<string>());
   const activeSessionsRef = React.useRef(new Set<string>());
+  const pendingRequestMessageIdsBySessionRef = React.useRef(new Map<string, Set<string>>());
   const activeSessionId = activeTask?.activeSessionId ?? null;
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
   const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
@@ -379,6 +380,32 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       ...current,
       [sessionId]: typeof next === "function" ? next(current[sessionId] ?? []) : next,
     }));
+  }, []);
+
+  const markRequestMessagePending = React.useCallback((sessionId: string, messageId: string) => {
+    const pending = pendingRequestMessageIdsBySessionRef.current.get(sessionId) ?? new Set<string>();
+    pending.add(messageId);
+    pendingRequestMessageIdsBySessionRef.current.set(sessionId, pending);
+  }, []);
+
+  const clearPendingRequestMessage = React.useCallback((sessionId: string, messageId: string | undefined) => {
+    if (!messageId) return;
+    const pending = pendingRequestMessageIdsBySessionRef.current.get(sessionId);
+    if (!pending) return;
+    pending.delete(messageId);
+    if (pending.size === 0) pendingRequestMessageIdsBySessionRef.current.delete(sessionId);
+  }, []);
+
+  const reconcileSessionMessageSnapshot = React.useCallback((
+    sessionId: string,
+    serverMessages: Message[],
+    localMessages: Message[],
+  ) => {
+    const pending = pendingRequestMessageIdsBySessionRef.current.get(sessionId) ?? new Set<string>();
+    const reconciled = reconcileFetchedSessionMessages(serverMessages, localMessages, pending);
+    for (const message of serverMessages) pending.delete(message.id);
+    if (pending.size === 0) pendingRequestMessageIdsBySessionRef.current.delete(sessionId);
+    return reconciled;
   }, []);
 
   const pendingStreamDeltasRef = React.useRef(new Map<string, {
@@ -728,8 +755,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const refreshSessionMessages = React.useCallback(async (sessionId: string) => {
     if (!client) return;
     const nextMessages = await client.listMessages(sessionId);
-    replaceSessionMessages(sessionId, (current) => reconcileFetchedSessionMessages(nextMessages, current));
-  }, [client, replaceSessionMessages]);
+    replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, nextMessages, current));
+  }, [client, reconcileSessionMessageSnapshot, replaceSessionMessages]);
 
   const applyDurableState = React.useCallback((sessionId: string, state: TurnState, rebuildStream = false) => {
     setDurableStatesBySession((current) => ({ ...current, [sessionId]: state }));
@@ -894,7 +921,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     void Promise.all([client.listMessages(sessionId), client.turnState(sessionId)])
       .then(([items, state]) => {
         if (cancelled) return;
-        replaceSessionMessages(sessionId, (current) => reconcileFetchedSessionMessages(items, current));
+        replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, items, current));
         const preserveDurableSurface = state.active || state.runState === "recovery_required";
         applyDurableState(sessionId, state, preserveDurableSurface);
         if (state.active) activeSessionsRef.current.add(sessionId);
@@ -907,7 +934,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (!cancelled) setResourceError("messages", cause instanceof Error ? cause.message : "Unable to load this task");
       });
     return () => { cancelled = true; };
-  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, client, replaceSessionMessages, resetSessionStream]);
+  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, client, reconcileSessionMessageSnapshot, replaceSessionMessages, resetSessionStream]);
 
   const runTurn = React.useCallback(async (
     task: Task,
@@ -984,6 +1011,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       }
       activeSessionsRef.current.delete(sessionId);
       stopSessionConnection(sessionId);
+      clearPendingRequestMessage(
+        sessionId,
+        params.continueInterruptedTurn === true ? undefined : params.requestMessageId,
+      );
       const error = cause instanceof Error ? cause : new Error("Unable to start the turn");
       updateSessionStream(sessionId, { kind: "error", message: error.message });
       const terminalEvent = { kind: "turn.end", turnId: `failed_${Date.now()}`, status: "failed" } as const;
@@ -998,7 +1029,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         return next;
       });
     }
-  }, [applyDurableState, attachSessionStream, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -1068,6 +1099,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     const attachments = [...imageAttachments, ...fileAttachments];
     const replacementMessageId = globalThis.crypto.randomUUID();
+    markRequestMessagePending(sessionId, replacementMessageId);
     requestThreadBottom(sessionId);
     replaceSessionMessages(sessionId, (current) => {
       const index = current.findIndex((item) => item.id === target.id);
@@ -1081,7 +1113,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       replaceFromMessageId: target.id,
     });
     await refreshSessionMessages(sessionId);
-  }, [activeTask, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, runTurn]);
+  }, [activeTask, markRequestMessagePending, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const continueTurn = React.useCallback(async () => {
     if (!activeTask?.activeSessionId) return;
@@ -2028,6 +2060,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 : undefined}
               runTurn={runTurn}
               onUserMessage={(text, sessionId, taskId, attachments, messageId) => {
+                if (messageId) markRequestMessagePending(sessionId, messageId);
                 const user = optimisticUserMessage(sessionId, text, attachments, messageId);
                 const nextTitle = text.trim().slice(0, 42);
                 requestThreadBottom(sessionId);
@@ -2101,6 +2134,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}
                 onUserMessage={(text, sessionId, _taskId, attachments, messageId) => {
+                  if (messageId) markRequestMessagePending(sessionId, messageId);
                   const user = optimisticUserMessage(sessionId, text, attachments, messageId);
                   replaceSessionMessages(sessionId, [user]);
                   return user.id;
