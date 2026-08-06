@@ -16,7 +16,7 @@ import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
 import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
-import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, type ComposerQuestionAnswer } from "./composer-question-overlay";
+import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, type ComposerQuestionAnswer } from "./composer-question-overlay";
 import { QueuedMessageList } from "./queued-message-list";
 import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
 import { resolveComposerSubmitIntent } from "@/lib/composer-submit-intent";
@@ -348,15 +348,17 @@ export function Composer({
     if (!question || !activeTask?.activeSessionId || !client) throw new Error("This question is no longer available. Refresh and try again.");
     const sessionId = activeTask.activeSessionId;
     const transcript = questionAnswerTranscript(answers);
-    const optimisticMessageId = onUserMessage(transcript, sessionId, activeTask.id);
+    const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
+    const optimisticMessageId = onUserMessage(transcript, sessionId, activeTask.id, undefined, answerMessageId);
     const persistedMessage = await client.appendMessage(sessionId, {
+      messageId: answerMessageId,
       role: "user",
       parts: [{ kind: "text", content: transcript }],
     });
     if (optimisticMessageId) onUserMessagePersisted(sessionId, optimisticMessageId, persistedMessage);
     await client.answerQuestion(question.questionId, {
       answer: questionToolAnswer(answers),
-      answerMessageId: persistedMessage.id,
+      answerMessageId,
       selectedOptions: answers.flatMap((item) => item.selectedOptions),
       answers,
     });
@@ -941,7 +943,6 @@ function ContextWindowRing({ stats }: { stats: ContextStats | undefined }) {
                 <span>{usedPercent}% used ({leftPercentLabel ?? "0"}% left)</span>
                 {used && total ? <span>{used} / {total} tokens used</span> : null}
                 {left ? <span className="berry-context-tooltip-label">{left} tokens remaining</span> : null}
-                <span>Retained task history; older detail becomes a checkpoint after compaction</span>
               </>
             ) : (
               <span className="berry-context-tooltip-label">Calculating context usage…</span>

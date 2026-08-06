@@ -14,9 +14,10 @@ import { ApiEventStreamService } from "./event-stream.service.ts";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { BudgetService, InMemoryBudgetHotCounters, InMemoryBudgetRepository } from "../budget/budget.service.ts";
 import { InMemoryModelGovernanceRepository, ModelGovernanceService } from "../model-governance/model-governance.service.ts";
-import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
+import { InMemoryUsageRepository, USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
+import { turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -24,6 +25,23 @@ describe("AgentApiController", () => {
   afterEach(async () => {
     await app?.close();
     app = null;
+  });
+
+  it("fingerprints the request payload independently from its operation key", () => {
+    const request = {
+      operationId: "00000000-0000-7000-8000-000000000001",
+      input: "Run the task",
+      workspacePath: "/workspace",
+      provider: { id: "provider" },
+    };
+    expect(turnAdmissionFingerprint(request)).toBe(turnAdmissionFingerprint({
+      ...request,
+      operationId: "00000000-0000-7000-8000-000000000002",
+    }));
+    expect(turnAdmissionFingerprint(request)).not.toBe(turnAdmissionFingerprint({
+      ...request,
+      input: "Run a different task",
+    }));
   });
 
   it("serves task, session, and message CRUD over HTTP", async () => {
@@ -256,6 +274,79 @@ describe("AgentApiController", () => {
       expect(body[0]).toMatchObject({ id: created.body.task.id, status: "completed" });
     });
   });
+
+  it("does not publish inline turn completion before usage and projections settle", async () => {
+    let releaseUsage!: () => void;
+    const usageGate = new Promise<void>((resolve) => { releaseUsage = resolve; });
+    const usageRepository = new InMemoryUsageRepository();
+    const originalIngest = usageRepository.ingestInternal.bind(usageRepository);
+    vi.spyOn(usageRepository, "ingestInternal").mockImplementation(async (...args) => {
+      await usageGate;
+      return originalIngest(...args);
+    });
+    const startTurn = vi.fn((options: StartTurnOptions) => {
+      options.onEvent({ kind: "turn.start", turnId: "turn_ordered" });
+      options.onEvent({ kind: "turn.end", turnId: "turn_ordered", status: "completed" });
+      return { turnId: "turn_ordered" };
+    });
+    app = await createApp(fakeSessionHost({ startTurn }), { usageRepository });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud" }).expect(201);
+    const observed: AgentStreamEvent[] = [];
+    const subscription = app.get(ApiEventStreamService)
+      .stream(created.body.session.id, [])
+      .subscribe((event) => observed.push(event.data));
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader()).send({
+      input: "run",
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+    }).expect(201);
+    await nextTick();
+    expect(observed).toContainEqual({ kind: "turn.start", turnId: "turn_ordered" });
+    expect(observed).not.toContainEqual(expect.objectContaining({ kind: "turn.end" }));
+
+    releaseUsage();
+    await nextTick();
+    await nextTick();
+    expect(observed).toContainEqual({ kind: "turn.end", turnId: "turn_ordered", status: "completed" });
+    subscription.unsubscribe();
+  });
+
+  it("publishes a failed terminal even when the fallback task-status write fails", async () => {
+    const taskStore = new InMemoryCloudTaskStore();
+    const updateTask = taskStore.updateTask.bind(taskStore);
+    vi.spyOn(taskStore, "updateTask").mockImplementation(async (taskId, input, ownerUserId) => {
+      if (input.status === "completed" || input.status === "failed") {
+        throw new Error("Task status persistence unavailable");
+      }
+      return updateTask(taskId, input, ownerUserId);
+    });
+    const startTurn = vi.fn((options: StartTurnOptions) => {
+      options.onEvent({ kind: "turn.start", turnId: "turn_fallback_terminal" });
+      options.onEvent({ kind: "turn.end", turnId: "turn_fallback_terminal", status: "completed" });
+      return { turnId: "turn_fallback_terminal" };
+    });
+    app = await createApp(fakeSessionHost({ startTurn }), { taskStore });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud" }).expect(201);
+    const observed: AgentStreamEvent[] = [];
+    const subscription = app.get(ApiEventStreamService)
+      .stream(created.body.session.id, [])
+      .subscribe((event) => observed.push(event.data));
+
+    await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader()).send({
+      input: "run",
+      workspacePath: "/workspace",
+      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none" },
+    }).expect(201);
+    await new Promise((resolve) => setTimeout(resolve, 1_400));
+
+    expect(observed).toContainEqual({
+      kind: "turn.end",
+      turnId: "turn_fallback_terminal",
+      status: "failed",
+    });
+    subscription.unsubscribe();
+  }, 5_000);
 
   it("continues a failed assistant turn without sending another user message", async () => {
     let attempt = 0;
@@ -906,7 +997,7 @@ describe("AgentApiController", () => {
   });
 });
 
-async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined; runtimeConfig?: CloudRuntimeConfigService | undefined; membershipActive?: boolean | undefined } = {}): Promise<INestApplication> {
+async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined; runtimeConfig?: CloudRuntimeConfigService | undefined; usageRepository?: UsageRepository | undefined; membershipActive?: boolean | undefined } = {}): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [
       CloudDatabaseModule.register({
@@ -921,6 +1012,7 @@ async function createApp(sessionHost: SessionHost, options: { budget?: BudgetSer
       auth: { useValue: fakeAuthRuntime(options.membershipActive ?? true) },
       ...(options.taskStore ? { taskStore: { useValue: options.taskStore } } : {}),
       ...(options.budget ? { budget: { service: { useValue: options.budget } } } : {}),
+      ...(options.usageRepository ? { usage: { repository: { useValue: options.usageRepository } } } : {}),
       ...(options.modelGovernance ? { modelGovernance: { service: { useValue: options.modelGovernance } } } : {}),
       }),
     ],

@@ -29,6 +29,28 @@ describe("ApiEventStreamService", () => {
     await module.close();
   });
 
+  it("drops a malformed durable cursor instead of polling from it forever", async () => {
+    const durable = {
+      eventsAfter: vi.fn(async () => []),
+    } as unknown as DurableTurnService;
+    const service = new ApiEventStreamService(durable);
+
+    const stream = await service.streamDurable(
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000002",
+      "not-a-cursor",
+    );
+
+    expect(stream).toBeDefined();
+    expect(durable.eventsAfter).toHaveBeenCalledWith(
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000002",
+      null,
+      500,
+      expect.any(Date),
+    );
+  });
+
   it("emits default SSE messages so EventSource.onmessage receives replayed and live events", () => {
     const service = new ApiEventStreamService();
     const received: Array<MessageEvent<unknown> & { id?: string }> = [];

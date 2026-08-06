@@ -44,6 +44,24 @@ export function questionToolAnswer(answers: ComposerQuestionAnswer[]): string {
   return answers.map((item) => `${item.question}: ${item.skipped ? "Skipped" : item.answer}`).join("\n");
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export async function stableQuestionAnswerMessageId(questionId: string): Promise<string> {
+  if (UUID_PATTERN.test(questionId)) return questionId;
+  const compact = questionId.match(/(?:^|_)([0-9a-f]{32})$/i)?.[1];
+  if (compact) {
+    return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+  }
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`berry-question-answer:${questionId}`),
+  ));
+  digest[6] = (digest[6]! & 0x0f) | 0x80;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = Array.from(digest.slice(0, 16), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function ComposerQuestionOverlay({
   question,
   onSubmit,

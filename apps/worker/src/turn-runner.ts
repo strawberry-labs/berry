@@ -444,7 +444,22 @@ export class DurableTurnRunner {
         `Model request failed after ${step.attempt} attempts.`,
       );
     }
-    if (this.options.compactor && shouldCompactSnapshot(snapshot, this.options)) {
+    const [extensionTools, additionalUserContent] = await this.withHeartbeat(snapshot, async () => Promise.all([
+      this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
+      this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
+    ]));
+    const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
+    const activeContextTokens = estimateActiveContextTokensForDecision(
+      snapshot,
+      definitions,
+      additionalUserContent,
+    );
+    if (this.options.compactor && shouldCompactSnapshot(snapshot, this.options, activeContextTokens)) {
+      if (completedCompactionForCurrentTail(snapshot)) {
+        throw new DurableTurnTerminalError(
+          `Context remains above the safe model limit after compaction (${activeContextTokens} estimated tokens).`,
+        );
+      }
       await this.commitAndWake(snapshot, {
         expectedState: "calling_model",
         nextState: "compacting",
@@ -466,7 +481,7 @@ export class DurableTurnRunner {
     }
     const budget = await this.repository.reserveNextModelCall?.(
       snapshot,
-      estimateNextModelCallCost(snapshot).toString(),
+      estimateNextModelCallCost(snapshot, activeContextTokens).toString(),
     );
     if (budget && !budget.allowed) {
       await this.finishForBudget(snapshot, budget.reason ?? "Your spend limit has been reached.");
@@ -491,11 +506,6 @@ export class DurableTurnRunner {
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
     const result = await this.withHeartbeat(snapshot, async () => {
-      const [extensionTools, additionalUserContent] = await Promise.all([
-        this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
-        this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
-      ]);
-      const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
       const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
       try {
         return await this.model.call(snapshot, step, {
@@ -517,6 +527,13 @@ export class DurableTurnRunner {
       this.options.leaseSeconds ?? 90,
     ));
     if (freshCancelled) throw new DurableTurnRetryableError("Turn lease was lost after the model request");
+
+    const duplicateToolCallId = firstDuplicateToolCallId(result.toolCalls);
+    if (duplicateToolCallId) {
+      throw new DurableTurnTerminalError(
+        `The provider returned duplicate tool-call id ${duplicateToolCallId}.`,
+      );
+    }
 
     const messageEvents: AgentStreamEvent[] = [
       { kind: "message.end", messageId },
@@ -1385,7 +1402,14 @@ export class SqlDurableTurnRepository implements DurableTurnRepository {
         [snapshot.tenantId, requestId],
       );
       const reservation = reservations[0];
-      if (!reservation || reservation.status !== "reserved") return { allowed: true, reason: null };
+      if (!reservation) {
+        return snapshot.runtimeRequest.budgetReservationRequired === true
+          ? { allowed: false, reason: "The budget reservation for this turn is missing." }
+          : { allowed: true, reason: null };
+      }
+      if (reservation.status !== "reserved") {
+        return { allowed: false, reason: "The budget reservation for this turn is no longer active." };
+      }
       const target = safeBigInt(snapshot.usageTotals.costMicros) + safeBigInt(estimatedCostMicros);
       const reserved = safeBigInt(reservation.reserved_micros);
       const additional = target - reserved;
@@ -1395,12 +1419,13 @@ export class SqlDurableTurnRepository implements DurableTurnRepository {
         ...(reservation.department_id ? [{ type: "department", id: reservation.department_id }] : []),
         ...(reservation.user_id ? [{ type: "user", id: reservation.user_id }] : []),
       ];
-      for (const scope of [...scopes].sort((left, right) => `${left.type}:${left.id}`.localeCompare(`${right.type}:${right.id}`))) {
-        await executor.query(
-          "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
-          [`berry-budget:${snapshot.tenantId}:${scope.type}:${scope.id}`],
-        );
-      }
+      // API admission uses the same tenant lock. Sharing one lock namespace
+      // prevents admission and reservation extension from both observing the
+      // same remaining organization balance.
+      await executor.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+        [`berry-budget:${snapshot.tenantId}`],
+      );
       const settings = (await executor.query<AllowanceCycleGuardRow>(
         "SELECT timezone,anchor_day FROM allowance_cycle_settings WHERE tenant_id=$1::uuid LIMIT 1",
         [snapshot.tenantId],
@@ -1541,7 +1566,8 @@ WITH RECURSIVE leaf AS (
 SELECT checkpoint,covered_entry_end
 FROM session_checkpoints
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
-  AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+  AND schema_version=2
+  AND split_part(validation_status, ':', 1) IN ('valid','repaired','fallback')
   AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM active_entries))
 ORDER BY created_at DESC,id DESC
 LIMIT 1
@@ -1979,7 +2005,7 @@ export class SnapshotProviderDurableTurnModel implements DurableTurnModel {
         },
       ).call(snapshot, step, context);
     }
-    return callProviderStream(provider, apiKey, snapshot, context);
+    return callProviderStream(provider, apiKey, snapshot, step, context);
   }
 }
 
@@ -1987,6 +2013,7 @@ async function callProviderStream(
   provider: DurableProviderTransport,
   apiKey: string | undefined,
   snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
   context: DurableModelCallContext,
 ): Promise<TurnModelResult> {
   const selectedModel = stringValue(snapshot.runtimeRequest.model) ?? provider.defaultModel;
@@ -2017,6 +2044,7 @@ async function callProviderStream(
     sessionId: snapshot.sessionId,
     temperature: 0,
     maxTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
+    metadata: { "Idempotency-Key": step.idempotencyKey ?? `${snapshot.id}:model:${step.sequence}` },
     ...(effort ? { reasoning: effort } : {}),
   });
   for await (const event of stream) {
@@ -2259,9 +2287,12 @@ function usageCostMicros(
   return BigInt(Math.max(0, micros));
 }
 
-function estimateNextModelCallCost(snapshot: DurableTurnSnapshot): bigint {
+function estimateNextModelCallCost(
+  snapshot: DurableTurnSnapshot,
+  estimatedInputTokens = estimateActiveContextTokens(snapshot),
+): bigint {
   return usageCostMicros({
-    inputTokens: estimateActiveContextTokens(snapshot),
+    inputTokens: estimatedInputTokens,
     outputTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
   }, snapshot.runtimeRequest.modelPricing);
 }
@@ -2281,15 +2312,57 @@ function safeBigInt(value: unknown): bigint {
 function shouldCompactSnapshot(
   snapshot: DurableTurnSnapshot,
   options: { contextWindowTokens?: number },
+  estimatedTokens = estimateActiveContextTokens(snapshot),
 ): boolean {
   const contextWindow = numberValue(snapshot.runtimeRequest.contextWindowTokens)
     ?? options.contextWindowTokens
     ?? 128_000;
   return shouldCompact(
-    estimateActiveContextTokens(snapshot),
+    estimatedTokens,
     contextWindow,
     DEFAULT_COMPACTION_SETTINGS,
   );
+}
+
+function completedCompactionForCurrentTail(snapshot: DurableTurnSnapshot): DurableTurnStep | null {
+  const tailEntryId = snapshot.entries.at(-1)?.entryId ?? "empty";
+  const idempotencyKey = `${snapshot.id}:compact:${tailEntryId}`;
+  return [...snapshot.steps].reverse().find((step) =>
+    step.type === "session.compact"
+    && step.state === "completed"
+    && step.idempotencyKey === idempotencyKey
+  ) ?? null;
+}
+
+function estimateActiveContextTokensForDecision(
+  snapshot: DurableTurnSnapshot,
+  tools: readonly ChatToolDefinition[] = [],
+  additionalUserContent: readonly ChatContentPart[] = [],
+): number {
+  const serializedRequestTokens = Math.ceil((
+    JSON.stringify(modelMessages(snapshot, additionalUserContent).messages).length
+    + JSON.stringify(tools).length
+  ) / 4);
+  const completedCompaction = completedCompactionForCurrentTail(snapshot);
+  const output = record(completedCompaction?.output);
+  const tokensAfter = nonnegativeNumber(output?.tokensAfter);
+  if (tokensAfter !== null) return Math.max(tokensAfter, serializedRequestTokens);
+  if (output?.noOp === true) {
+    return Math.max(
+      nonnegativeNumber(output.tokensBefore) ?? 0,
+      serializedRequestTokens,
+    );
+  }
+  return Math.max(estimateActiveContextTokens(snapshot), serializedRequestTokens);
+}
+
+function firstDuplicateToolCallId(toolCalls: readonly TurnModelToolIntent[]): string | null {
+  const seen = new Set<string>();
+  for (const call of toolCalls) {
+    if (seen.has(call.id)) return call.id;
+    seen.add(call.id);
+  }
+  return null;
 }
 
 function estimateUncompactedTokens(snapshot: DurableTurnSnapshot): number {
@@ -2453,9 +2526,16 @@ function durableToolPolicy(name: string, permissionMode: string): {
   ) {
     return { retryClass: "read_only", requiresApproval: false, approvalKind: "file-edit" };
   }
-  if (name === "write_file" || name === "edit_file" || name === "apply_patch") {
+  if (name === "write_file") {
     return {
       retryClass: "idempotent",
+      requiresApproval: !["auto-edit", "full-access"].includes(permissionMode),
+      approvalKind: "file-edit",
+    };
+  }
+  if (name === "edit_file" || name === "apply_patch") {
+    return {
+      retryClass: "non_idempotent_manual",
       requiresApproval: !["auto-edit", "full-access"].includes(permissionMode),
       approvalKind: "file-edit",
     };

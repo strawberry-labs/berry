@@ -173,7 +173,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {
@@ -192,6 +192,13 @@ describe("cloud postgres schema", () => {
     expect(migration?.sql).toContain("turn_runs_terminal_sandbox_cleanup_idx");
     expect(migration?.sql).toContain("sandbox_id IS NOT NULL");
     expect(migration?.sql).toContain("'pause_requested'");
+  });
+
+  it("makes durable turn admission idempotent per tenant request", () => {
+    const migration = cloudMigrations.find((candidate) => candidate.id === 42);
+    expect(migration).toMatchObject({ id: 42, name: "turn_run_admission_idempotency_v1" });
+    expect(migration?.sql).toContain("ADD COLUMN IF NOT EXISTS request_id");
+    expect(migration?.sql).toContain("turn_runs_tenant_request_unique");
   });
 
   it("adds canonical files, associations, multipart uploads, and derivatives behind tenant RLS", () => {

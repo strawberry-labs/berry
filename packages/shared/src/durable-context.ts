@@ -500,6 +500,8 @@ export type DurableImageGenerationCapability = z.infer<typeof DurableImageGenera
 export const DurableTurnRuntimeRequestSchema = z.object({
   capabilityVersion: z.literal(1),
   requestId: z.string().min(1).optional(),
+  admissionFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  budgetReservationRequired: z.boolean().default(false),
   input: z.string().default(""),
   providerId: z.string().min(1),
   provider: DurableProviderTransportSchema,

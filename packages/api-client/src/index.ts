@@ -276,6 +276,8 @@ export interface UpdateTaskRequest {
 }
 
 interface StartTurnRequestBase {
+  /** Stable key for retrying this exact turn admission without duplicating work or spend. */
+  operationId?: string | undefined;
   workspacePath: string;
   workspaceId?: string | undefined;
   permissionMode?: PermissionMode | undefined;

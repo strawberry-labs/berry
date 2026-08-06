@@ -10,8 +10,106 @@ const runId = "00000000-0000-7000-8000-000000000005";
 const questionId = "00000000-0000-7000-8000-000000000006";
 const stepId = "00000000-0000-7000-8000-000000000007";
 const workspaceId = "00000000-0000-7000-8000-000000000008";
+const operationFingerprint = "a".repeat(64);
 
 describe("DurableTurnService", () => {
+  it("returns the original run for a retried admission without writing another run", async () => {
+    const executions: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { executions.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("WHERE tenant_id=$1::uuid AND request_id=$2")) {
+          return [{
+            id: runId,
+            user_id: userId,
+            workspace_id: workspaceId,
+            task_id: taskId,
+            session_id: sessionId,
+            runtime_request: { admissionFingerprint: operationFingerprint },
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "model_operation_1",
+      operationFingerprint,
+      budgetReservationRequired: false,
+      requestMessageId: userId,
+      input: "Do the work",
+      runtimeRequest: {},
+      groundingContext: {},
+    })).resolves.toEqual({ runId, sessionId });
+
+    expect(executions).not.toContainEqual(expect.stringContaining("INSERT INTO turn_runs"));
+  });
+
+  it("rejects a reused operation key when the request fingerprint changes", async () => {
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => sql.includes("FROM turn_runs")
+        ? [{
+            id: runId,
+            user_id: userId,
+            workspace_id: workspaceId,
+            task_id: taskId,
+            session_id: sessionId,
+            runtime_request: { admissionFingerprint: operationFingerprint },
+          }] as T[]
+        : [],
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.replayAdmission({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "model_operation_1",
+      operationFingerprint: "b".repeat(64),
+    })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("does not admit a new run after its budget reservation was settled", async () => {
+    const executions: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { executions.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("FROM budget_reservations")) return [{ status: "reconciled" }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "model_settled_operation",
+      operationFingerprint,
+      budgetReservationRequired: true,
+      input: "Do the work",
+      runtimeRequest: {},
+      groundingContext: {},
+    })).rejects.toMatchObject({ status: 409 });
+
+    expect(executions).not.toContainEqual(expect.stringContaining("INSERT INTO turn_runs"));
+  });
+
   it("reports context from the durable journal, including trailing and in-flight text", async () => {
     const executor: SqlExecutor = {
       execute: async () => undefined,
@@ -160,6 +258,8 @@ describe("DurableTurnService", () => {
       taskId,
       sessionId,
       requestId: "request_exact",
+      operationFingerprint,
+      budgetReservationRequired: false,
       requestMessageId: userId,
       input: "Visible prompt\n\nUser instructions:\nUse terse replies.",
       runtimeRequest: {},
@@ -189,6 +289,8 @@ describe("DurableTurnService", () => {
       taskId,
       sessionId,
       requestId: "request_atomic_message",
+      operationFingerprint,
+      budgetReservationRequired: false,
       requestMessageId: userId,
       input: "Create this message atomically.",
       runtimeRequest: {},
@@ -225,6 +327,8 @@ describe("DurableTurnService", () => {
       taskId,
       sessionId,
       requestId: "request_edit",
+      operationFingerprint,
+      budgetReservationRequired: false,
       requestMessageId: replacementId,
       replaceFromMessageId: userId,
       input: "Edited prompt",
@@ -263,6 +367,8 @@ describe("DurableTurnService", () => {
       taskId,
       sessionId,
       requestId: "request_stale_edit",
+      operationFingerprint,
+      budgetReservationRequired: false,
       requestMessageId: "00000000-0000-7000-8000-000000000009",
       replaceFromMessageId: userId,
       input: "Edited prompt",
@@ -417,6 +523,8 @@ describe("DurableTurnService", () => {
       taskId,
       sessionId,
       requestId: "request_backfill",
+      operationFingerprint,
+      budgetReservationRequired: false,
       requestMessageId: userId,
       input: "Current message",
       runtimeRequest: {},
@@ -484,6 +592,33 @@ describe("DurableTurnService", () => {
     expect(queries.find(({ sql }) => sql.includes("sequence >= $3"))?.params[2]).toBe(10);
   });
 
+  it("resets a future or unknown event cursor to the latest run", async () => {
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params = []) => {
+        queries.push({ sql, params });
+        return [{
+          run_id: runId,
+          sequence: 1,
+          payload: { kind: "turn.start", turnId: runId },
+          created_at: "2026-08-05T13:42:15.000Z",
+        }] as T[];
+      },
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+    const unknownRunId = "00000000-0000-7000-8000-000000000099";
+
+    const events = await service.eventsAfter(tenantId, sessionId, `${unknownRunId}:999`, 500);
+
+    expect(events).toEqual([expect.objectContaining({ id: `${runId}:1`, runId, sequence: 1 })]);
+    expect(queries[0]?.sql).toContain("valid_cursor");
+    expect(queries[0]?.sql).toContain("fallback_run");
+    expect(queries[0]?.sql).toContain("WHEN r.state IN ('completed','failed','cancelled','recovery_required')");
+    expect(queries[0]?.sql).toContain("THEN COALESCE(MAX(e.sequence),0)");
+    expect(queries[0]?.params).toEqual([tenantId, sessionId, unknownRunId, 999, 500]);
+  });
+
   it("admits a turn using one PostgreSQL command per prepared statement", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
@@ -506,6 +641,8 @@ describe("DurableTurnService", () => {
       taskId,
       sessionId,
       requestId: "request_1",
+      operationFingerprint,
+      budgetReservationRequired: false,
       input: "Remember that my name is Chirag.",
       runtimeRequest: {},
       groundingContext: {},
@@ -537,7 +674,6 @@ describe("DurableTurnService", () => {
             created_at: "2026-07-28T00:00:00.000Z",
           }] as T[];
         }
-        if (sql.includes("m.id=$4::uuid AND m.role='user'")) return [{ id: userId }] as T[];
         if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 1 }] as T[];
         if (sql.includes("COUNT(*) FILTER")) return [{ sequence: 2, iteration: 2 }] as T[];
         if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 4 }] as T[];
@@ -554,6 +690,10 @@ describe("DurableTurnService", () => {
 
     const outboxInsert = executions.find((call) => call.sql.includes("'turn.resume'"));
     expect(outboxInsert).toBeDefined();
+    expect(executions).toContainEqual(expect.objectContaining({
+      sql: expect.stringContaining("INSERT INTO messages"),
+      params: [userId, tenantId, sessionId, taskId],
+    }));
     expect(JSON.parse(String(outboxInsert?.params[3]))).toEqual({
       tenantId,
       runId,
@@ -561,13 +701,58 @@ describe("DurableTurnService", () => {
     });
   });
 
+  it("treats an identical answered question as a successful replay", async () => {
+    const updates: string[] = [];
+    const storedAnswer = {
+      selectedOptions: ["Staging"],
+      answerMessageId: null,
+      answers: [{ skipped: false, selectedOptions: ["Staging"], answer: "Staging", question: "Which environment?" }],
+      answer: "Staging",
+    };
+    const executor: SqlExecutor = {
+      execute: async (sql) => { updates.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_questions q")) {
+          return [{
+            id: questionId,
+            run_id: runId,
+            session_id: sessionId,
+            step_id: stepId,
+            tool_call_id: null,
+            question: "Which environment?",
+            status: "answered",
+            answer: storedAnswer,
+            run_state: "waiting",
+            task_id: taskId,
+            created_at: "2026-07-28T00:00:00.000Z",
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+    const replay = {
+      answer: "Staging",
+      selectedOptions: ["Staging"],
+      answers: [{ question: "Which environment?", answer: "Staging", selectedOptions: ["Staging"] }],
+    };
+
+    await expect(service.answerQuestion(tenantId, userId, questionId, replay)).resolves.toBe(true);
+    await expect(service.answerQuestion(tenantId, userId, questionId, {
+      ...replay,
+      answers: [{ question: "Which environment?", answer: "Production", selectedOptions: ["Production"] }],
+    })).resolves.toBe(false);
+    expect(updates.some((sql) => sql.includes("UPDATE turn_questions"))).toBe(false);
+  });
+
   it("atomically cancels an active run and projects its partial assistant output", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
       execute: async (sql, params = []) => { executions.push({ sql, params }); },
       query: async <T>(sql: string) => {
-        if (sql.includes("SELECT id,task_id,request_message_id")) {
-          return [{ id: runId, task_id: taskId, request_message_id: userId }] as T[];
+        if (sql.includes("SELECT id,task_id,session_id,request_message_id")) {
+          return [{ id: runId, task_id: taskId, session_id: sessionId, request_message_id: userId }] as T[];
         }
         if (sql.includes("FROM turn_events") && sql.includes("ORDER BY sequence ASC")) {
           return [
@@ -592,6 +777,35 @@ describe("DurableTurnService", () => {
     expect(executions.some(({ params }) =>
       params.some((value) => typeof value === "string" && value.includes('"kind":"turn.end"'))
     )).toBe(true);
+  });
+
+  it("cancels active durable work and soft-deletes the task in one transaction", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    let transactionCount = 0;
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT id FROM tasks")) return [{ id: taskId }] as T[];
+        if (sql.includes("SELECT id,task_id,session_id,request_message_id")) {
+          return [{ id: runId, task_id: taskId, session_id: sessionId, request_message_id: userId }] as T[];
+        }
+        if (sql.includes("FROM turn_events") && sql.includes("ORDER BY sequence ASC")) return [] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 1 }] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 1 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => {
+        transactionCount += 1;
+        return callback(executor);
+      },
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.deleteTask(tenantId, userId, taskId)).resolves.toBe(true);
+
+    expect(transactionCount).toBe(1);
+    expect(executions.some(({ sql }) => sql.startsWith("UPDATE turn_runs") && sql.includes("state='cancelled'"))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("SET deleted_at=COALESCE(deleted_at,now())"))).toBe(true);
   });
 
   it("continues model execution after an operator marks an ambiguous tool call complete", async () => {

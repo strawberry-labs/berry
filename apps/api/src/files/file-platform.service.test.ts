@@ -108,6 +108,134 @@ describe("FilePlatformService.initiateUpload", () => {
 });
 
 describe("FilePlatformService.completeUpload", () => {
+  it("reconciles PostgreSQL when S3 already completed the multipart upload", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const fileId = "00000000-0000-7000-8000-000000000204";
+    const uploadId = "00000000-0000-7000-8000-000000000205";
+    const fileRow = {
+      id: fileId,
+      owner_user_id: USER_ID,
+      original_name: "notes.txt",
+      display_name: "notes.txt",
+      media_type: "text/plain",
+      detected_media_type: null,
+      size_bytes: 12,
+      sha256: null,
+      bucket: "berry-test",
+      object_key: "artifacts/notes.txt",
+      etag: "etag",
+      origin: "user_upload",
+      status: "available",
+      created_at: new Date(),
+      updated_at: new Date(),
+      task_ids: [],
+      roles: [],
+    };
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT f.*")) return [fileRow] as T[];
+        if (sql.includes("SELECT u.*")) return [{
+          id: uploadId,
+          file_id: fileId,
+          provider_upload_id: "consumed-provider-upload",
+          part_size: 5 * 1024 * 1024,
+          part_count: 1,
+          status: "uploading",
+          expires_at: new Date(Date.now() + 60_000),
+          object_key: "artifacts/notes.txt",
+          declared_size_bytes: 12,
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const client = {
+      send: vi.fn(async (command: object) => {
+        if (command.constructor.name === "CompleteMultipartUploadCommand") throw new Error("NoSuchUpload");
+        if (command.constructor.name === "HeadObjectCommand") return { ContentLength: 12, ETag: "etag" };
+        throw new Error(`Unexpected S3 command: ${command.constructor.name}`);
+      }),
+    };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024,
+      maxIndexableBytes: 512,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+
+    await expect(service.completeUpload(TENANT_ID, USER_ID, fileId, uploadId, [{ PartNumber: 1, ETag: "etag" }]))
+      .resolves.toMatchObject({ id: fileId });
+
+    expect(executions.some((call) => call.sql.includes("UPDATE file_uploads SET status = 'completed'"))).toBe(true);
+    expect(executions.some((call) => call.sql.includes("UPDATE files SET status = $6"))).toBe(true);
+  });
+
+  it("returns the completed file when the completion response is retried", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000204";
+    const uploadId = "00000000-0000-7000-8000-000000000205";
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT u.*")) return [{
+          id: uploadId,
+          file_id: fileId,
+          provider_upload_id: "consumed-provider-upload",
+          part_size: 5 * 1024 * 1024,
+          part_count: 1,
+          status: "completed",
+          expires_at: new Date(Date.now() - 60_000),
+          object_key: "artifacts/notes.txt",
+          declared_size_bytes: 12,
+        }] as T[];
+        if (sql.includes("SELECT f.*")) return [{
+          id: fileId,
+          owner_user_id: USER_ID,
+          original_name: "notes.txt",
+          display_name: "notes.txt",
+          media_type: "text/plain",
+          detected_media_type: null,
+          size_bytes: 12,
+          sha256: null,
+          bucket: "berry-test",
+          object_key: "artifacts/notes.txt",
+          etag: "etag",
+          origin: "user_upload",
+          status: "available",
+          created_at: new Date(),
+          updated_at: new Date(),
+          task_ids: [],
+          roles: [],
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const client = { send: vi.fn() };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024,
+      maxIndexableBytes: 512,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+
+    await expect(service.completeUpload(TENANT_ID, USER_ID, fileId, uploadId, []))
+      .resolves.toMatchObject({ id: fileId, status: "available" });
+    expect(client.send).not.toHaveBeenCalled();
+  });
+
   it("rejects and removes an object whose actual size differs from the declared upload", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {

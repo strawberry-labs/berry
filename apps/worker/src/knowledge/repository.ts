@@ -351,7 +351,8 @@ export class SqlKnowledgeRepository {
       const [checkpoint] = await executor.query<{ checkpoint: unknown }>(`
         SELECT checkpoint FROM session_checkpoints
         WHERE tenant_id = $1::uuid AND session_id = $2::uuid
-          AND kind = 'rolling' AND validation_status = 'valid'
+          AND kind = 'rolling'
+          AND split_part(validation_status, ':', 1) IN ('valid','repaired','fallback')
         ORDER BY created_at DESC LIMIT 1
       `, [input.tenantId, input.sessionId]);
       const text = buildTaskOutcomeText({

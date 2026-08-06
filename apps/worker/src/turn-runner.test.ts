@@ -229,6 +229,119 @@ describe("durable turn runner", () => {
     expect(modelCalls).toBe(1);
   });
 
+  it("uses a reduced post-compaction estimate instead of compacting the retained tail forever", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 20_000;
+    current.entries.push({
+      entryId: "entry-assistant-retained",
+      parentEntryId: "entry-user",
+      entryType: "message",
+      sequence: 2,
+      payload: {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: "Retained response",
+          usage: { input: 18_000, output: 1_000, totalTokens: 19_000 },
+        },
+      },
+    });
+    const repository = new FakeTurnRepository(current);
+    let compactions = 0;
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "Continued.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), {
+      owner: "worker-compact-no-op",
+      compactor: {
+        compactSession: async () => {
+          compactions += 1;
+          return {
+            sessionId: repository.current.sessionId,
+            summary: "The retained tail is already compacted.",
+            tokensBefore: 19_000,
+            tokensAfter: 2_000,
+            noOp: true,
+          };
+        },
+      },
+    });
+
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("calling_model");
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
+    expect(compactions).toBe(1);
+    expect(modelCalls).toBe(1);
+  });
+
+  it("fails clearly when the retained tail remains too large after compaction", async () => {
+    const compactStep: DurableTurnStep = {
+      id: randomUUID(),
+      sequence: 2,
+      type: "session.compact",
+      state: "completed",
+      input: {},
+      output: { noOp: true, tokensBefore: 19_000, tokensAfter: 19_000 },
+      retryClass: "idempotent_with_key",
+      idempotencyKey: `${runId}:compact:entry-user`,
+      attempt: 1,
+      error: null,
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1), compactStep]);
+    current.runtimeRequest.contextWindowTokens = 20_000;
+    const repository = new FakeTurnRepository(current);
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "", inputTokens: 0, outputTokens: 0, toolCalls: [] };
+      },
+    }, noTools(), {
+      owner: "worker-compact-still-large",
+      compactor: { compactSession: async () => ({ sessionId: current.sessionId, summary: "", tokensBefore: 0 }) },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(modelCalls).toBe(0);
+    expect(repository.current.error).toContain("Context remains above the safe model limit after compaction");
+  });
+
+  it("includes unchanged grounding content in the post-compaction limit check", async () => {
+    const compactStep: DurableTurnStep = {
+      id: randomUUID(),
+      sequence: 2,
+      type: "session.compact",
+      state: "completed",
+      input: {},
+      output: { tokensBefore: 30_000, tokensAfter: 500 },
+      retryClass: "idempotent_with_key",
+      idempotencyKey: `${runId}:compact:entry-user`,
+      attempt: 1,
+      error: null,
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1), compactStep]);
+    current.runtimeRequest.contextWindowTokens = 20_000;
+    current.groundingContext = { document: "x".repeat(100_000) };
+    const repository = new FakeTurnRepository(current);
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "", inputTokens: 0, outputTokens: 0, toolCalls: [] };
+      },
+    }, noTools(), {
+      owner: "worker-compact-large-grounding",
+      compactor: { compactSession: async () => ({ sessionId: current.sessionId, summary: "", tokensBefore: 0 }) },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(modelCalls).toBe(0);
+    expect(repository.current.error).toContain("Context remains above the safe model limit after compaction");
+  });
+
   it("persists model deltas before the model call completes", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
     const runner = new DurableTurnRunner(repository, {
@@ -305,12 +418,18 @@ describe("durable turn runner", () => {
     ]));
     let composePolicy: unknown;
     let imagePolicy: unknown;
+    let writePolicy: unknown;
+    let editPolicy: unknown;
+    let patchPolicy: unknown;
     let toolNames: string[] = [];
     const runner = new DurableTurnRunner(repository, {
       call: async (_snapshot, _step, context) => {
         toolNames = context.tools.map((tool) => tool.function.name);
         composePolicy = context.policyForTool("compose_message");
         imagePolicy = context.policyForTool("create_image");
+        writePolicy = context.policyForTool("write_file");
+        editPolicy = context.policyForTool("edit_file");
+        patchPolicy = context.policyForTool("apply_patch");
         return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), { owner: "worker-compose-definition" });
@@ -328,6 +447,47 @@ describe("durable turn runner", () => {
       requiresApproval: false,
       approvalKind: "file-edit",
     });
+    expect(writePolicy).toEqual({
+      retryClass: "idempotent",
+      requiresApproval: true,
+      approvalKind: "file-edit",
+    });
+    expect(editPolicy).toEqual({
+      retryClass: "non_idempotent_manual",
+      requiresApproval: true,
+      approvalKind: "file-edit",
+    });
+    expect(patchPolicy).toEqual({
+      retryClass: "non_idempotent_manual",
+      requiresApproval: true,
+      approvalKind: "file-edit",
+    });
+  });
+
+  it("rejects duplicate provider tool-call ids before executing either tool", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    let toolCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({
+        text: "",
+        inputTokens: 1,
+        outputTokens: 1,
+        toolCalls: [
+          { id: "duplicate-call", name: "read_file", input: { path: "a" }, retryClass: "read_only", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" },
+          { id: "duplicate-call", name: "read_file", input: { path: "b" }, retryClass: "read_only", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" },
+        ],
+      }),
+    }, {
+      execute: async () => {
+        toolCalls += 1;
+        return { output: {}, summary: "" };
+      },
+    }, { owner: "worker-duplicate-tool-id" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(toolCalls).toBe(0);
+    expect(repository.current.error).toContain("duplicate tool-call id");
+    expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
   });
 
   it("persists requested question batches and emits the popup event before waiting", async () => {
@@ -820,6 +980,82 @@ describe("durable turn runner", () => {
       .toContain("ON CONFLICT DO NOTHING");
     expect(statements.some((sql) => sql.startsWith("UPDATE turn_steps"))).toBe(false);
     expect(statements.some((sql) => sql.startsWith("UPDATE turn_runs"))).toBe(true);
+  });
+
+  it("prices the complete serialized model request before extending the reservation", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.modelPricing = { input: 1, output: 0 };
+    current.runtimeRequest.maxTokens = 1;
+    current.groundingContext = { document: "x".repeat(40_000) };
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({ text: "done", inputTokens: 1, outputTokens: 1, toolCalls: [] }),
+    }, noTools(), { owner: "worker-complete-budget-estimate" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+
+    expect(BigInt(repository.lastBudgetEstimate)).toBeGreaterThan(9_000n);
+  });
+
+  it("serializes reservation extensions with API admission at the tenant level", async () => {
+    const advisoryLocks: unknown[][] = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string, params = []) => {
+        if (sql.includes("FROM budget_reservations")) {
+          return [{
+            id: randomUUID(),
+            user_id: "00000000-0000-7000-8000-000000000003",
+            department_id: null,
+            reserved_micros: "0",
+            status: "reserved",
+          }] as T[];
+        }
+        if (sql.includes("pg_advisory_xact_lock")) {
+          advisoryLocks.push([...params]);
+          return [] as T[];
+        }
+        if (sql.includes("allowance_cycle_settings")) return [] as T[];
+        if (sql.includes("FROM budget_limits")) return [] as T[];
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async () => undefined,
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.requestId = "model_operation";
+
+    await expect(new SqlDurableTurnRepository(executor).reserveNextModelCall(current, "100"))
+      .resolves.toEqual({ allowed: true, reason: null });
+
+    expect(advisoryLocks).toEqual([[`berry-budget:${tenantId}`]]);
+  });
+
+  it("fails closed when a durable run references a settled budget reservation", async () => {
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM budget_reservations")) {
+          return [{
+            id: randomUUID(),
+            user_id: "00000000-0000-7000-8000-000000000003",
+            department_id: null,
+            reserved_micros: "100",
+            status: "reconciled",
+          }] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async () => undefined,
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.requestId = "model_settled_operation";
+    current.runtimeRequest.budgetReservationRequired = true;
+
+    await expect(new SqlDurableTurnRepository(executor).reserveNextModelCall(current, "100"))
+      .resolves.toEqual({
+        allowed: false,
+        reason: "The budget reservation for this turn is no longer active.",
+      });
   });
 });
 

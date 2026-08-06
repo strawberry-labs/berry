@@ -6,7 +6,7 @@ import type {
 import type { SqlExecutor } from "./sql-repositories.js";
 
 const BackfillPhaseSchema = z.enum(["workspace_files", "file_sources", "task_outcomes"]);
-const CleanupPhaseSchema = z.enum(["expired_memory", "turn_events", "retrieval_snapshots", "knowledge_tombstones", "runtime_outbox"]);
+const CleanupPhaseSchema = z.enum(["expired_memory", "turn_events", "retrieval_snapshots", "knowledge_tombstones", "orphan_budget_reservations", "runtime_outbox"]);
 const BackfillCursorSchema = z.object({
   phase: BackfillPhaseSchema.default("workspace_files"),
   lastId: z.string().uuid().nullable().default(null),
@@ -428,6 +428,54 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
         )
         RETURNING source.id
       `, [payload.tenantId, payload.diagnosticRetentionDays, payload.batchSize]);
+    } else if (phase === "orphan_budget_reservations") {
+      rows = await executor.query<{ id: string }>(`
+        WITH candidates AS (
+          SELECT reservation.id
+          FROM budget_reservations reservation
+          WHERE reservation.tenant_id = $1::uuid
+            AND reservation.status = 'reserved'
+            AND reservation.feature = 'model'
+            AND reservation.request_id LIKE 'model_%'
+            AND reservation.created_at < now() - interval '15 minutes'
+            AND NOT EXISTS (
+              SELECT 1 FROM turn_runs run
+              WHERE run.tenant_id = reservation.tenant_id
+                AND run.request_id = reservation.request_id
+            )
+          ORDER BY reservation.created_at ASC, reservation.id ASC
+          FOR UPDATE SKIP LOCKED
+          LIMIT $2
+        ), released AS (
+          UPDATE budget_reservations reservation
+          SET status = 'released', actual_cost_micros = 0, updated_at = now()
+          FROM candidates
+          WHERE reservation.tenant_id = $1::uuid AND reservation.id = candidates.id
+          RETURNING reservation.*
+        ), scopes AS (
+          SELECT released.id AS reservation_id, released.request_id,
+                 scope.scope_type, scope.scope_id, -released.reserved_micros AS amount_micros
+          FROM released
+          CROSS JOIN LATERAL (
+            VALUES
+              ('org'::text, released.tenant_id::text),
+              ('department'::text, released.department_id::text),
+              ('user'::text, released.user_id::text)
+          ) AS scope(scope_type, scope_id)
+          WHERE scope.scope_id IS NOT NULL
+        ), ledger AS (
+          INSERT INTO credit_ledger_entries (
+            tenant_id, scope_type, scope_id, reservation_id, request_id,
+            kind, amount_micros, metadata
+          )
+          SELECT $1::uuid, scope_type, scope_id, reservation_id, request_id,
+                 'release', amount_micros, '{"reason":"orphan_admission_timeout"}'::jsonb
+          FROM scopes
+          ON CONFLICT (tenant_id, request_id, scope_type, scope_id, kind) DO NOTHING
+          RETURNING reservation_id
+        )
+        SELECT DISTINCT reservation_id AS id FROM ledger
+      `, [payload.tenantId, payload.batchSize]);
     } else {
       rows = await executor.query<{ id: string }>(`
         DELETE FROM runtime_outbox outbox
@@ -528,6 +576,7 @@ function nextCleanupPhase(phase: z.infer<typeof CleanupPhaseSchema>): z.infer<ty
   if (phase === "expired_memory") return "turn_events";
   if (phase === "turn_events") return "retrieval_snapshots";
   if (phase === "retrieval_snapshots") return "knowledge_tombstones";
-  if (phase === "knowledge_tombstones") return "runtime_outbox";
+  if (phase === "knowledge_tombstones") return "orphan_budget_reservations";
+  if (phase === "orphan_budget_reservations") return "runtime_outbox";
   return null;
 }

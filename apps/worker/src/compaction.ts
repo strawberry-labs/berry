@@ -314,8 +314,8 @@ SELECT s.id, s.task_id, s.model_provider_id, s.model,
 FROM sessions s
 LEFT JOIN model_governance_policies selected
   ON selected.tenant_id = s.tenant_id
- AND selected.provider_id = COALESCE(s.model_provider_id, $4)
- AND selected.model = COALESCE(s.model, $5)
+ AND selected.provider_id = $4
+ AND selected.model = $5
 WHERE s.tenant_id = $1::uuid AND s.id = $2::uuid AND s.task_id = $3::uuid
       `.trim(),
       [input.tenantId, input.sessionId, input.taskId, selection.provider, selection.model],
@@ -830,7 +830,7 @@ function checkpointInsertParams(
     checkpoint.coveredEntryStart,
     checkpoint.coveredEntryEnd,
     JSON.stringify(checkpoint),
-    kind === "rolling" && input.rebased ? `${input.validationStatus}:rebased` : input.validationStatus,
+    input.validationStatus,
     input.provider,
     input.model,
     checkpoint.promptManifestHash,

@@ -22,6 +22,8 @@ export interface DurableTurnAdmission {
   taskId: string;
   sessionId: string;
   requestId: string;
+  operationFingerprint: string;
+  budgetReservationRequired: boolean;
   requestMessageId?: string;
   replaceFromMessageId?: string;
   input: string;
@@ -31,6 +33,16 @@ export interface DurableTurnAdmission {
   runtimeRequest: Record<string, unknown>;
   groundingContext: JsonValue;
   promptManifest?: JsonValue;
+}
+
+export interface DurableTurnAdmissionReplay {
+  tenantId: string;
+  userId: string;
+  workspaceId: string;
+  taskId: string;
+  sessionId: string;
+  requestId: string;
+  operationFingerprint: string;
 }
 
 export interface DurableEventEnvelope {
@@ -46,12 +58,29 @@ export interface DurableContextStats {
   source: "estimated" | "provider-reported";
 }
 
+type AdmissionReplayRow = {
+  id: string;
+  user_id: string;
+  workspace_id: string;
+  task_id: string;
+  session_id: string;
+  runtime_request: unknown;
+};
+
 @Injectable()
 export class DurableTurnService {
   constructor(
     @Inject(CloudDatabaseService) private readonly database: CloudDatabaseService,
     @Inject(DURABLE_TURN_RUNNER_ENABLED) readonly enabled: boolean,
   ) {}
+
+  async replayAdmission(input: DurableTurnAdmissionReplay): Promise<{ runId: string; sessionId: string } | null> {
+    if (!this.enabled) return null;
+    return this.database.withTenant(input.tenantId, async (executor) => {
+      const retried = await loadAdmissionReplay(executor, input.tenantId, input.requestId);
+      return retried ? validateAdmissionReplay(retried, input) : null;
+    });
+  }
 
   async admit(input: DurableTurnAdmission): Promise<{ runId: string; sessionId: string }> {
     if (!this.enabled) throw new Error("Durable turn runner is disabled");
@@ -71,6 +100,8 @@ FOR UPDATE OF s,t
         [input.tenantId, input.userId, input.sessionId, input.taskId, input.workspaceId],
       );
       if (!owned[0]) throw new Error("Session is not authorized for durable execution");
+      const retried = await loadAdmissionReplay(executor, input.tenantId, input.requestId);
+      if (retried) return validateAdmissionReplay(retried, input);
       const existing = await executor.query<{ id: string; request_message_id: string | null }>(
         `
 SELECT id,request_message_id FROM turn_runs
@@ -86,6 +117,20 @@ LIMIT 1
           return { runId: existing[0].id, sessionId: input.sessionId };
         }
         throw new ConflictException("This session already has an active turn");
+      }
+
+      if (input.budgetReservationRequired) {
+        const reservations = await executor.query<{ status: string }>(
+          `
+SELECT status FROM budget_reservations
+WHERE tenant_id=$1::uuid AND request_id=$2
+FOR UPDATE
+          `.trim(),
+          [input.tenantId, input.requestId],
+        );
+        if (reservations[0]?.status !== "reserved") {
+          throw new ConflictException("The budget reservation for this turn is no longer active; submit a new operation key");
+        }
       }
 
       if (!input.continueInterruptedTurn && input.replaceFromMessageId) {
@@ -104,11 +149,11 @@ LIMIT 1
       await executor.execute(
         `
 INSERT INTO turn_runs (
-  id,tenant_id,user_id,workspace_id,task_id,session_id,request_message_id,
+  id,tenant_id,user_id,workspace_id,task_id,session_id,request_id,request_message_id,
   state,next_action,runtime_request,grounding_context,prompt_manifest
 ) VALUES (
-  $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7::uuid,
-  'queued','Assemble durable context',$8::jsonb,$9::jsonb,$10::jsonb
+  $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8::uuid,
+  'queued','Assemble durable context',$9::jsonb,$10::jsonb,$11::jsonb
 )
         `.trim(),
         [
@@ -118,8 +163,15 @@ INSERT INTO turn_runs (
           input.workspaceId,
           input.taskId,
           input.sessionId,
+          input.requestId,
           requestMessageId,
-          JSON.stringify({ ...input.runtimeRequest, requestId: input.requestId, input: input.input }),
+          JSON.stringify({
+            ...input.runtimeRequest,
+            requestId: input.requestId,
+            admissionFingerprint: input.operationFingerprint,
+            budgetReservationRequired: input.budgetReservationRequired,
+            input: input.input,
+          }),
           JSON.stringify(input.groundingContext),
           JSON.stringify(input.promptManifest ?? {}),
         ],
@@ -317,7 +369,8 @@ WITH RECURSIVE leaf AS (
   SELECT covered_entry_end
   FROM session_checkpoints
   WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
-    AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+    AND schema_version=2
+    AND split_part(validation_status, ':', 1) IN ('valid','repaired','fallback')
     AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM ancestry))
   ORDER BY created_at DESC,id DESC
   LIMIT 1
@@ -376,7 +429,8 @@ WITH RECURSIVE leaf AS (
 SELECT checkpoint,covered_entry_end
 FROM session_checkpoints
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND kind='rolling'
-  AND schema_version=2 AND validation_status IN ('valid','repaired','fallback')
+  AND schema_version=2
+  AND split_part(validation_status, ':', 1) IN ('valid','repaired','fallback')
   AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM ancestry))
 ORDER BY created_at DESC,id DESC
 LIMIT 1
@@ -482,21 +536,49 @@ LIMIT 1
         parsed
           ? `
 WITH cursor_run AS (
-  SELECT id,created_at FROM turn_runs
-  WHERE tenant_id=$1::uuid AND id=$3::uuid AND session_id=$2::uuid
+  SELECT r.id,r.created_at,$4::bigint AS cursor_sequence,
+         COALESCE(MAX(e.sequence),0) AS max_sequence
+  FROM turn_runs r
+  LEFT JOIN turn_events e ON e.tenant_id=r.tenant_id AND e.run_id=r.id
+  WHERE r.tenant_id=$1::uuid AND r.id=$3::uuid AND r.session_id=$2::uuid
+  GROUP BY r.id,r.created_at
+), valid_cursor AS (
+  SELECT id,created_at,cursor_sequence
+  FROM cursor_run
+  WHERE cursor_sequence <= max_sequence
+), fallback_run AS (
+  SELECT r.id,r.created_at,
+         CASE
+           WHEN r.state IN ('completed','failed','cancelled','recovery_required')
+             THEN COALESCE(MAX(e.sequence),0)
+           ELSE 0
+         END AS cursor_sequence
+  FROM turn_runs r
+  LEFT JOIN turn_events e ON e.tenant_id=r.tenant_id AND e.run_id=r.id
+  WHERE r.tenant_id=$1::uuid AND r.session_id=$2::uuid
+  GROUP BY r.id,r.created_at,r.state
+  ORDER BY r.created_at DESC,r.id DESC
+  LIMIT 1
+), effective_cursor AS (
+  SELECT * FROM valid_cursor
+  UNION ALL
+  SELECT * FROM fallback_run WHERE NOT EXISTS (SELECT 1 FROM valid_cursor)
 )
 SELECT e.run_id,e.sequence,e.payload,e.created_at
 FROM turn_events e
 JOIN turn_runs r ON r.tenant_id=e.tenant_id AND r.id=e.run_id
 WHERE e.tenant_id=$1::uuid AND e.session_id=$2::uuid
-  AND EXISTS (SELECT 1 FROM cursor_run)
+  AND EXISTS (SELECT 1 FROM effective_cursor)
   AND (
-    r.created_at > (SELECT created_at FROM cursor_run)
+    r.created_at > (SELECT created_at FROM effective_cursor)
     OR (
-      r.created_at = (SELECT created_at FROM cursor_run)
-      AND r.id > (SELECT id FROM cursor_run)
+      r.created_at = (SELECT created_at FROM effective_cursor)
+      AND r.id > (SELECT id FROM effective_cursor)
     )
-    OR (e.run_id=$3::uuid AND e.sequence>$4)
+    OR (
+      e.run_id=(SELECT id FROM effective_cursor)
+      AND e.sequence>(SELECT cursor_sequence FROM effective_cursor)
+    )
   )
 ORDER BY r.created_at ASC,r.id ASC,e.sequence ASC
 LIMIT $5
@@ -552,10 +634,11 @@ LIMIT $3
         const rows = await transaction.query<{
           id: string;
           task_id: string;
+          session_id: string;
           request_message_id: string | null;
         }>(
           `
-SELECT id,task_id,request_message_id
+SELECT id,task_id,session_id,request_message_id
 FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
   AND state NOT IN ('completed','failed','cancelled','recovery_required')
@@ -567,80 +650,53 @@ FOR UPDATE
         );
         const active = rows[0];
         if (!active) return false;
-        await projectInterruptedTools(transaction, tenantId, sessionId, active.task_id, active.id);
-        await projectTerminalAssistant(transaction, tenantId, sessionId, active.task_id, active.id, "cancelled");
-        await transaction.execute(
+        await cancelActiveDurableRun(transaction, tenantId, active);
+        return true;
+      };
+      // CloudDatabaseService.withTenant already owns the transaction boundary.
+      return run(executor);
+    });
+  }
+
+  async deleteTask(tenantId: string, userId: string, taskId: string): Promise<boolean> {
+    if (!this.enabled) return false;
+    return this.database.withTenant(tenantId, async (executor) => {
+      const run = async (transaction: SqlExecutor): Promise<boolean> => {
+        const tasks = await transaction.query<{ id: string }>(
           `
-UPDATE turn_steps
-SET state='cancelled',completed_at=now(),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid
-  AND state IN ('pending','running','waiting')
+SELECT id FROM tasks
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND user_id=$3::uuid
+FOR UPDATE
           `.trim(),
-          [tenantId, active.id],
+          [tenantId, taskId, userId],
         );
-        await transaction.execute(
+        if (!tasks[0]) return false;
+        const activeRuns = await transaction.query<{
+          id: string;
+          task_id: string;
+          session_id: string;
+          request_message_id: string | null;
+        }>(
           `
-UPDATE tool_calls
-SET status='cancelled',completed_at=now(),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid
-  AND status IN ('pending','waiting-for-approval','running')
+SELECT id,task_id,session_id,request_message_id
+FROM turn_runs
+WHERE tenant_id=$1::uuid AND task_id=$2::uuid
+  AND state NOT IN ('completed','failed','cancelled','recovery_required')
+ORDER BY created_at ASC
+FOR UPDATE
           `.trim(),
-          [tenantId, active.id],
+          [tenantId, taskId],
         );
+        for (const active of activeRuns) {
+          await cancelActiveDurableRun(transaction, tenantId, active);
+        }
         await transaction.execute(
-          "UPDATE approvals SET status='expired',decided_at=now() WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
-          [tenantId, active.id],
-        );
-        await transaction.execute(
-          "UPDATE turn_questions SET status='cancelled' WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
-          [tenantId, active.id],
-        );
-        await appendDurableEvents(transaction, tenantId, active.id, sessionId, [
-          { kind: "turn.end", turnId: active.id, status: "cancelled" },
-        ]);
-        await transaction.execute(
-          `
-UPDATE turn_runs
-SET state='cancelled',cancelled_at=now(),completed_at=now(),
-    lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
-    version=version+1,updated_at=now()
-WHERE tenant_id=$1::uuid AND id=$2::uuid
-          `.trim(),
-          [tenantId, active.id],
-        );
-        await transaction.execute(
-          `
-UPDATE runtime_outbox
-SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND completed_at IS NULL
-          `.trim(),
-          [tenantId, active.id],
-        );
-        await transaction.execute(
-          "UPDATE tasks SET status='cancelled',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
-          [tenantId, active.task_id],
-        );
-        await reconcileTerminalUsage(transaction, tenantId, active.id, "cancelled");
-        await transaction.execute(
-          `
-UPDATE sessions
-SET runtime_metadata=runtime_metadata || jsonb_build_object(
-      'activeRunId',$2::text,
-      'lastRunState','cancelled',
-      'leafId',COALESCE((
-        SELECT entry_id FROM session_entries
-        WHERE tenant_id=$1::uuid AND session_id=$3::uuid AND is_leaf_marker=true
-        ORDER BY sequence DESC LIMIT 1
-      ),runtime_metadata->>'leafId')
-    ),
-    updated_at=now()
-WHERE tenant_id=$1::uuid AND id=$3::uuid
-          `.trim(),
-          [tenantId, active.id, sessionId],
+          "UPDATE tasks SET deleted_at=COALESCE(deleted_at,now()),updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+          [tenantId, taskId],
         );
         return true;
       };
-      return executor.transaction ? executor.transaction(run) : run(executor);
+      return run(executor);
     });
   }
 
@@ -795,12 +851,13 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
           tool_call_id: string | null;
           question: string;
           status: string;
+          answer: unknown;
           run_state: string;
           task_id: string;
           created_at: Date | string;
         }>(
           `
-SELECT q.id,q.run_id,q.session_id,q.step_id,q.tool_call_id,q.question,q.status,
+SELECT q.id,q.run_id,q.session_id,q.step_id,q.tool_call_id,q.question,q.status,q.answer,
        q.created_at,r.state AS run_state,r.task_id
 FROM turn_questions q
 JOIN turn_runs r ON r.tenant_id=q.tenant_id AND r.id=q.run_id
@@ -811,11 +868,10 @@ FOR UPDATE OF q,r
           [tenantId, questionId, userId],
         );
         const question = rows[0];
-        if (!question || question.status !== "pending" || question.run_state !== "waiting" || !question.step_id) {
-          return false;
-        }
+        if (!question) return false;
         const normalizedAnswer = {
           answer: answer.answer,
+          answerMessageId: answer.answerMessageId ?? null,
           selectedOptions: [...(answer.selectedOptions ?? [])],
           ...(answer.answers ? {
             answers: answer.answers.map((item) => ({
@@ -826,6 +882,13 @@ FOR UPDATE OF q,r
             })),
           } : {}),
         };
+        if (question.status === "answered") {
+          const priorAnswer = recordValue(question.answer);
+          return jsonValuesEqual(priorAnswer, normalizedAnswer);
+        }
+        if (question.status !== "pending" || question.run_state !== "waiting" || !question.step_id) {
+          return false;
+        }
         const responseText = answer.answers?.length
           ? answer.answers
               .map((item) => `${item.question}: ${item.skipped ? "Skipped" : item.answer}`)
@@ -861,10 +924,7 @@ LIMIT 1
             ? [tenantId, question.session_id, question.task_id, answer.answerMessageId]
             : [tenantId, question.session_id, iso(question.created_at)],
         );
-        if (answer.answerMessageId && !messageRows[0]) {
-          throw new Error("The submitted question answer message does not belong to this session");
-        }
-        const answerMessageId = messageRows[0]?.id ?? randomUUID();
+        const answerMessageId = messageRows[0]?.id ?? answer.answerMessageId ?? randomUUID();
         if (!messageRows[0]) {
           await transaction.execute(
             `
@@ -1328,6 +1388,118 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       return true;
     });
   }
+}
+
+async function loadAdmissionReplay(
+  executor: SqlExecutor,
+  tenantId: string,
+  requestId: string,
+): Promise<AdmissionReplayRow | null> {
+  const rows = await executor.query<AdmissionReplayRow>(
+    `
+SELECT id,user_id,workspace_id,task_id,session_id,runtime_request
+FROM turn_runs
+WHERE tenant_id=$1::uuid AND request_id=$2
+LIMIT 1
+    `.trim(),
+    [tenantId, requestId],
+  );
+  return rows[0] ?? null;
+}
+
+function validateAdmissionReplay(
+  replayed: AdmissionReplayRow,
+  input: DurableTurnAdmissionReplay,
+): { runId: string; sessionId: string } {
+  const runtimeRequest = recordValue(replayed.runtime_request);
+  if (
+    replayed.user_id !== input.userId
+    || replayed.workspace_id !== input.workspaceId
+    || replayed.task_id !== input.taskId
+    || replayed.session_id !== input.sessionId
+    || stringValue(runtimeRequest?.admissionFingerprint) !== input.operationFingerprint
+  ) {
+    throw new ConflictException("This turn operation key belongs to a different request");
+  }
+  return { runId: replayed.id, sessionId: input.sessionId };
+}
+
+async function cancelActiveDurableRun(
+  transaction: SqlExecutor,
+  tenantId: string,
+  active: { id: string; task_id: string; session_id: string; request_message_id: string | null },
+): Promise<void> {
+  await projectInterruptedTools(transaction, tenantId, active.session_id, active.task_id, active.id);
+  await projectTerminalAssistant(transaction, tenantId, active.session_id, active.task_id, active.id, "cancelled");
+  await transaction.execute(
+    `
+UPDATE turn_steps
+SET state='cancelled',completed_at=now(),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND state IN ('pending','running','waiting')
+    `.trim(),
+    [tenantId, active.id],
+  );
+  await transaction.execute(
+    `
+UPDATE tool_calls
+SET status='cancelled',completed_at=now(),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND status IN ('pending','waiting-for-approval','running')
+    `.trim(),
+    [tenantId, active.id],
+  );
+  await transaction.execute(
+    "UPDATE approvals SET status='expired',decided_at=now() WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
+    [tenantId, active.id],
+  );
+  await transaction.execute(
+    "UPDATE turn_questions SET status='cancelled' WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
+    [tenantId, active.id],
+  );
+  await appendDurableEvents(transaction, tenantId, active.id, active.session_id, [
+    { kind: "turn.end", turnId: active.id, status: "cancelled" },
+  ]);
+  await transaction.execute(
+    `
+UPDATE turn_runs
+SET state='cancelled',cancelled_at=now(),completed_at=now(),
+    lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
+    version=version+1,updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+    `.trim(),
+    [tenantId, active.id],
+  );
+  await transaction.execute(
+    `
+UPDATE runtime_outbox
+SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND completed_at IS NULL
+    `.trim(),
+    [tenantId, active.id],
+  );
+  await transaction.execute(
+    "UPDATE tasks SET status='cancelled',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+    [tenantId, active.task_id],
+  );
+  await reconcileTerminalUsage(transaction, tenantId, active.id, "cancelled");
+  await transaction.execute(
+    `
+UPDATE sessions
+SET runtime_metadata=runtime_metadata || jsonb_build_object(
+      'activeRunId',$2::text,
+      'lastRunState','cancelled',
+      'leafId',COALESCE((
+        SELECT entry_id FROM session_entries
+        WHERE tenant_id=$1::uuid AND session_id=$3::uuid AND is_leaf_marker=true
+        ORDER BY sequence DESC LIMIT 1
+      ),runtime_metadata->>'leafId')
+    ),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$3::uuid
+    `.trim(),
+    [tenantId, active.id, active.session_id],
+  );
 }
 
 export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentStreamEvent[] {
@@ -2046,6 +2218,26 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => jsonValuesEqual(value, right[index]));
+  }
+  const leftRecord = recordValue(left);
+  const rightRecord = recordValue(right);
+  if (!leftRecord || !rightRecord) return false;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) =>
+      key === rightKeys[index]
+      && jsonValuesEqual(leftRecord[key], rightRecord[key])
+    );
 }
 
 function stringValue(value: unknown): string | null {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { SessionCheckpointV2 } from "@berry/shared";
 import {
   DurableSessionCompactor,
+  SqlSessionCompactionRepository,
   type CheckpointGenerator,
   type CompactionSessionState,
   type SessionCompactionRepository,
@@ -16,6 +17,33 @@ const job: CompactionJobPayload = {
 };
 
 describe("durable session compactor", () => {
+  it("checks governance against the compaction provider and model actually selected", async () => {
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const repository = new SqlSessionCompactionRepository({
+      execute: async () => undefined,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("FROM sessions s")) {
+          return [{ id: job.sessionId, task_id: job.taskId, model_provider_id: "chat-provider", model: "chat-model", model_allowed: true }] as T[];
+        }
+        return [] as T[];
+      },
+    });
+
+    await repository.load(job, { provider: "compaction-provider", model: "compaction-model" });
+
+    const governance = queries.find((query) => query.sql.includes("model_governance_policies selected"));
+    expect(governance?.sql).toContain("selected.provider_id = $4");
+    expect(governance?.sql).toContain("selected.model = $5");
+    expect(governance?.params).toEqual([
+      job.tenantId,
+      job.sessionId,
+      job.taskId,
+      "compaction-provider",
+      "compaction-model",
+    ]);
+  });
+
   it("persists one immutable segment and no-ops when the same leaf is delivered again", async () => {
     let persistCalls = 0;
     let generatorCalls = 0;

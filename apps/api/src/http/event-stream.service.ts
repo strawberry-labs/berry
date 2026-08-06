@@ -1,7 +1,7 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { AgentStreamEventSchema, HostPushEventSchema, type AgentStreamEvent, type HostPushEvent, type Task } from "@berry/shared";
 import { Observable, Subject } from "rxjs";
-import { DurableTurnService } from "../runtime/durable-turn.service.js";
+import { DurableTurnService, parseEventCursor } from "../runtime/durable-turn.service.js";
 
 export const DURABLE_EVENT_POLL_MS = 150;
 
@@ -43,12 +43,13 @@ export class ApiEventStreamService {
     // A no-cursor connection is opened before POST /turns so it cannot use an
     // old terminal event as its replay boundary. Keep polling from the
     // connection timestamp until the newly admitted run emits its first event.
-    const connectedAt = cursor ? undefined : new Date();
-    let initial = await durableTurns.eventsAfter(tenantId, sessionId, cursor, 500, connectedAt);
+    const normalizedCursor = parseEventCursor(cursor) ? cursor : null;
+    const connectedAt = normalizedCursor ? undefined : new Date();
+    let initial = await durableTurns.eventsAfter(tenantId, sessionId, normalizedCursor, 500, connectedAt);
     return new Observable((subscriber) => {
       let closed = false;
       let polling = false;
-      let lastCursor = cursor ?? null;
+      let lastCursor = normalizedCursor;
       const seen = new Set<string>();
       const seenOrder: string[] = [];
       const emit = (envelope: typeof initial[number]) => {

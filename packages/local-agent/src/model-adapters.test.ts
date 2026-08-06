@@ -2,6 +2,7 @@ import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
   AnthropicMessagesAdapter,
+  BerryModelAdapter,
   contextToAnthropicMessages,
   contextToResponsesInput,
   createBerryModel,
@@ -33,10 +34,13 @@ const anthropicProvider = {
   authType: "x-api-key" as const,
 };
 
-function fakeClient(events: Array<Record<string, unknown>>, capture?: { body?: Record<string, unknown> }) {
+function fakeClient(events: Array<Record<string, unknown>>, capture?: { body?: Record<string, unknown>; metadata?: Record<string, string> }) {
   return {
-    async *streamEvents(body: Record<string, unknown>): AsyncGenerator<Record<string, unknown>> {
-      if (capture) capture.body = body;
+    async *streamEvents(body: Record<string, unknown>, _signal?: AbortSignal, metadata?: Record<string, string>): AsyncGenerator<Record<string, unknown>> {
+      if (capture) {
+        capture.body = body;
+        if (metadata) capture.metadata = metadata;
+      }
       for (const event of events) yield event;
     },
   };
@@ -49,6 +53,21 @@ async function collect(stream: ReturnType<OpenAIResponsesAdapter["stream"]>): Pr
 }
 
 describe("OpenAIResponsesAdapter", () => {
+  it("forwards only the durable provider idempotency header", async () => {
+    const capture: { body?: Record<string, unknown>; metadata?: Record<string, string> } = {};
+    const adapter = new OpenAIResponsesAdapter({
+      client: fakeClient([{ type: "response.completed", response: {} }], capture),
+    });
+
+    await collect(adapter.stream(
+      createBerryModel(responsesProvider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      { metadata: { "Idempotency-Key": "durable-step", internal: "not-a-header" } },
+    ));
+
+    expect(capture.metadata).toEqual({ "Idempotency-Key": "durable-step" });
+  });
+
   it("sends declared OpenAI cache controls and omits them when unsupported", async () => {
     const supportedCapture: { body?: Record<string, unknown> } = {};
     const supportedProvider = {
@@ -205,6 +224,33 @@ describe("OpenAIResponsesAdapter", () => {
     const last = events.at(-1);
     if (last?.type !== "error") throw new Error("expected error event");
     expect(last.error.errorMessage).not.toContain("sk-secret-123");
+  });
+});
+
+describe("BerryModelAdapter", () => {
+  it("passes the durable idempotency key into Chat Completions transport options", async () => {
+    let metadata: Record<string, string> | undefined;
+    const adapter = new BerryModelAdapter({
+      client: {
+        async *stream(options: import("@berry/router-client").ChatCompletionOptions) {
+          metadata = options.metadata;
+          yield { id: "chat-1", model: "chat-test", delta: "ok", finishReason: "stop", raw: {} };
+        },
+      },
+    });
+    const provider = {
+      ...responsesProvider,
+      apiType: "openai-chat-completions" as const,
+      defaultModel: "chat-test",
+    };
+
+    await collect(adapter.stream(
+      createBerryModel(provider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      { metadata: { "Idempotency-Key": "chat-durable-step" } },
+    ));
+
+    expect(metadata).toEqual({ "Idempotency-Key": "chat-durable-step" });
   });
 });
 

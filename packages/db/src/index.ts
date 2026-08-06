@@ -750,6 +750,7 @@ export const turnRuns = pgTable("turn_runs", {
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
   taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
   sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  requestId: text("request_id").notNull(),
   requestMessageId: uuid("request_message_id").references(() => messages.id, { onDelete: "set null" }),
   state: text("state").notNull().default("queued"),
   attempt: integer("attempt").notNull().default(0),
@@ -774,6 +775,7 @@ export const turnRuns = pgTable("turn_runs", {
 }, (table) => [
   index("turn_runs_claim_idx").on(table.tenantId, table.state, table.leaseExpiresAt),
   index("turn_runs_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  uniqueIndex("turn_runs_tenant_request_unique").on(table.tenantId, table.requestId),
   index("turn_runs_terminal_sandbox_cleanup_idx")
     .on(table.tenantId, table.updatedAt)
     .where(sql`${table.state} IN ('completed','failed','cancelled','recovery_required')
@@ -3912,6 +3914,16 @@ CREATE INDEX IF NOT EXISTS turn_runs_terminal_sandbox_cleanup_idx ON turn_runs (
     AND COALESCE(sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested');
 `.trim();
 
+export const TURN_RUN_ADMISSION_IDEMPOTENCY_MIGRATION = `
+ALTER TABLE turn_runs ADD COLUMN IF NOT EXISTS request_id text;
+UPDATE turn_runs
+SET request_id = COALESCE(NULLIF(runtime_request->>'requestId',''), 'legacy_' || id::text)
+WHERE request_id IS NULL;
+ALTER TABLE turn_runs ALTER COLUMN request_id SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS turn_runs_tenant_request_unique
+  ON turn_runs (tenant_id, request_id);
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -4012,4 +4024,5 @@ export const cloudMigrations = [
   { id: 39, name: "organization_ai_access_rules_v1", sql: ORGANIZATION_AI_ACCESS_RULES_MIGRATION },
   { id: 40, name: "allowance_base_hierarchy_v1", sql: ALLOWANCE_BASE_HIERARCHY_MIGRATION },
   { id: 41, name: "terminal_sandbox_cleanup_index_v1", sql: TERMINAL_SANDBOX_CLEANUP_INDEX_MIGRATION },
+  { id: 42, name: "turn_run_admission_idempotency_v1", sql: TURN_RUN_ADMISSION_IDEMPOTENCY_MIGRATION },
 ] as const;

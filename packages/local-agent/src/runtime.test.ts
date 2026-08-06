@@ -210,6 +210,31 @@ function turnCollector(): TurnHarness {
 }
 
 describe("BerryAgentRuntime", () => {
+  it("reserves a session synchronously before asynchronous setup", async () => {
+    const { db, workspace } = setup();
+    const workspaceRow = db.workspaces().open(workspace, "ws", true);
+    const { task, session } = db.tasks().create(workspaceRow.id, "Single-flight task", "ask");
+    const collector = turnCollector();
+    const runtime = new BerryAgentRuntime({ db });
+    const options = {
+      sessionId: session.id,
+      taskId: task.id,
+      workspacePath: workspace,
+      input: "run once",
+      permissionMode: "ask" as const,
+      provider,
+      streamFn: textStreamFn("One turn only."),
+      onEvent: collector.onEvent,
+    };
+
+    runtime.startTurn(options);
+    expect(() => runtime.startTurn(options)).toThrow("already running a turn");
+
+    await collector.done;
+    await runtime.dispose();
+    db.close();
+  });
+
   it("runs turns through an injected cloud sandbox provider and disposes the session", async () => {
     const { db, workspace } = setup();
     const workspaceRow = db.workspaces().open(workspace, "ws", true);

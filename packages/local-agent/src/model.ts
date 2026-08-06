@@ -75,6 +75,14 @@ export interface PromptCacheAdapterConfig {
   provider: BerryModelProviderInfo;
 }
 
+function providerHeaderMetadata(metadata: Record<string, unknown> | undefined): Record<string, string> | undefined {
+  if (!metadata) return undefined;
+  const idempotencyKey = metadata["Idempotency-Key"] ?? metadata["idempotency-key"];
+  return typeof idempotencyKey === "string" && idempotencyKey.length > 0
+    ? { "Idempotency-Key": idempotencyKey }
+    : undefined;
+}
+
 function promptCacheCapability(config: PromptCacheAdapterConfig | undefined, modelId: string): PromptCachingCapabilities {
   if (!config) return resolvePromptCachingCapabilities(undefined, undefined);
   const metadata = config.provider.models?.find((candidate) => candidate.id === modelId);
@@ -513,6 +521,8 @@ export class BerryModelAdapter {
       if (options?.temperature !== undefined) request.temperature = options.temperature;
       if (options?.maxTokens !== undefined) request.maxTokens = options.maxTokens;
       if (options?.signal) request.signal = options.signal;
+      const metadata = providerHeaderMetadata(options?.metadata);
+      if (metadata) request.metadata = metadata;
       if (options?.reasoning && model.reasoning) request.reasoningEffort = reasoningEffort(options.reasoning);
       if (promptCache.cacheKey) request.promptCacheKey = promptCache.cacheKey;
       if (promptCache.retention !== "none") request.promptCacheRetention = promptCache.retention;
@@ -715,7 +725,11 @@ export function contextToResponsesTools(context: Context): Array<Record<string, 
 }
 
 interface ResponsesStreamClient {
-  streamEvents(body: Record<string, unknown>, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>>;
+  streamEvents(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    metadata?: Record<string, string>,
+  ): AsyncGenerator<Record<string, unknown>>;
 }
 
 /**
@@ -793,7 +807,7 @@ export class OpenAIResponsesAdapter {
       if (options?.maxTokens !== undefined) body.max_output_tokens = options.maxTokens;
       if (options?.reasoning && model.reasoning) body.reasoning = { effort: reasoningEffort(options.reasoning) };
 
-      for await (const event of this.#client.streamEvents(body, options?.signal)) {
+      for await (const event of this.#client.streamEvents(body, options?.signal, providerHeaderMetadata(options?.metadata))) {
         if (options?.signal?.aborted) throw new Error("aborted");
         const routerMetadata = event[BERRY_ROUTER_METADATA_KEY] as BerryRouterStreamMetadata | undefined;
         applyRouterAttribution(message, routerMetadata?.attribution);
@@ -1045,7 +1059,11 @@ function anthropicThinkingBudget(value: NonNullable<SimpleStreamOptions["reasoni
 const ANTHROPIC_DEFAULT_MAX_TOKENS = 16_384;
 
 interface AnthropicStreamClient {
-  streamEvents(body: Record<string, unknown>, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>>;
+  streamEvents(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    metadata?: Record<string, string>,
+  ): AsyncGenerator<Record<string, unknown>>;
 }
 
 /**
@@ -1121,7 +1139,7 @@ export class AnthropicMessagesAdapter {
         body.thinking = { type: "enabled", budget_tokens: budget };
       }
 
-      for await (const event of this.#client.streamEvents(body, options?.signal)) {
+      for await (const event of this.#client.streamEvents(body, options?.signal, providerHeaderMetadata(options?.metadata))) {
         if (options?.signal?.aborted) throw new Error("aborted");
         const type = typeof event.type === "string" ? event.type : "";
         if (type === "message_start") {

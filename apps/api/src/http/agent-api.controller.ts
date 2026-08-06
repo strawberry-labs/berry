@@ -1,5 +1,5 @@
-import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Inject, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
-import { randomUUID } from "node:crypto";
+import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Inject, NotFoundException, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
+import { createHash, randomUUID } from "node:crypto";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import {
   AgentStreamEventSchema,
@@ -133,7 +133,22 @@ function interruptedAssistantParts(events: AgentStreamEvent[]): Array<{ kind: "t
   return parts;
 }
 
+async function retryInlineFinalization(write: () => Promise<void>): Promise<void> {
+  let lastError: unknown;
+  for (const delayMs of [0, 250, 1_000]) {
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    try {
+      await write();
+      return;
+    } catch (cause) {
+      lastError = cause;
+    }
+  }
+  throw lastError;
+}
+
 const StartTurnRequestSchema = z.object({
+  operationId: z.string().uuid().optional(),
   input: z.string().min(1).optional(),
   messageInput: z.string().min(1).optional(),
   requestMessageId: z.string().uuid().optional(),
@@ -173,6 +188,24 @@ const StartTurnRequestSchema = z.object({
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["input"], message: "A new turn requires user input" });
   }
 });
+
+function canonicalTurnOperation(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalTurnOperation).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalTurnOperation(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+export function turnAdmissionFingerprint(request: z.infer<typeof StartTurnRequestSchema>): string {
+  const { operationId: _operationId, ...operation } = request;
+  return createHash("sha256").update(canonicalTurnOperation(operation)).digest("hex");
+}
 
 const SteerTurnRequestSchema = z.object({
   messageId: z.string().uuid(),
@@ -241,12 +274,16 @@ export class AgentApiController {
     return membership?.primaryDepartmentId ?? membership?.departmentIds[0] ?? null;
   }
 
-  #queueProjectionWrite(sessionId: string, write: () => Promise<unknown>): void {
+  #queueProjectionWrite(
+    sessionId: string,
+    write: () => Promise<unknown>,
+    onFailure?: (cause: unknown) => Promise<unknown>,
+  ): void {
     const previous = this.#projectionWrites.get(sessionId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
       .then(write)
-      .then(() => undefined, () => undefined)
+      .then(() => undefined, (cause) => onFailure?.(cause).then(() => undefined, () => undefined))
       .finally(() => {
         if (this.#projectionWrites.get(sessionId) === next) this.#projectionWrites.delete(sessionId);
       });
@@ -425,12 +462,10 @@ export class AgentApiController {
       // Reconcile legacy/stale rows instead of leaving the sidebar on
       // "Working" forever after a restart.
       if (Date.parse(task.updatedAt) >= this.#startedAt) return task;
-      const messages = await this.store.listMessages(task.activeSessionId);
-      const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
-      const status = lastAssistant && !lastAssistant.parts.some((part) => part.kind === "error")
-        ? "completed"
-        : "failed";
-      return this.store.updateTask(task.id, { status }, httpRequest.auth?.user.id ?? null);
+      // An API restart discards the in-memory terminal receipt. Persisted
+      // assistant content alone cannot prove that accounting and projections
+      // finished, so never infer success from a partial transcript.
+      return this.store.updateTask(task.id, { status: "failed" }, httpRequest.auth?.user.id ?? null);
     }));
   }
 
@@ -557,7 +592,20 @@ export class AgentApiController {
 
   @Delete("/tasks/:taskId")
   async deleteTask(@Req() httpRequest: AuthenticatedRequest, @Param("taskId") taskId: string) {
-    const task = await this.store.deleteTask(taskId, httpRequest.auth?.user.id ?? null);
+    const userId = httpRequest.auth?.user.id ?? null;
+    const current = await this.store.getTask(taskId, userId);
+    let task;
+    if (this.durableTurns.enabled && userId) {
+      const deleted = await this.durableTurns.deleteTask(tenantIdFromRequest(httpRequest), userId, taskId);
+      if (!deleted) throw new NotFoundException(`Task not found: ${taskId}`);
+      task = await this.store.getTask(taskId, userId);
+    } else {
+      if (current.activeSessionId && this.sessionHost.turnState(current.activeSessionId).active) {
+        await this.sessionHost.cancel(current.activeSessionId);
+      }
+      if (current.activeSessionId) await this.#projectionWrites.get(current.activeSessionId);
+      task = await this.store.deleteTask(taskId, userId);
+    }
     this.events.publishTask(task);
     return task;
   }
@@ -647,15 +695,28 @@ export class AgentApiController {
   async startTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(StartTurnRequestSchema, body);
     const { session, task } = await this.ownedSession(httpRequest, sessionId);
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const userId = httpRequest.auth!.user.id;
+    const requestId = `model_${request.operationId ?? request.requestMessageId ?? randomUUID()}`;
+    const operationFingerprint = turnAdmissionFingerprint(request);
+    if (this.durableTurns.enabled) {
+      const replayed = await this.durableTurns.replayAdmission({
+        tenantId,
+        userId,
+        workspaceId: request.workspaceId ?? task.workspaceId,
+        taskId: task.id,
+        sessionId,
+        requestId,
+        operationFingerprint,
+      });
+      if (replayed) return { turnId: replayed.runId, sessionId };
+    }
     if (request.continueInterruptedTurn) {
       await this.assertContinuableTurn(sessionId);
     }
-    const tenantId = tenantIdFromRequest(httpRequest);
-    const requestId = `model_${randomUUID()}`;
     const baseRuntime = await this.runtimeConfig.resolve(tenantId, request);
-    const userId = httpRequest.auth?.user.id ?? null;
     const [effectiveRuntime, departmentId] = await Promise.all([
-      this.organizationCapabilities.effective(tenantId, userId ?? ""),
+      this.organizationCapabilities.effective(tenantId, userId),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
     const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
@@ -784,10 +845,10 @@ export class AgentApiController {
       ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     const pricingSnapshot = modelCostSnapshot(governedRequest.provider, governedRequest.model);
     const hasModelPricing = Object.values(pricingSnapshot).some((value) => typeof value === "number");
-    const budgetCheck = await this.budgets.reserve({
+    const reserveModelBudget = () => this.budgets.reserve({
       tenantId,
       requestId,
-      userId: httpRequest.auth?.user.id ?? null,
+      userId,
       departmentId,
       taskId: task.id,
       sessionId,
@@ -803,7 +864,8 @@ export class AgentApiController {
       estimatedTokens: governedRequest.maxTokens ?? 4000,
       metadata: { workspaceId: request.workspaceId ?? task.workspaceId },
     });
-    const reservedCostMicros = BigInt(budgetCheck.reservation?.reservedMicros ?? "0");
+    const inlineBudgetCheck = this.durableTurns.enabled ? null : await reserveModelBudget();
+    const reservedCostMicros = BigInt(inlineBudgetCheck?.reservation?.reservedMicros ?? "0");
     let actualCostMicros = 0n;
     let usagePricingComplete = true;
     const startedAt = Date.now();
@@ -874,6 +936,7 @@ export class AgentApiController {
         ];
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
+          admissionFingerprint: operationFingerprint,
           providerId,
           provider,
           model: governedRequest.model ?? null,
@@ -908,20 +971,24 @@ export class AgentApiController {
           })),
           ...(portableCheckpoint ? { portableCheckpoint } : {}),
         });
+        const durableBudgetCheck = await reserveModelBudget();
+        const budgetReservationRequired = Boolean(durableBudgetCheck.reservation);
         const admitted = await this.durableTurns.admit({
           tenantId,
-          userId: httpRequest.auth!.user.id,
+          userId,
           workspaceId: governedRequest.workspaceId ?? task.workspaceId,
           taskId: task.id,
           sessionId,
           requestId,
+          operationFingerprint,
+          budgetReservationRequired,
           ...(request.requestMessageId ? { requestMessageId: request.requestMessageId } : {}),
           ...(request.replaceFromMessageId ? { replaceFromMessageId: request.replaceFromMessageId } : {}),
           input: request.continueInterruptedTurn ? "" : request.input ?? "",
           ...(request.messageInput ? { messageInput: request.messageInput } : {}),
           ...(request.attachments ? { attachments: request.attachments } : {}),
           ...(request.continueInterruptedTurn ? { continueInterruptedTurn: true } : {}),
-          runtimeRequest,
+          runtimeRequest: { ...runtimeRequest, budgetReservationRequired },
           groundingContext: groundingContext as unknown as JsonValue,
         });
         return { turnId: admitted.runId, sessionId };
@@ -1105,34 +1172,9 @@ export class AgentApiController {
               model: parsed.servedModel ?? parsed.model ?? usage?.model ?? governedRequest.model ?? null,
             };
           }
-          this.events.publish(sessionId, parsed);
           if (parsed.kind === "turn.end") {
             const terminalCostMicros = usage && !usagePricingComplete ? reservedCostMicros : actualCostMicros;
-            this.#queueProjectionWrite(sessionId, async () => {
-              await this.store.updateTask(task.id, { status: parsed.status });
-              if (parsed.status === "completed") {
-                await Promise.all([
-                  this.knowledge.enqueueTaskOutcome({
-                    tenantId,
-                    workspaceId: governedRequest.workspaceId ?? task.workspaceId,
-                    taskId: task.id,
-                    sessionId,
-                    revision: parsed.turnId,
-                  }),
-                  this.memory.enqueueExtraction({
-                    tenantId,
-                    userId: httpRequest.auth!.user.id,
-                    workspaceId: governedRequest.workspaceId ?? task.workspaceId,
-                    taskId: task.id,
-                    sessionId,
-                    revision: parsed.turnId,
-                  }),
-                ]);
-              }
-            });
-            void Promise.all([
-              this.budgets.reconcile({ tenantId, requestId, actualCostMicros: terminalCostMicros, usage }),
-              this.usageRepository.ingestInternal(tenantId, {
+            const terminalUsage = {
                 requestId,
                 userId: httpRequest.auth?.user.id ?? null,
                 departmentId,
@@ -1168,9 +1210,55 @@ export class AgentApiController {
                   ...(usage?.cacheMissComponentId ? { cacheMissComponentId: usage.cacheMissComponentId } : {}),
                 },
                 ts: new Date().toISOString(),
+              };
+            this.#queueProjectionWrite(
+              sessionId,
+              () => retryInlineFinalization(async () => {
+                await Promise.all([
+                  this.budgets.reconcile({ tenantId, requestId, actualCostMicros: terminalCostMicros, usage }),
+                  this.usageRepository.ingestInternal(tenantId, terminalUsage),
+                  ...(parsed.status === "completed" ? [
+                    this.knowledge.enqueueTaskOutcome({
+                      tenantId,
+                      workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+                      taskId: task.id,
+                      sessionId,
+                      revision: parsed.turnId,
+                    }),
+                    this.memory.enqueueExtraction({
+                      tenantId,
+                      userId: httpRequest.auth!.user.id,
+                      workspaceId: governedRequest.workspaceId ?? task.workspaceId,
+                      taskId: task.id,
+                      sessionId,
+                      revision: parsed.turnId,
+                    }),
+                  ] : []),
+                ]);
+                await this.store.updateTask(task.id, { status: parsed.status });
+              }).then(() => {
+                // The browser may only observe a terminal event after every
+                // earlier projection, accounting write, and completion
+                // trigger has settled successfully.
+                this.events.publish(sessionId, parsed);
               }),
-            ]).catch(() => undefined);
+              async (cause) => {
+                const message = cause instanceof Error ? cause.message : "Inline turn finalization failed";
+                try {
+                  await Promise.all([
+                    this.budgets.reconcile({ tenantId, requestId, actualCostMicros: terminalCostMicros, usage }),
+                    this.usageRepository.ingestInternal(tenantId, { ...terminalUsage, status: "failed" }),
+                  ]).catch(() => undefined);
+                  await this.store.updateTask(task.id, { status: "failed" }).catch(() => undefined);
+                } finally {
+                  this.events.publish(sessionId, { kind: "error", message });
+                  this.events.publish(sessionId, { kind: "turn.end", turnId: parsed.turnId, status: "failed" });
+                }
+              },
+            );
+            return;
           }
+          this.events.publish(sessionId, parsed);
         },
       } as StartTurnOptions);
       activeTurnId = turnId;
@@ -1328,6 +1416,9 @@ export class AgentApiController {
   async steerTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const request = parseBody(SteerTurnRequestSchema, body);
     const { session } = await this.ownedSession(httpRequest, sessionId);
+    if (this.durableTurns.enabled) {
+      throw new ConflictException("Steering is unavailable for durable turns; cancel the active turn and submit a new prompt instead");
+    }
     const steeringKey = `${sessionId}:${request.messageId}`;
     const inFlight = this.#steerWrites.get(steeringKey);
     if (inFlight) return inFlight;

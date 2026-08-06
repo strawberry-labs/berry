@@ -10,6 +10,13 @@ import { FilePlatformService } from "./files/file-platform.service.ts";
 import { createApiMainModule, createAuthRuntime, HealthController } from "./main.ts";
 
 describe("API health probes", () => {
+  it("refuses the non-durable inline runner in production", () => {
+    expect(() => createApiMainModule({
+      NODE_ENV: "production",
+      BERRY_DURABLE_RUNNER_ENABLED: "false",
+    })).toThrow("BERRY_DURABLE_RUNNER_ENABLED must remain enabled in production");
+  });
+
   it("starts direct execution only after runtime class declarations are initialized", () => {
     const adjacentSource = new URL("./main.ts", import.meta.url);
     const sourceUrl = existsSync(adjacentSource) ? adjacentSource : new URL("../src/main.ts", import.meta.url);

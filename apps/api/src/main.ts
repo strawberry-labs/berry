@@ -195,6 +195,9 @@ class BerryApiMainModule {}
 
 export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): DynamicModule {
   const durableConfig = durableContextConfigFromEnv(env);
+  if (env.NODE_ENV === "production" && !durableConfig.durableRunnerEnabled) {
+    throw new Error("BERRY_DURABLE_RUNNER_ENABLED must remain enabled in production; the inline runner is intended for development and tests only");
+  }
   const pg = PgSqlExecutor.fromConnectionString(requiredEnv(env, "BERRY_DATABASE_URL", env.DATABASE_URL));
   const platformPg = env.BERRY_PLATFORM_DATABASE_URL
     ? PgSqlExecutor.fromConnectionString(env.BERRY_PLATFORM_DATABASE_URL)

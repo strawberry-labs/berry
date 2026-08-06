@@ -173,6 +173,49 @@ export function shouldRefreshAdministration(permissions: readonly OrgPermission[
   return permissions.includes("org:admin");
 }
 
+export function shouldConfirmTurnAdmission(cause: unknown): boolean {
+  return !(cause instanceof BerryApiError)
+    || cause.status === 408
+    || cause.status === 429
+    || cause.status >= 500;
+}
+
+export async function retryTurnAdmission(
+  client: Pick<BerryApiClient, "startTurn" | "turnState">,
+  sessionId: string,
+  request: StartTurnRequest,
+): Promise<{ started: { turnId: string; sessionId: string }; state: TurnState | null }> {
+  const started = await client.startTurn(sessionId, request);
+  const state = await client.turnState(sessionId).catch(() => null);
+  return { started, state };
+}
+
+export async function revokeAuthSession(
+  baseUrl: string,
+  options: {
+    fetchImpl?: typeof fetch;
+    retryDelaysMs?: readonly number[];
+  } = {},
+): Promise<void> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const retryDelaysMs = options.retryDelaysMs ?? [0, 250, 1_000];
+  let lastError: unknown = new Error("Unable to revoke the server session");
+  for (const delayMs of retryDelaysMs) {
+    if (delayMs > 0) await new Promise<void>((resolve) => globalThis.setTimeout(resolve, delayMs));
+    try {
+      const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/v1/auth/sign-out`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (response.ok || response.status === 401) return;
+      lastError = new Error(`Server logout failed with status ${response.status}`);
+    } catch (cause) {
+      lastError = cause;
+    }
+  }
+  throw lastError;
+}
+
 export function isInterruptedTurnAvailable(
   streamEndStatus: StreamState["endStatus"],
   runState: TurnState["runState"],
@@ -863,13 +906,27 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           terminal = true;
           activeSessionsRef.current.delete(sessionId);
           stopSessionConnection(sessionId);
-          void Promise.all([refreshSessionMessages(sessionId), client.turnState(sessionId)])
-            .then(([, state]) => {
-              applyDurableState(sessionId, state);
-              resetSessionStream(sessionId);
-              handleQueueTurnEndRef.current(sessionId, event.status);
-            })
-            .catch((cause) => setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn"));
+          handleQueueTurnEndRef.current(sessionId, event.status);
+          const reconcileTerminal = (attempt: number): void => {
+            void Promise.all([refreshSessionMessages(sessionId), client.turnState(sessionId)])
+              .then(([, state]) => {
+                // A queued follow-up can begin locally before its POST is
+                // admitted. Do not let this older terminal snapshot erase
+                // that newer pending turn.
+                if (!state.active && activeSessionsRef.current.has(sessionId)) return;
+                applyDurableState(sessionId, state);
+                if (state.active) activeSessionsRef.current.add(sessionId);
+                else resetSessionStream(sessionId);
+              })
+              .catch((cause) => {
+                if (attempt < 2) {
+                  window.setTimeout(() => reconcileTerminal(attempt + 1), 500 * (attempt + 1));
+                  return;
+                }
+                setResourceError("messages", cause instanceof Error ? cause.message : "Unable to refresh the completed turn");
+              });
+          };
+          reconcileTerminal(0);
         },
         onError: () => {
           if (terminal || !trackedSessionsRef.current.has(sessionId)) return;
@@ -961,27 +1018,34 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       nextAction: "Submitting the turn",
       error: null,
     });
-    // Listen before submitting so early deltas render live instead of being
-    // delivered together from the server's replay buffer.
-    await attachSessionStream(sessionId);
+    const request = {
+      operationId: params.continueInterruptedTurn === true
+        ? globalThis.crypto.randomUUID()
+        : params.requestMessageId ?? globalThis.crypto.randomUUID(),
+      workspacePath: taskWorkspacePath,
+      workspaceId: task.workspaceId,
+      permissionMode,
+      provider: { id: providerId },
+      model,
+      reasoning,
+      ...(params.continueInterruptedTurn
+        ? { continueInterruptedTurn: true as const }
+        : {
+          input: params.input,
+          ...(params.messageInput ? { messageInput: params.messageInput } : {}),
+          ...(params.requestMessageId ? { requestMessageId: params.requestMessageId } : {}),
+          ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
+          ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
+        }),
+    } satisfies StartTurnRequest;
+    let submissionAttempted = false;
     try {
-      const request = {
-        workspacePath: taskWorkspacePath,
-        workspaceId: task.workspaceId,
-        permissionMode,
-        provider: { id: providerId },
-        model,
-        reasoning,
-        ...(params.continueInterruptedTurn
-          ? { continueInterruptedTurn: true as const }
-          : {
-            input: params.input,
-            ...(params.messageInput ? { messageInput: params.messageInput } : {}),
-            ...(params.requestMessageId ? { requestMessageId: params.requestMessageId } : {}),
-            ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
-            ...(params.replaceFromMessageId ? { replaceFromMessageId: params.replaceFromMessageId } : {}),
-          }),
-      } satisfies StartTurnRequest;
+      // Listen before submitting so early deltas render live instead of being
+      // delivered together from the server's replay buffer. Connection setup
+      // belongs inside this try/finally so an initial SSE failure cannot leave
+      // a phantom active turn in browser state.
+      await attachSessionStream(sessionId);
+      submissionAttempted = true;
       const started = await client.startTurn(sessionId, request);
       applyDurableState(sessionId, {
         active: true,
@@ -995,15 +1059,34 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         error: null,
       });
     } catch (cause) {
-      if (!(cause instanceof BerryApiError)) {
+      if (submissionAttempted && shouldConfirmTurnAdmission(cause)) {
         try {
-          const state = await client.turnState(sessionId);
-          applyDurableState(sessionId, state);
-          if (state.active) {
+          const recovered = await retryTurnAdmission(client, sessionId, request);
+          if (recovered.state) {
+            applyDurableState(sessionId, recovered.state);
+          } else {
+            applyDurableState(sessionId, {
+              active: true,
+              turnId: recovered.started.turnId,
+              bufferedEvents: [],
+              replayOnly: false,
+              owner: null,
+              runState: "queued",
+              waitingReason: null,
+              nextAction: "Reconciling the confirmed turn",
+              error: null,
+            });
+          }
+          if (recovered.state?.active !== false) {
             activeSessionsRef.current.add(sessionId);
             void attachSessionStream(sessionId).catch(() => undefined);
-            return;
+          } else {
+            activeSessionsRef.current.delete(sessionId);
+            stopSessionConnection(sessionId);
+            await refreshSessionMessages(sessionId).catch(() => undefined);
+            resetSessionStream(sessionId);
           }
+          return;
         } catch {
           // Fall through to the original start error when acceptance cannot
           // be confirmed.
@@ -1029,7 +1112,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         return next;
       });
     }
-  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -1138,8 +1221,18 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [client, fixtureWorkspace, navigateHome]);
 
   const signOut = React.useCallback(async () => {
-    await fetch(`${initial.config.apiBaseUrl ?? ""}/v1/auth/sign-out`, { method: "POST", credentials: "include" });
+    // Replace a task URL immediately so another account cannot inherit it
+    // while server-side session revocation is still in flight.
     onSignedOut?.();
+    try {
+      await revokeAuthSession(initial.config.apiBaseUrl ?? "");
+    } catch (cause) {
+      toast.error("Server logout could not be confirmed", {
+        description: cause instanceof Error
+          ? `${cause.message}. Check your connection before leaving this device.`
+          : "Check your connection before leaving this device.",
+      });
+    }
   }, [initial.config.apiBaseUrl, onSignedOut]);
 
   const saveTaskTitle = React.useCallback(async (title: string) => {
@@ -2064,7 +2157,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 const user = optimisticUserMessage(sessionId, text, attachments, messageId);
                 const nextTitle = text.trim().slice(0, 42);
                 requestThreadBottom(sessionId);
-                replaceSessionMessages(sessionId, (current) => [...current, user]);
+                replaceSessionMessages(sessionId, (current) => current.some((item) => item.id === user.id)
+                  ? current
+                  : [...current, user]);
                 setTasks((current) => current.map((task) => task.id === taskId ? { ...task, title: task.title === "New cloud task" ? nextTitle || task.title : task.title } : task));
                 if (client && activeTask.title === "New cloud task" && nextTitle) {
                   void client.updateTask(taskId, { title: nextTitle })

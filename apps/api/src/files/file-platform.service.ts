@@ -10,6 +10,7 @@ import {
   S3Client,
   UploadPartCommand,
   type CompletedPart,
+  type HeadObjectCommandOutput,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "node:crypto";
@@ -229,6 +230,7 @@ export class FilePlatformService {
   async presignParts(tenantId: string, userId: string, fileId: string, uploadId: string, partNumbers: number[]) {
     const config = this.requireConfig();
     const upload = await this.requireUpload(tenantId, userId, fileId, uploadId);
+    if (upload.status !== "uploading") throw new BadRequestException("Upload is already complete");
     const unique = [...new Set(partNumbers)];
     if (unique.length === 0 || unique.length > 100 || unique.some((part) => !Number.isInteger(part) || part < 1 || part > upload.part_count)) {
       throw new BadRequestException("A valid batch of upload part numbers is required");
@@ -250,17 +252,34 @@ export class FilePlatformService {
   async completeUpload(tenantId: string, userId: string, fileId: string, uploadId: string, parts: CompletedPart[]) {
     const config = this.requireConfig();
     const upload = await this.requireUpload(tenantId, userId, fileId, uploadId);
+    if (upload.status === "completed") return this.get(tenantId, userId, fileId);
     const ordered = [...parts].sort((left, right) => Number(left.PartNumber) - Number(right.PartNumber));
     if (ordered.length !== upload.part_count || ordered.some((part, index) => part.PartNumber !== index + 1 || !part.ETag)) {
       throw new BadRequestException("Every uploaded part and ETag is required");
     }
-    const completed = await config.client.send(new CompleteMultipartUploadCommand({
-      Bucket: config.bucket,
-      Key: upload.object_key,
-      UploadId: upload.provider_upload_id,
-      MultipartUpload: { Parts: ordered },
-    }));
-    const head = await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: upload.object_key }));
+    let completedEtag: string | undefined;
+    let completedVersionId: string | undefined;
+    let head: HeadObjectCommandOutput | undefined;
+    try {
+      const completed = await config.client.send(new CompleteMultipartUploadCommand({
+        Bucket: config.bucket,
+        Key: upload.object_key,
+        UploadId: upload.provider_upload_id,
+        MultipartUpload: { Parts: ordered },
+      }));
+      completedEtag = completed.ETag;
+      completedVersionId = completed.VersionId;
+    } catch (completionError) {
+      // CompleteMultipartUpload consumes the provider upload id. If the API
+      // died after that side effect but before the PostgreSQL update, the
+      // retry receives NoSuchUpload even though the final object is valid.
+      try {
+        head = await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: upload.object_key }));
+      } catch {
+        throw completionError;
+      }
+    }
+    head ??= await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: upload.object_key }));
     const actualSize = Number(head.ContentLength);
     const declaredSize = Number(upload.declared_size_bytes);
     if (!Number.isSafeInteger(actualSize)
@@ -316,10 +335,10 @@ export class FilePlatformService {
       await executor.execute(`
         UPDATE files SET status = $6::file_status, size_bytes = $3, etag = $4, object_version_id = $5, updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
-      `, [tenantId, fileId, actualSize, cleanEtag(head.ETag ?? completed.ETag), completed.VersionId ?? null, shouldIndex ? "processing" : "available"]);
+      `, [tenantId, fileId, actualSize, cleanEtag(head.ETag ?? completedEtag), completedVersionId ?? head.VersionId ?? null, shouldIndex ? "processing" : "available"]);
       if (workspaceFile && shouldIndex) {
-        const revision = completed.VersionId ?? cleanEtag(head.ETag ?? completed.ETag) ?? `upload-${uploadId}`;
-        const contentHash = cleanEtag(head.ETag ?? completed.ETag) ?? `file-${fileId}-${revision}`;
+        const revision = completedVersionId ?? head.VersionId ?? cleanEtag(head.ETag ?? completedEtag) ?? `upload-${uploadId}`;
+        const contentHash = cleanEtag(head.ETag ?? completedEtag) ?? `file-${fileId}-${revision}`;
         const [source] = await executor.query<{ id: string }>(`
           INSERT INTO knowledge_sources (
             tenant_id, user_id, workspace_id, source_type, source_id, source_revision,
@@ -667,7 +686,8 @@ export class FilePlatformService {
       const [row] = await executor.query<UploadRow>(`
         SELECT u.*, f.object_key, f.size_bytes AS declared_size_bytes
         FROM file_uploads u JOIN files f ON f.id = u.file_id
-        WHERE u.tenant_id = $1::uuid AND u.id = $2::uuid AND u.file_id = $3::uuid AND u.status = 'uploading' AND u.expires_at > now()
+        WHERE u.tenant_id = $1::uuid AND u.id = $2::uuid AND u.file_id = $3::uuid
+          AND (u.status = 'completed' OR (u.status = 'uploading' AND u.expires_at > now()))
       `, [tenantId, uploadId, fileId]);
       if (!row) throw new NotFoundException("Upload session not found or expired");
       return row;

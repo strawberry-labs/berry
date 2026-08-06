@@ -642,6 +642,7 @@ export class BerryAgentRuntime {
   readonly #groundingBySession = new Map<string, GroundingContext>();
   readonly #checkpointBySession = new Map<string, SessionCheckpointV2>();
   readonly #compactedSkillSessions = new Set<string>();
+  readonly #startingSessions = new Set<string>();
   readonly #pendingApprovals = new Map<string, PendingApproval>();
   readonly #pendingQuestions = new Map<string, PendingQuestion>();
   readonly #turns = new Set<Promise<void>>();
@@ -664,7 +665,10 @@ export class BerryAgentRuntime {
 
   startTurn(options: StartTurnOptions): { turnId: string } {
     const existing = this.#sessions.get(options.sessionId);
-    if (existing?.active) throw new Error(`Session ${options.sessionId} is already running a turn`);
+    if (this.#startingSessions.has(options.sessionId) || existing?.active) {
+      throw new Error(`Session ${options.sessionId} is already running a turn`);
+    }
+    this.#startingSessions.add(options.sessionId);
     if (options.groundingContext) this.#groundingBySession.set(options.sessionId, options.groundingContext);
     else this.#groundingBySession.delete(options.sessionId);
     if (options.portableCheckpoint) this.#checkpointBySession.set(options.sessionId, options.portableCheckpoint);
@@ -760,6 +764,7 @@ export class BerryAgentRuntime {
       }
     } finally {
       if (state) state.active = undefined;
+      this.#startingSessions.delete(options.sessionId);
     }
   }
 

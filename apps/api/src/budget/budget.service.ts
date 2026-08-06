@@ -75,9 +75,12 @@ export type ReconcileBudgetInput = {
   } | undefined;
 };
 
+type BudgetCheckResult = BudgetCheck & { reused?: boolean };
+type BudgetReservationResult = BudgetReservation & { reused?: boolean };
+
 export interface BudgetRepository {
-  reserve(input: ReserveBudgetInput, scopes: BudgetScope[]): Promise<BudgetCheck>;
-  reconcile(input: ReconcileBudgetInput): Promise<BudgetReservation | null>;
+  reserve(input: ReserveBudgetInput, scopes: BudgetScope[]): Promise<BudgetCheckResult>;
+  reconcile(input: ReconcileBudgetInput): Promise<BudgetReservationResult | null>;
   listLimits(tenantId: string): Promise<BudgetLimit[]>;
   upsertLimit(input: BudgetLimitInput): Promise<BudgetLimit>;
   getAllowanceCycle(tenantId: string): Promise<AllowanceCycleSettings>;
@@ -155,15 +158,19 @@ export class BudgetService {
     const scopes = budgetScopes(input.tenantId ?? SELF_HOST_TENANT_ID, input.userId, input.departmentId ?? null);
     const check = await this.options.repository.reserve(input, scopes);
     if (!check.allowed) throw budgetExceeded(check.reason ?? "Budget hard limit exceeded.", check);
-    if (check.reservation) await this.options.hotCounters.reserve(scopes, toMicros(check.reservation.reservedMicros));
+    if (check.reservation && !check.reused) {
+      await this.options.hotCounters.reserve(scopes, toMicros(check.reservation.reservedMicros));
+    }
     return check;
   }
 
-  async reconcile(input: ReconcileBudgetInput): Promise<BudgetReservation | null> {
+  async reconcile(input: ReconcileBudgetInput): Promise<BudgetReservationResult | null> {
     const reservation = await this.options.repository.reconcile(input);
     if (!reservation) return null;
     const scopes = budgetScopes(reservation.tenantId, reservation.userId, reservation.departmentId);
-    await this.options.hotCounters.reconcile(scopes, toMicros(reservation.reservedMicros), toMicros(reservation.actualCostMicros ?? reservation.reservedMicros));
+    if (!reservation.reused) {
+      await this.options.hotCounters.reconcile(scopes, toMicros(reservation.reservedMicros), toMicros(reservation.actualCostMicros ?? reservation.reservedMicros));
+    }
     return reservation;
   }
 
@@ -352,6 +359,8 @@ export class InMemoryBudgetRepository implements BudgetRepository {
 
   async reserve(input: ReserveBudgetInput, scopes: BudgetScope[]): Promise<BudgetCheck> {
     const tenantId = input.tenantId ?? SELF_HOST_TENANT_ID;
+    const replayed = this.#reservations.get(`${tenantId}:${input.requestId}`);
+    if (replayed) return reusedBudgetCheck(replayed, input);
     const estimated = toMicros(input.estimatedCostMicros);
     const adjustment = input.userId
       ? await this.currentAdjustment(tenantId, input.userId)
@@ -394,10 +403,12 @@ export class InMemoryBudgetRepository implements BudgetRepository {
     });
   }
 
-  async reconcile(input: ReconcileBudgetInput): Promise<BudgetReservation | null> {
+  async reconcile(input: ReconcileBudgetInput): Promise<BudgetReservationResult | null> {
     const tenantId = input.tenantId ?? SELF_HOST_TENANT_ID;
     const existing = this.#reservations.get(`${tenantId}:${input.requestId}`);
-    if (!existing || existing.status !== "reserved") return existing ?? null;
+    if (!existing || existing.status !== "reserved") {
+      return existing ? { ...existing, reused: true } : null;
+    }
     const actual = toMicros(input.actualCostMicros);
     const next = BudgetReservationSchema.parse({ ...existing, actualCostMicros: actual.toString(), status: "reconciled", updatedAt: new Date().toISOString() });
     this.#reservations.set(`${tenantId}:${input.requestId}`, next);
@@ -602,6 +613,18 @@ export class PostgresBudgetRepository implements BudgetRepository {
   async reserve(input: ReserveBudgetInput, scopes: BudgetScope[]): Promise<BudgetCheck> {
     const tenantId = input.tenantId ?? this.database.selfHostTenantId;
     return this.database.withTenant(tenantId, async (executor) => {
+      // Org limits span every member, so serialize the short admission check
+      // per tenant. Without this lock, two distinct requests can both observe
+      // the same remaining balance and oversubscribe it under READ COMMITTED.
+      await executor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`berry-budget:${tenantId}`],
+      );
+      const replayedRows = await executor.query<BudgetReservationRow>(
+        "SELECT * FROM budget_reservations WHERE tenant_id = $1::uuid AND request_id = $2 LIMIT 1",
+        [tenantId, input.requestId],
+      );
+      if (replayedRows[0]) return reusedBudgetCheck(budgetReservationFromRow(replayedRows[0]), input);
       const cycle = await allowanceCycleFromDatabase(executor, tenantId);
       const rawLimits = await this.listLimitsInTenant(executor, tenantId);
       const adjustment = input.userId
@@ -617,16 +640,22 @@ export class PostgresBudgetRepository implements BudgetRepository {
       const estimated = toMicros(input.estimatedCostMicros);
       const quotaExceeded = await firstExceededQuotaInDatabase(executor, tenantId, limits.filter((limit) => limit.status === "active"), scopes, input, cycle);
       if (quotaExceeded) {
-        const blocked = await this.insertReservation(executor, input, tenantId, "blocked", estimated, 0n, null, quotaExceeded.reason);
+        const inserted = await this.insertReservation(executor, input, tenantId, "blocked", estimated, 0n, null, quotaExceeded.reason);
+        if (!inserted.inserted) return reusedBudgetCheck(inserted.reservation, input);
+        const blocked = inserted.reservation;
         return BudgetCheckSchema.parse({ allowed: false, reason: quotaExceeded.reason, reservation: blocked, limit: quotaExceeded.limit, retryAfterSeconds: null });
       }
       const exceeded = firstExceededLimit(limits.filter((limit) => limit.status === "active"), scopes, spent, estimated);
       if (exceeded) {
-        const blocked = await this.insertReservation(executor, input, tenantId, "blocked", estimated, 0n, null, exceeded.reason);
+        const inserted = await this.insertReservation(executor, input, tenantId, "blocked", estimated, 0n, null, exceeded.reason);
+        if (!inserted.inserted) return reusedBudgetCheck(inserted.reservation, input);
+        const blocked = inserted.reservation;
         return BudgetCheckSchema.parse({ allowed: false, reason: exceeded.reason, reservation: blocked, limit: exceeded.limit, retryAfterSeconds: null });
       }
       const softExceeded = firstSoftLimit(limits.filter((limit) => limit.status === "active"), scopes, spent, estimated);
-      const reservation = await this.insertReservation(executor, input, tenantId, "reserved", estimated, estimated, null, null);
+      const inserted = await this.insertReservation(executor, input, tenantId, "reserved", estimated, estimated, null, null);
+      if (!inserted.inserted) return reusedBudgetCheck(inserted.reservation, input);
+      const reservation = inserted.reservation;
       for (const scope of scopes) {
         await executor.execute(
           `INSERT INTO credit_ledger_entries (tenant_id, scope_type, scope_id, reservation_id, request_id, kind, amount_micros, balance_after_micros, metadata)
@@ -645,21 +674,30 @@ export class PostgresBudgetRepository implements BudgetRepository {
     });
   }
 
-  async reconcile(input: ReconcileBudgetInput): Promise<BudgetReservation | null> {
+  async reconcile(input: ReconcileBudgetInput): Promise<BudgetReservationResult | null> {
     const tenantId = input.tenantId ?? this.database.selfHostTenantId;
     return this.database.withTenant(tenantId, async (executor) => {
       const rows = await executor.query<BudgetReservationRow>("SELECT * FROM budget_reservations WHERE tenant_id = $1::uuid AND request_id = $2 LIMIT 1", [tenantId, input.requestId]);
       const existing = rows[0] ? budgetReservationFromRow(rows[0]) : null;
-      if (!existing || existing.status !== "reserved") return existing;
+      if (!existing || existing.status !== "reserved") {
+        return existing ? { ...existing, reused: true } : null;
+      }
       const actual = toMicros(input.actualCostMicros);
       const updatedRows = await executor.query<BudgetReservationRow>(
         `UPDATE budget_reservations
          SET actual_cost_micros = $3, status = 'reconciled', provider = COALESCE($4, provider), model = COALESCE($5, model), updated_at = now()
-         WHERE tenant_id = $1::uuid AND request_id = $2
+         WHERE tenant_id = $1::uuid AND request_id = $2 AND status = 'reserved'
          RETURNING *`,
         [tenantId, input.requestId, actual.toString(), input.usage?.provider ?? null, input.usage?.model ?? null],
       );
-      const updated = budgetReservationFromRow(updatedRows[0]!);
+      if (!updatedRows[0]) {
+        const replayedRows = await executor.query<BudgetReservationRow>(
+          "SELECT * FROM budget_reservations WHERE tenant_id = $1::uuid AND request_id = $2 LIMIT 1",
+          [tenantId, input.requestId],
+        );
+        return replayedRows[0] ? { ...budgetReservationFromRow(replayedRows[0]), reused: true } : null;
+      }
+      const updated = budgetReservationFromRow(updatedRows[0]);
       const scopes = budgetScopes(updated.tenantId, updated.userId, updated.departmentId);
       const cycle = await allowanceCycleFromDatabase(executor, tenantId);
       const spent = await ledgerSpentByScope(
@@ -941,14 +979,13 @@ export class PostgresBudgetRepository implements BudgetRepository {
     return rows.map(budgetLimitFromRow);
   }
 
-  private async insertReservation(executor: SqlExecutor, input: ReserveBudgetInput, tenantId: string, status: BudgetReservation["status"], estimated: bigint, reserved: bigint, actual: bigint | null, blockReason: string | null): Promise<BudgetReservation> {
+  private async insertReservation(executor: SqlExecutor, input: ReserveBudgetInput, tenantId: string, status: BudgetReservation["status"], estimated: bigint, reserved: bigint, actual: bigint | null, blockReason: string | null): Promise<{ reservation: BudgetReservation; inserted: boolean }> {
     const rows = await executor.query<BudgetReservationRow>(
       `INSERT INTO budget_reservations (
          tenant_id, request_id, user_id, department_id, task_id, session_id, feature, provider, model,
          estimated_cost_micros, reserved_micros, actual_cost_micros, status, block_reason, metadata
        ) VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)
-       ON CONFLICT (tenant_id, request_id) DO UPDATE
-       SET updated_at = now()
+       ON CONFLICT (tenant_id, request_id) DO NOTHING
        RETURNING *`,
       [
         tenantId,
@@ -968,7 +1005,13 @@ export class PostgresBudgetRepository implements BudgetRepository {
         JSON.stringify({ ...(input.metadata && typeof input.metadata === "object" && !Array.isArray(input.metadata) ? input.metadata : {}), requestUnits: input.requestUnits ?? 1, estimatedTokens: input.estimatedTokens ?? 0, estimatedSandboxMinutes: input.estimatedSandboxMinutes ?? 0 }),
       ],
     );
-    return budgetReservationFromRow(rows[0]!);
+    if (rows[0]) return { reservation: budgetReservationFromRow(rows[0]), inserted: true };
+    const replayed = await executor.query<BudgetReservationRow>(
+      "SELECT * FROM budget_reservations WHERE tenant_id = $1::uuid AND request_id = $2 LIMIT 1",
+      [tenantId, input.requestId],
+    );
+    if (!replayed[0]) throw new Error("Budget reservation conflict could not be reloaded");
+    return { reservation: budgetReservationFromRow(replayed[0]), inserted: false };
   }
 }
 
@@ -1185,6 +1228,33 @@ async function ledgerSpentByScope(
 
 function budgetExceeded(message: string, check: BudgetCheck): HttpException {
   return new HttpException({ code: "budget_exceeded", message, check }, 402);
+}
+
+function reusedBudgetCheck(reservation: BudgetReservation, input: ReserveBudgetInput): BudgetCheckResult {
+  if (
+    reservation.userId !== input.userId
+    || reservation.taskId !== input.taskId
+    || reservation.sessionId !== input.sessionId
+    || reservation.feature !== input.feature
+  ) {
+    throw new Error("Budget request id already belongs to a different operation");
+  }
+  const allowed = reservation.status === "reserved";
+  const reason = reservation.status === "released"
+    ? "This budget reservation expired before turn admission; submit a new operation key."
+    : reservation.status === "reconciled"
+      ? "This budget reservation was already settled; submit a new operation key."
+      : reservation.blockReason;
+  return {
+    ...BudgetCheckSchema.parse({
+      allowed,
+      reason,
+      reservation,
+      limit: null,
+      retryAfterSeconds: null,
+    }),
+    reused: true,
+  };
 }
 
 function budgetLimitFromRow(row: BudgetLimitRow): BudgetLimit {

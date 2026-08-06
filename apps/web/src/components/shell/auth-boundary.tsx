@@ -1,8 +1,19 @@
 import * as React from "react";
+import { useLocation, useNavigate } from "@tanstack/react-router";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 
 export type SignedInUser = { id: string; email: string; name?: string | null; image?: string | null };
+
+export function authDestination(input: {
+  authenticated: boolean;
+  loading: boolean;
+  pathname: string;
+}): "/" | "/login" | null {
+  if (input.loading) return null;
+  if (!input.authenticated) return input.pathname === "/login" ? null : "/login";
+  return input.pathname === "/login" ? "/" : null;
+}
 
 export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }: {
   baseUrl: string;
@@ -10,6 +21,8 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
   sessionResolved: boolean;
   children: (user: SignedInUser, onSignedOut: () => void) => React.ReactNode;
 }) {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [user, setUser] = React.useState<SignedInUser | null>(initialUser);
   const [loading, setLoading] = React.useState(!sessionResolved);
 
@@ -35,11 +48,26 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
     void refreshSession();
   }, [refreshSession, sessionResolved]);
 
+  const destination = authDestination({
+    authenticated: Boolean(user),
+    loading,
+    pathname: location.pathname,
+  });
+  React.useEffect(() => {
+    if (!destination) return;
+    void navigate({ to: destination, replace: true });
+  }, [destination, navigate]);
+
+  const signedOut = React.useCallback(() => {
+    setUser(null);
+    void navigate({ to: "/login", replace: true });
+  }, [navigate]);
+
   if (loading) {
     return <div className="auth-shell" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading workspace" /></div>;
   }
   if (!user) return <AuthScreen baseUrl={baseUrl} onAuthenticated={refreshSession} />;
-  return children(user, () => setUser(null));
+  return children(user, signedOut);
 }
 
 function AuthScreen({ baseUrl, onAuthenticated }: { baseUrl: string; onAuthenticated: () => Promise<void> }) {

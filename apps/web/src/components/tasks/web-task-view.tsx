@@ -14,6 +14,7 @@ import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { fileTypeLabel, formatBytes } from "../library/file-metadata";
+import { stableQuestionAnswerMessageId } from "./composer-question-overlay";
 
 const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
@@ -83,7 +84,17 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         await client.decideApproval(approval.approvalId, { decision });
       },
       onQuestionAnswer: async (question, answer, selectedOptions) => {
-        await client.answerQuestion(question.questionId, { answer, selectedOptions });
+        const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
+        await client.appendMessage(sessionId, {
+          messageId: answerMessageId,
+          role: "user",
+          parts: [{ kind: "text", content: answer }],
+        });
+        await client.answerQuestion(question.questionId, {
+          answer,
+          answerMessageId,
+          selectedOptions,
+        });
       },
       onOpenAttachment: async (attachment) => {
         if (!attachment.fileId) return;

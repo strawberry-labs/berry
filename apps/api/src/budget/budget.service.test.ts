@@ -12,6 +12,94 @@ import {
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
 
 describe("BudgetService", () => {
+  it("does not reserve or reconcile hot counters twice when a request is retried", async () => {
+    const hotCounters = {
+      healthy: vi.fn(async () => true),
+      reserve: vi.fn(async () => undefined),
+      reconcile: vi.fn(async () => undefined),
+    };
+    const service = new BudgetService({
+      repository: new InMemoryBudgetRepository(),
+      hotCounters,
+      enabled: true,
+    });
+    const input = {
+      tenantId: SELF_HOST_TENANT_ID,
+      requestId: "same-operation",
+      userId: "user_1",
+      taskId: "task_1",
+      sessionId: "session_1",
+      feature: "model",
+      estimatedCostMicros: "3",
+    };
+
+    await service.reserve(input);
+    await service.reserve(input);
+    await service.reconcile({ tenantId: SELF_HOST_TENANT_ID, requestId: input.requestId, actualCostMicros: "2" });
+    await service.reconcile({ tenantId: SELF_HOST_TENANT_ID, requestId: input.requestId, actualCostMicros: "2" });
+    await expect(service.reserve(input)).rejects.toMatchObject({
+      status: 402,
+      response: expect.objectContaining({ message: expect.stringContaining("already settled") }),
+    });
+
+    expect(hotCounters.reserve).toHaveBeenCalledTimes(1);
+    expect(hotCounters.reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an operation key whose orphaned reservation was released", async () => {
+    const userId = "00000000-0000-7000-8000-000000000201";
+    const taskId = "00000000-0000-7000-8000-000000000202";
+    const sessionId = "00000000-0000-7000-8000-000000000203";
+    const released = {
+      id: "00000000-0000-7000-8000-000000000204",
+      tenant_id: SELF_HOST_TENANT_ID,
+      request_id: "released-operation",
+      user_id: userId,
+      department_id: null,
+      task_id: taskId,
+      session_id: sessionId,
+      feature: "model",
+      provider: "router",
+      model: "model-a",
+      estimated_cost_micros: "10",
+      reserved_micros: "10",
+      actual_cost_micros: "0",
+      status: "released",
+      block_reason: null,
+      metadata: {},
+      created_at: "2026-08-05T00:00:00.000Z",
+      updated_at: "2026-08-05T00:15:00.000Z",
+    };
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => sql.startsWith("SELECT * FROM budget_reservations")
+        ? [released] as T[]
+        : [],
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new BudgetService({
+      repository: new PostgresBudgetRepository(new CloudDatabaseService(executor)),
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+
+    await expect(service.reserve({
+      tenantId: SELF_HOST_TENANT_ID,
+      requestId: "released-operation",
+      userId,
+      taskId,
+      sessionId,
+      feature: "model",
+      estimatedCostMicros: "10",
+    })).rejects.toMatchObject({
+      status: 402,
+      response: expect.objectContaining({
+        code: "budget_exceeded",
+        message: expect.stringContaining("expired before turn admission"),
+      }),
+    });
+  });
+
   it("enforces request and token quotas using the most restrictive applicable scope", async () => {
     const repository = new InMemoryBudgetRepository([
       { tenantId: SELF_HOST_TENANT_ID, scopeType: "org", scopeId: SELF_HOST_TENANT_ID, period: "month", softLimitMicros: "100000", hardLimitMicros: "100000", requestLimit: 10, tokenLimit: 1000, status: "active" },

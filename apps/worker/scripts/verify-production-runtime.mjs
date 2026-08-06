@@ -450,9 +450,9 @@ async function verifyUploadSizeEnforcement() {
   );
   await admin.query(
     `INSERT INTO turn_runs (
-       id,tenant_id,user_id,workspace_id,task_id,session_id,request_message_id,state
-     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7::uuid,'completed')`,
-    [stagingRunId, ids.tenantA, ids.user, ids.workspace, ids.task, ids.session, requestMessageId],
+       id,tenant_id,user_id,workspace_id,task_id,session_id,request_id,request_message_id,state
+     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8::uuid,'completed')`,
+    [stagingRunId, ids.tenantA, ids.user, ids.workspace, ids.task, ids.session, `model_verify_${stagingRunId}`, requestMessageId],
   );
   const sandboxRepository = new SqlSandboxSnapshotRepository(workerExecutor);
   const stagedInputs = await workerExecutor.runWithTenant(

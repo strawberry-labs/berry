@@ -624,10 +624,12 @@ describe("router client", () => {
   it("streams OpenAI Responses events with bearer auth on the /responses path", async () => {
     let path: string | undefined;
     let authHeader: string | undefined;
+    let idempotencyHeader: string | undefined;
     let requestBody: Record<string, unknown> = {};
     const baseUrl = await withServer((request, response) => {
       path = request.url;
       authHeader = request.headers["authorization"];
+      idempotencyHeader = request.headers["idempotency-key"] as string | undefined;
       let raw = "";
       request.on("data", (chunk) => {
         raw += String(chunk);
@@ -645,9 +647,10 @@ describe("router client", () => {
       apiKey: "sk-test",
     });
     const events: Array<Record<string, unknown>> = [];
-    for await (const event of client.streamEvents({ input: [] })) events.push(event);
+    for await (const event of client.streamEvents({ input: [] }, undefined, { "Idempotency-Key": "durable-step-1" })) events.push(event);
     expect(path).toBe("/v1/responses");
     expect(authHeader).toBe("Bearer sk-test");
+    expect(idempotencyHeader).toBe("durable-step-1");
     expect(requestBody).toMatchObject({ model: "gpt-test", stream: true });
     expect(events.map((event) => event.type)).toEqual(["response.output_text.delta", "response.completed"]);
   });
@@ -697,10 +700,12 @@ describe("router client", () => {
     let apiKeyHeader: string | undefined;
     let versionHeader: string | undefined;
     let authHeader: string | undefined | null;
+    let idempotencyHeader: string | undefined;
     const baseUrl = await withServer((request, response) => {
       apiKeyHeader = request.headers["x-api-key"] as string | undefined;
       versionHeader = request.headers["anthropic-version"] as string | undefined;
       authHeader = request.headers["authorization"] ?? null;
+      idempotencyHeader = request.headers["idempotency-key"] as string | undefined;
       response.setHeader("Content-Type", "text/event-stream");
       response.write('data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3}}}\n\n');
       response.write('data: {"type":"ping"}\n\n');
@@ -712,10 +717,11 @@ describe("router client", () => {
       apiKey: "ak-test",
     });
     const events: Array<Record<string, unknown>> = [];
-    for await (const event of client.streamEvents({ messages: [] })) events.push(event);
+    for await (const event of client.streamEvents({ messages: [] }, undefined, { "Idempotency-Key": "durable-step-2" })) events.push(event);
     expect(apiKeyHeader).toBe("ak-test");
     expect(versionHeader).toBe("2023-06-01");
     expect(authHeader).toBeNull();
+    expect(idempotencyHeader).toBe("durable-step-2");
     expect(events.map((event) => event.type)).toEqual(["message_start", "ping", "message_stop"]);
   });
 

@@ -645,11 +645,18 @@ export class OpenAIResponsesClient {
     this.#fetch = options.fetchImpl ?? fetch;
   }
 
-  async *streamEvents(body: Record<string, unknown>, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+  async *streamEvents(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    metadata?: Record<string, string>,
+  ): AsyncGenerator<Record<string, unknown>> {
     const url = requestUrl(this.#provider, this.#provider.endpointPath ?? "/responses");
     const init: RequestInit = {
       method: "POST",
-      headers: buildHeaders(this.#provider, this.#apiKey, { appName: this.#appName }),
+      headers: buildHeaders(this.#provider, this.#apiKey, {
+        appName: this.#appName,
+        ...(metadata ? { metadata } : {}),
+      }),
       body: JSON.stringify({ ...body, model: body.model ?? this.#provider.defaultModel, stream: true }),
     };
     if (signal) init.signal = signal;
@@ -722,11 +729,18 @@ export class AnthropicMessagesClient {
     this.#fetch = options.fetchImpl ?? fetch;
   }
 
-  async *streamEvents(body: Record<string, unknown>, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+  async *streamEvents(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    metadata?: Record<string, string>,
+  ): AsyncGenerator<Record<string, unknown>> {
     const url = requestUrl(this.#provider, this.#provider.endpointPath ?? "/messages");
     const init: RequestInit = {
       method: "POST",
-      headers: buildHeaders(this.#provider, this.#apiKey, { appName: this.#appName }),
+      headers: buildHeaders(this.#provider, this.#apiKey, {
+        appName: this.#appName,
+        ...(metadata ? { metadata } : {}),
+      }),
       body: JSON.stringify({ ...body, model: body.model ?? this.#provider.defaultModel, stream: true }),
     };
     if (signal) init.signal = signal;

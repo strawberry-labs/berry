@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
-import { initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 
 describe("cloud shell bootstrap", () => {
   it("does not issue live requests for fixture task and session identifiers", () => {
@@ -27,6 +28,59 @@ describe("cloud shell bootstrap", () => {
   it("does not load organization administration data for ordinary members", () => {
     expect(shouldRefreshAdministration(["org:read", "departments:read", "sso:read"])).toBe(false);
     expect(shouldRefreshAdministration(["org:read", "org:admin"])).toBe(true);
+  });
+
+  it("checks durable state after network and retryable gateway failures", () => {
+    expect(shouldConfirmTurnAdmission(new TypeError("connection reset"))).toBe(true);
+    expect(shouldConfirmTurnAdmission(new BerryApiError("gateway timeout", 504, null))).toBe(true);
+    expect(shouldConfirmTurnAdmission(new BerryApiError("invalid request", 400, null))).toBe(false);
+    expect(shouldConfirmTurnAdmission(new BerryApiError("different active turn", 409, null))).toBe(false);
+  });
+
+  it("confirms a response-lost admission even when the run already completed", async () => {
+    const request = {
+      operationId: "00000000-0000-7000-8000-000000000001",
+      input: "Run the task",
+      workspacePath: "/workspace",
+      provider: { id: "provider" },
+    } satisfies StartTurnRequest;
+    const client = {
+      startTurn: vi.fn(async () => ({ turnId: "turn_completed", sessionId: "session_1" })),
+      turnState: vi.fn(async () => ({
+        active: false,
+        turnId: "turn_completed",
+        bufferedEvents: [],
+        replayOnly: false,
+        owner: null,
+        runState: "completed" as const,
+        waitingReason: null,
+        nextAction: null,
+        error: null,
+      })),
+    };
+
+    await expect(retryTurnAdmission(client, "session_1", request)).resolves.toMatchObject({
+      started: { turnId: "turn_completed" },
+      state: { active: false, turnId: "turn_completed", runState: "completed" },
+    });
+    expect(client.startTurn).toHaveBeenCalledWith("session_1", request);
+  });
+
+  it("retries server session revocation and requires a successful response", async () => {
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection reset"))
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: true, status: 204 });
+
+    await expect(revokeAuthSession("https://api.example.test", {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      retryDelaysMs: [0, 0, 0],
+    })).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenLastCalledWith("https://api.example.test/v1/auth/sign-out", {
+      method: "POST",
+      credentials: "include",
+    });
   });
 
   it("shows only administration screens allowed by the active role", () => {
