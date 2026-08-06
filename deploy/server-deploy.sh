@@ -75,10 +75,14 @@ changed_files="$(git diff --name-only "$deployed_ref" "$target_ref")"
 git reset --hard "$target_ref"
 
 if grep -q '^BERRY_OBJECT_STORAGE_MODE=r2$' "$env_file"; then
+  berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis api worker web"
+  berry_initialize_minio=false
   compose() {
     docker compose --env-file "$env_file" -f deploy/compose.yaml "$@"
   }
 else
+  berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis minio api worker web"
+  berry_initialize_minio=true
   compose() {
     docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml "$@"
   }
@@ -110,7 +114,13 @@ if [ "$berry_configure_roles" = true ]; then
 fi
 
 if [ "$berry_compose_changed" = true ]; then
-  compose up -d --no-build --pull never --remove-orphans --wait --wait-timeout 120
+  # Wait only for long-running services. Compose reports a successful one-shot
+  # container such as minio-init as an error under `up --wait`, and following
+  # API dependencies here would also run migrations and role setup twice.
+  compose up -d --no-deps --no-build --pull never --remove-orphans --wait --wait-timeout 120 $berry_runtime_services
+  if [ "$berry_initialize_minio" = true ]; then
+    compose run --rm --no-deps minio-init
+  fi
 elif [ -n "$berry_restart_services" ]; then
   echo "Restarting affected services:$berry_restart_services"
   compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 $berry_restart_services

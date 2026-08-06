@@ -161,7 +161,7 @@ assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy
 assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS=", "BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY=", "BERRY_SANDBOX_TTL_SECONDS=300"]);
 assertContains("deploy/PRODUCTION.md", productionRunbook, ["aesg-v2.berry.me", "pause/reconnect", "deploy/backup.sh", "bak-sandbox-ttl-300"]);
 assertContains("deploy/server-deploy.sh", serverDeploy, ["max_sandbox_ttl_seconds=300", "Deployment automation will not replace the production environment file"]);
-assertContains("deploy/server-deploy.sh", serverDeploy, ["deployment-impact.sh", "compose build $berry_image_services", "--wait-timeout 120"]);
+assertContains("deploy/server-deploy.sh", serverDeploy, ["deployment-impact.sh", "compose build $berry_image_services", "berry_runtime_services=", "compose run --rm --no-deps minio-init", "--wait-timeout 120 $berry_runtime_services"]);
 assertContains("deploy/deployment-impact.sh", deploymentImpact, ["packages/db/*", "berry_run_migrations=true", "deploy/compose.yaml"]);
 
 console.log("[compose] self-host deployment config OK");
