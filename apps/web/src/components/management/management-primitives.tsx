@@ -997,17 +997,23 @@ export function ManagementSwitch({
   onCheckedChange,
   disabled,
   "aria-label": ariaLabel,
+  "aria-describedby": ariaDescribedBy,
+  title,
 }: {
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
   disabled?: boolean;
   "aria-label"?: string;
+  "aria-describedby"?: string;
+  title?: string;
 }) {
   return (
     <Switch
       checked={checked}
       disabled={disabled}
       aria-label={ariaLabel}
+      aria-describedby={ariaDescribedBy}
+      title={title}
       onCheckedChange={onCheckedChange}
     />
   );

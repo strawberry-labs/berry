@@ -556,13 +556,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [navigateHome, navigateToTask]);
 
   const navigateToSettings = React.useCallback((tab: SettingsTab) => {
-    if (tab === "governance") {
-      void navigate({ to: "/admin/$tab", params: { tab: "organization" } });
-    } else if (tab === "platform") {
-      void navigate({ to: "/platform/$tab", params: { tab: "organizations" } });
-    } else {
-      void navigate({ to: "/settings/$tab", params: { tab: tab as UserSettingsTab } });
-    }
+    void navigate({ to: "/settings/$tab", params: { tab: tab as UserSettingsTab } });
   }, [navigate]);
 
   const navigateToLibrary = React.useCallback((tab: ArtifactLibraryTab) => {
@@ -2387,7 +2381,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             onOpenChange={setTaskFilesOpen}
             client={client}
             taskId={activeTask.id}
-            projectTaskIds={tasks.filter((task) => task.workspaceId === activeTask.workspaceId).map((task) => task.id)}
+            projectWorkspaceId={activeTask.workspaceId}
             projectName={workspaces.find((workspace) => workspace.id === activeTask.workspaceId)?.name ?? "this project"}
           />
         </React.Suspense>

@@ -1,5 +1,6 @@
 import {
   BerryWorkerJobNameSchema,
+  FileDeleteObjectJobPayloadSchema,
   SandboxSnapshotJobPayloadSchema,
   type BerryWorkerJobMap,
   type BerryWorkerJobName,
@@ -30,6 +31,7 @@ export class RuntimeOutboxDispatcher {
       batchSize?: number;
       terminalCleanupIntervalMs?: number;
       terminalCleanupBatchSize?: number;
+      deliveryReceiptRetryMs?: number;
     },
   ) {}
 
@@ -146,12 +148,19 @@ export class RuntimeOutboxDispatcher {
         try {
           const name = parsedName.data;
           await this.prepare(row, name);
+          const payload = name === "file.delete-object"
+            ? FileDeleteObjectJobPayloadSchema.parse({
+                ...(isRecord(row.payload) ? row.payload : {}),
+                outboxId: row.id,
+              })
+            : row.payload as BerryWorkerJobMap[typeof name];
           await this.queue.enqueue(
             name,
-            row.payload as BerryWorkerJobMap[typeof name],
-            { jobId: outboxJobId(name, row.id) },
+            payload as BerryWorkerJobMap[typeof name],
+            { jobId: outboxJobId(name, row.id, row.attempts) },
           );
-          await this.complete(row);
+          if (name === "file.delete-object") await this.deferForDeliveryReceipt(row);
+          else await this.complete(row);
           dispatched += 1;
         } catch (error) {
           await this.fail(row, error instanceof Error ? error.message : String(error), false);
@@ -200,6 +209,20 @@ export class RuntimeOutboxDispatcher {
     });
   }
 
+  private async deferForDeliveryReceipt(row: OutboxRow): Promise<void> {
+    const retryMs = Math.max(30_000, this.options.deliveryReceiptRetryMs ?? 300_000);
+    await this.withTenant(row.tenant_id, async (executor) => {
+      await executor.execute(`
+        UPDATE runtime_outbox
+        SET lease_owner = NULL, lease_expires_at = NULL,
+            available_at = now() + ($4::bigint * interval '1 millisecond'),
+            last_error = 'Awaiting object-deletion receipt', updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND lease_owner = $3 AND completed_at IS NULL
+      `, [row.tenant_id, row.id, this.options.workerId, retryMs]);
+    });
+  }
+
   private terminalCleanupDue(): boolean {
     const now = Date.now();
     if (now < this.#nextTerminalCleanupAt) return false;
@@ -245,6 +268,11 @@ export class RuntimeOutboxDispatcher {
   }
 }
 
-export function outboxJobId(name: BerryWorkerJobName, outboxId: string): string {
-  return `outbox-${name.replaceAll(".", "-")}-${outboxId}`;
+export function outboxJobId(name: BerryWorkerJobName, outboxId: string, attempt = 1): string {
+  const base = `outbox-${name.replaceAll(".", "-")}-${outboxId}`;
+  return name === "file.delete-object" ? `${base}-delivery-${attempt}` : base;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }

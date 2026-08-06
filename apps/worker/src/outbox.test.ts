@@ -144,6 +144,62 @@ describe("RuntimeOutboxDispatcher", () => {
     );
   });
 
+  it("keeps object deletion pending until the worker records a delivery receipt", async () => {
+    let claimCount = 0;
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+        statements.push({ sql, params });
+      }),
+      query: async <T>(sql: string): Promise<readonly T[]> => {
+        if (sql.includes("RETURNING outbox.id") && claimCount < 2) {
+          claimCount += 1;
+          return [{
+            id: outboxId,
+            tenant_id: tenantId,
+            event_type: "file.delete-object",
+            payload: {
+              tenantId,
+              fileId: runId,
+              bucket: "berry-test",
+              keys: ["artifacts/file.png"],
+            },
+            attempts: claimCount,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const enqueue = vi.fn(async () => ({ id: "queued", name: "file.delete-object" as const }));
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: enqueue as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-test",
+      deliveryReceiptRetryMs: 30_000,
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(1);
+    await expect(dispatcher.dispatchDue()).resolves.toBe(1);
+
+    expect(enqueue).toHaveBeenNthCalledWith(1, "file.delete-object", {
+      outboxId,
+      tenantId,
+      fileId: runId,
+      bucket: "berry-test",
+      keys: ["artifacts/file.png"],
+    }, { jobId: `outbox-file-delete-object-${outboxId}-delivery-1` });
+    expect(enqueue).toHaveBeenNthCalledWith(2, "file.delete-object", expect.any(Object), {
+      jobId: `outbox-file-delete-object-${outboxId}-delivery-2`,
+    });
+    const receiptWaits = statements.filter(({ sql }) => sql.includes("Awaiting object-deletion receipt"));
+    expect(receiptWaits).toHaveLength(2);
+    expect(receiptWaits.every(({ sql }) => sql.includes("completed_at IS NULL"))).toBe(true);
+    expect(statements.some(({ sql }) => sql.includes("SET completed_at = now()"))).toBe(false);
+  });
+
   it("discovers and dispatches due rows for every active tenant", async () => {
     const secondTenantId = "00000000-0000-7000-8000-000000000010";
     const executor: SqlExecutor = {

@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
-import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
+import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
 import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
   it("does not issue live requests for fixture task and session identifiers", () => {
@@ -119,8 +120,12 @@ describe("cloud shell bootstrap", () => {
     });
   });
 
-  it("shows only administration screens allowed by the active role", () => {
-    const visible = visibleNavigationGroups(ADMIN_NAV, ["org:read", "members:read"]);
+  it("hides organization administration from non-admin members", () => {
+    expect(visibleAdministrationGroups(["org:read", "models:read", "skills:read"])).toEqual([]);
+  });
+
+  it("shows only permitted administration screens to organization admins", () => {
+    const visible = visibleAdministrationGroups(["org:admin", "org:read", "members:read"]);
     expect(visible.flatMap((group) => group.items.map((item) => item.id))).toEqual(["overview", "people", "ai-tools"]);
   });
 
@@ -135,6 +140,21 @@ describe("cloud shell bootstrap", () => {
     }))).toEqual([
       { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived chats"]] },
     ]);
+  });
+
+  it("shows bounded allowance progress and a human-readable reset date", () => {
+    const allowance = {
+      effectiveLimitMicros: "100000000",
+      usedMicros: "1250000",
+      reservedMicros: "250000",
+    };
+    expect(allowanceProgress(allowance as Parameters<typeof allowanceProgress>[0])).toBe(1.5);
+    expect(formatAllowanceResetDate("2026-08-31T00:00:00.000Z")).toBe(
+      new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" })
+        .format(new Date("2026-08-31T00:00:00.000Z")),
+    );
+
+    expect(allowanceProgress({ ...allowance, usedMicros: "999000000" } as Parameters<typeof allowanceProgress>[0])).toBe(100);
   });
 
   it("shows the composer project switcher only when the transcript is empty", () => {

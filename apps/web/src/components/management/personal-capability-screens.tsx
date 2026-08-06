@@ -415,45 +415,54 @@ export function PersonalSkillsScreen({
         <DataTable
           label="Skills"
           columns={["Skill", "Provided by", "Policy", "Status"]}
-          rows={rows.map((skill) => [
-            <Button
-              variant="ghost"
-              className="grid h-auto max-w-80 justify-start gap-0.5 p-0 text-left [&_b]:truncate [&_small]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"
-              onClick={() => setSelected(skill)}
-            >
-              <b>
-                {skill.name.startsWith("$") ? skill.name : `$${skill.name}`}
-              </b>
-              <small>{skill.description}</small>
-            </Button>,
-            skill.provenance === "organization"
-              ? "Organization"
-              : skill.provenance === "personal"
-                ? "You"
-                : "Deployment",
-            skill.personal && !skill.personal.trusted ? (
-              <StatusPill tone="warning">Trust required</StatusPill>
-            ) : (
-              <StatusPill tone={skill.locked ? "neutral" : "info"}>
-                {skill.assignment
-                  ? skill.assignment.replace("-", " ")
-                  : skill.reason}
-              </StatusPill>
-            ),
-            <span className="inline-flex items-center gap-2 [&_small]:text-xs [&_small]:text-muted-foreground">
-              <ManagementSwitch
-                checked={skill.enabled}
-                disabled={
-                  !client ||
-                  skill.locked ||
-                  Boolean(skill.personal && !skill.personal.trusted)
-                }
-                onCheckedChange={(enabled) => void toggle(skill, enabled)}
-                aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
-              />
-              <small>{skill.enabled ? "On" : "Off"}</small>
-            </span>,
-          ])}
+          rows={rows.map((skill) => {
+            const controlHint = skillControlHint(skill, Boolean(client));
+            const hintId = `skill-control-${skill.key.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+            return [
+              <Button
+                variant="ghost"
+                className="grid h-auto max-w-80 justify-start gap-0.5 p-0 text-left [&_b]:truncate [&_small]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"
+                onClick={() => setSelected(skill)}
+              >
+                <b>
+                  {skill.name.startsWith("$") ? skill.name : `$${skill.name}`}
+                </b>
+                <small>{skill.description}</small>
+              </Button>,
+              skill.provenance === "organization"
+                ? "Organization"
+                : skill.provenance === "personal"
+                  ? "You"
+                  : "Deployment",
+              skill.personal && !skill.personal.trusted ? (
+                <span className="inline-flex flex-wrap items-center gap-1.5">
+                  <StatusPill tone="warning">Trust required</StatusPill>
+                  <Button variant="ghost" size="xs" onClick={() => setSelected(skill)}>Review &amp; trust</Button>
+                </span>
+              ) : (
+                <StatusPill tone={skill.locked ? "neutral" : "info"}>
+                  {skill.assignment
+                    ? skill.assignment.replace("-", " ")
+                    : skill.reason}
+                </StatusPill>
+              ),
+              <span className="inline-flex items-center gap-2 [&_small]:max-w-40 [&_small]:text-xs [&_small]:text-[var(--berry-text-secondary)]">
+                <ManagementSwitch
+                  checked={skill.enabled}
+                  disabled={
+                    !client ||
+                    skill.locked ||
+                    Boolean(skill.personal && !skill.personal.trusted)
+                  }
+                  onCheckedChange={(enabled) => void toggle(skill, enabled)}
+                  aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
+                  aria-describedby={hintId}
+                  title={controlHint}
+                />
+                <small id={hintId}>{controlHint}</small>
+              </span>,
+            ];
+          })}
         />
       </AsyncState>
       {selected ? (
@@ -583,6 +592,20 @@ function buildSkillRows(
     (a, b) =>
       a.provenance.localeCompare(b.provenance) || a.name.localeCompare(b.name),
   );
+}
+
+export function skillControlHint(
+  skill: Pick<SkillCatalogRow, "enabled" | "locked" | "personal">,
+  hasClient: boolean,
+): string {
+  if (!hasClient) return "Connect to Berry to change this setting";
+  if (skill.personal && !skill.personal.trusted)
+    return "Review and trust before enabling";
+  if (skill.locked)
+    return skill.enabled
+      ? "Required by your organization"
+      : "Disabled by your organization";
+  return skill.enabled ? "On" : "Off";
 }
 
 export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {

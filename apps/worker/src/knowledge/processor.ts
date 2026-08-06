@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { EmbeddingProvider } from "@berry/shared";
 import type { KnowledgeIndexTaskJobPayload, KnowledgeRevisionJobPayload } from "../jobs.js";
-import { SqlKnowledgeRepository } from "./repository.js";
+import { knowledgeDerivativeKey, SqlKnowledgeRepository } from "./repository.js";
 import { DocumentExtractor, KnowledgeChunker, type KnowledgeObjectStore } from "./services.js";
 
 const EMBEDDING_BATCH_SIZE = 32;
@@ -37,7 +37,14 @@ export class KnowledgeProcessor {
 
   private async extract(payload: KnowledgeRevisionJobPayload): Promise<{ stale: boolean; bytes?: number }> {
     const claimed = await this.dependencies.repository.markExtracting(payload.tenantId, payload.sourceId, payload.revision);
-    if (!claimed) return { stale: true };
+    if (!claimed) {
+      await this.dependencies.repository.cleanupUnclaimedExtraction(
+        payload.tenantId,
+        payload.sourceId,
+        payload.revision,
+      );
+      return { stale: true };
+    }
     const source = await this.dependencies.repository.loadSource(payload.tenantId, payload.sourceId, payload.revision);
     if (!source || source.tombstonedAt) return { stale: true };
     if (source.sourceType !== "file" || !source.bucket || !source.objectKey) {
@@ -58,14 +65,14 @@ export class KnowledgeProcessor {
       const text = await this.dependencies.extractor.extract({ bytes, mediaType: source.mediaType });
       if (!text) throw new Error("Document extraction produced no text");
       const encoded = new TextEncoder().encode(text);
-      const derivativeObjectKey = derivativeKey(source.objectKey, source.revision);
+      const derivativeObjectKey = knowledgeDerivativeKey(source.objectKey, source.revision);
       await this.dependencies.objects.write({
         bucket: source.bucket,
         key: derivativeObjectKey,
         mediaType: "text/plain; charset=utf-8",
         body: encoded,
       });
-      await this.dependencies.repository.saveExtraction({
+      const saved = await this.dependencies.repository.saveExtraction({
         tenantId: payload.tenantId,
         source,
         derivativeObjectKey,
@@ -73,7 +80,7 @@ export class KnowledgeProcessor {
         sizeBytes: encoded.byteLength,
         contentHash: createHash("sha256").update(encoded).digest("hex"),
       });
-      return { stale: false, bytes: encoded.byteLength };
+      return saved ? { stale: false, bytes: encoded.byteLength } : { stale: true };
     } catch (error) {
       await this.dependencies.repository.markFailed(
         payload.tenantId,
@@ -156,10 +163,4 @@ export class KnowledgeProcessor {
     await this.dependencies.repository.replaceChunks({ tenantId: payload.tenantId, source: result.source, chunks });
     return { stale: false, chunks: chunks.length };
   }
-}
-
-function derivativeKey(objectKey: string, revision: string): string {
-  const safeRevision = createHash("sha256").update(revision).digest("hex").slice(0, 16);
-  const base = objectKey.includes("/original/") ? objectKey.replace(/\/original\/.*$/, "/derivatives") : `${objectKey}.derivatives`;
-  return `${base}/text-${safeRevision}.txt`;
 }

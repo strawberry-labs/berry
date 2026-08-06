@@ -16,6 +16,58 @@ describe("BerryApiClient", () => {
     );
   });
 
+  it("deletes a library file through the authenticated file API", async () => {
+    const fetchImpl = vi.fn(async () => json({ ok: true }));
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      headers: { Authorization: "Bearer session" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(client.deleteFile("file/with spaces")).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/files/file%2Fwith%20spaces",
+      expect.objectContaining({ method: "DELETE", credentials: "include" }),
+    );
+  });
+
+  it("downloads private file bytes with auth headers and cancellation", async () => {
+    const payload = new Blob(["berry-file"], { type: "text/plain" });
+    const calls: Array<{ input: RequestInfo | URL; init: RequestInit | undefined }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init });
+      return new Response(payload);
+    });
+    const controller = new AbortController();
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      headers: { Authorization: "Bearer session" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const downloaded = await client.downloadFile("file_1", { signal: controller.signal });
+
+    await expect(downloaded.text()).resolves.toBe("berry-file");
+    const init = calls[0]!.init;
+    expect(init).toEqual(expect.objectContaining({ method: "GET", credentials: "include", signal: controller.signal }));
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer session");
+    expect(new Headers(init?.headers).get("Accept")).toBe("application/octet-stream");
+  });
+
+  it("returns structured errors when a private file download is rejected", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ message: "File not found" }), {
+      status: 404,
+      headers: { "content-type": "application/json" },
+    }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.downloadFile("missing")).rejects.toMatchObject({
+      name: "BerryApiError",
+      status: 404,
+      body: { message: "File not found" },
+    });
+  });
+
   it("calls browser-style fetch implementations without a class receiver", async () => {
     let receiver: unknown = "not-called";
     const fetchImpl = async function(this: unknown) {

@@ -177,3 +177,8 @@ export function visibleNavigationGroups(groups: NavGroup[], permissions: readonl
     }))
     .filter((group) => group.items.length > 0);
 }
+
+export function visibleAdministrationGroups(permissions: readonly OrgPermission[]): NavGroup[] {
+  if (!permissions.includes("org:admin")) return [];
+  return visibleNavigationGroups(ADMIN_NAV, permissions);
+}

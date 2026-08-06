@@ -51,6 +51,8 @@ durableContext:
   chunkOverlapTokens: 50
   retrievalTokenBudget: 5000
   runLeaseSeconds: 90
+  modelIdleTimeoutMs: 240000
+  modelMaxDurationMs: 900000
   snapshotIntervalSeconds: 900
   maxInputBytes: "104857600"
   maxOutputBytes: "26214400"

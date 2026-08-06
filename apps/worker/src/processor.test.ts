@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { BerryWorkerDependencies } from "./processor.js";
 import { processBerryWorkerJob } from "./processor.js";
 
@@ -96,5 +96,47 @@ describe("processBerryWorkerJob", () => {
     await processBerryWorkerJob("context.cleanup", { tenantId, runId, batchSize: 25 }, dependencies);
 
     expect(calls).toEqual(["backfill:50:0", "cleanup:30:25"]);
+  });
+
+  it("validates and dispatches durable object deletion jobs", async () => {
+    const dependencies = testDependencies();
+    const calls: unknown[] = [];
+    dependencies.fileDeleter = {
+      async delete(payload) {
+        calls.push(payload);
+        return { deleted: payload.keys.length };
+      },
+    };
+    const fileId = "00000000-0000-7000-8000-000000000010";
+
+    await expect(processBerryWorkerJob("file.delete-object", {
+      outboxId: "00000000-0000-7000-8000-000000000011",
+      tenantId,
+      fileId,
+      bucket: "berry-test",
+      keys: ["artifacts/file.png", "artifacts/preview.png"],
+    }, dependencies)).resolves.toEqual({ deleted: 2 });
+    expect(calls).toEqual([{
+      outboxId: "00000000-0000-7000-8000-000000000011",
+      tenantId,
+      fileId,
+      bucket: "berry-test",
+      keys: ["artifacts/file.png", "artifacts/preview.png"],
+    }]);
+  });
+
+  it("rejects malformed object deletion jobs before storage is touched", async () => {
+    const dependencies = testDependencies();
+    const remove = vi.fn();
+    dependencies.fileDeleter = { delete: remove };
+
+    await expect(processBerryWorkerJob("file.delete-object", {
+      outboxId: "00000000-0000-7000-8000-000000000011",
+      tenantId,
+      fileId: "not-a-uuid",
+      bucket: "berry-test",
+      keys: [],
+    }, dependencies)).rejects.toThrow();
+    expect(remove).not.toHaveBeenCalled();
   });
 });

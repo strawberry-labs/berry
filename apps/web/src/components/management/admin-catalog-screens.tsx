@@ -711,8 +711,12 @@ function ModelsScreen({
             client.listOrgModelDefaults(tenantId),
             client.listOrganizationModelProviders(tenantId),
             client.listOrgAiAccessRules(tenantId),
-            client.listOrgMembers(tenantId),
-            client.listDepartments(tenantId),
+            permissions.includes("members:read")
+              ? client.listOrgMembers(tenantId)
+              : Promise.resolve([]),
+            permissions.includes("departments:read")
+              ? client.listDepartments(tenantId)
+              : Promise.resolve([]),
           ])
         : [
             config.modelPolicies as any[],

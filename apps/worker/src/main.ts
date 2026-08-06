@@ -31,6 +31,7 @@ import {
 } from "./sandbox-continuity.ts";
 import { SqlMaintenanceRunner } from "./maintenance.ts";
 import { createDurableTurnToolsFromEnv } from "./mcp-tools.ts";
+import { S3FileObjectDeleter, SqlFileDeletionReceiptStore } from "./file-deletion.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const durableConfig = durableContextConfigFromEnv(env);
@@ -102,6 +103,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     durableConfig.memoryEnabled,
   );
   const durableTools = createDurableTurnToolsFromEnv(env, memoryTools);
+  const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
   const worker = createBerryWorker({
     titles: new SqlTaskTitleRepository(executor),
     usage: new SqlUsageRollupRepository(executor),
@@ -125,11 +127,20 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
         owner: `${hostname()}:${process.pid}:${randomUUID()}:turn`,
         leaseSeconds: durableConfig.runLeaseSeconds,
         snapshotIntervalSeconds: durableConfig.sandboxSnapshotIntervalSeconds,
+        modelIdleTimeoutMs: Math.min(
+          positiveInteger(env.BERRY_MODEL_IDLE_TIMEOUT_MS) ?? 240_000,
+          300_000,
+        ),
+        modelMaxDurationMs: Math.min(
+          positiveInteger(env.BERRY_MODEL_MAX_DURATION_MS) ?? 900_000,
+          1_800_000,
+        ),
         compactor,
       },
     ),
     snapshotter: sandboxContinuity,
     maintenance: new SqlMaintenanceRunner(executor),
+    ...(fileDeleter ? { fileDeleter } : {}),
     tenantContext: {
       run: (tenantId, callback) => executor.runWithTenant(tenantId, callback),
     },

@@ -117,6 +117,11 @@ export class FilePlatformController {
   content(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Query("download") download: string | undefined, @Res() response: ServerResponse) {
     return this.files.streamContent(tenant(), user(request), z.string().uuid().parse(fileId), typeof request.headers.range === "string" ? request.headers.range : undefined, response, download === "1");
   }
+
+  @Delete(":fileId")
+  remove(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string) {
+    return this.files.deleteOwnedFile(tenant(), user(request), parse(z.string().uuid(), fileId));
+  }
 }
 
 @Controller("/v1/workspaces/:workspaceId/files")

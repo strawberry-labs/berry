@@ -77,9 +77,32 @@ export class SqlKnowledgeRepository {
     mediaType: string;
     sizeBytes: number;
     contentHash: string;
-  }): Promise<void> {
-    await this.withTenant(input.tenantId, async (executor) => {
+  }): Promise<boolean> {
+    return this.withTenant(input.tenantId, async (executor) => {
       if (input.source.sourceType !== "file") throw new Error("Only file sources create text derivatives");
+      const [current] = await executor.query<{
+        id: string;
+        source_revision: string;
+        tombstoned_at: Date | string | null;
+        file_deleted_at: Date | string | null;
+      }>(`
+        SELECT ks.id, ks.source_revision, ks.tombstoned_at,
+               f.deleted_at AS file_deleted_at
+        FROM knowledge_sources ks
+        JOIN files f ON ks.source_type = 'file' AND f.id = ks.source_id::uuid
+        WHERE ks.tenant_id = $1::uuid AND ks.id = $2::uuid
+        FOR UPDATE OF ks, f
+      `, [input.tenantId, input.source.id]);
+      if (!current || current.source_revision !== input.source.revision || current.file_deleted_at) {
+        if (!input.source.bucket) throw new Error("Stale file extraction has no object-storage bucket");
+        await this.enqueueDerivativeDeletion(executor, {
+          tenantId: input.tenantId,
+          fileId: input.source.sourceId,
+          bucket: input.source.bucket,
+          objectKey: input.derivativeObjectKey,
+        });
+        return false;
+      }
       await executor.execute(`
         INSERT INTO file_derivatives (
           tenant_id, file_id, kind, status, object_key, media_type, size_bytes,
@@ -93,6 +116,10 @@ export class SqlKnowledgeRepository {
           media_type = EXCLUDED.media_type, size_bytes = EXCLUDED.size_bytes,
           metadata = EXCLUDED.metadata, error = NULL, updated_at = now()
       `, [input.tenantId, input.source.sourceId, input.derivativeObjectKey, input.mediaType, input.sizeBytes, input.contentHash]);
+      // A project unlink tombstones only this knowledge source. Preserve the
+      // file-level derivative for other projects, but do not continue this
+      // source's chunking pipeline.
+      if (current.tombstoned_at) return false;
       await executor.execute(`
         UPDATE knowledge_sources
         SET extraction_status = 'available', index_status = 'chunking',
@@ -101,6 +128,7 @@ export class SqlKnowledgeRepository {
           AND source_revision = $3 AND tombstoned_at IS NULL
       `, [input.tenantId, input.source.id, input.source.revision, input.contentHash]);
       await this.enqueue(executor, input.tenantId, "knowledge.chunk", input.source.id, input.source.revision);
+      return true;
     });
   }
 
@@ -114,6 +142,38 @@ export class SqlKnowledgeRepository {
           AND source_revision = $3 AND tombstoned_at IS NULL
       `, [tenantId, source.id, source.revision]);
       await this.enqueue(executor, tenantId, "knowledge.chunk", source.id, source.revision, "cached-extract");
+    });
+  }
+
+  async cleanupUnclaimedExtraction(
+    tenantId: string,
+    sourceId: string,
+    attemptedRevision: string,
+  ): Promise<void> {
+    await this.withTenant(tenantId, async (executor) => {
+      const [source] = await executor.query<{
+        source_type: KnowledgeSourceRecord["sourceType"];
+        source_id: string;
+        source_revision: string;
+        bucket: string | null;
+        object_key: string | null;
+        file_deleted_at: Date | string | null;
+      }>(`
+        SELECT ks.source_type, ks.source_id, ks.source_revision,
+               f.bucket, f.object_key, f.deleted_at AS file_deleted_at
+        FROM knowledge_sources ks
+        JOIN files f ON ks.source_type = 'file' AND f.id = ks.source_id::uuid
+        WHERE ks.tenant_id = $1::uuid AND ks.id = $2::uuid
+        FOR UPDATE OF ks, f
+      `, [tenantId, sourceId]);
+      if (!source || source.source_type !== "file" || !source.bucket || !source.object_key) return;
+      if (source.source_revision === attemptedRevision && !source.file_deleted_at) return;
+      await this.enqueueDerivativeDeletion(executor, {
+        tenantId,
+        fileId: source.source_id,
+        bucket: source.bucket,
+        objectKey: knowledgeDerivativeKey(source.object_key, attemptedRevision),
+      });
     });
   }
 
@@ -478,6 +538,28 @@ export class SqlKnowledgeRepository {
     `, [tenantId, eventType, sourceId, dedupeKey, JSON.stringify({ tenantId, sourceId, revision })]);
   }
 
+  private async enqueueDerivativeDeletion(
+    executor: SqlExecutor,
+    input: { tenantId: string; fileId: string; bucket: string; objectKey: string },
+  ): Promise<void> {
+    const objectDigest = createHash("sha256").update(`${input.bucket}\0${input.objectKey}`).digest("hex");
+    await executor.execute(`
+      INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+      VALUES ($1::uuid, 'file.delete-object', $2, $3, $4::jsonb)
+      ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+    `, [
+      input.tenantId,
+      input.fileId,
+      `file.delete-object:${input.fileId}:stale-derivative:${objectDigest}`,
+      JSON.stringify({
+        tenantId: input.tenantId,
+        fileId: input.fileId,
+        bucket: input.bucket,
+        keys: [input.objectKey],
+      }),
+    ]);
+  }
+
   private async withTenant<T>(tenantId: string, callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {
     const run = async (executor: SqlExecutor) => {
       await executor.execute("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
@@ -513,6 +595,14 @@ type ChunkRow = {
   ordinal: number;
   token_estimate: number;
 };
+
+export function knowledgeDerivativeKey(objectKey: string, revision: string): string {
+  const safeRevision = createHash("sha256").update(revision).digest("hex").slice(0, 16);
+  const base = objectKey.includes("/original/")
+    ? objectKey.replace(/\/original\/.*$/, "/derivatives")
+    : `${objectKey}.derivatives`;
+  return `${base}/text-${safeRevision}.txt`;
+}
 
 function sourceFromRow(row: SourceRow): KnowledgeSourceRecord {
   const metadata = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)

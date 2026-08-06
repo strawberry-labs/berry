@@ -54,6 +54,8 @@ export function AdminScreen({
   const navigate = useNavigate();
   const area = adminAreaForTab(tab);
   const resolvedTab = resolvedAdminTab(tab, p.permissions);
+  if (!p.permissions.includes("org:admin"))
+    return <PermissionDenied label="Organization administration" />;
   const read = permissionFor(resolvedTab);
   if (read && !p.permissions.includes(read as any))
     return <PermissionDenied label={titleFor(resolvedTab)} />;

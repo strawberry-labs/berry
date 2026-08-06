@@ -2780,10 +2780,10 @@ code, pre {
   text-decoration: none;
   font: inherit;
   text-align: left;
-  cursor: pointer;
 }
 
 .berry-library-image-card {
+  position: relative;
   min-width: 0;
   padding: 8px;
   border: 1px solid var(--berry-border);
@@ -2793,6 +2793,8 @@ code, pre {
 }
 
 .berry-library-image-card:hover { border-color: var(--berry-border-strong); transform: translateY(-1px); }
+.berry-library-image-card-open { display: block; width: 100%; min-width: 0; color: inherit; text-align: left; }
+.berry-library-delete { position: absolute; top: 12px; right: 12px; color: var(--berry-text-secondary); background: var(--berry-card-bg); box-shadow: var(--berry-shadow-sm); }
 .berry-library-image-preview { display: grid; place-items: center; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 8px; background: var(--berry-control-bg); }
 .berry-library-image-preview img { width: 100%; height: 100%; object-fit: cover; }
 
@@ -2802,9 +2804,10 @@ code, pre {
 
 .berry-library-document-list { display: grid; gap: 5px; margin-top: 18px; }
 .berry-library-all-documents { margin-top: 24px; }
-.berry-library-document-row { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 8px 12px; border: 1px solid transparent; border-radius: 10px; }
+.berry-library-document-row { display: flex; align-items: center; gap: 4px; min-width: 0; padding: 4px; border: 1px solid transparent; border-radius: 10px; }
 .berry-library-document-row:hover { border-color: var(--berry-border); background: var(--berry-card-bg); }
 .berry-library-document-row .berry-library-meta { padding: 0; }
+.berry-library-document-open { display: flex; min-width: 0; flex: 1; align-items: center; gap: 12px; padding: 4px 8px; color: inherit; text-align: left; }
 .berry-library-file-icon { display: grid; flex: 0 0 38px; height: 38px; place-items: center; border-radius: 9px; color: var(--berry-text-secondary); background: var(--berry-control-bg); }
 .berry-library-file-icon svg { width: 18px; height: 18px; }
 .berry-library-open { color: var(--berry-text-tertiary); font-size: 12px; }

@@ -81,6 +81,8 @@ data:
   BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS: {{ .Values.durableContext.chunkOverlapTokens | quote }}
   BERRY_RETRIEVAL_TOKEN_BUDGET: {{ .Values.durableContext.retrievalTokenBudget | quote }}
   BERRY_RUN_LEASE_SECONDS: {{ .Values.durableContext.runLeaseSeconds | quote }}
+  BERRY_MODEL_IDLE_TIMEOUT_MS: {{ .Values.durableContext.modelIdleTimeoutMs | quote }}
+  BERRY_MODEL_MAX_DURATION_MS: {{ .Values.durableContext.modelMaxDurationMs | quote }}
   BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS: {{ .Values.durableContext.snapshotIntervalSeconds | quote }}
   BERRY_KNOWLEDGE_MAX_INPUT_BYTES: {{ .Values.durableContext.maxInputBytes | quote }}
   BERRY_KNOWLEDGE_MAX_OUTPUT_BYTES: {{ .Values.durableContext.maxOutputBytes | quote }}

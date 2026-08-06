@@ -48,6 +48,7 @@ type FileRow = {
   status: "initiated" | "uploading" | "scanning" | "processing" | "available" | "failed" | "quarantined" | "deleted";
   created_at: Date | string;
   updated_at: Date | string;
+  deleted_at?: Date | string | null;
   task_ids?: string[] | null;
   roles?: Array<"input" | "output" | "reference"> | null;
   workspace_id?: string | null;
@@ -532,6 +533,72 @@ export class FilePlatformService {
     });
   }
 
+  async deleteOwnedFile(tenantId: string, userId: string, fileId: string) {
+    return this.database.withTenant(tenantId, async (executor) => {
+      const file = await this.requireOwnedFileForUpdate(executor, tenantId, userId, fileId);
+      if (file.deleted_at) return { ok: true as const };
+      const sources = await executor.query<{ id: string; source_revision: string }>(`
+        UPDATE knowledge_sources
+        SET tombstoned_at = COALESCE(tombstoned_at, now()),
+            extraction_status = 'deleted', index_status = 'deleted',
+            vector_ready = false, updated_at = now()
+        WHERE tenant_id = $1::uuid AND source_type = 'file'
+          AND source_id = $2 AND tombstoned_at IS NULL
+        RETURNING id, source_revision
+      `, [tenantId, fileId]);
+      await executor.execute(`
+        UPDATE workspace_files
+        SET deleted_at = COALESCE(deleted_at, now()), index_status = 'deleted', updated_at = now()
+        WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND deleted_at IS NULL
+      `, [tenantId, fileId]);
+      const deleted = await executor.query<{ id: string }>(`
+        UPDATE files
+        SET status = 'deleted', deleted_at = now(), updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND owner_user_id = $3::uuid AND deleted_at IS NULL
+        RETURNING id
+      `, [tenantId, fileId, userId]);
+      if (!deleted[0]) throw new NotFoundException("File not found");
+      // Tombstoning the source above takes the same row lock used when an
+      // extraction is saved. Query derivatives only after that lock is held:
+      // an extraction that won the race is now visible, while an extraction
+      // that lost the race will enqueue its own object cleanup.
+      const derivatives = await executor.query<{ object_key: string }>(`
+        SELECT object_key
+        FROM file_derivatives
+        WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND object_key IS NOT NULL
+      `, [tenantId, fileId]);
+      for (const source of sources) {
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+          VALUES ($1::uuid, 'knowledge.delete', $2, $3, $4::jsonb)
+          ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+        `, [
+          tenantId,
+          source.id,
+          `knowledge.delete:${source.id}:${source.source_revision}`,
+          JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision }),
+        ]);
+      }
+      const keys = [...new Set([file.object_key, ...derivatives.map((item) => item.object_key)])];
+      for (let offset = 0; offset < keys.length; offset += 1_000) {
+        const batch = keys.slice(offset, offset + 1_000);
+        const batchNumber = Math.floor(offset / 1_000);
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+          VALUES ($1::uuid, 'file.delete-object', $2, $3, $4::jsonb)
+          ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+        `, [
+          tenantId,
+          fileId,
+          `file.delete-object:${fileId}:${batchNumber}`,
+          JSON.stringify({ tenantId, fileId, bucket: file.bucket, keys: batch }),
+        ]);
+      }
+      return { ok: true as const };
+    });
+  }
+
   async abortUpload(tenantId: string, userId: string, fileId: string, uploadId: string) {
     const config = this.requireConfig();
     const upload = await this.requireUpload(tenantId, userId, fileId, uploadId);
@@ -694,7 +761,12 @@ export class FilePlatformService {
     });
   }
 
-  private async requireOwnedFile(executor: SqlExecutor, tenantId: string, userId: string, fileId: string): Promise<FileRow> {
+  private async requireOwnedFile(
+    executor: SqlExecutor,
+    tenantId: string,
+    userId: string,
+    fileId: string,
+  ): Promise<FileRow> {
     const [row] = await executor.query<FileRow>(`
       SELECT f.*,
         COALESCE(array_remove(array_agg(DISTINCT a.task_id), NULL), '{}') AS task_ids,
@@ -703,8 +775,25 @@ export class FilePlatformService {
           ARRAY[]::text[]
         ) AS roles
       FROM files f LEFT JOIN file_associations a ON a.file_id = f.id
-      WHERE f.tenant_id = $1::uuid AND f.owner_user_id = $2::uuid AND f.id = $3::uuid AND f.deleted_at IS NULL
+      WHERE f.tenant_id = $1::uuid AND f.owner_user_id = $2::uuid AND f.id = $3::uuid
+        AND f.deleted_at IS NULL
       GROUP BY f.id
+    `, [tenantId, userId, fileId]);
+    if (!row) throw new NotFoundException("File not found");
+    return row;
+  }
+
+  private async requireOwnedFileForUpdate(
+    executor: SqlExecutor,
+    tenantId: string,
+    userId: string,
+    fileId: string,
+  ): Promise<FileRow> {
+    const [row] = await executor.query<FileRow>(`
+      SELECT f.*
+      FROM files f
+      WHERE f.tenant_id = $1::uuid AND f.owner_user_id = $2::uuid AND f.id = $3::uuid
+      FOR UPDATE
     `, [tenantId, userId, fileId]);
     if (!row) throw new NotFoundException("File not found");
     return row;

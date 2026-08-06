@@ -10,11 +10,10 @@ import {
   SidebarMenuItem,
 } from "@berry/desktop-ui/components/ui/sidebar";
 import {
-  ADMIN_NAV,
   PERSONAL_NAV,
   PLATFORM_NAV,
   adminAreaForTab,
-  visibleNavigationGroups,
+  visibleAdministrationGroups,
   type ManagementKind,
 } from "../management/management-navigation";
 
@@ -33,7 +32,7 @@ export function WebSettingsNavigation({
   onNavigate: (kind: ManagementKind, tab: string) => void;
   onBack: () => void;
 }) {
-  const adminGroups = visibleNavigationGroups(ADMIN_NAV, permissions);
+  const adminGroups = visibleAdministrationGroups(permissions);
 
   return (
     <>

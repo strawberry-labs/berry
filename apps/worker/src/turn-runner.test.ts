@@ -120,6 +120,101 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("aborts and retries a model request that stops making progress", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let aborted = false;
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => new Promise((_resolve, reject) => {
+        context.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(context.signal?.reason);
+        }, { once: true });
+      }),
+    }, noTools(), { owner: "worker-timeout", modelIdleTimeoutMs: 10 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Model request stalled for 1 seconds without progress");
+    expect(aborted).toBe(true);
+    expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);
+  });
+
+  it("keeps the turn lease until an aborted model request finishes cleanup", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let cleanupFinished = false;
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        try {
+          return await new Promise<never>((_resolve, reject) => {
+            context.signal?.addEventListener("abort", () => reject(context.signal?.reason), { once: true });
+          });
+        } finally {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          cleanupFinished = true;
+        }
+      },
+    }, noTools(), {
+      owner: "worker-cleanup",
+      modelIdleTimeoutMs: 10,
+      abortCleanupTimeoutMs: 100,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Model request stalled");
+    expect(cleanupFinished).toBe(true);
+    expect(repository.current.leaseOwner).toBe("");
+  });
+
+  it("bounds cleanup time when an aborted provider never settles", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => new Promise<never>(() => undefined),
+    }, noTools(), {
+      owner: "worker-stuck-cleanup",
+      modelIdleTimeoutMs: 5,
+      abortCleanupTimeoutMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Model request stalled");
+    expect(repository.current.leaseOwner).toBe("");
+  });
+
+  it("aborts a noisy model stream at its absolute duration limit", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let aborted = false;
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => new Promise((_resolve, reject) => {
+        const activity = setInterval(() => context.reportProgress?.(), 1);
+        context.signal?.addEventListener("abort", () => {
+          clearInterval(activity);
+          aborted = true;
+          reject(context.signal?.reason);
+        }, { once: true });
+      }),
+    }, noTools(), {
+      owner: "worker-max-duration",
+      modelIdleTimeoutMs: 1_000,
+      modelMaxDurationMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Model request exceeded its maximum duration of 1 seconds");
+    expect(aborted).toBe(true);
+    expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);
+  });
+
   it("resumes a running read-only tool safely", async () => {
     const tool = toolStep("running", "read_only", false);
     const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
@@ -720,6 +815,39 @@ describe("durable turn runner", () => {
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
       .rejects.toBeInstanceOf(DurableTurnRetryableError);
+  });
+
+  it("does not release a lease while a non-abort-aware tool is still settling", async () => {
+    const current = snapshot("executing_tool", [admittedStep(), toolStep("pending", "read_only", false)]);
+    const repository = new FakeTurnRepository(current);
+    const order: string[] = [];
+    let heartbeatObserved!: () => void;
+    const heartbeat = new Promise<void>((resolve) => { heartbeatObserved = resolve; });
+    repository.heartbeat = async () => {
+      heartbeatObserved();
+      return false;
+    };
+    repository.release = async () => {
+      order.push("lease-released");
+      repository.current.leaseOwner = "";
+    };
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        await heartbeat;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        order.push("tool-settled");
+        return { output: { ok: true }, summary: "Done" };
+      },
+    }, {
+      owner: "worker-side-effect-heartbeat",
+      heartbeatMs: 1,
+      leaseSeconds: 1,
+      abortCleanupTimeoutMs: 1,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toBeInstanceOf(DurableTurnRetryableError);
+    expect(order).toEqual(["tool-settled", "lease-released"]);
   });
 
   it("continues beyond the former model-iteration limit", async () => {

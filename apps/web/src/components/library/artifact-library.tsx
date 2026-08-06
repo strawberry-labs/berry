@@ -2,14 +2,25 @@ import * as React from "react";
 import type { BerryApiClient } from "@berry/api-client";
 import type { StoredFile, Workspace } from "@berry/shared";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@berry/desktop-ui/components/ui/alert-dialog";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { Input } from "@berry/desktop-ui/components/ui/input";
-import { FileImage, Files, FileText, FolderOpen, RefreshCw, Search } from "@berry/desktop-ui/lib/icons";
+import { FileImage, Files, FileText, FolderOpen, RefreshCw, Search, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { GeneratedImageLightbox, type GeneratedImageView } from "@berry/desktop-ui/components/generated-image-gallery";
 import type { ArtifactLibraryTab } from "@/lib/cloud-shell-state";
 import { DocumentPreviewModal } from "./document-preview-modal";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
+import { toast } from "sonner";
 
 const LIBRARY_PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 220;
@@ -24,6 +35,8 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
   const [selectedProjectId, setSelectedProjectId] = React.useState("");
   const [items, setItems] = React.useState<StoredFile[]>([]);
   const [selected, setSelected] = React.useState<StoredFile | null>(null);
+  const [pendingDelete, setPendingDelete] = React.useState<StoredFile | null>(null);
+  const [deletingId, setDeletingId] = React.useState<string | null>(null);
   const [nextCursor, setNextCursor] = React.useState<string | null>(null);
   const [loadingMore, setLoadingMore] = React.useState(false);
   const [state, setState] = React.useState<"loading" | "ready" | "error">("loading");
@@ -107,6 +120,23 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
     downloadUrl: item.downloadUrl,
   })), [images]);
 
+  const removeFile = React.useCallback(async () => {
+    if (!client || !pendingDelete || deletingId) return;
+    const file = pendingDelete;
+    setDeletingId(file.id);
+    try {
+      await client.deleteFile(file.id);
+      setItems((current) => current.filter((item) => item.id !== file.id));
+      setSelected((current) => current?.id === file.id ? null : current);
+      setPendingDelete(null);
+      toast.success(`${file.name} deleted`);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Unable to delete the file");
+    } finally {
+      setDeletingId(null);
+    }
+  }, [client, deletingId, pendingDelete]);
+
   return (
     <section className="berry-library-page" aria-labelledby="berry-library-title">
       <header className="berry-library-header">
@@ -155,10 +185,13 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
       {state === "ready" && (tab === "all" || tab === "images") && visibleImages.length > 0 ? (
         <div className="berry-library-image-grid">
           {visibleImages.map((item) => (
-            <button type="button" key={item.id} className="berry-library-image-card" onClick={() => setSelected(item)}>
-              <div className="berry-library-image-preview"><img src={item.previewUrl} alt={item.name} loading="lazy" /></div>
-              <ArtifactMeta item={item} />
-            </button>
+            <article key={item.id} className="berry-library-image-card">
+              <button type="button" className="berry-library-image-card-open" onClick={() => setSelected(item)}>
+                <div className="berry-library-image-preview"><img src={item.previewUrl} alt={item.name} loading="lazy" /></div>
+                <ArtifactMeta item={item} />
+              </button>
+              <Button variant="ghost" size="icon-sm" className="berry-library-delete" onClick={() => setPendingDelete(item)} aria-label={`Delete ${item.name}`} title={`Delete ${item.name}`}><Trash2 /></Button>
+            </article>
           ))}
         </div>
       ) : null}
@@ -166,11 +199,14 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
       {state === "ready" && (tab === "all" || tab === "documents") && visibleDocuments.length > 0 ? (
         <div className={`berry-library-document-list${tab === "all" && visibleImages.length > 0 ? " berry-library-all-documents" : ""}`}>
           {visibleDocuments.map((item) => (
-            <button type="button" key={item.id} className="berry-library-document-row" onClick={() => setSelected(item)}>
-              <span className="berry-library-file-icon"><FileTypeIcon path={item.name} className="size-10" /></span>
-              <ArtifactMeta item={item} />
-              <span className="berry-library-open">Open</span>
-            </button>
+            <article key={item.id} className="berry-library-document-row">
+              <button type="button" className="berry-library-document-open" onClick={() => setSelected(item)}>
+                <span className="berry-library-file-icon"><FileTypeIcon path={item.name} className="size-10" /></span>
+                <ArtifactMeta item={item} />
+                <span className="berry-library-open">Open</span>
+              </button>
+              <Button variant="ghost" size="icon-sm" onClick={() => setPendingDelete(item)} aria-label={`Delete ${item.name}`} title={`Delete ${item.name}`}><Trash2 /></Button>
+            </article>
           ))}
         </div>
       ) : null}
@@ -184,6 +220,22 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
       ) : (
         <DocumentPreviewModal file={selected} onOpenChange={(open) => { if (!open) setSelected(null); }} />
       )}
+      <AlertDialog open={Boolean(pendingDelete)} onOpenChange={(open) => { if (!open && !deletingId) setPendingDelete(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete {pendingDelete?.name}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the file from Library, every linked task and project, and project knowledge. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={Boolean(deletingId)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" disabled={Boolean(deletingId)} onClick={(event) => { event.preventDefault(); void removeFile(); }}>
+              {deletingId ? "Deleting…" : "Delete file"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }

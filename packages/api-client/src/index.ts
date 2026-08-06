@@ -704,6 +704,25 @@ export class BerryApiClient {
     return { ...page, items: page.items.map((file) => this.#resolveFileUrls(file)) };
   }
 
+  async deleteFile(fileId: string): Promise<{ ok: true }> {
+    return this.#request(`/v1/files/${encodeURIComponent(fileId)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  async downloadFile(fileId: string, options: { signal?: AbortSignal } = {}): Promise<Blob> {
+    const headers = new Headers(this.#headers);
+    headers.set("Accept", "application/octet-stream");
+    const response = await this.#fetch(
+      `${this.#baseUrl}/v1/files/${encodeURIComponent(fileId)}/content?download=1`,
+      { method: "GET", headers, credentials: "include", ...(options.signal ? { signal: options.signal } : {}) },
+    );
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") ?? "";
+      const body = contentType.includes("application/json") ? await response.json() : await response.text();
+      throw new BerryApiError(`Berry API request failed with ${response.status}`, response.status, body);
+    }
+    return response.blob();
+  }
+
   async listProjectFiles(
     workspaceId: string,
     input: { visibility?: "project" | "task_only"; status?: "pending" | "extracting" | "chunking" | "embedding" | "indexed" | "failed"; search?: string; cursor?: string; limit?: number } = {},

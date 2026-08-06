@@ -37,7 +37,7 @@ import { WebSettingsNavigation } from "./web-settings-navigation";
 
 const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-dialog").then((module) => ({ default: module.ProjectUploadDialog })));
 
-export type SettingsTab = "general" | "account" | "personalization" | "mcp" | "skills" | "usage" | "archived" | "governance" | "platform";
+export type SettingsTab = "general" | "account" | "personalization" | "mcp" | "skills" | "usage" | "archived";
 
 export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
@@ -47,8 +47,6 @@ export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "mcp", label: "MCP servers" },
   { id: "usage", label: "Usage" },
   { id: "archived", label: "Archived chats" },
-  { id: "governance", label: "Organization administration" },
-  { id: "platform", label: "Platform administration" },
 ];
 
 export function WebWindowChrome({ onHome, onSearch }: {
@@ -183,17 +181,25 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
                   <strong className="block truncate text-sm">{user?.name || "Berry account"}</strong>
                   <span className="block truncate text-xs text-muted-foreground">{user?.email}</span>
                 </div>
-                <div className="grid gap-2 rounded-lg border border-border bg-muted/30 p-3">
+                <div className="grid gap-2 rounded-lg border border-[var(--berry-border)] bg-[var(--berry-control-bg)] p-3">
                   <div className="flex items-start justify-between gap-3">
-                    <span className="text-xs text-muted-foreground">Available this cycle</span>
-                    <strong className="text-sm tabular-nums">{allowanceLoading ? "…" : allowance?.availableMicros === null ? "Unlimited" : formatCurrencyMicros(allowance?.availableMicros)}</strong>
+                    <span className="text-xs text-[var(--berry-text-secondary)]">Available this cycle</span>
+                    <strong className="text-sm tabular-nums text-[var(--berry-text-primary)]">{allowanceLoading ? "…" : allowance?.availableMicros === null ? "Unlimited" : formatCurrencyMicros(allowance?.availableMicros)}</strong>
                   </div>
                   <div className="flex items-start justify-between gap-3">
-                    <span className="text-xs text-muted-foreground">Used</span>
-                    <strong className="text-sm tabular-nums">{allowanceLoading ? "…" : formatCurrencyMicros(allowance ? String(BigInt(allowance.usedMicros) + BigInt(allowance.reservedMicros)) : null)}</strong>
+                    <span className="text-xs text-[var(--berry-text-secondary)]">Used</span>
+                    <strong className="text-sm tabular-nums text-[var(--berry-text-primary)]">{allowanceLoading ? "…" : formatCurrencyMicros(allowance ? String(BigInt(allowance.usedMicros) + BigInt(allowance.reservedMicros)) : null)}</strong>
                   </div>
-                  {allowance?.effectiveLimitMicros ? <Progress value={allowanceProgress(allowance)} aria-label={`${Math.round(allowanceProgress(allowance))}% of allowance used`} /> : null}
-                  <span className="text-[11px] text-muted-foreground">{allowance ? `Resets ${new Date(allowance.cycleEnd).toLocaleDateString()}` : "Allowance information is unavailable."}</span>
+                  {allowance?.effectiveLimitMicros ? (
+                    <div className="grid gap-1.5">
+                      <div className="flex items-center justify-between text-[11px] text-[var(--berry-text-secondary)]">
+                        <span>Cycle usage</span>
+                        <span className="tabular-nums">{Math.round(allowanceProgress(allowance))}%</span>
+                      </div>
+                      <Progress value={allowanceProgress(allowance)} aria-label={`${Math.round(allowanceProgress(allowance))}% of allowance used`} />
+                    </div>
+                  ) : null}
+                  <span className="text-[11px] text-[var(--berry-text-secondary)]">{allowance ? `Resets ${formatAllowanceResetDate(allowance.cycleEnd)}` : "Allowance information is unavailable."}</span>
                 </div>
                 <Button variant="ghost" className="justify-start" onClick={onUsage}>
                   <DollarSign />
@@ -220,10 +226,18 @@ function formatCurrencyMicros(value: string | null | undefined): string {
   }).format(Number(value) / 1_000_000);
 }
 
-function allowanceProgress(allowance: AllowanceBalance): number {
+export function allowanceProgress(allowance: AllowanceBalance): number {
   if (!allowance.effectiveLimitMicros || allowance.effectiveLimitMicros === "0") return 0;
   const consumed = Number(allowance.usedMicros) + Number(allowance.reservedMicros);
   return Math.min(100, (consumed / Number(allowance.effectiveLimitMicros)) * 100);
+}
+
+export function formatAllowanceResetDate(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(new Date(value));
 }
 
 function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveChats, onRemove, onReveal, onUpload }: {

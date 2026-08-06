@@ -9,6 +9,18 @@ export type RunPresentation = {
   tone: "neutral";
 };
 
+const ACTIVE_RUN_PRESENTATIONS: Partial<
+  Record<NonNullable<TurnState["runState"]>, readonly [label: string, detail: string]>
+> = {
+  queued: ["Waiting for a worker", "Your request is queued and will start automatically."],
+  assembling_context: ["Preparing context", "Loading the conversation and workspace context."],
+  calling_model: ["Generating a response", "The model is working on the next response."],
+  executing_tool: ["Running a tool", "Berry is completing the current action."],
+  compacting: ["Optimizing context", "Preparing the conversation for the next model call."],
+  persisting_response: ["Saving the response", "Writing the completed response safely."],
+  finalizing: ["Finishing the response", "Saving files and final task state."],
+};
+
 export function runPresentation(
   state: TurnState | null | undefined,
 ): RunPresentation {
@@ -26,7 +38,16 @@ export function runPresentation(
       tone: "neutral",
     };
   }
-  return { visible: false, label: "", detail: "", tone: "neutral" };
+  const presentation = state.runState
+    ? ACTIVE_RUN_PRESENTATIONS[state.runState]
+    : undefined;
+  if (!presentation) return { visible: false, label: "", detail: "", tone: "neutral" };
+  return {
+    visible: true,
+    label: presentation[0],
+    detail: state.nextAction ?? presentation[1],
+    tone: "neutral",
+  };
 }
 
 export function DurableRunStatus({ state }: {

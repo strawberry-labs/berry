@@ -1,5 +1,7 @@
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@berry/desktop-ui/components/ui/empty";
+import { MessageSquareOff, ShieldAlert, TriangleAlert } from "lucide-react";
 
 export type TaskRouteStatus = "loading" | "not-found" | "forbidden" | "deleted" | "failed";
 
@@ -24,16 +26,24 @@ export function TaskRouteState({ state, onRetry, onHome, onRestore }: {
         : state === "failed"
           ? { title: "Conversation unavailable", detail: "Berry could not load this conversation. You can retry safely." }
           : { title: "Conversation not found", detail: "It may have been removed, or this link may be incorrect." };
+  const Icon = state === "forbidden" ? ShieldAlert : state === "failed" ? TriangleAlert : MessageSquareOff;
 
   return (
-    <section className="berry-route-state" aria-live="assertive">
-      <h1>{copy.title}</h1>
-      <p>{copy.detail}</p>
-      <div className="flex gap-2">
-        {state === "deleted" && onRestore ? <Button onClick={onRestore}>Restore conversation</Button> : null}
-        {state === "failed" ? <Button onClick={onRetry}>Retry</Button> : null}
-        <Button variant="outline" onClick={onHome}>Back to chats</Button>
-      </div>
+    <section className="flex min-h-0 flex-1 items-center justify-center p-6" aria-labelledby="task-route-state-title">
+      <Empty className="max-w-md border border-[var(--berry-border)] bg-[var(--berry-card-bg)] shadow-[var(--berry-shadow-floating)]">
+        <EmptyHeader>
+          <EmptyMedia variant="icon" className="bg-[var(--berry-surface-inset)] text-[var(--berry-text-secondary)]">
+            <Icon aria-hidden />
+          </EmptyMedia>
+          <EmptyTitle id="task-route-state-title" className="text-[var(--berry-text-primary)]">{copy.title}</EmptyTitle>
+          <EmptyDescription className="text-[var(--berry-text-secondary)]">{copy.detail}</EmptyDescription>
+        </EmptyHeader>
+        <EmptyContent className="flex-row flex-wrap justify-center">
+          {state === "deleted" && onRestore ? <Button onClick={onRestore}>Restore conversation</Button> : null}
+          {state === "failed" ? <Button onClick={onRetry}>Retry</Button> : null}
+          <Button variant="outline" onClick={onHome}>Back to chats</Button>
+        </EmptyContent>
+      </Empty>
     </section>
   );
 }

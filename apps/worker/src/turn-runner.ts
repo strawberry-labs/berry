@@ -281,6 +281,8 @@ export interface DurableModelCallContext {
   messageId: string;
   tools: readonly ChatToolDefinition[];
   additionalUserContent?: readonly ChatContentPart[];
+  signal?: AbortSignal;
+  reportProgress?(): void;
   emitDelta(delta: string, channel: "text" | "reasoning"): Promise<void>;
   policyForTool(name: string): DurableToolPolicy;
 }
@@ -319,6 +321,9 @@ export class DurableTurnRunner {
       snapshotIntervalSeconds?: number;
       contextWindowTokens?: number;
       maxModelAttempts?: number;
+      modelIdleTimeoutMs?: number;
+      modelMaxDurationMs?: number;
+      abortCleanupTimeoutMs?: number;
       compactor?: SessionCompactionRunner;
     } = {},
   ) {}
@@ -505,20 +510,30 @@ export class DurableTurnRunner {
       { kind: "message.start", messageId, role: "assistant" },
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
-    const result = await this.withHeartbeat(snapshot, async () => {
+    const result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress }) => {
       const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
       try {
         return await this.model.call(snapshot, step, {
           messageId,
           tools: definitions,
           additionalUserContent,
-          emitDelta: (delta, channel) => writer.write(delta, channel),
+          signal,
+          reportProgress,
+          emitDelta: async (delta, channel) => {
+            reportProgress();
+            await writer.write(delta, channel);
+          },
           policyForTool: (name) => this.tools.policy?.(snapshot, name, permissionMode)
             ?? durableToolPolicy(name, permissionMode),
         });
       } finally {
         await writer.flush();
       }
+    }, {
+      label: "Model request",
+      abortable: true,
+      idleTimeoutMs: this.options.modelIdleTimeoutMs ?? 240_000,
+      maxDurationMs: this.options.modelMaxDurationMs ?? 900_000,
     });
     const freshCancelled = !(await this.repository.heartbeat(
       snapshot.tenantId,
@@ -1306,13 +1321,29 @@ export class DurableTurnRunner {
 
   private async withHeartbeat<T>(
     snapshot: DurableTurnSnapshot,
-    operation: () => Promise<T>,
+    operation: (control: { signal: AbortSignal; reportProgress(): void }) => Promise<T>,
+    limits: { label?: string; abortable?: boolean; idleTimeoutMs?: number; maxDurationMs?: number } = {},
   ): Promise<T> {
     const leaseSeconds = this.options.leaseSeconds ?? 90;
     const heartbeatMs = this.options.heartbeatMs ?? Math.max(5_000, Math.floor(leaseSeconds * 1_000 / 3));
+    const controller = new AbortController();
     let timer: NodeJS.Timeout | null = null;
+    let idleTimer: NodeJS.Timeout | null = null;
+    let durationTimer: NodeJS.Timeout | null = null;
     let stopped = false;
     let heartbeatFailure: unknown;
+    let timeoutFailure: DurableTurnRetryableError | null = null;
+    const reportProgress = () => {
+      if (!limits.idleTimeoutMs || stopped) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timeoutFailure = new DurableTurnRetryableError(
+          `${limits.label ?? "Operation"} stalled for ${Math.ceil(limits.idleTimeoutMs! / 1_000)} seconds without progress.`,
+        );
+        if (limits.abortable) controller.abort(timeoutFailure);
+      }, limits.idleTimeoutMs);
+      idleTimer.unref?.();
+    };
     const heartbeat = async () => {
       if (stopped) return;
       try {
@@ -1324,9 +1355,11 @@ export class DurableTurnRunner {
         );
         if (!retained) {
           heartbeatFailure = new DurableTurnRetryableError("Turn lease was lost during a long-running operation");
+          if (limits.abortable) controller.abort(heartbeatFailure);
         }
       } catch (error) {
         heartbeatFailure = error;
+        if (limits.abortable) controller.abort(error);
       }
       if (heartbeatFailure) return;
       if (!stopped) timer = setTimeout(() => void heartbeat(), heartbeatMs);
@@ -1334,8 +1367,46 @@ export class DurableTurnRunner {
     };
     timer = setTimeout(() => void heartbeat(), heartbeatMs);
     timer.unref?.();
+    if (limits.maxDurationMs) {
+      durationTimer = setTimeout(() => {
+        timeoutFailure = new DurableTurnRetryableError(
+          `${limits.label ?? "Operation"} exceeded its maximum duration of ${Math.ceil(limits.maxDurationMs! / 1_000)} seconds.`,
+        );
+        if (limits.abortable) controller.abort(timeoutFailure);
+      }, limits.maxDurationMs);
+      durationTimer.unref?.();
+    }
+    reportProgress();
     try {
-      const result = await operation();
+      const operationPromise = operation({ signal: controller.signal, reportProgress });
+      let result: T;
+      try {
+        if (limits.abortable) {
+          const aborted = new Promise<never>((_, reject) => {
+            controller.signal.addEventListener("abort", () => {
+              reject(longOperationAbortError(timeoutFailure, heartbeatFailure));
+            }, { once: true });
+          });
+          result = await Promise.race([operationPromise, aborted]);
+        } else {
+          // Non-abort-aware operations may perform external side effects. Keep
+          // the lease until they settle so a recovery worker cannot overlap.
+          result = await operationPromise;
+        }
+      } catch (error) {
+        if (limits.abortable && controller.signal.aborted) {
+          await waitForPromiseSettlement(
+            operationPromise,
+            this.options.abortCleanupTimeoutMs ?? 15_000,
+          );
+          throw longOperationAbortError(timeoutFailure, heartbeatFailure);
+        }
+        if (timeoutFailure || heartbeatFailure) {
+          throw longOperationAbortError(timeoutFailure, heartbeatFailure);
+        }
+        throw error;
+      }
+      if (timeoutFailure) throw timeoutFailure;
       if (heartbeatFailure) {
         throw heartbeatFailure instanceof DurableTurnRetryableError
           ? heartbeatFailure
@@ -1345,7 +1416,39 @@ export class DurableTurnRunner {
     } finally {
       stopped = true;
       if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (durationTimer) clearTimeout(durationTimer);
     }
+  }
+}
+
+function longOperationAbortError(
+  timeoutFailure: DurableTurnRetryableError | null,
+  heartbeatFailure: unknown,
+): DurableTurnRetryableError {
+  if (timeoutFailure) return timeoutFailure;
+  if (heartbeatFailure instanceof DurableTurnRetryableError) return heartbeatFailure;
+  if (heartbeatFailure) {
+    return new DurableTurnRetryableError(
+      "Turn heartbeat failed during a long-running operation",
+      heartbeatFailure,
+    );
+  }
+  return new DurableTurnRetryableError("Long-running operation was aborted");
+}
+
+async function waitForPromiseSettlement(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      promise.then(() => undefined, () => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(1, timeoutMs));
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1855,11 +1958,13 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       tools: [...context.tools],
       temperature: 0,
       maxTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
+      ...(context.signal ? { signal: context.signal } : {}),
       ...(selectedReasoningEffort ? { reasoningEffort: selectedReasoningEffort } : {}),
       metadata: { "Idempotency-Key": step.idempotencyKey ?? `${snapshot.id}:${step.sequence}` },
       ...(cachePlan.cacheKey ? { promptCacheKey: cachePlan.cacheKey } : {}),
       ...(cachePlan.retention !== "none" ? { promptCacheRetention: cachePlan.retention } : {}),
     })) {
+      context.reportProgress?.();
       servedModel = chunk.model || servedModel;
       await acceptTextDelta(chunk.delta);
       if (chunk.reasoningDelta) {
@@ -2044,10 +2149,12 @@ async function callProviderStream(
     sessionId: snapshot.sessionId,
     temperature: 0,
     maxTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
+    ...(context.signal ? { signal: context.signal } : {}),
     metadata: { "Idempotency-Key": step.idempotencyKey ?? `${snapshot.id}:model:${step.sequence}` },
     ...(effort ? { reasoning: effort } : {}),
   });
   for await (const event of stream) {
+    context.reportProgress?.();
     if (event.type === "text_delta") await context.emitDelta(event.delta, "text");
     else if (event.type === "thinking_delta") await context.emitDelta(event.delta, "reasoning");
   }

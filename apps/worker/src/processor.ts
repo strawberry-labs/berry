@@ -1,4 +1,4 @@
-import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
+import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, FileDeleteObjectJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
 import { processAlertEvaluationJob, processReportRunJob, type ManagementJobRepository } from "./reporting-alerts.js";
 import { processCompactionJob, type SessionCompactionRunner } from "./compaction.js";
 import { processTitleGenerationJob, type TaskTitleRepository, type TitleGenerator } from "./title-gen.js";
@@ -8,6 +8,7 @@ import type { MemoryProcessor } from "./memory/processor.js";
 import type { DurableTurnRunner } from "./turn-runner.js";
 import type { SandboxContinuityManager } from "./sandbox-continuity.js";
 import type { MaintenanceRunner } from "./maintenance.js";
+import type { FileObjectDeleter } from "./file-deletion.js";
 
 export interface BerryWorkerDependencies {
   titles: TaskTitleRepository;
@@ -20,6 +21,7 @@ export interface BerryWorkerDependencies {
   turnRunner?: DurableTurnRunner | undefined;
   snapshotter?: SandboxContinuityManager | undefined;
   maintenance?: MaintenanceRunner | undefined;
+  fileDeleter?: FileObjectDeleter | undefined;
   tenantContext?: {
     run<T>(tenantId: string, callback: () => Promise<T>): Promise<T>;
   } | undefined;
@@ -73,6 +75,10 @@ export async function processBerryWorkerJob(
   if (jobName === "memory.extract") {
     if (!dependencies.memory) throw new Error("Memory processor is not configured");
     return dependencies.memory.process(MemoryExtractJobPayloadSchema.parse(data));
+  }
+  if (jobName === "file.delete-object") {
+    if (!dependencies.fileDeleter) throw new Error("File object deletion is not configured");
+    return dependencies.fileDeleter.delete(FileDeleteObjectJobPayloadSchema.parse(data));
   }
   if (jobName === "context.backfill" || jobName === "context.cleanup") {
     if (!dependencies.maintenance) throw new Error("Maintenance runner is not configured");

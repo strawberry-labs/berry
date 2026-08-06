@@ -36,9 +36,11 @@ describe("runPresentation", () => {
     });
   });
 
-  it("hides internal queue, worker, compaction, and reconnect progress", () => {
+  it("shows the current phase for active durable work", () => {
     for (const runState of ["queued", "assembling_context", "calling_model", "executing_tool", "compacting"] as const) {
-      expect(runPresentation(state({ runState })).visible).toBe(false);
+      expect(runPresentation(state({ runState })).visible).toBe(true);
     }
+    expect(runPresentation(state({ runState: "calling_model", nextAction: "Model request in progress" })))
+      .toMatchObject({ label: "Generating a response", detail: "Model request in progress" });
   });
 });

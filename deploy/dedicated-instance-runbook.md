@@ -62,6 +62,11 @@ helm upgrade --install berry deploy/helm/berry-platform \
   --set ingress.tlsSecretName=berry-acme-tls
 ```
 
+The artifact S3 principal must allow `s3:ListBucketVersions` on the artifact
+bucket and `s3:DeleteObject` plus `s3:DeleteObjectVersion` on its objects. Berry
+does not acknowledge a file-deletion job until every stored version and delete
+marker has been removed.
+
 ## Confirm
 
 ```sh

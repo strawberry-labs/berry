@@ -67,6 +67,15 @@ export const KnowledgeIndexTaskJobPayloadSchema = z.object({
 });
 export type KnowledgeIndexTaskJobPayload = z.infer<typeof KnowledgeIndexTaskJobPayloadSchema>;
 
+export const FileDeleteObjectJobPayloadSchema = z.object({
+  outboxId: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  fileId: z.string().uuid(),
+  bucket: z.string().min(1).max(255),
+  keys: z.array(z.string().min(1).max(2_048)).min(1).max(1_000),
+});
+export type FileDeleteObjectJobPayload = z.infer<typeof FileDeleteObjectJobPayloadSchema>;
+
 export const MemoryExtractJobPayloadSchema = z.object({
   tenantId: z.string().uuid(),
   userId: z.string().uuid(),
@@ -115,6 +124,7 @@ export const BerryWorkerJobNameSchema = z.enum([
   "knowledge.index-task",
   "knowledge.delete",
   "knowledge.reindex",
+  "file.delete-object",
   "memory.extract",
   "context.backfill",
   "context.cleanup",
@@ -136,6 +146,7 @@ export interface BerryWorkerJobMap {
   "knowledge.index-task": KnowledgeIndexTaskJobPayload;
   "knowledge.delete": KnowledgeRevisionJobPayload;
   "knowledge.reindex": KnowledgeRevisionJobPayload;
+  "file.delete-object": FileDeleteObjectJobPayload;
   "memory.extract": MemoryExtractJobPayload;
   "context.backfill": ContextBackfillJobPayload;
   "context.cleanup": RetentionCleanupJobPayload;
@@ -154,6 +165,7 @@ export function parseWorkerJob(name: string, data: unknown): BerryWorkerJobPaylo
   if(jobName==="report.run")return ReportRunJobPayloadSchema.parse(data);
   if(jobName==="alerts.evaluate")return AlertEvaluationJobPayloadSchema.parse(data);
   if(jobName==="knowledge.index-task")return KnowledgeIndexTaskJobPayloadSchema.parse(data);
+  if(jobName==="file.delete-object")return FileDeleteObjectJobPayloadSchema.parse(data);
   if(jobName==="memory.extract")return MemoryExtractJobPayloadSchema.parse(data);
   if(jobName==="context.backfill")return ContextBackfillJobPayloadSchema.parse(data);
   if(jobName==="context.cleanup")return RetentionCleanupJobPayloadSchema.parse(data);
