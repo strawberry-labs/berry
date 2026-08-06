@@ -2339,10 +2339,10 @@ function estimateActiveContextTokensForDecision(
   tools: readonly ChatToolDefinition[] = [],
   additionalUserContent: readonly ChatContentPart[] = [],
 ): number {
-  const serializedRequestTokens = Math.ceil((
-    JSON.stringify(modelMessages(snapshot, additionalUserContent).messages).length
-    + JSON.stringify(tools).length
-  ) / 4);
+  const serializedRequestTokens = estimateSerializedModelRequestTokens(
+    modelMessages(snapshot, additionalUserContent).messages,
+    tools,
+  );
   const completedCompaction = completedCompactionForCurrentTail(snapshot);
   const output = record(completedCompaction?.output);
   const tokensAfter = nonnegativeNumber(output?.tokensAfter);
@@ -2354,6 +2354,20 @@ function estimateActiveContextTokensForDecision(
     );
   }
   return Math.max(estimateActiveContextTokens(snapshot), serializedRequestTokens);
+}
+
+const ESTIMATED_MODEL_IMAGE_CHARACTERS = 4_800;
+const ESTIMATED_MODEL_IMAGE_PLACEHOLDER = "x".repeat(ESTIMATED_MODEL_IMAGE_CHARACTERS);
+
+function estimateSerializedModelRequestTokens(
+  messages: readonly ChatMessage[],
+  tools: readonly ChatToolDefinition[],
+): number {
+  const json = JSON.stringify({ messages, tools }, (_key, value: unknown) => {
+    if (typeof value !== "string" || !value.startsWith("data:image/")) return value;
+    return ESTIMATED_MODEL_IMAGE_PLACEHOLDER;
+  });
+  return Math.ceil(json.length / 4);
 }
 
 function firstDuplicateToolCallId(toolCalls: readonly TurnModelToolIntent[]): string | null {

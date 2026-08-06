@@ -523,7 +523,9 @@ export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGen
   const apiKey = env.BERRY_ROUTER_API_KEY?.trim();
   const model = env.BERRY_COMPACTION_MODEL?.trim() || env.BERRY_ROUTER_DEFAULT_MODEL?.trim();
   if (!baseUrl || !apiKey || !model) return null;
-  const provider = env.BERRY_COMPACTION_PROVIDER?.trim() || "berry-router";
+  const provider = env.BERRY_COMPACTION_PROVIDER?.trim()
+    || env.BERRY_ROUTER_PROVIDER_ID?.trim()
+    || "router";
   return new RouterCheckpointGenerator(
     new OpenAIChatCompletionsClient({
       provider: {

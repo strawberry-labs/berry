@@ -229,6 +229,38 @@ describe("durable turn runner", () => {
     expect(modelCalls).toBe(1);
   });
 
+  it("does not compact generated image bytes as if their base64 were prompt text", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 20_000;
+    const repository = new FakeTurnRepository(current);
+    let compactions = 0;
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "The image is ready.", inputTokens: 2_000, outputTokens: 10, toolCalls: [] };
+      },
+    }, {
+      execute: async () => ({ output: {}, summary: "" }),
+      modelContent: async () => [{
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${"A".repeat(1_000_000)}` },
+      }],
+    }, {
+      owner: "worker-image-context",
+      compactor: {
+        compactSession: async () => {
+          compactions += 1;
+          return { sessionId: current.sessionId, summary: "Unexpected compaction", tokensBefore: 0 };
+        },
+      },
+    });
+
+    expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
+    expect(compactions).toBe(0);
+    expect(modelCalls).toBe(1);
+  });
+
   it("uses a reduced post-compaction estimate instead of compacting the retained tail forever", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest.contextWindowTokens = 20_000;

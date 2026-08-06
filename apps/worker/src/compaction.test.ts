@@ -3,6 +3,7 @@ import type { SessionCheckpointV2 } from "@berry/shared";
 import {
   DurableSessionCompactor,
   SqlSessionCompactionRepository,
+  createCheckpointGenerator,
   type CheckpointGenerator,
   type CompactionSessionState,
   type SessionCompactionRepository,
@@ -17,6 +18,32 @@ const job: CompactionJobPayload = {
 };
 
 describe("durable session compactor", () => {
+  it("uses the governed router provider id for compaction by default", () => {
+    const generator = createCheckpointGenerator({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_API_KEY: "test-key",
+      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/moonshotai/kimi-k2.6",
+      BERRY_ROUTER_PROVIDER_ID: "router",
+    });
+
+    expect(generator).toMatchObject({
+      provider: "router",
+      model: "canopywave/moonshotai/kimi-k2.6",
+    });
+  });
+
+  it("allows an explicit compaction provider to override the router provider id", () => {
+    const generator = createCheckpointGenerator({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_API_KEY: "test-key",
+      BERRY_ROUTER_DEFAULT_MODEL: "chat-model",
+      BERRY_ROUTER_PROVIDER_ID: "router",
+      BERRY_COMPACTION_PROVIDER: "dedicated-compactor",
+    });
+
+    expect(generator?.provider).toBe("dedicated-compactor");
+  });
+
   it("checks governance against the compaction provider and model actually selected", async () => {
     const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
     const repository = new SqlSessionCompactionRepository({
