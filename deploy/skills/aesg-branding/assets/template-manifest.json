@@ -1,67 +1,79 @@
 {
-  "schemaVersion": 1,
-  "generated": "2026-08-04",
-  "sources": [
+  "schemaVersion": 2,
+  "generated": "2026-08-06",
+  "sourceEvidence": [
+    {
+      "name": "General Template_AESG.docx",
+      "sha256": "d7c2570afae3c0322308c7f6dae884f8c4017f30aa1907015a1ccb814af67979",
+      "status": "accepted after metadata sanitisation",
+      "evidence": "Clean CRC; 66 rendered pages; 5 sections; 108 styles; 4 headers; 4 footers"
+    },
+    {
+      "name": "General Template_AESG.pptx",
+      "sha256": "098dc97be3d9ce56c246e2557e84ceb004b1208ed55eb1c065545d4757e238a7",
+      "status": "accepted after LibreOffice repair and metadata sanitisation",
+      "evidence": "Raw ppt/media/image5.jpeg had a bad CRC; repaired package retains 17 specimen slides, 2 masters, and 59 layouts"
+    },
+    {
+      "name": "AESG_BrandGuidelines.pdf",
+      "sha256": "ff4568a73f5041d7234e43db1447cbd107ed0cd4a6578fe0b596f98362f13586",
+      "status": "accepted as canonical January 2022 manual"
+    }
+  ],
+  "runtimeTemplates": [
+    {
+      "path": "templates/AESG_General_Report_Template.docx",
+      "sha256": "cf8f283ef5537359ccb8cd2f7d08c86d627771ca6214a9d64e41919b5b056702",
+      "purpose": "Sanitised General Template source for reports and long-form Word documents"
+    },
     {
       "path": "templates/AESG_Letterhead_Dubai.docx",
       "sha256": "652b1cc1b8c16bca1203c5925bc56a994a7720fd20ece1e12f040c48dec8b40e",
-      "purpose": "Retained A4 letterhead and report page system"
+      "purpose": "Retained A4 letterhead for correspondence"
+    },
+    {
+      "path": "templates/AESG_General_Presentation.pptx",
+      "sha256": "45edd262a02b014ec38546ef09ce11d4446cee4ad61b8a55b04fc33ed5d38dee",
+      "purpose": "CRC-clean General Presentation with 17 specimens, 2 masters, and 59 layouts"
     },
     {
       "path": "templates/AESG_Excel_Template_2023.xlsx",
       "sha256": "bb80b24dc6dc1b43bb4d2ca78390adf32dd46afcd7866e5df2bc5c1064caccaa",
-      "purpose": "Sanitized one-sheet style reference; original hidden employee sheet removed"
-    },
-    {
-      "path": "templates/AESG_Presentation_16x9.pptx",
-      "sha256": "bf91eb1b7525a48c240d7899f6d4f7adec23da119c83d21caff2575b467ea327",
-      "purpose": "Retained standard 16:9 slide master, layouts, artwork, and layout library"
-    },
-    {
-      "path": "../../cv-creator/assets/templates/v3/aesg_cv_portrait_v3.docx",
-      "sha256": "eefcaa7a99d47aa3cbdd2e33d31ad056a7f83abc96cf73dd43ba7f7c48e975d8",
-      "purpose": "Sanitized AESG V3 portrait CV DOCX template with organization-only author metadata"
-    },
-    {
-      "path": "../../cv-creator/assets/templates/v3/aesg_cv_landscape_v3.docx",
-      "sha256": "e37e649acba2a927f83a1deb8b2979326a61ab181a694fafc8d4e67585b08724",
-      "purpose": "Sanitized AESG V3 landscape CV DOCX template with organization-only author metadata"
-    },
-    {
-      "path": "../../cv-creator/assets/templates/v3/aesg_cv_portrait_v3.pptx",
-      "sha256": "bd80f65ef6f3b811e753f13f95b926995f7ca22916903d73fee8ef94a0ca0610",
-      "purpose": "Sanitized AESG V3 portrait CV PPTX template with organization-only author metadata"
-    },
-    {
-      "path": "../../cv-creator/assets/templates/v3/aesg_cv_landscape_v3.pptx",
-      "sha256": "88817b104c5695d7f06b683523ee376817df447ff07eb5e3ab08427164468088",
-      "purpose": "Sanitized AESG V3 landscape CV PPTX template with organization-only author metadata"
-    },
-    {
-      "path": "../../cv-creator/assets/templates/v3/aesg_logo_white.png",
-      "sha256": "9d328232b37a02cee0974993f6c316f4b7fd5967a95d42b6d1fb39c78a3b7251",
-      "purpose": "Approved white AESG logo used by the CV templates and renderers"
-    },
-    {
-      "path": "extracted/aesg-logo-primary.jpg",
-      "sha256": "b25ad7fd1fff98cd2b574778643995c6901420eb089b408abeb9dfe5ae4ca589",
-      "purpose": "Primary logo extracted from the sanitized AESG workbook"
-    },
-    {
-      "path": "extracted/letterhead-first-page-background.jpg",
-      "sha256": "80d785f4d68f748da85a0d9049601ea42f2daecf78576334b1df10860a92048e",
-      "purpose": "First-page letterhead artwork reference"
-    },
-    {
-      "path": "extracted/letterhead-continuation-overlay.png",
-      "sha256": "67f1024d39698b9a33d81847267b0e72afaa4ea8035581173334401dbdc1e48f",
-      "purpose": "Continuation-page letterhead artwork reference"
+      "purpose": "Sanitised one-sheet style evidence; original hidden Joiners sheet remains excluded"
     }
   ],
-  "excludedForPrivacyOrSize": [
-    "Original AESG Excel Template 2023.xlsx with hidden Joiners employee records",
-    "AESG Bid Template Buildings 2.docx with live proposal content",
-    "Landscape and portrait bid PPTX files with live people, client, project, and award content",
-    "The landscape bid PPTX also fails ZIP CRC validation at ppt/media/image5.jpeg"
+  "brandAssets": [
+    {"path": "reference/AESG_Brand_Guidelines_2022.pdf", "sha256": "ff4568a73f5041d7234e43db1447cbd107ed0cd4a6578fe0b596f98362f13586"},
+    {"path": "logos/aesg-brandmark-rgb.png", "sha256": "a2cf60a5ce45477a3b31c7d6c64b38d352e578fb73bf88e384d33d3f39a4bf2f"},
+    {"path": "logos/aesg-brandmark-rgb.svg", "sha256": "9cb1bd6f4878f6254e27ef393aa6bf1b786d04ea617a3930c80a3c824a50a71b"},
+    {"path": "logos/aesg-brandmark-white-rgb.png", "sha256": "f14a1733ee71ce6ea6e5e8b1954ec18c62e4f515cf1d55aae06dc1f74cdbe77f"},
+    {"path": "supergraphics/primary-green.png", "sha256": "2ac2dc0d8e854c027eeeb569a7c195739e9342542960d4c4c5fc51dc37ba46c6"},
+    {"path": "supergraphics/primary-white.png", "sha256": "f86b9f2eb99a3f82ac3fa5d0a319621135ec97af13b7e4c453f2d5d15e482f08"},
+    {"path": "supergraphics/secondary-wind-rgb.png", "sha256": "c0014d42ccc278388528f6e51743a0783124dee23a1c5706137b28414a35a027"},
+    {"path": "supergraphics/secondary-earth-rgb.png", "sha256": "ebb9f14838fa810f643e68ca69b2c63e4aeb710d78e38790fbf4c1b02141c83d"},
+    {"path": "supergraphics/secondary-fire-rgb.png", "sha256": "320d79a565a6bbf531298ddaee8570c0ed16a919df2c3cfdb76a9ffd0cd57f66"},
+    {"path": "icons/services/all-services.png", "sha256": "b5dc8448674424f4508f4c8c37ad620dbea2e8942813ce918c5a730740597a25"},
+    {"path": "icons/services/strategy-advisory.png", "sha256": "19c227e480736b680c947800ab0868e5640925c560ae6e20f94ce01e9338b528"},
+    {"path": "icons/services/environment-waste.png", "sha256": "b4b869a531bad9b813f7f53afcea9e52e9f219125c335d6803c02b9d5b8931e6"},
+    {"path": "icons/services/cdm-health-safety.png", "sha256": "ea50a6d1b38dd2d403ef57d8be3a45a530d7de4735dbe8e84e104cb8ec594f7b"},
+    {"path": "icons/services/project-delivery-management.png", "sha256": "daf46fd7534e5cd466cc29e3a990cf491feab1ef50e171e5e3e8e18b282a2ec5"},
+    {"path": "icons/services/sustainability.png", "sha256": "55511c1eab60f8cf814e6f5960730ce701afdff3a34468a4dfe2c31b889dbf32"},
+    {"path": "icons/services/acoustics.png", "sha256": "5df6a455b14be581f7deecfd725a9b40998aac62bff0047f3e70d279e0177dc4"},
+    {"path": "icons/services/digital-project-delivery.png", "sha256": "553fb7a0098062b7cf99053c638bf72695da679ec92a2da2ce8df3b188ea3daf"},
+    {"path": "icons/services/net-zero.png", "sha256": "b8e08f52f90b15c4cde5534e58d771362c7d1f6572d2ac0a054418eea68913b3"},
+    {"path": "icons/services/specialist-engineering.png", "sha256": "659967a94ed82c8d59da247943500f5f483ec4bfd60f4fc8dd7573bd4eb66736"},
+    {"path": "icons/services/external-walls.png", "sha256": "6853636831e5d6135976904272384824b00fb3f9b671147e973cdc1c4b91ce4f"},
+    {"path": "icons/services/security.png", "sha256": "44b51d2d312a4f285071801bd872c17a2e8655bb66ded0f13358d4224daaa6e6"},
+    {"path": "icons/services/facade.png", "sha256": "7a21aae6564983c1feb5313a5361f2a86e67584316b6a56abb8438efd7b6b19f"},
+    {"path": "icons/services/fire-life-safety.png", "sha256": "13462a30a20c93d7d04d96d7a4a96cc88b8485c302b9c532ec51ce4374cc62f5"}
+  ],
+  "excluded": [
+    "Three duplicate DOCX copies of the January 2022 brand guideline",
+    "AI, EPS, CMYK, and print-production files not required by the Office generators",
+    "AESG SGW co-brand assets, which are not the default AESG identity",
+    "Social-media guidance, which is outside these Office artifact skills",
+    "AESG_ICONS.pptx after extracting the approved service-icon PNG files",
+    "Original AESG Excel source with hidden Joiners employee records",
+    "Unrepaired General Template_AESG.pptx with bad CRC at ppt/media/image5.jpeg"
   ]
 }

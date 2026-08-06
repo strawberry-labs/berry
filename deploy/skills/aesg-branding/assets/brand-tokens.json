@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "brand": "AESG",
   "sourceManual": "AESG Brand Guidelines, January 2022",
   "colors": {
@@ -9,8 +9,7 @@
     "purple": "#6D2077",
     "red": "#DA291C",
     "yellow": "#FFC72C",
-    "letterheadGray": "#53565A",
-    "letterheadTitleGreen": "#00686F"
+    "templateHeadingGreen": "#059B9B"
   },
   "typography": {
     "office": "Verdana",
@@ -18,22 +17,19 @@
     "arabicMarketing": "Tahoma"
   },
   "logo": {
-    "aspectRatio": 3.4674556213,
-    "widthPx": 586,
-    "heightPx": 169
+    "aspectRatio": 3.465210356,
+    "widthPx": 4283,
+    "heightPx": 1236
   },
   "docx": {
+    "reportTemplate": "AESG_General_Report_Template.docx",
+    "letterTemplate": "AESG_Letterhead_Dubai.docx",
     "pageSize": "A4",
     "widthDxa": 11900,
     "heightDxa": 16840,
-    "marginsDxa": {
-      "top": 2410,
-      "right": 1268,
-      "bottom": 2127,
-      "left": 1560
-    },
-    "headerDxa": 708,
-    "footerDxa": 878
+    "marginsDxa": {"top": 720, "right": 720, "bottom": 720, "left": 720},
+    "headerDxa": 1134,
+    "footerDxa": 1134
   },
   "xlsx": {
     "titleRowHeightPt": 30,
@@ -42,7 +38,11 @@
     "chartSeries": ["#008C95", "#343741", "#6D2077", "#DA291C", "#FFC72C"]
   },
   "pptx": {
-    "standard": "16:9",
-    "template": "AESG_Presentation_16x9.pptx"
+    "template": "AESG_General_Presentation.pptx",
+    "widthEmu": 9906000,
+    "heightEmu": 6858000,
+    "masters": 2,
+    "layouts": 59,
+    "specimenSlides": 17
   }
 }

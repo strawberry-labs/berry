@@ -28,6 +28,8 @@ try {
     ["PDF skill", "test -f /managed-skills/pdf/scripts/create_aesg_pdf.py"],
     ["XLSX skill", "test -f /managed-skills/xlsx/scripts/create_aesg_xlsx.py"],
     ["PPTX skill", "test -f /managed-skills/pptx/scripts/create_aesg_pptx.py"],
+    ["General report template", "test -f /managed-skills/aesg-branding/assets/templates/AESG_General_Report_Template.docx"],
+    ["General presentation template", "test -f /managed-skills/aesg-branding/assets/templates/AESG_General_Presentation.pptx"],
     ["Verdana font", "test \"$(fc-match -f '%{family}' Verdana)\" = Verdana"],
     ["Python artifact libraries", "python -c \"import docx,docxtpl,pptx,openpyxl,reportlab,pypdf\""],
     ["LibreOffice", "soffice --version"],
@@ -45,7 +47,7 @@ try {
       kind: "report",
       title: "AESG Sandbox Validation",
       subtitle: "DOCX generation smoke test",
-      date: "24 July 2026",
+      date: "06 August 2026",
       sections: [
         {
           heading: "Executive summary",
@@ -58,7 +60,7 @@ try {
       kind: "report",
       title: "AESG Sandbox Validation",
       subtitle: "PDF generation smoke test",
-      date: "24 July 2026",
+      date: "06 August 2026",
       sections: [
         {
           heading: "Executive summary",
@@ -88,9 +90,16 @@ try {
     pptx: {
       title: "AESG Sandbox Validation",
       slides: [
-        { layout: "title", title: "AESG Sandbox Validation" },
+        {
+          layout: "cover",
+          title: "AESG Sandbox Validation",
+          subtitle: "General Template smoke test",
+          date: "06 August 2026",
+        },
         {
           layout: "three_columns",
+          title: "Generation workflow",
+          section: "Runtime validation",
           columns: [
             { title: "Create", body: "Generate from the retained template." },
             { title: "Validate", body: "Run structural and brand checks." },

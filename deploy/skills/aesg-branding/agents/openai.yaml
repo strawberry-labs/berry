@@ -1,0 +1,7 @@
+interface:
+  display_name: "AESG Branding"
+  short_description: "Apply approved AESG branding to Office files"
+  brand_color: "#008C95"
+  default_prompt: "Use $aesg-branding with the matching format skill to create an approved AESG-branded artifact."
+policy:
+  allow_implicit_invocation: true

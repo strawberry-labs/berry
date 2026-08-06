@@ -33,11 +33,15 @@ deploy/
 │   │   ├── references/brand-system.md
 │   │   ├── scripts/
 │   │   │   ├── validate_artifact.py
-│   │   │   └── render_artifact.py
+│   │   │   ├── render_artifact.py
+│   │   │   └── prepare_office_template.py
 │   │   └── assets/
 │   │       ├── brand-tokens.json
 │   │       ├── template-manifest.json
-│   │       ├── extracted/
+│   │       ├── icons/services/
+│   │       ├── logos/
+│   │       ├── reference/
+│   │       ├── supergraphics/
 │   │       └── templates/
 │   ├── docx/
 │   │   ├── SKILL.md
@@ -50,6 +54,7 @@ deploy/
 │   │   └── scripts/create_aesg_xlsx.py
 │   ├── pptx/
 │   │   ├── SKILL.md
+│   │   ├── references/layout-catalog.md
 │   │   └── scripts/create_aesg_pptx.py
 │   └── cv-creator/
 │       ├── SKILL.md
@@ -80,10 +85,12 @@ Updating only one layer can leave new tasks using stale instructions or code.
 
 - Do not package the original Excel workbook. Its hidden `Joiners` sheet
   contains employee data.
-- Do not package the large bid DOCX or bid PPTX files. They contain live
+- Do not package historical bid DOCX or bid PPTX files. They contain live
   people, clients, projects, awards, and proposal material.
-- The landscape bid deck also contains a corrupt ZIP member at
-  `ppt/media/image5.jpeg`; do not use it as a runtime template.
+- The approved General Presentation source also arrived with a corrupt ZIP
+  member at `ppt/media/image5.jpeg`. The committed runtime copy is a
+  LibreOffice-repaired, metadata-sanitised package that retains 17 specimen
+  slides, 2 masters, and 59 layouts. Never restore the raw source.
 - Commit only sanitized templates and approved extracted assets.
 - Do not commit Verdana font files. They are licensed, ignored by Git, and
   supplied to the E2B build separately.
@@ -130,16 +137,16 @@ Use this section when starting with only the AESG source pack.
 
 ### Step 1: establish inputs and examples
 
-The source pack used for the current implementation was:
+The source pack used for the current General Template implementation was:
 
 ```text
-/Users/chiragasarpota/Documents/aesg-skills/
-└── AESG Sample Templates/
-    ├── AESG_BrandGuidelines.pdf
-    ├── AESG_ Letterhead_Dubai.docx
-    ├── AESG Excel Template 2023.xlsx
-    ├── Powerpoint Presentation Template.pptx
-    └── aesg-files-sample/
+AESG source pack/
+├── General Template_AESG.docx
+├── General Template_AESG.pptx
+└── Brand Essentials_ Logos and Guidelines/
+    ├── AESG Brand Guidelines/
+    ├── AESG Icons/
+    └── AESG Logo/
 ```
 
 Set a task-specific variable if the location changes:
@@ -153,7 +160,7 @@ Define concrete acceptance prompts before writing the skills:
 - “Create an AESG project-status PDF.”
 - “Create an AESG-branded Word report.”
 - “Create an AESG Excel register with formulas and a chart.”
-- “Create an AESG 16:9 presentation.”
+- “Create an AESG presentation using the General Template.”
 
 These examples determine what instructions, scripts, templates, and validators
 must be reusable.
@@ -205,15 +212,13 @@ explanations in every format skill.
 
 #### DOCX
 
-Retain the approved letterhead DOCX. Modify a copy with `python-docx` while
-preserving:
+Route reports and long-form documents through
+`AESG_General_Report_Template.docx`. Retain its cover, divider specimen,
+sections, relationships, media, and AESG styles, then compose new body content.
+Do not copy the source's 66 pages of sample text into outputs.
 
-- sections and A4 geometry;
-- first-page and continuation headers/footers;
-- fields, relationships, media, and page furniture;
-- approved styles.
-
-Replace only sample body content. Do not redraw the letterhead.
+Route letters through `AESG_Letterhead_Dubai.docx` so correspondence retains
+the dedicated first-page and continuation-page letterhead.
 
 #### PDF
 
@@ -242,28 +247,34 @@ Generate a new workbook with `openpyxl` using measured AESG styles:
 
 #### PPTX
 
-Retain the standard 16:9 template. Use a clone-and-fill generator that copies
-approved source slides and preserves the master/layout hierarchy,
-relationships, artwork, and logo.
+Retain `AESG_General_Presentation.pptx` at its native `10.833 × 7.5 in` size.
+Use a clone-and-fill generator that copies approved specimen slides and
+preserves both masters, all 59 layouts, relationships, city imagery, and logo.
 
-Map simple semantic layout names to known template slides. The current set is:
+The specimen-backed semantic layout set is:
 
 ```text
-title
-statement
-three_columns
-process
-four_cards
-seven_points
-comparison
-star
-table
-image_text
+cover
+text
 two_columns
+three_columns
+statement
+image_bottom
+text_image
+image_text
+divider
+gallery
+image_three_columns
+three_columns_image
+image_two_columns
+plain
+closing
 ```
 
-When the template changes, rediscover slide and shape IDs. Never assume the old
-mapping still applies.
+Keep the complete inventory and capacity limits in
+`deploy/skills/pptx/references/layout-catalog.md`. The second master remains
+unclassified and is not a generation route. When the template changes,
+rediscover slide, layout, and shape IDs.
 
 ### Step 5: create the skill folders
 
@@ -565,13 +576,19 @@ For `cv-creator`, also confirm one representative profile produces the four
 expected portrait/landscape DOCX/PPTX deliverables and publishes no extracted
 JSON, photo, or other intermediate file.
 
+For the five artifact skills, confirm the task activity shows `aesg-branding`
+and the matching format skill activating before generation. A generic request
+such as “create a project brief” should route to DOCX without requiring the
+user to name a skill or file extension.
+
 ## 5. Modify or tweak an existing implementation
 
 Start by identifying the change type:
 
 | Change | Files to inspect | Required deployment |
 |---|---|---|
-| Prompt/workflow wording | Format `SKILL.md` and `aesg-branding/SKILL.md` | Commit, new E2B image, template switch, skill sync |
+| Skill prompt/workflow wording | Format `SKILL.md` and `aesg-branding/SKILL.md` | Commit, new E2B image, template switch, skill sync |
+| Shared skill auto-routing | `packages/harness/src/harness/system-prompt.ts` | Deploy API and worker; rebuild the image and sync skills only when bundled skill content also changed |
 | Brand rule or token | `brand-system.md`, `brand-tokens.json`, affected generators | Revalidate all affected formats, new image, skill sync |
 | DOCX generation | `create_aesg_docx.py`, letterhead template | New image; PDF also needs review because it depends on DOCX |
 | PDF generation | `create_aesg_pdf.py`, DOCX generator, LibreOffice runtime | New image |
@@ -726,6 +743,7 @@ environment file.
 - [ ] Environment file backed up.
 - [ ] API recreated with the new template ID.
 - [ ] Six organization skills synced with expected hashes.
+- [ ] Generic artifact requests auto-activate `aesg-branding` and the matching format skill.
 - [ ] Previous template ID and backups retained for rollback.
 
 ## 9. Historical reference

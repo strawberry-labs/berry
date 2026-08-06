@@ -1,38 +1,47 @@
 ---
 name: docx
-description: Create, edit, inspect, or convert Word DOCX files. Use for every Word document request; activate aesg-branding for AESG output.
+description: Create, edit, inspect, or convert Word DOCX files. Use for every Word-document request; combine with aesg-branding for AESG reports, letters, briefs, policies, proposals, technical documents, and other branded Word output.
 ---
 
 # DOCX
 
-For AESG output, read `aesg-branding/references/brand-system.md` and use the
-bundled generator first.
+For AESG output, read
+`/managed-skills/aesg-branding/references/brand-system.md` and use the bundled
+generator. It routes reports through the new General Template and letters
+through the retained letterhead.
 
-## Golden path
-
-Use `/managed-skills` for bundled scripts. Never use
-`/workspace/.berry/managed-skills` in a command; `/.berry` is protected. If a
-path is rejected, correct the prefix and rerun. Do not copy or rewrite the
-generator.
+## Canonical workflow
 
 Create `/workspace/tmp/docx/spec.json`:
 
 ```json
 {
   "kind": "report",
-  "title": "Project Brief",
-  "subtitle": "Executive summary",
-  "date": "24 July 2026",
+  "title": "Environmental monitoring report",
+  "project": "Project North",
+  "client": "Client organisation",
+  "date": "06 August 2026",
+  "approvalPage": true,
+  "documentControl": {
+    "issue": "01",
+    "revision": "00",
+    "preparedBy": "AESG",
+    "reviewedBy": "AESG",
+    "approvedBy": "AESG"
+  },
   "sections": [
     {
       "heading": "Executive summary",
-      "paragraphs": ["Concise report text."],
-      "bullets": ["First finding.", "Second finding."]
+      "divider": true,
+      "paragraphs": ["Concise, evidence-based summary."],
+      "bullets": ["Finding one", "Finding two"],
+      "callout": "Overall status: on track"
     },
     {
       "heading": "Key metrics",
       "table": {
-        "headers": ["Metric", "Value"],
+        "caption": "Table 1: Monitoring results",
+        "headers": ["Metric", "Result"],
         "rows": [["Coverage", "94%"], ["Status", "On track"]]
       }
     }
@@ -46,34 +55,29 @@ Run:
 mkdir -p /workspace/tmp/docx /workspace/outputs
 python /managed-skills/docx/scripts/create_aesg_docx.py \
   --spec /workspace/tmp/docx/spec.json \
-  --output /workspace/outputs/project-brief.docx
+  --output /workspace/outputs/environmental-monitoring-report.docx
 python /managed-skills/aesg-branding/scripts/validate_artifact.py \
-  /workspace/outputs/project-brief.docx
+  /workspace/outputs/environmental-monitoring-report.docx
 python /managed-skills/aesg-branding/scripts/render_artifact.py \
-  /workspace/outputs/project-brief.docx \
+  /workspace/outputs/environmental-monitoring-report.docx \
   --output-dir /workspace/tmp/docx/rendered
 ```
 
-`kind` may be `report` or `letter`. For letters, the JSON may also contain
-`recipient`, `reference`, `subject`, `salutation`, `closing`, `signatory`, and
-`designation`.
+Supported report blocks include paragraphs, bullets, numbering, callouts,
+tables, images with captions/sources, page breaks, approval pages, and branded
+section dividers. Image objects accept `path`, `caption`, `source`, and
+`widthInches`.
 
-The generator preserves the retained AESG template's sections, headers,
-footers, page fields, media, and A4 geometry while replacing all sample body
-content. Prefer it over a one-off script.
+For `kind: "letter"`, also use `recipient`, `reference`, `subject`,
+`salutation`, `closing`, `signatory`, and `designation`. Do not use the report
+cover for a letter.
 
-## Editing existing DOCX
+## Editing and output
 
-Use `python-docx` for normal paragraph, run, list, and table work. For a
-template, preserve its section properties, styles, headers, footers,
-relationships, fields, and media. Never rebuild AESG letterhead from scratch.
-Use OOXML only for features `python-docx` cannot preserve.
-
-## Output contract
-
-- Working files: `/workspace/tmp/docx`.
-- Final `.docx` only: `/workspace/outputs`.
-- Render every page for branded or layout-sensitive work.
-- Publish once with media type
+- Preserve existing sections, styles, fields, headers, footers, relationships,
+  and media when editing an AESG DOCX.
+- Use OOXML only for features `python-docx` cannot preserve.
+- Inspect every rendered page. Correct orphan headings, broken tables,
+  stretched images, and stray sample text.
+- Publish only the final `.docx` with media type
   `application/vnd.openxmlformats-officedocument.wordprocessingml.document`.
-- Do not publish spec files, temporary PDFs, previews, or Python scripts.

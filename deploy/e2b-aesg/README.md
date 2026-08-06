@@ -34,7 +34,7 @@ From the repository root:
 cd deploy/e2b-aesg
 npm install
 cd ../..
-E2B_TEMPLATE_ALIAS=aesg-artifacts-2026-07-vN \
+E2B_TEMPLATE_ALIAS=aesg-artifacts-2026-08-vN \
 AESG_FONTS_CONFIRMED=1 \
 ./node_modules/.bin/tsx deploy/e2b-aesg/build.ts
 ```
@@ -42,7 +42,7 @@ AESG_FONTS_CONFIRMED=1 \
 When dependencies are installed only in this directory, use:
 
 ```bash
-E2B_TEMPLATE_ALIAS=aesg-artifacts-2026-07-vN \
+E2B_TEMPLATE_ALIAS=aesg-artifacts-2026-08-vN \
 AESG_FONTS_CONFIRMED=1 \
 deploy/e2b-aesg/node_modules/.bin/tsx deploy/e2b-aesg/build.ts
 ```

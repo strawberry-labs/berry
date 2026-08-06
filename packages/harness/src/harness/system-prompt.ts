@@ -21,7 +21,26 @@ export function formatSkillsForSystemPrompt(skills: Skill[]): string {
 	}
 
 	lines.push("</available_skills>");
+	const aesgRouting = formatAesgArtifactRouting(visibleSkills);
+	if (aesgRouting) lines.push("", aesgRouting);
 	return lines.join("\n");
+}
+
+function formatAesgArtifactRouting(skills: Skill[]): string {
+	const names = new Set(skills.map((skill) => skill.name));
+	if (!["aesg-branding", "docx", "pdf", "pptx", "xlsx"].every((name) => names.has(name))) return "";
+	return [
+		"# AESG Artifact Skill Routing",
+		"The AESG artifact skills are required workflow components, not optional suggestions.",
+		"- Before creating, editing, converting, or exporting any Office or PDF deliverable, activate `aesg-branding` and every matching format skill. Activate them before planning the artifact or calling file-generation tools.",
+		"- Word, DOCX, document, report, proposal, letter, brief, policy, and memo deliverables route to `aesg-branding` then `docx`.",
+		"- PDF deliverables route to `aesg-branding` then `pdf`.",
+		"- PowerPoint, PPTX, presentation, slide, slide-deck, pitch-deck, and workshop-deck deliverables route to `aesg-branding` then `pptx`.",
+		"- Excel, XLSX, spreadsheet, workbook, register, tracker, schedule, and tabular-dashboard deliverables route to `aesg-branding` then `xlsx`.",
+		"- If the user requests several output formats, activate every matching format skill. If a generic professional document has no requested file format, default to DOCX.",
+		"- For reading, inspecting, or analysing an existing file without producing a new artifact, activate its format skill; add `aesg-branding` when the answer must assess branding or when a branded file will be returned.",
+		"- Do not bypass the retained AESG templates or rebuild their branding with ad-hoc styling when the skills provide a canonical generator or template.",
+	].join("\n");
 }
 
 function escapeXml(value: string): string {

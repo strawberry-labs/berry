@@ -7,66 +7,67 @@
 3. AESG Brand Guidelines, January 2022.
 4. Generic format guidance.
 
-## Colour
+## Colour and typography
 
-| Role | Hex | RGB | Use |
-|---|---|---|---|
-| AESG Green | `#008C95` | 0, 140, 149 | Primary field, headings, links, series 1 |
-| AESG Gray | `#343741` | 52, 55, 65 | Body text, neutral fields, series 2 |
-| White | `#FFFFFF` | 255, 255, 255 | Main background |
-| Purple | `#6D2077` | 109, 32, 119 | Secondary series/status |
-| Red | `#DA291C` | 218, 41, 28 | Secondary series/status |
-| Yellow | `#FFC72C` | 255, 199, 44 | Secondary highlight |
+| Role | Hex | Use |
+|---|---|---|
+| AESG Green | `#008C95` | Primary fields, headings, links, first chart series |
+| AESG Gray | `#343741` | Body text, neutral fields, second chart series |
+| White | `#FFFFFF` | Main background and reversed copy |
+| Purple | `#6D2077` | Secondary series or status |
+| Red | `#DA291C` | Secondary series, risk, or warning |
+| Yellow | `#FFC72C` | Small secondary highlight |
 
-Target roughly 55% white space, 30% Green/Gray, and at most 15% secondary
-colour. Do not invent extra hues. The retained Word template also uses legacy
-Gray `#53565A` and title Green `#00686F`; preserve those existing values.
+Aim for generous white space. Keep the three secondary colours below 15% of
+the page or slide. Preserve legacy colours already embedded in retained
+template artwork.
 
-## Typography
+- Office artifacts: Verdana Regular/Bold/Italic/Bold Italic.
+- English external marketing: Ubuntu.
+- Arabic external marketing: Tahoma.
+- Never claim exact fidelity after silently substituting fonts.
 
-- DOCX, XLSX, and ordinary PPTX: Verdana Regular/Bold/Italic/Bold Italic.
-- External marketing: Ubuntu Light/Regular/Medium/Bold/Italic.
-- Arabic marketing: Tahoma Regular/Bold.
-- Never silently substitute fonts and claim exact fidelity.
+## Identity and editorial rules
 
-## Word/report geometry
+- Preserve the logo as one composition at its 3.465:1 ratio.
+- Do not redraw, recolour, rotate, crop, split, or distort the logo.
+- Use British English, `-ise` spellings, and dates such as `01 January 2026`.
+- Keep body copy left aligned. Use real bullets and numbering.
+- Add captions and source notes for reproduced visuals and data.
+- Remove sample copy, personal author metadata, and off-canvas source content
+  from final artifacts.
 
-- A4 portrait: `11900 × 16840` DXA.
-- Margins: top `2410`, right `1268`, bottom `2127`, left `1560` DXA.
-- Header `708` and footer `878` DXA; different first page enabled.
-- Body 9 pt; Heading 1 12 pt Green bold; Heading 2 9 pt Green; title 26 pt
-  legacy Green.
-- Retain the template's first-page letterhead and continuation-page furniture.
+## Word/report system
 
-## Excel system
-
-- Logo at the upper left.
-- Title band: Green, white Verdana Bold, 30 pt row height.
-- Column header: Gray, white Verdana Bold, 24.75 pt row height.
-- Body row height: 19.5 pt.
-- Chart series order: Green, Gray, Purple, Red, Yellow.
-- Hide gridlines, use restrained separators, formulas for calculations, and a
-  content-specific print area.
+- Use `AESG_General_Report_Template.docx` for reports and long-form documents.
+- Use `AESG_Letterhead_Dubai.docx` only for letters.
+- The General Template is A4, with `11900 × 16840` DXA page geometry, 720 DXA
+  margins, and 1134 DXA header/footer distances.
+- Preserve its cover artwork, section relationship hierarchy, media, and AESG
+  styles. Main headings are 22 pt, first subheadings 16 pt, and second
+  subheadings 14 pt in the retained template.
+- Use the specimen-backed cover and divider pages. Do not copy the 66 pages of
+  Lorem Ipsum samples into output documents.
 
 ## PowerPoint system
 
-- Standard deck: 16:9, using the retained `AESG_Presentation_16x9.pptx`.
-- Preserve its master/layout hierarchy, original brand furniture, and native
-  slide-local artwork.
-- The template is primarily Verdana. Preserve any inherited type treatment on
-  copied shapes; use Verdana for new Office copy.
-- Keep text shorter than the source slot. Choose a different layout or split a
-  slide rather than shrinking body text into illegibility.
-- Use the large bid templates only as visual evidence. Never copy their people,
-  client names, project examples, awards, or proposal text into a deliverable.
+- Use `AESG_General_Presentation.pptx` at its native `10.833 × 7.5 in` size.
+- Preserve both masters, all 59 layouts, inherited artwork, and relationships.
+- Build slides by cloning the approved 17-slide specimen library. Do not
+  flatten masters or rebuild the city imagery and page furniture.
+- Use `pptx/references/layout-catalog.md` for the supported semantic layouts,
+  image requirements, and full master inventory.
+- Keep text within the generator's capacity checks. Split content rather than
+  shrinking it into illegibility.
 
-## Editorial and logo rules
+## Excel system
 
-- British English and `-ise` spellings.
-- Dates: `01 January 2026`.
-- Body copy is left aligned.
-- Real bullets and numbering, never typed bullet symbols.
-- Keep the primary logo at its 3.467:1 ratio with clear space.
-- Never redraw, recolour, distort, rotate, split, or place the logo in an
-  improvised white box.
-- Add captions and source notes for reproduced visuals.
+- Use the sanitised one-sheet workbook only as style evidence. Never restore
+  the original hidden employee/Joiners sheet.
+- Place the approved full-colour logo at upper left.
+- Use a Green title band, a Gray header row, white Verdana Bold labels, 19.5 pt
+  body rows, hidden gridlines, restrained separators, and formula-driven
+  calculations.
+- Use chart series in this order: Green, Gray, Purple, Red, Yellow.
+- Set a bounded print area and use landscape orientation for tables wider than
+  six columns.

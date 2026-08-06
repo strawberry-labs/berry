@@ -1,37 +1,44 @@
 ---
 name: xlsx
-description: Create, edit, inspect, calculate, or convert Excel XLSX files. Use for every spreadsheet request; activate aesg-branding for AESG output.
+description: Create, edit, inspect, calculate, or convert Excel XLSX workbooks. Use for every spreadsheet request; combine with aesg-branding for AESG registers, trackers, analyses, schedules, dashboards, and reporting workbooks.
 ---
 
 # XLSX
 
-For AESG output, read `aesg-branding/references/brand-system.md` and use the
-bundled generator before writing custom workbook code.
+For AESG output, generate a clean workbook from the measured AESG Excel system.
+The original source workbook contained a hidden employee sheet; never clone or
+restore it.
 
-## Golden path
-
-Use `/managed-skills` for bundled scripts. Never use
-`/workspace/.berry/managed-skills` in a command; `/.berry` is protected. If a
-path is rejected, correct the prefix and rerun. Do not copy or rewrite the
-generator.
+## Canonical workflow
 
 Create `/workspace/tmp/xlsx/spec.json`:
 
 ```json
 {
-  "title": "Project Status Register",
-  "sheet": "Status",
-  "columns": [
-    {"key": "project", "label": "Project", "width": 28},
-    {"key": "status", "label": "Status", "width": 16},
-    {"key": "progress", "label": "Progress", "width": 14, "format": "0%"},
-    {"key": "budget", "label": "Budget (AED)", "width": 18, "format": "#,##0"}
-  ],
-  "rows": [
-    {"project": "Example A", "status": "On track", "progress": 0.75, "budget": 250000},
-    {"project": "Example B", "status": "At risk", "progress": 0.4, "budget": 180000}
-  ],
-  "chart": {"type": "bar", "category": "project", "value": "progress", "title": "Progress"}
+  "title": "Project controls register",
+  "sheets": [
+    {
+      "sheet": "Register",
+      "columns": [
+        {"key": "item", "label": "Item", "width": 28},
+        {"key": "owner", "label": "Owner", "width": 20},
+        {"key": "status", "label": "Status", "validation": ["On track", "At risk", "Closed"]},
+        {"key": "budget", "label": "Budget", "format": "#,##0"},
+        {"key": "actual", "label": "Actual", "format": "#,##0"},
+        {"key": "variance", "label": "Variance", "formula": "=D{row}-E{row}", "format": "#,##0"}
+      ],
+      "rows": [
+        {"item": "Package A", "owner": "Team A", "status": "On track", "budget": 120000, "actual": 110000},
+        {"item": "Package B", "owner": "Team B", "status": "At risk", "budget": 90000, "actual": 96000}
+      ],
+      "chart": {
+        "type": "bar",
+        "title": "Budget and actual",
+        "category": "item",
+        "values": ["budget", "actual"]
+      }
+    }
+  ]
 }
 ```
 
@@ -41,27 +48,19 @@ Run:
 mkdir -p /workspace/tmp/xlsx /workspace/outputs
 python /managed-skills/xlsx/scripts/create_aesg_xlsx.py \
   --spec /workspace/tmp/xlsx/spec.json \
-  --output /workspace/outputs/project-status.xlsx
+  --output /workspace/outputs/project-controls-register.xlsx
 python /managed-skills/aesg-branding/scripts/validate_artifact.py \
-  /workspace/outputs/project-status.xlsx
+  /workspace/outputs/project-controls-register.xlsx
 python /managed-skills/aesg-branding/scripts/render_artifact.py \
-  /workspace/outputs/project-status.xlsx \
+  /workspace/outputs/project-controls-register.xlsx \
   --output-dir /workspace/tmp/xlsx/rendered
 ```
 
-Cells beginning with `=` are preserved as formulas. Use formulas for derived
-values, explicit number formats, bounded ranges, data validation for editable
-categories, and a useful print area. The final workbook must contain zero
-formula errors.
+Use typed numeric/date values and auditable formulas. Formula templates may
+use `{row}`. Charts accept `bar`, `line`, or `pie`; `values` supports multiple
+series. Add more entries to `sheets` for multi-sheet workbooks.
 
-Never use the original sample workbook: its hidden `Joiners` sheet contains
-employee data. The generator reproduces the approved sanitized style without
-copying that workbook's inflated used range or unused sample charts.
-
-## Output contract
-
-- Working files: `/workspace/tmp/xlsx`.
-- Final `.xlsx` only: `/workspace/outputs`.
-- Publish once with media type
-  `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
-- Do not publish CSV sources, previews, spec files, or generator scripts.
+Inspect every rendered sheet. Confirm no hidden sheets, formula errors,
+truncated labels, distorted charts, or unbounded print areas. Publish only the
+final `.xlsx` with media type
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.

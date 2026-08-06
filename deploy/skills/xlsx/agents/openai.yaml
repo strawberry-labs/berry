@@ -1,0 +1,7 @@
+interface:
+  display_name: "AESG Workbooks"
+  short_description: "Create safe AESG-branded Excel workbooks"
+  brand_color: "#008C95"
+  default_prompt: "Use $xlsx and $aesg-branding to create a safe AESG-branded workbook."
+policy:
+  allow_implicit_invocation: true

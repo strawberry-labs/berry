@@ -1,0 +1,7 @@
+interface:
+  display_name: "AESG PDF Documents"
+  short_description: "Create validated AESG-branded PDFs"
+  brand_color: "#008C95"
+  default_prompt: "Use $pdf and $aesg-branding to create a validated AESG-branded PDF."
+policy:
+  allow_implicit_invocation: true

@@ -1,75 +1,66 @@
 ---
 name: aesg-branding
-description: Apply AESG's approved brand, fonts, retained templates, and quality checks to PDF, DOCX, XLSX, and PPTX deliverables. Use for every AESG-branded artifact together with the matching format skill.
+description: Apply AESG's approved identity, retained General Templates, logos, supergraphics, service icons, editorial rules, and quality checks to DOCX, PDF, PPTX, and XLSX deliverables. Use for every AESG-branded artifact together with exactly one matching format skill.
 ---
 
 # AESG brand authority
 
-Use this skill with exactly one format skill: `docx`, `pdf`, `xlsx`, or `pptx`.
-The retained Office templates override generic design advice.
+Use this skill with exactly one of `docx`, `pdf`, `pptx`, or `xlsx`. Treat the
+retained Office template as the design authority for that format.
 
-## Prepared Berry runtime
+## Runtime contract
 
-- Work from `/workspace`.
-- Write working JSON, source data, conversions, and previews under
-  `/workspace/tmp`.
-- Put only final deliverables in `/workspace/outputs`.
-- Use `/managed-skills` in every shell command. It is the safe, read-only
-  command mount for bundled skills.
-- Never reference `/workspace/.berry` in a shell command. The platform treats
-  `/.berry` as protected configuration and rejects the command.
-- Templates are in `assets/templates`; scripts are in `scripts`.
-- Verdana, Ubuntu, LibreOffice, Poppler, qpdf, Python packages, and Node
-  packages are preinstalled. Do not run package installation or dependency
-  discovery unless the first canonical command fails.
-- Use the format skill's bundled generator before writing a one-off generator.
+- Work under `/workspace`; keep intermediates in `/workspace/tmp` and final
+  deliverables in `/workspace/outputs`.
+- Invoke bundled resources through `/managed-skills`. Never reference a
+  protected `/.berry` path.
+- Use the matching format generator before considering custom code. Extend its
+  JSON specification when the existing fields can express the request.
+- Do not install packages, copy generators, publish specs, or publish previews.
 
-If a command is rejected for mentioning a protected `/.berry` path, replace
-only the skill-root prefix with `/managed-skills` and rerun it. Do not copy the
-bundled generator, write a replacement generator, or bypass the guard
-indirectly.
+## Required brand rules
 
-## Exact identity
+Read `references/brand-system.md` before authoring. Apply these rules:
 
-Read `references/brand-system.md` before authoring. Core rules:
-
-- Office documents: Verdana.
-- External English marketing collateral: Ubuntu.
-- Arabic marketing collateral: Tahoma.
-- Primary Green `#008C95`, Gray `#343741`, and White `#FFFFFF`.
-- Secondary Purple `#6D2077`, Red `#DA291C`, and Yellow `#FFC72C` together
-  occupy no more than 15% of the design.
-- Preserve the logo as a locked composition and at its native 3.467:1 ratio.
+- Use Verdana for Office artifacts, Ubuntu for English marketing material, and
+  Tahoma for Arabic marketing material.
+- Use AESG Green `#008C95`, Gray `#343741`, and White `#FFFFFF` as the core
+  palette. Keep Purple, Red, and Yellow together below 15% of a layout.
+- Preserve the approved logo composition and its native 3.465:1 ratio.
 - Use British English and dates such as `01 January 2026`.
-- Cite reproduced photographs, figures, charts, tables, and external claims.
+- Cite reproduced images, figures, tables, data, and external claims.
 
 ## Template routing
 
-| Output | Runtime template |
+| Output | Required source |
 |---|---|
-| Letter or A4 report DOCX | `assets/templates/AESG_Letterhead_Dubai.docx` |
-| Office/report PDF | Generate DOCX from the letterhead, then convert it |
-| XLSX | Generator reproduces the sanitized workbook's measured style system |
-| Standard 16:9 PPTX | `assets/templates/AESG_Presentation_16x9.pptx` |
+| Report or long-form DOCX | `assets/templates/AESG_General_Report_Template.docx` |
+| Letter DOCX | `assets/templates/AESG_Letterhead_Dubai.docx` |
+| Office/report PDF | Generate the matching DOCX, then convert it with LibreOffice |
+| Presentation | `assets/templates/AESG_General_Presentation.pptx` |
+| Workbook | Generate from the measured AESG Excel system; use the sanitised workbook only as evidence |
 
-The source workbook in the original sample pack contains a hidden employee
-sheet. It is prohibited. Only the sanitized one-sheet workbook in this skill
-may be used as a reference. The large bid decks and bid document are design
-evidence only: they contain live people, client, portfolio, and proposal
-content and are deliberately not packaged in production.
+The presentation retains two masters and 59 layouts at its native
+`10.833 × 7.5 in` size. Use only the specimen-backed layouts exposed by the
+PPTX generator. Do not route content through the unclassified second master.
 
-## Fast completion gate
+## Asset library
 
-Run the format generator, then:
+- Canonical manual: `assets/reference/AESG_Brand_Guidelines_2022.pdf`.
+- Full-colour and white logos: `assets/logos`.
+- Primary and elemental RGB supergraphics: `assets/supergraphics`.
+- Thirteen individual service icons plus the combined services sheet:
+  `assets/icons/services`.
 
-1. Run
-   `python /managed-skills/aesg-branding/scripts/validate_artifact.py <final-file>`.
-2. Render branded or layout-sensitive output with
-   `python /managed-skills/aesg-branding/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
-3. Inspect every rendered page/slide or every relevant sheet.
-4. Confirm no Lorem Ipsum, sample names, template prompts, hidden employee
-   data, or generator files remain.
-5. Publish the final file once with `persist_artifact`, using the exact Office
-   or PDF media type and a filename with the correct extension.
+Do not use the SGW co-brand, CMYK print files, duplicate guideline copies, or
+social-media guidance for ordinary Office artifacts.
 
-Never publish a helper `.py`, `.js`, source JSON, preview, or temporary DOCX.
+## Completion gate
+
+1. Run the matching format generator.
+2. Run `python /managed-skills/aesg-branding/scripts/validate_artifact.py <final-file>`.
+3. Render with `python /managed-skills/aesg-branding/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
+4. Inspect every rendered page, slide, or relevant sheet and correct clipping,
+   overlap, blank placeholders, weak pagination, or distorted images.
+5. Publish only the final artifact, once, with the correct extension and MIME
+   type.

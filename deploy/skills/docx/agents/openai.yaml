@@ -1,0 +1,7 @@
+interface:
+  display_name: "AESG Word Documents"
+  short_description: "Create Word files from AESG templates"
+  brand_color: "#008C95"
+  default_prompt: "Use $docx and $aesg-branding to create an AESG-branded Word document."
+policy:
+  allow_implicit_invocation: true

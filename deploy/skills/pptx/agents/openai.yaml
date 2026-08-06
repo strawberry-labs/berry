@@ -1,0 +1,7 @@
+interface:
+  display_name: "AESG Presentations"
+  short_description: "Create decks from the AESG General Template"
+  brand_color: "#008C95"
+  default_prompt: "Use $pptx and $aesg-branding to create a presentation from the AESG General Template."
+policy:
+  allow_implicit_invocation: true

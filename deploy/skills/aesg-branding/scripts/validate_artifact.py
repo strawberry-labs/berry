@@ -15,7 +15,8 @@ from pathlib import Path
 
 PLACEHOLDER_RE = re.compile(
     r"\b(lorem ipsum|insert title|sample heading|sample sub-heading|"
-    r"replace text|name another|client name|click to add|xxxx-xxx)\b",
+    r"replace text|name another|name surname|client name|click to add|"
+    r"click to edit|section heading|xxxx-xxx|xxxxxxxx)\b",
     re.IGNORECASE,
 )
 ERROR_TOKENS = ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A", "#NUM!", "#NULL!")
@@ -37,17 +38,42 @@ def package_text(path: Path) -> str:
     return "\n".join(chunks)
 
 
+def validate_core_author(path: Path, errors: list[str], evidence: dict) -> None:
+    with zipfile.ZipFile(path) as archive:
+        try:
+            core = archive.read("docProps/core.xml").decode("utf-8", errors="ignore")
+        except KeyError:
+            errors.append("Office package has no core properties")
+            return
+    creators = re.findall(r"<(?:dc:creator|cp:lastModifiedBy)>(.*?)</", core)
+    evidence["coreAuthors"] = creators
+    if creators and any(value.strip().casefold() != "aesg" for value in creators):
+        errors.append("Office core properties contain a non-AESG author")
+
+
 def validate_pdf(path: Path, errors: list[str], evidence: dict) -> None:
     if path.read_bytes()[:5] != b"%PDF-":
         errors.append("missing PDF signature")
-    for command in (["qpdf", "--check", str(path)], ["pdfinfo", str(path)]):
-        if not shutil.which(command[0]):
-            errors.append(f"missing validator: {command[0]}")
-            continue
-        result = run(command)
-        evidence[command[0]] = result.stdout.strip() or result.stderr.strip()
+    if shutil.which("qpdf"):
+        result = run(["qpdf", "--check", str(path)])
+        evidence["qpdf"] = result.stdout.strip() or result.stderr.strip()
         if result.returncode:
-            errors.append(f"{command[0]} validation failed")
+            errors.append("qpdf validation failed")
+    else:
+        try:
+            from pypdf import PdfReader
+
+            document = PdfReader(path)
+            evidence["pypdf"] = {"pages": len(document.pages), "fallback": True}
+        except Exception as exc:
+            errors.append(f"PDF package validation failed: {exc}")
+    if shutil.which("pdfinfo"):
+        result = run(["pdfinfo", str(path)])
+        evidence["pdfinfo"] = result.stdout.strip() or result.stderr.strip()
+        if result.returncode:
+            errors.append("pdfinfo validation failed")
+    else:
+        errors.append("missing validator: pdfinfo")
     if shutil.which("pdffonts"):
         fonts = run(["pdffonts", str(path)])
         evidence["pdffonts"] = fonts.stdout.strip()
@@ -76,6 +102,7 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     xml = package_text(path).casefold()
     if "verdana" not in xml:
         errors.append("Verdana is not declared in DOCX package")
+    validate_core_author(path, errors, evidence)
     evidence.update(
         {
             "sections": len(document.sections),
@@ -116,6 +143,7 @@ def validate_xlsx(path: Path, errors: list[str], evidence: dict) -> None:
         errors.append("forbidden Joiners identifier found in package")
     if "verdana" not in xml:
         errors.append("Verdana is not declared in XLSX package")
+    validate_core_author(path, errors, evidence)
     evidence["worksheets"] = workbook.sheetnames
     evidence["dimensions"] = {
         ws.title: {"rows": ws.max_row, "columns": ws.max_column} for ws in workbook.worksheets
@@ -140,12 +168,21 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
     xml = package_text(path).casefold()
     if "verdana" not in xml:
         errors.append("Verdana is not declared in PPTX package")
+    layout_count = sum(len(master.slide_layouts) for master in presentation.slide_masters)
+    expected_size = [9906000, 6858000]
+    actual_size = [presentation.slide_width, presentation.slide_height]
+    if presentation.core_properties.subject == "AESG General Template":
+        if len(presentation.slide_masters) < 2 or layout_count < 59:
+            errors.append("AESG General Template master/layout hierarchy is incomplete")
+        if actual_size != expected_size:
+            errors.append(f"unexpected AESG General Template size: {actual_size}")
+    validate_core_author(path, errors, evidence)
     evidence.update(
         {
             "slides": len(presentation.slides),
-            "layouts": len(presentation.slide_layouts),
+            "layouts": layout_count,
             "masters": len(presentation.slide_masters),
-            "sizeEmu": [presentation.slide_width, presentation.slide_height],
+            "sizeEmu": actual_size,
         }
     )
 
