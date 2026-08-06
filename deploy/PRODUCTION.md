@@ -88,6 +88,16 @@ Project records, tasks, messages, governance, budgets, usage, and audit data are
 
 ## Operations
 
+- Deploy an update with `./deploy/server-deploy.sh origin/main`. The script
+  serializes deployments, refuses non-fast-forward targets, classifies the Git
+  diff, and builds all affected images together so BuildKit can reuse the
+  dependency and package-build layers. It then runs only required migrations or
+  role setup, restarts only affected services, and waits for Compose and public
+  health checks before recording the deployed commit.
+- A web-only change builds and restarts only `web`. An API-only change builds
+  and restarts only `api`. Changes to shared packages expand to the exact
+  consumers declared by `deploy/deployment-impact.sh`; its behavior is covered
+  by `pnpm check:deploy`.
 - Run `deploy/backup.sh` daily from systemd/cron, copy the dated Berry Postgres,
   Mem0 pgvector, and MinIO archive off-box, retain at least 7 daily and 4 weekly
   copies, and test restores quarterly.

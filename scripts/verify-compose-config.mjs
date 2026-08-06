@@ -14,6 +14,7 @@ const helmHpa = readFileSync(resolve(root, "deploy/helm/berry-platform/templates
 const dedicatedRunbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md"), "utf8");
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
 const serverDeploy = readFileSync(resolve(root, "deploy/server-deploy.sh"), "utf8");
+const deploymentImpact = readFileSync(resolve(root, "deploy/deployment-impact.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
 const productionEnv = readFileSync(resolve(root, "deploy/.env.production.example"), "utf8");
 
@@ -69,6 +70,10 @@ const requiredComposeSnippets = [
   "BERRY_WEB_API_INTERNAL_URL: http://api:3000",
   "mc mb --ignore-existing",
   "127.0.0.1:${BERRY_API_PORT:-3001}:3000",
+  "image: ${BERRY_API_IMAGE:-berry-api:local}",
+  "image: ${BERRY_WORKER_IMAGE:-berry-worker:local}",
+  "image: ${BERRY_MEM0_IMAGE:-berry-mem0:local}",
+  "image: ${BERRY_WEB_IMAGE:-berry-web:local}",
 ];
 
 const requiredDockerfileSnippets = [
@@ -76,6 +81,8 @@ const requiredDockerfileSnippets = [
   "corepack pnpm --filter @berry/web... build",
   "corepack pnpm --filter @berry/worker... build",
   "corepack pnpm --filter @berry/mem0... build",
+  "corepack pnpm --filter @berry/api deploy --prod --legacy /out/apps/api",
+  "corepack pnpm --filter @berry/web deploy --prod --legacy /out/apps/web",
   "docker.io",
   "CMD [\"node\", \"apps/api/dist/main.js\"]",
   "CMD [\"node\", \"apps/mem0/dist/main.js\"]",
@@ -154,6 +161,8 @@ assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy
 assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS=", "BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY=", "BERRY_SANDBOX_TTL_SECONDS=300"]);
 assertContains("deploy/PRODUCTION.md", productionRunbook, ["aesg-v2.berry.me", "pause/reconnect", "deploy/backup.sh", "bak-sandbox-ttl-300"]);
 assertContains("deploy/server-deploy.sh", serverDeploy, ["max_sandbox_ttl_seconds=300", "Deployment automation will not replace the production environment file"]);
+assertContains("deploy/server-deploy.sh", serverDeploy, ["deployment-impact.sh", "compose build $berry_image_services", "--wait-timeout 120"]);
+assertContains("deploy/deployment-impact.sh", deploymentImpact, ["packages/db/*", "berry_run_migrations=true", "deploy/compose.yaml"]);
 
 console.log("[compose] self-host deployment config OK");
 console.log("[helm] managed/dedicated/self-host chart config OK");

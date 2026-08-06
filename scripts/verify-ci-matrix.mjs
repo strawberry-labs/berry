@@ -4,16 +4,28 @@ import { resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
 const ci = readFileSync(resolve(root, ".github", "workflows", "ci.yml"), "utf8");
+const normalizedCi = ci.replace(/\s+/g, " ");
 const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
 
 assert(ci.includes("ubuntu-24.04"), "Web-platform CI must use the supported Ubuntu runner");
-for (const workspace of ["@berry/shared", "@berry/db", "@berry/api", "@berry/worker", "@berry/web"]) {
-  assert(ci.includes(`pnpm --filter ${workspace} test`), `CI must test ${workspace}`);
+for (const workspace of ["@berry/web...", "@berry/api...", "@berry/worker...", "@berry/mem0..."]) {
+  assert(ci.includes(`--filter ${workspace}`), `CI must build and typecheck ${workspace}`);
 }
-for (const workspace of ["@berry/web...", "@berry/api...", "@berry/worker..."]) {
-  assert(ci.includes(`pnpm --filter ${workspace} build`), `CI must build ${workspace}`);
-  assert(ci.includes(`pnpm --filter ${workspace} typecheck`), `CI must typecheck ${workspace}`);
-}
+assert(
+  normalizedCi.includes("pnpm --filter @berry/web... --filter @berry/api... --filter @berry/worker... --filter @berry/mem0... build"),
+  "CI must build the shared web graph once instead of rebuilding overlapping dependencies",
+);
+assert(
+  normalizedCi.includes("pnpm --filter @berry/web... --filter @berry/api... --filter @berry/worker... --filter @berry/mem0... typecheck"),
+  "CI must typecheck the shared web graph once",
+);
+assert(
+  normalizedCi.includes(
+    "pnpm --filter @berry/shared --filter @berry/db --filter @berry/api --filter @berry/worker --filter @berry/mem0 --filter @berry/web test",
+  ),
+  "CI must test every production web workspace",
+);
+assert(!ci.includes("needs: compile"), "Production integration should run in parallel with compile checks");
 for (const service of [
   "pgvector/pgvector:0.8.2-pg16-bookworm",
   "redis:7-alpine",
@@ -32,6 +44,12 @@ assert(
   "Production integration CI must exercise admission, outbox, worker recovery, SSE, RLS, billing, and uploads",
 );
 assert(packageJson.scripts.check.includes("pnpm check:ci"), "pnpm check must include CI verification");
+assert(packageJson.scripts.check.includes("pnpm check:deploy"), "pnpm check must include deployment-impact tests");
+assert(packageJson.scripts.check.includes("pnpm check:docker"), "pnpm check must include Docker context verification");
+assert(
+  ci.includes("pnpm check:compose && pnpm check:docker && pnpm check:ci && pnpm check:deploy"),
+  "CI must validate deployment assets",
+);
 
 console.log("[ci] web compile, tests, and production runtime integration matrix OK");
 

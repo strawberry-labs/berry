@@ -56,8 +56,11 @@ cd /opt/berry
 ./deploy/server-deploy.sh origin/main
 ```
 
-The deployment script pulls public `main`, rebuilds only affected web-platform
-services, and leaves `deploy/.env.production` and persistent volumes unchanged.
+The deployment script pulls public `main`, classifies the changed files, builds
+only affected web-platform images in one cache-sharing BuildKit invocation, and
+restarts only the affected services. Database migrations and role updates run
+only when their inputs changed. `deploy/.env.production` and persistent volumes
+remain untouched.
 
 ## License
 

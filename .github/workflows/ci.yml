@@ -6,6 +6,7 @@ on:
       - "apps/web/**"
       - "apps/api/**"
       - "apps/worker/**"
+      - "apps/mem0/**"
       - "packages/**"
       - "scripts/prepare-web-build.mjs"
       - "scripts/verify-web-build-assets.mjs"
@@ -24,6 +25,7 @@ on:
       - "apps/web/**"
       - "apps/api/**"
       - "apps/worker/**"
+      - "apps/mem0/**"
       - "packages/**"
       - "scripts/prepare-web-build.mjs"
       - "scripts/verify-web-build-assets.mjs"
@@ -65,29 +67,26 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Validate deployment assets
+        run: pnpm check:compose && pnpm check:docker && pnpm check:ci && pnpm check:deploy
+
       - name: Build web stack
-        run: |
-          pnpm --filter @berry/web... build
-          pnpm --filter @berry/api... build
-          pnpm --filter @berry/worker... build
+        run: >-
+          pnpm --filter @berry/web... --filter @berry/api... --filter @berry/worker...
+          --filter @berry/mem0... build
 
       - name: Typecheck web stack
-        run: |
-          pnpm --filter @berry/web... typecheck
-          pnpm --filter @berry/api... typecheck
-          pnpm --filter @berry/worker... typecheck
+        run: >-
+          pnpm --filter @berry/web... --filter @berry/api... --filter @berry/worker...
+          --filter @berry/mem0... typecheck
 
       - name: Test web stack
-        run: |
-          pnpm --filter @berry/shared test
-          pnpm --filter @berry/db test
-          pnpm --filter @berry/api test
-          pnpm --filter @berry/worker test
-          pnpm --filter @berry/web test
+        run: >-
+          pnpm --filter @berry/shared --filter @berry/db --filter @berry/api
+          --filter @berry/worker --filter @berry/mem0 --filter @berry/web test
 
   production-integration:
     name: Production runtime integration
-    needs: compile
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     services:
@@ -137,9 +136,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build durable runtime
-        run: |
-          pnpm --filter @berry/api... build
-          pnpm --filter @berry/worker... build
+        run: pnpm --filter @berry/api... --filter @berry/worker... build
 
       - name: Start object storage
         run: >-

@@ -36,6 +36,7 @@ services:
       retries: 20
 
   db-migrate:
+    image: ${BERRY_API_IMAGE:-berry-api:local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -50,6 +51,7 @@ services:
       BERRY_DATABASE_URL: postgres://${POSTGRES_USER:-berry}:${POSTGRES_PASSWORD:-berry-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
 
   postgres-roles:
+    image: ${BERRY_API_IMAGE:-berry-api:local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -93,6 +95,7 @@ services:
       - embeddings_data:/data
 
   mem0:
+    image: ${BERRY_MEM0_IMAGE:-berry-mem0:local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -188,6 +191,7 @@ services:
       BERRY_AUDIT_S3_BUCKET: ${BERRY_AUDIT_S3_BUCKET:-berry-audit}
 
   api:
+    image: ${BERRY_API_IMAGE:-berry-api:local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -336,6 +340,7 @@ services:
       - api_data:/data
 
   worker:
+    image: ${BERRY_WORKER_IMAGE:-berry-worker:local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -423,6 +428,7 @@ services:
       BERRY_ARTIFACT_S3_PREFIX: ${BERRY_ARTIFACT_S3_PREFIX:-artifacts}
 
   web:
+    image: ${BERRY_WEB_IMAGE:-berry-web:local}
     build:
       context: ..
       dockerfile: Dockerfile
