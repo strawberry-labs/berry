@@ -111,7 +111,9 @@ class CloudSandboxSession {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
-    const stop = this.#provider.suspend?.bind(this.#provider) ?? this.#provider.destroy.bind(this.#provider);
+    const stop = this.#provider.suspend && this.#provider.supportsPause !== false
+      ? this.#provider.suspend.bind(this.#provider)
+      : this.#provider.destroy.bind(this.#provider);
     await stop({ sandbox_id: this.#sandboxId, reason: "session disposed" });
   }
 }
@@ -146,6 +148,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     let stderr = "";
     let exitCode = 0;
     try {
+      await this.#resumeForActiveOperation();
       for await (const event of this.#provider.exec({
         sandbox_id: this.#sandbox.sandbox_id,
         request_id: `exec_${randomUUID()}`,
@@ -180,6 +183,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
   async readTextFile(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>> {
     if (abortSignal?.aborted) return err(new FileError("aborted", "aborted", path));
     try {
+      await this.#resumeForActiveOperation();
       const result = await this.#provider.files.read({ sandbox_id: this.#sandbox.sandbox_id, path: this.#resolve(path), encoding: "utf8" });
       return ok(result.content);
     } catch (error) {
@@ -197,6 +201,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
   async readBinaryFile(path: string, abortSignal?: AbortSignal): Promise<Result<Uint8Array, FileError>> {
     if (abortSignal?.aborted) return err(new FileError("aborted", "aborted", path));
     try {
+      await this.#resumeForActiveOperation();
       const result = await this.#provider.files.read({ sandbox_id: this.#sandbox.sandbox_id, path: this.#resolve(path), encoding: "base64" });
       return ok(Buffer.from(result.content, "base64"));
     } catch (error) {
@@ -207,6 +212,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
   async writeFile(path: string, content: string | Uint8Array, abortSignal?: AbortSignal): Promise<Result<void, FileError>> {
     if (abortSignal?.aborted) return err(new FileError("aborted", "aborted", path));
     try {
+      await this.#resumeForActiveOperation();
       const text = typeof content === "string" ? content : Buffer.from(content).toString("base64");
       await this.#provider.files.write({
         sandbox_id: this.#sandbox.sandbox_id,
@@ -240,6 +246,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
   async fileInfo(path: string): Promise<Result<FileInfo, FileError>> {
     const resolved = this.#resolve(path);
     try {
+      await this.#resumeForActiveOperation();
       const listing = await this.#provider.files.list({ sandbox_id: this.#sandbox.sandbox_id, path: resolved, recursive: false });
       const exact = listing.entries.find((entry: SandboxFileEntry) => entry.path === resolved);
       if (exact) return ok(fileInfoFromSandboxEntry(exact));
@@ -258,6 +265,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     if (abortSignal?.aborted) return err(new FileError("aborted", "aborted", path));
     const resolved = this.#resolve(path);
     try {
+      await this.#resumeForActiveOperation();
       const listing = await this.#provider.files.list({ sandbox_id: this.#sandbox.sandbox_id, path: resolved, recursive: false });
       return ok(listing.entries.map(fileInfoFromSandboxEntry));
     } catch (error) {
@@ -311,6 +319,14 @@ export class SandboxExecutionEnv implements ExecutionEnv {
   #resolve(path: string): string {
     const candidate = path.startsWith("/") ? path : `${this.cwd.replace(/\/$/, "")}/${path}`;
     return posixNormalize(candidate);
+  }
+
+  async #resumeForActiveOperation(): Promise<void> {
+    if (!this.#provider.resume || this.#provider.supportsResume === false) return;
+    await this.#provider.resume({
+      sandbox_id: this.#sandbox.sandbox_id,
+      reason: "Active cloud sandbox session operation",
+    });
   }
 }
 

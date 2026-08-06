@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { BadRequestException, Injectable } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import type {
   CloudGitState,
   CloudPreview,
@@ -72,9 +72,30 @@ export class SandboxWorkspaceService {
     this.#ttlSeconds = options.ttlSeconds ?? 300;
   }
 
+  async state(tenantId: string, taskId: string): Promise<CloudWorkspaceState> {
+    const existing = await this.#repository.get(tenantId, taskId);
+    if (!existing) throw new NotFoundException("Task workspace has not been started");
+    return publicState(existing);
+  }
+
   async ensure(tenantId: string, taskId: string, sessionId: string | null): Promise<CloudWorkspaceState> {
     const existing = await this.#repository.get(tenantId, taskId);
-    if (existing && (!existing.expiresAt || Date.parse(existing.expiresAt) > Date.now())) return publicState(existing);
+    if (existing && (!existing.expiresAt || Date.parse(existing.expiresAt) > Date.now())) {
+      if (!this.#provider.resume || this.#provider.supportsResume === false) return publicState(existing);
+      const resumed = await this.#provider.resume({
+        sandbox_id: existing.sandboxId,
+        reason: "Task workspace explicitly requested",
+      });
+      const record: WorkspaceRecord = {
+        ...existing,
+        status: "running",
+        provider: resumed.provider,
+        expiresAt: resumed.expires_at,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.#repository.put(record);
+      return publicState(record);
+    }
     const sandbox = await this.#provider.create({
       request_id: `web-workspace-${taskId}`,
       tenant_id: tenantId,

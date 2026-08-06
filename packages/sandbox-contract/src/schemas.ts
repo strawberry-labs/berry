@@ -160,6 +160,12 @@ export const SandboxDestroyInputSchema = z.object({
 }).passthrough();
 export type SandboxDestroyInput = z.input<typeof SandboxDestroyInputSchema>;
 
+export const SandboxResumeInputSchema = z.object({
+  sandbox_id: IdSchema,
+  reason: z.string().trim().min(1).optional(),
+}).passthrough();
+export type SandboxResumeInput = z.input<typeof SandboxResumeInputSchema>;
+
 export const SandboxDestroyResultSchema = z.object({
   sandbox_id: IdSchema,
   destroyed: z.boolean(),

@@ -482,7 +482,8 @@ export class AgentApiController {
 
   @Get("/tasks/:taskId/workspace")
   async getSandboxWorkspace(@Req() httpRequest: AuthenticatedRequest, @Param("taskId") taskId: string) {
-    return this.ensureSandboxWorkspace(httpRequest, taskId);
+    const task = await this.store.getTask(taskId, httpRequest.auth?.user.id ?? null);
+    return this.sandboxWorkspace.state(tenantIdFromRequest(httpRequest), task.id);
   }
 
   @Get("/tasks/:taskId/workspace/files")
@@ -569,7 +570,8 @@ export class AgentApiController {
 
   @Get("/tasks/:taskId/workspace/capture")
   async captureSandboxWorkspace(@Req() httpRequest: AuthenticatedRequest, @Param("taskId") taskId: string) {
-    const state = await this.ensureSandboxWorkspace(httpRequest, taskId);
+    const task = await this.store.getTask(taskId, httpRequest.auth?.user.id ?? null);
+    const state = await this.sandboxWorkspace.state(tenantIdFromRequest(httpRequest), task.id);
     return { state, previews: this.sandboxWorkspace.listPreviews(taskId), terminals: this.sandboxWorkspace.listTerminals(taskId) };
   }
 

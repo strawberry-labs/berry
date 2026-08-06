@@ -34,7 +34,8 @@ const MAX_MODEL_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_MODEL_IMAGES = 5;
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
-const STOPPED_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
+const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
+const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
 
 interface SnapshotArchive {
   version: 1;
@@ -50,6 +51,8 @@ interface SnapshotRun {
   sandboxProvider: string | null;
   sandboxId: string | null;
   sandboxState?: string | null;
+  runState: string;
+  sandboxClaimedByNewerRun?: boolean;
   sessionLeafId: string | null;
 }
 
@@ -114,6 +117,11 @@ export interface SandboxSnapshotRepository {
     sandboxId: string;
     state: string;
   }): Promise<void>;
+  withSandboxLifecycleLock?<T>(
+    tenantId: string,
+    sandboxId: string,
+    operation: (repository: SandboxSnapshotRepository) => Promise<T>,
+  ): Promise<T>;
 }
 
 export interface SandboxSnapshotObjectStore {
@@ -505,9 +513,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     if (!snapshot.sandboxId || !this.objects) return [];
+    const sandbox = await this.ensureSandbox(snapshot);
     let listed;
     try {
-      listed = await this.provider.files.list({ sandbox_id: snapshot.sandboxId, path: "/workspace/outputs", recursive: true });
+      listed = await this.provider.files.list({ sandbox_id: sandbox.id, path: "/workspace/outputs", recursive: true });
     } catch {
       return [];
     }
@@ -524,7 +533,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     for (const entry of listed.entries) {
       if (entry.type !== "file" || explicitlyPersisted.has(entry.path) || !isDurableArtifact(entry.path)) continue;
       const path = safeOutputPath(entry.path);
-      const source = await this.provider.files.read({ sandbox_id: snapshot.sandboxId, path, encoding: "base64" });
+      const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
       const bytes = Buffer.from(source.content, "base64");
       if (bytes.byteLength === 0) continue;
       const name = safeArtifactName(path.split("/").at(-1) ?? "artifact");
@@ -543,77 +552,132 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       results.push({
         output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
         summary: `Published ${name}`,
-        sandbox: { provider: this.provider.kind, id: snapshot.sandboxId, state: snapshot.sandboxState ?? "running" },
+        sandbox,
       });
     }
     return results;
   }
 
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
-    const run = await this.repository.loadRun(payload.tenantId, payload.runId);
-    if (!run.sandboxId) return { noOp: true };
-    const terminal = payload.reason === "before-finalize";
-    if (terminal && run.sandboxState && STOPPED_SANDBOX_STATES.has(run.sandboxState)) {
-      return { noOp: true };
-    }
-    const preserve = async () => {
-      const archive = await this.capture(run.sandboxId!);
-      const bytes = Buffer.from(JSON.stringify(archive));
-      const contentHash = createHash("sha256")
-        .update(JSON.stringify({ version: archive.version, files: archive.files }))
-        .digest("hex");
-      const prior = await this.repository.latest(payload.tenantId, payload.runId);
-      if (prior?.contentHash === contentHash) return { noOp: true, snapshotId: prior.id };
-      if (!this.objects) throw new Error("Sandbox snapshot object storage is not configured");
-      const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
-      await this.objects.put(key, bytes);
-      const record = await this.repository.persist({
-        run,
-        provider: run.sandboxProvider ?? this.provider.kind,
-        sandboxId: run.sandboxId!,
-        objectKey: key,
-        contentHash,
-      });
-      return { noOp: false, snapshotId: record.id };
-    };
-    try {
-      return terminal
-        ? await withTimeout(
-            preserve(),
-            this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS,
-            "Terminal sandbox snapshot",
-          )
-        : await preserve();
-    } finally {
-      if (terminal && this.provider.suspend) {
-        const result = await withTimeout(
-          this.provider.suspend({
-            sandbox_id: run.sandboxId,
-            reason: "Terminal turn snapshot completed",
-          }),
-          this.options.terminalSuspendTimeoutMs ?? DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS,
-          "Terminal sandbox pause",
-        );
-        await this.repository.recordSandbox({
+    const candidate = await this.repository.loadRun(payload.tenantId, payload.runId);
+    if (!candidate.sandboxId) return { noOp: true };
+    return this.withSandboxLifecycleLock(payload.tenantId, candidate.sandboxId, async (repository) => {
+      const run = await repository.loadRun(payload.tenantId, payload.runId);
+      if (!run.sandboxId || run.sandboxId !== candidate.sandboxId) return { noOp: true };
+      const terminal = payload.reason === "before-finalize";
+      const beforeWait = payload.reason === "before-wait";
+      if (
+        (run.sandboxState && INACTIVE_SANDBOX_STATES.has(run.sandboxState))
+        || (run.sandboxState === "pause_requested" && !terminal)
+        || (TERMINAL_RUN_STATES.has(run.runState) && !terminal)
+        || (terminal && !TERMINAL_RUN_STATES.has(run.runState))
+        || (beforeWait && run.runState !== "waiting")
+        || (terminal && run.sandboxClaimedByNewerRun === true)
+      ) {
+        return { noOp: true };
+      }
+
+      let preservationCompleted = false;
+      const preserve = async () => {
+        const archive = await this.capture(run.sandboxId!);
+        const bytes = Buffer.from(JSON.stringify(archive));
+        const contentHash = createHash("sha256")
+          .update(JSON.stringify({ version: archive.version, files: archive.files }))
+          .digest("hex");
+        const prior = await repository.latest(payload.tenantId, payload.runId);
+        if (prior?.contentHash === contentHash) {
+          preservationCompleted = true;
+          return { noOp: true, snapshotId: prior.id };
+        }
+        if (!this.objects) throw new Error("Sandbox snapshot object storage is not configured");
+        const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
+        await this.objects.put(key, bytes);
+        const record = await repository.persist({
+          run,
+          provider: run.sandboxProvider ?? this.provider.kind,
+          sandboxId: run.sandboxId!,
+          objectKey: key,
+          contentHash,
+        });
+        preservationCompleted = true;
+        return { noOp: false, snapshotId: record.id };
+      };
+      let observedPaused = false;
+      try {
+        const bounded = terminal || beforeWait;
+        return bounded
+          ? await withTimeout(
+              preserve(),
+              this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS,
+              `${terminal ? "Terminal" : "Waiting"} sandbox snapshot`,
+            )
+          : await preserve();
+      } catch (error) {
+        if (!isSandboxPausedError(error)) throw error;
+        observedPaused = true;
+        await repository.recordSandbox({
           tenantId: payload.tenantId,
           runId: payload.runId,
           provider: run.sandboxProvider ?? this.provider.kind,
           sandboxId: run.sandboxId,
-          state: result.status === "missing" ? "missing" : "paused",
+          state: "paused",
         });
+        return { noOp: true };
+      } finally {
+        if ((terminal || beforeWait) && !observedPaused) {
+          const canPause = Boolean(this.provider.suspend) && this.provider.supportsPause !== false;
+          if (canPause || terminal || preservationCompleted) {
+            const stop = canPause
+              ? this.provider.suspend!.bind(this.provider)
+              : this.provider.destroy.bind(this.provider);
+            const lifecycle = terminal ? "Terminal turn" : "Waiting turn";
+            const result = await withTimeout(
+              stop({
+                sandbox_id: run.sandboxId,
+                reason: canPause
+                  ? `${lifecycle} snapshot completed`
+                  : `${lifecycle} sandbox cleanup completed`,
+              }),
+              this.options.terminalSuspendTimeoutMs ?? DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS,
+              `${lifecycle} sandbox ${canPause ? "pause" : "stop"}`,
+            );
+            await repository.recordSandbox({
+              tenantId: payload.tenantId,
+              runId: payload.runId,
+              provider: run.sandboxProvider ?? this.provider.kind,
+              sandboxId: run.sandboxId,
+              state: result.status === "missing" ? "missing" : canPause ? "paused" : "stopped",
+            });
+          }
+        }
       }
-    }
+    });
   }
 
   private async ensureSandbox(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
     if (snapshot.sandboxId) {
       try {
-        await this.provider.files.list({
-          sandbox_id: snapshot.sandboxId,
-          path: this.options.cwd ?? "/workspace",
-          recursive: false,
+        return await this.withSandboxLifecycleLock(snapshot.tenantId, snapshot.sandboxId, async (repository) => {
+          if (this.provider.supportsResume !== false) {
+            await this.provider.resume?.({
+              sandbox_id: snapshot.sandboxId!,
+              reason: "Durable turn requested sandbox access",
+            });
+          }
+          await this.provider.files.list({
+            sandbox_id: snapshot.sandboxId!,
+            path: this.options.cwd ?? "/workspace",
+            recursive: false,
+          });
+          await repository.recordSandbox({
+            tenantId: snapshot.tenantId,
+            runId: snapshot.id,
+            provider: snapshot.sandboxProvider ?? this.provider.kind,
+            sandboxId: snapshot.sandboxId!,
+            state: "running",
+          });
+          return { provider: snapshot.sandboxProvider ?? this.provider.kind, id: snapshot.sandboxId!, state: "running" };
         });
-        return { provider: snapshot.sandboxProvider ?? this.provider.kind, id: snapshot.sandboxId, state: "running" };
       } catch {
         // Restore from the newest complete archive below.
       }
@@ -625,24 +689,39 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       && (!continuity.provider || continuity.provider === this.provider.kind)
     ) {
       try {
-        await this.provider.files.list({
-          sandbox_id: continuity.sandboxId,
-          path: this.options.cwd ?? "/workspace",
-          recursive: false,
+        return await this.withSandboxLifecycleLock(snapshot.tenantId, continuity.sandboxId, async (repository) => {
+          await repository.recordSandbox({
+            tenantId: snapshot.tenantId,
+            runId: snapshot.id,
+            provider: continuity.provider ?? this.provider.kind,
+            sandboxId: continuity.sandboxId!,
+            state: "resume_requested",
+          });
+          if (this.provider.supportsResume !== false) {
+            await this.provider.resume?.({
+              sandbox_id: continuity.sandboxId!,
+              reason: "Follow-up turn requested the prior sandbox",
+            });
+          }
+          await this.provider.files.list({
+            sandbox_id: continuity.sandboxId!,
+            path: this.options.cwd ?? "/workspace",
+            recursive: false,
+          });
+          await this.stageInputFiles(snapshot, continuity.sandboxId!, repository);
+          await repository.recordSandbox({
+            tenantId: snapshot.tenantId,
+            runId: snapshot.id,
+            provider: continuity.provider ?? this.provider.kind,
+            sandboxId: continuity.sandboxId!,
+            state: "running",
+          });
+          return {
+            provider: continuity.provider ?? this.provider.kind,
+            id: continuity.sandboxId!,
+            state: "running",
+          };
         });
-        await this.stageInputFiles(snapshot, continuity.sandboxId);
-        await this.repository.recordSandbox({
-          tenantId: snapshot.tenantId,
-          runId: snapshot.id,
-          provider: continuity.provider ?? this.provider.kind,
-          sandboxId: continuity.sandboxId,
-          state: "running",
-        });
-        return {
-          provider: continuity.provider ?? this.provider.kind,
-          id: continuity.sandboxId,
-          state: "running",
-        };
       } catch {
         // The previous turn's sandbox expired. Restore its durable archive below.
       }
@@ -683,8 +762,22 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     return { provider: handle.provider, id: handle.sandbox_id, state: handle.status };
   }
 
-  private async stageInputFiles(snapshot: DurableTurnSnapshot, sandboxId: string): Promise<void> {
-    const files = await this.repository.inputFiles(snapshot.tenantId, snapshot.id);
+  private withSandboxLifecycleLock<T>(
+    tenantId: string,
+    sandboxId: string,
+    operation: (repository: SandboxSnapshotRepository) => Promise<T>,
+  ): Promise<T> {
+    return this.repository.withSandboxLifecycleLock
+      ? this.repository.withSandboxLifecycleLock(tenantId, sandboxId, operation)
+      : operation(this.repository);
+  }
+
+  private async stageInputFiles(
+    snapshot: DurableTurnSnapshot,
+    sandboxId: string,
+    repository: SandboxSnapshotRepository = this.repository,
+  ): Promise<void> {
+    const files = await repository.inputFiles(snapshot.tenantId, snapshot.id);
     if (files.length === 0) return;
     if (!this.objects) throw new Error("Input file object storage is not configured");
     for (const file of files) {
@@ -812,7 +905,19 @@ export class SqlSandboxSnapshotRepository implements SandboxSnapshotRepository {
   async loadRun(tenantId: string, runId: string): Promise<SnapshotRun> {
     const rows = await this.executor.query<SnapshotRunRow>(
       `
-SELECT r.tenant_id,r.id AS run_id,r.session_id,r.task_id,r.sandbox_provider,r.sandbox_id,r.sandbox_state,
+SELECT r.tenant_id,r.id AS run_id,r.session_id,r.task_id,r.state AS run_state,
+       r.sandbox_provider,r.sandbox_id,r.sandbox_state,
+       EXISTS (
+         SELECT 1
+         FROM turn_runs newer
+         WHERE newer.tenant_id=r.tenant_id
+           AND newer.session_id=r.session_id
+           AND newer.sandbox_id=r.sandbox_id
+           AND (
+             newer.created_at>r.created_at
+             OR (newer.created_at=r.created_at AND newer.id>r.id)
+           )
+       ) AS sandbox_claimed_by_newer_run,
        (SELECT entry_id FROM session_entries e
         WHERE e.tenant_id=r.tenant_id AND e.session_id=r.session_id AND e.is_leaf_marker=true
         ORDER BY e.sequence DESC LIMIT 1) AS session_leaf_id
@@ -831,6 +936,8 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
       sandboxProvider: row.sandbox_provider,
       sandboxId: row.sandbox_id,
       sandboxState: row.sandbox_state,
+      runState: row.run_state,
+      sandboxClaimedByNewerRun: row.sandbox_claimed_by_newer_run,
       sessionLeafId: row.session_leaf_id,
     };
   }
@@ -1071,6 +1178,21 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
       `.trim(),
       [input.tenantId, input.runId, input.provider, input.sandboxId, input.state],
     );
+  }
+
+  async withSandboxLifecycleLock<T>(
+    tenantId: string,
+    sandboxId: string,
+    operation: (repository: SandboxSnapshotRepository) => Promise<T>,
+  ): Promise<T> {
+    if (!this.executor.transaction) return operation(this);
+    return this.executor.transaction(async (executor) => {
+      await executor.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+        [`${tenantId}:${sandboxId}`],
+      );
+      return operation(new SqlSandboxSnapshotRepository(executor));
+    });
   }
 }
 
@@ -1617,6 +1739,12 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function isSandboxPausedError(error: unknown): error is Error & { code: "sandbox_paused" } {
+  return error instanceof Error
+    && "code" in error
+    && (error as Error & { code?: unknown }).code === "sandbox_paused";
+}
+
 function mapSnapshot(row: SnapshotRow): SnapshotRecord {
   return {
     id: row.id,
@@ -1651,6 +1779,8 @@ interface SnapshotRunRow {
   sandbox_provider: string | null;
   sandbox_id: string | null;
   sandbox_state: string | null;
+  run_state: string;
+  sandbox_claimed_by_newer_run: boolean;
   session_leaf_id: string | null;
 }
 

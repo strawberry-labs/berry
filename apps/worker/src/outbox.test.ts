@@ -56,6 +56,7 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(cleanup).toContain("LIMIT $2");
     expect(cleanup).toContain("'pause_requested'");
     expect(cleanup).toContain("'reason','before-finalize'");
+    expect(cleanup).toContain("COALESCE(pending.payload->>'reason','interval')='before-finalize'");
 
     await expect(dispatcher.dispatchDue()).resolves.toBe(0);
     expect(statements.filter((sql) => sql.includes("snapshot:terminal-cleanup"))).toHaveLength(1);
@@ -64,6 +65,7 @@ describe("RuntimeOutboxDispatcher", () => {
   it("atomically marks terminal sandboxes as pause requested when dispatching their snapshot", async () => {
     const statements: string[] = [];
     let claimed = false;
+    let pauseRequestedBeforeEnqueue = false;
     const executor: SqlExecutor = {
       execute: vi.fn(async (sql: string) => {
         statements.push(sql);
@@ -83,7 +85,10 @@ describe("RuntimeOutboxDispatcher", () => {
       },
       transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
     };
-    const enqueue = vi.fn(async () => ({ id: "queued", name: "sandbox.snapshot" as const }));
+    const enqueue = vi.fn(async () => {
+      pauseRequestedBeforeEnqueue = statements.some((sql) => sql.includes("sandbox_state='pause_requested'"));
+      return { id: "queued", name: "sandbox.snapshot" as const };
+    });
     const dispatcher = new RuntimeOutboxDispatcher(executor, {
       enqueue: enqueue as BerryQueueClient["enqueue"],
       close: async () => undefined,
@@ -96,6 +101,9 @@ describe("RuntimeOutboxDispatcher", () => {
 
     expect(statements.find((sql) => sql.includes("sandbox_state='pause_requested'")))
       .toContain("state IN ('completed','failed','cancelled','recovery_required')");
+    expect(pauseRequestedBeforeEnqueue).toBe(true);
+    expect(statements.find((sql) => sql.includes("Superseded by terminal sandbox cleanup")))
+      .toContain("COALESCE(payload->>'reason','interval')<>'before-finalize'");
     expect(statements.at(-1)).toContain("UPDATE runtime_outbox");
   });
 

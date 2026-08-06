@@ -516,6 +516,8 @@ describe("AgentApiController", () => {
     const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Code workspace", conversationKind: "code", permissionMode: "ask" }).expect(201);
     const taskId = created.body.task.id as string;
 
+    await request(app.getHttpServer()).get(`/v1/tasks/${taskId}/workspace`).set(authHeader()).expect(404);
+    await request(app.getHttpServer()).get(`/v1/tasks/${taskId}/workspace/capture`).set(authHeader()).expect(404);
     const first = await request(app.getHttpServer()).post(`/v1/tasks/${taskId}/workspace`).set(authHeader()).send({}).expect(201);
     const second = await request(app.getHttpServer()).get(`/v1/tasks/${taskId}/workspace`).set(authHeader()).expect(200);
     expect(second.body.sandboxId).toBe(first.body.sandboxId);

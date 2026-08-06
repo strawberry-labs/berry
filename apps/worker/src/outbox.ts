@@ -92,6 +92,7 @@ export class RuntimeOutboxDispatcher {
               WHERE pending.tenant_id=r.tenant_id
                 AND pending.aggregate_id=r.id::text
                 AND pending.event_type='sandbox.snapshot'
+                AND COALESCE(pending.payload->>'reason','interval')='before-finalize'
                 AND pending.completed_at IS NULL
             )
           ORDER BY r.updated_at ASC
@@ -144,12 +145,13 @@ export class RuntimeOutboxDispatcher {
         }
         try {
           const name = parsedName.data;
+          await this.prepare(row, name);
           await this.queue.enqueue(
             name,
             row.payload as BerryWorkerJobMap[typeof name],
             { jobId: outboxJobId(name, row.id) },
           );
-          await this.complete(row, name);
+          await this.complete(row);
           dispatched += 1;
         } catch (error) {
           await this.fail(row, error instanceof Error ? error.message : String(error), false);
@@ -161,21 +163,34 @@ export class RuntimeOutboxDispatcher {
     }
   }
 
-  private async complete(row: OutboxRow, name: BerryWorkerJobName): Promise<void> {
+  private async prepare(row: OutboxRow, name: BerryWorkerJobName): Promise<void> {
     const snapshot = name === "sandbox.snapshot"
       ? SandboxSnapshotJobPayloadSchema.safeParse(row.payload)
       : null;
+    if (!snapshot?.success || snapshot.data.reason !== "before-finalize") return;
     await this.withTenant(row.tenant_id, async (executor) => {
-      if (snapshot?.success && snapshot.data.reason === "before-finalize") {
-        await executor.execute(`
-          UPDATE turn_runs
-          SET sandbox_state='pause_requested',sandbox_heartbeat_at=now(),updated_at=now()
-          WHERE tenant_id=$1::uuid AND id=$2::uuid
-            AND state IN ('completed','failed','cancelled','recovery_required')
-            AND sandbox_id IS NOT NULL
-            AND COALESCE(sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')
-        `, [row.tenant_id, snapshot.data.runId]);
-      }
+      await executor.execute(`
+        UPDATE turn_runs
+        SET sandbox_state='pause_requested',sandbox_heartbeat_at=now(),updated_at=now()
+        WHERE tenant_id=$1::uuid AND id=$2::uuid
+          AND state IN ('completed','failed','cancelled','recovery_required')
+          AND sandbox_id IS NOT NULL
+          AND COALESCE(sandbox_state,'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')
+      `, [row.tenant_id, snapshot.data.runId]);
+      await executor.execute(`
+        UPDATE runtime_outbox
+        SET completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,
+            last_error='Superseded by terminal sandbox cleanup',updated_at=now()
+        WHERE tenant_id=$1::uuid AND aggregate_id=$2
+          AND event_type='sandbox.snapshot' AND id<>$3::uuid
+          AND completed_at IS NULL
+          AND COALESCE(payload->>'reason','interval')<>'before-finalize'
+      `, [row.tenant_id, snapshot.data.runId, row.id]);
+    });
+  }
+
+  private async complete(row: OutboxRow): Promise<void> {
+    await this.withTenant(row.tenant_id, async (executor) => {
       await executor.execute(`
         UPDATE runtime_outbox
         SET completed_at = now(), lease_owner = NULL, lease_expires_at = NULL,

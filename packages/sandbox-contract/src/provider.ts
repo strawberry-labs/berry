@@ -14,7 +14,17 @@ import type {
   SandboxFileWriteResult,
   SandboxHandle,
   SandboxProviderKind,
+  SandboxResumeInput,
 } from "./schemas.js";
+
+export class SandboxPausedError extends Error {
+  readonly code = "sandbox_paused";
+
+  constructor(readonly sandboxId: string) {
+    super(`Sandbox is paused and requires an explicit resume: ${sandboxId}`);
+    this.name = "SandboxPausedError";
+  }
+}
 
 export interface SandboxFileApi {
   read(input: SandboxFileReadInput): Promise<SandboxFileReadResult>;
@@ -24,6 +34,8 @@ export interface SandboxFileApi {
 
 export interface SandboxProvider {
   readonly kind: SandboxProviderKind;
+  readonly supportsPause?: boolean;
+  readonly supportsResume?: boolean;
   create(input: SandboxCreateInput): Promise<SandboxHandle>;
   exec(input: SandboxExecInput, options?: { signal?: AbortSignal | undefined }): AsyncIterable<SandboxExecEvent>;
   readonly files: SandboxFileApi;
@@ -33,6 +45,11 @@ export interface SandboxProvider {
    * reconnect. Providers without durable pause support may omit this method.
    */
   suspend?(input: SandboxDestroyInput): Promise<SandboxDestroyResult>;
+  /**
+   * Explicitly resume a paused sandbox. Ordinary file, exec, and port calls
+   * must not be used as implicit lifecycle transitions.
+   */
+  resume?(input: SandboxResumeInput): Promise<SandboxHandle>;
   destroy(input: SandboxDestroyInput): Promise<SandboxDestroyResult>;
   dispose?(): Promise<void>;
 }

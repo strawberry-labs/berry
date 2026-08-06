@@ -9,7 +9,7 @@ import {
   type E2BSandboxLike,
 } from "./e2b-provider.js";
 import { createSandboxProviderFromConfig, sandboxProviderConfigFromEnv } from "./config.js";
-import { collectSandboxExecEvents, exerciseSandboxProviderContract } from "./provider.js";
+import { SandboxPausedError, collectSandboxExecEvents, exerciseSandboxProviderContract } from "./provider.js";
 
 const TENANT_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -73,6 +73,30 @@ describe("E2BSandboxProvider", () => {
       allowOut: ["registry.npmjs.org"],
       denyOut: ["0.0.0.0/0"],
     });
+  });
+
+  it("requires an explicit resume before passive operations can wake a paused sandbox", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const sandbox = await provider.create({ request_id: "explicit-resume", tenant_id: TENANT_ID, image: "base" });
+    await provider.files.write({ sandbox_id: sandbox.sandbox_id, path: "/workspace/state.txt", content: "saved", encoding: "utf8" });
+    await provider.suspend({ sandbox_id: sandbox.sandbox_id });
+    const connectsBeforeRead = client.connectCount;
+
+    await expect(provider.files.read({
+      sandbox_id: sandbox.sandbox_id,
+      path: "/workspace/state.txt",
+      encoding: "utf8",
+    })).rejects.toBeInstanceOf(SandboxPausedError);
+    expect(client.connectCount).toBe(connectsBeforeRead);
+
+    await provider.resume({ sandbox_id: sandbox.sandbox_id, reason: "User continued the task" });
+    await expect(provider.files.read({
+      sandbox_id: sandbox.sandbox_id,
+      path: "/workspace/state.txt",
+      encoding: "utf8",
+    })).resolves.toMatchObject({ content: "saved" });
+    expect(client.connectCount).toBe(connectsBeforeRead + 1);
   });
 
   it("does not reuse a sandbox from an older template or workspace root", async () => {

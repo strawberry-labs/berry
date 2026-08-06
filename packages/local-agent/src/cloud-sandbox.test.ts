@@ -34,6 +34,42 @@ async function run(tools: Map<string, AgentTool>, name: string, params: Record<s
 }
 
 describe("CloudSandboxProvider", () => {
+  it("explicitly resumes durable compute before an active session operation", async () => {
+    const fixture = new FixtureSandboxProvider();
+    let sandbox: Awaited<ReturnType<typeof fixture.create>> | null = null;
+    const resume = vi.fn(async () => {
+      if (!sandbox) throw new Error("Sandbox was not created");
+      return sandbox;
+    });
+    const contractProvider: ContractSandboxProvider = {
+      kind: fixture.kind,
+      supportsResume: true,
+      files: fixture.files,
+      create: async (input) => {
+        sandbox = await fixture.create(input);
+        return sandbox;
+      },
+      resume,
+      exec: fixture.exec.bind(fixture),
+      exposePort: fixture.exposePort.bind(fixture),
+      destroy: fixture.destroy.bind(fixture),
+    };
+    const provider = new CloudSandboxProvider({ provider: contractProvider, tenantId, image: "berry/python:3.12" });
+    const session = await provider.createSession({
+      sessionId: "sess_resume",
+      taskId: "task_resume",
+      workspacePath: "/unused",
+      policy: { tier: "workspace-write", writableRoots: ["/workspace"], network: "off" },
+      enforceEscalated: true,
+    });
+
+    await expect(session.env.writeFile("state.txt", "active")).resolves.toMatchObject({ ok: true });
+    expect(resume).toHaveBeenCalledWith({
+      sandbox_id: sandbox!.sandbox_id,
+      reason: "Active cloud sandbox session operation",
+    });
+  });
+
   it("suspends durable providers when a session is disposed", async () => {
     const fixture = new FixtureSandboxProvider();
     const create = vi.fn(fixture.create.bind(fixture));

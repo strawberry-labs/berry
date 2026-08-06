@@ -25,6 +25,7 @@ import {
   SandboxFileWriteResultSchema,
   SandboxHandleSchema,
   SandboxResourceLimitsSchema,
+  SandboxResumeInputSchema,
   type SandboxCreateInput,
   type SandboxDestroyInput,
   type SandboxDestroyResult,
@@ -40,8 +41,9 @@ import {
   type SandboxFileWriteResult,
   type SandboxHandle,
   type SandboxResourceLimits,
+  type SandboxResumeInput,
 } from "./schemas.js";
-import type { SandboxFileApi, SandboxProvider } from "./provider.js";
+import { SandboxPausedError, type SandboxFileApi, type SandboxProvider } from "./provider.js";
 
 type ParsedCreateInput = ReturnType<typeof SandboxCreateInputSchema.parse>;
 
@@ -166,6 +168,8 @@ const ACTIVE_EXPIRY_SAFETY_MS = 2_000;
 /** Direct, server-side E2B implementation of Berry's provider-neutral sandbox contract. */
 export class E2BSandboxProvider implements SandboxProvider {
   readonly kind = "e2b" as const;
+  readonly supportsPause = true;
+  readonly supportsResume = true;
   readonly #apiKey: string;
   readonly #template: string;
   readonly #domain: string | undefined;
@@ -373,6 +377,30 @@ export class E2BSandboxProvider implements SandboxProvider {
     }
   }
 
+  async resume(input: SandboxResumeInput): Promise<SandboxHandle> {
+    const parsed = SandboxResumeInputSchema.parse(input);
+    const current = this.#sandboxes.get(parsed.sandbox_id);
+    if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) {
+      return current.handle;
+    }
+
+    const info = await this.#client.getInfo(parsed.sandbox_id, this.#authOptions());
+    const ttlSeconds = current?.ttlSeconds
+      ?? positiveMetadataInteger(info.metadata.berry_ttl_seconds)
+      ?? DEFAULT_RECONNECT_TTL_SECONDS;
+    const sandbox = await this.#client.connect(parsed.sandbox_id, {
+      ...this.#authOptions(),
+      timeoutMs: ttlSeconds * 1_000,
+    });
+    const handle = SandboxHandleSchema.parse({
+      ...(current?.handle ?? this.#handleFromStoredInfo(info)),
+      status: "running",
+      expires_at: new Date(this.#now().getTime() + ttlSeconds * 1_000).toISOString(),
+    });
+    this.#remember(sandbox, handle, current?.resources ?? resourcesFromMetadata(info.metadata.berry_resources_json), ttlSeconds);
+    return handle;
+  }
+
   async destroy(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
     const parsed = SandboxDestroyInputSchema.parse(input);
     try {
@@ -458,7 +486,8 @@ export class E2BSandboxProvider implements SandboxProvider {
     const current = this.#sandboxes.get(sandboxId);
     if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) return current.sandbox;
 
-    const info = current ? undefined : await this.#client.getInfo(sandboxId, this.#authOptions());
+    const info = await this.#client.getInfo(sandboxId, this.#authOptions());
+    if (info.state === "paused") throw new SandboxPausedError(sandboxId);
     const ttlSeconds = current?.ttlSeconds ?? positiveMetadataInteger(info?.metadata.berry_ttl_seconds) ?? DEFAULT_RECONNECT_TTL_SECONDS;
     const sandbox = await this.#client.connect(sandboxId, {
       ...this.#authOptions(),
@@ -466,7 +495,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     });
     if (current) {
       this.#remember(sandbox, current.handle, current.resources, ttlSeconds);
-    } else if (info) {
+    } else {
       const handle = this.#handleFromStoredInfo(info);
       const resources = resourcesFromMetadata(info.metadata.berry_resources_json);
       this.#remember(sandbox, handle, resources, ttlSeconds);
@@ -495,7 +524,7 @@ export class E2BSandboxProvider implements SandboxProvider {
       image: info.templateId || input.snapshot_id || this.#template,
       cwd: input.cwd,
       created_at: info.startedAt.toISOString(),
-      expires_at: info.endAt.toISOString(),
+      expires_at: new Date(this.#now().getTime() + input.ttl_seconds * 1_000).toISOString(),
       metadata: {
         client: input.metadata,
         template: info.templateId,

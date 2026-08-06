@@ -15,6 +15,7 @@ import type {
   SandboxFileWriteResult,
   SandboxHandle,
   SandboxProvider,
+  SandboxResumeInput,
   SandboxUsageEvent,
 } from "@berry/sandbox-contract";
 import type { JsonValue } from "@berry/shared";
@@ -36,6 +37,8 @@ export type BudgetedSandboxProviderOptions = {
 export class BudgetedSandboxProvider implements SandboxProvider {
   readonly kind: SandboxProvider["kind"];
   readonly files: SandboxFileApi;
+  readonly supportsPause: boolean;
+  readonly supportsResume: boolean;
   readonly #provider: SandboxProvider;
   readonly #budgets: BudgetService;
   readonly #estimates: {
@@ -50,6 +53,8 @@ export class BudgetedSandboxProvider implements SandboxProvider {
     this.#provider = options.provider;
     this.#budgets = options.budgets;
     this.kind = options.provider.kind;
+    this.supportsPause = Boolean(options.provider.suspend) && options.provider.supportsPause !== false;
+    this.supportsResume = Boolean(options.provider.resume) && options.provider.supportsResume !== false;
     this.#estimates = {
       createMicros: options.estimates?.createMicros ?? 50,
       execMicros: options.estimates?.execMicros ?? 25,
@@ -137,14 +142,6 @@ export class BudgetedSandboxProvider implements SandboxProvider {
     return this.#budgetFile("sandbox.expose_port", input.sandbox_id, input, () => this.#provider.exposePort(input), this.#estimates.portMicros);
   }
 
-  async suspend(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
-    try {
-      return this.#provider.suspend ? await this.#provider.suspend(input) : await this.#provider.destroy(input);
-    } finally {
-      this.#sandboxes.delete(input.sandbox_id);
-    }
-  }
-
   async destroy(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
     try {
       return await this.#provider.destroy(input);
@@ -153,8 +150,34 @@ export class BudgetedSandboxProvider implements SandboxProvider {
     }
   }
 
+  async suspend(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
+    try {
+      return this.supportsPause
+        ? await this.#provider.suspend!(input)
+        : await this.#provider.destroy(input);
+    } finally {
+      this.#sandboxes.delete(input.sandbox_id);
+    }
+  }
+
+  async resume(input: SandboxResumeInput): Promise<SandboxHandle> {
+    if (!this.supportsResume) throw new Error(`Sandbox provider ${this.kind} does not support resume`);
+    return this.#resume(input);
+  }
+
   async dispose(): Promise<void> {
     await this.#provider.dispose?.();
+  }
+
+  async #resume(input: SandboxResumeInput): Promise<SandboxHandle> {
+    const sandbox = await this.#provider.resume!(input);
+    this.#sandboxes.set(sandbox.sandbox_id, {
+      tenantId: sandbox.tenant_id,
+      taskId: null,
+      sessionId: null,
+      provider: sandbox.provider,
+    });
+    return sandbox;
   }
 
   async #budgetFile<T>(feature: string, sandboxId: string, input: unknown, run: () => Promise<T>, estimate = this.#estimates.fileMicros): Promise<T> {
