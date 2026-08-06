@@ -9,10 +9,13 @@ import {
 import {
   DurableTurnRunner,
   DurableTurnRetryableError,
+  DURABLE_IMAGE_TOOL_SELECTION_PROMPT,
+  DURABLE_TOOL_DEFINITIONS,
   RouterDurableTurnModel,
   SnapshotProviderDurableTurnModel,
   SqlDurableTurnRepository,
   createDurableTurnModel,
+  durableImageToolSelectionPrompt,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -26,6 +29,17 @@ const tenantId = "00000000-0000-7000-8000-000000000001";
 const runId = "00000000-0000-7000-8000-000000000002";
 
 describe("durable turn runner", () => {
+  it("guides ordinary image-edit turns toward the admitted image tool", () => {
+    expect(durableImageToolSelectionPrompt([...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"]))
+      .toBe(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
+    expect(DURABLE_IMAGE_TOOL_SELECTION_PROMPT).toContain("background replacement");
+    expect(DURABLE_IMAGE_TOOL_SELECTION_PROMPT).toContain("Prefer create_image");
+    expect(DURABLE_IMAGE_TOOL_SELECTION_PROMPT).toContain("already saves the generated file");
+    expect(DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "create_image")?.function.description)
+      .toContain("already published");
+    expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
+  });
+
   it("starts in live mode without a global router for snapshot-admitted providers", () => {
     expect(createDurableTurnModel({ BERRY_API_MODEL_MODE: "live" }))
       .toBeInstanceOf(SnapshotProviderDurableTurnModel);
@@ -902,6 +916,7 @@ describe("durable turn runner", () => {
     expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
     expect(request?.tools?.[1]?.function.name).toBe("create_image");
     expect(request?.messages[0]?.content).toContain("The user explicitly selected Create image. Call create_image");
+    expect(request?.messages[0]?.content).toContain(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
     expect(request?.messages[0]?.content).toContain(
       "call compose_message so it renders as an editable writing block",
     );

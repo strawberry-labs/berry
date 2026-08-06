@@ -974,7 +974,16 @@ export function partitionAssistantParts(
         }
         continue;
       }
-      upsertTool(id, meta, part.kind === "tool-result");
+      // Finalization can discover files left in /workspace/outputs by an
+      // earlier turn and project result-only persist_artifact messages for
+      // them. When a settled turn has an explicit, completed publication
+      // batch, keep both the cards and activity rows scoped to that batch.
+      // Otherwise stale result-only rows land after the final answer and make
+      // it look like the current turn published every historical output.
+      const visibleArtifactActivity = meta.name !== "persist_artifact"
+        || !visibleArtifactToolCallIds
+        || visibleArtifactToolCallIds.has(id);
+      if (visibleArtifactActivity) upsertTool(id, meta, part.kind === "tool-result");
       if (
         part.kind === "tool-result"
         && meta.name === "persist_artifact"

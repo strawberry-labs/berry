@@ -2671,6 +2671,19 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "Explain the final result clearly.",
 ].join("\n\n");
 
+export const DURABLE_IMAGE_TOOL_SELECTION_PROMPT = [
+  "The create_image tool is available for this turn.",
+  "Use it for requests to generate a new image or materially edit, composite, restyle, add, remove, perform background replacement, or replace other visual content, especially when the user supplies reference images.",
+  "Prefer create_image over shell scripts or general file tools when generative image editing is likely to produce the better visual result.",
+  "Treat requests to preserve a person, face, product, pose, or other reference detail as constraints for the create_image prompt; preservation constraints alone are not a reason to fall back to shell processing.",
+  "Use deterministic file or code tools instead only when the requested operation itself is non-generative, such as resizing, cropping, format conversion, metadata changes, or a pixel-exact transform, or when the user explicitly forbids generative AI.",
+  "create_image already saves the generated file under /workspace/outputs and publishes it into the task. After it succeeds, use its returned image and artifact directly; do not search for, copy, or call persist_artifact on that same generated file unless the user asks for another transformed deliverable.",
+].join(" ");
+
+export function durableImageToolSelectionPrompt(toolNames: readonly string[]): string {
+  return toolNames.includes("create_image") ? DURABLE_IMAGE_TOOL_SELECTION_PROMPT : "";
+}
+
 function modelMessages(
   snapshot: DurableTurnSnapshot,
   additionalUserContent: readonly ChatContentPart[] = [],
@@ -2691,6 +2704,7 @@ function modelMessages(
     runtime?.intent === "image_generation"
       ? "The user explicitly selected Create image. Call create_image to fulfill this request. Do not claim image generation is unavailable when create_image is declared for this turn."
       : "",
+    durableImageToolSelectionPrompt(runtime?.builtInTools ?? []),
     snapshot.runtimeRequest.continueInterruptedTurn === true
       ? "This is an explicit continuation request. Continue the interrupted assistant response from the persisted partial output without repeating completed content."
       : "",
@@ -3166,7 +3180,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "create_image",
-      description: "Generate or edit an image and publish it into the task. Use reference_image_paths for images already in the workspace.",
+      description: "Generate or materially edit an image, save it under /workspace/outputs, and publish it into the task. Prefer this tool for image creation, background replacement, compositing, object addition/removal, and visual restyling when generative editing will produce a better result than shell-based image processing. Pass existing workspace images through reference_image_paths and express subject-preservation requirements in the prompt. The returned image is already published; do not copy, search for, or persist_artifact the same file again. Use deterministic file tools only for non-generative crop, resize, conversion, metadata, or pixel-exact transforms, or when the user forbids generative AI.",
       parameters: {
         type: "object",
         additionalProperties: false,

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { ADMIN_NAV, PERSONAL_NAV, visibleNavigationGroups } from "./management/management-navigation";
-import { initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 
 describe("cloud shell bootstrap", () => {
   it("does not issue live requests for fixture task and session identifiers", () => {
@@ -35,6 +35,42 @@ describe("cloud shell bootstrap", () => {
     expect(shouldConfirmTurnAdmission(new BerryApiError("gateway timeout", 504, null))).toBe(true);
     expect(shouldConfirmTurnAdmission(new BerryApiError("invalid request", 400, null))).toBe(false);
     expect(shouldConfirmTurnAdmission(new BerryApiError("different active turn", 409, null))).toBe(false);
+  });
+
+  it("rehydrates a genuinely active turn after an admission conflict", async () => {
+    const state = {
+      active: true,
+      turnId: "turn_existing",
+      bufferedEvents: [],
+      replayOnly: false,
+      runState: "calling_model",
+    } as const;
+    const client = { turnState: vi.fn(async () => state) };
+
+    await expect(activeTurnStateAfterConflict(
+      client as never,
+      "session_1",
+      new BerryApiError("active", 409, null),
+    )).resolves.toEqual(state);
+    expect(client.turnState).toHaveBeenCalledWith("session_1");
+    await expect(activeTurnStateAfterConflict(
+      client as never,
+      "session_1",
+      new BerryApiError("invalid", 400, null),
+    )).resolves.toBeNull();
+  });
+
+  it("clears the cancelled run replay boundary before a replacement turn", () => {
+    const cursors = new Map([["session_1", "turn_cancelled:42"], ["session_2", "turn_other:3"]]);
+    const sequences = new Map([
+      ["session_1", { turn_cancelled: 42 }],
+      ["session_2", { turn_other: 3 }],
+    ]);
+
+    clearDurableEventReplayBoundary("session_1", cursors, sequences);
+
+    expect(cursors).toEqual(new Map([["session_2", "turn_other:3"]]));
+    expect(sequences).toEqual(new Map([["session_2", { turn_other: 3 }]]));
   });
 
   it("confirms a response-lost admission even when the run already completed", async () => {

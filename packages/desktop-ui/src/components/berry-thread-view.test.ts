@@ -6,6 +6,7 @@ import {
   latestArtifactToolCallIds,
   partitionAssistantParts,
 } from "./berry-thread-view";
+import { classifyTurnSegments } from "./thread-stream";
 
 function assistant(status: Message["status"], id: string): Message {
   const createdAt = "2026-07-27T05:20:55.000Z";
@@ -171,7 +172,63 @@ describe("artifact batch projection", () => {
     expect(projected.segments.flatMap((segment) => segment.kind === "artifact" ? [segment.name] : []))
       .toEqual(["new-a.png", "new-b.png", "new-c.png"]);
     expect(projected.segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []))
-      .toHaveLength(5);
+      .toHaveLength(3);
+  });
+
+  it("keeps automatic publications from older output files out of the current turn", () => {
+    const call = assistant("complete", "current_call");
+    call.parts = [{
+      ...call.parts[0]!,
+      id: "current_call_part",
+      kind: "tool-call",
+      content: {
+        toolCallId: "current_call_id",
+        name: "persist_artifact",
+        arguments: { path: "/workspace/outputs/current.png" },
+      },
+    }];
+    const result = assistant("complete", "current_result");
+    result.parts = [{
+      ...result.parts[0]!,
+      id: "current_result_part",
+      kind: "tool-result",
+      content: {
+        toolCallId: "current_call_id",
+        name: "persist_artifact",
+        status: "completed",
+        output: { artifact: { name: "current.png", path: "/v1/files/current" } },
+      },
+    }];
+    const answer = assistant("complete", "answer");
+    answer.parts[0] = { ...answer.parts[0]!, content: "The current image is ready." };
+    const oldAutomatic = assistant("complete", "old_automatic");
+    oldAutomatic.parts = [{
+      ...oldAutomatic.parts[0]!,
+      id: "old_automatic_part",
+      kind: "tool-result",
+      content: {
+        toolCallId: "old_automatic_id",
+        name: "persist_artifact",
+        status: "completed",
+        arguments: {},
+        output: { artifact: { name: "old.png", path: "/v1/files/old" } },
+      },
+    }];
+    const messages = [call, result, answer, oldAutomatic];
+
+    const projected = partitionAssistantParts(
+      messages.flatMap((message) => message.parts),
+      new Map(),
+      latestArtifactToolCallIds(messages),
+    );
+    const classified = classifyTurnSegments(projected.segments);
+
+    expect(projected.segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []))
+      .toEqual([expect.objectContaining({ toolCallId: "current_call_id" })]);
+    expect(projected.segments.flatMap((segment) => segment.kind === "artifact" ? [segment.name] : []))
+      .toEqual(["current.png"]);
+    expect(classified.hasFinalText).toBe(true);
+    expect(classified.body).toContainEqual(expect.objectContaining({ kind: "text", text: "The current image is ready." }));
   });
 });
 

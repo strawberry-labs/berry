@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SandboxProvider } from "@berry/sandbox-contract";
@@ -840,6 +841,57 @@ describe("SandboxContinuityManager", () => {
     }));
   });
 
+  it("does not republish an unchanged output from an earlier turn", async () => {
+    const bytes = Buffer.from("already published");
+    const sourcePath = "/workspace/outputs/portrait.png";
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(async () => ({
+          path: sourcePath,
+          content: bytes.toString("base64"),
+          size_bytes: bytes.byteLength,
+          mtime: null,
+        })),
+        write: vi.fn(),
+        list: vi.fn(async () => ({
+          path: "/workspace/outputs",
+          entries: [{ path: sourcePath, type: "file", size_bytes: bytes.byteLength, mtime: null }],
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      publishedOutputs: vi.fn(async () => [{ sourcePath, sha256 }]),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-artifact";
+    current.sandboxProvider = "e2b";
+    current.sandboxState = "running";
+    current.steps = [];
+
+    await expect(manager.finalize(current)).resolves.toEqual([]);
+    expect(repository.publishedOutputs).toHaveBeenCalledWith(current.tenantId, current.sessionId);
+    expect(objects.putArtifact).not.toHaveBeenCalled();
+    expect(repository.persistOutput).not.toHaveBeenCalled();
+  });
+
   it("generates, stages, and registers an admitted durable image", async () => {
     const bytes = Buffer.from([137, 80, 78, 71]);
     const provider = {
@@ -1135,6 +1187,25 @@ describe("SandboxContinuityManager", () => {
     expect(query).toContain("a.session_id=r.session_id");
     expect(query).toContain("f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact')");
     expect(query).toContain("f.status='available'");
+  });
+
+  it("loads previously published output paths and hashes for session deduplication", async () => {
+    let query = "";
+    const repository = new SqlSandboxSnapshotRepository({
+      query: vi.fn(async (sql: string) => {
+        query = sql;
+        return [{ source_path: "/workspace/outputs/report.pdf", sha256: "abc123" }];
+      }),
+      execute: vi.fn(),
+    } as never);
+
+    await expect(repository.publishedOutputs(
+      "00000000-0000-7000-8000-000000000002",
+      "00000000-0000-7000-8000-000000000004",
+    )).resolves.toEqual([{ sourcePath: "/workspace/outputs/report.pdf", sha256: "abc123" }]);
+    expect(query).toContain("a.session_id=$2::uuid");
+    expect(query).toContain("f.metadata->>'sourcePath'");
+    expect(query).toContain("f.sha256 IS NOT NULL");
   });
 
   it("detects newer sandbox owners and uses a transaction-scoped lifecycle lock", async () => {

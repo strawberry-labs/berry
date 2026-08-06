@@ -85,10 +85,16 @@ interface SandboxOutputFile {
   objectKey: string;
 }
 
+interface PublishedSandboxOutput {
+  sourcePath: string;
+  sha256: string;
+}
+
 export interface SandboxSnapshotRepository {
   loadRun(tenantId: string, runId: string): Promise<SnapshotRun>;
   continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null>;
   inputFiles(tenantId: string, runId: string, scope?: "turn" | "session"): Promise<readonly SandboxInputFile[]>;
+  publishedOutputs?(tenantId: string, sessionId: string): Promise<readonly PublishedSandboxOutput[]>;
   persistOutput(input: {
     snapshot: DurableTurnSnapshot;
     fileId: string;
@@ -529,6 +535,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         : stringValue(objectValue(step.output).visionPath);
       return path ? [safeOutputPath(path)] : [];
     }));
+    const previouslyPublished = new Set<string>();
+    for (const output of await this.repository.publishedOutputs?.(snapshot.tenantId, snapshot.sessionId) ?? []) {
+      try {
+        previouslyPublished.add(`${safeOutputPath(output.sourcePath)}\0${output.sha256}`);
+      } catch {
+        // Ignore malformed legacy metadata. The live sandbox path still goes
+        // through safeOutputPath below before it can be read or published.
+      }
+    }
     const results: TurnToolResult[] = [];
     for (const entry of listed.entries) {
       if (entry.type !== "file" || explicitlyPersisted.has(entry.path) || !isDurableArtifact(entry.path)) continue;
@@ -539,6 +554,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const name = safeArtifactName(path.split("/").at(-1) ?? "artifact");
       const mediaType = durableArtifactMediaType(name);
       const sha256 = createHash("sha256").update(bytes).digest("hex");
+      if (previouslyPublished.has(`${path}\0${sha256}`)) continue;
       const fileId = randomUUID();
       const stored = await this.objects.putArtifact(
         `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${sha256}/${name}`,
@@ -1107,6 +1123,21 @@ ON CONFLICT DO NOTHING
       };
     };
     return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
+  }
+
+  async publishedOutputs(tenantId: string, sessionId: string): Promise<readonly PublishedSandboxOutput[]> {
+    const rows = await this.executor.query<{ source_path: string; sha256: string }>(
+      `
+SELECT DISTINCT f.metadata->>'sourcePath' AS source_path,f.sha256
+FROM file_associations a
+JOIN files f ON f.tenant_id=a.tenant_id AND f.id=a.file_id
+WHERE a.tenant_id=$1::uuid AND a.session_id=$2::uuid AND a.role='output'
+  AND f.status='available' AND f.deleted_at IS NULL
+  AND f.metadata->>'sourcePath' IS NOT NULL AND f.sha256 IS NOT NULL
+      `.trim(),
+      [tenantId, sessionId],
+    );
+    return rows.map((row) => ({ sourcePath: row.source_path, sha256: row.sha256 }));
   }
 
   async latest(tenantId: string, runId: string): Promise<SnapshotRecord | null> {

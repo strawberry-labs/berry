@@ -69,6 +69,7 @@ import { WebHelpMenu } from "./shell/web-help-menu";
 import {
   QUEUED_FOLLOW_UP_STORAGE_PREFIX,
   commitQueuedFollowUps,
+  createQueuedFollowUp,
   nextQueuedFollowUp,
   readQueuedFollowUps,
   reconcileInterruptedQueuedFollowUps,
@@ -178,6 +179,25 @@ export function shouldConfirmTurnAdmission(cause: unknown): boolean {
     || cause.status === 408
     || cause.status === 429
     || cause.status >= 500;
+}
+
+export async function activeTurnStateAfterConflict(
+  client: Pick<BerryApiClient, "turnState">,
+  sessionId: string,
+  cause: unknown,
+): Promise<TurnState | null> {
+  if (!(cause instanceof BerryApiError) || cause.status !== 409) return null;
+  const state = await client.turnState(sessionId);
+  return state.active ? state : null;
+}
+
+export function clearDurableEventReplayBoundary(
+  sessionId: string,
+  cursors: Map<string, string>,
+  sequences: Map<string, DurableEventSequences>,
+): void {
+  cursors.delete(sessionId);
+  sequences.delete(sessionId);
 }
 
 export async function retryTurnAdmission(
@@ -1068,6 +1088,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       await attachSessionStream(sessionId);
       submissionAttempted = true;
       const started = await client.startTurn(sessionId, request);
+      // A stale terminal event can close the pre-admission EventSource while
+      // POST /turns is in flight. Reassert ownership after the server accepts
+      // this run and reopen the stream from the cursor that event supplied.
+      activeSessionsRef.current.add(sessionId);
+      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
       applyDurableState(sessionId, {
         active: true,
         turnId: started.turnId,
@@ -1079,7 +1104,37 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         nextAction: "Waiting for a worker slot",
         error: null,
       });
+      void attachSessionStream(sessionId).catch(() => undefined);
     } catch (cause) {
+      if (submissionAttempted) {
+        const activeConflict = await activeTurnStateAfterConflict(client, sessionId, cause).catch(() => null);
+        if (activeConflict) {
+          clearPendingRequestMessage(
+            sessionId,
+            params.continueInterruptedTurn === true ? undefined : params.requestMessageId,
+          );
+          await refreshSessionMessages(sessionId).catch(() => undefined);
+          applyDurableState(sessionId, activeConflict, true);
+          activeSessionsRef.current.add(sessionId);
+          setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
+          void attachSessionStream(sessionId).catch(() => undefined);
+          if (params.continueInterruptedTurn === true) {
+            toast.info("The existing turn is still running. Live updates have been restored.");
+          } else {
+            const queued = createQueuedFollowUp({
+              taskId: task.id,
+              sessionId,
+              ordinal: followUpsBySessionRef.current[sessionId]?.length ?? 0,
+              input: params.input,
+              ...(params.intent ? { intent: params.intent } : {}),
+              ...(params.attachments ? { attachments: params.attachments } : {}),
+            });
+            updateSessionFollowUps(sessionId, (current) => [...current, queued]);
+            toast.info("The existing turn is still running. Live updates were restored and your prompt was queued.");
+          }
+          return;
+        }
+      }
       if (submissionAttempted && shouldConfirmTurnAdmission(cause)) {
         try {
           const recovered = await retryTurnAdmission(client, sessionId, request);
@@ -1133,7 +1188,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         return next;
       });
     }
-  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionFollowUps, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -1144,6 +1199,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (!result.ok) throw new Error("The active turn could not be cancelled.");
       }
       stopSessionConnection(sessionId);
+      // cancelTurn commits its terminal event before returning. The next turn
+      // must open a no-cursor stream so old cancellation cannot replay as the
+      // terminal event for the replacement turn.
+      clearDurableEventReplayBoundary(
+        sessionId,
+        lastEventCursorBySessionRef.current,
+        durableEventSequencesBySessionRef.current,
+      );
       activeSessionsRef.current.delete(sessionId);
       const terminalEvent = {
         kind: "turn.end",
@@ -1492,6 +1555,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     // The cancelled turn must no longer own the live tail before rendering the
     // next user prompt. listMessages waits for server-side projection writes.
     stopSessionConnection(sessionId);
+    clearDurableEventReplayBoundary(
+      sessionId,
+      lastEventCursorBySessionRef.current,
+      durableEventSequencesBySessionRef.current,
+    );
     activeSessionsRef.current.delete(sessionId);
     resetSessionStream(sessionId);
     await refreshSessionMessages(sessionId);
