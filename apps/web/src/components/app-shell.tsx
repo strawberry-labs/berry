@@ -1,8 +1,8 @@
 import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
-import { BerryApiClient, BerryApiError, type StartTurnRequest } from "@berry/api-client";
+import { BerryApiClient, BerryApiError, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -321,6 +321,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [streamsBySession, setStreamsBySession] = React.useState<Record<string, StreamState>>({});
   const [durableStatesBySession, setDurableStatesBySession] = React.useState<Record<string, TurnState>>({});
   const [imageGenerationBySession, setImageGenerationBySession] = React.useState<Record<string, ImageGenerationState | null>>({});
+  const [imageGenerationCapability, setImageGenerationCapability] = React.useState<ImageGenerationCapabilityStatus>(() => initial.config.demoMode
+    ? { available: true, model: "fixture-image", reason: null, message: null }
+    : { available: false, model: null, reason: "loading", message: "Checking image generation availability…" });
   const [startingSessions, setStartingSessions] = React.useState<Set<string>>(() => new Set());
   const permissionMode = "full-access" satisfies PermissionMode;
   const [reasoning, setReasoning] = React.useState<ReasoningLevel>("medium");
@@ -671,6 +674,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         }
         if (catalogResult.status === "fulfilled" && catalogResult.value) {
           const catalog = catalogResult.value;
+          setImageGenerationCapability(catalog.capabilities.imageGeneration);
           setProviderId(catalog.providerId);
           setModelOptions(catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id, capabilities: resolveModelCapabilities(item) })));
           setModel((current) => catalog.models.some((item) => item.id === current) ? current : catalog.defaultModel);
@@ -687,6 +691,22 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             skills: catalog.skills,
             mcpServers: catalog.mcpServers,
           }));
+        } else if (catalogResult.status === "rejected") {
+          setImageGenerationCapability({
+            available: false,
+            model: null,
+            reason: "catalog_unavailable",
+            message: catalogResult.reason instanceof Error
+              ? catalogResult.reason.message
+              : "Image generation availability could not be loaded.",
+          });
+        } else {
+          setImageGenerationCapability({
+            available: false,
+            model: null,
+            reason: "not_configured",
+            message: "Image generation is not configured for this deployment.",
+          });
         }
         const errors = [catalogResult, organizationsResult]
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -996,7 +1016,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const runTurn = React.useCallback(async (
     task: Task,
     params:
-      | { input: string; messageInput?: string | undefined; requestMessageId?: string | undefined; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
+      | { input: string; intent?: TurnIntent | undefined; messageInput?: string | undefined; requestMessageId?: string | undefined; continueInterruptedTurn?: false | undefined; attachments?: AttachmentInput[] | undefined; replaceFromMessageId?: string | undefined }
       | { continueInterruptedTurn: true; input?: undefined; attachments?: undefined; replaceFromMessageId?: undefined },
   ) => {
     if (!client || !task.activeSessionId) return;
@@ -1032,6 +1052,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         ? { continueInterruptedTurn: true as const }
         : {
           input: params.input,
+          ...(params.intent ? { intent: params.intent } : {}),
           ...(params.messageInput ? { messageInput: params.messageInput } : {}),
           ...(params.requestMessageId ? { requestMessageId: params.requestMessageId } : {}),
           ...(params.attachments && params.attachments.length > 0 ? { attachments: params.attachments } : {}),
@@ -1191,6 +1212,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     await runTurn(activeTask, {
       input: text,
+      ...(text.startsWith("Create image\n") ? { intent: "image_generation" as const } : {}),
       requestMessageId: replacementMessageId,
       ...(attachments.length > 0 ? { attachments } : {}),
       replaceFromMessageId: target.id,
@@ -1428,7 +1450,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
   }, [updateSessionFollowUps]);
 
-  const updateFollowUp = React.useCallback(async (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "attachments">) => {
+  const updateFollowUp = React.useCallback(async (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "intent" | "attachments">) => {
     rememberFollowUp({
       ...followUp,
       ...update,
@@ -1458,6 +1480,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     input: string,
     attachments: AttachmentInput[],
     messageId: string = crypto.randomUUID(),
+    intent?: TurnIntent,
   ): Promise<Message> => {
     const sessionId = task.activeSessionId;
     if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
@@ -1500,6 +1523,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     requestThreadBottom(sessionId);
     await runTurn(task, {
       input,
+      ...(intent ? { intent } : {}),
       requestMessageId: persisted.id,
       ...(attachments.length > 0 ? { attachments } : {}),
     });
@@ -1529,7 +1553,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       }
 
       if (deliveryMode === "steer") {
-        const message = await interruptAndStartTurn(task, followUp.input, followUp.attachments, messageId);
+        const message = await interruptAndStartTurn(task, followUp.input, followUp.attachments, messageId, followUp.intent);
         messageId = message.id;
       } else {
         if (currentlyActive) {
@@ -1570,6 +1594,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         }
         await runTurn(task, {
           input: followUp.input,
+          ...(followUp.intent ? { intent: followUp.intent } : {}),
           requestMessageId: messageId,
           ...(followUp.attachments.length > 0 ? { attachments: followUp.attachments } : {}),
         });
@@ -1657,8 +1682,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     return true;
   }, []);
 
-  const steerActiveTurn = React.useCallback(async (task: Task, input: string, attachments: AttachmentInput[]) => {
-    await interruptAndStartTurn(task, input, attachments);
+  const steerActiveTurn = React.useCallback(async (task: Task, input: string, attachments: AttachmentInput[], intent?: TurnIntent) => {
+    await interruptAndStartTurn(task, input, attachments, crypto.randomUUID(), intent);
   }, [interruptAndStartTurn]);
 
   const generateImage = React.useCallback(async (task: Task, prompt: string, appendUserMessage: boolean) => {
@@ -1842,7 +1867,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     replaceSessionMessages(activeTask.activeSessionId, (current) => [...current, userMessage]);
     requestThreadBottom(activeTask.activeSessionId);
-    await runTurn(activeTask, { input, requestMessageId: userMessage.id, attachments: [attachment] });
+    await runTurn(activeTask, { input, intent: "image_generation", requestMessageId: userMessage.id, attachments: [attachment] });
   }, [activeTask, appendDemoGeneratedImageIteration, client, generatedImageAttachment, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const regenerateGeneratedImage = React.useCallback(async (
@@ -1865,7 +1890,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     replaceSessionMessages(activeTask.activeSessionId, (current) => [...current, userMessage]);
     requestThreadBottom(activeTask.activeSessionId);
-    await runTurn(activeTask, { input, requestMessageId: userMessage.id, attachments: [attachment] });
+    await runTurn(activeTask, { input, intent: "image_generation", requestMessageId: userMessage.id, attachments: [attachment] });
   }, [activeTask, appendDemoGeneratedImageIteration, client, generatedImageAttachment, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const runSlashCommand = React.useCallback(async (name: string, args: string[]) => {
@@ -2144,6 +2169,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               question={stream.question}
               showProjectSwitcher={shouldShowComposerProjectSwitcher(messages)}
               personalization={personalization}
+              imageGenerationCapability={imageGenerationCapability}
               onCreateTask={createTask}
               onCancel={() => void cancelTurn()}
               onContinueTurn={activeTask.activeSessionId && interruptedTurnAvailable
@@ -2225,6 +2251,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onSteerMessage={steerActiveTurn}
                 showProjectSwitcher
                 personalization={personalization}
+                imageGenerationCapability={imageGenerationCapability}
                 onCreateTask={createTask}
                 onCancel={() => void cancelTurn()}
                 runTurn={runTurn}

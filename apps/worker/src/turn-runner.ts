@@ -2674,6 +2674,9 @@ function modelMessages(
     skillInstructions,
   ].filter(Boolean).join("\n\n");
   const dynamicSystem = [
+    runtime?.intent === "image_generation"
+      ? "The user explicitly selected Create image. Call create_image to fulfill this request. Do not claim image generation is unavailable when create_image is declared for this turn."
+      : "",
     snapshot.runtimeRequest.continueInterruptedTurn === true
       ? "This is an explicit continuation request. Continue the interrupted assistant response from the persisted partial output without repeating completed content."
       : "",

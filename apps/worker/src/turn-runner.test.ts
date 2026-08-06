@@ -464,6 +464,43 @@ describe("durable turn runner", () => {
     });
   });
 
+  it("reconstructs create_image from the persisted explicit image admission", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = {
+      capabilityVersion: 1,
+      input: "Create image\nA red berry icon",
+      intent: "image_generation",
+      providerId: "router",
+      provider: { id: "router", name: "Berry Router", kind: "berry-router", baseUrl: "https://router.example.test/v1", defaultModel: "chat-model" },
+      model: "chat-model",
+      conversationKind: "chat",
+      workspacePath: "/workspace",
+      workspaceId: current.workspaceId,
+      permissionMode: "ask",
+      reasoning: "medium",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      modelPricing: {},
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"],
+      imageGeneration: { providerId: "router", model: "openai/gpt-image-2", costMicros: "10" },
+      mcpServers: [],
+      extraSkills: [],
+      attachments: [],
+    };
+    const repository = new FakeTurnRepository(current);
+    let toolNames: string[] = [];
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        toolNames = context.tools.map((tool) => tool.function.name);
+        return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-image-definition" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+
+    expect(toolNames).toContain("create_image");
+  });
+
   it("rejects duplicate provider tool-call ids before executing either tool", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
     let toolCalls = 0;
@@ -758,7 +795,27 @@ describe("durable turn runner", () => {
     });
     const deltas: Array<{ delta: string; channel: "text" | "reasoning" }> = [];
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
-    current.runtimeRequest.modelPricing = { input: 1, output: 2 };
+    current.runtimeRequest = {
+      capabilityVersion: 1,
+      input: "Create image\nA red berry icon",
+      intent: "image_generation",
+      providerId: "router",
+      provider: { id: "router", name: "Berry Router", kind: "berry-router", baseUrl: "https://router.example.test/v1", defaultModel: "kimi-2.6" },
+      model: "kimi-2.6",
+      conversationKind: "chat",
+      workspacePath: "/workspace",
+      workspaceId: "00000000-0000-7000-8000-000000000004",
+      permissionMode: "ask",
+      reasoning: "medium",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      modelPricing: { input: 1, output: 2 },
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"],
+      imageGeneration: { providerId: "router", model: "openai/gpt-image-2", costMicros: "10" },
+      attachments: [],
+      mcpServers: [],
+      extraSkills: [],
+    };
     current.entries[0]!.payload = {
       type: "message",
       message: {
@@ -789,6 +846,13 @@ describe("durable turn runner", () => {
             description: "Search the web",
             parameters: { type: "object" },
           },
+        }, {
+          type: "function",
+          function: {
+            name: "create_image",
+            description: "Create an image",
+            parameters: { type: "object" },
+          },
         }],
         additionalUserContent: [{
           type: "image_url",
@@ -804,6 +868,8 @@ describe("durable turn runner", () => {
     );
 
     expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
+    expect(request?.tools?.[1]?.function.name).toBe("create_image");
+    expect(request?.messages[0]?.content).toContain("The user explicitly selected Create image. Call create_image");
     expect(request?.messages[0]?.content).toContain(
       "call compose_message so it renders as an editable writing block",
     );

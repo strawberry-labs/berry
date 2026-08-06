@@ -497,12 +497,16 @@ export const DurableImageGenerationCapabilitySchema = z.object({
 }).strict();
 export type DurableImageGenerationCapability = z.infer<typeof DurableImageGenerationCapabilitySchema>;
 
+export const TurnIntentSchema = z.enum(["image_generation"]);
+export type TurnIntent = z.infer<typeof TurnIntentSchema>;
+
 export const DurableTurnRuntimeRequestSchema = z.object({
   capabilityVersion: z.literal(1),
   requestId: z.string().min(1).optional(),
   admissionFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   budgetReservationRequired: z.boolean().default(false),
   input: z.string().default(""),
+  intent: TurnIntentSchema.optional(),
   providerId: z.string().min(1),
   provider: DurableProviderTransportSchema,
   model: z.string().min(1).nullable(),
@@ -529,7 +533,18 @@ export const DurableTurnRuntimeRequestSchema = z.object({
     sourceKind: z.string().nullable().optional(),
   }).strict()).default([]),
   portableCheckpoint: SessionCheckpointV2Schema.optional(),
-}).strict();
+}).strict().superRefine((request, context) => {
+  const hasImageTool = request.builtInTools.includes("create_image");
+  if (request.intent === "image_generation" && !hasImageTool) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["builtInTools"], message: "Image intent requires the create_image tool" });
+  }
+  if (request.intent === "image_generation" && !request.imageGeneration) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "Image intent requires admitted image generation configuration" });
+  }
+  if (hasImageTool && !request.imageGeneration) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "The create_image tool requires admitted image generation configuration" });
+  }
+});
 export type DurableTurnRuntimeRequest = z.infer<typeof DurableTurnRuntimeRequestSchema>;
 
 export const TurnRunStateSchema = z.enum([

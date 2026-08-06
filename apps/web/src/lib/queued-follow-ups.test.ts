@@ -48,6 +48,16 @@ describe("queued follow-up local storage", () => {
     ]);
   });
 
+  it("preserves image intent while a queued request waits or reloads", () => {
+    const storage = memoryStorage();
+    const image = { ...followUp("image"), input: "Create image\nA red berry icon", intent: "image_generation" as const };
+
+    expect(writeQueuedFollowUps("session-1", [image], storage)).toBe(true);
+    expect(readQueuedFollowUps("session-1", storage)).toEqual([
+      expect.objectContaining({ id: "image", intent: "image_generation" }),
+    ]);
+  });
+
   it("keeps identical prompt text as separate queue iterations", () => {
     const storage = memoryStorage();
     const first = { ...followUp("iteration-1"), input: "Run this prompt again" };

@@ -22,10 +22,11 @@ describe("durable capability contract", () => {
     await expect(openDurableSecret(sealed, key)).resolves.toBe("provider-secret");
   });
 
-  it("keeps the complete base tool catalog in the versioned request", () => {
+  it("keeps explicit image intent paired with its admitted durable capability", () => {
     const parsed = DurableTurnRuntimeRequestSchema.parse({
       capabilityVersion: 1,
       input: "hello",
+      intent: "image_generation",
       providerId: "provider",
       provider: {
         id: "provider",
@@ -41,8 +42,31 @@ describe("durable capability contract", () => {
       reasoning: "medium",
       maxTokens: 8_000,
       contextWindowTokens: 128_000,
-      builtInTools: DURABLE_BASE_BUILT_IN_TOOLS,
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"],
+      imageGeneration: { providerId: "router", model: "openai/gpt-image-2", costMicros: "10" },
     });
-    expect(parsed.builtInTools).toEqual(DURABLE_BASE_BUILT_IN_TOOLS);
+    expect(parsed).toMatchObject({
+      intent: "image_generation",
+      imageGeneration: { providerId: "router", model: "openai/gpt-image-2" },
+    });
+    expect(parsed.builtInTools).toEqual([...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"]);
+  });
+
+  it("rejects image intent if durable admission drops the image tool", () => {
+    expect(() => DurableTurnRuntimeRequestSchema.parse({
+      capabilityVersion: 1,
+      input: "hello",
+      intent: "image_generation",
+      providerId: "provider",
+      provider: { id: "provider", name: "Provider", kind: "openai", baseUrl: "https://provider.example/v1", defaultModel: "model" },
+      model: "model",
+      workspacePath: "/workspace",
+      workspaceId: "workspace",
+      permissionMode: "auto-edit",
+      reasoning: "medium",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      builtInTools: DURABLE_BASE_BUILT_IN_TOOLS,
+    })).toThrow("Image intent requires the create_image tool");
   });
 });

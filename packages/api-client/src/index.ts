@@ -220,6 +220,7 @@ import {
   type SsoConnection,
   type SsoStartResponse,
   type Task,
+  type TurnIntent,
   type TurnState,
   type Workspace,
   type AttachmentInput,
@@ -290,6 +291,8 @@ interface StartTurnRequestBase {
 export type StartTurnRequest = StartTurnRequestBase & (
   | {
     input: string;
+    /** Explicit product intent that the API must admit without capability downgrade. */
+    intent?: TurnIntent | undefined;
     /** Visible user-authored text when runtime input contains injected context. */
     messageInput?: string | undefined;
     /** Exact persisted user message that this turn consumes. */
@@ -320,8 +323,29 @@ export const ManagedModelCatalogSchema = z.object({
   }).passthrough()),
   skills: z.array(z.object({ id: z.string(), name: z.string(), description: z.string(), enabled: z.boolean() })).default([]),
   mcpServers: z.array(z.object({ id: z.string(), name: z.string(), url: z.string().url(), auth: z.enum(["none", "bearer", "oauth"]), enabled: z.boolean() })).default([]),
+  capabilities: z.object({
+    imageGeneration: z.object({
+      available: z.boolean(),
+      model: z.string().nullable(),
+      reason: z.string().nullable(),
+      message: z.string().nullable(),
+    }).default({
+      available: false,
+      model: null,
+      reason: "capability_unknown",
+      message: "Image generation availability could not be confirmed.",
+    }),
+  }).default({
+    imageGeneration: {
+      available: false,
+      model: null,
+      reason: "capability_unknown",
+      message: "Image generation availability could not be confirmed.",
+    },
+  }),
 }).nullable();
 export type ManagedModelCatalog = z.output<typeof ManagedModelCatalogSchema>;
+export type ImageGenerationCapabilityStatus = NonNullable<ManagedModelCatalog>["capabilities"]["imageGeneration"];
 
 export const ImageGenerationResponseSchema = z.object({
   model: z.string().optional(),

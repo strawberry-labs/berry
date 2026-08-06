@@ -17,6 +17,7 @@ import { InMemoryModelGovernanceRepository, ModelGovernanceService } from "../mo
 import { InMemoryUsageRepository, USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
+import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissionReplay } from "../runtime/durable-turn.service.ts";
 import { turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
@@ -657,11 +658,172 @@ describe("AgentApiController", () => {
       .expect(403)
       .expect(({ body }) => {
         expect(body).toMatchObject({
-          code: "model_governance_blocked",
+          code: "image_generation_governance_blocked",
           decision: { reason: "model_blocked", allowed: false },
         });
       });
     expect(generateImage).not.toHaveBeenCalled();
+  });
+
+  it("reports image capability from the same per-user governance decision used for admission", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: true,
+      modeAllow: ["chat"],
+    });
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: imageRuntimeConfig(),
+    });
+
+    await request(app.getHttpServer())
+      .get("/v1/models/catalog")
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body.capabilities.imageGeneration).toMatchObject({
+        available: false,
+        model: "openai/gpt-image-2",
+        reason: "not_in_enforced_allowlist",
+      }));
+
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "openai/gpt-image-2",
+      displayName: "GPT Image 2",
+      status: "allowed",
+      enforce: true,
+      modeAllow: ["chat"],
+    });
+
+    await request(app.getHttpServer())
+      .get("/v1/models/catalog")
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body.capabilities.imageGeneration).toEqual({
+        available: true,
+        model: "openai/gpt-image-2",
+        reason: null,
+        message: null,
+      }));
+  });
+
+  it("fails an explicit image turn before admission when governance removes the image tool", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: true,
+      modeAllow: ["chat"],
+    });
+    const admit = vi.fn(async () => ({ runId: "turn_never", sessionId: "session_never" }));
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: imageRuntimeConfig(),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Image task" }).expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        input: "Create image\nA red berry icon",
+        intent: "image_generation",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+        model: "chat-model",
+      })
+      .expect(403)
+      .expect(({ body }) => expect(body).toMatchObject({
+        code: "image_generation_governance_blocked",
+        decision: { allowed: false, reason: "not_in_enforced_allowlist" },
+      }));
+    expect(admit).not.toHaveBeenCalled();
+  });
+
+  it("fails an explicit image turn clearly when image generation is not configured", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: true,
+      modeAllow: ["chat"],
+    });
+    const admit = vi.fn(async () => ({ runId: "turn_never", sessionId: "session_never" }));
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: chatRuntimeConfig(),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Image task" }).expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        input: "Create image\nA red berry icon",
+        intent: "image_generation",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+        model: "chat-model",
+      })
+      .expect(503)
+      .expect(({ body }) => expect(body).toMatchObject({
+        code: "image_generation_unavailable",
+        message: "Image generation is not configured for this deployment.",
+      }));
+    expect(admit).not.toHaveBeenCalled();
+  });
+
+  it("persists explicit image intent and the admitted create_image capability for durable execution", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    for (const model of ["chat-model", "openai/gpt-image-2"]) {
+      await repository.upsertPolicy({
+        tenantId: SELF_HOST_TENANT_ID,
+        providerId: "router",
+        model,
+        status: "allowed",
+        enforce: true,
+        modeAllow: ["chat"],
+      });
+    }
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({ runId: "turn_image", sessionId: input.sessionId }));
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: imageRuntimeConfig(),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Image task" }).expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        input: "Create image\nA red berry icon",
+        intent: "image_generation",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+        model: "chat-model",
+      })
+      .expect(201)
+      .expect({ turnId: "turn_image", sessionId: created.body.session.id });
+
+    expect(admit).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeRequest: expect.objectContaining({
+        intent: "image_generation",
+        builtInTools: expect.arrayContaining(["create_image"]),
+        imageGeneration: expect.objectContaining({ providerId: "router", model: "openai/gpt-image-2" }),
+      }),
+    }));
   });
 
   it("reserves and reconciles successful model turns", async () => {
@@ -999,8 +1161,8 @@ describe("AgentApiController", () => {
   });
 });
 
-async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined; runtimeConfig?: CloudRuntimeConfigService | undefined; usageRepository?: UsageRepository | undefined; membershipActive?: boolean | undefined } = {}): Promise<INestApplication> {
-  const moduleRef = await Test.createTestingModule({
+async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined; runtimeConfig?: CloudRuntimeConfigService | undefined; usageRepository?: UsageRepository | undefined; membershipActive?: boolean | undefined; durableTurns?: { enabled: boolean; replayAdmission: (input: DurableTurnAdmissionReplay) => Promise<{ runId: string; sessionId: string } | null>; admit: (input: DurableTurnAdmission) => Promise<{ runId: string; sessionId: string }> } | undefined } = {}): Promise<INestApplication> {
+  let builder = Test.createTestingModule({
     imports: [
       CloudDatabaseModule.register({
         useValue: {
@@ -1022,8 +1184,11 @@ async function createApp(sessionHost: SessionHost, options: { budget?: BudgetSer
     .overrideProvider(FilePlatformService)
     .useValue(fakeFilePlatformService)
     .overrideProvider(CloudRuntimeConfigService)
-    .useValue(options.runtimeConfig ?? new CloudRuntimeConfigService())
-    .compile();
+    .useValue(options.runtimeConfig ?? new CloudRuntimeConfigService());
+  if (options.durableTurns) {
+    builder = builder.overrideProvider(DurableTurnService).useValue(options.durableTurns);
+  }
+  const moduleRef = await builder.compile();
   const nestApp = moduleRef.createNestApplication();
   await nestApp.init();
   return nestApp;
@@ -1033,6 +1198,28 @@ const fakeFilePlatformService = {
   runtimeAttachments: async (_tenantId: string, _userId: string, attachments: unknown[]) => attachments,
   associateInputFiles: async () => undefined,
 };
+
+function imageRuntimeConfig(): CloudRuntimeConfigService {
+  return new CloudRuntimeConfigService({
+    ...chatRuntimeEnv(),
+    BERRY_ROUTER_IMAGE_MODEL: "openai/gpt-image-2",
+    BERRY_ROUTER_IMAGE_COST_MICROS: "10",
+  });
+}
+
+function chatRuntimeConfig(): CloudRuntimeConfigService {
+  return new CloudRuntimeConfigService(chatRuntimeEnv());
+}
+
+function chatRuntimeEnv(): NodeJS.ProcessEnv {
+  return {
+    BERRY_API_MODEL_MODE: "live",
+    BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+    BERRY_ROUTER_PROVIDER_ID: "router",
+    BERRY_ROUTER_DEFAULT_MODEL: "chat-model",
+    BERRY_ROUTER_MODELS_JSON: JSON.stringify([{ id: "chat-model", name: "Chat Model" }]),
+  };
+}
 
 function nextTick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));

@@ -147,6 +147,28 @@ describe("BerryApiClient", () => {
     }));
   });
 
+  it("serializes explicit image intent when starting a turn", async () => {
+    const fetchImpl = vi.fn(async () => json({ turnId: "turn_image", sessionId: "session_1" }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await client.startTurn("session_1", {
+      input: "Create image\nA red berry icon",
+      intent: "image_generation",
+      workspacePath: "/workspace",
+      provider: { id: "router" },
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/turns", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        input: "Create image\nA red berry icon",
+        intent: "image_generation",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+      }),
+    }));
+  });
+
   it("reads replayable per-session turn state", async () => {
     const fetchImpl = vi.fn(async () => json({
       active: true,

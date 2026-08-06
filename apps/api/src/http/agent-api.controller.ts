@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Inject, NotFoundException, Param, Patch, Post, Put, Query, Req, Sse } from "@nestjs/common";
+import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Inject, NotFoundException, Param, Patch, Post, Put, Query, Req, ServiceUnavailableException, Sse } from "@nestjs/common";
 import { createHash, randomUUID } from "node:crypto";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import {
@@ -21,6 +21,7 @@ import {
   resolveModelCapabilities,
   sealDurableSecret,
   TaskStatusSchema,
+  TurnIntentSchema,
   TurnStateSchema,
   WorkspaceKindSchema,
   type AgentStreamEvent,
@@ -30,6 +31,7 @@ import {
   type ImageGenerationRequest,
   type JsonValue,
   type Message,
+  type ModelGovernanceDecision,
 } from "@berry/shared";
 import type {
   ApprovalDecisionKind,
@@ -160,6 +162,7 @@ const StartTurnRequestSchema = z.object({
   model: z.string().optional(),
   apiKey: z.string().optional(),
   reasoning: ReasoningLevelSchema.optional(),
+  intent: TurnIntentSchema.optional(),
   attachments: z.array(AttachmentInputSchema).max(100).optional(),
   // Edit-and-resubmit: rewind the session to before this user message, drop it
   // and everything after, persist the new input as the user message, and run
@@ -181,6 +184,9 @@ const StartTurnRequestSchema = z.object({
     }
     if (request.replaceFromMessageId !== undefined) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["replaceFromMessageId"], message: "A continued turn cannot replace an earlier message" });
+    }
+    if (request.intent !== undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["intent"], message: "A continued turn must not declare a new intent" });
     }
     return;
   }
@@ -274,6 +280,48 @@ export class AgentApiController {
     return membership?.primaryDepartmentId ?? membership?.departmentIds[0] ?? null;
   }
 
+  async #resolveImageGenerationAccess(
+    tenantId: string,
+    userId: string | null,
+    departmentId: string | null,
+    mode: ConversationKind,
+  ): Promise<{
+    image: ReturnType<CloudRuntimeConfigService["imageGenerationInfo"]>;
+    decision: ModelGovernanceDecision | null;
+  }> {
+    const image = this.runtimeConfig.imageGenerationInfo();
+    if (!image) return { image: null, decision: null };
+    const decision = await this.modelGovernance.resolve({
+      tenantId,
+      mode,
+      providerId: image.providerId,
+      model: image.model,
+      userId,
+      departmentId,
+    });
+    return { image, decision };
+  }
+
+  #assertImageGenerationAvailable(access: {
+    image: ReturnType<CloudRuntimeConfigService["imageGenerationInfo"]>;
+    decision: ModelGovernanceDecision | null;
+  }) {
+    if (!access.image) {
+      throw new ServiceUnavailableException({
+        code: "image_generation_unavailable",
+        message: "Image generation is not configured for this deployment.",
+      });
+    }
+    if (!access.decision?.allowed) {
+      throw new ForbiddenException({
+        code: "image_generation_governance_blocked",
+        message: modelGovernanceMessage(access.decision?.reason ?? "model_blocked"),
+        decision: access.decision,
+      });
+    }
+    return access.image;
+  }
+
   #queueProjectionWrite(
     sessionId: string,
     write: () => Promise<unknown>,
@@ -292,10 +340,32 @@ export class AgentApiController {
 
   @Get("/models/catalog")
   async modelCatalog(@Req() httpRequest: AuthenticatedRequest) {
-    const catalog = await this.runtimeConfig.catalog(tenantIdFromRequest(httpRequest));
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const userId = httpRequest.auth?.user.id ?? null;
+    const [catalog, effective, departmentId] = await Promise.all([
+      this.runtimeConfig.catalog(tenantId),
+      this.organizationCapabilities.effective(tenantId, userId ?? ""),
+      this.#primaryDepartmentId(tenantId, userId),
+    ]);
     if (!catalog) return null;
-    const effective = await this.organizationCapabilities.effective(tenantIdFromRequest(httpRequest), httpRequest.auth?.user.id ?? "");
-    return { ...catalog, skills: [...catalog.skills, ...effective.skills.map((skill) => ({ id: skill.filePath, name: skill.name, description: skill.description, enabled: true }))], mcpServers: [...catalog.mcpServers, ...effective.mcpServers.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : [])] };
+    const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, "chat");
+    return {
+      ...catalog,
+      skills: [...catalog.skills, ...effective.skills.map((skill) => ({ id: skill.filePath, name: skill.name, description: skill.description, enabled: true }))],
+      mcpServers: [...catalog.mcpServers, ...effective.mcpServers.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : [])],
+      capabilities: {
+        imageGeneration: imageAccess.image && imageAccess.decision?.allowed
+          ? { available: true, model: imageAccess.image.model, reason: null, message: null }
+          : {
+              available: false,
+              model: imageAccess.image?.model ?? null,
+              reason: imageAccess.decision?.reason ?? "not_configured",
+              message: imageAccess.decision
+                ? modelGovernanceMessage(imageAccess.decision.reason)
+                : "Image generation is not configured for this deployment.",
+            },
+      },
+    };
   }
 
   @Post("/images/generations")
@@ -313,32 +383,17 @@ export class AgentApiController {
     request: ImageGenerationRequest,
     onPartial?: (partial: { index: number; b64: string; mimeType: string }) => void,
   ) {
-    const image = this.runtimeConfig.imageGenerationInfo();
-    if (!image) return this.runtimeConfig.generateImage(request, onPartial);
     const tenantId = tenantIdFromRequest(httpRequest);
     const requestId = `image_${randomUUID()}`;
-    const actualCostMicros = BigInt(image.costMicros);
     const startedAt = Date.now();
     const userId = httpRequest.auth?.user.id ?? null;
     const departmentId = await this.#primaryDepartmentId(
       tenantId,
       userId,
     );
-    const modelDecision = await this.modelGovernance.resolve({
-      tenantId,
-      mode: "chat",
-      providerId: image.providerId,
-      model: image.model,
-      userId,
-      departmentId,
-    });
-    if (!modelDecision.allowed) {
-      throw new ForbiddenException({
-        code: "model_governance_blocked",
-        message: modelGovernanceMessage(modelDecision.reason),
-        decision: modelDecision,
-      });
-    }
+    const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, "chat");
+    const image = this.#assertImageGenerationAvailable(imageAccess);
+    const actualCostMicros = BigInt(image.costMicros);
     await this.budgets.reserve({
       tenantId,
       requestId,
@@ -739,6 +794,8 @@ export class AgentApiController {
         decision: modelDecision,
       });
     }
+    const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, mode);
+    if (request.intent === "image_generation") this.#assertImageGenerationAvailable(imageAccess);
     const [groundingContext, portableCheckpoint] = await Promise.all([
       this.contextAssembly.assemble({
         tenantId,
@@ -810,7 +867,7 @@ export class AgentApiController {
           return { forgotten: Boolean(forgotten), memoryId: forgotten?.id ?? null };
         },
       },
-      ...(this.runtimeConfig.imageGenerationInfo() ? {
+      ...(imageAccess.image && imageAccess.decision?.allowed ? {
         imageGeneration: {
           generate: async ({ prompt, size, aspectRatio, transparentBackground, referenceImagePaths, referencedImageIds, onPartial }: {
             prompt: string;
@@ -908,17 +965,8 @@ export class AgentApiController {
     }
     if (this.durableTurns.enabled) {
       try {
-        const imageInfo = this.runtimeConfig.imageGenerationInfo();
-        const imageDecision = imageInfo
-          ? await this.modelGovernance.resolve({
-              tenantId,
-              mode,
-              providerId: imageInfo.providerId,
-              model: imageInfo.model,
-              userId,
-              departmentId,
-            })
-          : null;
+        const imageInfo = imageAccess.image;
+        const imageDecision = imageAccess.decision;
         const [provider, mcpServers] = await Promise.all([
           durableProviderTransport(
             governedRequest.provider,
@@ -939,6 +987,7 @@ export class AgentApiController {
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
           admissionFingerprint: operationFingerprint,
+          ...(request.intent ? { intent: request.intent } : {}),
           providerId,
           provider,
           model: governedRequest.model ?? null,

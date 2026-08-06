@@ -1,4 +1,4 @@
-import { AttachmentInputSchema, type AttachmentInput } from "@berry/shared";
+import { AttachmentInputSchema, TurnIntentSchema, type AttachmentInput, type TurnIntent } from "@berry/shared";
 import { z } from "zod";
 
 export const QUEUED_FOLLOW_UP_STORAGE_PREFIX = "berry.web.queuedFollowUps.v1:";
@@ -9,6 +9,7 @@ export const QueuedFollowUpSchema = z.object({
   sessionId: z.string().min(1),
   ordinal: z.number().int().nonnegative(),
   input: z.string().min(1),
+  intent: TurnIntentSchema.optional(),
   attachments: z.array(AttachmentInputSchema).default([]),
   status: z.enum(["queued", "sending", "paused", "failed"]),
   error: z.string().nullable().default(null),
@@ -31,6 +32,7 @@ export function createQueuedFollowUp(input: {
   sessionId: string;
   ordinal: number;
   input: string;
+  intent?: TurnIntent;
   attachments?: AttachmentInput[];
 }): QueuedFollowUp {
   const now = new Date().toISOString();
@@ -40,6 +42,7 @@ export function createQueuedFollowUp(input: {
     sessionId: input.sessionId,
     ordinal: input.ordinal,
     input: input.input,
+    ...(input.intent ? { intent: input.intent } : {}),
     attachments: input.attachments ?? [],
     status: "queued",
     error: null,

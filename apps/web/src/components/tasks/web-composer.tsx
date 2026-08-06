@@ -1,7 +1,7 @@
 import * as React from "react";
 import { ArrowUp, Play, Plus, Square } from "lucide-react";
-import { type BerryApiClient } from "@berry/api-client";
-import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type Workspace } from "@berry/shared";
+import { type BerryApiClient, type ImageGenerationCapabilityStatus } from "@berry/api-client";
+import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -69,6 +69,14 @@ export function prunePastedTextPresentations(
 }
 
 const CREATE_IMAGE_TOKEN = "__berry_create_image__";
+function insertCreateImageToken(editor: PromptEditorHandle | null): void {
+  editor?.insertPromptToken({
+    id: "mode:create-image",
+    category: "image",
+    label: "Create image",
+    markdown: CREATE_IMAGE_TOKEN,
+  });
+}
 const PastedTextEditorDialog = React.lazy(() => import("./pasted-text-editor-dialog").then((module) => ({ default: module.PastedTextEditorDialog })));
 const ComposerAttachmentPill = React.lazy(() => import("./composer-attachment-pill").then((module) => ({ default: module.ComposerAttachmentPill })));
 
@@ -122,6 +130,7 @@ export function Composer({
   question,
   showProjectSwitcher,
   personalization,
+  imageGenerationCapability,
 }: {
   config: WebConfig;
   activeTask: Task | null;
@@ -137,7 +146,7 @@ export function Composer({
   onUserMessagePersisted: (sessionId: string, optimisticMessageId: string, message: Message) => void;
   onAssistantMessage: (text: string, sessionId: string, taskId: string) => void;
   onEvent: (sessionId: string, event: Parameters<typeof reduceStream>[1]) => void;
-  runTurn: (task: Task, params: { input: string; messageInput?: string | undefined; requestMessageId?: string | undefined; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
+  runTurn: (task: Task, params: { input: string; intent?: TurnIntent | undefined; messageInput?: string | undefined; requestMessageId?: string | undefined; attachments?: AttachmentInput[] | undefined }) => Promise<void>;
   onCancel: () => void;
   onContinueTurn?: (() => Promise<void>) | undefined;
   variant: "home" | "thread";
@@ -152,14 +161,15 @@ export function Composer({
   onRetryFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onReorderFollowUps: (sessionId: string, orderedIds: string[]) => void;
   onSteerFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
-  onUpdateFollowUp: (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "attachments">) => Promise<void>;
+  onUpdateFollowUp: (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "intent" | "attachments">) => Promise<void>;
   onResumeFollowUps: (sessionId: string) => Promise<void>;
   onEditingFollowUpChange: (followUp: QueuedFollowUp | null) => boolean;
-  onSteerMessage: (task: Task, input: string, attachments: AttachmentInput[]) => Promise<void>;
+  onSteerMessage: (task: Task, input: string, attachments: AttachmentInput[], intent?: TurnIntent) => Promise<void>;
   planProgress?: PlanProgress | null;
   question?: QuestionPrompt | null;
   showProjectSwitcher: boolean;
   personalization: PersonalizationProfile;
+  imageGenerationCapability: ImageGenerationCapabilityStatus;
 }) {
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -182,7 +192,7 @@ export function Composer({
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const pastedTextCountRef = React.useRef(0);
   const uploadControllersRef = React.useRef(new Map<string, AbortController>());
-  const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[] } | null>(null);
+  const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[]; createImageMode: boolean } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
   const contextStatsRequestRef = React.useRef(0);
@@ -269,18 +279,17 @@ export function Composer({
     setAttachments((current) => current.some((attachment) => attachment.id === reference.id) ? current : [...current, reference]);
   }, []);
   const enableCreateImageMode = React.useCallback(() => {
+    if (!imageGenerationCapability.available) {
+      setUploadError(imageGenerationCapability.message ?? "Image generation is unavailable.");
+      return;
+    }
     if (createImageMode) {
       editorRef.current?.focus();
       return;
     }
     setCreateImageMode(true);
-    window.requestAnimationFrame(() => editorRef.current?.insertPromptToken({
-      id: "mode:create-image",
-      category: "image",
-      label: "Create image",
-      markdown: CREATE_IMAGE_TOKEN,
-    }));
-  }, [createImageMode]);
+    window.requestAnimationFrame(() => insertCreateImageToken(editorRef.current));
+  }, [createImageMode, imageGenerationCapability.available, imageGenerationCapability.message]);
   const mentions = useStaticMentions({ editorRef, config, taskTitles, onSelectItem: onMentionSelected });
   React.useEffect(() => {
     const pending = window.localStorage.getItem("berry.web.pendingPrompt");
@@ -303,14 +312,20 @@ export function Composer({
   const editQueuedFollowUp = React.useCallback((followUp: QueuedFollowUp) => {
     if (savingQueuedEdit || editingFollowUp) return;
     if (!onEditingFollowUpChange(followUp)) return;
-    queueEditDraftRef.current = { text, attachments };
+    queueEditDraftRef.current = { text, attachments, createImageMode };
     queueEditIndexRef.current = queuedFollowUps.findIndex((item) => item.id === followUp.id);
     editingFollowUpRef.current = followUp;
     setEditingFollowUp(followUp);
-    setText(followUp.input);
+    const editingImage = followUp.intent === "image_generation";
+    const editableInput = editingImage ? followUp.input.replace(/^Create image\s*\n?/, "") : followUp.input;
+    setCreateImageMode(editingImage);
+    setText(editableInput);
     setAttachments(followUp.attachments);
-    window.requestAnimationFrame(() => editorRef.current?.setText(followUp.input));
-  }, [attachments, editingFollowUp, onEditingFollowUpChange, queuedFollowUps, savingQueuedEdit, text]);
+    window.requestAnimationFrame(() => {
+      editorRef.current?.setText(editableInput);
+      if (editingImage) insertCreateImageToken(editorRef.current);
+    });
+  }, [attachments, createImageMode, editingFollowUp, onEditingFollowUpChange, queuedFollowUps, savingQueuedEdit, text]);
 
   const cancelQueuedEdit = React.useCallback(() => {
     const draft = queueEditDraftRef.current;
@@ -319,9 +334,11 @@ export function Composer({
     editingFollowUpRef.current = null;
     onEditingFollowUpChange(null);
     setEditingFollowUp(null);
+    setCreateImageMode(draft?.createImageMode ?? false);
     setText(draft?.text ?? "");
     setAttachments(draft?.attachments ?? []);
-    editorRef.current?.setText(draft?.text ?? "");
+    editorRef.current?.setText(draft?.text.replaceAll(CREATE_IMAGE_TOKEN, "") ?? "");
+    if (draft?.createImageMode) insertCreateImageToken(editorRef.current);
   }, [onEditingFollowUpChange]);
 
   React.useEffect(() => () => {
@@ -381,6 +398,7 @@ export function Composer({
     if (savingQueuedEdit || pendingUploads.some((upload) => upload.state === "uploading")) return;
     const plainInput = text.replaceAll(CREATE_IMAGE_TOKEN, "").trim() || (attachments.length > 0 ? "Review the attached files." : "");
     const input = createImageMode ? `Create image\n${plainInput}` : plainInput;
+    const intent = createImageMode ? "image_generation" as const : undefined;
     if (!input) {
       await continueInterruptedTurn();
       return;
@@ -390,15 +408,17 @@ export function Composer({
       setUploadError("");
       try {
         const draft = queueEditDraftRef.current;
-        await onUpdateFollowUp(editingFollowUp, { input, attachments });
+        await onUpdateFollowUp(editingFollowUp, { input, intent, attachments });
         queueEditDraftRef.current = null;
         queueEditIndexRef.current = null;
         editingFollowUpRef.current = null;
         onEditingFollowUpChange(null);
         setEditingFollowUp(null);
+        setCreateImageMode(draft?.createImageMode ?? false);
         setText(draft?.text ?? "");
         setAttachments(draft?.attachments ?? []);
-        editorRef.current?.setText(draft?.text ?? "");
+        editorRef.current?.setText(draft?.text.replaceAll(CREATE_IMAGE_TOKEN, "") ?? "");
+        if (draft?.createImageMode) insertCreateImageToken(editorRef.current);
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : "Unable to update the queued prompt");
       } finally {
@@ -428,6 +448,7 @@ export function Composer({
           sessionId: activeTask.activeSessionId,
           ordinal: queuedFollowUps.length,
           input,
+          ...(intent ? { intent } : {}),
           attachments,
         }));
         setText("");
@@ -445,7 +466,7 @@ export function Composer({
         return;
       }
       try {
-        await onSteerMessage(activeTask, input, attachments);
+        await onSteerMessage(activeTask, input, attachments, intent);
         setText("");
         setCreateImageMode(false);
         editorRef.current?.clear();
@@ -474,6 +495,7 @@ export function Composer({
         setAttachments([]);
         await runTurn(task, {
           input: runtimeInput,
+          ...(intent ? { intent } : {}),
           ...(runtimeInput !== input ? { messageInput: input } : {}),
           requestMessageId,
           ...(sent.length > 0 ? { attachments: sent } : {}),
@@ -809,7 +831,7 @@ export function Composer({
         </div>
         <div className="berry-composer-controls flex min-w-0 flex-nowrap items-center gap-1">
           <input ref={fileInputRef} className="visually-hidden" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => void addFiles(event.currentTarget.files)} />
-          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem className="berry-create-image-menu-item" onClick={enableCreateImageMode}><ImagePlus /><strong className="berry-create-image-menu-label">Create image</strong></DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
+          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem className="berry-create-image-menu-item" disabled={!imageGenerationCapability.available} onClick={enableCreateImageMode} title={imageGenerationCapability.available ? undefined : imageGenerationCapability.message ?? "Image generation is unavailable"}><ImagePlus /><strong className="berry-create-image-menu-label">Create image</strong>{!imageGenerationCapability.available ? <span className="ml-auto text-xs text-muted-foreground">Unavailable</span> : null}</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           <span className="min-w-0 flex-1" />
           {contextSessionId ? <ContextWindowRing stats={contextStats} /> : null}
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{selectedComposerModel?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => { onModelChange(item.id); const nextLevels = reasoningLevelsForModel(item); if (!nextLevels.includes(reasoning)) onReasoningChange(nextLevels[0] ?? "off"); }}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
