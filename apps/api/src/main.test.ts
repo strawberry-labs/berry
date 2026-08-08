@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { BERRY_AUTH_PUBLIC } from "./auth/auth.decorators.ts";
 import { FilePlatformController } from "./files/file-platform.controller.ts";
 import { FilePlatformService } from "./files/file-platform.service.ts";
+import { ENTERPRISE_IDENTITY_REPOSITORY, PostgresEnterpriseIdentityRepository } from "./identity/identity.repository.ts";
 import { createApiMainModule, createAuthRuntime, HealthController } from "./main.ts";
 
 describe("API health probes", () => {
@@ -28,20 +29,24 @@ describe("API health probes", () => {
   it("resolves production repository factories from the shared database module", async () => {
     const directory = mkdtempSync(join(tmpdir(), "berry-api-main-"));
     try {
+      const env = {
+        BERRY_DATABASE_URL: "postgres://berry:berry@127.0.0.1:5432/berry",
+        BERRY_API_MODEL_MODE: "fixture",
+        BERRY_SANDBOX_PROVIDER: "fixture",
+        BERRY_AUTH_MODE: "better-auth",
+        BETTER_AUTH_SECRET: "test-only-auth-secret-with-at-least-thirty-two-characters",
+        BERRY_CONNECTOR_ENCRYPTION_KEY: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        BERRY_RUNTIME_DB_PATH: join(directory, "runtime.sqlite"),
+      };
       const moduleRef = await Test.createTestingModule({
-        imports: [createApiMainModule({
-          BERRY_DATABASE_URL: "postgres://berry:berry@127.0.0.1:5432/berry",
-          BERRY_API_MODEL_MODE: "fixture",
-          BERRY_SANDBOX_PROVIDER: "fixture",
-          BERRY_AUTH_MODE: "better-auth",
-          BETTER_AUTH_SECRET: "test-only-auth-secret-with-at-least-thirty-two-characters",
-          BERRY_RUNTIME_DB_PATH: join(directory, "runtime.sqlite"),
-        })],
+        imports: [createApiMainModule(env)],
       }).compile();
 
       const fileController = moduleRef.get(FilePlatformController);
       const fileService = moduleRef.get(FilePlatformService);
+      const identityRepository = moduleRef.get<PostgresEnterpriseIdentityRepository>(ENTERPRISE_IDENTITY_REPOSITORY);
       expect((fileController as unknown as { files: FilePlatformService }).files).toBe(fileService);
+      expect((identityRepository as unknown as { env: NodeJS.ProcessEnv }).env).toBe(env);
 
       await moduleRef.close();
     } finally {

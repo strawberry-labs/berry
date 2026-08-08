@@ -311,25 +311,20 @@ describe("BerryApiClient", () => {
           updatedAt: "2026-07-10T00:00:00.000Z",
         }]);
       }
-      if (url.includes("/sso/start?")) {
-        return json({
-          connectionId: "sso_1",
-          kind: "oidc",
-          redirectUrl: "https://idp.example.test/authorize?client_id=berry",
-          state: "berry_state",
-        });
+      if (url.endsWith("/sso/connections")) {
+        return json([{ id: "sso_1", tenantId: "00000000-0000-7000-8000-000000000001", kind: "oidc", provider: "google", slug: "google-workspace", displayName: "Google Workspace", status: "enabled", issuer: "https://accounts.google.com", clientId: "client.apps.googleusercontent.com", clientSecretConfigured: true, domains: ["aesg.com"], jitProvisioning: true, defaultRole: "member", scimEnabled: false, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }]);
       }
       return json([]);
     });
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
     const orgs = await client.listOrganizations("berry.example.test");
-    const start = await client.startSso(orgs[0]!.id, "okta", "https://berry.example.test/callback");
+    const connections = await client.listSsoConnections(orgs[0]!.id);
 
     expect(orgs[0]?.deploymentMode).toBe("dedicated");
-    expect(start.kind).toBe("oidc");
+    expect(connections[0]?.provider).toBe("google");
     expect(fetchImpl).toHaveBeenCalledWith(
-      "https://api.berry.test/v1/orgs/00000000-0000-7000-8000-000000000001/sso/start?connection=okta&redirectUri=https%3A%2F%2Fberry.example.test%2Fcallback",
+      "https://api.berry.test/v1/orgs/00000000-0000-7000-8000-000000000001/sso/connections",
       expect.objectContaining({ method: "GET" }),
     );
   });

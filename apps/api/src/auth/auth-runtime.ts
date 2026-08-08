@@ -7,6 +7,7 @@ import { hashPassword } from "better-auth/crypto";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { Pool, type PoolClient } from "pg";
 import { SELF_HOST_TENANT_ID, SELF_HOST_WORKSPACE_ID } from "@berry/db";
+import { ConnectorSecretEnvelopeSchema, openConnectorSecret, type ConnectorSecretEnvelope } from "@berry/shared";
 import { z } from "zod";
 
 export const BERRY_AUTH_RUNTIME = Symbol("BERRY_AUTH_RUNTIME");
@@ -37,6 +38,11 @@ export type BerryAuthDescription = {
     missingConfiguration: string[];
   };
   socialProviders: Array<"github">;
+  ssoProviders?: Array<{
+    id: "google";
+    name: string;
+    domain: string;
+  }>;
   storage: "postgres" | "memory";
 };
 
@@ -131,28 +137,32 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
       databaseHooks: {
         user: {
           create: {
-            before: async (user: { email: string }) => {
+            before: async (user: { email: string }, context: unknown) => {
               const email = user.email.trim().toLowerCase();
               const domain = email.split("@")[1] ?? "";
+              const ssoProvisioning = isGoogleSsoContext(context);
               if (!await ownerExists(pool, tenantId)) {
                 throw new Error("Complete the one-time owner setup before creating member accounts.");
               }
-              if (!signupEnabled) throw new Error("Account creation is disabled. Ask an administrator to invite you.");
-              if (allowedEmails.size > 0 && !allowedEmails.has(email)) throw new Error("This email address is not allowed to create an account.");
-              if (allowedDomains.size > 0 && !allowedDomains.has(domain)) throw new Error("This email domain is not allowed to create an account.");
+              if (!ssoProvisioning) {
+                if (!signupEnabled) throw new Error("Account creation is disabled. Ask an administrator to invite you.");
+                if (allowedEmails.size > 0 && !allowedEmails.has(email)) throw new Error("This email address is not allowed to create an account.");
+                if (allowedDomains.size > 0 && !allowedDomains.has(domain)) throw new Error("This email domain is not allowed to create an account.");
+              }
               const count = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM users WHERE deleted_at IS NULL");
               if (Number(count.rows[0]?.count ?? "0") >= maxUsers) throw new Error("This Berry instance has reached its account limit.");
             },
-            after: async (user: { id: string }) => {
+            after: async (user: { id: string }, context: unknown) => {
+              const membershipSource = isGoogleSsoContext(context) ? "sso" : "signup";
               const client = await pool.connect();
               try {
                 await client.query("BEGIN");
                 await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
                 await client.query(
                   `INSERT INTO tenant_memberships (tenant_id, user_id, status, role, source)
-                   VALUES ($1::uuid, $2::uuid, 'active', 'member', 'signup')
+                   VALUES ($1::uuid, $2::uuid, 'active', 'member', $3)
                    ON CONFLICT (tenant_id, user_id) DO UPDATE SET status = 'active', updated_at = now()`,
-                  [tenantId, user.id],
+                  [tenantId, user.id, membershipSource],
                 );
                 await client.query(
                   `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
@@ -205,6 +215,7 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
       accountLinking: {
         enabled: true,
         trustedProviders: ["github", "email-password"],
+        requireLocalEmailVerified: true,
       },
       fields: {
         userId: "user_id",
@@ -248,6 +259,7 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
         missingConfiguration: [],
       },
       socialProviders: socialProviders.github ? ["github"] : [],
+      ssoProviders: [],
       storage: pool ? "postgres" : "memory",
     },
   };
@@ -263,12 +275,14 @@ export function createBerryAuthRuntime(options: CreateBerryAuthOptions = {}): Re
     pool,
     options.env ?? process.env,
     (options.env ?? process.env).BERRY_TENANT_ID ?? SELF_HOST_TENANT_ID,
+    authOptions,
   );
 }
 
 @Injectable()
 export class RealBetterAuthRuntime implements BerryAuthRuntime {
   private readonly nodeHandler: ReturnType<typeof toNodeHandler>;
+  private googleHandlerCache?: { fingerprint: string; handler: ReturnType<typeof toNodeHandler> };
 
   constructor(
     private readonly auth: Auth,
@@ -276,15 +290,21 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
     private readonly pool?: Pool,
     private readonly env: BerryAuthEnv = process.env,
     private readonly tenantId = SELF_HOST_TENANT_ID,
+    private readonly baseAuthOptions?: BetterAuthOptions,
   ) {
     this.nodeHandler = toNodeHandler(auth);
   }
 
   async describe(): Promise<BerryAuthDescription> {
     if (!this.pool) return this.authDescription;
+    const google = await loadEnabledGoogleSso(this.pool, this.tenantId);
+    const googleUsable = google ? await isGoogleSsoUsable(google, this.env, this.tenantId) : false;
     return {
       ...this.authDescription,
       setup: await setupDescription(this.pool, this.tenantId, this.env),
+      ssoProviders: google && googleUsable
+        ? [{ id: "google", name: google.displayName, domain: google.domain }]
+        : [],
     };
   }
 
@@ -432,7 +452,40 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
   }
 
   async handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    await this.nodeHandler(req, res);
+    if (!this.pool || !this.baseAuthOptions || !isGoogleAuthRequest(req)) {
+      await this.nodeHandler(req, res);
+      return;
+    }
+    sanitizeGoogleSignInRequest(req);
+    const google = await loadEnabledGoogleSso(this.pool, this.tenantId);
+    if (!google) {
+      await this.nodeHandler(req, res);
+      return;
+    }
+    const envelope = ConnectorSecretEnvelopeSchema.parse(google.clientSecretEnvelope);
+    const fingerprint = googleSsoFingerprint(google, envelope);
+    if (this.googleHandlerCache?.fingerprint !== fingerprint) {
+      const clientSecret = await openConnectorSecret(
+        envelope,
+        connectorEncryptionKeys(this.env),
+        `${this.tenantId}:sso:${google.id}:client-secret`,
+      );
+      const googleAuth = betterAuth({
+        ...this.baseAuthOptions,
+        socialProviders: {
+          ...this.baseAuthOptions.socialProviders,
+          google: {
+            clientId: google.clientId,
+            clientSecret,
+            hd: google.domain,
+            accessType: "online",
+            disableSignUp: !google.jitProvisioning,
+          },
+        },
+      });
+      this.googleHandlerCache = { fingerprint, handler: toNodeHandler(googleAuth) };
+    }
+    await this.googleHandlerCache.handler(req, res);
   }
 
   async close(): Promise<void> {
@@ -503,6 +556,124 @@ function normalizeSession(value: unknown): BerryAuthSession | null {
 function parseCsv(value: string | undefined): string[] {
   if (!value) return [];
   return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+type GoogleWorkspaceSsoRecord = {
+  id: string;
+  displayName: string;
+  clientId: string;
+  clientSecretEnvelope: unknown;
+  domain: string;
+  jitProvisioning: boolean;
+  updatedAt: string;
+};
+
+async function loadEnabledGoogleSso(pool: Pool, tenantId: string): Promise<GoogleWorkspaceSsoRecord | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
+    const result = await client.query<{
+      id: string;
+      display_name: string;
+      client_id: string | null;
+      client_secret_envelope: unknown;
+      domains: unknown;
+      jit_provisioning: boolean;
+      updated_at: Date | string;
+    }>(
+      `SELECT id, display_name, client_id, client_secret_envelope, domains, jit_provisioning, updated_at
+       FROM sso_connections
+       WHERE tenant_id = $1::uuid AND provider = 'google' AND kind = 'oidc' AND status = 'enabled'
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [tenantId],
+    );
+    await client.query("COMMIT");
+    const row = result.rows[0];
+    const domain = Array.isArray(row?.domains) && typeof row.domains[0] === "string" ? row.domains[0].trim().toLowerCase() : "";
+    if (!row?.client_id || !domain) return null;
+    return {
+      id: row.id,
+      displayName: row.display_name,
+      clientId: row.client_id,
+      clientSecretEnvelope: row.client_secret_envelope,
+      domain,
+      jitProvisioning: row.jit_provisioning,
+      updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+    };
+  } catch (cause) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw cause;
+  } finally {
+    client.release();
+  }
+}
+
+function connectorEncryptionKeys(env: BerryAuthEnv): string[] {
+  const primary = env.BERRY_CONNECTOR_ENCRYPTION_KEY?.trim();
+  if (!primary) throw new Error("BERRY_CONNECTOR_ENCRYPTION_KEY is required to use Google Workspace SSO");
+  return [primary, ...parseCsv(env.BERRY_CONNECTOR_DECRYPTION_KEYS)];
+}
+
+async function isGoogleSsoUsable(record: GoogleWorkspaceSsoRecord, env: BerryAuthEnv, tenantId: string): Promise<boolean> {
+  const parsed = ConnectorSecretEnvelopeSchema.safeParse(record.clientSecretEnvelope);
+  if (!record.clientId || !record.domain || !parsed.success) return false;
+  try {
+    const clientSecret = await openConnectorSecret(
+      parsed.data,
+      connectorEncryptionKeys(env),
+      `${tenantId}:sso:${record.id}:client-secret`,
+    );
+    return clientSecret.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function googleSsoFingerprint(record: GoogleWorkspaceSsoRecord, envelope: ConnectorSecretEnvelope): string {
+  return createHash("sha256").update(JSON.stringify({
+    id: record.id,
+    clientId: record.clientId,
+    domain: record.domain,
+    jitProvisioning: record.jitProvisioning,
+    updatedAt: record.updatedAt,
+    keyId: envelope.keyId,
+    ciphertext: envelope.ciphertext,
+  })).digest("hex");
+}
+
+function isGoogleAuthRequest(req: IncomingMessage): boolean {
+  const path = new URL(req.url ?? "/", "http://berry.local").pathname;
+  if (path === `${AUTH_BASE_PATH}/callback/google`) return true;
+  if (path !== `${AUTH_BASE_PATH}/sign-in/social`) return false;
+  const body = (req as IncomingMessage & { body?: unknown }).body;
+  return typeof body === "object"
+    && body !== null
+    && !Array.isArray(body)
+    && (body as Record<string, unknown>).provider === "google";
+}
+
+function sanitizeGoogleSignInRequest(req: IncomingMessage): void {
+  const path = new URL(req.url ?? "/", "http://berry.local").pathname;
+  if (path !== `${AUTH_BASE_PATH}/sign-in/social`) return;
+  const request = req as IncomingMessage & { body?: unknown };
+  if (!request.body || typeof request.body !== "object" || Array.isArray(request.body)) return;
+  const body = request.body as Record<string, unknown>;
+  request.body = {
+    provider: "google",
+    ...(typeof body.callbackURL === "string" ? { callbackURL: body.callbackURL } : {}),
+    ...(typeof body.errorCallbackURL === "string" ? { errorCallbackURL: body.errorCallbackURL } : {}),
+    ...(typeof body.disableRedirect === "boolean" ? { disableRedirect: body.disableRedirect } : {}),
+  };
+}
+
+function isGoogleSsoContext(context: unknown): boolean {
+  if (!context || typeof context !== "object") return false;
+  const candidate = context as { path?: unknown; params?: unknown };
+  if (candidate.path === "/callback/google") return true;
+  if (candidate.path !== "/callback/:id" || !candidate.params || typeof candidate.params !== "object") return false;
+  return (candidate.params as { id?: unknown }).id === "google";
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {

@@ -6,6 +6,7 @@ import {
   SELF_HOST_WORKSPACE_SLUG,
 } from "@berry/db";
 import {
+  ConnectorSecretEnvelopeSchema,
   DepartmentSchema,
   EffectivePermissionsSchema,
   FeatureFlagSchema,
@@ -16,6 +17,7 @@ import {
   ScimGroupSchema,
   ScimUserSchema,
   SsoConnectionSchema,
+  sealConnectorSecret,
   type Department,
   type EffectivePermissions,
   type FeatureFlag,
@@ -80,17 +82,26 @@ export class IdentityMemberLimitError extends Error {
 export type CreateSsoConnectionInput = {
   tenantId: string;
   kind: "saml" | "oidc";
+  provider?: string | undefined;
   slug: string;
   displayName: string;
+  status?: "draft" | "enabled" | "disabled" | undefined;
   issuer?: string | null | undefined;
   ssoUrl?: string | null | undefined;
   metadataUrl?: string | null | undefined;
   entityId?: string | null | undefined;
   clientId?: string | null | undefined;
-  clientSecretRef?: string | null | undefined;
+  clientSecret?: string | undefined;
   domains?: string[] | undefined;
+  jitProvisioning?: boolean | undefined;
+  defaultRole?: "member" | undefined;
   scimEnabled?: boolean | undefined;
 };
+
+export type EnterpriseIdentitySecretEnv = Partial<Record<
+  "BERRY_CONNECTOR_ENCRYPTION_KEY" | "BERRY_CONNECTOR_DECRYPTION_KEYS",
+  string | undefined
+>>;
 
 export type AuthorizationResource = {
   type: string;
@@ -155,6 +166,7 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
   readonly #resourceAcls = new Map<string, ResourceAcl>();
   readonly #departments = new Map<string, Department>();
   readonly #sso = new Map<string, SsoConnection>();
+  readonly #ssoSecrets = new Set<string>();
   readonly #scimUsers = new Map<string, ScimUser>();
   readonly #scimGroups = new Map<string, ScimGroup>();
   readonly #deprovisionedUsers = new Set<string>();
@@ -398,26 +410,38 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
   }
 
   async listSsoConnections(tenantId: string): Promise<SsoConnection[]> {
-    return [...this.#sso.values()].filter((connection) => connection.tenantId === tenantId);
+    return [...new Map(
+      [...this.#sso.values()]
+        .filter((connection) => connection.tenantId === tenantId)
+        .map((connection) => [connection.id, connection]),
+    ).values()];
   }
 
   async createSsoConnection(input: CreateSsoConnectionInput): Promise<SsoConnection> {
     const now = new Date().toISOString();
+    const existing = this.#sso.get(`${input.tenantId}:${input.slug}`);
+    const id = existing?.id ?? randomUUID();
+    if (input.clientSecret) this.#ssoSecrets.add(`${input.tenantId}:${id}`);
     const connection = SsoConnectionSchema.parse({
-      id: randomUUID(),
+      id,
       tenantId: input.tenantId,
       kind: input.kind,
+      provider: input.provider ?? "generic",
       slug: input.slug,
       displayName: input.displayName,
-      status: "enabled",
+      status: input.status ?? "draft",
       issuer: input.issuer ?? null,
       ssoUrl: input.ssoUrl ?? null,
       metadataUrl: input.metadataUrl ?? null,
       entityId: input.entityId ?? null,
       clientId: input.clientId ?? null,
-      clientSecretRef: input.clientSecretRef ?? null,
+      clientSecretConfigured: this.#ssoSecrets.has(`${input.tenantId}:${id}`),
       domains: input.domains ?? [],
+      jitProvisioning: input.jitProvisioning ?? true,
+      defaultRole: input.defaultRole ?? "member",
       scimEnabled: input.scimEnabled ?? false,
+      lastTestedAt: null,
+      lastErrorCode: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -478,7 +502,11 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
 }
 
 export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityRepository {
-  constructor(private readonly database: CloudDatabaseService, private readonly maxUsers = 10) {}
+  constructor(
+    private readonly database: CloudDatabaseService,
+    private readonly maxUsers = 10,
+    private readonly env: EnterpriseIdentitySecretEnv = process.env,
+  ) {}
 
   async listOrganizations(userId: string, host?: string | undefined): Promise<Organization[]> {
     const hostOrg = host ? await this.resolveOrganizationByHost(host) : null;
@@ -731,8 +759,9 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
 
   async listSsoConnections(tenantId: string): Promise<SsoConnection[]> {
     const rows = await this.database.withTenant(tenantId, (executor) => executor.query<SsoConnectionRow>(`
-      SELECT id, tenant_id, kind, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
-        client_secret_ref, domains, scim_enabled, created_at, updated_at
+      SELECT id, tenant_id, kind, provider, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
+        client_secret_ref, client_secret_envelope, domains, jit_provisioning, default_role, scim_enabled,
+        last_tested_at, last_error_code, created_at, updated_at
       FROM sso_connections
       ORDER BY display_name ASC
     `));
@@ -740,45 +769,80 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
   }
 
   async createSsoConnection(input: CreateSsoConnectionInput): Promise<SsoConnection> {
-    const rows = await this.database.withTenant(input.tenantId, (executor) => executor.query<SsoConnectionRow>(`
-      INSERT INTO sso_connections (
-        tenant_id, kind, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
-        client_secret_ref, domains, scim_enabled
-      )
-      VALUES ($1::uuid, $2, $3, $4, 'enabled', $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
-      ON CONFLICT (tenant_id, slug) DO UPDATE
-      SET kind = excluded.kind, display_name = excluded.display_name, issuer = excluded.issuer, sso_url = excluded.sso_url,
-          metadata_url = excluded.metadata_url, entity_id = excluded.entity_id, client_id = excluded.client_id,
-          client_secret_ref = excluded.client_secret_ref, domains = excluded.domains, scim_enabled = excluded.scim_enabled,
-          updated_at = now()
-      RETURNING id, tenant_id, kind, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
-        client_secret_ref, domains, scim_enabled, created_at, updated_at
-    `, [
-      input.tenantId,
-      input.kind,
-      input.slug,
-      input.displayName,
-      input.issuer ?? null,
-      input.ssoUrl ?? null,
-      input.metadataUrl ?? null,
-      input.entityId ?? null,
-      input.clientId ?? null,
-      input.clientSecretRef ?? null,
-      JSON.stringify(input.domains ?? []),
-      input.scimEnabled ?? false,
-    ]));
-    return ssoFromRow(rows[0]!);
+    return this.database.withTenant(input.tenantId, async (executor) => {
+      const rows = await executor.query<SsoConnectionRow>(`
+        INSERT INTO sso_connections (
+          id, tenant_id, kind, provider, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
+          domains, jit_provisioning, default_role, scim_enabled
+        )
+        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16)
+        ON CONFLICT (tenant_id, slug) DO UPDATE
+        SET kind = excluded.kind, provider = excluded.provider, display_name = excluded.display_name, status = excluded.status,
+            issuer = excluded.issuer, sso_url = excluded.sso_url,
+            metadata_url = excluded.metadata_url, entity_id = excluded.entity_id, client_id = excluded.client_id,
+            domains = excluded.domains, jit_provisioning = excluded.jit_provisioning,
+            default_role = excluded.default_role, scim_enabled = excluded.scim_enabled, last_error_code = NULL,
+            updated_at = now()
+        RETURNING id, tenant_id, kind, provider, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
+          client_secret_ref, client_secret_envelope, domains, jit_provisioning, default_role, scim_enabled,
+          last_tested_at, last_error_code, created_at, updated_at
+      `, [
+        randomUUID(),
+        input.tenantId,
+        input.kind,
+        input.provider ?? "generic",
+        input.slug,
+        input.displayName,
+        input.status ?? "draft",
+        input.issuer ?? null,
+        input.ssoUrl ?? null,
+        input.metadataUrl ?? null,
+        input.entityId ?? null,
+        input.clientId ?? null,
+        JSON.stringify(input.domains ?? []),
+        input.jitProvisioning ?? true,
+        input.defaultRole ?? "member",
+        input.scimEnabled ?? false,
+      ]);
+      const connection = rows[0];
+      if (!connection) throw new Error("SSO connection upsert did not return a row");
+      if (!input.clientSecret) return ssoFromRow(connection);
+
+      const secretEnvelope = await sealConnectorSecret(
+        input.clientSecret,
+        this.#encryptionKey(),
+        ssoSecretContext(input.tenantId, connection.id),
+      );
+      const updated = await executor.query<SsoConnectionRow>(`
+        UPDATE sso_connections
+        SET client_secret_ref = 'encrypted-db', client_secret_envelope = $3::jsonb,
+            last_error_code = NULL, updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+        RETURNING id, tenant_id, kind, provider, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
+          client_secret_ref, client_secret_envelope, domains, jit_provisioning, default_role, scim_enabled,
+          last_tested_at, last_error_code, created_at, updated_at
+      `, [input.tenantId, connection.id, JSON.stringify(secretEnvelope)]);
+      if (!updated[0]) throw new Error("SSO credential update did not return a row");
+      return ssoFromRow(updated[0]);
+    });
   }
 
   async getSsoConnection(tenantId: string, idOrSlug: string): Promise<SsoConnection | null> {
     const rows = await this.database.withTenant(tenantId, (executor) => executor.query<SsoConnectionRow>(`
-      SELECT id, tenant_id, kind, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
-        client_secret_ref, domains, scim_enabled, created_at, updated_at
+      SELECT id, tenant_id, kind, provider, slug, display_name, status, issuer, sso_url, metadata_url, entity_id, client_id,
+        client_secret_ref, client_secret_envelope, domains, jit_provisioning, default_role, scim_enabled,
+        last_tested_at, last_error_code, created_at, updated_at
       FROM sso_connections
       WHERE id::text = $1 OR slug = $1
       LIMIT 1
     `, [idOrSlug]));
     return rows[0] ? ssoFromRow(rows[0]) : null;
+  }
+
+  #encryptionKey(): string {
+    const key = this.env.BERRY_CONNECTOR_ENCRYPTION_KEY?.trim();
+    if (!key) throw new Error("BERRY_CONNECTOR_ENCRYPTION_KEY is required for SSO client credentials");
+    return key;
   }
 
   async upsertScimUser(tenantId: string, input: ScimUser): Promise<ScimUser> {
@@ -894,6 +958,7 @@ type SsoConnectionRow = {
   id: string;
   tenant_id: string;
   kind: "saml" | "oidc";
+  provider: string;
   slug: string;
   display_name: string;
   status: "draft" | "enabled" | "disabled";
@@ -903,8 +968,13 @@ type SsoConnectionRow = {
   entity_id: string | null;
   client_id: string | null;
   client_secret_ref: string | null;
+  client_secret_envelope: unknown;
   domains: unknown;
+  jit_provisioning: boolean;
+  default_role: "member";
   scim_enabled: boolean;
+  last_tested_at: Date | string | null;
+  last_error_code: string | null;
   created_at: Date | string;
   updated_at: Date | string;
 };
@@ -1037,6 +1107,7 @@ function ssoFromRow(row: SsoConnectionRow): SsoConnection {
     id: row.id,
     tenantId: row.tenant_id,
     kind: row.kind,
+    provider: row.provider,
     slug: row.slug,
     displayName: row.display_name,
     status: row.status,
@@ -1045,12 +1116,20 @@ function ssoFromRow(row: SsoConnectionRow): SsoConnection {
     metadataUrl: row.metadata_url,
     entityId: row.entity_id,
     clientId: row.client_id,
-    clientSecretRef: row.client_secret_ref,
+    clientSecretConfigured: ConnectorSecretEnvelopeSchema.safeParse(row.client_secret_envelope).success,
     domains: Array.isArray(row.domains) ? row.domains : [],
+    jitProvisioning: row.jit_provisioning,
+    defaultRole: row.default_role,
     scimEnabled: row.scim_enabled,
+    lastTestedAt: row.last_tested_at ? toIso(row.last_tested_at) : null,
+    lastErrorCode: row.last_error_code,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
   });
+}
+
+function ssoSecretContext(tenantId: string, connectionId: string): string {
+  return `${tenantId}:sso:${connectionId}:client-secret`;
 }
 
 function effectivePermissionsForRole(role: string, rolePermissions: RolePermissionSet[], flags: FeatureFlag[]): OrgPermission[] {

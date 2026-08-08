@@ -1101,7 +1101,7 @@ export function ManagementDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         className={cn(
-          "max-h-[min(760px,calc(100dvh-2rem))] gap-0 overflow-hidden rounded-xl border-border p-0 shadow-[0_24px_70px_oklch(0_0_0/0.28),0_2px_10px_oklch(0_0_0/0.14)]",
+          "max-h-[min(760px,calc(100dvh-2rem))] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden rounded-xl border-border p-0 shadow-[0_24px_70px_oklch(0_0_0/0.28),0_2px_10px_oklch(0_0_0/0.14)]",
           size === "sm" && "sm:max-w-md",
           size === "md" && "sm:max-w-xl",
           size === "lg" && "sm:max-w-2xl",

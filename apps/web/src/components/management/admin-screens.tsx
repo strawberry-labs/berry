@@ -1804,7 +1804,7 @@ function PolicyScreen({
     >
       {kind === "authentication" ? (
         <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          Berry is currently in No SSO mode. Local password accounts and the protected owner recovery path are active; OIDC, SAML, JIT provisioning, Google Directory sync, and SCIM remain disabled until the deferred identity roadmap is implemented end to end.
+          Local password accounts and the protected owner path stay active. Configure Google Workspace OIDC and just-in-time member provisioning under SSO &amp; SCIM; directory sync and SCIM remain reserved for a future release.
         </p>
       ) : null}
       <AsyncState

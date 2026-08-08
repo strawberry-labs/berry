@@ -55,6 +55,11 @@ Before enabling Google Workspace, Gmail, or Calendar in the admin UI, complete
 the organization-owned OAuth, Workspace Admin, Picker, scope, and connector-key
 checklist in [`docs/google-connectors-self-hosting.md`](../docs/google-connectors-self-hosting.md).
 
+Before enabling **Continue with Google**, create a separate identity-only OAuth
+client and follow [`docs/google-workspace-sso-self-hosting.md`](../docs/google-workspace-sso-self-hosting.md).
+The SSO client ID and encrypted secret are configured in Berry's admin UI, not
+in `deploy/.env.production`; local password login remains available.
+
 For an existing installation created with the former 15-minute sandbox timeout,
 update only the non-secret TTL setting before the next deployment:
 

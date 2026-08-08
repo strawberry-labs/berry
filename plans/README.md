@@ -43,12 +43,16 @@ before Plans 001–004. It repairs the current production file lifecycle.
 |------|-------|----------|--------|------------|--------|
 | 005 | Preserve conversation files and garbage-collect deduplicated blobs safely | P1 | L | — | DONE |
 | 006 | Add native Google connectors and administrator-published MCP servers | P1 | L | 005 | DONE |
+| 007 | Add Google Workspace SSO and future enterprise identity seams | P1 | M | 006 | DONE |
 
 Plan 005 is self-contained in
 [`005-reference-safe-file-lifecycle.md`](./005-reference-safe-file-lifecycle.md).
 
 Plan 006 is self-contained in
 [`006-google-connectors-and-custom-mcp.md`](./006-google-connectors-and-custom-mcp.md).
+
+Plan 007 is self-contained in
+[`007-google-workspace-sso.md`](./007-google-workspace-sso.md).
 
 ## Dependency notes
 

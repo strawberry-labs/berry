@@ -3,6 +3,8 @@ import { useLocation, useNavigate } from "@tanstack/react-router";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 
+const GoogleSsoButton = React.lazy(() => import("./google-sso-button.tsx"));
+
 export type SignedInUser = { id: string; email: string; name?: string | null; image?: string | null };
 
 export function authDestination(input: {
@@ -90,6 +92,7 @@ function AuthScreen({ baseUrl, onAuthenticated }: { baseUrl: string; onAuthentic
 
   const setup = config?.setup;
   const settingUp = setup?.required === true;
+  const googleSso = config?.ssoProviders?.[0];
 
   const submit = React.useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -152,12 +155,17 @@ function AuthScreen({ baseUrl, onAuthenticated }: { baseUrl: string; onAuthentic
           </>
         ) : (
           <>
-            <div><h1>{creating ? "Create your account" : "Welcome back"}</h1><p>{creating ? "Join this private Berry deployment." : "Sign in to your projects and tasks."}</p></div>
+            <div><h1>{creating ? "Create your account" : "Welcome back"}</h1><p>{creating ? "Join this private Berry deployment." : "Sign in to Berry."}</p></div>
             {creating ? <label>Name<input name="name" autoComplete="name" required maxLength={80} /></label> : null}
             <label>Email<input name="email" type="email" autoComplete="email" required /></label>
             <label>Password<input name="password" type="password" autoComplete={creating ? "new-password" : "current-password"} minLength={8} maxLength={128} required /></label>
             {error ? <p className="form-error" role="alert">{error}</p> : null}
             <button className="primary-button" type="submit" disabled={busy}>{busy ? "Please wait…" : creating ? "Create account" : "Sign in"}</button>
+            {!creating && googleSso ? (
+              <React.Suspense fallback={null}>
+                <GoogleSsoButton baseUrl={baseUrl} domain={googleSso.domain} busy={busy} setBusy={setBusy} setError={setError} />
+              </React.Suspense>
+            ) : null}
           </>
         )}
         {!configLoading && !settingUp && (config?.signupEnabled || creating) ? (
@@ -181,6 +189,11 @@ function AuthBrand() {
 
 type AuthConfig = {
   signupEnabled?: boolean;
+  ssoProviders?: Array<{
+    id: "google";
+    name: string;
+    domain: string;
+  }>;
   setup?: {
     required: boolean;
     available: boolean;

@@ -108,7 +108,6 @@ import {
   ResourceAclSchema,
   RolePermissionSetSchema,
   SsoConnectionSchema,
-  SsoStartResponseSchema,
   SessionSchema,
   TaskSchema,
   TurnStateSchema,
@@ -226,7 +225,6 @@ import {
   type RolePermissionSet,
   type Session,
   type SsoConnection,
-  type SsoStartResponse,
   type Task,
   type TurnIntent,
   type TurnState,
@@ -388,15 +386,19 @@ export interface CreateOrgMemberRequest {
 
 export interface CreateSsoConnectionRequest {
   kind: "saml" | "oidc";
+  provider?: string | undefined;
   slug: string;
   displayName: string;
+  status?: "draft" | "enabled" | "disabled" | undefined;
   issuer?: string | null | undefined;
   ssoUrl?: string | null | undefined;
   metadataUrl?: string | null | undefined;
   entityId?: string | null | undefined;
   clientId?: string | null | undefined;
-  clientSecretRef?: string | null | undefined;
+  clientSecret?: string | undefined;
   domains?: string[] | undefined;
+  jitProvisioning?: boolean | undefined;
+  defaultRole?: "member" | undefined;
   scimEnabled?: boolean | undefined;
 }
 
@@ -1484,12 +1486,6 @@ export class BerryApiClient {
       method: "POST",
       body: input,
     });
-  }
-
-  async startSso(tenantId: string, connection: string, redirectUri?: string | undefined): Promise<SsoStartResponse> {
-    const params = new URLSearchParams({ connection });
-    if (redirectUri) params.set("redirectUri", redirectUri);
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/sso/start?${params.toString()}`, SsoStartResponseSchema);
   }
 
   streamEvents(sessionId: string, callbacks: {

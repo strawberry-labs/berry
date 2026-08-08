@@ -45,6 +45,7 @@ import {
   FILE_PLATFORM_MIGRATION,
   FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION,
   FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION,
+  GOOGLE_WORKSPACE_SSO_MIGRATION,
   FILE_LIBRARY_SEARCH_MIGRATION,
   MODEL_GOVERNANCE_MIGRATION,
   MODEL_GOVERNANCE_TABLES,
@@ -176,7 +177,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46]);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {
@@ -364,6 +365,19 @@ describe("cloud postgres schema", () => {
     expect(ENTERPRISE_IDENTITY_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS scim_identities");
     expect(ENTERPRISE_IDENTITY_MIGRATION).toContain("UNIQUE (tenant_id, resource_type, external_id)");
     expect(ENTERPRISE_IDENTITY_MIGRATION).not.toContain("DROP TABLE");
+  });
+
+  it("adds encrypted Google Workspace SSO configuration without replacing the provider-neutral identity tables", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 46)).toMatchObject({
+      id: 46,
+      name: "google_workspace_sso_v1",
+    });
+    expect(GOOGLE_WORKSPACE_SSO_MIGRATION).toContain("client_secret_envelope jsonb");
+    expect(GOOGLE_WORKSPACE_SSO_MIGRATION).toContain("jit_provisioning boolean NOT NULL DEFAULT true");
+    expect(GOOGLE_WORKSPACE_SSO_MIGRATION).toContain("default_role IN ('member')");
+    expect(GOOGLE_WORKSPACE_SSO_MIGRATION).toContain("provider <> 'generic'");
+    expect(GOOGLE_WORKSPACE_SSO_MIGRATION).not.toContain("client_secret text");
+    expect(GOOGLE_WORKSPACE_SSO_MIGRATION).not.toContain("DROP TABLE");
   });
 
   it("protects enterprise identity tenant-owned tables with additive RLS policies", () => {

@@ -1042,7 +1042,7 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .settings-skill-dr
 .auth-shell {
   min-height: 100vh;
   padding: 28px;
-  background: #000000;
+  background: var(--berry-main-bg);
   display: grid;
   place-items: center;
 }
@@ -1118,6 +1118,62 @@ body :is([data-slot="attachment"], [data-slot="input-group"], .settings-skill-dr
 .primary-button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--berry-text-tertiary);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  height: 1px;
+  flex: 1;
+  background: var(--berry-border);
+  content: "";
+}
+
+.sso-button {
+  min-height: 42px;
+  border: 1px solid var(--berry-border-strong);
+  border-radius: 8px;
+  background: var(--berry-control-bg);
+  color: var(--berry-text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  font-weight: 600;
+}
+
+.sso-button:hover {
+  background: var(--berry-hover);
+}
+
+.sso-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.sso-button:focus-visible {
+  outline: 2px solid var(--berry-focus);
+  outline-offset: 2px;
+}
+
+.google-mark {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+}
+
+.auth-card .auth-sso-domain {
+  margin: -13px 0 0;
+  text-align: center;
+  font-size: 11px;
 }
 
 .text-button {

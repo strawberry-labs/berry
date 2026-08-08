@@ -121,32 +121,40 @@ describe("Enterprise identity API", () => {
       .expect(403);
   });
 
-  it("stores SAML and OIDC SSO seams and returns provider redirect starts", async () => {
+  it("stores an encrypted Google Workspace SSO configuration without exposing the secret", async () => {
     app = await createApp();
 
-    const oidc = await request(app.getHttpServer())
+    const google = await request(app.getHttpServer())
       .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/sso/connections`)
       .set(authHeader())
       .send({
         kind: "oidc",
-        slug: "okta",
-        displayName: "Okta",
-        issuer: "https://idp.example.test",
-        ssoUrl: "https://idp.example.test/oauth2/v1/authorize",
-        clientId: "berry-client",
-        domains: ["example.test"],
-        scimEnabled: true,
+        provider: "google",
+        slug: "google-workspace",
+        displayName: "Google Workspace",
+        status: "enabled",
+        clientId: "berry.apps.googleusercontent.com",
+        clientSecret: "google-client-secret",
+        domains: ["AESG.COM"],
+        jitProvisioning: true,
       })
       .expect(201);
+    expect(google.body).toMatchObject({
+      provider: "google",
+      status: "enabled",
+      issuer: "https://accounts.google.com",
+      domains: ["aesg.com"],
+      clientSecretConfigured: true,
+    });
+    expect(google.body).not.toHaveProperty("clientSecret");
 
     await request(app.getHttpServer())
-      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/sso/start?connection=${oidc.body.slug}&redirectUri=https%3A%2F%2Fberry.example.test%2Fcallback`)
+      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/sso/connections`)
       .set(authHeader())
       .expect(200)
       .expect(({ body }) => {
-        expect(body.kind).toBe("oidc");
-        expect(body.redirectUrl).toContain("client_id=berry-client");
-        expect(body.redirectUrl).toContain("redirect_uri=https%3A%2F%2Fberry.example.test%2Fcallback");
+        expect(body).toHaveLength(1);
+        expect(body[0]).not.toHaveProperty("clientSecret");
       });
 
     await request(app.getHttpServer())
@@ -156,17 +164,14 @@ describe("Enterprise identity API", () => {
         kind: "saml",
         slug: "entra-saml",
         displayName: "Entra SAML",
-        ssoUrl: "https://login.example.test/saml",
+        status: "enabled",
       })
-      .expect(201);
+      .expect(400);
+
     await request(app.getHttpServer())
-      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/sso/start?connection=entra-saml`)
+      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/sso/start?connection=google-workspace`)
       .set(authHeader())
-      .expect(200)
-      .expect(({ body }) => {
-        expect(body.kind).toBe("saml");
-        expect(body.redirectUrl).toContain("SAMLRequest=");
-      });
+      .expect(404);
   });
 
   it("enforces RBAC, feature-flag role defaults, and resource ACL administration", async () => {

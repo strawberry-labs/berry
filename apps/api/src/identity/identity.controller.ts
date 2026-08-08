@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Inject, Optional, Param, Post, Put, Query, Req } from "@nestjs/common";
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Inject, Optional, Param, Post, Put, Query, Req, ServiceUnavailableException } from "@nestjs/common";
 import {
   DepartmentSchema,
   EffectivePermissionsSchema,
@@ -12,7 +12,6 @@ import {
   RolePermissionSetSchema,
   SsoConnectionKindSchema,
   SsoConnectionSchema,
-  SsoStartResponseSchema,
   type OrgPermission,
 } from "@berry/shared";
 import { z } from "zod";
@@ -41,16 +40,20 @@ const CreateDepartmentRequestSchema = z.object({
 
 const CreateSsoConnectionRequestSchema = z.object({
   kind: SsoConnectionKindSchema,
-  slug: z.string().trim().min(1),
-  displayName: z.string().trim().min(1),
-  issuer: z.string().nullable().optional(),
+  provider: z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/).default("generic"),
+  slug: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  displayName: z.string().trim().min(1).max(120),
+  status: z.enum(["draft", "enabled", "disabled"]).default("draft"),
+  issuer: z.string().url().nullable().optional(),
   ssoUrl: z.string().url().nullable().optional(),
   metadataUrl: z.string().url().nullable().optional(),
-  entityId: z.string().nullable().optional(),
-  clientId: z.string().nullable().optional(),
-  clientSecretRef: z.string().nullable().optional(),
-  domains: z.array(z.string()).optional(),
-  scimEnabled: z.boolean().optional(),
+  entityId: z.string().trim().max(1024).nullable().optional(),
+  clientId: z.string().trim().max(1024).nullable().optional(),
+  clientSecret: z.string().trim().min(1).max(8192).optional(),
+  domains: z.array(z.string().trim().toLowerCase().regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/)).max(20).default([]),
+  jitProvisioning: z.boolean().default(true),
+  defaultRole: z.literal("member").default("member"),
+  scimEnabled: z.boolean().default(false),
 }).strict();
 
 const UpdateRolePermissionsRequestSchema = z.object({
@@ -224,37 +227,43 @@ export class IdentityController {
   async createSsoConnection(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
     await this.requirePermission(request, tenantId, "sso:write");
     const parsed = parseBody(CreateSsoConnectionRequestSchema, body);
-    const connection = SsoConnectionSchema.parse(await this.repository.createSsoConnection({ tenantId, ...parsed }));
-    await this.auditAdminMutation(request, tenantId, "identity", "sso-connection-created", "sso_connection", connection.id, connection);
-    return connection;
-  }
-
-  @Get("/:tenantId/sso/start")
-  async startSso(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query("connection") connectionId: string, @Query("redirectUri") redirectUri?: string) {
-    await this.requirePermission(request, tenantId, "sso:read");
-    if (!connectionId) throw new BadRequestException("connection query parameter is required");
-    const connection = await this.repository.getSsoConnection(tenantId, connectionId);
-    if (!connection) throw new BadRequestException("Unknown SSO connection");
-    const state = `berry_${tenantId}_${Date.now()}`;
-    const base = connection.ssoUrl ?? connection.metadataUrl;
-    if (!base) throw new BadRequestException("SSO connection needs ssoUrl or metadataUrl before it can start");
-    const url = new URL(base);
-    if (connection.kind === "oidc") {
-      url.searchParams.set("response_type", "code");
-      url.searchParams.set("client_id", connection.clientId ?? connection.slug);
-      url.searchParams.set("scope", "openid email profile");
-      url.searchParams.set("state", state);
-      url.searchParams.set("redirect_uri", redirectUri ?? "https://berry.example.com/v1/orgs/sso/callback");
-    } else {
-      url.searchParams.set("SAMLRequest", "berry-saml-request-placeholder");
-      url.searchParams.set("RelayState", state);
+    const existing = (await this.repository.listSsoConnections(tenantId)).find((connection) => connection.slug === parsed.slug);
+    if (parsed.provider === "google") {
+      if (parsed.kind !== "oidc") throw new BadRequestException("Google Workspace SSO must use OIDC");
+      if (parsed.domains.length !== 1) throw new BadRequestException("Google Workspace SSO requires exactly one hosted domain");
+      if (!parsed.clientId) throw new BadRequestException("Google Workspace SSO requires a client ID");
+      if (existing?.clientId && existing.clientId !== parsed.clientId && !parsed.clientSecret) {
+        throw new BadRequestException("Enter the matching client secret when changing the Google client ID");
+      }
+      if (parsed.status === "enabled" && !parsed.clientSecret && !existing?.clientSecretConfigured) {
+        throw new BadRequestException("Enter a Google client secret before enabling SSO");
+      }
+    } else if (parsed.status === "enabled") {
+      throw new BadRequestException("Only Google Workspace OIDC can be enabled in this release");
     }
-    return SsoStartResponseSchema.parse({
-      connectionId: connection.id,
-      kind: connection.kind,
-      redirectUrl: url.toString(),
-      state,
-    });
+
+    try {
+      const connection = SsoConnectionSchema.parse(await this.repository.createSsoConnection({
+        tenantId,
+        ...parsed,
+        issuer: parsed.provider === "google" ? "https://accounts.google.com" : parsed.issuer,
+      }));
+      await this.auditAdminMutation(
+        request,
+        tenantId,
+        "identity",
+        existing ? "sso-connection-updated" : "sso-connection-created",
+        "sso_connection",
+        connection.id,
+        connection,
+      );
+      return connection;
+    } catch (cause) {
+      if (cause instanceof Error && cause.message.includes("BERRY_CONNECTOR_ENCRYPTION_KEY")) {
+        throw new ServiceUnavailableException("SSO secret encryption is not configured on this deployment");
+      }
+      throw cause;
+    }
   }
 
   private async requirePermission(request: AuthenticatedRequest, tenantId: string, permission: OrgPermission): Promise<void> {

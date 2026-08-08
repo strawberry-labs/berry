@@ -211,6 +211,7 @@ export const ssoConnections = pgTable("sso_connections", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   kind: text("kind").notNull(),
+  provider: text("provider").notNull().default("generic"),
   slug: text("slug").notNull(),
   displayName: text("display_name").notNull(),
   status: text("status").notNull().default("draft"),
@@ -220,13 +221,21 @@ export const ssoConnections = pgTable("sso_connections", {
   entityId: text("entity_id"),
   clientId: text("client_id"),
   clientSecretRef: text("client_secret_ref"),
+  clientSecretEnvelope: jsonb("client_secret_envelope").$type<JsonValue>(),
   certificate: text("certificate"),
   domains: jsonArray("domains"),
+  jitProvisioning: boolean("jit_provisioning").notNull().default(true),
+  defaultRole: text("default_role").notNull().default("member"),
   scimEnabled: boolean("scim_enabled").notNull().default(false),
+  lastTestedAt: timestamp("last_tested_at", { withTimezone: true }),
+  lastErrorCode: text("last_error_code"),
   createdAt,
   updatedAt,
 }, (table) => [
   uniqueIndex("sso_connections_tenant_slug_unique").on(table.tenantId, table.slug),
+  uniqueIndex("sso_connections_tenant_provider_enabled_unique")
+    .on(table.tenantId, table.provider)
+    .where(sql`${table.status} = 'enabled' AND ${table.provider} <> 'generic'`),
   index("sso_connections_tenant_status_idx").on(table.tenantId, table.status),
 ]);
 
@@ -2198,6 +2207,7 @@ CREATE TABLE IF NOT EXISTS sso_connections (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   kind text NOT NULL CHECK (kind IN ('saml', 'oidc')),
+  provider text NOT NULL DEFAULT 'generic',
   slug text NOT NULL,
   display_name text NOT NULL,
   status text NOT NULL DEFAULT 'draft',
@@ -2207,9 +2217,14 @@ CREATE TABLE IF NOT EXISTS sso_connections (
   entity_id text,
   client_id text,
   client_secret_ref text,
+  client_secret_envelope jsonb,
   certificate text,
   domains jsonb NOT NULL DEFAULT '[]'::jsonb,
+  jit_provisioning boolean NOT NULL DEFAULT true,
+  default_role text NOT NULL DEFAULT 'member' CHECK (default_role IN ('member')),
   scim_enabled boolean NOT NULL DEFAULT false,
+  last_tested_at timestamptz,
+  last_error_code text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, slug)
@@ -2233,6 +2248,24 @@ CREATE TABLE IF NOT EXISTS scim_identities (
 CREATE INDEX IF NOT EXISTS scim_identities_tenant_user_idx ON scim_identities (tenant_id, user_id);
 
 ${ENTERPRISE_IDENTITY_TENANT_SCOPED_TABLES.map((tableName) => tenantRlsSql(tableName)).join("\n\n")}
+`.trim();
+
+export const GOOGLE_WORKSPACE_SSO_MIGRATION = `
+ALTER TABLE sso_connections ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'generic';
+ALTER TABLE sso_connections ADD COLUMN IF NOT EXISTS client_secret_envelope jsonb;
+ALTER TABLE sso_connections ADD COLUMN IF NOT EXISTS jit_provisioning boolean NOT NULL DEFAULT true;
+ALTER TABLE sso_connections ADD COLUMN IF NOT EXISTS default_role text NOT NULL DEFAULT 'member';
+ALTER TABLE sso_connections ADD COLUMN IF NOT EXISTS last_tested_at timestamptz;
+ALTER TABLE sso_connections ADD COLUMN IF NOT EXISTS last_error_code text;
+
+DO $$ BEGIN
+  ALTER TABLE sso_connections
+    ADD CONSTRAINT sso_connections_default_role_check CHECK (default_role IN ('member'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS sso_connections_tenant_provider_enabled_unique
+  ON sso_connections (tenant_id, provider)
+  WHERE status = 'enabled' AND provider <> 'generic';
 `.trim();
 
 export const ENTERPRISE_RBAC_MIGRATION = `
@@ -4438,4 +4471,5 @@ export const cloudMigrations = [
   { id: 43, name: "file_reference_safe_lifecycle_v1", sql: FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION },
   { id: 44, name: "file_reference_safe_legacy_writer_compat_v1", sql: FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION },
   { id: 45, name: "connectors_v1", sql: CONNECTORS_MIGRATION },
+  { id: 46, name: "google_workspace_sso_v1", sql: GOOGLE_WORKSPACE_SSO_MIGRATION },
 ] as const;

@@ -238,6 +238,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
             useFactory: (database: CloudDatabaseService) => new PostgresEnterpriseIdentityRepository(
               database,
               Math.max(1, Math.floor(numberEnv(env.BERRY_AUTH_MAX_USERS, 10))),
+              env,
             ),
           },
         },

@@ -705,6 +705,7 @@ export const SsoConnectionSchema = z.object({
   id: z.string(),
   tenantId: z.string(),
   kind: SsoConnectionKindSchema,
+  provider: z.string().min(1).default("generic"),
   slug: z.string(),
   displayName: z.string(),
   status: z.enum(["draft", "enabled", "disabled"]).default("draft"),
@@ -713,21 +714,17 @@ export const SsoConnectionSchema = z.object({
   metadataUrl: z.string().url().nullable().default(null),
   entityId: z.string().nullable().default(null),
   clientId: z.string().nullable().default(null),
-  clientSecretRef: z.string().nullable().default(null),
+  clientSecretConfigured: z.boolean().default(false),
   domains: z.array(z.string()).default([]),
+  jitProvisioning: z.boolean().default(true),
+  defaultRole: z.literal("member").default("member"),
   scimEnabled: z.boolean().default(false),
+  lastTestedAt: ISODateSchema.nullable().default(null),
+  lastErrorCode: z.string().nullable().default(null),
   createdAt: ISODateSchema,
   updatedAt: ISODateSchema,
 });
 export type SsoConnection = z.infer<typeof SsoConnectionSchema>;
-
-export const SsoStartResponseSchema = z.object({
-  connectionId: z.string(),
-  kind: SsoConnectionKindSchema,
-  redirectUrl: z.string().url(),
-  state: z.string(),
-});
-export type SsoStartResponse = z.infer<typeof SsoStartResponseSchema>;
 
 export const ScimUserSchema = z.object({
   id: z.string(),
