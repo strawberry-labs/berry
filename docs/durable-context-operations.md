@@ -1,5 +1,7 @@
 # Durable context and long-running task operations
 
+File retention, tenant-scoped deduplication, and physical object cleanup are documented in [Reference-safe file lifecycle](./file-lifecycle.md).
+
 This runbook covers the web platform’s personal memory, project knowledge,
 prompt caching, structured compaction, and durable task runner. It describes
 the initial rollout and rollback path; it does not contain credentials.

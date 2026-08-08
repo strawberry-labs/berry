@@ -10,6 +10,7 @@ import {
   type SandboxSnapshotRepository,
 } from "./sandbox-continuity.js";
 import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
+import type { SqlExecutor } from "./sql-repositories.js";
 
 describe("SandboxContinuityManager", () => {
   it("pauses a terminal E2B sandbox after preserving its durable snapshot", async () => {
@@ -639,6 +640,7 @@ describe("SandboxContinuityManager", () => {
           mediaType: "image/png",
           sizeBytes: attached.byteLength,
           objectKey: "artifacts/tenants/t/reference.png",
+          objectVersionId: "reference-version-7",
         },
         {
           fileId: "00000000-0000-7000-8000-000000000091",
@@ -691,6 +693,10 @@ describe("SandboxContinuityManager", () => {
       encoding: "base64",
     });
     expect(objects.getSource).toHaveBeenCalledOnce();
+    expect(objects.getSource).toHaveBeenCalledWith(
+      "artifacts/tenants/t/reference.png",
+      "reference-version-7",
+    );
   });
 
   it("publishes completed output files into durable task storage", async () => {
@@ -787,12 +793,20 @@ describe("SandboxContinuityManager", () => {
         write: vi.fn(),
         list: vi.fn(async () => ({
           path: "/workspace/outputs",
-          entries: [{
-            path: "/workspace/outputs/summary.txt",
-            type: "file",
-            size_bytes: bytes.byteLength,
-            mtime: null,
-          }],
+          entries: [
+            {
+              path: "/workspace/outputs/first/summary.txt",
+              type: "file",
+              size_bytes: bytes.byteLength,
+              mtime: null,
+            },
+            {
+              path: "/workspace/outputs/second/summary.txt",
+              type: "file",
+              size_bytes: bytes.byteLength,
+              mtime: null,
+            },
+          ],
         })),
       },
     } as unknown as SandboxProvider;
@@ -830,14 +844,24 @@ describe("SandboxContinuityManager", () => {
           artifact: expect.objectContaining({ name: "summary.txt", mediaType: "text/plain" }),
         }),
       }),
+      expect.objectContaining({
+        output: expect.objectContaining({
+          artifact: expect.objectContaining({ name: "summary.txt", mediaType: "text/plain" }),
+        }),
+      }),
     ]);
-    expect(objects.putArtifact).toHaveBeenCalledWith(
+    expect(objects.putArtifact).toHaveBeenCalledTimes(2);
+    const objectKeys = objects.putArtifact.mock.calls.map(([key]) => key);
+    expect(new Set(objectKeys).size).toBe(2);
+    expect(objectKeys).toEqual([
       expect.stringContaining("/auto/"),
-      bytes,
-      "text/plain",
-    );
+      expect.stringContaining("/auto/"),
+    ]);
     expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({
-      sourcePath: "/workspace/outputs/summary.txt",
+      sourcePath: "/workspace/outputs/first/summary.txt",
+    }));
+    expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({
+      sourcePath: "/workspace/outputs/second/summary.txt",
     }));
   });
 
@@ -1069,6 +1093,7 @@ describe("SandboxContinuityManager", () => {
     expect(objects.streamSource).toHaveBeenCalledWith(
       "artifacts/tenants/t/files/candidate.pdf",
       350 * 1024 * 1024,
+      undefined,
     );
     const path = "/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf";
     const stagedBytes = Buffer.concat(staged.get(path)!.map((chunk) => Buffer.from(chunk)));
@@ -1139,9 +1164,11 @@ describe("SandboxContinuityManager", () => {
 
   it("round-trips snapshot keys with the S3 prefix while preserving full input-file keys", async () => {
     const keys: string[] = [];
+    const versions: Array<string | undefined> = [];
     const client = {
-      send: vi.fn(async (command: { input?: { Key?: string } }) => {
+      send: vi.fn(async (command: { input?: { Key?: string; VersionId?: string } }) => {
         keys.push(command.input?.Key ?? "");
+        versions.push(command.input?.VersionId);
         if (command.constructor.name === "GetObjectCommand") {
           return {
             ContentLength: 2,
@@ -1159,13 +1186,14 @@ describe("SandboxContinuityManager", () => {
 
     await store.put("sandbox-snapshots/tenant/run/hash.json", new Uint8Array([1, 2]));
     await expect(store.get("sandbox-snapshots/tenant/run/hash.json")).resolves.toEqual(new Uint8Array([1, 2]));
-    await expect(store.getSource("artifacts/tenants/tenant/files/input.pdf")).resolves.toEqual(new Uint8Array([1, 2]));
+    await expect(store.getSource("artifacts/tenants/tenant/files/input.pdf", "version-7")).resolves.toEqual(new Uint8Array([1, 2]));
 
     expect(keys).toEqual([
       "artifacts/sandbox-snapshots/tenant/run/hash.json",
       "artifacts/sandbox-snapshots/tenant/run/hash.json",
       "artifacts/tenants/tenant/files/input.pdf",
     ]);
+    expect(versions).toEqual([undefined, undefined, "version-7"]);
   });
 
   it("stages completed uploads and storage-ready generated files", async () => {
@@ -1205,7 +1233,104 @@ describe("SandboxContinuityManager", () => {
     )).resolves.toEqual([{ sourcePath: "/workspace/outputs/report.pdf", sha256: "abc123" }]);
     expect(query).toContain("a.session_id=$2::uuid");
     expect(query).toContain("f.metadata->>'sourcePath'");
-    expect(query).toContain("f.sha256 IS NOT NULL");
+    expect(query).toContain("COALESCE(blob.sha256, f.sha256) IS NOT NULL");
+  });
+
+  it("fails closed when a stable sandbox object key belongs to another user", async () => {
+    const execute = vi.fn(async () => undefined);
+    const query: SqlExecutor["query"] = async <T>(sql: string) => sql.includes("COALESCE(blob.sha256, f.sha256)")
+      ? [{
+          id: "00000000-0000-7000-8000-000000000020",
+          owner_user_id: "00000000-0000-7000-8000-000000000021",
+          object_key: "artifacts/tenants/00000000-0000-7000-8000-000000000002/users/00000000-0000-7000-8000-000000000006/files/00000000-0000-7000-8000-000000000020/digest/original/shared-output.png",
+          sha256: "digest",
+        }] as T[]
+      : [] as T[];
+    const executor: SqlExecutor = {
+      execute,
+      query,
+    };
+    executor.transaction = async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor);
+    const repository = new SqlSandboxSnapshotRepository(executor);
+
+    await expect(repository.persistOutput({
+      snapshot: snapshot(),
+      fileId: "00000000-0000-7000-8000-000000000020",
+      name: "shared-output.png",
+      mediaType: "image/png",
+      sizeBytes: 4,
+      sha256: "digest",
+      bucket: "berry",
+      objectKey: "artifacts/tenants/00000000-0000-7000-8000-000000000002/users/00000000-0000-7000-8000-000000000006/files/00000000-0000-7000-8000-000000000020/digest/original/shared-output.png",
+      etag: "etag",
+    })).rejects.toThrow("identity conflicts");
+    expect(execute).not.toHaveBeenCalledWith(expect.stringContaining("UPDATE files"), expect.anything());
+  });
+
+  it("fails closed when a stable file id is reused for different sandbox bytes", async () => {
+    const execute = vi.fn(async () => undefined);
+    const query: SqlExecutor["query"] = async <T>(sql: string) => sql.includes("COALESCE(blob.sha256, f.sha256)")
+      ? [{
+          id: "00000000-0000-7000-8000-000000000020",
+          owner_user_id: snapshot().userId,
+          object_key: "artifacts/tenants/00000000-0000-7000-8000-000000000002/users/00000000-0000-7000-8000-000000000006/files/00000000-0000-7000-8000-000000000020/digest/original/shared-output.png",
+          sha256: "different-digest",
+        }] as T[]
+      : [] as T[];
+    const executor: SqlExecutor = { execute, query };
+    executor.transaction = async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor);
+    const repository = new SqlSandboxSnapshotRepository(executor);
+
+    await expect(repository.persistOutput({
+      snapshot: snapshot(),
+      fileId: "00000000-0000-7000-8000-000000000020",
+      name: "shared-output.png",
+      mediaType: "image/png",
+      sizeBytes: 4,
+      sha256: "digest",
+      bucket: "berry",
+      objectKey: "artifacts/tenants/00000000-0000-7000-8000-000000000002/users/00000000-0000-7000-8000-000000000006/files/00000000-0000-7000-8000-000000000020/digest/original/shared-output.png",
+      etag: "etag",
+    })).rejects.toThrow("identity conflicts");
+    expect(execute).not.toHaveBeenCalledWith(expect.stringContaining("INSERT INTO file_associations"), expect.anything());
+  });
+
+  it("idempotently reuses only an exact stable sandbox identity", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000020";
+    const objectKey = "artifacts/tenants/00000000-0000-7000-8000-000000000002/users/00000000-0000-7000-8000-000000000006/files/00000000-0000-7000-8000-000000000020/digest/original/shared-output.png";
+    const execute = vi.fn(async () => undefined);
+    const query: SqlExecutor["query"] = async <T>(sql: string) => {
+      if (sql.includes("COALESCE(blob.sha256, f.sha256)")) {
+        return [{
+          id: fileId,
+          owner_user_id: snapshot().userId,
+          object_key: objectKey,
+          resolved_bucket: "berry",
+          resolved_size_bytes: 4,
+          sha256: "digest",
+        }] as T[];
+      }
+      if (sql.includes("SELECT id FROM files")) return [{ id: fileId }] as T[];
+      return [] as T[];
+    };
+    const executor: SqlExecutor = { execute, query };
+    executor.transaction = async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor);
+    const repository = new SqlSandboxSnapshotRepository(executor);
+
+    await expect(repository.persistOutput({
+      snapshot: snapshot(),
+      fileId,
+      name: "shared-output.png",
+      mediaType: "image/png",
+      sizeBytes: 4,
+      sha256: "digest",
+      bucket: "berry",
+      objectKey,
+      etag: "etag",
+    })).resolves.toMatchObject({ fileId, objectKey });
+    expect(execute).not.toHaveBeenCalledWith(expect.stringContaining("INSERT INTO file_blobs"), expect.anything());
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO file_library_entries"), expect.anything());
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO file_associations"), expect.anything());
   });
 
   it("detects newer sandbox owners and uses a transaction-scoped lifecycle lock", async () => {

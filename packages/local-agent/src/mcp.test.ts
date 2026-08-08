@@ -107,6 +107,28 @@ describe("McpToolSource", () => {
     await source.close();
   });
 
+  it("disables an approved tool when its live definition changed after review", async () => {
+    const logs: string[] = [];
+    const source = new McpToolSource({
+      servers: [stdioServer({
+        allowedTools: ["echo"],
+        cachedTools: [{
+          name: "echo",
+          description: "Administrator-reviewed echo",
+          inputSchema: { type: "object", properties: { message: { type: "integer" } }, required: ["message"] },
+        }],
+      })],
+      log: (level, message) => logs.push(`${level}:${message}`),
+    });
+    const reviewedTool = source.listTools()[0]!;
+
+    await expect(reviewedTool.execute("call_changed", { message: 42 } as never, undefined, undefined))
+      .rejects.toThrow("definition changed after administrator review");
+    expect(source.listTools()).toEqual([]);
+    expect(logs).toContainEqual(expect.stringContaining("disabling it until republished"));
+    await source.close();
+  });
+
   it("defers a large catalog behind tool_search and reveals matching tools", async () => {
     const source = new McpToolSource({
       servers: [stdioServer({
@@ -143,18 +165,39 @@ describe("McpToolSource", () => {
         inputSchema: { type: "object" },
         annotations: { readOnlyHint: true, openWorldHint: true },
       }],
+      approvalRequiredTools: ["write"],
     }]), { BERRYCRAWL_API_KEY: "secret-from-worker" });
     const source = new McpToolSource({ servers });
 
     expect(servers[0]).toMatchObject({
       credential: "secret-from-worker",
       credentialKey: "env:BERRYCRAWL_API_KEY",
+      approvalRequiredTools: ["write"],
     });
     expect(source.approvalHints("mcp__BerryCrawl__search")).toEqual({
       readOnly: true,
+      requiresApproval: true,
       destructive: false,
       idempotent: false,
       openWorld: true,
     });
+  });
+
+  it("trusts read-only annotations only for an explicitly Berry-owned adapter", () => {
+    const untrusted = new McpToolSource({ servers: [stdioServer({ name: "Remote", cachedTools: [{ name: "read", description: null, inputSchema: {}, annotations: { readOnlyHint: true } }] })] });
+    const native = new McpToolSource({ servers: [stdioServer({ name: "Native", trustReadOnlyAnnotations: true, cachedTools: [{ name: "read", description: null, inputSchema: {}, annotations: { readOnlyHint: true } }] })] });
+    expect(untrusted.approvalHints("mcp__Remote__read")).not.toHaveProperty("trustedReadOnly");
+    expect(untrusted.approvalHints("mcp__Remote__read")).toMatchObject({ requiresApproval: true });
+    expect(native.approvalHints("mcp__Native__read")).toMatchObject({ readOnly: true, trustedReadOnly: true });
+  });
+
+  it("reports immutable approval requirements from Berry-owned server policy", () => {
+    const source = new McpToolSource({ servers: [stdioServer({
+      name: "Native",
+      approvalRequiredTools: ["write"],
+      cachedTools: [{ name: "write", description: null, inputSchema: {} }],
+    })] });
+
+    expect(source.approvalHints("mcp__Native__write")).toMatchObject({ requiresApproval: true });
   });
 });

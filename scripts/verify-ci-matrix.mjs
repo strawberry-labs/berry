@@ -43,6 +43,14 @@ assert(
   ci.includes("node apps/worker/scripts/verify-production-runtime.mjs"),
   "Production integration CI must exercise admission, outbox, worker recovery, SSE, RLS, billing, and uploads",
 );
+assert(
+  ci.includes("node apps/worker/scripts/verify-file-lifecycle-migration.mjs"),
+  "Production integration CI must execute the file lifecycle migration and backfill test",
+);
+assert(
+  ci.includes("playwright test --config playwright.file-lifecycle.config.ts"),
+  "Production integration CI must exercise the real PostgreSQL and object-storage file lifecycle in a browser",
+);
 assert(packageJson.scripts.check.includes("pnpm check:ci"), "pnpm check must include CI verification");
 assert(packageJson.scripts.check.includes("pnpm check:deploy"), "pnpm check must include deployment-impact tests");
 assert(packageJson.scripts.check.includes("pnpm check:docker"), "pnpm check must include Docker context verification");

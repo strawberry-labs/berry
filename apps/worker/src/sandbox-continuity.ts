@@ -75,6 +75,7 @@ interface SandboxInputFile {
   mediaType: string;
   sizeBytes: number;
   objectKey: string;
+  objectVersionId?: string | null;
 }
 
 interface SandboxOutputFile {
@@ -105,6 +106,7 @@ export interface SandboxSnapshotRepository {
     bucket: string;
     objectKey: string;
     etag: string | null;
+    objectVersionId?: string | null;
     origin?: "sandbox_output" | "image_generation";
     sourcePath?: string;
   }): Promise<SandboxOutputFile>;
@@ -136,10 +138,11 @@ export interface SandboxSnapshotObjectStore {
     bucket: string;
     key: string;
     etag: string | null;
+    objectVersionId?: string | null;
   }>;
   get(key: string): Promise<Uint8Array>;
-  getSource(key: string): Promise<Uint8Array>;
-  streamSource?(key: string, maxBytes: number): AsyncIterable<Uint8Array>;
+  getSource(key: string, versionId?: string | null): Promise<Uint8Array>;
+  streamSource?(key: string, maxBytes: number, versionId?: string | null): AsyncIterable<Uint8Array>;
 }
 
 export class SandboxContinuityManager implements DurableTurnToolExecutor {
@@ -211,7 +214,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       for (const file of attachedImages) {
         if (parts.length >= MAX_MODEL_IMAGES) break;
         if (file.sizeBytes > MAX_MODEL_IMAGE_BYTES) continue;
-        const bytes = await this.objects.getSource(file.objectKey);
+        const bytes = await this.objects.getSource(file.objectKey, file.objectVersionId);
         if (bytes.byteLength !== file.sizeBytes) {
           throw new Error(`Input image ${file.name} is incomplete`);
         }
@@ -397,7 +400,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!this.objects) throw new Error("Artifact object storage is not configured");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const stored = await this.objects.putArtifact(
-        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/original/${title}.png`,
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${title}.png`,
         bytes,
         "image/png",
       );
@@ -411,6 +414,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         bucket: stored.bucket,
         objectKey: stored.key,
         etag: stored.etag,
+        ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
         origin: "image_generation",
         sourcePath: path,
       });
@@ -454,7 +458,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         ?? "application/octet-stream";
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const stored = await this.objects.putArtifact(
-        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/original/${name}`,
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${name}`,
         bytes,
         mediaType,
       );
@@ -468,6 +472,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         bucket: stored.bucket,
         objectKey: stored.key,
         etag: stored.etag,
+        ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
         sourcePath: path,
       });
       return {
@@ -557,13 +562,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (previouslyPublished.has(`${path}\0${sha256}`)) continue;
       const fileId = randomUUID();
       const stored = await this.objects.putArtifact(
-        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${sha256}/${name}`,
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${fileId}/${sha256}/${name}`,
         bytes,
         mediaType,
       );
       const output = await this.repository.persistOutput({
         snapshot, fileId, name, mediaType, sizeBytes: bytes.byteLength, sha256,
-        bucket: stored.bucket, objectKey: stored.key, etag: stored.etag, sourcePath: path,
+        bucket: stored.bucket, objectKey: stored.key, etag: stored.etag,
+        ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
+        sourcePath: path,
       });
       results.push({
         output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
@@ -813,8 +820,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
       await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name);
       const source = this.objects.streamSource
-        ? this.objects.streamSource(file.objectKey, maxInputBytes)
-        : singleChunk(await this.objects.getSource(file.objectKey));
+        ? this.objects.streamSource(file.objectKey, maxInputBytes, file.objectVersionId)
+        : singleChunk(await this.objects.getSource(file.objectKey, file.objectVersionId));
       let written = 0;
       for await (const sourceChunk of source) {
         for (let offset = 0; offset < sourceChunk.byteLength; offset += 256 * 1024) {
@@ -1011,7 +1018,10 @@ LEFT JOIN LATERAL (
   async inputFiles(tenantId: string, runId: string, scope: "turn" | "session" = "session"): Promise<readonly SandboxInputFile[]> {
     const rows = await this.executor.query<SandboxInputFileRow>(
       `
-SELECT DISTINCT f.id AS file_id,f.display_name,f.media_type,f.size_bytes,f.object_key
+SELECT DISTINCT f.id AS file_id,f.display_name,f.media_type,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.size_bytes ELSE f.size_bytes END AS size_bytes,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS object_key,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END AS object_version_id
 FROM turn_runs r
 JOIN file_associations a
   ON a.tenant_id=r.tenant_id AND a.session_id=r.session_id AND a.role='input'
@@ -1019,6 +1029,8 @@ JOIN file_associations a
   AND ($3::text='session' OR a.message_id=r.request_message_id)
 JOIN files f
   ON f.tenant_id=a.tenant_id AND f.id=a.file_id
+LEFT JOIN file_blobs blob
+  ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
   AND f.status IN ('processing', 'available', 'failed')
   AND f.deleted_at IS NULL
@@ -1043,6 +1055,7 @@ ORDER BY f.id ASC
       mediaType: row.media_type,
       sizeBytes: Number(row.size_bytes),
       objectKey: row.object_key,
+      objectVersionId: row.object_version_id,
     }));
   }
 
@@ -1056,48 +1069,82 @@ ORDER BY f.id ASC
     bucket: string;
     objectKey: string;
     etag: string | null;
+    objectVersionId?: string | null;
     origin?: "sandbox_output" | "image_generation";
     sourcePath?: string;
   }): Promise<SandboxOutputFile> {
     const run = async (executor: SqlExecutor): Promise<SandboxOutputFile> => {
-      const rows = await executor.query<{ id: string }>(
-        `
-INSERT INTO files (
-  id,tenant_id,owner_user_id,original_name,display_name,media_type,size_bytes,
-  sha256,bucket,object_key,etag,origin,status,metadata
-) VALUES (
-  $1::uuid,$2::uuid,$3::uuid,$4,$4,$5,$6,$7,$8,$9,$10,
-  $11,'available',$12::jsonb
-)
-ON CONFLICT (tenant_id,object_key) DO UPDATE SET
-  owner_user_id=excluded.owner_user_id,
-  display_name=excluded.display_name,
-  media_type=excluded.media_type,
-  size_bytes=excluded.size_bytes,
-  sha256=excluded.sha256,
-  etag=excluded.etag,
-  status='available',
-  metadata=excluded.metadata,
-  updated_at=now()
-RETURNING id
-        `.trim(),
-        [
-          input.fileId,
-          input.snapshot.tenantId,
-          input.snapshot.userId,
-          input.name,
-          input.mediaType,
-          input.sizeBytes,
-          input.sha256,
-          input.bucket,
-          input.objectKey,
-          input.etag,
-          input.origin ?? "sandbox_output",
-          JSON.stringify({ source: "durable-sandbox", runId: input.snapshot.id, ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}) }),
-        ],
-      );
-      const fileId = rows[0]?.id;
+      const ownerNamespace = `tenants/${input.snapshot.tenantId}/users/${input.snapshot.userId}/files/`;
+      if ((!input.objectKey.startsWith(ownerNamespace) && !input.objectKey.includes(`/${ownerNamespace}`))
+        || input.objectKey.includes("\\")
+        || input.objectKey.split("/").includes("..")) {
+        throw new Error("Sandbox artifact key is outside the tenant user namespace");
+      }
+      const existing = await executor.query<{
+        id: string;
+        owner_user_id: string | null;
+        object_key: string;
+        resolved_bucket: string;
+        resolved_size_bytes: string | number;
+        sha256: string | null;
+      }>(`
+        SELECT f.id, f.owner_user_id, f.object_key,
+          COALESCE(blob.bucket, f.bucket) AS resolved_bucket,
+          COALESCE(blob.size_bytes, f.size_bytes) AS resolved_size_bytes,
+          COALESCE(blob.sha256, f.sha256) AS sha256
+        FROM files f
+        LEFT JOIN file_blobs blob ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
+        WHERE f.tenant_id = $1::uuid AND (f.id = $2::uuid OR f.object_key = $3)
+        ORDER BY f.id
+        FOR UPDATE OF f
+      `, [input.snapshot.tenantId, input.fileId, input.objectKey]);
+      if (existing.some((file) => file.id !== input.fileId
+        || file.owner_user_id !== input.snapshot.userId
+        || file.object_key !== input.objectKey
+        || file.resolved_bucket !== input.bucket
+        || Number(file.resolved_size_bytes) !== input.sizeBytes
+        || file.sha256 !== input.sha256)) {
+        throw new Error("Sandbox artifact identity conflicts with an existing file");
+      }
+      let fileId = existing[0]?.id;
+      if (!fileId) {
+        const blobId = randomUUID();
+        await executor.execute(`
+          INSERT INTO file_blobs (
+            id,tenant_id,bucket,object_key,size_bytes,etag,object_version_id,
+            verification_status,metadata
+          ) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,'unverified',$8::jsonb)
+        `, [blobId, input.snapshot.tenantId, input.bucket, input.objectKey, input.sizeBytes, input.etag, input.objectVersionId ?? null, JSON.stringify({ expectedSha256: input.sha256, source: "durable-sandbox" })]);
+        const rows = await executor.query<{ id: string }>(`
+          INSERT INTO files (
+            id,tenant_id,owner_user_id,blob_id,original_name,display_name,media_type,size_bytes,
+            sha256,bucket,object_key,etag,object_version_id,origin,status,metadata
+          ) VALUES (
+            $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$5,$6,$7,$8,$9,$10,$11,
+            $12,$13,'available',$14::jsonb
+          )
+          RETURNING id
+        `, [input.fileId, input.snapshot.tenantId, input.snapshot.userId, blobId, input.name, input.mediaType, input.sizeBytes, input.sha256, input.bucket, input.objectKey, input.etag, input.objectVersionId ?? null, input.origin ?? "sandbox_output", JSON.stringify({ source: "durable-sandbox", runId: input.snapshot.id, ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}) })]);
+        fileId = rows[0]?.id;
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+          VALUES ($1::uuid,'file.verify-blob',$2,$3,$4::jsonb)
+          ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        `, [input.snapshot.tenantId, blobId, `file.verify-blob:${blobId}`, JSON.stringify({ tenantId: input.snapshot.tenantId, blobId })]);
+      }
       if (!fileId) throw new Error("Unable to register the sandbox artifact");
+      await executor.execute(`
+        INSERT INTO file_library_entries (tenant_id,user_id,file_id)
+        VALUES ($1::uuid,$2::uuid,$3::uuid)
+        ON CONFLICT (tenant_id,user_id,file_id) DO UPDATE
+        SET deleted_at=NULL,updated_at=now()
+      `, [input.snapshot.tenantId, input.snapshot.userId, fileId]);
+      const locked = await executor.query<{ id: string }>(`
+        SELECT id FROM files
+        WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL
+        FOR UPDATE
+      `, [input.snapshot.tenantId, fileId]);
+      if (!locked[0]) throw new Error("Sandbox artifact became unavailable");
       await executor.execute(
         `
 INSERT INTO file_associations (
@@ -1128,12 +1175,15 @@ ON CONFLICT DO NOTHING
   async publishedOutputs(tenantId: string, sessionId: string): Promise<readonly PublishedSandboxOutput[]> {
     const rows = await this.executor.query<{ source_path: string; sha256: string }>(
       `
-SELECT DISTINCT f.metadata->>'sourcePath' AS source_path,f.sha256
+SELECT DISTINCT f.metadata->>'sourcePath' AS source_path,
+  COALESCE(blob.sha256, f.sha256) AS sha256
 FROM file_associations a
 JOIN files f ON f.tenant_id=a.tenant_id AND f.id=a.file_id
+LEFT JOIN file_blobs blob ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
 WHERE a.tenant_id=$1::uuid AND a.session_id=$2::uuid AND a.role='output'
   AND f.status='available' AND f.deleted_at IS NULL
-  AND f.metadata->>'sourcePath' IS NOT NULL AND f.sha256 IS NOT NULL
+  AND f.metadata->>'sourcePath' IS NOT NULL
+  AND COALESCE(blob.sha256, f.sha256) IS NOT NULL
       `.trim(),
       [tenantId, sessionId],
     );
@@ -1267,6 +1317,7 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     bucket: string;
     key: string;
     etag: string | null;
+    objectVersionId?: string | null;
   }> {
     const objectKey = key.startsWith(`${this.prefix}/`) ? key : `${this.prefix}/${key}`;
     const result = await this.client.send(new PutObjectCommand({
@@ -1279,6 +1330,7 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
       bucket: this.bucket,
       key: objectKey,
       etag: result.ETag?.replaceAll("\"", "") ?? null,
+      objectVersionId: result.VersionId ?? null,
     };
   }
 
@@ -1286,14 +1338,14 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     return this.readObject(this.snapshotKey(key), MAX_SNAPSHOT_ARCHIVE_BYTES, "Sandbox snapshot");
   }
 
-  async getSource(key: string): Promise<Uint8Array> {
-    return this.readObject(key, this.maxSourceBytes, "Input file");
+  async getSource(key: string, versionId?: string | null): Promise<Uint8Array> {
+    return this.readObject(key, this.maxSourceBytes, "Input file", versionId);
   }
 
-  private async readObject(key: string, maxBytes: number, label: string): Promise<Uint8Array> {
+  private async readObject(key: string, maxBytes: number, label: string, versionId?: string | null): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let total = 0;
-    for await (const chunk of this.streamKey(key, maxBytes, label)) {
+    for await (const chunk of this.streamKey(key, maxBytes, label, versionId)) {
       chunks.push(chunk);
       total += chunk.byteLength;
     }
@@ -1306,14 +1358,15 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     return result;
   }
 
-  async *streamSource(key: string, maxBytes: number): AsyncIterable<Uint8Array> {
-    yield* this.streamKey(key, maxBytes, "Input file");
+  async *streamSource(key: string, maxBytes: number, versionId?: string | null): AsyncIterable<Uint8Array> {
+    yield* this.streamKey(key, maxBytes, "Input file", versionId);
   }
 
-  private async *streamKey(key: string, maxBytes: number, label: string): AsyncIterable<Uint8Array> {
+  private async *streamKey(key: string, maxBytes: number, label: string, versionId?: string | null): AsyncIterable<Uint8Array> {
     const result = await this.client.send(new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
+      ...(versionId ? { VersionId: versionId } : {}),
     }));
     if (!result.Body) throw new Error(`${label} object has no body`);
     if (result.ContentLength !== undefined && result.ContentLength > maxBytes) {
@@ -1837,4 +1890,5 @@ interface SandboxInputFileRow {
   media_type: string;
   size_bytes: number | string;
   object_key: string;
+  object_version_id: string | null;
 }

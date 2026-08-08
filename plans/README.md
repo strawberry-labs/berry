@@ -34,6 +34,22 @@ enterprise-ready application surface.
 Status values: `TODO`, `IN PROGRESS`, `DONE`, `BLOCKED (<reason>)`, or
 `REJECTED (<reason>)`.
 
+## Independent reliability stream
+
+This plan is independent of the Berry Apps sequence above and may be executed
+before Plans 001–004. It repairs the current production file lifecycle.
+
+| Plan | Title | Priority | Effort | Depends on | Status |
+|------|-------|----------|--------|------------|--------|
+| 005 | Preserve conversation files and garbage-collect deduplicated blobs safely | P1 | L | — | DONE |
+| 006 | Add native Google connectors and administrator-published MCP servers | P1 | L | 005 | DONE |
+
+Plan 005 is self-contained in
+[`005-reference-safe-file-lifecycle.md`](./005-reference-safe-file-lifecycle.md).
+
+Plan 006 is self-contained in
+[`006-google-connectors-and-custom-mcp.md`](./006-google-connectors-and-custom-mcp.md).
+
 ## Dependency notes
 
 - Plan 002 requires Plan 001 because app execution must use the extracted
@@ -136,4 +152,3 @@ or a visual workflow builder.
 - **Trust `allowed-tools` from Agent Skills frontmatter as enforcement**:
   rejected. Berry parses the field but does not currently enforce it. The
   Berry manifest's allowlist must be applied to the actual runtime tool set.
-

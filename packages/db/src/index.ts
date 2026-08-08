@@ -3,6 +3,7 @@ import {
   bigint,
   boolean,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -56,6 +57,14 @@ export const fileStatusEnum = pgEnum("file_status", ["initiated", "uploading", "
 export const fileAssociationRoleEnum = pgEnum("file_association_role", ["input", "output", "reference"]);
 export const fileDerivativeKindEnum = pgEnum("file_derivative_kind", ["thumbnail", "pdf_preview", "text_extract", "sheet_data", "slide_image"]);
 export const fileProcessingStatusEnum = pgEnum("file_processing_status", ["queued", "processing", "available", "failed"]);
+export const fileBlobVerificationStatusEnum = pgEnum("file_blob_verification_status", [
+  "unverified",
+  "verifying",
+  "verified",
+  "failed",
+  "pending_delete",
+  "deleted",
+]);
 
 const createdAt = timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
 const updatedAt = timestamp("updated_at", { withTimezone: true }).notNull().defaultNow();
@@ -450,10 +459,38 @@ export const messageParts = pgTable("message_parts", {
   index("message_parts_tenant_message_idx").on(table.tenantId, table.messageId),
 ]);
 
+export const fileBlobs = pgTable("file_blobs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  bucket: text("bucket").notNull(),
+  objectKey: text("object_key").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull().default(0),
+  sha256: text("sha256"),
+  etag: text("etag"),
+  objectVersionId: text("object_version_id"),
+  verificationStatus: fileBlobVerificationStatusEnum("verification_status").notNull().default("unverified"),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }),
+  deleteAfter: timestamp("delete_after", { withTimezone: true }),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  metadata: jsonObject("metadata"),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("file_blobs_tenant_id_id_unique").on(table.tenantId, table.id),
+  uniqueIndex("file_blobs_physical_location_unique").on(table.bucket, table.objectKey),
+  uniqueIndex("file_blobs_tenant_location_unique").on(table.tenantId, table.bucket, table.objectKey),
+  uniqueIndex("file_blobs_tenant_verified_hash_unique")
+    .on(table.tenantId, table.sha256, table.sizeBytes)
+    .where(sql`${table.sha256} IS NOT NULL AND ${table.verificationStatus} = 'verified' AND ${table.deletedAt} IS NULL`),
+  index("file_blobs_tenant_status_created_idx").on(table.tenantId, table.verificationStatus, table.createdAt),
+  index("file_blobs_pending_delete_idx").on(table.tenantId, table.deleteAfter),
+]);
+
 export const files = pgTable("files", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   ownerUserId: uuid("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+  blobId: uuid("blob_id").references(() => fileBlobs.id, { onDelete: "restrict" }),
   originalName: text("original_name").notNull(),
   displayName: text("display_name").notNull(),
   mediaType: text("media_type").notNull().default("application/octet-stream"),
@@ -471,9 +508,28 @@ export const files = pgTable("files", {
   updatedAt,
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
 }, (table) => [
+  foreignKey({
+    columns: [table.tenantId, table.blobId],
+    foreignColumns: [fileBlobs.tenantId, fileBlobs.id],
+    name: "files_tenant_blob_id_fkey",
+  }).onDelete("restrict"),
   uniqueIndex("files_tenant_object_key_unique").on(table.tenantId, table.objectKey),
   index("files_tenant_owner_created_idx").on(table.tenantId, table.ownerUserId, table.createdAt),
   index("files_tenant_status_created_idx").on(table.tenantId, table.status, table.createdAt),
+]);
+
+export const fileLibraryEntries = pgTable("file_library_entries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  fileId: uuid("file_id").notNull().references(() => files.id, { onDelete: "cascade" }),
+  createdAt,
+  updatedAt,
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("file_library_entries_tenant_user_file_unique").on(table.tenantId, table.userId, table.fileId),
+  index("file_library_entries_tenant_user_active_idx").on(table.tenantId, table.userId, table.deletedAt, table.createdAt),
+  index("file_library_entries_tenant_file_active_idx").on(table.tenantId, table.fileId, table.deletedAt),
 ]);
 
 export const fileAssociations = pgTable("file_associations", {
@@ -1428,7 +1484,9 @@ export const cloudSchema = {
   sessions,
   messages,
   messageParts,
+  fileBlobs,
   files,
+  fileLibraryEntries,
   fileAssociations,
   fileUploads,
   fileDerivatives,
@@ -1484,7 +1542,9 @@ export const CLOUD_SCHEMA_TABLES = [
   "sessions",
   "messages",
   "message_parts",
+  "file_blobs",
   "files",
+  "file_library_entries",
   "file_associations",
   "file_uploads",
   "file_derivatives",
@@ -1536,7 +1596,9 @@ export const TENANT_SCOPED_TABLES = [
   "sessions",
   "messages",
   "message_parts",
+  "file_blobs",
   "files",
+  "file_library_entries",
   "file_associations",
   "file_uploads",
   "file_derivatives",
@@ -3924,6 +3986,354 @@ CREATE UNIQUE INDEX IF NOT EXISTS turn_runs_tenant_request_unique
   ON turn_runs (tenant_id, request_id);
 `.trim();
 
+export const FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION = `
+DO $$ BEGIN
+  CREATE TYPE file_blob_verification_status AS ENUM ('unverified','verifying','verified','failed','pending_delete','deleted');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE TABLE IF NOT EXISTS file_blobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  bucket text NOT NULL,
+  object_key text NOT NULL,
+  size_bytes bigint NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
+  sha256 text,
+  etag text,
+  object_version_id text,
+  verification_status file_blob_verification_status NOT NULL DEFAULT 'unverified',
+  verified_at timestamptz,
+  delete_after timestamptz,
+  deleted_at timestamptz,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, bucket, object_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS file_blobs_tenant_verified_hash_unique
+  ON file_blobs (tenant_id, sha256, size_bytes)
+  WHERE sha256 IS NOT NULL AND verification_status = 'verified' AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS file_blobs_tenant_status_created_idx
+  ON file_blobs (tenant_id, verification_status, created_at);
+CREATE INDEX IF NOT EXISTS file_blobs_pending_delete_idx
+  ON file_blobs (tenant_id, delete_after)
+  WHERE verification_status = 'pending_delete' AND deleted_at IS NULL;
+
+ALTER TABLE files ADD COLUMN IF NOT EXISTS blob_id uuid;
+DO $$ BEGIN
+  ALTER TABLE files
+    ADD CONSTRAINT files_blob_id_fkey
+    FOREIGN KEY (blob_id) REFERENCES file_blobs(id) ON DELETE RESTRICT;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS files_tenant_blob_idx ON files (tenant_id, blob_id);
+
+CREATE TABLE IF NOT EXISTS file_library_entries (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  file_id uuid NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz,
+  UNIQUE (tenant_id, user_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS file_library_entries_tenant_user_active_idx
+  ON file_library_entries (tenant_id, user_id, created_at DESC)
+  WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS file_library_entries_tenant_file_active_idx
+  ON file_library_entries (tenant_id, file_id)
+  WHERE deleted_at IS NULL;
+
+DO $berry_file_backfill$
+DECLARE
+  target_tenant record;
+BEGIN
+  FOR target_tenant IN SELECT id FROM tenants ORDER BY id LOOP
+    PERFORM berry_set_tenant_id(target_tenant.id);
+
+    INSERT INTO file_blobs (
+      tenant_id, bucket, object_key, size_bytes, sha256, etag,
+      object_version_id, verification_status, metadata, created_at, updated_at
+    )
+    SELECT f.tenant_id, f.bucket, f.object_key, f.size_bytes, NULL, f.etag,
+           f.object_version_id, 'unverified',
+           jsonb_build_object('backfilledFromFileId', f.id::text),
+           f.created_at, f.updated_at
+    FROM files f
+    WHERE f.tenant_id = target_tenant.id AND f.blob_id IS NULL
+    ON CONFLICT (tenant_id, bucket, object_key) DO NOTHING;
+
+    UPDATE files f
+    SET blob_id = blob.id, updated_at = f.updated_at
+    FROM file_blobs blob
+    WHERE f.tenant_id = target_tenant.id AND f.blob_id IS NULL
+      AND blob.tenant_id = f.tenant_id
+      AND blob.bucket = f.bucket
+      AND blob.object_key = f.object_key;
+
+    INSERT INTO file_library_entries (tenant_id, user_id, file_id, created_at, updated_at)
+    SELECT f.tenant_id, f.owner_user_id, f.id, f.created_at, f.updated_at
+    FROM files f
+    WHERE f.tenant_id = target_tenant.id
+      AND f.owner_user_id IS NOT NULL AND f.deleted_at IS NULL
+      AND f.status IN ('scanning', 'processing', 'available')
+    ON CONFLICT (tenant_id, user_id, file_id) DO NOTHING;
+  END LOOP;
+  PERFORM set_config('berry.tenant_id', '', true);
+END;
+$berry_file_backfill$;
+
+ALTER TABLE file_blobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE file_blobs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS file_blobs_tenant_isolation ON file_blobs;
+CREATE POLICY file_blobs_tenant_isolation ON file_blobs
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+
+ALTER TABLE file_library_entries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE file_library_entries FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS file_library_entries_tenant_isolation ON file_library_entries;
+CREATE POLICY file_library_entries_tenant_isolation ON file_library_entries
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
+export const FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION = `
+CREATE OR REPLACE FUNCTION berry_file_blob_before_insert_compat()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.blob_id IS NULL THEN
+    INSERT INTO file_blobs (
+      tenant_id, bucket, object_key, size_bytes, etag, object_version_id,
+      verification_status, metadata, created_at, updated_at
+    ) VALUES (
+      NEW.tenant_id, NEW.bucket, NEW.object_key, NEW.size_bytes, NEW.etag,
+      NEW.object_version_id, 'unverified',
+      jsonb_build_object('legacyWriterFileId', NEW.id::text),
+      NEW.created_at, NEW.updated_at
+    )
+    RETURNING id INTO NEW.blob_id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS files_blob_before_insert_compat ON files;
+CREATE TRIGGER files_blob_before_insert_compat
+BEFORE INSERT ON files
+FOR EACH ROW
+EXECUTE FUNCTION berry_file_blob_before_insert_compat();
+
+CREATE OR REPLACE FUNCTION berry_file_library_after_insert_compat()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.owner_user_id IS NOT NULL
+    AND NEW.deleted_at IS NULL
+    AND NEW.status IN ('scanning', 'processing', 'available') THEN
+    INSERT INTO file_library_entries (
+      tenant_id, user_id, file_id, created_at, updated_at
+    ) VALUES (
+      NEW.tenant_id, NEW.owner_user_id, NEW.id, NEW.created_at, NEW.updated_at
+    )
+    ON CONFLICT (tenant_id, user_id, file_id) DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS files_library_after_insert_compat ON files;
+CREATE TRIGGER files_library_after_insert_compat
+AFTER INSERT ON files
+FOR EACH ROW
+EXECUTE FUNCTION berry_file_library_after_insert_compat();
+
+CREATE UNIQUE INDEX IF NOT EXISTS file_blobs_tenant_id_id_unique
+  ON file_blobs (tenant_id, id);
+DO $$ BEGIN
+  ALTER TABLE files
+    ADD CONSTRAINT files_tenant_blob_id_fkey
+    FOREIGN KEY (tenant_id, blob_id)
+    REFERENCES file_blobs(tenant_id, id) ON DELETE RESTRICT;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $berry_file_catchup$
+DECLARE
+  target_tenant record;
+BEGIN
+  FOR target_tenant IN SELECT id FROM tenants ORDER BY id LOOP
+    PERFORM berry_set_tenant_id(target_tenant.id);
+
+    INSERT INTO file_blobs (
+      tenant_id, bucket, object_key, size_bytes, sha256, etag,
+      object_version_id, verification_status, metadata, created_at, updated_at
+    )
+    SELECT f.tenant_id, f.bucket, f.object_key, f.size_bytes, NULL, f.etag,
+           f.object_version_id, 'unverified',
+           jsonb_build_object('legacyWriterCatchupFileId', f.id::text),
+           f.created_at, f.updated_at
+    FROM files f
+    WHERE f.tenant_id = target_tenant.id AND f.blob_id IS NULL
+    ON CONFLICT (tenant_id, bucket, object_key) DO NOTHING;
+
+    UPDATE files f
+    SET blob_id = blob.id, updated_at = f.updated_at
+    FROM file_blobs blob
+    WHERE f.tenant_id = target_tenant.id AND f.blob_id IS NULL
+      AND blob.tenant_id = f.tenant_id
+      AND blob.bucket = f.bucket
+      AND blob.object_key = f.object_key;
+
+    INSERT INTO file_library_entries (tenant_id, user_id, file_id, created_at, updated_at)
+    SELECT f.tenant_id, f.owner_user_id, f.id, f.created_at, f.updated_at
+    FROM files f
+    WHERE f.tenant_id = target_tenant.id
+      AND f.owner_user_id IS NOT NULL AND f.deleted_at IS NULL
+      AND f.status IN ('scanning', 'processing', 'available')
+    ON CONFLICT (tenant_id, user_id, file_id) DO NOTHING;
+  END LOOP;
+  PERFORM set_config('berry.tenant_id', '', true);
+END;
+$berry_file_catchup$;
+
+-- Object storage addresses are global within a bucket, even though logical
+-- rows are tenant-scoped. Refuse the migration instead of allowing two
+-- tenants to claim the same physical bytes: otherwise either tenant's later
+-- garbage collection could destroy the other tenant's data.
+DO $berry_file_location_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM file_blobs
+    GROUP BY bucket, object_key
+    HAVING count(DISTINCT tenant_id) > 1
+  ) THEN
+    RAISE EXCEPTION 'Cross-tenant file blob location conflict detected; migration stopped without deleting data';
+  END IF;
+END;
+$berry_file_location_guard$;
+CREATE UNIQUE INDEX IF NOT EXISTS file_blobs_physical_location_unique
+  ON file_blobs (bucket, object_key);
+`.trim();
+
+export const CONNECTORS_MIGRATION = `
+CREATE TABLE IF NOT EXISTS connector_provider_credentials (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  provider text NOT NULL,
+  client_id text NOT NULL,
+  client_secret_envelope jsonb NOT NULL,
+  hosted_domain text,
+  picker_api_key_envelope jsonb,
+  picker_project_number text,
+  status text NOT NULL DEFAULT 'configured' CHECK (status IN ('configured','verified','error')),
+  last_tested_at timestamptz,
+  last_error_code text,
+  configured_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS organization_connectors (
+  id text NOT NULL,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  connector_key text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('app','custom_mcp')),
+  provider text NOT NULL,
+  name text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  enabled boolean NOT NULL DEFAULT false,
+  max_access_level text NOT NULL DEFAULT 'read' CHECK (max_access_level IN ('read','full')),
+  workspace_access_mode text CHECK (workspace_access_mode IS NULL OR workspace_access_mode IN ('selected_files','search_workspace')),
+  auth_strategy text NOT NULL DEFAULT 'personal' CHECK (auth_strategy IN ('personal','shared')),
+  transport text CHECK (transport IS NULL OR transport IN ('http-sse','streamable-http')),
+  endpoint_url text,
+  auth_type text NOT NULL DEFAULT 'oauth' CHECK (auth_type IN ('none','bearer','oauth')),
+  shared_credential_envelope jsonb,
+  publication_status text NOT NULL DEFAULT 'draft' CHECK (publication_status IN ('draft','published')),
+  config jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, connector_key)
+);
+CREATE INDEX IF NOT EXISTS organization_connectors_tenant_kind_enabled_idx
+  ON organization_connectors (tenant_id, kind, enabled, name);
+
+CREATE TABLE IF NOT EXISTS connector_connections (
+  id text NOT NULL,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  connector_id text NOT NULL,
+  user_id text,
+  access_level text NOT NULL DEFAULT 'read' CHECK (access_level IN ('read','full')),
+  credential_envelope jsonb,
+  account_email text,
+  account_subject text,
+  granted_scopes text[] NOT NULL DEFAULT ARRAY[]::text[],
+  status text NOT NULL DEFAULT 'connected' CHECK (status IN ('connected','reauth_required','revoked','error')),
+  expires_at timestamptz,
+  last_error_code text,
+  last_successful_use_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, connector_id)
+    REFERENCES organization_connectors(tenant_id, id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS connector_connections_personal_unique
+  ON connector_connections (tenant_id, connector_id, user_id) WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS connector_connections_shared_unique
+  ON connector_connections (tenant_id, connector_id) WHERE user_id IS NULL;
+CREATE INDEX IF NOT EXISTS connector_connections_user_status_idx
+  ON connector_connections (tenant_id, user_id, status);
+
+CREATE TABLE IF NOT EXISTS connector_oauth_states (
+  state_digest text NOT NULL,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  connector_id text NOT NULL,
+  user_id text NOT NULL,
+  access_level text NOT NULL CHECK (access_level IN ('read','full')),
+  requested_scopes text[] NOT NULL DEFAULT ARRAY[]::text[],
+  code_verifier_envelope jsonb NOT NULL,
+  redirect_after text NOT NULL DEFAULT '/settings/connectors',
+  expires_at timestamptz NOT NULL,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, state_digest),
+  FOREIGN KEY (tenant_id, connector_id)
+    REFERENCES organization_connectors(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS connector_oauth_states_expiry_idx
+  ON connector_oauth_states (tenant_id, expires_at);
+
+ALTER TABLE connector_provider_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE connector_provider_credentials FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS connector_provider_credentials_tenant_isolation ON connector_provider_credentials;
+CREATE POLICY connector_provider_credentials_tenant_isolation ON connector_provider_credentials
+  USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
+
+ALTER TABLE organization_connectors ENABLE ROW LEVEL SECURITY;
+ALTER TABLE organization_connectors FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS organization_connectors_tenant_isolation ON organization_connectors;
+CREATE POLICY organization_connectors_tenant_isolation ON organization_connectors
+  USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
+
+ALTER TABLE connector_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE connector_connections FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS connector_connections_tenant_isolation ON connector_connections;
+CREATE POLICY connector_connections_tenant_isolation ON connector_connections
+  USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
+
+ALTER TABLE connector_oauth_states ENABLE ROW LEVEL SECURITY;
+ALTER TABLE connector_oauth_states FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS connector_oauth_states_tenant_isolation ON connector_oauth_states;
+CREATE POLICY connector_oauth_states_tenant_isolation ON connector_oauth_states
+  USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -4025,4 +4435,7 @@ export const cloudMigrations = [
   { id: 40, name: "allowance_base_hierarchy_v1", sql: ALLOWANCE_BASE_HIERARCHY_MIGRATION },
   { id: 41, name: "terminal_sandbox_cleanup_index_v1", sql: TERMINAL_SANDBOX_CLEANUP_INDEX_MIGRATION },
   { id: 42, name: "turn_run_admission_idempotency_v1", sql: TURN_RUN_ADMISSION_IDEMPOTENCY_MIGRATION },
+  { id: 43, name: "file_reference_safe_lifecycle_v1", sql: FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION },
+  { id: 44, name: "file_reference_safe_legacy_writer_compat_v1", sql: FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION },
+  { id: 45, name: "connectors_v1", sql: CONNECTORS_MIGRATION },
 ] as const;

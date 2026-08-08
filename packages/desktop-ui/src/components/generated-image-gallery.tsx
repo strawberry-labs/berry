@@ -10,6 +10,7 @@ import {
   ArrowUpRight01Icon,
   CirclePlus,
   FileDown,
+  FileImage,
   MoreHorizontal,
   Pencil,
   X,
@@ -81,6 +82,7 @@ export function GeneratedImageGallery({
   }), [conversationParts]);
   const [activeIndex, setActiveIndex] = React.useState(0);
   const [lightboxId, setLightboxId] = React.useState<string | null>(null);
+  const [failedThumbnails, setFailedThumbnails] = React.useState<Record<string, string>>({});
   const active = images[Math.min(activeIndex, images.length - 1)];
   if (!active) return null;
 
@@ -104,7 +106,16 @@ export function GeneratedImageGallery({
                 aria-current={index === activeIndex ? "true" : undefined}
                 onClick={() => setActiveIndex(index)}
               >
-                <img src={image.src} alt="" className={styles.thumbnail} />
+                {failedThumbnails[image.id] === image.src ? (
+                  <span className={styles.thumbnailUnavailable}><FileImage aria-hidden="true" /></span>
+                ) : (
+                  <img
+                    src={image.src}
+                    alt=""
+                    className={styles.thumbnail}
+                    onError={() => setFailedThumbnails((current) => ({ ...current, [image.id]: image.src }))}
+                  />
+                )}
               </button>
             ))}
           </div>
@@ -130,6 +141,16 @@ function GeneratedImageCard({
   onOpen: () => void;
   onEdit?: (() => void) | undefined;
 }) {
+  const [failedSource, setFailedSource] = React.useState<string | null>(null);
+  const failed = failedSource === image.src;
+  React.useEffect(() => setFailedSource(null), [image.id, image.src]);
+  if (failed) {
+    return (
+      <div className={styles.card} style={{ aspectRatio: ratioCss(image.aspectRatio) }}>
+        <UnavailableImage image={image} />
+      </div>
+    );
+  }
   return (
     <div
       className={styles.card}
@@ -143,6 +164,7 @@ function GeneratedImageCard({
           availablePercentComplete={1}
           dimensions={{ width: image.width ?? 1024, height: image.height ?? 1024 }}
           isTransparent={image.transparentBackground}
+          onError={() => setFailedSource(image.src)}
         />
       </button>
       <div className={styles.scrim} aria-hidden />
@@ -245,6 +267,14 @@ export function GeneratedImageLightbox({
   const [annotations, setAnnotations] = React.useState<ImageEditAnnotation[]>([]);
   const [activePin, setActivePin] = React.useState<number | null>(null);
   const [submitting, setSubmitting] = React.useState(false);
+  const [failedSources, setFailedSources] = React.useState<Record<string, string>>({});
+  const activeFailed = Boolean(active && failedSources[active.id] === active.src);
+
+  React.useEffect(() => {
+    setFailedSources((current) => Object.fromEntries(
+      Object.entries(current).filter(([id, source]) => images.some((image) => image.id === id && image.src === source)),
+    ));
+  }, [images]);
 
   React.useEffect(() => {
     if (!activeId) return;
@@ -298,43 +328,47 @@ export function GeneratedImageLightbox({
             <Button variant="ghost" size="icon" aria-label="Close fullscreen view"><X /></Button>
           </DialogClose>
           <DialogHeader className={styles.lightboxTitle}>
-            <DialogTitle>{commentMode ? "Add comments" : active.title}</DialogTitle>
+            <DialogTitle>{activeFailed ? active.title : commentMode ? "Add comments" : active.title}</DialogTitle>
             <DialogDescription className="sr-only">Generated image viewer and editor</DialogDescription>
           </DialogHeader>
           <div className={styles.headerActions}>
-            {commentMode ? (
-              <Button variant="ghost" size="sm" onClick={() => setCommentMode(false)}>Cancel</Button>
-            ) : (
+            {activeFailed ? null : (
               <>
-                {onEdit ? <Button variant="ghost" size="sm" onClick={() => setCommentMode(true)}><CirclePlus /> Comment</Button> : null}
-                {onRegenerate ? (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="sm"><ArrowUpRight01Icon /> Aspect ratio</Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      {ASPECT_RATIOS.map((ratio) => (
-                        <DropdownMenuItem key={ratio.value} onClick={() => {
-                          void Promise.resolve(onRegenerate(active, ratio.value)).then(() => onActiveIdChange(null));
-                        }}>
-                          <span className={styles.ratioGlyph} style={{ aspectRatio: ratioCss(ratio.value) }} />
-                          {ratio.label}
-                        </DropdownMenuItem>
-                      ))}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                ) : null}
-                <span className={styles.headerDivider} />
-                <Button asChild variant="default" size="sm">
-                  <a href={active.downloadUrl ?? active.src} download={downloadName(active)}><FileDown /> Save</a>
-                </Button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" aria-label="Show more"><MoreHorizontal /></Button></DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuItem>Like this image</DropdownMenuItem>
-                    <DropdownMenuItem>Dislike this image</DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
+                {commentMode ? (
+                  <Button variant="ghost" size="sm" onClick={() => setCommentMode(false)}>Cancel</Button>
+                ) : (
+                  <>
+                    {onEdit ? <Button variant="ghost" size="sm" onClick={() => setCommentMode(true)}><CirclePlus /> Comment</Button> : null}
+                    {onRegenerate ? (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="sm"><ArrowUpRight01Icon /> Aspect ratio</Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {ASPECT_RATIOS.map((ratio) => (
+                            <DropdownMenuItem key={ratio.value} onClick={() => {
+                              void Promise.resolve(onRegenerate(active, ratio.value)).then(() => onActiveIdChange(null));
+                            }}>
+                              <span className={styles.ratioGlyph} style={{ aspectRatio: ratioCss(ratio.value) }} />
+                              {ratio.label}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    ) : null}
+                    <span className={styles.headerDivider} />
+                    <Button asChild variant="default" size="sm">
+                      <a href={active.downloadUrl ?? active.src} download={downloadName(active)}><FileDown /> Save</a>
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" aria-label="Show more"><MoreHorizontal /></Button></DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem>Like this image</DropdownMenuItem>
+                        <DropdownMenuItem>Dislike this image</DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </>
+                )}
               </>
             )}
           </div>
@@ -351,32 +385,41 @@ export function GeneratedImageLightbox({
                   aria-current={image.id === active.id ? "true" : undefined}
                   onClick={() => onActiveIdChange(image.id)}
                 >
-                  <img src={image.src} alt="" />
+                  {failedSources[image.id] === image.src ? (
+                    <span className={styles.thumbnailUnavailable}><FileImage aria-hidden="true" /></span>
+                  ) : (
+                    <img src={image.src} alt="" onError={() => setFailedSources((current) => ({ ...current, [image.id]: image.src }))} />
+                  )}
                 </button>
               ))}
             </aside>
           ) : <span />}
           <main className={styles.lightboxCenter}>
-            <div
-              className={cn(styles.lightboxStage, commentMode && styles.commentStage)}
-              data-transparent={active.transparentBackground ? "true" : undefined}
-            >
+            {activeFailed ? (
+              <div className={styles.lightboxUnavailable} style={{ aspectRatio: ratioCss(active.aspectRatio) }}>
+                <UnavailableImage image={active} />
+              </div>
+            ) : (
               <div
-                className={styles.lightboxImageFrame}
-                onClick={(event) => {
-                  if (!commentMode) return;
-                  const bounds = event.currentTarget.getBoundingClientRect();
-                  const next: ImageEditAnnotation = {
-                    index: annotations.length + 1,
-                    xPct: ((event.clientX - bounds.left) / bounds.width) * 100,
-                    yPct: ((event.clientY - bounds.top) / bounds.height) * 100,
-                    text: "",
-                  };
-                  setAnnotations((current) => [...current, next]);
-                  setActivePin(next.index);
-                }}
+                className={cn(styles.lightboxStage, commentMode && styles.commentStage)}
+                data-transparent={active.transparentBackground ? "true" : undefined}
               >
-                <img src={active.src} alt={active.title} />
+                <div
+                  className={styles.lightboxImageFrame}
+                  onClick={(event) => {
+                    if (!commentMode) return;
+                    const bounds = event.currentTarget.getBoundingClientRect();
+                    const next: ImageEditAnnotation = {
+                      index: annotations.length + 1,
+                      xPct: ((event.clientX - bounds.left) / bounds.width) * 100,
+                      yPct: ((event.clientY - bounds.top) / bounds.height) * 100,
+                      text: "",
+                    };
+                    setAnnotations((current) => [...current, next]);
+                    setActivePin(next.index);
+                  }}
+                >
+                <img src={active.src} alt={active.title} onError={() => setFailedSources((current) => ({ ...current, [active.id]: active.src }))} />
                 {annotations.map((annotation) => (
                   <button
                     type="button"
@@ -413,10 +456,11 @@ export function GeneratedImageLightbox({
                     }}><X /></button>
                   </div>
                 ) : null}
+                </div>
               </div>
-            </div>
-            {commentMode ? <p className={styles.helper}>Tap on the image to add comments. Pins guide a semantic edit, not a pixel-perfect mask.</p> : null}
-            {onEdit ? (
+            )}
+            {commentMode && !activeFailed ? <p className={styles.helper}>Tap on the image to add comments. Pins guide a semantic edit, not a pixel-perfect mask.</p> : null}
+            {onEdit && !activeFailed ? (
               <footer className={styles.editComposer}>
                 <textarea
                   rows={1}
@@ -445,6 +489,17 @@ export function GeneratedImageLightbox({
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function UnavailableImage({ image }: { image: GeneratedImageView }) {
+  return (
+    <div className={styles.unavailable} role="status" aria-label={`${image.title}: Image unavailable`}>
+      <FileImage aria-hidden="true" />
+      <strong>{image.title}</strong>
+      <span>Image unavailable</span>
+      <p>This image was deleted or you no longer have access.</p>
+    </div>
   );
 }
 

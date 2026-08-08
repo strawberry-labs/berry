@@ -47,8 +47,8 @@ export async function runMaintenanceCli(argv: string[], env: NodeJS.ProcessEnv =
     }
     return;
   }
-  if (command !== "backfill" && command !== "cleanup") {
-    throw new Error("Usage: maintenance <backfill|cleanup|status|cancel> --tenant <uuid> [--run <uuid>] [--batch <10-500>]");
+  if (command !== "backfill" && command !== "verify_file_blobs" && command !== "cleanup") {
+    throw new Error("Usage: maintenance <backfill|verify_file_blobs|cleanup|status|cancel> --tenant <uuid> [--run <uuid>] [--batch <10-500>]");
   }
   const runId = UuidSchema.parse(args.run ?? randomUUID());
   const batchSize = numberArg(args.batch, 100);
@@ -56,12 +56,13 @@ export async function runMaintenanceCli(argv: string[], env: NodeJS.ProcessEnv =
   const redisUrl = env.BERRY_REDIS_URL ?? env.REDIS_URL;
   const queue = new BullMqBerryQueueClient(createBerryQueue(redisUrl ? { redisUrl } : {}));
   try {
-    if (command === "backfill") {
+    if (command === "backfill" || command === "verify_file_blobs") {
       const payload = ContextBackfillJobPayloadSchema.parse({
         tenantId,
         runId,
         generation: 0,
         batchSize,
+        ...(command === "verify_file_blobs" ? { phase: "verify_file_blobs" } : {}),
         ...(requestedByUserId ? { requestedByUserId } : {}),
       });
       await queue.enqueue("context.backfill", payload);

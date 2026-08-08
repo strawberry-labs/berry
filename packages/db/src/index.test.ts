@@ -29,6 +29,7 @@ import {
   CAPABILITY_PERMISSION_DEFAULTS_MIGRATION,
   CLOUD_INITIAL_MIGRATION,
   CONVERSATION_KIND_AND_GENERAL_WORKSPACES_MIGRATION,
+  CONNECTORS_MIGRATION,
   CLOUD_SCHEMA_SQL,
   CLOUD_SCHEMA_TABLES,
   DURABLE_CONTEXT_MIGRATION,
@@ -42,6 +43,8 @@ import {
   ENTERPRISE_RBAC_TABLES,
   ENTERPRISE_RBAC_TENANT_SCOPED_TABLES,
   FILE_PLATFORM_MIGRATION,
+  FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION,
+  FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION,
   FILE_LIBRARY_SEARCH_MIGRATION,
   MODEL_GOVERNANCE_MIGRATION,
   MODEL_GOVERNANCE_TABLES,
@@ -173,7 +176,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {
@@ -210,6 +213,67 @@ describe("cloud postgres schema", () => {
     expect(FILE_PLATFORM_MIGRATION).toContain("file_associations_context_unique");
     expect(FILE_PLATFORM_MIGRATION).toContain("file_uploads_tenant_status_expiry_idx");
     expect(FILE_PLATFORM_MIGRATION).not.toContain("DROP TABLE");
+  });
+
+  it("adds reference-safe blobs and per-user Library memberships without destructive migration SQL", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 43)).toMatchObject({ id: 43, name: "file_reference_safe_lifecycle_v1" });
+    for (const table of ["file_blobs", "file_library_entries"]) {
+      expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+      expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+      expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`);
+      expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain(`CREATE POLICY ${table}_tenant_isolation ON ${table}`);
+      expect(CLOUD_SCHEMA_TABLES).toContain(table);
+      expect(TENANT_SCOPED_TABLES).toContain(table);
+    }
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain("FOREIGN KEY (blob_id) REFERENCES file_blobs(id) ON DELETE RESTRICT");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain("WHERE sha256 IS NOT NULL AND verification_status = 'verified' AND deleted_at IS NULL");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain("SELECT f.tenant_id, f.bucket, f.object_key, f.size_bytes, NULL");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain("FOR target_tenant IN SELECT id FROM tenants ORDER BY id LOOP");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain("PERFORM berry_set_tenant_id(target_tenant.id)");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION.indexOf("$berry_file_backfill$")).toBeLessThan(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION.indexOf("ALTER TABLE file_blobs ENABLE ROW LEVEL SECURITY"));
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).toContain("f.owner_user_id IS NOT NULL AND f.deleted_at IS NULL");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).not.toMatch(/DROP\s+(TABLE|COLUMN)/i);
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).not.toContain("file.delete-object");
+    expect(FILE_REFERENCE_SAFE_LIFECYCLE_MIGRATION).not.toContain("DELETE FROM files");
+  });
+
+  it("keeps legacy writers reference-safe after the one-time lifecycle backfill", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 44)).toMatchObject({ id: 44, name: "file_reference_safe_legacy_writer_compat_v1" });
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("BEFORE INSERT ON files");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("RETURNING id INTO NEW.blob_id");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("'unverified'");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("AFTER INSERT ON files");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("NEW.owner_user_id IS NOT NULL");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("NEW.deleted_at IS NULL");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("NEW.status IN ('scanning', 'processing', 'available')");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("FOREIGN KEY (tenant_id, blob_id)");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("REFERENCES file_blobs(tenant_id, id) ON DELETE RESTRICT");
+    const blobTrigger = FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION.split("CREATE OR REPLACE FUNCTION berry_file_library_after_insert_compat")[0]!;
+    expect(blobTrigger).not.toContain("ON CONFLICT");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("legacyWriterCatchupFileId");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("$berry_file_catchup$");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("PERFORM berry_set_tenant_id(target_tenant.id)");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("AND f.blob_id IS NULL");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("f.owner_user_id IS NOT NULL AND f.deleted_at IS NULL");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("f.status IN ('scanning', 'processing', 'available')");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("Cross-tenant file blob location conflict detected");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("file_blobs_physical_location_unique");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).toContain("ON file_blobs (bucket, object_key)");
+    expect(FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION).not.toMatch(/DROP\s+(TABLE|COLUMN)/i);
+  });
+
+  it("stores tenant-scoped connector policy and encrypted credentials behind RLS", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 45)).toMatchObject({ id: 45, name: "connectors_v1" });
+    for (const table of ["connector_provider_credentials", "organization_connectors", "connector_connections", "connector_oauth_states"]) {
+      expect(CONNECTORS_MIGRATION).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+      expect(CONNECTORS_MIGRATION).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+      expect(CONNECTORS_MIGRATION).toContain(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`);
+      expect(CONNECTORS_MIGRATION).toContain(`CREATE POLICY ${table}_tenant_isolation ON ${table}`);
+    }
+    expect(CONNECTORS_MIGRATION).toContain("client_secret_envelope jsonb NOT NULL");
+    expect(CONNECTORS_MIGRATION).toContain("credential_envelope jsonb");
+    expect(CONNECTORS_MIGRATION).toContain("PRIMARY KEY (tenant_id, state_digest)");
+    expect(CONNECTORS_MIGRATION).not.toMatch(/client_secret\s+text|refresh_token\s+text|access_token\s+text/);
   });
 
   it("removes obsolete server-side queued follow-up storage", () => {

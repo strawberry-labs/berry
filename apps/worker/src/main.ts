@@ -32,6 +32,7 @@ import {
 import { SqlMaintenanceRunner } from "./maintenance.ts";
 import { createDurableTurnToolsFromEnv } from "./mcp-tools.ts";
 import { S3FileObjectDeleter, SqlFileDeletionReceiptStore } from "./file-deletion.ts";
+import { SqlFileBlobProcessor } from "./file-blobs.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const durableConfig = durableContextConfigFromEnv(env);
@@ -104,6 +105,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   );
   const durableTools = createDurableTurnToolsFromEnv(env, memoryTools);
   const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
+  const fileBlobs = SqlFileBlobProcessor.fromEnv(env, executor);
   const worker = createBerryWorker({
     titles: new SqlTaskTitleRepository(executor),
     usage: new SqlUsageRollupRepository(executor),
@@ -141,6 +143,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     snapshotter: sandboxContinuity,
     maintenance: new SqlMaintenanceRunner(executor),
     ...(fileDeleter ? { fileDeleter } : {}),
+    ...(fileBlobs ? { fileBlobs } : {}),
     tenantContext: {
       run: (tenantId, callback) => executor.runWithTenant(tenantId, callback),
     },

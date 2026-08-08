@@ -13,12 +13,27 @@ export {
 } from "./guard.ts";
 export {
   McpToolSource,
+  discoverRemoteMcpTools,
   mcpServerSpecsFromJson,
   validatedRemoteMcpUrl,
   type McpServerHealth,
   type McpServerSpec,
+  type McpCachedTool,
   type McpToolSourceOptions,
 } from "./mcp.ts";
+export {
+  createPublicRemoteFetch,
+  isPublicRemoteAddress,
+  resolvePublicRemoteUrl,
+  validatedPublicRemoteUrl,
+} from "./remote-fetch.ts";
+export {
+  completeRemoteMcpOAuth,
+  refreshRemoteMcpOAuth,
+  startRemoteMcpOAuth,
+  type McpOAuthStartResult,
+  type McpOAuthState,
+} from "./mcp-oauth.ts";
 export { HookRunner, loadHookConfiguration, parseHookConfig, type HookPayload, type LoadedHooks } from "./hooks.ts";
 export { SandboxEnforcer, assertShellWritePolicy, resolveSandboxHelper, seatbeltProfile, type SandboxEnforcerOptions } from "./sandbox.ts";
 export {

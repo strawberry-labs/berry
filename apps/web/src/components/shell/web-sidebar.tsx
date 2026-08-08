@@ -37,12 +37,13 @@ import { WebSettingsNavigation } from "./web-settings-navigation";
 
 const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-dialog").then((module) => ({ default: module.ProjectUploadDialog })));
 
-export type SettingsTab = "general" | "account" | "personalization" | "mcp" | "skills" | "usage" | "archived";
+export type SettingsTab = "general" | "account" | "personalization" | "connectors" | "mcp" | "skills" | "usage" | "archived";
 
 export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
   { id: "account", label: "Account" },
   { id: "personalization", label: "Personalization" },
+  { id: "connectors", label: "Connectors" },
   { id: "skills", label: "Skills" },
   { id: "mcp", label: "MCP servers" },
   { id: "usage", label: "Usage" },

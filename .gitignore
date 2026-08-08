@@ -54,3 +54,9 @@ artifacts/
 # Local generated review reports and PDF QA intermediates
 output/pdf/
 tmp/pdfs/
+
+# Local generated deliverables, previews, and office lock files
+/outputs/
+/tmp/
+/Ops Team (AI Access).xlsx
+~$*

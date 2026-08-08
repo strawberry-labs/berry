@@ -11,6 +11,9 @@ const PersonalSkillsScreen = React.lazy(async () => ({
 const PersonalMcpScreen = React.lazy(async () => ({
   default: (await import("./personal-capability-screens")).PersonalMcpScreen,
 }));
+const PersonalConnectorsScreen = React.lazy(async () => ({
+  default: (await import("./connectors-screen")).PersonalConnectorsScreen,
+}));
 const PersonalizationSettingsScreen = React.lazy(async () => ({
   default: (await import("./personalization-settings-screen")).PersonalizationSettingsScreen,
 }));
@@ -25,6 +28,7 @@ export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps 
   if (tab === "general") return <GeneralSettingsScreen />;
   if (tab === "account") return <AccountSettingsScreen {...props} />;
   if (tab === "personalization") return <PersonalizationSettingsScreen {...props} />;
+  if (tab === "connectors") return <PersonalConnectorsScreen {...props} />;
   if (tab === "skills") return <PersonalSkillsScreen {...props} />;
   if (tab === "mcp") return <PersonalMcpScreen {...props} />;
   if (tab === "usage") return <PersonalUsageScreen {...props} />;

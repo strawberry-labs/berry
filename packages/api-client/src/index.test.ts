@@ -16,7 +16,7 @@ describe("BerryApiClient", () => {
     );
   });
 
-  it("deletes a library file through the authenticated file API", async () => {
+  it("removes a library membership through the authenticated file API", async () => {
     const fetchImpl = vi.fn(async () => json({ ok: true }));
     const client = new BerryApiClient({
       baseUrl: "https://api.berry.test",
@@ -24,7 +24,7 @@ describe("BerryApiClient", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
 
-    await expect(client.deleteFile("file/with spaces")).resolves.toEqual({ ok: true });
+    await expect(client.removeFileFromLibrary("file/with spaces")).resolves.toEqual({ ok: true });
     expect(fetchImpl).toHaveBeenCalledWith(
       "https://api.berry.test/v1/files/file%2Fwith%20spaces",
       expect.objectContaining({ method: "DELETE", credentials: "include" }),

@@ -36,6 +36,25 @@ describe("ToolGuard", () => {
     ).toBe("approval-required");
   });
 
+  it("does not let full-access mode or saved grants waive connector approval", () => {
+    const grants = new GrantStore();
+    const request = {
+      permissionMode: "full-access" as const,
+      risk: "mcp" as const,
+      toolName: "mcp__Google__gmail_send_message",
+      summary: "Send an email",
+      payload: { to: ["person@example.com"] },
+      requiresApproval: true,
+    };
+    grants.allowForSession(request);
+
+    expect(new ToolGuard(grants).decide(request)).toMatchObject({
+      type: "approval-required",
+      approvalKind: "mcp",
+      reason: expect.stringContaining("always requires approval"),
+    });
+  });
+
   it("routes explicit danger escalation through approval before grants", () => {
     const request = {
       permissionMode: "auto-edit" as const,

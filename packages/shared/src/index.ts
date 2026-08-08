@@ -2675,6 +2675,76 @@ export const PersonalMcpServerSchema = z.object({
 });
 export type PersonalMcpServer = z.infer<typeof PersonalMcpServerSchema>;
 
+export const ConnectorAccessLevelSchema = z.enum(["read", "full"]);
+export type ConnectorAccessLevel = z.infer<typeof ConnectorAccessLevelSchema>;
+export const ConnectorAuthStrategySchema = z.enum(["personal", "shared"]);
+export type ConnectorAuthStrategy = z.infer<typeof ConnectorAuthStrategySchema>;
+export const ConnectorAuthTypeSchema = z.enum(["none", "bearer", "oauth"]);
+export type ConnectorAuthType = z.infer<typeof ConnectorAuthTypeSchema>;
+export const ConnectorKindSchema = z.enum(["app", "custom_mcp"]);
+export type ConnectorKind = z.infer<typeof ConnectorKindSchema>;
+export const ConnectorWorkspaceAccessModeSchema = z.enum(["selected_files", "search_workspace"]);
+export type ConnectorWorkspaceAccessMode = z.infer<typeof ConnectorWorkspaceAccessModeSchema>;
+export const ConnectorConnectionStatusSchema = z.enum(["not_connected", "connected", "reauth_required", "revoked", "error"]);
+export type ConnectorConnectionStatus = z.infer<typeof ConnectorConnectionStatusSchema>;
+export const ConnectorPublicationStatusSchema = z.enum(["draft", "published"]);
+export type ConnectorPublicationStatus = z.infer<typeof ConnectorPublicationStatusSchema>;
+export const ConnectorSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  kind: ConnectorKindSchema,
+  provider: z.string(),
+  name: z.string(),
+  description: z.string(),
+  enabled: z.boolean(),
+  maxAccessLevel: ConnectorAccessLevelSchema,
+  workspaceAccessMode: ConnectorWorkspaceAccessModeSchema.nullable(),
+  authStrategy: ConnectorAuthStrategySchema,
+  authType: ConnectorAuthTypeSchema,
+  publicationStatus: ConnectorPublicationStatusSchema,
+  transport: z.enum(["http-sse", "streamable-http"]).nullable(),
+  url: z.string().url().nullable(),
+  websiteUrl: z.string().url().nullable().optional(),
+  privacyPolicyUrl: z.string().url().nullable().optional(),
+  configured: z.boolean(),
+  credentialConfigured: z.boolean(),
+  connectionStatus: ConnectorConnectionStatusSchema,
+  connectedAccessLevel: ConnectorAccessLevelSchema.nullable(),
+  accountEmail: z.string().nullable(),
+  grantedScopes: z.array(z.string()),
+  services: z.array(z.string()),
+  tools: z.array(z.string()),
+  limitations: z.array(z.string()).default([]),
+  createdAt: ISODateSchema.nullable(),
+  updatedAt: ISODateSchema.nullable(),
+});
+export type Connector = z.infer<typeof ConnectorSchema>;
+export const GoogleConnectorConfigurationSchema = z.object({
+  configured: z.boolean(),
+  clientId: z.string().nullable(),
+  hostedDomain: z.string().nullable(),
+  pickerConfigured: z.boolean(),
+  pickerProjectNumber: z.string().nullable(),
+  status: z.enum(["not_configured", "configured", "verified", "error"]),
+  lastTestedAt: ISODateSchema.nullable(),
+  callbackUrl: z.string().url(),
+});
+export type GoogleConnectorConfiguration = z.infer<typeof GoogleConnectorConfigurationSchema>;
+export const GooglePickerSessionSchema = z.object({
+  apiKey: z.string().min(1),
+  appId: z.string().regex(/^\d+$/),
+  accessToken: z.string().min(1),
+  origin: z.string().url(),
+});
+export type GooglePickerSession = z.infer<typeof GooglePickerSessionSchema>;
+export const ConnectorOAuthStartSchema = z.object({
+  connectorId: z.string(),
+  state: z.string(),
+  authorizationUrl: z.string().url(),
+  expiresAt: ISODateSchema,
+});
+export type ConnectorOAuthStart = z.infer<typeof ConnectorOAuthStartSchema>;
+
 export const OrgCapabilityAssignmentSchema = z.enum(["required", "default-on", "available", "blocked"]);
 export type OrgCapabilityAssignment = z.infer<typeof OrgCapabilityAssignmentSchema>;
 export const OrgCapabilitySchema = z.object({

@@ -34,6 +34,7 @@ import { OrganizationProfileScreen } from "./organization-profile-screen";
 import { ReportsAlertsScreen } from "./reports-alerts-screen";
 import { AnalyticsScreen } from "./analytics-screen";
 import { AdminCatalogScreen } from "./admin-catalog-screens";
+import { AdminConnectorsScreen } from "./connectors-screen";
 import {
   adminAreaForTab,
   resolvedAdminTab,
@@ -77,6 +78,7 @@ export function AdminScreen({
       return <PolicyScreen kind="authentication" {...p} />;
     if (resolvedTab === "data-governance") return <PolicyScreen kind="data" {...p} />;
     if (resolvedTab === "service-accounts") return <ServiceAccounts {...p} />;
+    if (resolvedTab === "connectors") return <AdminConnectorsScreen {...p} />;
     if (resolvedTab === "profile-domains") return <OrganizationProfileScreen {...p} />;
     return <AdminCatalogScreen tab={resolvedTab} {...p} />;
   })();
@@ -2068,6 +2070,7 @@ function permissionFor(tab: string) {
       "resource-access": "acl:read",
       providers: "models:read",
       models: "models:read",
+      connectors: "mcp:read",
       "feature-access": "feature_flags:read",
       "execution-network": "guardrails:read",
       analytics: "usage:read",
@@ -2091,6 +2094,7 @@ function titleFor(tab: string) {
         roles: "Roles & permissions",
         "resource-access": "Resource access",
         models: "Models",
+        connectors: "Connectors",
         "skills-mcp": "Skills & MCP",
         "feature-access": "Feature access",
         "sso-scim": "SSO & SCIM",

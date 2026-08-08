@@ -129,6 +129,12 @@ describe("cloud shell bootstrap", () => {
     expect(visible.flatMap((group) => group.items.map((item) => item.id))).toEqual(["overview", "people", "ai-tools"]);
   });
 
+  it("shows AI & tools navigation to an MCP-only organization administrator", () => {
+    const visible = visibleAdministrationGroups(["org:admin", "mcp:read"]);
+
+    expect(visible.flatMap((group) => group.items.map((item) => item.id))).toEqual(["ai-tools"]);
+  });
+
   it("redirects legacy memory navigation into personalization", () => {
     expect(parseCloudShellLocation("/settings/memory")).toEqual({ kind: "settings", tab: "personalization" });
   });
@@ -138,7 +144,7 @@ describe("cloud shell bootstrap", () => {
       label: group.label,
       items: group.items.map((item) => [item.id, item.label]),
     }))).toEqual([
-      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived chats"]] },
+      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived chats"]] },
     ]);
   });
 

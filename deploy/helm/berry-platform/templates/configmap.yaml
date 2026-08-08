@@ -8,6 +8,7 @@ data:
   DEPLOYMENT_MODE: {{ .Values.deploymentMode | quote }}
   BERRY_AUTH_MODE: {{ .Values.auth.mode | quote }}
   BERRY_AUTH_BASE_URL: {{ .Values.auth.baseUrl | quote }}
+  BERRY_WEB_PUBLIC_URL: {{ printf "https://%s" .Values.ingress.webHost | quote }}
   BERRY_AUTH_TRUSTED_ORIGINS: {{ .Values.auth.trustedOrigins | quote }}
   BERRY_AUTH_SIGNUP_ENABLED: {{ .Values.auth.signupEnabled | quote }}
   BERRY_SETUP_OWNER_EMAIL: {{ .Values.auth.setupOwnerEmail | quote }}

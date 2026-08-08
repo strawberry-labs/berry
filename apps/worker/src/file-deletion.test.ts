@@ -25,8 +25,8 @@ describe("S3FileObjectDeleter", () => {
     })).resolves.toEqual({ deleted: 2 });
 
     expect(commands.map((command) => (command as { constructor: { name: string } }).constructor.name))
-      .toEqual(["ListObjectVersionsCommand", "ListObjectVersionsCommand", "DeleteObjectsCommand"]);
-    const command = commands[2] as { input: unknown };
+      .toEqual(["ListObjectVersionsCommand", "HeadObjectCommand", "ListObjectVersionsCommand", "HeadObjectCommand", "DeleteObjectsCommand"]);
+    const command = commands[4] as { input: unknown };
     expect(command.input).toEqual({
       Bucket: "berry-test",
       Delete: {
@@ -151,9 +151,96 @@ describe("S3FileObjectDeleter", () => {
     await expect(deleter.delete({ outboxId, tenantId, fileId, bucket: "berry-test", keys: ["artifacts/file.png"] }))
       .rejects.toBe(receiptError);
   });
+
+  it("treats an already-absent key as deleted without creating another delete marker", async () => {
+    const commands: unknown[] = [];
+    const acknowledge = vi.fn(async () => undefined);
+    const deleter = new S3FileObjectDeleter({
+      send: vi.fn(async (command: unknown) => {
+        commands.push(command);
+        if ((command as { constructor: { name: string } }).constructor.name === "HeadObjectCommand") {
+          throw Object.assign(new Error("not found"), { name: "NotFound", $metadata: { httpStatusCode: 404 } });
+        }
+        return {};
+      }),
+    } as never, { acknowledge });
+
+    await expect(deleter.delete({ outboxId, tenantId, fileId, bucket: "berry-test", keys: ["artifacts/file.png"] }))
+      .resolves.toEqual({ deleted: 1 });
+
+    expect(commands.map((command) => (command as { constructor: { name: string } }).constructor.name))
+      .toEqual(["ListObjectVersionsCommand", "HeadObjectCommand"]);
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it("never sends a canonical blob key returned as protected by the durable store", async () => {
+    const commands: unknown[] = [];
+    const acknowledge = vi.fn(async () => undefined);
+    const deleter = new S3FileObjectDeleter({
+      send: vi.fn(async (command: unknown) => { commands.push(command); return {}; }),
+    } as never, {
+      deletableKeys: vi.fn(async () => ["artifacts/preview.png"]),
+      acknowledge,
+    });
+
+    await expect(deleter.delete({
+      outboxId,
+      tenantId,
+      fileId,
+      bucket: "berry-test",
+      keys: ["artifacts/original.png", "artifacts/preview.png"],
+    })).resolves.toEqual({ deleted: 1 });
+
+    expect(commands).toHaveLength(3);
+    expect((commands[0] as { input: { Prefix: string } }).input.Prefix).toBe("artifacts/preview.png");
+    expect(JSON.stringify(commands)).not.toContain("artifacts/original.png");
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
 });
 
 describe("SqlFileDeletionReceiptStore", () => {
+  it("filters canonical blob keys out of legacy object-deletion jobs", async () => {
+    const calls: Array<{ kind: "execute" | "query"; sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { calls.push({ kind: "execute", sql, params }); },
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        calls.push({ kind: "query", sql, params });
+        if (sql.includes("to_regclass")) return [{ guard_name: "file_blobs_physical_location_unique" }] as T[];
+        return [{ object_key: "artifacts/original.png" }] as T[];
+      },
+    };
+    executor.transaction = async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor);
+
+    await expect(new SqlFileDeletionReceiptStore(executor).deletableKeys({
+      outboxId,
+      tenantId,
+      fileId,
+      bucket: "berry-test",
+      keys: ["artifacts/original.png", "artifacts/preview.png"],
+    })).resolves.toEqual(["artifacts/preview.png"]);
+
+    const protectionQuery = calls.find((call) => call.kind === "query" && call.sql.includes("FROM file_blobs"));
+    expect(protectionQuery?.sql).toContain("FROM file_blobs");
+    expect(protectionQuery?.params).toEqual([tenantId, "berry-test", ["artifacts/original.png", "artifacts/preview.png"]]);
+    expect(calls[0]?.sql).toContain("berry_set_tenant_id");
+  });
+
+  it("fails closed before object deletion when global physical locations are not enforced", async () => {
+    const executor: SqlExecutor = {
+      execute: vi.fn(async () => undefined),
+      query: async <T>() => [{ guard_name: null }] as T[],
+    };
+    executor.transaction = async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor);
+
+    await expect(new SqlFileDeletionReceiptStore(executor).deletableKeys({
+      outboxId,
+      tenantId,
+      fileId,
+      bucket: "berry-test",
+      keys: ["artifacts/file.png"],
+    })).rejects.toThrow("refusing object deletion");
+  });
+
   it("acknowledges only the matching tenant, outbox row, event, and file", async () => {
     const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {

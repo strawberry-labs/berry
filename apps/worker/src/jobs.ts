@@ -76,6 +76,17 @@ export const FileDeleteObjectJobPayloadSchema = z.object({
 });
 export type FileDeleteObjectJobPayload = z.infer<typeof FileDeleteObjectJobPayloadSchema>;
 
+export const FileBlobJobPayloadSchema = z.object({
+  tenantId: z.string().uuid(),
+  blobId: z.string().uuid(),
+});
+export type FileBlobJobPayload = z.infer<typeof FileBlobJobPayloadSchema>;
+
+export const FileDeleteBlobJobPayloadSchema = FileBlobJobPayloadSchema.extend({
+  outboxId: z.string().uuid(),
+});
+export type FileDeleteBlobJobPayload = z.infer<typeof FileDeleteBlobJobPayloadSchema>;
+
 export const MemoryExtractJobPayloadSchema = z.object({
   tenantId: z.string().uuid(),
   userId: z.string().uuid(),
@@ -99,7 +110,9 @@ const MaintenanceJobBaseSchema = z.object({
   requestedByUserId: z.string().uuid().nullable().optional(),
 });
 
-export const ContextBackfillJobPayloadSchema = MaintenanceJobBaseSchema;
+export const ContextBackfillJobPayloadSchema = MaintenanceJobBaseSchema.extend({
+  phase: z.enum(["workspace_files", "file_sources", "task_outcomes", "verify_file_blobs"]).optional(),
+});
 export type ContextBackfillJobPayload = z.infer<typeof ContextBackfillJobPayloadSchema>;
 
 export const RetentionCleanupJobPayloadSchema = MaintenanceJobBaseSchema.extend({
@@ -125,6 +138,8 @@ export const BerryWorkerJobNameSchema = z.enum([
   "knowledge.delete",
   "knowledge.reindex",
   "file.delete-object",
+  "file.delete-blob",
+  "file.verify-blob",
   "memory.extract",
   "context.backfill",
   "context.cleanup",
@@ -147,6 +162,8 @@ export interface BerryWorkerJobMap {
   "knowledge.delete": KnowledgeRevisionJobPayload;
   "knowledge.reindex": KnowledgeRevisionJobPayload;
   "file.delete-object": FileDeleteObjectJobPayload;
+  "file.delete-blob": FileDeleteBlobJobPayload;
+  "file.verify-blob": FileBlobJobPayload;
   "memory.extract": MemoryExtractJobPayload;
   "context.backfill": ContextBackfillJobPayload;
   "context.cleanup": RetentionCleanupJobPayload;
@@ -166,6 +183,8 @@ export function parseWorkerJob(name: string, data: unknown): BerryWorkerJobPaylo
   if(jobName==="alerts.evaluate")return AlertEvaluationJobPayloadSchema.parse(data);
   if(jobName==="knowledge.index-task")return KnowledgeIndexTaskJobPayloadSchema.parse(data);
   if(jobName==="file.delete-object")return FileDeleteObjectJobPayloadSchema.parse(data);
+  if(jobName==="file.delete-blob")return FileDeleteBlobJobPayloadSchema.parse(data);
+  if(jobName==="file.verify-blob")return FileBlobJobPayloadSchema.parse(data);
   if(jobName==="memory.extract")return MemoryExtractJobPayloadSchema.parse(data);
   if(jobName==="context.backfill")return ContextBackfillJobPayloadSchema.parse(data);
   if(jobName==="context.cleanup")return RetentionCleanupJobPayloadSchema.parse(data);

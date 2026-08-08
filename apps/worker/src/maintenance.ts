@@ -5,8 +5,8 @@ import type {
 } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
-const BackfillPhaseSchema = z.enum(["workspace_files", "file_sources", "task_outcomes"]);
-const CleanupPhaseSchema = z.enum(["expired_memory", "turn_events", "retrieval_snapshots", "knowledge_tombstones", "orphan_budget_reservations", "runtime_outbox"]);
+const BackfillPhaseSchema = z.enum(["workspace_files", "file_sources", "task_outcomes", "verify_file_blobs"]);
+const CleanupPhaseSchema = z.enum(["expired_memory", "turn_events", "retrieval_snapshots", "knowledge_tombstones", "orphan_budget_reservations", "orphan_files", "runtime_outbox"]);
 const BackfillCursorSchema = z.object({
   phase: BackfillPhaseSchema.default("workspace_files"),
   lastId: z.string().uuid().nullable().default(null),
@@ -53,7 +53,7 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
   async backfill(payload: ContextBackfillJobPayload): Promise<MaintenanceBatchResult> {
     try {
       return await this.withTenant(payload.tenantId, async (executor) => {
-        const run = await this.claim(executor, payload, "context_backfill", { phase: "workspace_files", lastId: null });
+        const run = await this.claim(executor, payload, "context_backfill", { phase: payload.phase ?? "workspace_files", lastId: null });
         if (run.status === "completed" || run.status === "cancelled") {
           return { runId: payload.runId, status: run.status, phase: "done", scanned: 0, changed: 0, enqueued: 0 };
         }
@@ -62,7 +62,9 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
           ? await this.backfillWorkspaceFiles(executor, payload, cursor.lastId)
           : cursor.phase === "file_sources"
             ? await this.backfillFileSources(executor, payload, cursor.lastId)
-            : await this.backfillTaskOutcomes(executor, payload, cursor.lastId);
+            : cursor.phase === "task_outcomes"
+              ? await this.backfillTaskOutcomes(executor, payload, cursor.lastId)
+              : await this.enqueueBlobVerification(executor, payload, cursor.lastId);
         const nextPhase = batch.exhausted ? nextBackfillPhase(cursor.phase) : cursor.phase;
         const completed = batch.exhausted && nextPhase === null;
         const nextCursor = {
@@ -106,7 +108,7 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
           phase: completed ? "done" : nextCursor.phase,
           scanned: batch.scanned,
           changed: batch.changed,
-          enqueued: 0,
+          enqueued: batch.enqueued,
         };
       });
     } catch (error) {
@@ -178,7 +180,23 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
       LIMIT $3
     `, [payload.tenantId, lastId, payload.batchSize]);
     let changed = 0;
-    for (const row of rows) {
+    // Reference creation and garbage collection serialize on the logical file
+    // row. Keep lock ordering deterministic when a batch contains many files.
+    const mutationRows = [...rows].sort((left, right) =>
+      left.file_id.localeCompare(right.file_id) || left.association_id.localeCompare(right.association_id));
+    for (const row of mutationRows) {
+      const [locked] = await executor.query<{ id: string }>(`
+        SELECT f.id
+        FROM files f
+        JOIN file_associations fa
+          ON fa.tenant_id = f.tenant_id AND fa.file_id = f.id
+        WHERE f.tenant_id = $1::uuid AND f.id = $2::uuid
+          AND fa.id = $3::uuid AND f.deleted_at IS NULL
+        FOR UPDATE OF f
+      `, [payload.tenantId, row.file_id, row.association_id]);
+      // The candidate query is intentionally paginated without holding locks.
+      // If collection won the race, do not revive a reference to a tombstone.
+      if (!locked) continue;
       const inserted = await executor.query<{ id: string }>(`
         INSERT INTO workspace_files (
           tenant_id, workspace_id, file_id, visibility, originating_task_id,
@@ -217,11 +235,23 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
       content_hash: string;
     }>(`
       SELECT wf.id AS workspace_file_id, wf.workspace_id, wf.file_id, wf.visibility,
-             wf.originating_task_id, f.owner_user_id, f.display_name, f.media_type, f.object_key,
-             COALESCE(NULLIF(f.object_version_id,''), NULLIF(f.etag,''), NULLIF(f.sha256,''), 'legacy-' || f.id::text) AS revision,
-             COALESCE(NULLIF(f.sha256,''), NULLIF(f.etag,''), NULLIF(f.object_version_id,''), 'legacy-' || f.id::text) AS content_hash
+             wf.originating_task_id, f.owner_user_id, f.display_name, f.media_type,
+             CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS object_key,
+             COALESCE(
+               NULLIF(CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END,''),
+               NULLIF(CASE WHEN f.blob_id IS NOT NULL THEN blob.etag ELSE f.etag END,''),
+               NULLIF(CASE WHEN f.blob_id IS NOT NULL THEN blob.sha256 ELSE f.sha256 END,''),
+               'legacy-' || f.id::text
+             ) AS revision,
+             COALESCE(
+               NULLIF(CASE WHEN f.blob_id IS NOT NULL THEN blob.sha256 ELSE f.sha256 END,''),
+               NULLIF(CASE WHEN f.blob_id IS NOT NULL THEN blob.etag ELSE f.etag END,''),
+               NULLIF(CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END,''),
+               'legacy-' || f.id::text
+             ) AS content_hash
       FROM workspace_files wf
       JOIN files f ON f.tenant_id = wf.tenant_id AND f.id = wf.file_id
+      LEFT JOIN file_blobs blob ON blob.tenant_id = f.tenant_id AND blob.id = f.blob_id
       WHERE wf.tenant_id = $1::uuid
         AND ($2::uuid IS NULL OR wf.id > $2::uuid)
         AND wf.deleted_at IS NULL AND f.deleted_at IS NULL
@@ -476,6 +506,8 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
         )
         SELECT DISTINCT reservation_id AS id FROM ledger
       `, [payload.tenantId, payload.batchSize]);
+    } else if (phase === "orphan_files") {
+      return this.cleanupOrphanFiles(executor, payload);
     } else {
       rows = await executor.query<{ id: string }>(`
         DELETE FROM runtime_outbox outbox
@@ -495,6 +527,265 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
       enqueued: 0,
       exhausted: rows.length < payload.batchSize,
     };
+  }
+
+  private async enqueueBlobVerification(
+    executor: SqlExecutor,
+    payload: ContextBackfillJobPayload,
+    lastId: string | null,
+  ): Promise<BatchResult> {
+    const rows = await executor.query<{ id: string }>(`
+      SELECT id
+      FROM file_blobs
+      WHERE tenant_id = $1::uuid
+        AND ($2::uuid IS NULL OR id > $2::uuid)
+        AND (
+          verification_status IN ('unverified','failed')
+          OR (verification_status='verifying' AND updated_at < now()-interval '15 minutes')
+        )
+        AND deleted_at IS NULL
+      ORDER BY id ASC
+      LIMIT $3
+    `, [payload.tenantId, lastId, payload.batchSize]);
+    for (const row of rows) {
+      await executor.execute(`
+        INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+        VALUES ($1::uuid,'file.verify-blob',$2,$3,$4::jsonb)
+        ON CONFLICT (tenant_id,dedupe_key) DO UPDATE SET
+          completed_at=NULL,available_at=now(),last_error=NULL,updated_at=now()
+      `, [payload.tenantId, row.id, `file.verify-blob:${row.id}`, JSON.stringify({ tenantId: payload.tenantId, blobId: row.id })]);
+    }
+    return {
+      scanned: rows.length,
+      changed: 0,
+      enqueued: rows.length,
+      exhausted: rows.length < payload.batchSize,
+      lastId: rows.at(-1)?.id ?? lastId,
+    };
+  }
+
+  private async cleanupOrphanFiles(
+    executor: SqlExecutor,
+    payload: RetentionCleanupJobPayload,
+  ): Promise<BatchResult> {
+    await this.retireExpiredUploads(executor, payload);
+    const rows = await executor.query<{ id: string; blob_id: string | null; bucket: string; object_key: string; deleted_at: Date | string | null }>(`
+      SELECT f.id, f.blob_id, f.deleted_at,
+        CASE WHEN f.blob_id IS NOT NULL THEN blob.bucket ELSE f.bucket END AS bucket,
+        CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS object_key
+      FROM files f
+      LEFT JOIN file_blobs blob ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
+      WHERE f.tenant_id=$1::uuid
+        AND (
+          f.deleted_at IS NULL
+          OR (
+            f.blob_id IS NOT NULL
+            AND blob.deleted_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM files live_file
+              WHERE live_file.tenant_id=f.tenant_id
+                AND live_file.blob_id=f.blob_id
+                AND live_file.deleted_at IS NULL
+            )
+            AND (
+              blob.verification_status IS DISTINCT FROM 'pending_delete'
+              OR NOT EXISTS (
+                SELECT 1 FROM runtime_outbox pending_delete
+                WHERE pending_delete.tenant_id=f.tenant_id
+                  AND pending_delete.event_type='file.delete-blob'
+                  AND pending_delete.aggregate_id=f.blob_id::text
+                  AND pending_delete.completed_at IS NULL
+              )
+            )
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM file_library_entries library
+          WHERE library.tenant_id=f.tenant_id AND library.file_id=f.id AND library.deleted_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM file_associations association
+          WHERE association.tenant_id=f.tenant_id AND association.file_id=f.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM workspace_files wf
+          WHERE wf.tenant_id=f.tenant_id AND wf.file_id=f.id AND wf.deleted_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM file_uploads upload
+          WHERE upload.tenant_id=f.tenant_id AND upload.file_id=f.id AND upload.status='uploading'
+        )
+      ORDER BY f.id ASC
+      FOR UPDATE OF f SKIP LOCKED
+      LIMIT $2
+    `, [payload.tenantId, payload.batchSize]);
+    let enqueued = 0;
+    let changed = 0;
+    for (const row of rows) {
+      // The candidate statement may have waited on a concurrent reference
+      // creator. Recheck in a new statement after owning the file lock so a
+      // reference committed while we waited is visible before tombstoning.
+      const [references] = await executor.query<{ reference_exists: boolean }>(`
+        SELECT (
+          EXISTS (
+            SELECT 1 FROM file_library_entries library
+            WHERE library.tenant_id=$1::uuid AND library.file_id=$2::uuid
+              AND library.deleted_at IS NULL
+          ) OR EXISTS (
+            SELECT 1 FROM file_associations association
+            WHERE association.tenant_id=$1::uuid AND association.file_id=$2::uuid
+          ) OR EXISTS (
+            SELECT 1 FROM workspace_files wf
+            WHERE wf.tenant_id=$1::uuid AND wf.file_id=$2::uuid
+              AND wf.deleted_at IS NULL
+          ) OR EXISTS (
+            SELECT 1
+            FROM knowledge_sources source
+            JOIN workspace_files wf
+              ON wf.tenant_id=source.tenant_id
+             AND wf.workspace_id=source.workspace_id
+             AND wf.file_id=$2::uuid
+             AND wf.deleted_at IS NULL
+            WHERE source.tenant_id=$1::uuid
+              AND source.source_type='file'
+              AND source.source_id=$2::uuid::text
+              AND source.tombstoned_at IS NULL
+          ) OR EXISTS (
+            SELECT 1 FROM file_uploads upload
+            WHERE upload.tenant_id=$1::uuid AND upload.file_id=$2::uuid
+              AND upload.status='uploading'
+          )
+        ) AS reference_exists
+      `, [payload.tenantId, row.id]);
+      if (references?.reference_exists) continue;
+      const sources = await executor.query<{ id: string; source_revision: string }>(`
+        UPDATE knowledge_sources
+        SET tombstoned_at=COALESCE(tombstoned_at,now()),extraction_status='deleted',
+            index_status='deleted',vector_ready=false,updated_at=now()
+        WHERE tenant_id=$1::uuid AND source_type='file' AND source_id=$2::uuid::text
+          AND tombstoned_at IS NULL
+        RETURNING id,source_revision
+      `, [payload.tenantId, row.id]);
+      for (const source of sources) {
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+          VALUES ($1::uuid,'knowledge.delete',$2,$3,$4::jsonb)
+          ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        `, [payload.tenantId, source.id, `knowledge.delete:${source.id}:${source.source_revision}`, JSON.stringify({ tenantId: payload.tenantId, sourceId: source.id, revision: source.source_revision })]);
+        enqueued += 1;
+      }
+      const derivatives = await executor.query<{ object_key: string }>(`
+        SELECT object_key FROM file_derivatives
+        WHERE tenant_id=$1::uuid AND file_id=$2::uuid AND object_key IS NOT NULL
+      `, [payload.tenantId, row.id]);
+      if (derivatives.length) {
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+          VALUES ($1::uuid,'file.delete-object',$2,$3,$4::jsonb)
+          ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        `, [payload.tenantId, row.id, `file.delete-derivatives:${row.id}:maintenance`, JSON.stringify({ tenantId: payload.tenantId, fileId: row.id, bucket: row.bucket, keys: [...new Set(derivatives.map((item) => item.object_key))] })]);
+        enqueued += 1;
+      }
+      await executor.execute(`
+        UPDATE files SET status='deleted',deleted_at=COALESCE(deleted_at,now()),updated_at=now()
+        WHERE tenant_id=$1::uuid AND id=$2::uuid
+      `, [payload.tenantId, row.id]);
+      if (!row.deleted_at) changed += 1;
+      if (row.blob_id) {
+        // Multiple logical files can converge on one tenant-scoped blob after
+        // verification. Serialize last-reference admission on the blob row so
+        // concurrent maintenance batches cannot both observe the other file
+        // as live and leave the final blob permanently unscheduled.
+        const [lockedBlob] = await executor.query<{ id: string }>(`
+          SELECT id FROM file_blobs
+          WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL
+          FOR UPDATE
+        `, [payload.tenantId, row.blob_id]);
+        if (!lockedBlob) continue;
+        const [other] = await executor.query<{ id: string }>(`
+          SELECT id FROM files
+          WHERE tenant_id=$1::uuid AND blob_id=$2::uuid AND id<>$3::uuid AND deleted_at IS NULL
+          LIMIT 1
+        `, [payload.tenantId, row.blob_id, row.id]);
+        if (!other) {
+          const [blob] = await executor.query<{ delete_after: Date | string }>(`
+            UPDATE file_blobs SET verification_status='pending_delete',
+              delete_after=COALESCE(delete_after,now()+interval '7 days'),updated_at=now()
+            WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL
+            RETURNING delete_after
+          `, [payload.tenantId, row.blob_id]);
+          if (blob) {
+            await executor.execute(`
+              INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at)
+              VALUES ($1::uuid,'file.delete-blob',$2,$3,$4::jsonb,$5::timestamptz)
+              ON CONFLICT (tenant_id,dedupe_key) DO UPDATE SET
+                available_at=EXCLUDED.available_at,completed_at=NULL,last_error=NULL,updated_at=now()
+            `, [payload.tenantId, row.blob_id, `file.delete-blob:${row.blob_id}`, JSON.stringify({ tenantId: payload.tenantId, blobId: row.blob_id }), new Date(blob.delete_after).toISOString()]);
+            enqueued += 1;
+          }
+        }
+      } else {
+        await executor.execute(`
+          INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at)
+          VALUES ($1::uuid,'file.delete-object',$2,$3,$4::jsonb,now()+interval '7 days')
+          ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        `, [payload.tenantId, row.id, `file.delete-object:legacy:${row.id}`, JSON.stringify({ tenantId: payload.tenantId, fileId: row.id, bucket: row.bucket, keys: [row.object_key] })]);
+        enqueued += 1;
+      }
+    }
+    return { scanned: rows.length, changed, enqueued, exhausted: rows.length < payload.batchSize };
+  }
+
+  private async retireExpiredUploads(
+    executor: SqlExecutor,
+    payload: RetentionCleanupJobPayload,
+  ): Promise<void> {
+    const expired = await executor.query<{ file_id: string }>(`
+      WITH candidates AS (
+        SELECT upload.id
+        FROM file_uploads upload
+        WHERE upload.tenant_id=$1::uuid AND upload.status='uploading'
+          AND upload.expires_at<=now()
+        ORDER BY upload.expires_at,upload.id
+        FOR UPDATE OF upload SKIP LOCKED
+        LIMIT $2
+      )
+      UPDATE file_uploads upload
+      SET status='expired',updated_at=now()
+      FROM candidates
+      WHERE upload.tenant_id=$1::uuid AND upload.id=candidates.id
+      RETURNING upload.file_id
+    `, [payload.tenantId, payload.batchSize]);
+    const fileIds = [...new Set(expired.map((row) => row.file_id))].sort();
+    for (const fileId of fileIds) {
+      const [file] = await executor.query<{ id: string }>(`
+        SELECT f.id FROM files f
+        WHERE f.tenant_id=$1::uuid AND f.id=$2::uuid AND f.deleted_at IS NULL
+        FOR UPDATE OF f
+      `, [payload.tenantId, fileId]);
+      if (!file) continue;
+      await executor.execute(`
+        UPDATE files
+        SET status='failed',
+            metadata=metadata || jsonb_build_object('uploadFailure','expired'),
+            updated_at=now()
+        WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL
+      `, [payload.tenantId, fileId]);
+      await executor.execute(`
+        UPDATE file_library_entries
+        SET deleted_at=COALESCE(deleted_at,now()),updated_at=now()
+        WHERE tenant_id=$1::uuid AND file_id=$2::uuid AND deleted_at IS NULL
+      `, [payload.tenantId, fileId]);
+      await executor.execute(`
+        DELETE FROM file_associations
+        WHERE tenant_id=$1::uuid AND file_id=$2::uuid
+      `, [payload.tenantId, fileId]);
+      await executor.execute(`
+        UPDATE workspace_files
+        SET deleted_at=COALESCE(deleted_at,now()),index_status='deleted',updated_at=now()
+        WHERE tenant_id=$1::uuid AND file_id=$2::uuid AND deleted_at IS NULL
+      `, [payload.tenantId, fileId]);
+    }
   }
 
   private async recordProgress(
@@ -577,6 +868,7 @@ function nextCleanupPhase(phase: z.infer<typeof CleanupPhaseSchema>): z.infer<ty
   if (phase === "turn_events") return "retrieval_snapshots";
   if (phase === "retrieval_snapshots") return "knowledge_tombstones";
   if (phase === "knowledge_tombstones") return "orphan_budget_reservations";
-  if (phase === "orphan_budget_reservations") return "runtime_outbox";
+  if (phase === "orphan_budget_reservations") return "orphan_files";
+  if (phase === "orphan_files") return "runtime_outbox";
   return null;
 }

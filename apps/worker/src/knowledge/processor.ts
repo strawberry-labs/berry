@@ -59,6 +59,7 @@ export class KnowledgeProcessor {
       const bytes = await this.dependencies.objects.read({
         bucket: source.bucket,
         key: source.objectKey,
+        ...(source.objectVersionId ? { versionId: source.objectVersionId } : {}),
         mediaType: source.mediaType,
         name: source.title,
       });

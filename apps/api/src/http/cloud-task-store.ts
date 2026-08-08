@@ -26,6 +26,7 @@ import {
 } from "@berry/shared";
 import { SELF_HOST_TENANT_ID, SELF_HOST_WORKSPACE_ID } from "@berry/db";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
+import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.ts";
 
 export const CLOUD_TASK_STORE = Symbol("CLOUD_TASK_STORE");
 
@@ -633,6 +634,19 @@ ORDER BY sequence_id ASC
   async deleteMessagesFrom(sessionId: string, messageId: string): Promise<void> {
     await this.database.withTenant(this.tenantId, async (executor) => {
       await this.getSessionInTenant(executor, sessionId);
+      const affectedFiles = await executor.query<{ file_id: string }>(`
+        SELECT DISTINCT association.file_id
+        FROM file_associations association
+        JOIN messages message
+          ON message.tenant_id = association.tenant_id
+         AND message.id = association.message_id
+        WHERE message.tenant_id = $1::uuid AND message.session_id = $2::uuid
+          AND message.sequence_id >= (
+            SELECT sequence_id FROM messages
+            WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND id = $3::uuid
+          )
+        ORDER BY association.file_id
+      `, [this.tenantId, sessionId, messageId]);
       // sequence_id is the canonical insertion order, including messages
       // written within the same timestamp millisecond.
       await executor.execute(
@@ -646,6 +660,9 @@ WHERE tenant_id = $1::uuid AND session_id = $2::uuid
         `.trim(),
         [this.tenantId, sessionId, messageId],
       );
+      for (const { file_id: fileId } of affectedFiles) {
+        await garbageCollectFileIfUnreferenced(executor, this.tenantId, fileId);
+      }
     });
   }
 

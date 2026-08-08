@@ -17,6 +17,8 @@ export interface ToolGuardRequest {
   workspacePath?: string;
   execPolicyRules?: ExecPolicyRule[];
   networkPolicy?: NetworkPolicy;
+  /** Policy-owned approval that permission modes and saved grants cannot waive. */
+  requiresApproval?: boolean;
 }
 
 export type ToolGuardDecision =
@@ -151,7 +153,7 @@ export class ToolGuard {
       trace.push(...policyTrace(result.trace));
       if (result.decision === "forbid") return { type: "block", reason: `execpolicy forbids ${result.canonical.display}`, trace };
     }
-    if (request.risk === "read") return { type: "allow", reason: "read-only workspace operation", trace: [...trace, step("permission-mode", "allow", "Read-only workspace operation")] };
+    if (request.risk === "read" && !request.requiresApproval) return { type: "allow", reason: "read-only workspace operation", trace: [...trace, step("permission-mode", "allow", "Read-only workspace operation")] };
     if (request.permissionMode === "plan") {
       return { type: "block", reason: "plan mode does not allow mutating tools or command execution", trace: [...trace, step("permission-mode", "forbid", "Plan mode blocks mutation and command execution")] };
     }
@@ -166,6 +168,15 @@ export class ToolGuard {
       };
     }
     trace.push(step("sandbox", "allow", "Sandbox policy permits the tool call"));
+    if (request.requiresApproval) {
+      return {
+        type: "approval-required",
+        approvalKind: approvalKindForRisk(request.risk),
+        reason: `${request.toolName} always requires approval by connector policy`,
+        subject: canonicalGrantSubject(request),
+        trace: [...trace, step("grant", "prompt", "Connector policy requires approval for every call")],
+      };
+    }
     if (request.permissionMode === "full-access") return { type: "allow", reason: "full-access mode", trace: [...trace, step("permission-mode", "allow", "Full-access mode allows non-forbidden commands")] };
     if (request.permissionMode === "auto-edit" && request.risk === "file-edit") {
       return { type: "allow", reason: "auto-edit mode allows workspace file edits", trace: [...trace, step("permission-mode", "allow", "Auto-edit mode allows workspace file edits")] };

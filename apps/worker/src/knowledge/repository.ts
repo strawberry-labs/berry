@@ -18,6 +18,7 @@ export type KnowledgeSourceRecord = {
   mediaType: string;
   bucket: string | null;
   objectKey: string | null;
+  objectVersionId?: string | null;
   derivativeObjectKey: string | null;
   inlineText: string | null;
   tombstonedAt: Date | string | null;
@@ -39,10 +40,17 @@ export class SqlKnowledgeRepository {
         SELECT ks.id, ks.tenant_id, ks.workspace_id, ks.user_id, ks.source_type,
                ks.source_id, ks.source_revision, ks.content_hash, ks.title, ks.visibility,
                ks.index_status, ks.metadata, ks.tombstoned_at,
-               f.media_type, f.bucket, f.object_key,
+               f.media_type,
+               CASE WHEN f.blob_id IS NOT NULL THEN blob.bucket ELSE f.bucket END AS bucket,
+               CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS object_key,
+               CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END AS object_version_id,
                derivative.object_key AS derivative_object_key
         FROM knowledge_sources ks
-        LEFT JOIN files f ON ks.source_type = 'file' AND f.id = ks.source_id::uuid
+        LEFT JOIN files f
+          ON f.tenant_id = ks.tenant_id
+         AND ks.source_type = 'file'
+         AND f.id = ks.source_id::uuid
+        LEFT JOIN file_blobs blob ON blob.tenant_id = f.tenant_id AND blob.id = f.blob_id
         LEFT JOIN LATERAL (
           SELECT fd.object_key
           FROM file_derivatives fd
@@ -89,7 +97,10 @@ export class SqlKnowledgeRepository {
         SELECT ks.id, ks.source_revision, ks.tombstoned_at,
                f.deleted_at AS file_deleted_at
         FROM knowledge_sources ks
-        JOIN files f ON ks.source_type = 'file' AND f.id = ks.source_id::uuid
+        JOIN files f
+          ON f.tenant_id = ks.tenant_id
+         AND ks.source_type = 'file'
+         AND f.id = ks.source_id::uuid
         WHERE ks.tenant_id = $1::uuid AND ks.id = $2::uuid
         FOR UPDATE OF ks, f
       `, [input.tenantId, input.source.id]);
@@ -160,9 +171,12 @@ export class SqlKnowledgeRepository {
         file_deleted_at: Date | string | null;
       }>(`
         SELECT ks.source_type, ks.source_id, ks.source_revision,
-               f.bucket, f.object_key, f.deleted_at AS file_deleted_at
+               CASE WHEN f.blob_id IS NOT NULL THEN blob.bucket ELSE f.bucket END AS bucket,
+               CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS object_key,
+               f.deleted_at AS file_deleted_at
         FROM knowledge_sources ks
         JOIN files f ON ks.source_type = 'file' AND f.id = ks.source_id::uuid
+        LEFT JOIN file_blobs blob ON blob.tenant_id = f.tenant_id AND blob.id = f.blob_id
         WHERE ks.tenant_id = $1::uuid AND ks.id = $2::uuid
         FOR UPDATE OF ks, f
       `, [tenantId, sourceId]);
@@ -586,6 +600,7 @@ type SourceRow = {
   media_type: string | null;
   bucket: string | null;
   object_key: string | null;
+  object_version_id: string | null;
   derivative_object_key: string | null;
 };
 
@@ -623,6 +638,7 @@ function sourceFromRow(row: SourceRow): KnowledgeSourceRecord {
     mediaType: row.media_type ?? "text/plain",
     bucket: row.bucket,
     objectKey: row.object_key,
+    objectVersionId: row.object_version_id,
     derivativeObjectKey: row.derivative_object_key,
     inlineText: typeof metadata.inlineText === "string" ? metadata.inlineText : null,
     tombstonedAt: row.tombstoned_at,

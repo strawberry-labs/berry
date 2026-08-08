@@ -1,7 +1,7 @@
 import type { OrgPermission } from "@berry/shared";
 import {
   Activity, Bot, Building2, Database, FileClock, GitBranch, KeyRound, Landmark,
-  LayoutDashboard, LineChart, Lock, MessageSquareText, Network, Puzzle, ScrollText,
+  LayoutDashboard, LineChart, Lock, MessageSquareText, Network, PlugZap, Puzzle, ScrollText,
   ShieldCheck, SlidersHorizontal, Sparkles, User, Users,
   type LucideIcon,
 } from "lucide-react";
@@ -66,6 +66,7 @@ export const ADMIN_AREAS: readonly AdminArea[] = [
     tabs: [
       { id: "providers", label: "Providers", permission: "models:read" },
       { id: "models", label: "Models", permission: "models:read" },
+      { id: "connectors", label: "Connectors", permission: "mcp:read" },
       { id: "skills-mcp", label: "Skills & MCP", permission: "org:read" },
       { id: "feature-access", label: "Feature access", permission: "feature_flags:read" },
       { id: "execution-network", label: "Execution & network", permission: "guardrails:read" },
@@ -133,6 +134,7 @@ export const PERSONAL_NAV: NavGroup[] = [
     { id: "general", label: "General", icon: SlidersHorizontal },
     { id: "account", label: "Account", icon: User },
     { id: "personalization", label: "Personalization", icon: Sparkles },
+    { id: "connectors", label: "Connectors", icon: PlugZap },
     { id: "skills", label: "Skills", icon: Puzzle },
     { id: "mcp", label: "MCP servers", icon: Network },
     { id: "usage", label: "Usage", icon: LineChart },
@@ -144,7 +146,7 @@ export const ADMIN_NAV: NavGroup[] = [
     { id: "overview", label: "Overview", icon: LayoutDashboard, permission: "org:read" },
     { id: "people", label: "People", icon: Users, permissions: ["members:read", "departments:read"] },
     { id: "access-control", label: "Access control", icon: Lock, permissions: ["rbac:read", "acl:read"] },
-    { id: "ai-tools", label: "AI & tools", icon: Bot, permissions: ["models:read", "org:read", "feature_flags:read", "guardrails:read"] },
+    { id: "ai-tools", label: "AI & tools", icon: Bot, permissions: ["models:read", "mcp:read", "org:read", "feature_flags:read", "guardrails:read"] },
     { id: "usage-billing", label: "Usage & billing", icon: LineChart, permissions: ["usage:read", "budgets:read", "billing:read", "reports:read"] },
     { id: "identity-security", label: "Identity & security", icon: ShieldCheck, permissions: ["auth_policy:read", "policy:read", "service_accounts:read"] },
     { id: "data-privacy", label: "Data & privacy", icon: Database, permission: "data_policy:read" },

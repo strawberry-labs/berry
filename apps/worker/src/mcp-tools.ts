@@ -101,34 +101,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       };
     }
     const hints = source.approvalHints(toolName);
-    const berryCrawl = server.id.toLowerCase() === "berrycrawl"
-      || server.name.toLowerCase().includes("berrycrawl");
-    if (hints?.readOnly || berryCrawl) {
-      return {
-        retryClass: "read_only",
-        requiresApproval: false,
-        approvalKind: "mcp",
-      };
-    }
-    if (hints?.destructive) {
-      return {
-        retryClass: "non_idempotent_manual",
-        requiresApproval: permissionMode !== "full-access",
-        approvalKind: "mcp",
-      };
-    }
-    if (hints?.idempotent) {
-      return {
-        retryClass: "idempotent_with_key",
-        requiresApproval: permissionMode !== "full-access",
-        approvalKind: "mcp",
-      };
-    }
-    return {
-      retryClass: "non_idempotent_manual",
-      requiresApproval: permissionMode !== "full-access",
-      approvalKind: "mcp",
-    };
+    return durableMcpToolPolicy(server, hints, permissionMode);
   }
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
@@ -195,6 +168,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
             inputSchema: tool.inputSchema,
             ...(tool.annotations ? { annotations: compactMcpAnnotations(tool.annotations) } : {}),
           })) } : {}),
+          ...(server.allowedTools ? { allowedTools: server.allowedTools } : {}),
+          ...(server.trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
+          ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
           ...(credential ? { credential } : {}),
         };
       }));
@@ -229,6 +205,56 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   #serverForTool(toolName: string, candidates: readonly McpServerSpec[]): McpServerSpec | undefined {
     return candidates.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
   }
+}
+
+export function durableMcpToolPolicy(
+  server: Pick<McpServerSpec, "trustReadOnlyAnnotations">,
+  hints: ReturnType<McpToolSource["approvalHints"]>,
+  permissionMode: string,
+): DurableToolPolicy {
+  if (hints?.requiresApproval) {
+    return {
+      retryClass: hints.idempotent ? "idempotent_with_key" : "non_idempotent_manual",
+      requiresApproval: true,
+      approvalKind: "mcp",
+    };
+  }
+  if (hints?.trustedReadOnly) {
+    return {
+      retryClass: "read_only",
+      requiresApproval: false,
+      approvalKind: "mcp",
+    };
+  }
+  // Only Berry-owned adapters opt into authoritative annotations. A custom
+  // server cannot waive approval or claim that a side effect is retry-safe.
+  if (server.trustReadOnlyAnnotations !== true) {
+    return {
+      retryClass: "non_idempotent_manual",
+      requiresApproval: true,
+      approvalKind: "mcp",
+    };
+  }
+  const requiresApproval = permissionMode !== "full-access";
+  if (hints?.destructive) {
+    return {
+      retryClass: "non_idempotent_manual",
+      requiresApproval,
+      approvalKind: "mcp",
+    };
+  }
+  if (hints?.idempotent) {
+    return {
+      retryClass: "idempotent_with_key",
+      requiresApproval,
+      approvalKind: "mcp",
+    };
+  }
+  return {
+    retryClass: "non_idempotent_manual",
+    requiresApproval,
+    approvalKind: "mcp",
+  };
 }
 
 export function createDurableTurnToolsFromEnv(

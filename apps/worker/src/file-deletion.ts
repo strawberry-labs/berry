@@ -1,4 +1,4 @@
-import { DeleteObjectsCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectsCommand, HeadObjectCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
 import type { FileDeleteObjectJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
@@ -7,11 +7,35 @@ export interface FileObjectDeleter {
 }
 
 export interface FileDeletionReceiptStore {
+  deletableKeys?(payload: FileDeleteObjectJobPayload): Promise<readonly string[]>;
   acknowledge(payload: FileDeleteObjectJobPayload): Promise<void>;
 }
 
 export class SqlFileDeletionReceiptStore implements FileDeletionReceiptStore {
   constructor(private readonly executor: SqlExecutor) {}
+
+  async deletableKeys(payload: FileDeleteObjectJobPayload): Promise<readonly string[]> {
+    const requested = [...new Set(payload.keys)];
+    if (requested.length === 0) return [];
+    const run = async (executor: SqlExecutor) => {
+      await executor.execute("SELECT berry_set_tenant_id($1::uuid)", [payload.tenantId]);
+      const [locationGuard] = await executor.query<{ guard_name: string | null }>(`
+        SELECT to_regclass('file_blobs_physical_location_unique')::text AS guard_name
+      `);
+      if (!locationGuard?.guard_name) {
+        throw new Error("Physical file-location uniqueness guard is unavailable; refusing object deletion");
+      }
+      const canonical = await executor.query<{ object_key: string }>(`
+        SELECT object_key
+        FROM file_blobs
+        WHERE tenant_id = $1::uuid AND bucket = $2
+          AND object_key = ANY($3::text[])
+      `, [payload.tenantId, payload.bucket, requested]);
+      const protectedKeys = new Set(canonical.map((row) => row.object_key));
+      return requested.filter((key) => !protectedKeys.has(key));
+    };
+    return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
+  }
 
   async acknowledge(payload: FileDeleteObjectJobPayload): Promise<void> {
     const rows = await this.executor.query<{ id: string }>(`
@@ -47,23 +71,13 @@ export class S3FileObjectDeleter implements FileObjectDeleter {
   }
 
   async delete(payload: FileDeleteObjectJobPayload): Promise<{ deleted: number }> {
-    const keys = [...new Set(payload.keys)];
-    const objects: Array<{ Key: string; VersionId?: string }> = [];
-    for (const key of keys) {
-      objects.push(...await this.listEveryVersion(payload.bucket, key));
-    }
-    for (let offset = 0; offset < objects.length; offset += 1_000) {
-      const response = await this.client.send(new DeleteObjectsCommand({
-        Bucket: payload.bucket,
-        Delete: {
-          Quiet: true,
-          Objects: objects.slice(offset, offset + 1_000),
-        },
-      }));
-      if (response.Errors?.length) {
-        throw new Error(`Object storage rejected ${response.Errors.length} file deletion${response.Errors.length === 1 ? "" : "s"}`);
-      }
-    }
+    const requested = [...new Set(payload.keys)];
+    const allowed = this.receipts.deletableKeys
+      ? await this.receipts.deletableKeys(payload)
+      : requested;
+    const requestedSet = new Set(requested);
+    const keys = [...new Set(allowed)].filter((key) => requestedSet.has(key));
+    await deleteEveryObjectVersion(this.client, payload.bucket, keys);
     // The outbox row remains pending until this acknowledgement succeeds.
     // Retrying after an acknowledgement failure is safe because S3 deletion
     // is idempotent, and prevents a transient DB error from losing cleanup.
@@ -71,12 +85,38 @@ export class S3FileObjectDeleter implements FileObjectDeleter {
     return { deleted: keys.length };
   }
 
-  private async listEveryVersion(bucket: string, key: string): Promise<Array<{ Key: string; VersionId?: string }>> {
+}
+
+export async function deleteEveryObjectVersion(
+  client: Pick<S3Client, "send">,
+  bucket: string,
+  keys: readonly string[],
+): Promise<void> {
+  const objects: Array<{ Key: string; VersionId?: string }> = [];
+  for (const key of [...new Set(keys)]) {
+    objects.push(...await listEveryVersion(client, bucket, key));
+  }
+  for (let offset = 0; offset < objects.length; offset += 1_000) {
+    const response = await client.send(new DeleteObjectsCommand({
+      Bucket: bucket,
+      Delete: { Quiet: true, Objects: objects.slice(offset, offset + 1_000) },
+    }));
+    if (response.Errors?.length) {
+      throw new Error(`Object storage rejected ${response.Errors.length} file deletion${response.Errors.length === 1 ? "" : "s"}`);
+    }
+  }
+}
+
+async function listEveryVersion(
+  client: Pick<S3Client, "send">,
+  bucket: string,
+  key: string,
+): Promise<Array<{ Key: string; VersionId?: string }>> {
     const objects: Array<{ Key: string; VersionId?: string }> = [];
     let keyMarker: string | undefined;
     let versionIdMarker: string | undefined;
     do {
-      const response = await this.client.send(new ListObjectVersionsCommand({
+      const response = await client.send(new ListObjectVersionsCommand({
         Bucket: bucket,
         Prefix: key,
         ...(keyMarker ? { KeyMarker: keyMarker } : {}),
@@ -99,9 +139,15 @@ export class S3FileObjectDeleter implements FileObjectDeleter {
       versionIdMarker = nextVersionIdMarker;
     } while (true);
 
-    // Unversioned buckets do not return version entries. A key-only delete is
-    // the correct physical delete for that storage mode.
-    return objects.length > 0 ? deduplicateObjects(objects) : [{ Key: key }];
+  if (objects.length > 0) return deduplicateObjects(objects);
+  // Avoid creating a fresh delete marker when a retry reaches a versioned key
+  // whose versions were removed before the durable receipt committed.
+  try {
+    await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return [{ Key: key }];
+  } catch (error) {
+    if (isMissingObject(error)) return [];
+    throw error;
   }
 }
 
@@ -115,4 +161,12 @@ function deduplicateObjects(
     seen.add(identity);
     return true;
   });
+}
+
+function isMissingObject(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { name?: unknown; $metadata?: { httpStatusCode?: unknown } };
+  return candidate.name === "NoSuchKey"
+    || candidate.name === "NotFound"
+    || candidate.$metadata?.httpStatusCode === 404;
 }

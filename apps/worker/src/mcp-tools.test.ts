@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sanitizeMcpJournalValue } from "./mcp-tools.js";
+import { durableMcpToolPolicy, sanitizeMcpJournalValue } from "./mcp-tools.js";
 
 describe("durable MCP journal serialization", () => {
   it("redacts binary content from both parts and raw result details", () => {
@@ -32,5 +32,51 @@ describe("durable MCP journal serialization", () => {
         data: "[omitted: binary MCP content is not stored in the journal]",
       },
     });
+  });
+});
+
+describe("durable MCP approval policy", () => {
+  it("never trusts a custom server's read-only annotation", () => {
+    const policy = durableMcpToolPolicy(
+      {},
+      { readOnly: true, destructive: false, idempotent: true, openWorld: false },
+      "full-access",
+    );
+
+    expect(policy).toMatchObject({
+      retryClass: "non_idempotent_manual",
+      requiresApproval: true,
+      approvalKind: "mcp",
+    });
+  });
+
+  it("allows Berry-owned read-only adapters to run without approval", () => {
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      { readOnly: true, trustedReadOnly: true, destructive: false, idempotent: true, openWorld: false },
+      "default",
+    );
+
+    expect(policy).toMatchObject({ retryClass: "read_only", requiresApproval: false });
+  });
+
+  it("always requires approval for high-impact Berry-owned connector actions", () => {
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      { readOnly: false, requiresApproval: true, destructive: false, idempotent: false, openWorld: true },
+      "full-access",
+    );
+
+    expect(policy).toMatchObject({ retryClass: "non_idempotent_manual", requiresApproval: true });
+  });
+
+  it("keeps reviewable native drafts approval-free in full-access tasks", () => {
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      { readOnly: false, destructive: false, idempotent: false, openWorld: true },
+      "full-access",
+    );
+
+    expect(policy).toMatchObject({ requiresApproval: false });
   });
 });

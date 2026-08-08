@@ -31,6 +31,8 @@ import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { MemoryService } from "../memory/memory.service.ts";
 import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { DURABLE_TURN_RUNNER_ENABLED, DurableTurnService } from "../runtime/durable-turn.service.ts";
+import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
+import { ConnectorsController, OrganizationConnectorsController } from "../connectors/connectors.controller.ts";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -50,6 +52,7 @@ export type AgentApiModuleOptions = {
   management?: ManagementModuleOptions;
   durableRunnerEnabled?: boolean;
   durableContextEnabled?: boolean;
+  connectors?: { useValue: ConnectorsService };
 };
 
 @Module({})
@@ -86,11 +89,18 @@ export class AgentApiModule {
         ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],
-      controllers: [AgentApiController, PersonalCapabilitiesController, OrganizationCapabilitiesController],
+      controllers: [AgentApiController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
       providers: [
         storeProvider,
         mobileDeviceProvider,
         sandboxWorkspaceProvider,
+        {
+          provide: CONNECTORS,
+          useValue: options.connectors?.useValue ?? {
+            list: async () => [],
+            runtime: async () => [],
+          } as unknown as ConnectorsService,
+        },
         options.personalCapabilities ? { provide: PERSONAL_CAPABILITIES, useValue: options.personalCapabilities.useValue } : { provide: PERSONAL_CAPABILITIES, useClass: PersonalCapabilitiesService },
         options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) },
         { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
@@ -139,7 +149,7 @@ export class AgentApiModule {
             new CloudRuntimeConfigService(process.env, organizationProviders),
         },
       ],
-      exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, DurableTurnService, ApiEventStreamService, CompanionPushService],
+      exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, CONNECTORS, DurableTurnService, ApiEventStreamService, CompanionPushService],
     };
   }
 }

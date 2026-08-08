@@ -88,7 +88,7 @@ jobs:
   production-integration:
     name: Production runtime integration
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     services:
       postgres:
         image: pgvector/pgvector:0.8.2-pg16-bookworm
@@ -160,6 +160,11 @@ jobs:
           BERRY_PLATFORM_DATABASE_PASSWORD: platform-integration-password
         run: node apps/api/dist/configure-service-roles.js
 
+      - name: Verify file lifecycle migration and backfill
+        env:
+          BERRY_INTEGRATION_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/berry
+        run: node apps/worker/scripts/verify-file-lifecycle-migration.mjs
+
       - name: Verify production runtime
         env:
           BERRY_INTEGRATION_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/berry
@@ -172,3 +177,16 @@ jobs:
           BERRY_INTEGRATION_REDIS_HOST: 127.0.0.1
           BERRY_INTEGRATION_REDIS_PORT: 6379
         run: node apps/worker/scripts/verify-production-runtime.mjs
+
+      - name: Install lifecycle browser engines
+        run: pnpm --filter @berry/web exec playwright install --with-deps chromium webkit
+
+      - name: Verify real file lifecycle in the browser
+        env:
+          BERRY_FILE_LIFECYCLE_E2E_REAL: "true"
+          BERRY_FILE_LIFECYCLE_E2E_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/berry
+          BERRY_FILE_LIFECYCLE_E2E_API_DATABASE_URL: postgres://berry_api:api-integration-password@127.0.0.1:5432/berry
+          BERRY_FILE_LIFECYCLE_E2E_S3_ENDPOINT: http://127.0.0.1:9000
+          BERRY_FILE_LIFECYCLE_E2E_S3_ACCESS_KEY_ID: berry
+          BERRY_FILE_LIFECYCLE_E2E_S3_SECRET_ACCESS_KEY: berry-integration-password
+        run: pnpm --filter @berry/web exec playwright test --config playwright.file-lifecycle.config.ts

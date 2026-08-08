@@ -106,6 +106,19 @@ spec:
                   name: {{ .Values.router.existingSecret }}
                   key: {{ .Values.router.durableCapabilityKeyKey }}
                   optional: true
+            {{ if .Values.connectors.enabled }}
+            - name: BERRY_CONNECTOR_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.connectors.existingSecret }}
+                  key: {{ .Values.connectors.encryptionKeyKey }}
+            - name: BERRY_CONNECTOR_DECRYPTION_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.connectors.existingSecret }}
+                  key: {{ .Values.connectors.decryptionKeysKey }}
+                  optional: true
+            {{ end }}
             - name: BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON
               valueFrom:
                 secretKeyRef:

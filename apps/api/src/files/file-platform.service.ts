@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -13,11 +13,12 @@ import {
   type HeadObjectCommandOutput,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { once } from "node:events";
 import { durableContextConfigFromEnv } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
+import { garbageCollectFileIfUnreferenced } from "./file-lifecycle.ts";
 
 export type FileStorageConfig = {
   client: S3Client;
@@ -34,6 +35,7 @@ export const FILE_STORAGE_CONFIG = Symbol("FILE_STORAGE_CONFIG");
 
 type FileRow = {
   id: string;
+  blob_id?: string | null;
   owner_user_id: string | null;
   original_name: string;
   display_name: string;
@@ -44,11 +46,18 @@ type FileRow = {
   bucket: string;
   object_key: string;
   etag: string | null;
+  object_version_id: string | null;
   origin: "user_upload" | "sandbox_output" | "image_generation" | "browser_capture" | "legacy_artifact";
   status: "initiated" | "uploading" | "scanning" | "processing" | "available" | "failed" | "quarantined" | "deleted";
   created_at: Date | string;
   updated_at: Date | string;
   deleted_at?: Date | string | null;
+  resolved_bucket?: string | null;
+  resolved_object_key?: string | null;
+  resolved_size_bytes?: string | number | null;
+  resolved_sha256?: string | null;
+  resolved_etag?: string | null;
+  resolved_object_version_id?: string | null;
   task_ids?: string[] | null;
   roles?: Array<"input" | "output" | "reference"> | null;
   workspace_id?: string | null;
@@ -57,6 +66,15 @@ type FileRow = {
   vector_ready?: boolean | null;
   failure_reason?: string | null;
 };
+
+const FILE_PHYSICAL_COLUMNS = `
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.bucket ELSE f.bucket END AS resolved_bucket,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS resolved_object_key,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.size_bytes ELSE f.size_bytes END AS resolved_size_bytes,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.sha256 ELSE f.sha256 END AS resolved_sha256,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.etag ELSE f.etag END AS resolved_etag,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END AS resolved_object_version_id
+`;
 
 type UploadRow = {
   id: string;
@@ -68,6 +86,7 @@ type UploadRow = {
   expires_at: Date | string;
   object_key: string;
   declared_size_bytes: number | string;
+  blob_id: string | null;
 };
 
 @Injectable()
@@ -83,17 +102,26 @@ export class FilePlatformService {
     const limit = Math.min(100, Math.max(1, filters.limit ?? 50));
     return this.database.withTenant(tenantId, async (executor) => {
       if (filters.workspaceId) await requireWorkspaceAccess(executor, tenantId, userId, filters.workspaceId);
-      await executor.execute(`
-        WITH expired AS (
-          UPDATE file_uploads SET status = 'expired', updated_at = now()
-          WHERE tenant_id = $1::uuid AND status = 'uploading' AND expires_at <= now()
-          RETURNING file_id
-        )
-        UPDATE files SET status = 'failed', updated_at = now()
-        WHERE tenant_id = $1::uuid AND id IN (SELECT file_id FROM expired) AND status = 'uploading'
+      const expiredUploads = await executor.query<{ file_id: string }>(`
+        UPDATE file_uploads
+        SET status = 'expired', updated_at = now()
+        WHERE tenant_id = $1::uuid AND status = 'uploading' AND expires_at <= now()
+        RETURNING file_id
       `, [tenantId]);
+      for (const upload of expiredUploads) {
+        await retireTerminalUpload(executor, tenantId, upload.file_id, {
+          status: "failed",
+          reason: "expired",
+        });
+      }
       const values: unknown[] = [tenantId, userId];
-      const where = ["f.tenant_id = $1::uuid", "f.owner_user_id = $2::uuid", "f.deleted_at IS NULL", "f.status IN ('available', 'processing')"];
+      const where = [
+        "f.tenant_id = $1::uuid",
+        "library.user_id = $2::uuid",
+        "library.deleted_at IS NULL",
+        "f.deleted_at IS NULL",
+        "f.status IN ('available', 'processing')",
+      ];
       if (filters.taskId) {
         values.push(filters.taskId);
         where.push(`EXISTS (SELECT 1 FROM file_associations task_link WHERE task_link.file_id = f.id AND task_link.task_id = $${values.length}::uuid)`);
@@ -134,22 +162,26 @@ export class FilePlatformService {
       values.push(limit + 1);
       const rows = await executor.query<FileRow>(`
         SELECT f.*,
+          ${FILE_PHYSICAL_COLUMNS},
           COALESCE(array_remove(array_agg(DISTINCT a.task_id), NULL), '{}') AS task_ids,
           COALESCE(
             array_remove(array_agg(DISTINCT a.role::text), NULL),
             ARRAY[]::text[]
           ) AS roles
         FROM files f
+        JOIN file_library_entries library
+          ON library.tenant_id = f.tenant_id AND library.file_id = f.id
+        LEFT JOIN file_blobs blob ON blob.id = f.blob_id AND blob.tenant_id = f.tenant_id
         LEFT JOIN file_associations a ON a.file_id = f.id
         WHERE ${where.join(" AND ")}
-        GROUP BY f.id
+        GROUP BY f.id, blob.id, library.id
         ORDER BY f.created_at DESC, f.id DESC
         LIMIT $${values.length}
       `, values);
       const page = rows.slice(0, limit);
       const last = page.at(-1);
       return {
-        items: page.map(fileDto),
+        items: page.map((row) => fileDto(resolvePhysicalFile(row))),
         nextCursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
       };
     });
@@ -179,6 +211,7 @@ export class FilePlatformService {
     const partCount = Math.max(1, Math.ceil(input.size / config.partSize));
     if (partCount > 10_000) throw new BadRequestException("The file requires too many upload parts");
     const fileId = randomUUID();
+    const blobId = randomUUID();
     const objectKey = `${config.prefix}/tenants/${tenantId}/users/${userId}/files/${fileId}/original/${name}`;
     const created = await config.client.send(new CreateMultipartUploadCommand({
       Bucket: config.bucket,
@@ -198,9 +231,14 @@ export class FilePlatformService {
           if (task && task.workspace_id !== input.workspaceId) throw new BadRequestException("Task and workspace do not match");
         }
         await executor.execute(`
-          INSERT INTO files (id, tenant_id, owner_user_id, original_name, display_name, media_type, size_bytes, sha256, bucket, object_key, origin, status)
-          VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4, $5, $6, $7, $8, $9, $10::file_origin, 'uploading')
-        `, [fileId, tenantId, userId, input.name, input.mediaType || "application/octet-stream", input.size, input.sha256 ?? null, config.bucket, objectKey, input.origin ?? "user_upload"]);
+          INSERT INTO file_blobs (
+            id, tenant_id, bucket, object_key, size_bytes, verification_status, metadata
+          ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, 'unverified', $6::jsonb)
+        `, [blobId, tenantId, config.bucket, objectKey, input.size, JSON.stringify({ expectedSha256: input.sha256 ?? null, source: "web-upload" })]);
+        await executor.execute(`
+          INSERT INTO files (id, tenant_id, owner_user_id, blob_id, original_name, display_name, media_type, size_bytes, sha256, bucket, object_key, origin, status)
+          VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $5, $6, $7, $8, $9, $10, $11::file_origin, 'uploading')
+        `, [fileId, tenantId, userId, blobId, input.name, input.mediaType || "application/octet-stream", input.size, input.sha256 ?? null, config.bucket, objectKey, input.origin ?? "user_upload"]);
         await executor.execute(`
           INSERT INTO file_uploads (id, tenant_id, file_id, provider_upload_id, part_size, part_count, expires_at)
           VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7)
@@ -310,6 +348,10 @@ export class FilePlatformService {
             }),
           ],
         );
+        await retireTerminalUpload(executor, tenantId, fileId, {
+          status: removed ? "failed" : "quarantined",
+          reason: "size_mismatch",
+        });
       });
       throw new BadRequestException("The uploaded object size does not match the requested upload");
     }
@@ -337,6 +379,20 @@ export class FilePlatformService {
         UPDATE files SET status = $6::file_status, size_bytes = $3, etag = $4, object_version_id = $5, updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
       `, [tenantId, fileId, actualSize, cleanEtag(head.ETag ?? completedEtag), completedVersionId ?? head.VersionId ?? null, shouldIndex ? "processing" : "available"]);
+      await reviveLibraryEntry(executor, tenantId, userId, fileId);
+      if (upload.blob_id) {
+        await executor.execute(`
+          UPDATE file_blobs
+          SET size_bytes = $3, etag = $4, object_version_id = $5,
+              verification_status = CASE
+                WHEN verification_status = 'failed' THEN 'unverified'::file_blob_verification_status
+                ELSE verification_status
+              END,
+              updated_at = now()
+          WHERE tenant_id = $1::uuid AND id = $2::uuid
+        `, [tenantId, upload.blob_id, actualSize, cleanEtag(head.ETag ?? completedEtag), completedVersionId ?? head.VersionId ?? null]);
+        await enqueueBlobVerification(executor, tenantId, upload.blob_id);
+      }
       if (workspaceFile && shouldIndex) {
         const revision = completedVersionId ?? head.VersionId ?? cleanEtag(head.ETag ?? completedEtag) ?? `upload-${uploadId}`;
         const contentHash = cleanEtag(head.ETag ?? completedEtag) ?? `file-${fileId}-${revision}`;
@@ -351,11 +407,12 @@ export class FilePlatformService {
                  jsonb_strip_nulls(jsonb_build_object(
                    'fileId', f.id,
                    'mediaType', f.media_type,
-                   'objectKey', f.object_key,
+                   'objectKey', CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END,
                    'taskId', wf.originating_task_id
                  ))
           FROM workspace_files wf
           JOIN files f ON f.id = wf.file_id
+          LEFT JOIN file_blobs blob ON blob.id = f.blob_id AND blob.tenant_id = f.tenant_id
           WHERE wf.tenant_id = $1::uuid AND wf.file_id = $3::uuid AND wf.deleted_at IS NULL
           ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
           DO UPDATE SET tombstoned_at = NULL, failure_reason = NULL, updated_at = now()
@@ -432,6 +489,7 @@ export class FilePlatformService {
       values.push(limit + 1);
       const rows = await executor.query<FileRow>(`
         SELECT f.*,
+          ${FILE_PHYSICAL_COLUMNS},
           wf.workspace_id,
           wf.visibility AS workspace_visibility,
           wf.index_status,
@@ -441,6 +499,7 @@ export class FilePlatformService {
           COALESCE(array_remove(array_agg(DISTINCT a.role::text), NULL), ARRAY[]::text[]) AS roles
         FROM workspace_files wf
         JOIN files f ON f.id = wf.file_id
+        LEFT JOIN file_blobs blob ON blob.id = f.blob_id AND blob.tenant_id = f.tenant_id
         LEFT JOIN file_associations a ON a.file_id = f.id
         LEFT JOIN LATERAL (
           SELECT ks.vector_ready, ks.failure_reason
@@ -454,14 +513,14 @@ export class FilePlatformService {
           LIMIT 1
         ) source ON true
         WHERE ${where.join(" AND ")}
-        GROUP BY f.id, wf.id, source.vector_ready, source.failure_reason
+        GROUP BY f.id, blob.id, wf.id, source.vector_ready, source.failure_reason
         ORDER BY wf.created_at DESC, wf.id DESC
         LIMIT $${values.length}
       `, values);
       const page = rows.slice(0, limit);
       const last = page.at(-1);
       return {
-        items: page.map(fileDto),
+        items: page.map((row) => fileDto(resolvePhysicalFile(row))),
         nextCursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
       };
     });
@@ -529,72 +588,32 @@ export class FilePlatformService {
           JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision }),
         ]);
       }
+      await garbageCollectFileIfUnreferenced(executor, tenantId, fileId);
       return { ok: true };
     });
   }
 
-  async deleteOwnedFile(tenantId: string, userId: string, fileId: string) {
+  async removeFromLibrary(tenantId: string, userId: string, fileId: string) {
     return this.database.withTenant(tenantId, async (executor) => {
-      const file = await this.requireOwnedFileForUpdate(executor, tenantId, userId, fileId);
-      if (file.deleted_at) return { ok: true as const };
-      const sources = await executor.query<{ id: string; source_revision: string }>(`
-        UPDATE knowledge_sources
-        SET tombstoned_at = COALESCE(tombstoned_at, now()),
-            extraction_status = 'deleted', index_status = 'deleted',
-            vector_ready = false, updated_at = now()
-        WHERE tenant_id = $1::uuid AND source_type = 'file'
-          AND source_id = $2 AND tombstoned_at IS NULL
-        RETURNING id, source_revision
-      `, [tenantId, fileId]);
-      await executor.execute(`
-        UPDATE workspace_files
-        SET deleted_at = COALESCE(deleted_at, now()), index_status = 'deleted', updated_at = now()
-        WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND deleted_at IS NULL
-      `, [tenantId, fileId]);
-      const deleted = await executor.query<{ id: string }>(`
-        UPDATE files
-        SET status = 'deleted', deleted_at = now(), updated_at = now()
-        WHERE tenant_id = $1::uuid AND id = $2::uuid
-          AND owner_user_id = $3::uuid AND deleted_at IS NULL
-        RETURNING id
+      const [membership] = await executor.query<{ file_id: string; deleted_at: Date | string | null }>(`
+        SELECT library.file_id, library.deleted_at
+        FROM files f
+        JOIN file_library_entries library
+          ON library.tenant_id = f.tenant_id AND library.file_id = f.id
+        WHERE f.tenant_id = $1::uuid AND f.id = $2::uuid
+          AND library.user_id = $3::uuid
+        FOR UPDATE OF f, library
       `, [tenantId, fileId, userId]);
-      if (!deleted[0]) throw new NotFoundException("File not found");
-      // Tombstoning the source above takes the same row lock used when an
-      // extraction is saved. Query derivatives only after that lock is held:
-      // an extraction that won the race is now visible, while an extraction
-      // that lost the race will enqueue its own object cleanup.
-      const derivatives = await executor.query<{ object_key: string }>(`
-        SELECT object_key
-        FROM file_derivatives
-        WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND object_key IS NOT NULL
-      `, [tenantId, fileId]);
-      for (const source of sources) {
+      if (!membership) throw new NotFoundException("File not found");
+      if (!membership.deleted_at) {
         await executor.execute(`
-          INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
-          VALUES ($1::uuid, 'knowledge.delete', $2, $3, $4::jsonb)
-          ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
-        `, [
-          tenantId,
-          source.id,
-          `knowledge.delete:${source.id}:${source.source_revision}`,
-          JSON.stringify({ tenantId, sourceId: source.id, revision: source.source_revision }),
-        ]);
+          UPDATE file_library_entries
+          SET deleted_at = now(), updated_at = now()
+          WHERE tenant_id = $1::uuid AND user_id = $2::uuid
+            AND file_id = $3::uuid AND deleted_at IS NULL
+        `, [tenantId, userId, fileId]);
       }
-      const keys = [...new Set([file.object_key, ...derivatives.map((item) => item.object_key)])];
-      for (let offset = 0; offset < keys.length; offset += 1_000) {
-        const batch = keys.slice(offset, offset + 1_000);
-        const batchNumber = Math.floor(offset / 1_000);
-        await executor.execute(`
-          INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
-          VALUES ($1::uuid, 'file.delete-object', $2, $3, $4::jsonb)
-          ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
-        `, [
-          tenantId,
-          fileId,
-          `file.delete-object:${fileId}:${batchNumber}`,
-          JSON.stringify({ tenantId, fileId, bucket: file.bucket, keys: batch }),
-        ]);
-      }
+      await garbageCollectFileIfUnreferenced(executor, tenantId, fileId);
       return { ok: true as const };
     });
   }
@@ -602,10 +621,23 @@ export class FilePlatformService {
   async abortUpload(tenantId: string, userId: string, fileId: string, uploadId: string) {
     const config = this.requireConfig();
     const upload = await this.requireUpload(tenantId, userId, fileId, uploadId);
-    await config.client.send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: upload.object_key, UploadId: upload.provider_upload_id }));
+    if (upload.status !== "uploading") throw new BadRequestException("Upload is already complete");
+    await config.client.send(new AbortMultipartUploadCommand({
+      Bucket: config.bucket,
+      Key: upload.object_key,
+      UploadId: upload.provider_upload_id,
+    })).catch((error) => {
+      // A previous request can successfully abort at the provider and lose its
+      // database response. Treat the provider's missing-upload result as an
+      // idempotent retry, but preserve every other storage failure for retry.
+      if (!isNoSuchUpload(error)) throw error;
+    });
     await this.database.withTenant(tenantId, async (executor) => {
       await executor.execute(`UPDATE file_uploads SET status = 'aborted', aborted_at = now(), updated_at = now() WHERE tenant_id = $1::uuid AND id = $2::uuid`, [tenantId, uploadId]);
-      await executor.execute(`UPDATE files SET status = 'failed', updated_at = now() WHERE tenant_id = $1::uuid AND id = $2::uuid`, [tenantId, fileId]);
+      await retireTerminalUpload(executor, tenantId, fileId, {
+        status: "failed",
+        reason: "aborted",
+      });
     });
     return { ok: true };
   }
@@ -614,8 +646,9 @@ export class FilePlatformService {
     if (input.fileIds.length === 0) return;
     await this.database.withTenant(tenantId, async (executor) => {
       await requireTask(executor, tenantId, input.taskId, userId);
-      for (const fileId of [...new Set(input.fileIds)]) {
-        await this.requireOwnedFile(executor, tenantId, userId, fileId);
+      for (const fileId of [...new Set(input.fileIds)].sort()) {
+        await lockFileForReference(executor, tenantId, fileId);
+        await this.requireAccessibleFile(executor, tenantId, userId, fileId);
         await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, ...(input.messageId ? { messageId: input.messageId } : {}), role: "input", userId });
       }
     });
@@ -632,11 +665,19 @@ export class FilePlatformService {
       }
       const file = await this.get(tenantId, userId, fileId);
       if (file.status !== "available" && file.status !== "processing") throw new BadRequestException(`File ${file.display_name} is not available`);
-      const remoteUrl = await getSignedUrl(config.presignClient, new GetObjectCommand({ Bucket: file.bucket, Key: file.object_key }), { expiresIn: config.presignSeconds });
+      const remoteUrl = await getSignedUrl(config.presignClient, new GetObjectCommand({
+        Bucket: file.bucket,
+        Key: file.object_key,
+        ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+      }), { expiresIn: config.presignSeconds });
       const mediaType = file.detected_media_type ?? file.media_type;
       let dataUrl = attachment.dataUrl ?? null;
       if (!dataUrl && mediaType.startsWith("image/") && Number(file.size_bytes) <= 25 * 1024 * 1024) {
-        const image = await config.client.send(new GetObjectCommand({ Bucket: file.bucket, Key: file.object_key }));
+        const image = await config.client.send(new GetObjectCommand({
+          Bucket: file.bucket,
+          Key: file.object_key,
+          ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+        }));
         if (image.Body) dataUrl = `data:${mediaType};base64,${Buffer.from(await image.Body.transformToByteArray()).toString("base64")}`;
       }
       resolved.push({
@@ -658,22 +699,58 @@ export class FilePlatformService {
   async registerSandboxOutput(tenantId: string, userId: string, input: { key: string; name: string; mediaType: string; size?: number; taskId: string; sessionId: string; turnId?: string; origin?: "sandbox_output" | "image_generation" | "browser_capture" }) {
     const config = this.requireConfig();
     if (!input.key.startsWith(`${config.prefix}/`) || input.key.includes("..") || input.key.includes("\\")) throw new BadRequestException("Invalid artifact object key");
+    const stableFileId = sandboxArtifactFileId(config.prefix, input.key);
+    if (!stableFileId) {
+      throw new BadRequestException("Artifact object key does not contain a stable logical file id");
+    }
     const head = await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: input.key }));
     return this.database.withTenant(tenantId, async (executor) => {
-      const rows = await executor.query<FileRow>(`
-        INSERT INTO files (tenant_id, owner_user_id, original_name, display_name, media_type, size_bytes, bucket, object_key, etag, origin, status)
-        VALUES ($1::uuid, $2::uuid, $3, $3, $4, $5, $6, $7, $8, $9::file_origin, 'available')
-        ON CONFLICT (tenant_id, object_key) DO UPDATE SET
-          owner_user_id = EXCLUDED.owner_user_id,
-          display_name = EXCLUDED.display_name,
-          media_type = EXCLUDED.media_type,
-          size_bytes = EXCLUDED.size_bytes,
-          etag = EXCLUDED.etag,
-          status = 'available',
-          updated_at = now()
-        RETURNING *
-      `, [tenantId, userId, input.name, input.mediaType, Number(head.ContentLength ?? input.size ?? 0), config.bucket, input.key, cleanEtag(head.ETag), input.origin ?? "sandbox_output"]);
-      const file = rows[0]!;
+      const existing = await executor.query<FileRow>(`
+        SELECT f.*, ${FILE_PHYSICAL_COLUMNS}
+        FROM files f
+        LEFT JOIN file_blobs blob ON blob.id = f.blob_id AND blob.tenant_id = f.tenant_id
+        WHERE f.tenant_id = $1::uuid AND (f.id = $2::uuid OR f.object_key = $3)
+        ORDER BY f.id
+        FOR UPDATE OF f
+      `, [tenantId, stableFileId, input.key]);
+      if (existing.length > 0 && (existing.length !== 1
+        || existing[0]!.id !== stableFileId
+        || existing[0]!.owner_user_id !== userId
+        || existing[0]!.object_key !== input.key)) {
+        throw new ConflictException("Artifact identity conflicts with an existing file");
+      }
+      const logicalFile = existing[0] ?? null;
+      if (logicalFile && (Number(logicalFile.size_bytes) !== Number(head.ContentLength ?? input.size ?? 0)
+        || logicalFile.bucket !== config.bucket
+        || logicalFile.object_key !== input.key
+        || logicalFile.etag !== cleanEtag(head.ETag)
+        || (logicalFile.object_version_id ?? null) !== (head.VersionId ?? null))) {
+        throw new ConflictException("Artifact key content changed; register a new object key");
+      }
+      // Deduplication may move the logical file to a different canonical blob.
+      // Retry identity is checked against the rollback-compatible logical
+      // columns above; reads still resolve through the canonical blob below.
+      let file = logicalFile ? resolvePhysicalFile(logicalFile) : null;
+      if (!file) {
+        const blobId = randomUUID();
+        await executor.execute(`
+          INSERT INTO file_blobs (
+            id, tenant_id, bucket, object_key, size_bytes, etag, object_version_id,
+            verification_status, metadata
+          ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, 'unverified', $8::jsonb)
+        `, [blobId, tenantId, config.bucket, input.key, Number(head.ContentLength ?? input.size ?? 0), cleanEtag(head.ETag), head.VersionId ?? null, JSON.stringify({ source: "sandbox-output" })]);
+        const rows = await executor.query<FileRow>(`
+          INSERT INTO files (
+            id, tenant_id, owner_user_id, blob_id, original_name, display_name,
+            media_type, size_bytes, bucket, object_key, etag, object_version_id, origin, status
+          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $5, $6, $7, $8, $9, $10, $11, $12::file_origin, 'available')
+          RETURNING *
+        `, [stableFileId, tenantId, userId, blobId, input.name, input.mediaType, Number(head.ContentLength ?? input.size ?? 0), config.bucket, input.key, cleanEtag(head.ETag), head.VersionId ?? null, input.origin ?? "sandbox_output"]);
+        file = rows[0] ?? null;
+        if (!file) throw new Error("Unable to register sandbox output");
+        await enqueueBlobVerification(executor, tenantId, blobId);
+      }
+      await reviveLibraryEntry(executor, tenantId, userId, file.id);
       await associate(executor, { tenantId, fileId: file.id, taskId: input.taskId, sessionId: input.sessionId, ...(input.turnId ? { turnId: input.turnId } : {}), role: "output", userId });
       return fileDto({ ...file, task_ids: [input.taskId], roles: ["output"] });
     });
@@ -690,10 +767,12 @@ export class FilePlatformService {
     const config = this.requireConfig();
     const name = safeFileName(input.name);
     const bytes = Buffer.from(input.data, "base64");
+    const expectedSha256 = createHash("sha256").update(bytes).digest("hex");
     if (bytes.length === 0 || bytes.length > config.maxUploadBytes) {
       throw new BadRequestException(`Generated images are limited to ${config.maxUploadBytes} bytes`);
     }
     const fileId = randomUUID();
+    const blobId = randomUUID();
     const objectKey = `${config.prefix}/tenants/${tenantId}/users/${userId}/files/${fileId}/original/${name}`;
     const stored = await config.client.send(new PutObjectCommand({
       Bucket: config.bucket,
@@ -704,12 +783,20 @@ export class FilePlatformService {
     }));
     return this.database.withTenant(tenantId, async (executor) => {
       await requireTask(executor, tenantId, input.taskId, userId);
+      await executor.execute(`
+        INSERT INTO file_blobs (
+          id, tenant_id, bucket, object_key, size_bytes, etag, object_version_id,
+          verification_status, metadata
+        ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, 'unverified', $8::jsonb)
+      `, [blobId, tenantId, config.bucket, objectKey, bytes.length, cleanEtag(stored.ETag), stored.VersionId ?? null, JSON.stringify({ source: "image-generation", expectedSha256 })]);
       const rows = await executor.query<FileRow>(`
-        INSERT INTO files (id, tenant_id, owner_user_id, original_name, display_name, media_type, size_bytes, bucket, object_key, etag, origin, status)
-        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4, $5, $6, $7, $8, $9, 'image_generation', 'available')
+        INSERT INTO files (id, tenant_id, owner_user_id, blob_id, original_name, display_name, media_type, size_bytes, bucket, object_key, etag, object_version_id, origin, status)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $5, $6, $7, $8, $9, $10, $11, 'image_generation', 'available')
         RETURNING *
-      `, [fileId, tenantId, userId, name, input.mediaType, bytes.length, config.bucket, objectKey, cleanEtag(stored.ETag)]);
+      `, [fileId, tenantId, userId, blobId, name, input.mediaType, bytes.length, config.bucket, objectKey, cleanEtag(stored.ETag), stored.VersionId ?? null]);
       const file = rows[0]!;
+      await reviveLibraryEntry(executor, tenantId, userId, fileId);
+      await enqueueBlobVerification(executor, tenantId, blobId);
       await associate(executor, {
         tenantId,
         fileId,
@@ -727,7 +814,12 @@ export class FilePlatformService {
     const config = this.requireConfig();
     const file = await this.get(tenantId, userId, fileId);
     if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
-    const object = await config.client.send(new GetObjectCommand({ Bucket: file.bucket, Key: file.object_key, ...(range ? { Range: range } : {}) }));
+    const object = await config.client.send(new GetObjectCommand({
+      Bucket: file.bucket,
+      Key: file.object_key,
+      ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+      ...(range ? { Range: range } : {}),
+    }));
     if (!object.Body) throw new NotFoundException("File content is unavailable");
     response.statusCode = object.ContentRange ? 206 : 200;
     response.setHeader("Content-Type", object.ContentType ?? file.media_type);
@@ -749,59 +841,27 @@ export class FilePlatformService {
 
   private async requireUpload(tenantId: string, userId: string, fileId: string, uploadId: string): Promise<UploadRow> {
     return this.database.withTenant(tenantId, async (executor) => {
-      await this.requireOwnedFile(executor, tenantId, userId, fileId);
       const [row] = await executor.query<UploadRow>(`
-        SELECT u.*, f.object_key, f.size_bytes AS declared_size_bytes
-        FROM file_uploads u JOIN files f ON f.id = u.file_id
+        SELECT u.*,
+          CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END AS object_key,
+          f.size_bytes AS declared_size_bytes,
+          f.blob_id
+        FROM file_uploads u
+        JOIN files f ON f.id = u.file_id
+        LEFT JOIN file_blobs blob ON blob.id = f.blob_id AND blob.tenant_id = f.tenant_id
         WHERE u.tenant_id = $1::uuid AND u.id = $2::uuid AND u.file_id = $3::uuid
+          AND f.tenant_id = u.tenant_id AND f.owner_user_id = $4::uuid AND f.deleted_at IS NULL
           AND (u.status = 'completed' OR (u.status = 'uploading' AND u.expires_at > now()))
-      `, [tenantId, uploadId, fileId]);
+      `, [tenantId, uploadId, fileId, userId]);
       if (!row) throw new NotFoundException("Upload session not found or expired");
       return row;
     });
   }
 
-  private async requireOwnedFile(
-    executor: SqlExecutor,
-    tenantId: string,
-    userId: string,
-    fileId: string,
-  ): Promise<FileRow> {
-    const [row] = await executor.query<FileRow>(`
-      SELECT f.*,
-        COALESCE(array_remove(array_agg(DISTINCT a.task_id), NULL), '{}') AS task_ids,
-        COALESCE(
-          array_remove(array_agg(DISTINCT a.role::text), NULL),
-          ARRAY[]::text[]
-        ) AS roles
-      FROM files f LEFT JOIN file_associations a ON a.file_id = f.id
-      WHERE f.tenant_id = $1::uuid AND f.owner_user_id = $2::uuid AND f.id = $3::uuid
-        AND f.deleted_at IS NULL
-      GROUP BY f.id
-    `, [tenantId, userId, fileId]);
-    if (!row) throw new NotFoundException("File not found");
-    return row;
-  }
-
-  private async requireOwnedFileForUpdate(
-    executor: SqlExecutor,
-    tenantId: string,
-    userId: string,
-    fileId: string,
-  ): Promise<FileRow> {
-    const [row] = await executor.query<FileRow>(`
-      SELECT f.*
-      FROM files f
-      WHERE f.tenant_id = $1::uuid AND f.owner_user_id = $2::uuid AND f.id = $3::uuid
-      FOR UPDATE
-    `, [tenantId, userId, fileId]);
-    if (!row) throw new NotFoundException("File not found");
-    return row;
-  }
-
   private async requireAccessibleFile(executor: SqlExecutor, tenantId: string, userId: string, fileId: string): Promise<FileRow> {
     const [row] = await executor.query<FileRow>(`
       SELECT f.*,
+        ${FILE_PHYSICAL_COLUMNS},
         project_link.workspace_id,
         project_link.visibility AS workspace_visibility,
         project_link.index_status,
@@ -810,12 +870,16 @@ export class FilePlatformService {
         COALESCE(array_remove(array_agg(DISTINCT a.task_id), NULL), '{}') AS task_ids,
         COALESCE(array_remove(array_agg(DISTINCT a.role::text), NULL), ARRAY[]::text[]) AS roles
       FROM files f
+      LEFT JOIN file_blobs blob ON blob.id = f.blob_id AND blob.tenant_id = f.tenant_id
       LEFT JOIN file_associations a ON a.file_id = f.id
       LEFT JOIN LATERAL (
         SELECT wf.workspace_id, wf.visibility, wf.index_status
         FROM workspace_files wf
-        JOIN workspaces w ON w.id = wf.workspace_id
-        WHERE wf.tenant_id = f.tenant_id AND wf.file_id = f.id AND wf.deleted_at IS NULL
+        JOIN workspaces w
+          ON w.tenant_id = wf.tenant_id
+         AND w.id = wf.workspace_id
+        WHERE wf.tenant_id = f.tenant_id AND wf.file_id = f.id
+          AND wf.deleted_at IS NULL AND w.deleted_at IS NULL
           AND (
             w.owner_id = $2::uuid OR w.owner_id IS NULL OR
             EXISTS (
@@ -828,8 +892,10 @@ export class FilePlatformService {
             wf.visibility = 'project' OR
             EXISTS (
               SELECT 1 FROM tasks access_task
-              WHERE access_task.id = wf.originating_task_id
+              WHERE access_task.tenant_id = wf.tenant_id
+                AND access_task.id = wf.originating_task_id
                 AND (access_task.user_id = $2::uuid OR access_task.user_id IS NULL)
+                AND access_task.deleted_at IS NULL
             )
           )
         ORDER BY wf.created_at ASC
@@ -843,17 +909,59 @@ export class FilePlatformService {
         ORDER BY ks.created_at DESC LIMIT 1
       ) source ON true
       WHERE f.tenant_id = $1::uuid AND f.id = $3::uuid AND f.deleted_at IS NULL
-        AND (f.owner_user_id = $2::uuid OR project_link.workspace_id IS NOT NULL)
-      GROUP BY f.id, project_link.workspace_id, project_link.visibility,
+        AND (
+          EXISTS (
+            SELECT 1 FROM file_library_entries library
+            WHERE library.tenant_id = f.tenant_id AND library.file_id = f.id
+              AND library.user_id = $2::uuid AND library.deleted_at IS NULL
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM file_associations access_link
+            LEFT JOIN sessions access_session
+              ON access_session.tenant_id = access_link.tenant_id
+             AND access_session.id = access_link.session_id
+            LEFT JOIN tasks access_task
+              ON access_task.tenant_id = access_link.tenant_id
+             AND access_task.id = COALESCE(access_link.task_id, access_session.task_id)
+            WHERE access_link.tenant_id = f.tenant_id
+              AND access_link.file_id = f.id
+              AND access_task.id IS NOT NULL
+              AND (
+                access_task.user_id = $2::uuid OR
+                (access_task.user_id IS NULL AND access_task.deleted_at IS NULL)
+              )
+          )
+          OR project_link.workspace_id IS NOT NULL
+        )
+      GROUP BY f.id, blob.id, project_link.workspace_id, project_link.visibility,
                project_link.index_status, source.vector_ready, source.failure_reason
     `, [tenantId, userId, fileId]);
     if (!row) throw new NotFoundException("File not found");
-    return row;
+    return resolvePhysicalFile(row);
   }
+}
+
+function sandboxArtifactFileId(prefix: string, objectKey: string): string | null {
+  const relative = objectKey.slice(prefix.length + 1);
+  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+  const leading = relative.match(new RegExp(`^(${uuid})(?:-|/)`, "i"));
+  if (leading?.[1]) return leading[1].toLowerCase();
+  const namespaced = relative.match(new RegExp(`(?:^|/)files/(${uuid})(?:/|$)`, "i"));
+  return namespaced?.[1]?.toLowerCase() ?? null;
 }
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[%_\\]/g, "\\$&");
+}
+
+function isNoSuchUpload(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { name?: unknown; code?: unknown; Code?: unknown; message?: unknown };
+  return candidate.name === "NoSuchUpload"
+    || candidate.code === "NoSuchUpload"
+    || candidate.Code === "NoSuchUpload"
+    || (typeof candidate.message === "string" && /\bNoSuchUpload\b/.test(candidate.message));
 }
 
 function expectedPartBytes(upload: UploadRow, partNumber: number): number {
@@ -887,6 +995,71 @@ function fileDto(row: FileRow) {
   };
 }
 
+function resolvePhysicalFile(row: FileRow): FileRow {
+  if (!row.blob_id) return row;
+  if (!row.resolved_bucket || !row.resolved_object_key) {
+    throw new Error(`File ${row.id} has an invalid blob reference`);
+  }
+  return {
+    ...row,
+    bucket: row.resolved_bucket,
+    object_key: row.resolved_object_key,
+    size_bytes: row.resolved_size_bytes ?? row.size_bytes,
+    sha256: row.resolved_sha256 ?? null,
+    etag: row.resolved_etag ?? null,
+    object_version_id: row.resolved_object_version_id ?? null,
+  };
+}
+
+async function reviveLibraryEntry(executor: SqlExecutor, tenantId: string, userId: string, fileId: string): Promise<void> {
+  await executor.execute(`
+    INSERT INTO file_library_entries (tenant_id, user_id, file_id)
+    VALUES ($1::uuid, $2::uuid, $3::uuid)
+    ON CONFLICT (tenant_id, user_id, file_id) DO UPDATE
+    SET deleted_at = NULL, updated_at = now()
+  `, [tenantId, userId, fileId]);
+}
+
+async function enqueueBlobVerification(executor: SqlExecutor, tenantId: string, blobId: string): Promise<void> {
+  await executor.execute(`
+    INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+    VALUES ($1::uuid, 'file.verify-blob', $2, $3, $4::jsonb)
+    ON CONFLICT (tenant_id, dedupe_key) DO UPDATE SET
+      completed_at = NULL, available_at = now(), last_error = NULL, updated_at = now()
+  `, [tenantId, blobId, `file.verify-blob:${blobId}`, JSON.stringify({ tenantId, blobId })]);
+}
+
+async function retireTerminalUpload(
+  executor: SqlExecutor,
+  tenantId: string,
+  fileId: string,
+  input: { status: "failed" | "quarantined"; reason: "aborted" | "expired" | "size_mismatch" },
+): Promise<void> {
+  await executor.execute(`
+    UPDATE files
+    SET status = $3::file_status,
+        metadata = metadata || jsonb_build_object('uploadFailure', $4::text),
+        updated_at = now()
+    WHERE tenant_id = $1::uuid AND id = $2::uuid AND deleted_at IS NULL
+  `, [tenantId, fileId, input.status, input.reason]);
+  await executor.execute(`
+    UPDATE file_library_entries
+    SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+    WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND deleted_at IS NULL
+  `, [tenantId, fileId]);
+  await executor.execute(`
+    DELETE FROM file_associations
+    WHERE tenant_id = $1::uuid AND file_id = $2::uuid
+  `, [tenantId, fileId]);
+  await executor.execute(`
+    UPDATE workspace_files
+    SET deleted_at = COALESCE(deleted_at, now()),
+        index_status = 'deleted', updated_at = now()
+    WHERE tenant_id = $1::uuid AND file_id = $2::uuid AND deleted_at IS NULL
+  `, [tenantId, fileId]);
+  await garbageCollectFileIfUnreferenced(executor, tenantId, fileId);
+}
+
 async function requireTask(executor: SqlExecutor, tenantId: string, taskId: string, userId: string) {
   const [task] = await executor.query<{ id: string; workspace_id: string }>(`
     SELECT id, workspace_id
@@ -917,11 +1090,54 @@ async function requireWorkspaceAccess(executor: SqlExecutor, tenantId: string, u
 }
 
 async function associate(executor: SqlExecutor, input: { tenantId: string; fileId: string; taskId?: string; sessionId?: string; messageId?: string; turnId?: string; role: string; userId: string }) {
+  const file = await lockFileForReference(executor, input.tenantId, input.fileId);
+  if (file.blob_id) {
+    await executor.execute(`
+      UPDATE file_blobs
+      SET verification_status = CASE
+            WHEN sha256 IS NULL THEN 'unverified'::file_blob_verification_status
+            ELSE 'verified'::file_blob_verification_status
+          END,
+          delete_after = NULL, updated_at = now()
+      WHERE tenant_id = $1::uuid AND id = $2::uuid
+        AND verification_status = 'pending_delete' AND deleted_at IS NULL
+    `, [input.tenantId, file.blob_id]);
+    await executor.execute(`
+      UPDATE runtime_outbox
+      SET completed_at = COALESCE(completed_at, now()),
+          last_error = 'Cancelled because a file reference was added', updated_at = now()
+      WHERE tenant_id = $1::uuid AND aggregate_id = $2
+        AND event_type = 'file.delete-blob' AND completed_at IS NULL
+    `, [input.tenantId, file.blob_id]);
+  }
   await executor.execute(`
     INSERT INTO file_associations (tenant_id, file_id, task_id, session_id, message_id, turn_id, role, created_by_user_id)
     VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7::file_association_role, $8::uuid)
     ON CONFLICT DO NOTHING
   `, [input.tenantId, input.fileId, input.taskId ?? null, input.sessionId ?? null, input.messageId ?? null, input.turnId ?? null, input.role, input.userId]);
+}
+
+async function lockFileForReference(
+  executor: SqlExecutor,
+  tenantId: string,
+  fileId: string,
+): Promise<{ id: string; blob_id: string | null }> {
+  const [file] = await executor.query<{ id: string; blob_id: string | null }>(`
+    SELECT f.id, f.blob_id
+    FROM files f
+    LEFT JOIN file_blobs blob
+      ON blob.tenant_id = f.tenant_id AND blob.id = f.blob_id
+    WHERE f.tenant_id = $1::uuid AND f.id = $2::uuid AND f.deleted_at IS NULL
+      AND (
+        f.blob_id IS NULL OR (
+          blob.id IS NOT NULL AND blob.deleted_at IS NULL
+          AND blob.verification_status <> 'deleted'
+        )
+      )
+    FOR UPDATE OF f
+  `, [tenantId, fileId]);
+  if (!file) throw new NotFoundException("File not found");
+  return file;
 }
 
 function safeFileName(value: string): string {

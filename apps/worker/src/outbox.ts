@@ -1,5 +1,6 @@
 import {
   BerryWorkerJobNameSchema,
+  FileDeleteBlobJobPayloadSchema,
   FileDeleteObjectJobPayloadSchema,
   SandboxSnapshotJobPayloadSchema,
   type BerryWorkerJobMap,
@@ -153,13 +154,18 @@ export class RuntimeOutboxDispatcher {
                 ...(isRecord(row.payload) ? row.payload : {}),
                 outboxId: row.id,
               })
+            : name === "file.delete-blob"
+              ? FileDeleteBlobJobPayloadSchema.parse({
+                  ...(isRecord(row.payload) ? row.payload : {}),
+                  outboxId: row.id,
+                })
             : row.payload as BerryWorkerJobMap[typeof name];
           await this.queue.enqueue(
             name,
             payload as BerryWorkerJobMap[typeof name],
             { jobId: outboxJobId(name, row.id, row.attempts) },
           );
-          if (name === "file.delete-object") await this.deferForDeliveryReceipt(row);
+          if (name === "file.delete-object" || name === "file.delete-blob" || name === "file.verify-blob") await this.deferForDeliveryReceipt(row);
           else await this.complete(row);
           dispatched += 1;
         } catch (error) {
@@ -216,7 +222,7 @@ export class RuntimeOutboxDispatcher {
         UPDATE runtime_outbox
         SET lease_owner = NULL, lease_expires_at = NULL,
             available_at = now() + ($4::bigint * interval '1 millisecond'),
-            last_error = 'Awaiting object-deletion receipt', updated_at = now()
+            last_error = 'Awaiting worker delivery receipt', updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
           AND lease_owner = $3 AND completed_at IS NULL
       `, [row.tenant_id, row.id, this.options.workerId, retryMs]);
@@ -270,7 +276,9 @@ export class RuntimeOutboxDispatcher {
 
 export function outboxJobId(name: BerryWorkerJobName, outboxId: string, attempt = 1): string {
   const base = `outbox-${name.replaceAll(".", "-")}-${outboxId}`;
-  return name === "file.delete-object" ? `${base}-delivery-${attempt}` : base;
+  return name === "file.delete-object" || name === "file.delete-blob" || name === "file.verify-blob"
+    ? `${base}-delivery-${attempt}`
+    : base;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

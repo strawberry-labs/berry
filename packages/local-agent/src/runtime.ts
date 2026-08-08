@@ -1306,7 +1306,9 @@ export class BerryAgentRuntime {
     abortHarness: AgentHarness,
     event: { toolName: string; toolCallId: string; input: unknown },
   ): Promise<{ block: true; reason: string } | undefined> {
-    const risk = riskForToolName(event.toolName);
+    const policyState = this.#sessions.get(sessionId);
+    const mcpApprovalHints = event.toolName.startsWith("mcp__") ? policyState?.mcp?.approvalHints(event.toolName) : undefined;
+    const risk = mcpApprovalHints?.trustedReadOnly ? "read" : riskForToolName(event.toolName);
     const rawInput = event.input as Record<string, unknown>;
     const webMethod = event.toolName === "web_search" ? "web.search" : event.toolName === "fetch_url" ? "web.fetch" : null;
     const trustedWebUrl = webMethod ? active.web?.approvalUrl(webMethod, rawInput) : null;
@@ -1319,7 +1321,6 @@ export class BerryAgentRuntime {
         ? { ...rawInput, url: trustedBrowserUrl }
         : rawInput;
     const summary = summarizeToolInput(event.toolName, guardedInput);
-    const policyState = this.#sessions.get(sessionId);
     const guardRequest: ToolGuardRequest = {
       ...(active.workspaceId ? { workspaceId: active.workspaceId } : {}),
       permissionMode: active.permissionMode,
@@ -1330,6 +1331,7 @@ export class BerryAgentRuntime {
       sandboxPolicy: active.sandboxPolicy,
       ...(policyState ? { workspacePath: policyState.workspacePath, execPolicyRules: policyState.execPolicyRules } : {}),
       ...(policyState ? { networkPolicy: policyState.networkPolicy } : {}),
+      ...(mcpApprovalHints?.requiresApproval ? { requiresApproval: true } : {}),
     };
     const decision = this.#guard.decide(guardRequest);
     active.decisionTraces.set(event.toolCallId, decision.trace);
@@ -1339,7 +1341,7 @@ export class BerryAgentRuntime {
       return { block: true, reason: decision.reason };
     }
     const approvalId = createId("approval");
-    const presentation = approvalPresentation(event.toolName, guardedInput, summary, policyState?.workspacePath, policyState?.mcp?.approvalHints(event.toolName));
+    const presentation = approvalPresentation(event.toolName, guardedInput, summary, policyState?.workspacePath, mcpApprovalHints);
     active.approvalsByToolCall.set(event.toolCallId, approvalId);
     this.#emit(active, {
       kind: "approval.request",

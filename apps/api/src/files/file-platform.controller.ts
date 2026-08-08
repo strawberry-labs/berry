@@ -120,7 +120,7 @@ export class FilePlatformController {
 
   @Delete(":fileId")
   remove(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string) {
-    return this.files.deleteOwnedFile(tenant(), user(request), parse(z.string().uuid(), fileId));
+    return this.files.removeFromLibrary(tenant(), user(request), parse(z.string().uuid(), fileId));
   }
 }
 

@@ -232,6 +232,74 @@
   object-fit: cover;
 }
 
+.thumbnailUnavailable {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--berry-text-secondary);
+  background: var(--berry-surface-raised);
+}
+
+.thumbnailUnavailable svg {
+  width: 18px;
+  height: 18px;
+}
+
+.unavailable {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 180px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 5px;
+  padding: 24px;
+  color: var(--berry-text-secondary);
+  background: var(--berry-surface-raised);
+  text-align: center;
+}
+
+.unavailable > svg {
+  width: 28px;
+  height: 28px;
+  margin-bottom: 5px;
+  color: var(--berry-text-secondary);
+}
+
+.unavailable strong {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--berry-text-primary);
+  font-size: 14px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unavailable span {
+  font-size: 12px;
+  font-weight: 560;
+}
+
+.unavailable p {
+  max-width: 320px;
+  margin: 0;
+  color: var(--berry-text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.lightboxUnavailable {
+  width: min(100%, 720px);
+  max-height: calc(100dvh - 190px);
+  overflow: hidden;
+  border: 1px solid var(--berry-border);
+  border-radius: 16px;
+}
+
 .lightbox {
   z-index: 120 !important;
   display: flex !important;

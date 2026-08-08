@@ -324,6 +324,101 @@ export const DurableSecretEnvelopeSchema = z.object({
 }).strict();
 export type DurableSecretEnvelope = z.infer<typeof DurableSecretEnvelopeSchema>;
 
+/**
+ * Record-bound envelope used for long-lived connector credentials. The key id
+ * is not secret; it lets operators rotate the root key without guessing which
+ * key can open a row. Additional authenticated data prevents ciphertext from
+ * being copied to another tenant, connector, or credential purpose.
+ */
+export const ConnectorSecretEnvelopeSchema = z.object({
+  version: z.literal(2),
+  algorithm: z.literal("AES-GCM"),
+  keyId: z.string().regex(/^[A-Za-z0-9_-]{16}$/),
+  iv: z.string().min(1),
+  ciphertext: z.string().min(1),
+}).strict();
+export type ConnectorSecretEnvelope = z.infer<typeof ConnectorSecretEnvelopeSchema>;
+
+export async function sealConnectorSecret(
+  plaintext: string,
+  encodedKey: string,
+  authenticatedContext: string,
+): Promise<ConnectorSecretEnvelope> {
+  const keyBytes = connectorKeyBytes(encodedKey);
+  const key = await globalThis.crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"],
+  );
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(new ArrayBuffer(12)));
+  const ciphertext = await globalThis.crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv,
+      additionalData: new TextEncoder().encode(authenticatedContext),
+    },
+    key,
+    new TextEncoder().encode(plaintext),
+  );
+  return ConnectorSecretEnvelopeSchema.parse({
+    version: 2,
+    algorithm: "AES-GCM",
+    keyId: await connectorKeyId(keyBytes),
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
+  });
+}
+
+export async function openConnectorSecret(
+  envelope: ConnectorSecretEnvelope,
+  encodedKeys: string | readonly string[],
+  authenticatedContext: string,
+): Promise<string> {
+  const parsed = ConnectorSecretEnvelopeSchema.parse(envelope);
+  const candidates = typeof encodedKeys === "string" ? [encodedKeys] : [...encodedKeys];
+  for (const encodedKey of candidates) {
+    const keyBytes = connectorKeyBytes(encodedKey);
+    if (await connectorKeyId(keyBytes) !== parsed.keyId) continue;
+    const key = await globalThis.crypto.subtle.importKey(
+      "raw",
+      keyBytes,
+      { name: "AES-GCM" },
+      false,
+      ["decrypt"],
+    );
+    try {
+      const plaintext = await globalThis.crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: base64ToBytes(parsed.iv),
+          additionalData: new TextEncoder().encode(authenticatedContext),
+        },
+        key,
+        base64ToBytes(parsed.ciphertext),
+      );
+      return new TextDecoder().decode(plaintext);
+    } catch {
+      throw new Error("Connector secret authentication failed");
+    }
+  }
+  throw new Error(`Connector encryption key ${parsed.keyId} is not configured`);
+}
+
+function connectorKeyBytes(encodedKey: string): Uint8Array<ArrayBuffer> {
+  const bytes = base64ToBytes(encodedKey.trim());
+  if (bytes.byteLength !== 32) {
+    throw new Error("BERRY_CONNECTOR_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+  }
+  return bytes;
+}
+
+async function connectorKeyId(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  return bytesToBase64(digest).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "").slice(0, 16);
+}
+
 export async function sealDurableSecret(
   plaintext: string,
   encodedKey: string,
@@ -477,6 +572,9 @@ export const DurableMcpServerSchema = z.object({
       openWorldHint: z.boolean().optional(),
     }).optional(),
   })).optional(),
+  allowedTools: z.array(z.string().min(1)).optional(),
+  trustReadOnlyAnnotations: z.boolean().optional(),
+  approvalRequiredTools: z.array(z.string().min(1)).optional(),
 }).strict();
 export type DurableMcpServer = z.infer<typeof DurableMcpServerSchema>;
 

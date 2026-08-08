@@ -62,6 +62,7 @@ import {
   ENTERPRISE_IDENTITY_REPOSITORY,
   type EnterpriseIdentityRepository,
 } from "../identity/identity.repository.ts";
+import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -272,6 +273,7 @@ export class AgentApiController {
     @Inject(ContextAssemblyService) private readonly contextAssembly: ContextAssemblyService,
     @Inject(DurableTurnService) private readonly durableTurns: DurableTurnService,
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
+    @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
   ) {}
 
   async #primaryDepartmentId(tenantId: string, userId: string | null): Promise<string | null> {
@@ -342,9 +344,10 @@ export class AgentApiController {
   async modelCatalog(@Req() httpRequest: AuthenticatedRequest) {
     const tenantId = tenantIdFromRequest(httpRequest);
     const userId = httpRequest.auth?.user.id ?? null;
-    const [catalog, effective, departmentId] = await Promise.all([
+    const [catalog, effective, connectorRuntime, departmentId] = await Promise.all([
       this.runtimeConfig.catalog(tenantId),
       this.organizationCapabilities.effective(tenantId, userId ?? ""),
+      userId ? this.connectors.runtime(tenantId, userId) : Promise.resolve([]),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
     if (!catalog) return null;
@@ -352,7 +355,11 @@ export class AgentApiController {
     return {
       ...catalog,
       skills: [...catalog.skills, ...effective.skills.map((skill) => ({ id: skill.filePath, name: skill.name, description: skill.description, enabled: true }))],
-      mcpServers: [...catalog.mcpServers, ...effective.mcpServers.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : [])],
+      mcpServers: [
+        ...catalog.mcpServers,
+        ...effective.mcpServers.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : []),
+        ...connectorRuntime.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : []),
+      ],
       capabilities: {
         imageGeneration: imageAccess.image && imageAccess.decision?.allowed
           ? { available: true, model: imageAccess.image.model, reason: null, message: null }
@@ -772,11 +779,12 @@ export class AgentApiController {
       await this.assertContinuableTurn(sessionId);
     }
     const baseRuntime = await this.runtimeConfig.resolve(tenantId, request);
-    const [effectiveRuntime, departmentId] = await Promise.all([
+    const [effectiveRuntime, connectorRuntime, departmentId] = await Promise.all([
       this.organizationCapabilities.effective(tenantId, userId),
+      this.connectors.runtime(tenantId, userId),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
-    const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
+    const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers, ...connectorRuntime], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
     const providerId = resolvedRuntime.provider.id;
     const mode = conversationKindFromTask(task);
     const modelDecision = await this.modelGovernance.resolve({
@@ -1697,6 +1705,9 @@ async function durableMcpServer(server: McpServerSpec): Promise<DurableMcpServer
     trusted: server.trusted,
     credentialRef: secret.credentialRef ?? null,
     ...(server.cachedTools ? { cachedTools: server.cachedTools } : {}),
+    ...(server.allowedTools ? { allowedTools: server.allowedTools } : {}),
+    ...(server.trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
+    ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
     ...(secret.credential ? { credential: secret.credential } : {}),
   };
 }

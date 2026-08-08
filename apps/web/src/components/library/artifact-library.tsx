@@ -125,13 +125,13 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
     const file = pendingDelete;
     setDeletingId(file.id);
     try {
-      await client.deleteFile(file.id);
+      await client.removeFileFromLibrary(file.id);
       setItems((current) => current.filter((item) => item.id !== file.id));
       setSelected((current) => current?.id === file.id ? null : current);
       setPendingDelete(null);
-      toast.success(`${file.name} deleted`);
+      toast.success(`${file.name} removed from Library`);
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to delete the file");
+      toast.error(cause instanceof Error ? cause.message : "Unable to remove the file from Library");
     } finally {
       setDeletingId(null);
     }
@@ -190,7 +190,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
                 <div className="berry-library-image-preview"><img src={item.previewUrl} alt={item.name} loading="lazy" /></div>
                 <ArtifactMeta item={item} />
               </button>
-              <Button variant="ghost" size="icon-sm" className="berry-library-delete" onClick={() => setPendingDelete(item)} aria-label={`Delete ${item.name}`} title={`Delete ${item.name}`}><Trash2 /></Button>
+              <Button variant="ghost" size="icon-sm" className="berry-library-delete" onClick={() => setPendingDelete(item)} aria-label={`Remove ${item.name} from Library`} title={`Remove ${item.name} from Library`}><Trash2 /></Button>
             </article>
           ))}
         </div>
@@ -205,7 +205,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
                 <ArtifactMeta item={item} />
                 <span className="berry-library-open">Open</span>
               </button>
-              <Button variant="ghost" size="icon-sm" onClick={() => setPendingDelete(item)} aria-label={`Delete ${item.name}`} title={`Delete ${item.name}`}><Trash2 /></Button>
+              <Button variant="ghost" size="icon-sm" onClick={() => setPendingDelete(item)} aria-label={`Remove ${item.name} from Library`} title={`Remove ${item.name} from Library`}><Trash2 /></Button>
             </article>
           ))}
         </div>
@@ -223,15 +223,15 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
       <AlertDialog open={Boolean(pendingDelete)} onOpenChange={(open) => { if (!open && !deletingId) setPendingDelete(null); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete {pendingDelete?.name}?</AlertDialogTitle>
+            <AlertDialogTitle>Remove {pendingDelete?.name} from Library?</AlertDialogTitle>
             <AlertDialogDescription>
-              This removes the file from Library, every linked task and project, and project knowledge. This cannot be undone.
+              The file will remain in conversations and projects where it is used. Storage is cleaned up after nothing references it.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={Boolean(deletingId)}>Cancel</AlertDialogCancel>
             <AlertDialogAction variant="destructive" disabled={Boolean(deletingId)} onClick={(event) => { event.preventDefault(); void removeFile(); }}>
-              {deletingId ? "Deleting…" : "Delete file"}
+              {deletingId ? "Removing…" : "Remove from Library"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

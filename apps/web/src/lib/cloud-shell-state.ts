@@ -1,8 +1,8 @@
-export const USER_SETTINGS_TABS = ["general", "account", "personalization", "skills", "mcp", "usage", "archived"] as const;
+export const USER_SETTINGS_TABS = ["general", "account", "personalization", "connectors", "skills", "mcp", "usage", "archived"] as const;
 export type UserSettingsTab = (typeof USER_SETTINGS_TABS)[number];
 export const ARTIFACT_LIBRARY_TABS = ["all", "images", "documents"] as const;
 export type ArtifactLibraryTab = (typeof ARTIFACT_LIBRARY_TABS)[number];
-export const ADMIN_TABS=["overview","people","access-control","ai-tools","usage-billing","identity-security","data-privacy","audit-log","organization","members","departments","roles","resource-access","providers","models","skills-mcp","feature-access","execution-network","analytics","spend-limits","credits-billing","reports-alerts","sso-scim","managed-policy","authentication","data-governance","service-accounts","profile-domains"]as const;
+export const ADMIN_TABS=["overview","people","access-control","ai-tools","usage-billing","identity-security","data-privacy","audit-log","organization","members","departments","roles","resource-access","providers","models","connectors","skills-mcp","feature-access","execution-network","analytics","spend-limits","credits-billing","reports-alerts","sso-scim","managed-policy","authentication","data-governance","service-accounts","profile-domains"]as const;
 export const PLATFORM_TABS=["overview","organizations","router-health","billing-operations","feature-rollout"]as const;
 
 export type CloudShellLocation =

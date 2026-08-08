@@ -12,6 +12,7 @@ import {
   type TurnState,
 } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.js";
+import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.js";
 
 export const DURABLE_TURN_RUNNER_ENABLED = Symbol("DURABLE_TURN_RUNNER_ENABLED");
 
@@ -1690,6 +1691,16 @@ FOR UPDATE
   if (!await rewindJournalBeforeExecutor(executor, input.tenantId, input.sessionId, messageId)) {
     throw new ConflictException("The message being edited has no durable history entry");
   }
+  const affectedFiles = await executor.query<{ file_id: string }>(`
+    SELECT DISTINCT association.file_id
+    FROM file_associations association
+    JOIN messages message
+      ON message.tenant_id = association.tenant_id
+     AND message.id = association.message_id
+    WHERE message.tenant_id = $1::uuid AND message.session_id = $2::uuid
+      AND message.sequence_id >= $3
+    ORDER BY association.file_id
+  `, [input.tenantId, input.sessionId, target[0].sequence_id]);
   await executor.execute(
     `
 DELETE FROM messages
@@ -1697,6 +1708,9 @@ WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND sequence_id >= $3
     `.trim(),
     [input.tenantId, input.sessionId, target[0].sequence_id],
   );
+  for (const { file_id: fileId } of affectedFiles) {
+    await garbageCollectFileIfUnreferenced(executor, input.tenantId, fileId);
+  }
 }
 
 async function rewindJournalBeforeExecutor(
@@ -1886,17 +1900,102 @@ async function ensureInputFileAssociations(
     attachment.fileId ? [attachment.fileId] : [],
   ))];
   if (fileIds.length === 0) return;
+  const locked = await executor.query<{ id: string; blob_id: string | null }>(`
+    SELECT f.id,f.blob_id
+    FROM files f
+    LEFT JOIN file_blobs blob
+      ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
+    WHERE f.tenant_id=$1::uuid AND f.id=ANY($2::uuid[]) AND f.deleted_at IS NULL
+      AND (
+        f.blob_id IS NULL OR (
+          blob.id IS NOT NULL AND blob.deleted_at IS NULL
+          AND blob.verification_status<>'deleted'
+        )
+      )
+    ORDER BY f.id
+    FOR UPDATE OF f
+  `, [input.tenantId, fileIds]);
+  if (locked.length !== fileIds.length) {
+    throw new Error("One or more input files became unavailable");
+  }
   const authorized = await executor.query<{ id: string }>(
     `
-SELECT id
-FROM files
-WHERE tenant_id=$1::uuid AND owner_user_id=$2::uuid
-  AND id=ANY($3::uuid[]) AND deleted_at IS NULL
+SELECT f.id
+FROM files f
+WHERE f.tenant_id=$1::uuid
+  AND f.id=ANY($3::uuid[]) AND f.deleted_at IS NULL
+  AND (
+    EXISTS (
+      SELECT 1 FROM file_library_entries library
+      WHERE library.tenant_id=f.tenant_id AND library.file_id=f.id
+        AND library.user_id=$2::uuid AND library.deleted_at IS NULL
+    ) OR EXISTS (
+      SELECT 1
+      FROM file_associations access_link
+      LEFT JOIN sessions access_session
+        ON access_session.tenant_id=access_link.tenant_id
+       AND access_session.id=access_link.session_id
+      LEFT JOIN tasks access_task
+        ON access_task.tenant_id=access_link.tenant_id
+       AND access_task.id=COALESCE(access_link.task_id,access_session.task_id)
+      WHERE access_link.tenant_id=f.tenant_id AND access_link.file_id=f.id
+        AND access_task.id IS NOT NULL
+        AND access_task.deleted_at IS NULL
+        AND (access_task.user_id=$2::uuid OR access_task.user_id IS NULL)
+    ) OR EXISTS (
+      SELECT 1
+      FROM workspace_files wf
+      JOIN workspaces workspace
+        ON workspace.tenant_id=wf.tenant_id AND workspace.id=wf.workspace_id
+      WHERE wf.tenant_id=f.tenant_id AND wf.file_id=f.id
+        AND wf.deleted_at IS NULL AND workspace.deleted_at IS NULL
+        AND (
+          workspace.owner_id=$2::uuid OR workspace.owner_id IS NULL OR
+          EXISTS (
+            SELECT 1 FROM tasks workspace_access_task
+            WHERE workspace_access_task.tenant_id=workspace.tenant_id
+              AND workspace_access_task.workspace_id=workspace.id
+              AND workspace_access_task.user_id=$2::uuid
+              AND workspace_access_task.deleted_at IS NULL
+          )
+        )
+        AND (
+          wf.visibility='project' OR
+          EXISTS (
+            SELECT 1 FROM tasks originating_task
+            WHERE originating_task.tenant_id=wf.tenant_id
+              AND originating_task.id=wf.originating_task_id
+              AND (originating_task.user_id=$2::uuid OR originating_task.user_id IS NULL)
+              AND originating_task.deleted_at IS NULL
+          )
+        )
+    )
+  )
     `.trim(),
     [input.tenantId, input.userId, fileIds],
   );
   if (authorized.length !== fileIds.length) {
-    throw new Error("One or more input files are unavailable or not owned by the authenticated user");
+    throw new Error("One or more input files are unavailable to the authenticated user");
+  }
+  for (const file of locked) {
+    if (!file.blob_id) continue;
+    await executor.execute(`
+      UPDATE file_blobs
+      SET verification_status=CASE
+            WHEN sha256 IS NULL THEN 'unverified'::file_blob_verification_status
+            ELSE 'verified'::file_blob_verification_status
+          END,
+          delete_after=NULL,updated_at=now()
+      WHERE tenant_id=$1::uuid AND id=$2::uuid
+        AND verification_status='pending_delete' AND deleted_at IS NULL
+    `, [input.tenantId, file.blob_id]);
+    await executor.execute(`
+      UPDATE runtime_outbox
+      SET completed_at=COALESCE(completed_at,now()),
+          last_error='Cancelled because a file reference was added',updated_at=now()
+      WHERE tenant_id=$1::uuid AND aggregate_id=$2
+        AND event_type='file.delete-blob' AND completed_at IS NULL
+    `, [input.tenantId, file.blob_id]);
   }
   for (const fileId of fileIds) {
     await executor.execute(

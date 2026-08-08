@@ -29,6 +29,25 @@ Set:
 - Ingress host, TLS secret, and class name.
 - Resource requests and limits for the target cluster.
 
+Connectors are disabled in the chart by default so an upgrade does not require
+a new Secret. To enable Google or custom MCP connectors, create the configured
+Secret and opt in from the environment-specific values file:
+
+```sh
+openssl rand -base64 32
+kubectl -n berry create secret generic berry-connectors \
+  --from-literal=BERRY_CONNECTOR_ENCRYPTION_KEY='PASTE_THE_GENERATED_VALUE'
+```
+
+```yaml
+connectors:
+  enabled: true
+  existingSecret: berry-connectors
+```
+
+Keep this key stable and backed up. Existing connector credentials cannot be
+decrypted if it is lost.
+
 ## Install or upgrade
 
 ```sh

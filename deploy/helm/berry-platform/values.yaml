@@ -151,6 +151,12 @@ router:
   organizationProviderCredentialsKey: BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON
   durableCapabilityKeyKey: BERRY_DURABLE_CAPABILITY_KEY
 
+connectors:
+  enabled: false
+  existingSecret: berry-connectors
+  encryptionKeyKey: BERRY_CONNECTOR_ENCRYPTION_KEY
+  decryptionKeysKey: BERRY_CONNECTOR_DECRYPTION_KEYS
+
 sandbox:
   provider: e2b
   templateId: base

@@ -54,10 +54,10 @@ describe("FilePlatformController", () => {
     expect(files.list).not.toHaveBeenCalled();
   });
 
-  it("deletes only a valid owned file through the authenticated file route", async () => {
+  it("removes only a valid Library membership through the authenticated file route", async () => {
     const files = {
       list: vi.fn(async () => ({ items: [], nextCursor: null })),
-      deleteOwnedFile: vi.fn(async () => ({ ok: true as const })),
+      removeFromLibrary: vi.fn(async () => ({ ok: true as const })),
     };
     app = await createApp(files);
     const fileId = "00000000-0000-7000-8000-000000000204";
@@ -66,12 +66,12 @@ describe("FilePlatformController", () => {
     await request(app.getHttpServer()).delete("/v1/files/not-a-uuid").set(authHeader()).expect(400);
     await request(app.getHttpServer()).delete(`/v1/files/${fileId}`).set(authHeader()).expect(200, { ok: true });
 
-    expect(files.deleteOwnedFile).toHaveBeenCalledTimes(1);
-    expect(files.deleteOwnedFile).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, USER_ID, fileId);
+    expect(files.removeFromLibrary).toHaveBeenCalledTimes(1);
+    expect(files.removeFromLibrary).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, USER_ID, fileId);
   });
 });
 
-async function createApp(files: Pick<FilePlatformService, "list"> & Partial<Pick<FilePlatformService, "deleteOwnedFile">>): Promise<INestApplication> {
+async function createApp(files: Pick<FilePlatformService, "list"> & Partial<Pick<FilePlatformService, "removeFromLibrary">>): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [BerryAuthModule.register({ runtime: { useValue: fakeAuthRuntime() } })],
     controllers: [FilePlatformController],

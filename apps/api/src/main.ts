@@ -59,6 +59,7 @@ import { createUsageEventVerifierFromEnv } from "./usage/usage.signing.ts";
 import { deploymentRuntimeDescription } from "./deployment-mode.ts";
 import { createBerryAuthRuntime, type BerryAuthRuntime } from "./auth/auth-runtime.ts";
 import { PublicAuth } from "./auth/auth.decorators.ts";
+import { ConnectorsService } from "./connectors/connectors.service.ts";
 
 @Controller()
 @PublicAuth()
@@ -279,6 +280,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
           dispatcher: { useValue: createAuditExportDispatcherFromEnv(env) },
         },
         auth: { useValue: auth },
+        connectors: { useValue: new ConnectorsService(database, env) },
       }),
     ],
     controllers: [HealthController, ArtifactController],

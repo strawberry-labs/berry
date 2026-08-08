@@ -81,6 +81,10 @@ import {
   McpOAuthFlowSchema,
   OrgCapabilitySchema,
   EffectiveCapabilitySchema,
+  ConnectorSchema,
+  ConnectorOAuthStartSchema,
+  GoogleConnectorConfigurationSchema,
+  GooglePickerSessionSchema,
   DepartmentSchema,
   EffectivePermissionsSchema,
   FeatureFlagSchema,
@@ -186,6 +190,10 @@ import {
   type PersonalSkillReview,
   type PersonalMcpServer,
   type McpOAuthFlow,
+  type Connector,
+  type ConnectorOAuthStart,
+  type GoogleConnectorConfiguration,
+  type GooglePickerSession,
   type OrgCapability,
   type EffectiveCapability,
   type Department,
@@ -564,6 +572,21 @@ export class BerryApiClient {
   async startPersonalMcpOAuth(id: string, redirectUri: string): Promise<McpOAuthFlow> { return this.#request(`/v1/me/mcp/${encodeURIComponent(id)}/oauth/start`, McpOAuthFlowSchema, { method: "POST", body: { redirectUri } }); }
   async completePersonalMcpOAuth(state: string, code: string): Promise<PersonalMcpServer> { return this.#request("/v1/me/mcp/oauth/complete", PersonalMcpServerSchema, { method: "POST", body: { state, code } }); }
   async pollPersonalMcpOAuth(state: string): Promise<{ status: "pending" | "complete"; serverId: string | null }> { return this.#request("/v1/me/mcp/oauth/poll", z.object({ status: z.enum(["pending", "complete"]), serverId: z.string().nullable() }), { method: "POST", body: { state } }); }
+  async listConnectors(): Promise<Connector[]> { return this.#request("/v1/connectors", z.array(ConnectorSchema)); }
+  async startConnectorOAuth(id: string, accessLevel: "read" | "full" = "read"): Promise<ConnectorOAuthStart> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/oauth/start`, ConnectorOAuthStartSchema, { method: "POST", body: { accessLevel } }); }
+  async connectConnectorBearer(id: string, credential: string): Promise<Connector> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/credentials`, ConnectorSchema, { method: "POST", body: { credential } }); }
+  async disconnectConnector(id: string): Promise<{ ok: true }> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/connection`, z.object({ ok: z.literal(true) }), { method: "DELETE" }); }
+  async googlePickerSession(id: string): Promise<GooglePickerSession> { return this.#request(`/v1/connectors/${encodeURIComponent(id)}/google-picker`, GooglePickerSessionSchema); }
+  async listOrganizationConnectors(tenantId: string): Promise<Connector[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors`, z.array(ConnectorSchema)); }
+  async googleConnectorConfiguration(tenantId: string): Promise<GoogleConnectorConfiguration> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/google/configuration`, GoogleConnectorConfigurationSchema); }
+  async configureGoogleConnectors(tenantId: string, input: { clientId: string; clientSecret?: string | undefined; hostedDomain?: string | null | undefined; pickerApiKey?: string | undefined; pickerProjectNumber?: string | null | undefined }): Promise<GoogleConnectorConfiguration> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/google/configuration`, GoogleConnectorConfigurationSchema, { method: "PUT", body: input }); }
+  async testGoogleConnectorConfiguration(tenantId: string): Promise<GoogleConnectorConfiguration> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/google/configuration/test`, GoogleConnectorConfigurationSchema, { method: "POST" }); }
+  async updateGoogleConnector(tenantId: string, key: "google-workspace" | "gmail" | "google-calendar", input: { enabled: boolean; maxAccessLevel: "read" | "full"; workspaceAccessMode?: "selected_files" | "search_workspace" | undefined }): Promise<Connector> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/google/${encodeURIComponent(key)}`, ConnectorSchema, { method: "PATCH", body: input }); }
+  async saveOrganizationCustomConnector(tenantId: string, input: { id?: string | undefined; name: string; description?: string | undefined; url: string; transport: "http-sse" | "streamable-http"; authType: "none" | "bearer" | "oauth"; authStrategy: "personal" | "shared"; maxAccessLevel?: "full" | undefined; oauthScope?: string | undefined; websiteUrl?: string | undefined; privacyPolicyUrl?: string | undefined; sharedCredential?: string | undefined; personalCredential?: string | undefined }): Promise<Connector> { const id = input.id; const body = { ...input, maxAccessLevel: "full", id: undefined }; return this.#request(id ? `/v1/orgs/${encodeURIComponent(tenantId)}/connectors/custom/${encodeURIComponent(id)}` : `/v1/orgs/${encodeURIComponent(tenantId)}/connectors/custom`, ConnectorSchema, { method: id ? "PUT" : "POST", body }); }
+  async startOrganizationConnectorOAuth(tenantId: string, id: string): Promise<ConnectorOAuthStart> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/custom/${encodeURIComponent(id)}/oauth/start`, ConnectorOAuthStartSchema, { method: "POST" }); }
+  async discoverOrganizationCustomConnector(tenantId: string, id: string): Promise<Connector> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/custom/${encodeURIComponent(id)}/discover`, ConnectorSchema, { method: "POST" }); }
+  async publishOrganizationCustomConnector(tenantId: string, id: string, input: { enabled: boolean; allowedTools?: string[] | undefined }): Promise<Connector> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/custom/${encodeURIComponent(id)}/publish`, ConnectorSchema, { method: "POST", body: input }); }
+  async deleteOrganizationCustomConnector(tenantId: string, id: string): Promise<{ ok: true }> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/connectors/custom/${encodeURIComponent(id)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" }); }
   async listOrganizationCapabilities(tenantId: string): Promise<OrgCapability[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, z.array(OrgCapabilitySchema)); }
   async upsertOrganizationCapability(tenantId: string, input: { kind: "skill" | "mcp"; capabilityId: string; name: string; description?: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean; contentHash?: string | null; config?: Record<string, unknown> }): Promise<OrgCapability> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, OrgCapabilitySchema, { method: "POST", body: input }); }
   async reviewOrganizationSkill(tenantId: string, input: { content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; packageFiles?: string[] }): Promise<PersonalSkillReview> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/review`, PersonalSkillReviewSchema, { method: "POST", body: input }); }
@@ -704,8 +727,13 @@ export class BerryApiClient {
     return { ...page, items: page.items.map((file) => this.#resolveFileUrls(file)) };
   }
 
-  async deleteFile(fileId: string): Promise<{ ok: true }> {
+  async removeFileFromLibrary(fileId: string): Promise<{ ok: true }> {
     return this.#request(`/v1/files/${encodeURIComponent(fileId)}`, z.object({ ok: z.literal(true) }), { method: "DELETE" });
+  }
+
+  /** @deprecated Use removeFileFromLibrary. */
+  async deleteFile(fileId: string): Promise<{ ok: true }> {
+    return this.removeFileFromLibrary(fileId);
   }
 
   async downloadFile(fileId: string, options: { signal?: AbortSignal } = {}): Promise<Blob> {

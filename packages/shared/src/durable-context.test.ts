@@ -4,7 +4,9 @@ import {
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
   durableContextConfigFromEnv,
+  openConnectorSecret,
   openDurableSecret,
+  sealConnectorSecret,
   sealDurableSecret,
 } from "./durable-context.js";
 
@@ -20,6 +22,21 @@ describe("durable capability contract", () => {
     const sealed = await sealDurableSecret("provider-secret", key);
     expect(JSON.stringify(sealed)).not.toContain("provider-secret");
     await expect(openDurableSecret(sealed, key)).resolves.toBe("provider-secret");
+  });
+
+  it("binds long-lived connector ciphertext to its tenant and record", async () => {
+    const sealed = await sealConnectorSecret("google-refresh-token", key, "tenant-a:connector-a:user-a");
+    expect(JSON.stringify(sealed)).not.toContain("google-refresh-token");
+    await expect(openConnectorSecret(sealed, key, "tenant-a:connector-a:user-a")).resolves.toBe("google-refresh-token");
+    await expect(openConnectorSecret(sealed, key, "tenant-b:connector-a:user-a")).rejects.toThrow("authentication failed");
+  });
+
+  it("supports connector root-key rotation without trying unrelated keys", async () => {
+    const oldKey = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const nextKey = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    const sealed = await sealConnectorSecret("shared-mcp-token", oldKey, "tenant:connector:shared");
+    await expect(openConnectorSecret(sealed, [nextKey, oldKey], "tenant:connector:shared")).resolves.toBe("shared-mcp-token");
+    await expect(openConnectorSecret(sealed, nextKey, "tenant:connector:shared")).rejects.toThrow("is not configured");
   });
 
   it("keeps explicit image intent paired with its admitted durable capability", () => {

@@ -1,11 +1,11 @@
 # Berry single-box production deployment
 
-This topology is for one private organization with roughly 5–10 users at `aesg-v2.berry.me`. Caddy is the only public container. It terminates TLS and serves the web app and API on one origin; Postgres, Redis, MinIO, the web process, and the API remain on Docker's internal network or loopback.
+This topology is for one private organization with roughly 5–10 users at `ai.aesg.com`. Caddy is the only public container. It terminates TLS and serves the web app and API on one origin; Postgres, Redis, MinIO, the web process, and the API remain on Docker's internal network or loopback.
 
 ## Server and account prerequisites
 
 - One x86-64 Hetzner server running Ubuntu 24.04 LTS. The recommended starting shape is CPX42 (8 shared AMD vCPU, 16 GB RAM, 320 GB SSD); CCX23 (4 dedicated AMD vCPU, 16 GB RAM, 160 GB SSD) is the predictable-performance alternative. Add a public IPv4 address and enable Hetzner backups. Since E2B provides execution, the box does not need local sandbox capacity. An 8 GB machine can smoke-test the stack, but 16 GB leaves safe headroom for image builds, Postgres, object storage, and concurrent streams.
-- DNS control for `berry.me`; create `A` records for both `aesg-v2.berry.me` and `files.aesg-v2.berry.me` pointing to the server. The second host serves only presigned MinIO transfers, so 200–300 MB files bypass the API process. Add `AAAA` only when IPv6 is configured and reachable.
+- DNS control for `aesg.com`; create `A` records for both `ai.aesg.com` and `files.ai.aesg.com` pointing to the server. The second host serves only presigned MinIO transfers, so 200–300 MB files bypass the API process. Add `AAAA` only when IPv6 is configured and reachable.
 - Firewall ingress for TCP 80 and 443, UDP 443, and SSH from administrator IPs only. Do not expose 3001, 3108, 5432, 6379, 9000, or 9001.
 - Docker Engine with the Compose v2 plugin, Git, curl, openssl, and enough free disk to build the monorepo image.
 - BerryRouter inference URL/key, exact Router IDs for Kimi 2.6 and GLM 5.2, their input/output prices per million tokens, the chat-completions path, and an image model/path.
@@ -27,7 +27,7 @@ Code execution does not pass through BerryRouter. The API uses the official E2B 
 
 `BERRY_E2B_TEMPLATE_ID=base` is enough for the first Node/Python test. For a controlled client deployment, build and pin a custom E2B template containing every required runtime and package. E2B compute size comes from that template/account configuration; `BERRY_SANDBOX_CPU_COUNT`, `BERRY_SANDBOX_MEMORY_MIB`, and `BERRY_SANDBOX_DISK_MIB` are Berry's metering estimates and must match the selected template. Set `BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS` to the selected template's total current price in USD micros/hour and `BERRY_BUDGET_SANDBOX_EXEC_ESTIMATE_MICROS` to a conservative pre-execution reservation. Berry reconciles the reservation against measured command runtime.
 
-Model turns, image generations, and direct E2B operations write first-party usage records. The sandbox provider records runtime and configured resource estimates; set the `BERRY_BUDGET_SANDBOX_*_ESTIMATE_MICROS` values from the actual E2B plan before enforcing hard dollar limits. For authoritative Router or BerryCrawl charges beyond built-in records, configure those services to send signed usage events to `POST https://aesg-v2.berry.me/v1/orgs/00000000-0000-7000-8000-000000000001/usage/events` using the `router-prod` key ID and the matching secret from `BERRY_USAGE_SIGNING_SECRETS`.
+Model turns, image generations, and direct E2B operations write first-party usage records. The sandbox provider records runtime and configured resource estimates; set the `BERRY_BUDGET_SANDBOX_*_ESTIMATE_MICROS` values from the actual E2B plan before enforcing hard dollar limits. For authoritative Router or BerryCrawl charges beyond built-in records, configure those services to send signed usage events to `POST https://ai.aesg.com/v1/orgs/00000000-0000-7000-8000-000000000001/usage/events` using the `router-prod` key ID and the matching secret from `BERRY_USAGE_SIGNING_SECRETS`.
 
 ## First deployment
 
@@ -50,6 +50,10 @@ then creates or refreshes separate non-bypass API and worker roles plus the
 tightly scoped platform role. The long-lived services never receive the schema
 owner credential. Caddy obtains and renews the certificate after DNS resolves
 and ports 80/443 are reachable.
+
+Before enabling Google Workspace, Gmail, or Calendar in the admin UI, complete
+the organization-owned OAuth, Workspace Admin, Picker, scope, and connector-key
+checklist in [`docs/google-connectors-self-hosting.md`](../docs/google-connectors-self-hosting.md).
 
 For an existing installation created with the former 15-minute sandbox timeout,
 update only the non-secret TTL setting before the next deployment:
@@ -76,9 +80,9 @@ The launcher prints a one-time URL containing the setup key in the URL fragment,
 
 ```sh
 docker compose --env-file deploy/.env.production -f deploy/compose.yaml ps
-curl -fsS https://aesg-v2.berry.me/healthz
-curl -I https://aesg-v2.berry.me/
-curl -I https://files.aesg-v2.berry.me/minio/health/live
+curl -fsS https://ai.aesg.com/healthz
+curl -I https://ai.aesg.com/
+curl -I https://files.ai.aesg.com/minio/health/live
 docker compose --env-file deploy/.env.production -f deploy/compose.yaml logs --tail=200 api web worker caddy
 ```
 

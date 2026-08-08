@@ -42,6 +42,7 @@ kubectl -n berry-acme create secret generic berry-billing \
   --from-literal=STRIPE_CREDIT_PRICE_ID='price_...'
 kubectl -n berry-acme create secret generic berry-router --from-literal=BERRY_ROUTER_API_KEY='...'
 kubectl -n berry-acme create secret generic berry-e2b --from-literal=E2B_API_KEY='...'
+kubectl -n berry-acme create secret generic berry-connectors --from-literal=BERRY_CONNECTOR_ENCRYPTION_KEY='...'
 
 helm upgrade --install berry deploy/helm/berry-platform \
   --namespace berry-acme \
@@ -54,6 +55,7 @@ helm upgrade --install berry deploy/helm/berry-platform \
   --set external.s3.artifactBucket=acme-berry-artifacts \
   --set external.s3.auditBucket=acme-berry-audit \
   --set billing.provider=stripe \
+  --set connectors.enabled=true \
   --set router.inferenceBaseUrl=https://router.acme.example.com/v1 \
   --set sandbox.templateId=base \
   --set ingress.enabled=true \

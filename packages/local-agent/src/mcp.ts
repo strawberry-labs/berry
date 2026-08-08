@@ -7,6 +7,7 @@ import { Type, type TSchema } from "typebox";
 import { ExecPolicyEngine, type ExecPolicyRule } from "@berry/execpolicy";
 import { networkDomainAllowed, type NetworkPolicy } from "@berry/shared";
 import { z } from "zod";
+import { createPublicRemoteFetch, validatedPublicRemoteUrl } from "./remote-fetch.ts";
 
 export interface McpCachedTool {
   name: string;
@@ -28,6 +29,12 @@ export interface McpServerSpec {
   credential?: string | null;
   credentialKey?: string | null;
   cachedTools?: McpCachedTool[];
+  /** Server tool names approved by the organization. Omit for unrestricted discovery. */
+  allowedTools?: string[];
+  /** Only Berry-owned adapters may make read-only annotations authoritative. */
+  trustReadOnlyAnnotations?: boolean;
+  /** Berry-owned tool names that require approval in every task permission mode. */
+  approvalRequiredTools?: string[];
 }
 
 export interface McpServerHealth {
@@ -72,6 +79,9 @@ const McpServerConfigSchema = z.object({
       openWorldHint: z.boolean().optional(),
     }).optional(),
   })).optional(),
+  allowedTools: z.array(z.string().min(1)).optional(),
+  trustReadOnlyAnnotations: z.boolean().optional(),
+  approvalRequiredTools: z.array(z.string().min(1)).optional(),
 });
 
 /** Parses deploy-safe MCP configuration while resolving credentials from the receiving process only. */
@@ -103,6 +113,9 @@ export function mcpServerSpecsFromJson(
           ...(tool.annotations ? { annotations: compactAnnotations(tool.annotations) } : {}),
         })),
       } : {}),
+      ...(server.allowedTools ? { allowedTools: server.allowedTools } : {}),
+      ...(server.trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
+      ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
       ...(credential ? { credential } : {}),
     };
   });
@@ -130,30 +143,13 @@ function mcpProcessEnv(extra: Record<string, string>): Record<string, string> {
   return { ...env, ...extra };
 }
 
-function isPrivateIpv4(hostname: string): boolean {
-  const parts = hostname.split(".");
-  if (parts.length !== 4) return false;
-  const octets = parts.map((part) => Number(part));
-  if (octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
-  const [a = 0, b = 0] = octets;
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) || a >= 224;
-}
-
-function isBlockedMcpHostname(hostname: string): boolean {
-  const normalized = hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (!normalized || normalized === "localhost" || normalized.endsWith(".localhost")) return true;
-  if (normalized === "::1" || normalized === "0:0:0:0:0:0:0:1" || normalized === "::") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe80:")) return true;
-  return isPrivateIpv4(normalized);
-}
-
 export function validatedRemoteMcpUrl(rawUrl: string): URL {
-  const url = new URL(rawUrl);
-  if (url.protocol !== "https:") throw new Error("remote MCP servers must use https");
-  if (url.username || url.password) throw new Error("remote MCP URLs must not contain credentials");
-  if (isBlockedMcpHostname(url.hostname)) throw new Error("remote MCP servers must not target localhost or private networks");
-  return url;
+  try {
+    return validatedPublicRemoteUrl(rawUrl);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message.replace(/^remote endpoints?/, "remote MCP servers") : "invalid remote MCP URL";
+    throw new Error(message);
+  }
 }
 
 function contentToToolResult(content: unknown): AgentToolResult<Record<string, unknown>> {
@@ -178,15 +174,6 @@ function bearerToken(raw: string | null | undefined): string | null {
   }
 }
 
-function fetchWithBearer(token: string | null): typeof fetch | undefined {
-  if (!token) return undefined;
-  return async (input, init) => {
-    const headers = new Headers(init?.headers);
-    headers.set("Authorization", `Bearer ${token}`);
-    return fetch(input, { ...init, headers });
-  };
-}
-
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
@@ -207,6 +194,31 @@ function cachedTool(spec: McpServerSpec, cached: McpCachedTool, invoke: (name: s
     parameters: cached.inputSchema as TSchema,
     execute: async (_toolCallId, params) => invoke(cached.name, (params ?? {}) as Record<string, unknown>),
   } as AgentTool;
+}
+
+function sameReviewedToolDefinition(reviewed: McpCachedTool, live: McpCachedTool): boolean {
+  return canonicalJson(reviewDocument(reviewed)) === canonicalJson(reviewDocument(live));
+}
+
+function reviewDocument(tool: McpCachedTool): Record<string, unknown> {
+  const annotations = tool.annotations ? compactAnnotations(tool.annotations) : undefined;
+  return {
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    ...(annotations && Object.keys(annotations).length > 0 ? { annotations } : {}),
+  };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 /** Connects MCP servers independently. Cached schemas are usable immediately; live startup never needs to block turn creation. */
@@ -278,22 +290,34 @@ export class McpToolSource {
       if (networkPolicy && !networkDomainAllowed(url.hostname, networkPolicy.allowedDomains)) throw new Error(`${url.hostname} is not in the network domain allowlist`);
       const networkDecision = new ExecPolicyEngine(this.#options.execPolicyRules ?? []).evaluateNetwork(url.toString());
       if (networkDecision.decision === "forbid") throw new Error(`execpolicy forbids remote MCP server ${url.hostname}`);
-      const authorizedFetch = fetchWithBearer(bearerToken(spec.credential));
+      const remoteFetch = createPublicRemoteFetch({ bearerToken: bearerToken(spec.credential) });
       if (spec.transport === "streamable-http") {
-        await client.connect(new StreamableHTTPClientTransport(url, { ...(authorizedFetch ? { fetch: authorizedFetch } : {}) }) as never);
+        await client.connect(new StreamableHTTPClientTransport(url, { fetch: remoteFetch }) as never);
       } else {
-        await client.connect(new SSEClientTransport(url, { ...(authorizedFetch ? { fetch: authorizedFetch } : {}) }));
+        await client.connect(new SSEClientTransport(url, { fetch: remoteFetch }));
       }
     }
     const listed = await client.listTools();
-    const cachedTools = listed.tools.map((tool): McpCachedTool => {
+    const allow = spec.allowedTools ? new Set(spec.allowedTools) : null;
+    const reviewed = allow
+      ? new Map((spec.cachedTools ?? []).filter((tool) => allow.has(tool.name)).map((tool) => [tool.name, tool]))
+      : null;
+    const cachedTools = listed.tools.flatMap((tool): McpCachedTool[] => {
+      if (allow && !allow.has(tool.name)) return [];
       const annotations = (tool as { annotations?: NonNullable<McpCachedTool["annotations"]> }).annotations;
-      return {
+      const live = {
         name: tool.name,
         description: tool.description ?? null,
         inputSchema: (tool.inputSchema ?? { type: "object", properties: {} }) as Record<string, unknown>,
         ...(annotations ? { annotations } : {}),
       };
+      if (!reviewed) return [live];
+      const approved = reviewed.get(tool.name);
+      if (!approved || !sameReviewedToolDefinition(approved, live)) {
+        this.#options.log?.("warn", `MCP tool ${spec.name}:${tool.name} changed after administrator review; disabling it until republished`);
+        return [];
+      }
+      return [approved];
     });
     const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args) => this.#call(client, name, args)));
     return { spec, client, tools, cachedTools };
@@ -313,9 +337,13 @@ export class McpToolSource {
     return this.#options.servers.flatMap((spec) => {
       if (!spec.enabled || !spec.trusted) return [];
       const live = this.#servers.get(spec.id);
-      const cached = live?.cachedTools ?? spec.cachedTools ?? [];
+      const allowed = spec.allowedTools ? new Set(spec.allowedTools) : null;
+      const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => !allowed || allowed.has(tool.name));
       return cached.map((tool) => cachedTool(spec, tool, async (name, args) => {
         const server = await this.#ensureConnected(spec);
+        if (spec.allowedTools && !server.cachedTools.some((candidate) => candidate.name === name)) {
+          throw new Error(`MCP tool ${spec.name}:${name} is unavailable because its definition changed after administrator review`);
+        }
         return this.#call(server.client, name, args);
       }));
     });
@@ -323,6 +351,8 @@ export class McpToolSource {
 
   approvalHints(toolName: string): {
     readOnly: boolean;
+    trustedReadOnly?: true;
+    requiresApproval?: true;
     destructive: boolean;
     idempotent: boolean;
     openWorld: boolean;
@@ -336,6 +366,10 @@ export class McpToolSource {
       if (!tool) return undefined;
       return {
         readOnly: tool.annotations?.readOnlyHint === true,
+        ...(spec.trustReadOnlyAnnotations === true && tool.annotations?.readOnlyHint === true ? { trustedReadOnly: true as const } : {}),
+        ...(spec.trustReadOnlyAnnotations !== true || spec.approvalRequiredTools?.includes(tool.name)
+          ? { requiresApproval: true as const }
+          : {}),
         destructive: tool.annotations?.destructiveHint === true,
         idempotent: tool.annotations?.idempotentHint === true,
         openWorld: tool.annotations?.openWorldHint === true,
@@ -377,6 +411,41 @@ export class McpToolSource {
       try { await server.client.close(); } catch { /* best effort */ }
     }));
     this.#servers.clear();
+  }
+}
+
+/** Performs one bounded initialize/tools-list cycle for an administrator review. */
+export async function discoverRemoteMcpTools(input: {
+  id: string;
+  name: string;
+  url: string;
+  transport: "http-sse" | "streamable-http";
+  credential?: string | null;
+  timeoutMs?: number;
+}): Promise<McpCachedTool[]> {
+  let discovered: McpCachedTool[] = [];
+  const source = new McpToolSource({
+    connectTimeoutMs: input.timeoutMs ?? 10_000,
+    servers: [{
+      id: input.id,
+      name: input.name,
+      url: validatedRemoteMcpUrl(input.url).toString(),
+      transport: input.transport,
+      command: null,
+      args: [],
+      env: {},
+      enabled: true,
+      trusted: true,
+      ...(input.credential ? { credential: input.credential } : {}),
+    }],
+    onHealth: (health) => { if (health.status === "connected") discovered = health.tools; },
+  });
+  try {
+    await source.connect();
+    if (!discovered.length) throw new Error("MCP server did not expose any tools");
+    return discovered;
+  } finally {
+    await source.close();
   }
 }
 

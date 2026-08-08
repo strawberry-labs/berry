@@ -653,6 +653,54 @@ describe("DurableTurnService", () => {
     expect(executions.some(({ sql }) => sql.startsWith("UPDATE sessions"))).toBe(true);
   });
 
+  it("uses the same project-file access rules during durable attachment admission", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000009";
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string, params = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("SELECT f.id") && sql.includes("file_library_entries")) return [{ id: fileId }] as T[];
+        if (sql.includes("SELECT f.id,f.blob_id") && sql.includes("FOR UPDATE OF f")) return [{ id: fileId, blob_id: null }] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 1 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "request_project_file",
+      operationFingerprint,
+      budgetReservationRequired: false,
+      input: "Use the project file.",
+      attachments: [{ fileId, name: "brief.pdf", mediaType: "application/pdf", size: 12 }],
+      runtimeRequest: {},
+      groundingContext: {},
+    })).resolves.toMatchObject({ sessionId });
+
+    const authorization = queries.find(({ sql }) => sql.includes("SELECT f.id") && sql.includes("file_library_entries"));
+    expect(authorization?.sql).toContain("workspace_access_task.workspace_id=workspace.id");
+    expect(authorization?.sql).toContain("workspace_access_task.deleted_at IS NULL");
+    expect(authorization?.sql).toContain("wf.visibility='project'");
+    expect(authorization?.sql).toContain("originating_task.id=wf.originating_task_id");
+    const authorizationSql = authorization?.sql ?? "";
+    const associationAccess = authorizationSql.slice(
+      authorizationSql.indexOf("FROM file_associations access_link"),
+      authorizationSql.indexOf("FROM workspace_files wf"),
+    );
+    expect(associationAccess).toContain("access_task.deleted_at IS NULL");
+    expect(authorization?.params).toEqual([tenantId, userId, [fileId]]);
+    expect(executions.some(({ sql, params }) => sql.includes("INSERT INTO file_associations") && params.includes(fileId))).toBe(true);
+  });
+
   it("resumes an answered question with a worker-valid user-input reason", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {

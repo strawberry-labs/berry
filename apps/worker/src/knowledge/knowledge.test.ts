@@ -232,6 +232,7 @@ describe("knowledge ingestion and ranking", () => {
       mediaType: "text/plain",
       bucket: "berry-test",
       objectKey: "artifacts/original.txt",
+      objectVersionId: "version-7",
       derivativeObjectKey: null,
       inlineText: null,
       tombstonedAt: null,
@@ -244,10 +245,11 @@ describe("knowledge ingestion and ranking", () => {
       saveExtraction: async () => false,
       markFailed,
     } as unknown as SqlKnowledgeRepository;
+    const read = vi.fn(async () => new TextEncoder().encode("project fact"));
     const processor = new KnowledgeProcessor({
       repository,
       objects: {
-        read: async () => new TextEncoder().encode("project fact"),
+        read,
         write: async () => { wroteDerivative = true; },
       },
       extractor: new DocumentExtractor("http://tika.invalid"),
@@ -260,6 +262,7 @@ describe("knowledge ingestion and ranking", () => {
       sourceId,
       revision: "revision-1",
     })).resolves.toEqual({ stale: true });
+    expect(read).toHaveBeenCalledWith(expect.objectContaining({ versionId: "version-7" }));
     expect(wroteDerivative).toBe(true);
     expect(markFailed).not.toHaveBeenCalled();
   });

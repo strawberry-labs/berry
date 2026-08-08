@@ -1,4 +1,4 @@
-import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, FileDeleteObjectJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
+import { AlertEvaluationJobPayloadSchema, BerryWorkerJobNameSchema, CompactionJobPayloadSchema, ContextBackfillJobPayloadSchema, FileBlobJobPayloadSchema, FileDeleteBlobJobPayloadSchema, FileDeleteObjectJobPayloadSchema, KnowledgeIndexTaskJobPayloadSchema, KnowledgeRevisionJobPayloadSchema, MemoryExtractJobPayloadSchema, ReportRunJobPayloadSchema, RetentionCleanupJobPayloadSchema, SandboxSnapshotJobPayloadSchema, TitleGenJobPayloadSchema, TurnExecuteJobPayloadSchema, TurnResumeJobPayloadSchema, UsageRollupJobPayloadSchema, parseWorkerJob } from "./jobs.js";
 import { processAlertEvaluationJob, processReportRunJob, type ManagementJobRepository } from "./reporting-alerts.js";
 import { processCompactionJob, type SessionCompactionRunner } from "./compaction.js";
 import { processTitleGenerationJob, type TaskTitleRepository, type TitleGenerator } from "./title-gen.js";
@@ -9,6 +9,7 @@ import type { DurableTurnRunner } from "./turn-runner.js";
 import type { SandboxContinuityManager } from "./sandbox-continuity.js";
 import type { MaintenanceRunner } from "./maintenance.js";
 import type { FileObjectDeleter } from "./file-deletion.js";
+import type { FileBlobProcessor } from "./file-blobs.js";
 
 export interface BerryWorkerDependencies {
   titles: TaskTitleRepository;
@@ -22,6 +23,7 @@ export interface BerryWorkerDependencies {
   snapshotter?: SandboxContinuityManager | undefined;
   maintenance?: MaintenanceRunner | undefined;
   fileDeleter?: FileObjectDeleter | undefined;
+  fileBlobs?: FileBlobProcessor | undefined;
   tenantContext?: {
     run<T>(tenantId: string, callback: () => Promise<T>): Promise<T>;
   } | undefined;
@@ -79,6 +81,12 @@ export async function processBerryWorkerJob(
   if (jobName === "file.delete-object") {
     if (!dependencies.fileDeleter) throw new Error("File object deletion is not configured");
     return dependencies.fileDeleter.delete(FileDeleteObjectJobPayloadSchema.parse(data));
+  }
+  if (jobName === "file.verify-blob" || jobName === "file.delete-blob") {
+    if (!dependencies.fileBlobs) throw new Error("File blob processing is not configured");
+    return jobName === "file.verify-blob"
+      ? dependencies.fileBlobs.verify(FileBlobJobPayloadSchema.parse(data))
+      : dependencies.fileBlobs.delete(FileDeleteBlobJobPayloadSchema.parse(data));
   }
   if (jobName === "context.backfill" || jobName === "context.cleanup") {
     if (!dependencies.maintenance) throw new Error("Maintenance runner is not configured");

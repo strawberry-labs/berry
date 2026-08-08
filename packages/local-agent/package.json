@@ -30,7 +30,9 @@
     "@berry/shared": "workspace:*",
     "@earendil-works/pi-ai": "0.80.3",
     "@modelcontextprotocol/sdk": "1.29.0",
+    "ipaddr.js": "^2.5.0",
     "typebox": "1.1.38",
+    "undici": "^7.28.0",
     "yaml": "2.9.0",
     "zod": "^3.25.67"
   },

@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 export type KnowledgeObject = {
   bucket: string;
   key: string;
+  versionId?: string;
   mediaType: string;
   name: string;
 };
@@ -37,7 +38,11 @@ export class S3KnowledgeObjectStore implements KnowledgeObjectStore {
   }
 
   async read(input: KnowledgeObject, maxBytes = this.maxReadBytes): Promise<Uint8Array> {
-    const object = await this.client.send(new GetObjectCommand({ Bucket: input.bucket, Key: input.key }));
+    const object = await this.client.send(new GetObjectCommand({
+      Bucket: input.bucket,
+      Key: input.key,
+      ...(input.versionId ? { VersionId: input.versionId } : {}),
+    }));
     if (!object.Body) throw new Error(`Knowledge object ${input.key} has no body`);
     if (object.ContentLength !== undefined && object.ContentLength > maxBytes) {
       throw new Error(`Knowledge object ${input.key} exceeds the ${maxBytes}-byte read limit`);

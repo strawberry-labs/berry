@@ -465,6 +465,7 @@ async function verifyUploadSizeEnforcement() {
     mediaType: "text/plain",
     sizeBytes: 5,
     objectKey: validStorage.objectKey,
+    objectVersionId: null,
   }]);
 
   const mismatch = await service.initiateUpload(ids.tenantA, ids.user, {
@@ -481,7 +482,7 @@ async function verifyUploadSizeEnforcement() {
     /uploaded object size does not match/i,
   );
   const failed = await admin.query("SELECT status::text,size_bytes::text FROM files WHERE id=$1::uuid", [mismatch.fileId]);
-  assert.equal(failed.rows[0]?.status, "failed");
+  assert.equal(failed.rows[0]?.status, "deleted");
   await assert.rejects(
     s3.send(new HeadObjectCommand({ Bucket: s3Bucket, Key: mismatchStorage.objectKey })),
     (error) => error?.$metadata?.httpStatusCode === 404,
