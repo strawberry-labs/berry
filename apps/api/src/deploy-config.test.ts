@@ -77,6 +77,8 @@ describe("self-host compose deployment", () => {
     expect(awsCompose).toContain("BERRY_DATABASE_URL: ${BERRY_WORKER_DATABASE_URL:");
     expect(awsCompose).toContain("BERRY_MEM0_DATABASE_URL: ${BERRY_MEM0_DATABASE_URL:");
     expect(deploymentLauncher).toContain("-f deploy/compose.yaml -f deploy/compose.aws.yaml");
+    expect(dockerfile).toContain("https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem");
+    expect(dockerfile).toContain("NODE_EXTRA_CA_CERTS=/etc/ssl/certs/aws-rds-global-bundle.pem");
     for (const key of [
       "BERRY_DATABASE_URL",
       "BERRY_API_DATABASE_URL",

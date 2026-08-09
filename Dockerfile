@@ -100,10 +100,20 @@ RUN --mount=type=cache,id=berry-turbo,target=/app/.turbo \
 FROM node:22-bookworm-slim AS runtime-base
 
 WORKDIR /app
+ARG BERRY_RDS_CA_BUNDLE_URL=https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 ENV NODE_ENV=production
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/aws-rds-global-bundle.pem
 
-RUN corepack enable \
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+    "$BERRY_RDS_CA_BUNDLE_URL" \
+    -o /etc/ssl/certs/aws-rds-global-bundle.pem \
+  && test -s /etc/ssl/certs/aws-rds-global-bundle.pem \
+  && chmod 0444 /etc/ssl/certs/aws-rds-global-bundle.pem \
+  && rm -rf /var/lib/apt/lists/* \
+  && corepack enable \
   && mkdir -p /data \
   && chown node:node /data
 
