@@ -375,7 +375,12 @@ Resources:
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y awscli ca-certificates curl docker-compose-v2 docker.io ec2-instance-connect git jq openssh-server postgresql-client unattended-upgrades unzip
+          apt-get install -y ca-certificates curl docker-compose-v2 docker.io ec2-instance-connect git jq openssh-server postgresql-client unattended-upgrades unzip
+          aws_cli_dir="$(mktemp -d)"
+          curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$aws_cli_dir/awscliv2.zip"
+          unzip -q "$aws_cli_dir/awscliv2.zip" -d "$aws_cli_dir"
+          "$aws_cli_dir/aws/install" --update
+          rm -rf -- "$aws_cli_dir"
           systemctl enable --now docker
           systemctl enable --now ssh
           usermod -aG docker ubuntu
