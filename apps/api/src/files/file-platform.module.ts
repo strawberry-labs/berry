@@ -2,6 +2,7 @@ import { Global, Module } from "@nestjs/common";
 import { S3Client } from "@aws-sdk/client-s3";
 import { FilePlatformController, WorkspaceFileController } from "./file-platform.controller.ts";
 import { FILE_STORAGE_CONFIG, FilePlatformService, type FileStorageConfig } from "./file-platform.service.ts";
+import { s3ClientOptions, s3PresignClientOptions } from "../storage/s3-client-options.ts";
 
 @Global()
 @Module({
@@ -14,18 +15,11 @@ import { FILE_STORAGE_CONFIG, FilePlatformService, type FileStorageConfig } from
         const bucket = process.env.BERRY_ARTIFACT_S3_BUCKET;
         const accessKeyId = process.env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
         const secretAccessKey = process.env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
-        if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
-        const clientOptions = {
-          region: process.env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-          forcePathStyle: true,
-          credentials: { accessKeyId, secretAccessKey },
-        };
+        if (!bucket) return null;
+        const clientOptions = s3ClientOptions({ endpoint, region: process.env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey });
         return {
-          client: new S3Client({ ...clientOptions, endpoint }),
-          presignClient: new S3Client({
-            ...clientOptions,
-            endpoint: process.env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT ?? endpoint,
-          }),
+          client: new S3Client(clientOptions),
+          presignClient: new S3Client(s3PresignClientOptions({ endpoint: process.env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT ?? endpoint, region: process.env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })),
           bucket,
           prefix: (process.env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
           maxUploadBytes: positiveInteger(process.env.BERRY_FILE_MAX_UPLOAD_BYTES, 1024 * 1024 * 1024),

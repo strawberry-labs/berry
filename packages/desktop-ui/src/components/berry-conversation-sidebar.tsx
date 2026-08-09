@@ -210,7 +210,9 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
       <SidebarContent className="scroll-fade">
         {pinned.length > 0 ? (
           <ConversationSection title="Pinned" open>
-            <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
+            <SidebarMenu className="berry-sidebar-task-list my-0 gap-0 pt-0.5 pb-2">
+              <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
+            </SidebarMenu>
           </ConversationSection>
         ) : null}
 

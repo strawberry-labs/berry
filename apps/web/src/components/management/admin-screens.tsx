@@ -43,6 +43,10 @@ import {
   parseMemberImportCsv,
   type MemberImportRow,
 } from "../../lib/member-import";
+import {
+  memberAccessStatusOptions,
+  memberStatusUpdate,
+} from "../../lib/member-administration";
 
 type BulkMemberRow = MemberImportRow & {
   status: "ready" | "creating" | "created" | "failed";
@@ -323,6 +327,7 @@ function Members({
   client,
   config,
   tenantId,
+  userId,
   permissions,
 }: ManagementScreenProps) {
   const navigate = useNavigate();
@@ -341,11 +346,21 @@ function Members({
   const [editStatus, setEditStatus] = React.useState("active");
   const [editDepartments, setEditDepartments] = React.useState<Set<string>>(new Set());
   const [editPrimaryDepartment, setEditPrimaryDepartment] = React.useState("none");
+  const [editBusy, setEditBusy] = React.useState(false);
+  const [editError, setEditError] = React.useState("");
   const r = useResource(
     `members:${tenantId}`,
     async () => (client ? client.listOrgMembers(tenantId) : []),
     [] as any[],
   );
+  const authConfiguration = useResource(
+    "member-auth-configuration",
+    async () => client ? client.authConfig() : { loginMode: "google" as const, emailPassword: { enabled: false }, ssoProviders: [] },
+    { loginMode: "google" as "password" | "google" | "mixed", emailPassword: { enabled: false }, ssoProviders: [] as Array<{ id: "google"; name: string; domain: string }> },
+  );
+  const googleOnly = authConfiguration.data.loginMode === "google";
+  const actorRole = r.data.find((member: any) => member.userId === userId)?.role as "owner" | "admin" | "member" | undefined;
+  const canAddGoogleAdministrator = !authConfiguration.loading && !authConfiguration.error && actorRole === "owner";
   const departments = useResource(
     `member-departments:${tenantId}`,
     async () =>
@@ -402,21 +417,17 @@ function Members({
     setManualError("");
     try {
       const f = new FormData(e.currentTarget);
-      const created = await client.createOrgMember(tenantId, {
-        email: String(f.get("email")),
-        name: String(f.get("name")),
-        password: String(f.get("password")),
-        role: String(f.get("role")) as any,
-      });
       const departmentId = String(f.get("primaryDepartmentId"));
-      if (departmentId && departmentId !== "none") {
-        await client.updateOrgMember(tenantId, created.userId, {
-          departmentIds: [departmentId],
-          primaryDepartmentId: departmentId,
-        });
-      }
+      await client.createOrgMember(tenantId, {
+        email: String(f.get("email")),
+        name: String(f.get("name") ?? "").trim() || undefined,
+        ...(googleOnly ? { provisioning: "google_sso" as const } : { provisioning: "local" as const, password: String(f.get("password")) }),
+        role: googleOnly ? "admin" : String(f.get("role")) as any,
+        departmentIds: departmentId && departmentId !== "none" ? [departmentId] : [],
+        primaryDepartmentId: departmentId && departmentId !== "none" ? departmentId : null,
+      });
       setAddMode(null);
-      setMessage("Member account created and the default allowance profile was applied.");
+      setMessage(googleOnly ? "Administrator added. Access activates after their first Google sign-in." : "Member account created and the default allowance profile was applied.");
       r.retry();
       balances.retry();
     } catch (error) {
@@ -510,6 +521,7 @@ function Members({
     }
   };
   const openMember = (member: any) => {
+    setEditError("");
     setEditing(member);
     setEditRole(member.role);
     setEditStatus(member.status);
@@ -531,33 +543,51 @@ function Members({
   };
   const saveMember = async () => {
     if (!client || !editing) return;
-    const updated = await client.updateOrgMember(tenantId, editing.userId, {
-      role: editRole as "admin" | "member",
-      status: editStatus as "active" | "disabled" | "deprovisioned",
-      departmentIds: [...editDepartments],
-      primaryDepartmentId: editPrimaryDepartment === "none" ? null : editPrimaryDepartment,
-    });
-    r.setData(r.data.map((member: any) => member.userId === updated.userId ? updated : member));
-    setEditing(null);
-    setMessage(editStatus === "disabled" ? "Member blocked. Existing usage history was preserved." : editStatus === "deprovisioned" ? "Member offboarded. Access was revoked and history was preserved." : "Member access and primary department updated.");
+    setEditBusy(true);
+    setEditError("");
+    try {
+      const pendingGoogleActivation = editing.status === "pending";
+      const statusUpdate = memberStatusUpdate(editing.status, editStatus);
+      const updated = await client.updateOrgMember(tenantId, editing.userId, {
+        role: editRole as "admin" | "member",
+        ...statusUpdate,
+        departmentIds: [...editDepartments],
+        primaryDepartmentId: editPrimaryDepartment === "none" ? null : editPrimaryDepartment,
+      });
+      r.setData(r.data.map((member: any) => member.userId === updated.userId ? updated : member));
+      setEditing(null);
+      setMessage(
+        pendingGoogleActivation && editStatus === "pending"
+          ? "Pending Google administrator updated. Access will activate after their first Google sign-in."
+          : editStatus === "disabled"
+            ? "Member blocked. Existing usage history was preserved."
+            : editStatus === "deprovisioned"
+              ? "Member offboarded. Access was revoked and history was preserved."
+              : "Member access and primary department updated.",
+      );
+    } catch (cause) {
+      setEditError(cause instanceof Error ? cause.message : "Member update failed.");
+    } finally {
+      setEditBusy(false);
+    }
   };
   return (
     <ManagementPage
       title="Members"
-      description="Find people by name or email, review current-month spend, and administer local organization accounts."
+      description={googleOnly ? "Review Workspace users, promote trusted administrators, and manage organization access." : "Find people by name or email, review current-month spend, and administer local organization accounts."}
       eyebrow="People"
       actions={
-        permissions.includes("members:write") ? (
+        permissions.includes("members:write") && !authConfiguration.loading && !authConfiguration.error && (!googleOnly || canAddGoogleAdministrator) ? (
           <Button onClick={() => {
             setBulkRows([]);
             setBulkFileName("");
             setBulkError("");
             setBulkNotice("");
             setManualError("");
-            setAddMode("choose");
+            setAddMode(googleOnly ? "manual" : "choose");
           }}>
             <Plus />
-            Add member
+            {googleOnly ? "Add administrator" : "Add member"}
           </Button>
         ) : null
       }
@@ -570,8 +600,9 @@ function Members({
           placeholder="Search name, email, or role"
         />
       </Toolbar>
+      {authConfiguration.error ? <AsyncState loading={false} error={authConfiguration.error} onRetry={authConfiguration.retry}>{null}</AsyncState> : null}
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      <ManagementDialog
+      {!googleOnly ? <ManagementDialog
         open={addMode === "choose"}
         onOpenChange={(next) => { if (!next) setAddMode(null); }}
         title="Add members"
@@ -596,24 +627,24 @@ function Members({
             <span><b className="block text-sm text-foreground">Bulk import</b><small className="mt-1 block text-xs leading-5 text-muted-foreground">Upload a CSV. New accounts use the member role and no department.</small></span>
           </button>
         </div>
-      </ManagementDialog>
+      </ManagementDialog> : null}
       <ManagementDialog
         open={addMode === "manual"}
         onOpenChange={(next) => { if (!next && !manualBusy) setAddMode(null); }}
-        title="Add member"
-        description="Create a local Berry account and apply the selected organization role. Email invitations are not sent in the current no-SSO mode."
+        title={googleOnly ? "Add Google administrator" : "Add member"}
+        description={googleOnly ? `Reserve the administrator role for a trusted @${authConfiguration.data.ssoProviders[0]?.domain ?? "Workspace"} account. Access activates on their first Google sign-in.` : "Create a local Berry account and apply the selected organization role. Email invitations are not sent in the current no-SSO mode."}
         footer={
           <>
             <Button
               type="button"
               variant="secondary"
-              onClick={() => setAddMode("choose")}
+              onClick={() => setAddMode(googleOnly ? null : "choose")}
               disabled={manualBusy}
             >
               Back
             </Button>
             <Button type="submit" form="invite-member-form" disabled={manualBusy}>
-              {manualBusy ? "Creating…" : "Create account"}
+              {manualBusy ? "Saving…" : googleOnly ? "Add administrator" : "Create account"}
             </Button>
           </>
         }
@@ -623,19 +654,19 @@ function Members({
           className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
           onSubmit={submit}
         >
-          <label>
+          {!googleOnly ? <label>
             Name
             <Input name="name" autoFocus required />
-          </label>
+          </label> : null}
           <label>
             Email
-            <Input name="email" type="email" required />
+            <Input name="email" type="email" autoFocus={googleOnly} required />
           </label>
-          <label>
+          {!googleOnly ? <label>
             Temporary password
             <Input name="password" type="password" minLength={12} required />
-          </label>
-          <label>
+          </label> : null}
+          {!googleOnly ? <label>
             Role
             <FormSelect
               name="role"
@@ -645,7 +676,7 @@ function Members({
                 { value: "admin", label: "Admin" },
               ]}
             />
-          </label>
+          </label> : null}
           <label>
             Primary department
             <FormSelect
@@ -657,7 +688,7 @@ function Members({
         </form>
         {manualError ? <p className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{manualError}</p> : null}
       </ManagementDialog>
-      <ManagementDialog
+      {!googleOnly ? <ManagementDialog
         open={addMode === "bulk"}
         onOpenChange={(next) => { if (!next && !bulkImporting) setAddMode(null); }}
         title="Bulk import members"
@@ -717,21 +748,21 @@ function Members({
           ) : null}
           <p className="text-[11px] leading-4 text-muted-foreground">Password format: capitalized first name, @, then at least six random numbers. Generated passwords are at least 12 characters long.</p>
         </div>
-      </ManagementDialog>
+      </ManagementDialog> : null}
       <ManagementDialog
         open={Boolean(editing)}
-        onOpenChange={(next) => { if (!next) setEditing(null); }}
+        onOpenChange={(next) => { if (!next && !editBusy) setEditing(null); }}
         title={editing?.name || "Manage member"}
         description={editing ? `${editing.email} · Set role, access status, and primary department.` : ""}
         size="lg"
-        footer={<><Button type="button" variant="secondary" onClick={() => setEditing(null)}>Cancel</Button><Button type="button" onClick={() => void saveMember()} disabled={editing?.role === "owner"}><Save />Save member</Button></>}
+        footer={<><Button type="button" variant="secondary" onClick={() => setEditing(null)} disabled={editBusy}>Cancel</Button><Button type="button" onClick={() => void saveMember()} disabled={editing?.role === "owner" || editBusy}><Save />{editBusy ? "Saving…" : "Save member"}</Button></>}
       >
         {editing ? (
           <div className="grid gap-4">
             {editing.role === "owner" ? <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">The organization owner cannot be demoted, blocked, or offboarded from this screen.</p> : null}
             <div className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
-              <label>Role<FormSelect value={editRole} onChange={setEditRole} disabled={editing.role === "owner"} options={[{ value: "member", label: "Member" }, { value: "admin", label: "Admin" }]} /></label>
-              <label>Account access<FormSelect value={editStatus} onChange={setEditStatus} disabled={editing.role === "owner"} options={[{ value: "active", label: "Active" }, { value: "disabled", label: "Blocked" }, { value: "deprovisioned", label: "Offboarded" }]} /></label>
+              <label>Role<FormSelect value={editRole} onChange={setEditRole} disabled={editing.role === "owner" || actorRole !== "owner"} options={[{ value: "member", label: "Member" }, { value: "admin", label: "Admin" }]} /></label>
+              <label>Account access<FormSelect value={editStatus} onChange={setEditStatus} disabled={editing.role === "owner" || (editing.role === "admin" && actorRole !== "owner")} options={memberAccessStatusOptions(editing.status)} /></label>
             </div>
             <fieldset className="grid gap-2 border-0 p-0" disabled={editing.role === "owner"}>
               <legend className="mb-1 text-xs font-semibold">Departments</legend>
@@ -744,6 +775,7 @@ function Members({
             </fieldset>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Primary department<FormSelect value={editPrimaryDepartment} onChange={setEditPrimaryDepartment} disabled={editing.role === "owner"} options={[{ value: "none", label: "No primary department" }, ...departments.data.filter((department: any) => editDepartments.has(department.id)).map((department: any) => ({ value: department.id, label: department.name }))]} /></label>
             <p className="text-xs text-muted-foreground">Blocked and offboarded members cannot authorize new requests. Their audit and usage history remains available.</p>
+            {editError ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{editError}</p> : null}
           </div>
         ) : null}
       </ManagementDialog>

@@ -62,6 +62,8 @@ import {
   POLICY_DISTRIBUTION_MIGRATION,
   POLICY_DISTRIBUTION_TABLES,
   POLICY_DISTRIBUTION_TENANT_SCOPED_TABLES,
+  PLATFORM_ROLE_RLS_MIGRATION,
+  PLATFORM_ROLE_RLS_TABLES,
   REMOVE_QUEUED_FOLLOW_UPS_MIGRATION,
   SANDBOX_WORKSPACES_MIGRATION,
   SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION,
@@ -177,7 +179,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {
@@ -378,6 +380,18 @@ describe("cloud postgres schema", () => {
     expect(GOOGLE_WORKSPACE_SSO_MIGRATION).toContain("provider <> 'generic'");
     expect(GOOGLE_WORKSPACE_SSO_MIGRATION).not.toContain("client_secret text");
     expect(GOOGLE_WORKSPACE_SSO_MIGRATION).not.toContain("DROP TABLE");
+  });
+
+  it("gives the platform login explicit read policies without PostgreSQL BYPASSRLS", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 47)).toMatchObject({
+      id: 47,
+      name: "platform_role_rls_v1",
+    });
+    for (const table of PLATFORM_ROLE_RLS_TABLES) {
+      expect(PLATFORM_ROLE_RLS_MIGRATION).toContain(`CREATE POLICY ${table}_platform_read ON ${table}`);
+    }
+    expect(PLATFORM_ROLE_RLS_MIGRATION).toContain("current_user = 'berry_platform'");
+    expect(PLATFORM_ROLE_RLS_MIGRATION).not.toContain("BYPASSRLS");
   });
 
   it("protects enterprise identity tenant-owned tables with additive RLS policies", () => {

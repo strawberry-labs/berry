@@ -77,11 +77,6 @@ import {
   TableHeader,
   TableRow,
 } from "@berry/desktop-ui/components/ui/table";
-import {
-  Tabs,
-  TabsList,
-  TabsTrigger,
-} from "@berry/desktop-ui/components/ui/tabs";
 import { Textarea } from "@berry/desktop-ui/components/ui/textarea";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
@@ -127,7 +122,7 @@ export function ManagementPage({
 }) {
   const pageTabs = React.useContext(ManagementPageTabsContext);
   return (
-    <main className="mx-auto flex w-full min-w-0 max-w-[1120px] flex-col gap-5 px-5 pb-16 pt-[calc(var(--berry-titlebar-height)+1rem)] md:px-7 md:py-8">
+    <section className="mx-auto flex w-full min-w-0 max-w-[1120px] flex-col gap-5 px-5 pb-16 pt-[calc(var(--berry-titlebar-height)+1rem)] md:px-7 md:py-8">
       <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 max-w-2xl">
           {eyebrow ? (
@@ -149,25 +144,29 @@ export function ManagementPage({
         ) : null}
       </header>
       {pageTabs && pageTabs.tabs.length > 1 ? (
-        <Tabs value={pageTabs.activeTab} onValueChange={pageTabs.onTabChange}>
-          <div className="scroll-fade overflow-x-auto border-b border-border">
-            <TabsList
-              variant="line"
-              aria-label={pageTabs.ariaLabel}
-              className="min-w-max px-0"
-            >
+        <nav aria-label={pageTabs.ariaLabel} className="scroll-fade overflow-x-auto border-b border-border">
+          <div className="flex min-w-max items-center">
               {pageTabs.tabs.map((tab) => (
-                <TabsTrigger key={tab.id} value={tab.id} className="px-3">
+                <Button
+                  key={tab.id}
+                  type="button"
+                  variant="ghost"
+                  aria-current={tab.id === pageTabs.activeTab ? "page" : undefined}
+                  onClick={() => pageTabs.onTabChange(tab.id)}
+                  className={cn(
+                    "h-9 rounded-none border-b-2 border-transparent px-3 text-sm text-muted-foreground shadow-none",
+                    tab.id === pageTabs.activeTab && "border-foreground text-foreground",
+                  )}
+                >
                   {tab.label}
-                </TabsTrigger>
+                </Button>
               ))}
-            </TabsList>
           </div>
-        </Tabs>
+        </nav>
       ) : null}
       {status}
       <div className="grid min-w-0 gap-4">{children}</div>
-    </main>
+    </section>
   );
 }
 
@@ -908,6 +907,7 @@ export function FormSelect({
   required,
   disabled,
   className,
+  ariaLabel,
 }: {
   name?: string;
   value?: string;
@@ -918,6 +918,7 @@ export function FormSelect({
   required?: boolean;
   disabled?: boolean;
   className?: string;
+  ariaLabel?: string;
 }) {
   const [uncontrolledValue, setUncontrolledValue] = React.useState(
     defaultValue ?? options[0]?.value ?? "",
@@ -949,7 +950,7 @@ export function FormSelect({
         required={required}
         disabled={disabled}
         tabIndex={-1}
-        aria-label={placeholder}
+        aria-hidden="true"
       >
         {options.map((option) => (
           <option key={option.value} value={option.value}>
@@ -958,7 +959,7 @@ export function FormSelect({
         ))}
       </select>
       <Select {...rootProps}>
-        <SelectTrigger aria-hidden="true" className={cn("w-full", className)}>
+        <SelectTrigger aria-label={ariaLabel ?? placeholder ?? "Select option"} className={cn("w-full", className)}>
           <SelectValue placeholder={placeholder}>{selectedLabel}</SelectValue>
         </SelectTrigger>
         <SelectContent>
@@ -987,7 +988,7 @@ export function FilterSelect({
   return (
     <label className="grid min-w-36 gap-1.5 text-xs font-medium text-muted-foreground">
       <span>{label}</span>
-      <FormSelect value={value} onChange={onChange} options={options} />
+      <FormSelect value={value} onChange={onChange} options={options} ariaLabel={label} />
     </label>
   );
 }
@@ -1160,18 +1161,24 @@ export function TabBar({
   label: string;
 }) {
   return (
-    <Tabs value={active} onValueChange={onSelect} className="w-full">
-      <TabsList
-        variant="line"
-        className="w-full justify-start overflow-x-auto border-b border-border"
-        aria-label={label}
-      >
+    <nav className="w-full overflow-x-auto border-b border-border" aria-label={label}>
+      <div className="flex min-w-max items-center">
         {tabs.map((tab) => (
-          <TabsTrigger key={tab.id} value={tab.id}>
+          <Button
+            key={tab.id}
+            type="button"
+            variant="ghost"
+            aria-current={tab.id === active ? "page" : undefined}
+            onClick={() => onSelect(tab.id)}
+            className={cn(
+              "h-9 rounded-none border-b-2 border-transparent px-3 text-sm text-muted-foreground shadow-none",
+              tab.id === active && "border-foreground text-foreground",
+            )}
+          >
             {tab.label}
-          </TabsTrigger>
+          </Button>
         ))}
-      </TabsList>
-    </Tabs>
+      </div>
+    </nav>
   );
 }

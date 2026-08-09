@@ -21,6 +21,7 @@ import { parsePatch, type PatchHunk } from "@berry/local-agent";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { s3ClientOptions } from "./s3-client-options.js";
 import type {
   DurableTurnSnapshot,
   DurableTurnStep,
@@ -1290,14 +1291,9 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     const bucket = env.BERRY_ARTIFACT_S3_BUCKET;
     const accessKeyId = env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
     const secretAccessKey = env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
-    if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
+    if (!bucket) return null;
     return new S3SandboxSnapshotObjectStore(
-      new S3Client({
-        endpoint,
-        region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-        forcePathStyle: true,
-        credentials: { accessKeyId, secretAccessKey },
-      }),
+      new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })),
       bucket,
       (env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
       positiveInteger(env.BERRY_SANDBOX_INPUT_MAX_BYTES, DEFAULT_SANDBOX_INPUT_MAX_BYTES),

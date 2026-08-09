@@ -1,21 +1,21 @@
 # Berry single-box production deployment
 
-This topology is for one private organization with roughly 5–10 users at `ai.aesg.com`. Caddy is the only public container. It terminates TLS and serves the web app and API on one origin; Postgres, Redis, MinIO, the web process, and the API remain on Docker's internal network or loopback.
+This topology is for one private organization at `ai.aesg.com`. Caddy is the only public container. It terminates TLS and serves the web app and API on one origin; RDS stays private in the VPC, while Redis and the application containers remain on Docker's internal network or loopback. Published files and audit exports use native AWS S3 in `eu-west-1` through the EC2 instance profile.
 
 ## Server and account prerequisites
 
-- One x86-64 Hetzner server running Ubuntu 24.04 LTS. The recommended starting shape is CPX42 (8 shared AMD vCPU, 16 GB RAM, 320 GB SSD); CCX23 (4 dedicated AMD vCPU, 16 GB RAM, 160 GB SSD) is the predictable-performance alternative. Add a public IPv4 address and enable Hetzner backups. Since E2B provides execution, the box does not need local sandbox capacity. An 8 GB machine can smoke-test the stack, but 16 GB leaves safe headroom for image builds, Postgres, object storage, and concurrent streams.
-- DNS control for `aesg.com`; create `A` records for both `ai.aesg.com` and `files.ai.aesg.com` pointing to the server. The second host serves only presigned MinIO transfers, so 200–300 MB files bypass the API process. Add `AAAA` only when IPv6 is configured and reachable.
-- Firewall ingress for TCP 80 and 443, UDP 443, and SSH from administrator IPs only. Do not expose 3001, 3108, 5432, 6379, 9000, or 9001.
+- One x86-64 EC2 instance in AWS Ireland (`eu-west-1`) running Ubuntu 24.04 LTS, with enough memory and disk to build the monorepo and run the Compose services. Since E2B provides execution and S3 stores files, the instance does not need local sandbox or object-storage capacity. Enable the instance metadata endpoint, require IMDSv2, and set the metadata response hop limit to `2` so the AWS SDK inside Docker can retrieve instance-profile credentials.
+- One Elastic IP attached to the EC2 instance. Keep GoDaddy nameservers and create one `A` record: host `ai` pointing to that Elastic IP. Add `AAAA` only when IPv6 is configured and reachable. Native S3 does not require a `files.ai.aesg.com` record.
+- Security-group ingress for TCP 80 and 443, and SSH from administrator IPs only. Do not expose 3001, 3108, 5432, 6379, 9000, or 9001.
+- One private RDS PostgreSQL instance reachable only from the EC2 security group. Create separate `berry` and `mem0` databases, enable `pgcrypto` and `vector`, require TLS, and enable automated backups with point-in-time recovery.
 - Docker Engine with the Compose v2 plugin, Git, curl, openssl, and enough free disk to build the monorepo image.
+- Two private S3 buckets in `eu-west-1`, one for artifacts and one for audit exports. The EC2 instance profile needs `s3:ListBucket` on both buckets; artifact objects need `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion`, and `s3:AbortMultipartUpload`, while audit objects need only `s3:PutObject`. Keep Block Public Access enabled. Configure CORS only on the artifact bucket so `https://ai.aesg.com` can upload through presigned URLs and read the returned `ETag`; the audit bucket remains server-only.
 - BerryRouter inference URL/key, exact Router IDs for Kimi 2.6 and GLM 5.2, their input/output prices per million tokens, the chat-completions path, and an image model/path.
 - An E2B Cloud team with billing enabled, a server API key, and either the built-in `base` template or a reviewed custom template ID. The E2B key is injected only into the private API container and never reaches the web app or browser.
 - BerryCrawl public HTTPS MCP URL and bearer key.
-- The initial account email allow-list, plus a decision on whether subsequent self-service signup remains enabled.
-- An off-box destination for the dated Berry Postgres, personal-memory
-  pgvector, and MinIO backups created by the included backup script.
+- A retention policy for RDS automated backups and snapshots. Configure S3 versioning, lifecycle, and retention separately for the two object buckets.
 
-This deployment uses a pinned, network-private MinIO Community image. It is suitable for the 5–10-user test, but its data shares the Hetzner failure domain and the historical Community images are not maintained. Copy every dated backup off the server and enable Hetzner server backups.
+The AWS production profile does not start PostgreSQL, Mem0 PostgreSQL, or MinIO containers and does not expose a second files hostname. Local development can still use the single-host database and MinIO services.
 
 ## External service contracts required by this build
 
@@ -32,24 +32,34 @@ Model turns, image generations, and direct E2B operations write first-party usag
 ## First deployment
 
 ```sh
-sudo install -d -m 0750 /opt/berry /var/backups/berry
-sudo chown -R "$USER":"$USER" /opt/berry /var/backups/berry
+sudo install -d -m 0750 /opt/berry
+sudo chown -R "$USER":"$USER" /opt/berry
 git clone YOUR_REPOSITORY_URL /opt/berry
 cd /opt/berry
 cp deploy/.env.production.example deploy/.env.production
 chmod 600 deploy/.env.production
-# Run the hex command four times for Postgres, MinIO, usage signing, and setup.
+# Run the hex command for each independent database, usage-signing, and setup value.
 openssl rand -hex 32
 openssl rand -base64 36
+openssl rand -base64 32
 ./deploy/production-up.sh
 ```
 
 Fill every `REPLACE_WITH` value before running the script. A one-shot migration
 container applies additive Postgres migrations with the schema-owner account,
-then creates or refreshes separate non-bypass API and worker roles plus the
-tightly scoped platform role. The long-lived services never receive the schema
-owner credential. Caddy obtains and renews the certificate after DNS resolves
-and ports 80/443 are reachable.
+then creates or refreshes three non-bypass runtime roles. The platform role gets
+explicit read-only RLS policies only for its operational reporting tables. The
+long-lived services never receive the schema-owner credential. Caddy obtains
+and renews the certificate after DNS resolves and ports 80/443 are reachable.
+
+Apply this CORS policy to the artifact bucket before opening onboarding. Replace
+the bucket placeholder; do not apply this rule to the audit bucket.
+
+```sh
+aws s3api put-bucket-cors \
+  --bucket YOUR_ARTIFACT_BUCKET \
+  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.aesg.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}'
+```
 
 Before enabling Google Workspace, Gmail, or Calendar in the admin UI, complete
 the organization-owned OAuth, Workspace Admin, Picker, scope, and connector-key
@@ -58,7 +68,7 @@ checklist in [`docs/google-connectors-self-hosting.md`](../docs/google-connector
 Before enabling **Continue with Google**, create a separate identity-only OAuth
 client and follow [`docs/google-workspace-sso-self-hosting.md`](../docs/google-workspace-sso-self-hosting.md).
 The SSO client ID and encrypted secret are configured in Berry's admin UI, not
-in `deploy/.env.production`; local password login remains available.
+in `deploy/.env.production`. The production profile permits Google sign-in only.
 
 For an existing installation created with the former 15-minute sandbox timeout,
 update only the non-secret TTL setting before the next deployment:
@@ -75,25 +85,32 @@ the production environment file or prints its secrets. The API and worker also
 cap the effective runtime value at 300 seconds, so the first rollout is protected
 even though it begins under the previous deployment script.
 
-Use URL-safe hexadecimal values for the Postgres, MinIO, setup, and usage-webhook secrets because the Postgres password is interpolated into a connection URL and the setup key is printed in a URL fragment. Use a separate 36-byte base64 value for `BETTER_AUTH_SECRET`. The launcher refuses to start while any `REPLACE_WITH` placeholder remains.
+Use URL-safe hexadecimal values for the Postgres, setup, and usage-webhook secrets because the Postgres password is interpolated into a connection URL. Use separate values from `openssl rand -base64 36` for `BETTER_AUTH_SECRET` and `openssl rand -base64 32` for `BERRY_CONNECTOR_ENCRYPTION_KEY`. The launcher validates the decoded connector key length and refuses to start while any `REPLACE_WITH` placeholder remains.
 
-The launcher prints a one-time URL containing the setup key in the URL fragment, which is not sent in HTTP requests. Open it and create the configured owner account. Berry creates the owner, organization membership, default workspace ownership, and initial budgets in one locked database transaction. The database then reports setup complete, so the endpoint cannot create another owner even if the key is reused.
+The launcher prints only the application URL. Append `#setup=<BERRY_SETUP_TOKEN>` locally in the browser; do not send or store the complete tokenized URL. Configure the organization, brand, approved Workspace domain, identity OAuth client, connector scopes, and initial owner email. The verified owner claims the account with Google. Berry creates the owner membership, default workspace ownership, and initial budgets in a locked, idempotent transaction, then closes setup.
 
-`BERRY_AUTH_SIGNUP_ENABLED=false` should remain the default. Owners and admins can create later email/password accounts and set each user's limit from Settings → Governance without reopening self-service signup. After verifying owner sign-in, clear both `BERRY_SETUP_OWNER_EMAIL` and `BERRY_SETUP_TOKEN` from the environment and restart the API; the completed database state remains authoritative.
+`BERRY_AUTH_SIGNUP_ENABLED=false` should remain the default. Workspace users are admitted on their first verified Google sign-in. The owner can pre-authorize additional administrators; ordinary domain users receive the member role. After verifying owner sign-in, clear both `BERRY_SETUP_OWNER_EMAIL` and `BERRY_SETUP_TOKEN` from the environment and restart the API; the completed database state remains authoritative.
 
 ## Go-live verification
 
+The onboarding system check is the authoritative S3 permission test. It runs a complete multipart write/read/delete cycle against the artifact bucket and a conditional write against the audit bucket. A successful `head-bucket` command alone is only a bucket and network smoke test.
+
 ```sh
-docker compose --env-file deploy/.env.production -f deploy/compose.yaml ps
+docker compose --env-file deploy/.env.production -f deploy/compose.yaml -f deploy/compose.aws.yaml ps
 curl -fsS https://ai.aesg.com/healthz
 curl -I https://ai.aesg.com/
-curl -I https://files.ai.aesg.com/minio/health/live
-docker compose --env-file deploy/.env.production -f deploy/compose.yaml logs --tail=200 api web worker caddy
+aws s3api head-bucket --bucket YOUR_ARTIFACT_BUCKET
+docker compose --env-file deploy/.env.production -f deploy/compose.yaml -f deploy/compose.aws.yaml exec -T api node -e "import('@aws-sdk/client-s3').then(async ({S3Client,HeadBucketCommand})=>{const client=new S3Client({region:process.env.BERRY_ARTIFACT_S3_REGION});await client.send(new HeadBucketCommand({Bucket:process.env.BERRY_ARTIFACT_S3_BUCKET}));client.destroy();console.log('EC2 role can access artifact S3')})"
+curl -i -X OPTIONS "https://YOUR_ARTIFACT_BUCKET.s3.eu-west-1.amazonaws.com/cors-smoke" \
+  -H 'Origin: https://ai.aesg.com' \
+  -H 'Access-Control-Request-Method: PUT' \
+  -H 'Access-Control-Request-Headers: content-type'
+docker compose --env-file deploy/.env.production -f deploy/compose.yaml -f deploy/compose.aws.yaml logs --tail=200 api web worker caddy
 ```
 
-Then verify in the browser: signup/sign-in/sign-out; create and switch projects; create a task; send one turn through each configured model; run a BerryCrawl-backed research skill; paste, drop, and upload a file larger than 200 MB; open PDF, DOCX, XLSX, and PPTX previews; generate an image; execute code in an E2B sandbox and open its published output; set a small test budget and confirm an over-budget turn is blocked; inspect usage/model/audit data; restart the stack and confirm projects, tasks, messages, generated file records, and an E2B workspace test file remain.
+Then verify in the browser: Google sign-in/sign-out with the owner, a reserved administrator, an ordinary Workspace member, a blocked member, and an outside-domain account; create and switch projects; create a task; send one turn through each configured model; run a BerryCrawl-backed research skill; paste, drop, and upload a file larger than 200 MB; open PDF, DOCX, XLSX, and PPTX previews; generate an image; execute code in an E2B sandbox and open its published output; set a small test budget and confirm an over-budget turn is blocked; inspect usage/model/audit data; restart the stack and confirm projects, tasks, messages, generated file records, and an E2B workspace test file remain.
 
-Project records, tasks, messages, governance, budgets, usage, and audit data are durable in Postgres. Published artifacts and audit exports are durable in MinIO. E2B session files survive idle timeout and API restart through pause/reconnect. They are still provider-managed working state, not the system of record: explicit sandbox deletion, E2B account retention changes, or provider failure can remove them, so important outputs must be published to MinIO as artifacts.
+Project records, tasks, messages, governance, budgets, usage, and audit data are durable in Postgres. Published artifacts and audit exports are durable in S3. E2B session files survive idle timeout and API restart through pause/reconnect. They are still provider-managed working state, not the system of record: explicit sandbox deletion, E2B account retention changes, or provider failure can remove them, so important outputs must be published to S3 as artifacts.
 
 ## Operations
 
@@ -107,13 +124,7 @@ Project records, tasks, messages, governance, budgets, usage, and audit data are
   and restarts only `api`. Changes to shared packages expand to the exact
   consumers declared by `deploy/deployment-impact.sh`; its behavior is covered
   by `pnpm check:deploy`.
-- Run `deploy/backup.sh` daily from systemd/cron, copy the dated Berry Postgres,
-  Mem0 pgvector, and MinIO archive off-box, retain at least 7 daily and 4 weekly
-  copies, and test restores quarterly.
-- Restore drills use `BERRY_RESTORE_CONFIRM=YES ./deploy/restore.sh /path/to/backup`.
-  The script verifies checksums, stops the application writers, restores both
-  PostgreSQL databases and both object buckets, then restarts the application
-  services.
+- Keep RDS automated backups and point-in-time recovery enabled for both databases, copy snapshots across accounts or Regions when policy requires it, and test an RDS restore quarterly. Protect S3 independently with versioning and lifecycle rules. The local `deploy/backup.sh` and `deploy/restore.sh` scripts are for the non-AWS Compose profile and must not be used against RDS.
 - Apply OS security updates automatically. Rebuild and redeploy Berry from a pinned Git commit; do not edit a running container.
 - Monitor disk, memory, Postgres health, Redis health, HTTP 5xx rate, Caddy certificate renewal, BerryRouter/E2B latency, budget rejections, and backup freshness.
-- Keep `deploy/.env.production` mode `0600`, never commit it, and rotate BerryRouter, E2B, BerryCrawl, auth, database, MinIO, usage-signing, and SCIM secrets after any suspected exposure.
+- Keep `deploy/.env.production` mode `0600`, never commit it, and rotate BerryRouter, E2B, BerryCrawl, auth, database, usage-signing, and SCIM secrets after any suspected exposure.

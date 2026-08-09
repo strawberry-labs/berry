@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { authDestination } from "./auth-boundary.tsx";
+import { authDestination, oauthErrorMessage, sanitizedAuthUrl } from "./auth-boundary.tsx";
+import { deploymentAccentTokens } from "./deployment-accent.ts";
 import { googleSsoRequest } from "./google-sso-button.tsx";
 
 describe("authDestination", () => {
@@ -36,5 +37,37 @@ describe("googleSsoRequest", () => {
       errorCallbackURL: "https://ai.aesg.com/login",
       disableRedirect: true,
     });
+  });
+});
+
+describe("OAuth callback errors", () => {
+  it("maps known provider failures without exposing callback details", () => {
+    expect(oauthErrorMessage({ error: "access_denied", error_description: "sensitive provider detail" }))
+      .toBe("Google sign-in was cancelled.");
+  });
+
+  it("uses a safe fallback for unknown provider failures", () => {
+    expect(oauthErrorMessage({ error: "internal_provider_error", error_description: "sensitive provider detail" }))
+      .toBe("Google sign-in could not be completed. Please try again or contact the Berry owner.");
+  });
+
+  it("removes OAuth errors and setup secrets from the address bar", () => {
+    expect(sanitizedAuthUrl("https://ai.aesg.com/login?next=%2F&error=access_denied&error_description=secret#setup=top-secret"))
+      .toBe("/login?next=%2F");
+  });
+});
+
+describe("deploymentAccentTokens", () => {
+  it.each(["#ffffff", "#000000", "#ffea00", "#7c6df2"])("creates contrast-safe light and dark variants for %s", (color) => {
+    const tokens = deploymentAccentTokens(color);
+    expect(tokens?.light).toMatch(/^oklch\(/);
+    expect(tokens?.dark).toMatch(/^oklch\(/);
+    expect(tokens?.lightContrast).toBeGreaterThanOrEqual(4.599);
+    expect(tokens?.darkContrast).toBeGreaterThanOrEqual(4.599);
+  });
+
+  it("rejects malformed accent values", () => {
+    expect(deploymentAccentTokens("white")).toBeNull();
+    expect(deploymentAccentTokens(null)).toBeNull();
   });
 });

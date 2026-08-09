@@ -7,7 +7,7 @@ cp deploy/.env.example deploy/.env
 ./deploy/up.sh deploy/.env
 ```
 
-The launcher prints a one-time setup URL. Open it, confirm the configured owner email, and choose the organization name, your name, and a password. The owner, organization membership, default workspace, and initial budgets are created in one database transaction; setup then closes automatically. After verifying owner sign-in, clear both `BERRY_SETUP_OWNER_EMAIL` and `BERRY_SETUP_TOKEN` and restart the stack. The API listens on `http://localhost:3001`, MinIO on `http://localhost:9000`, and the MinIO console on `http://localhost:9001`.
+The launcher prints the application URL but never prints the setup key. Open the application URL and append `#setup=<BERRY_SETUP_TOKEN>` locally. Confirm the configured owner email and complete the setup flow. The owner, organization membership, default workspace, and initial budgets are created in one database transaction; setup then closes automatically. After verifying owner sign-in, clear both `BERRY_SETUP_OWNER_EMAIL` and `BERRY_SETUP_TOKEN` and restart the stack. The API listens on `http://localhost:3001`, MinIO on `http://localhost:9000`, and the MinIO console on `http://localhost:9001`.
 
 Defaults are intentionally local-only:
 

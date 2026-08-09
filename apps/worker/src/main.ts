@@ -33,6 +33,7 @@ import { SqlMaintenanceRunner } from "./maintenance.ts";
 import { createDurableTurnToolsFromEnv } from "./mcp-tools.ts";
 import { S3FileObjectDeleter, SqlFileDeletionReceiptStore } from "./file-deletion.ts";
 import { SqlFileBlobProcessor } from "./file-blobs.ts";
+import { closeServer, startWorkerReadinessServer } from "./readiness.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const durableConfig = durableContextConfigFromEnv(env);
@@ -153,9 +154,21 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
     pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 100,
   });
+  await Promise.all([
+    executor.query("SELECT 1"),
+    queue.waitUntilReady(),
+    worker.waitUntilReady(),
+  ]);
   outbox.start();
+  const readinessPort = positiveInteger(env.BERRY_WORKER_READINESS_PORT) ?? 3010;
+  const readinessServer = await startWorkerReadinessServer({
+    pingDatabase: () => executor.query("SELECT 1"),
+    pingQueue: () => queue.ping(),
+    isWorkerRunning: () => worker.isRunning(),
+  }, readinessPort);
 
   const shutdown = async () => {
+    await closeServer(readinessServer);
     await outbox.stop();
     await queue.close();
     await worker.close();

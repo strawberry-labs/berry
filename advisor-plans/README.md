@@ -12,6 +12,10 @@ verification gate, honor its STOP conditions, and update the status here.
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001 | Unify settings and management with the main Berry shell | P1 | M | — | DONE |
+| 002 | Add a first-class AWS EC2 production profile | P1 | L | — | TODO |
+| 003 | Add a resumable Google-only deployment bootstrap | P1 | L | 002 | TODO |
+| 004 | Build the production onboarding wizard and live branding | P1 | L | 003 | TODO |
+| 005 | Add recovery, end-to-end checks, and operator runbooks | P1 | M | 002, 003, 004 | TODO |
 
 Status values: `TODO`, `IN PROGRESS`, `DONE`, `BLOCKED (<reason>)`, or
 `REJECTED (<reason>)`.
@@ -25,6 +29,28 @@ typography, spacing, focus behavior, and responsive navigation. The current
 self-hosted web deployment is single-tenant, so live management routes omit the
 organization switcher while retaining platform administration for future
 multi-tenant deployments.
+
+## Production onboarding decision
+
+Berry will separate operator-owned environment configuration from
+application-owned tenant setup. Operators provision RDS, S3, Redis, DNS, TLS,
+runtime secrets, and model access before starting Berry. The first-run web
+wizard then configures organization identity, branding, Google Workspace SSO,
+and Google connectors. For the AESG deployment, Google Workspace is the only
+interactive login method; no password owner is created.
+
+The wizard is driven by persisted server state. It resumes after refresh or
+restart, keeps secrets write-only, and disappears only after the designated
+owner successfully signs in with the configured Google Workspace account.
+
+## Production onboarding dependencies
+
+- Plan 003 depends on Plan 002 because setup readiness must test the final RDS,
+  Redis, S3, public URL, and IAM-based storage configuration.
+- Plan 004 depends on Plan 003 because the UI must render authoritative setup
+  state and use idempotent setup mutations rather than browser-only state.
+- Plan 005 verifies the completed deployment and onboarding flow and adds the
+  operator recovery path.
 
 ## Findings considered and rejected
 

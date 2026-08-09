@@ -1,11 +1,12 @@
 import * as React from "react";
 
-export default function GoogleSsoButton({ baseUrl, domain, busy, setBusy, setError }: {
+export default function GoogleSsoButton({ baseUrl, domain, busy, setBusy, setError, standalone = false }: {
   baseUrl: string;
   domain: string;
   busy: boolean;
   setBusy: React.Dispatch<React.SetStateAction<boolean>>;
   setError: React.Dispatch<React.SetStateAction<string>>;
+  standalone?: boolean;
 }) {
   async function signIn(): Promise<void> {
     setBusy(true);
@@ -31,7 +32,7 @@ export default function GoogleSsoButton({ baseUrl, domain, busy, setBusy, setErr
 
   return (
     <>
-      <div className="auth-divider"><span>or</span></div>
+      {!standalone ? <div className="auth-divider"><span>or</span></div> : null}
       <button className="sso-button" type="button" disabled={busy} onClick={() => void signIn()}>
         <img className="google-mark" src="/google-g.svg" alt="" />
         Continue with Google

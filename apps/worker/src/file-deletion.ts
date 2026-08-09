@@ -1,6 +1,7 @@
 import { DeleteObjectsCommand, HeadObjectCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
 import type { FileDeleteObjectJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { s3ClientOptions } from "./s3-client-options.js";
 
 export interface FileObjectDeleter {
   delete(payload: FileDeleteObjectJobPayload): Promise<{ deleted: number }>;
@@ -61,13 +62,8 @@ export class S3FileObjectDeleter implements FileObjectDeleter {
     const endpoint = env.BERRY_ARTIFACT_S3_ENDPOINT;
     const accessKeyId = env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
     const secretAccessKey = env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
-    if (!endpoint || !accessKeyId || !secretAccessKey) return null;
-    return new S3FileObjectDeleter(new S3Client({
-      endpoint,
-      region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-      forcePathStyle: true,
-      credentials: { accessKeyId, secretAccessKey },
-    }), receipts);
+    if (!env.BERRY_ARTIFACT_S3_BUCKET) return null;
+    return new S3FileObjectDeleter(new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })), receipts);
   }
 
   async delete(payload: FileDeleteObjectJobPayload): Promise<{ deleted: number }> {

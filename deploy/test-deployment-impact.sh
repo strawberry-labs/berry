@@ -84,6 +84,16 @@ for service in api worker mem0 web; do
 done
 
 berry_impact_reset
+berry_impact_add_file "deploy/compose.aws.yaml"
+test "$berry_compose_changed" = true
+test "$berry_run_migrations" = true
+test "$berry_configure_roles" = true
+for service in api worker mem0 web; do
+  assert_contains "$berry_image_services" "$service" "AWS Compose image services"
+  assert_contains "$berry_restart_services" "$service" "AWS Compose restart services"
+done
+
+berry_impact_reset
 berry_impact_add_file "deploy/.env.production.example"
 test "$berry_compose_changed" = false
 test -z "$berry_image_services"
@@ -96,6 +106,16 @@ done
 
 berry_impact_reset
 berry_impact_add_file "deploy/Caddyfile"
+test "$berry_caddy_changed" = true
+test -z "$berry_image_services"
+
+berry_impact_reset
+berry_impact_add_file "deploy/Caddyfile.storage"
+test "$berry_caddy_changed" = true
+test -z "$berry_image_services"
+
+berry_impact_reset
+berry_impact_add_file "deploy/Caddyfile.native"
 test "$berry_caddy_changed" = true
 test -z "$berry_image_services"
 

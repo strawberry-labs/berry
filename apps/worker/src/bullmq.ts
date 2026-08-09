@@ -39,6 +39,14 @@ export class BullMqBerryQueueClient implements BerryQueueClient {
   async close(): Promise<void> {
     await this.#queue.close();
   }
+
+  async waitUntilReady(): Promise<void> {
+    await this.#queue.waitUntilReady();
+  }
+
+  async ping(): Promise<void> {
+    await this.#queue.getJobCounts("waiting");
+  }
 }
 
 export function deterministicJobId(name: BerryWorkerJobName, payload: BerryWorkerJobMap[BerryWorkerJobName]): string {

@@ -2,6 +2,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3
 import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import type { EmbeddingProfile, EmbeddingProvider } from "@berry/shared";
 import { createHash } from "node:crypto";
+import { s3ClientOptions } from "../s3-client-options.js";
 
 export type KnowledgeObject = {
   bucket: string;
@@ -23,16 +24,12 @@ export class S3KnowledgeObjectStore implements KnowledgeObjectStore {
   ) {}
 
   static fromEnv(env: NodeJS.ProcessEnv): S3KnowledgeObjectStore {
-    const endpoint = required(env.BERRY_ARTIFACT_S3_ENDPOINT, "BERRY_ARTIFACT_S3_ENDPOINT");
-    const accessKeyId = required(env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID, "BERRY_ARTIFACT_S3_ACCESS_KEY_ID");
-    const secretAccessKey = required(env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY, "BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY");
+    const endpoint = env.BERRY_ARTIFACT_S3_ENDPOINT;
+    const accessKeyId = env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
+    const secretAccessKey = env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
+    required(env.BERRY_ARTIFACT_S3_BUCKET, "BERRY_ARTIFACT_S3_BUCKET");
     return new S3KnowledgeObjectStore(
-      new S3Client({
-        endpoint,
-        region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-        forcePathStyle: true,
-        credentials: { accessKeyId, secretAccessKey },
-      }),
+      new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })),
       positiveInteger(env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES, 100 * 1024 * 1024),
     );
   }

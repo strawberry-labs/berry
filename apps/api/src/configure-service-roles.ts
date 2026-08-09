@@ -23,7 +23,7 @@ $$
     for (const [role, password] of Object.entries(passwords)) {
       const rows = await executor.query<{ statement: string }>(
         `SELECT format(
-          'ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION ${role === "berry_platform" ? "BYPASSRLS" : "NOBYPASSRLS"} PASSWORD %L',
+          'ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
           $1::text,
           $2::text
         ) AS statement`,

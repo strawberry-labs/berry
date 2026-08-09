@@ -574,7 +574,11 @@ const DEFAULT_CONFIG: WebConfig = {
 
 export function getWebConfig(): WebConfig {
   const apiBaseUrl = envUrl("BERRY_WEB_API_BASE_URL");
-  const demoMode = process.env.BERRY_WEB_DEMO_MODE === "false" ? false : !apiBaseUrl;
+  const demoMode = resolveDemoMode({
+    apiBaseUrl,
+    configuredValue: process.env.BERRY_WEB_DEMO_MODE,
+    nodeEnv: process.env.NODE_ENV,
+  });
   const defaults = demoMode ? DEFAULT_CONFIG : hostedDefaults(apiBaseUrl);
   const parsed = WebConfigSchema.parse({
     ...defaults,
@@ -608,6 +612,24 @@ export function getWebConfig(): WebConfig {
     skills: parseJsonEnv("BERRY_WEB_SKILLS_JSON", defaults.skills),
   });
   return parsed;
+}
+
+export function resolveDemoMode({
+  apiBaseUrl,
+  configuredValue,
+  nodeEnv,
+}: {
+  apiBaseUrl: string | null;
+  configuredValue: string | undefined;
+  nodeEnv: string | undefined;
+}): boolean {
+  if (configuredValue === "true") return true;
+  if (configuredValue === "false") return false;
+  if (apiBaseUrl) return false;
+  if (nodeEnv === "production") {
+    throw new Error("BERRY_WEB_API_BASE_URL is required in production unless BERRY_WEB_DEMO_MODE=true is set explicitly");
+  }
+  return true;
 }
 
 function hostedDefaults(apiBaseUrl: string | null): WebConfig {

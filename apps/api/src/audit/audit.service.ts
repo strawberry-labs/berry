@@ -15,6 +15,7 @@ import {
   type JsonValue,
 } from "@berry/shared";
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
+import { s3ClientOptions } from "../storage/s3-client-options.ts";
 
 export const AUDIT_SERVICE = Symbol("AUDIT_SERVICE");
 export const AUDIT_EXPORT_DISPATCHER = Symbol("AUDIT_EXPORT_DISPATCHER");
@@ -237,13 +238,13 @@ export function createAuditExportDispatcherFromEnv(env: NodeJS.ProcessEnv): Audi
   const bucket = env.BERRY_AUDIT_S3_BUCKET;
   const accessKeyId = env.BERRY_AUDIT_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.BERRY_AUDIT_S3_SECRET_ACCESS_KEY;
-  if (endpoint && bucket && accessKeyId && secretAccessKey) {
-    dispatchers.push(new S3AuditExportDispatcher(new S3Client({
+  if (bucket) {
+    dispatchers.push(new S3AuditExportDispatcher(new S3Client(s3ClientOptions({
       endpoint,
-      region: env.BERRY_AUDIT_S3_REGION ?? "us-east-1",
-      forcePathStyle: true,
-      credentials: { accessKeyId, secretAccessKey },
-    }), { bucket, prefix: env.BERRY_AUDIT_S3_PREFIX ?? "audit" }));
+      region: env.BERRY_AUDIT_S3_REGION,
+      accessKeyId,
+      secretAccessKey,
+    })), { bucket, prefix: env.BERRY_AUDIT_S3_PREFIX ?? "audit" }));
   }
   return new CompositeAuditExportDispatcher(dispatchers);
 }

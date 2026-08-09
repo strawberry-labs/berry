@@ -6,8 +6,11 @@ This runbook enables **Continue with Google** for the AESG deployment at:
 https://ai.aesg.com
 ```
 
-Google SSO is optional. Existing email/password accounts, the owner account,
-and admin-created local accounts continue to work after SSO is enabled.
+The AESG production profile is Google-only. Set
+`BERRY_AUTH_LOGIN_METHODS=google`; the login page, owner claim, administrator
+reservations, and ordinary member access then use verified Workspace accounts.
+Berry does not expose email/password sign-in or permit local member accounts in
+this mode.
 
 SSO is also separate from Berry's Google connectors:
 
@@ -40,6 +43,8 @@ Keep these values in the untracked `deploy/.env.production`:
 ```dotenv
 BERRY_AUTH_BASE_URL=https://ai.aesg.com
 BERRY_AUTH_TRUSTED_ORIGINS=https://ai.aesg.com
+BERRY_AUTH_LOGIN_METHODS=google
+BERRY_AUTH_SIGNUP_ENABLED=false
 BETTER_AUTH_SECRET=YOUR_EXISTING_36_BYTE_BASE64_SECRET
 BERRY_CONNECTOR_ENCRYPTION_KEY=YOUR_EXISTING_32_BYTE_BASE64_KEY
 BERRY_CONNECTOR_DECRYPTION_KEYS=
@@ -142,11 +147,12 @@ prefer **Specific Google data** with only the approved services/scopes over
 blanket **Trusted** access. See
 [`google-connectors-self-hosting.md`](./google-connectors-self-hosting.md).
 
-## 5. Enable SSO inside Berry
+## 5. Configure SSO during Berry onboarding
 
-1. Sign in to Berry with the owner or a local admin account.
-2. Open **Admin > Security & data > SSO & SCIM**.
-3. Select **Set up Google**.
+1. Open the application URL and append `#setup=<BERRY_SETUP_TOKEN>` locally.
+   Never send or paste the complete tokenized URL into chat, email, or a ticket.
+2. Complete the foundation and organization steps.
+3. On **Google SSO**, enter the identity OAuth client.
 4. Confirm the displayed redirect URI is:
 
    ```text
@@ -158,17 +164,18 @@ blanket **Trusted** access. See
 7. Keep **Create members on first sign-in** on if AESG wants just-in-time
    provisioning. New users receive the `member` role; SSO cannot create an
    owner or admin.
-8. Enable Google sign-in and save.
+8. Save and continue through connector policy and review.
+9. Claim `strawberry@aesg.com` as owner with Google.
 
 After saving, the secret cannot be read back from the API or UI. To rotate it,
 enter the new client ID/secret pair and save again.
 
 ## 6. Verify safely
 
-Keep the current local owner session open in one browser window.
+Keep the owner session open in one browser window.
 
 1. Open a private/incognito window at `https://ai.aesg.com/login`.
-2. Confirm both local email/password and **Continue with Google** appear.
+2. Confirm only **Continue with Google** appears.
 3. Sign in with an AESG Workspace account.
 4. Confirm a personal Gmail account is rejected.
 5. If JIT is on, confirm the first login created one Berry member with source
@@ -176,7 +183,8 @@ Keep the current local owner session open in one browser window.
 6. Disable that member in Berry and confirm its existing session no longer
    authorizes organization requests.
 7. Confirm Drive, Gmail, and Calendar consent was not requested during login.
-8. Confirm a local password account can still sign in.
+8. Pre-authorize `it2@aesg.com` as an administrator, sign in with that Google
+   account, and confirm it receives the reserved admin role.
 
 Berry verifies Google's ID-token signature, issuer, audience, expiry, and the
 signed `hd` claim. The email suffix is not used as proof of Workspace

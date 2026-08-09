@@ -12,9 +12,11 @@ encrypted client secret, optional Picker key, connector policy, and each user's
 encrypted refresh token are stored in Berry's database. Only Berry's root
 connector-encryption key stays in the production environment.
 
-This authorization is separate from sign-in. Local email/password accounts
-continue to work, and adding Google connectors does not enable Google SSO,
-SCIM, user provisioning, or Domain-Wide Delegation.
+This authorization is separate from sign-in and does not change Berry's login
+policy. In the AESG Google-only profile, sign-in still uses the identity OAuth
+client while Drive, Gmail, and Calendar consent uses the connector client.
+Adding connectors does not enable SCIM, user provisioning, or Domain-Wide
+Delegation.
 
 ## Decisions to make first
 

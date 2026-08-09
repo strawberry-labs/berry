@@ -61,8 +61,11 @@ export type CreateOrgMemberInput = {
   tenantId: string;
   email: string;
   name: string;
-  password: string;
+  password?: string | undefined;
   role: "admin" | "member";
+  provisioning?: "local" | "google_sso" | undefined;
+  departmentIds?: string[] | undefined;
+  primaryDepartmentId?: string | null | undefined;
 };
 
 export class IdentityMemberConflictError extends Error {
@@ -266,17 +269,25 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
     const existing = [...this.#memberships.values()].find((membership) => membership.email.toLowerCase() === input.email.toLowerCase());
     if (existing) throw new IdentityMemberConflictError();
     if ((await this.listMemberships(input.tenantId)).length >= this.maxUsers) throw new IdentityMemberLimitError(this.maxUsers);
+    const departmentIds = [...new Set(input.departmentIds ?? [])];
+    if (departmentIds.some((id) => ![...this.#departments.values()].some((department) => department.tenantId === input.tenantId && department.id === id))) {
+      throw new Error("Unknown organization department");
+    }
+    if (input.primaryDepartmentId && !departmentIds.includes(input.primaryDepartmentId)) {
+      throw new Error("Primary department must be one of the member's departments");
+    }
     const now = new Date().toISOString();
     const membership: OrgMembership = {
       tenantId: input.tenantId,
       userId: randomUUID(),
       email: input.email.trim().toLowerCase(),
       name: input.name.trim(),
-      status: "active",
+      status: input.provisioning === "google_sso" ? "pending" : "active",
       role: input.role,
-      departmentIds: [],
+      departmentIds,
+      primaryDepartmentId: input.primaryDepartmentId ?? null,
       externalId: null,
-      source: "manual",
+      source: input.provisioning === "google_sso" ? "sso" : "manual",
       joinedAt: now,
       updatedAt: now,
     };
@@ -562,7 +573,14 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
 
   async createMembership(input: CreateOrgMemberInput): Promise<OrgMembership> {
     const email = input.email.trim().toLowerCase();
-    const password = await hashPassword(input.password);
+    const googleSso = input.provisioning === "google_sso";
+    if (!googleSso && !input.password) throw new Error("A password is required for local account provisioning");
+    const password = googleSso ? null : await hashPassword(input.password!);
+    const departmentIds = [...new Set(input.departmentIds ?? [])];
+    const primaryDepartmentId = input.primaryDepartmentId ?? null;
+    if (primaryDepartmentId && !departmentIds.includes(primaryDepartmentId)) {
+      throw new Error("Primary department must be one of the member's departments");
+    }
     const userId = await this.database.withTenant(input.tenantId, async (executor) => {
       const existing = await executor.query<{ id: string }>(
         "SELECT id FROM users WHERE lower(email) = lower($1) AND deleted_at IS NULL LIMIT 1",
@@ -574,20 +592,35 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
         [input.tenantId],
       );
       if (Number(members[0]?.count ?? "0") >= this.maxUsers) throw new IdentityMemberLimitError(this.maxUsers);
+      const validDepartments = departmentIds.length === 0 ? [] : await executor.query<{ id: string }>(
+        "SELECT id::text id FROM departments WHERE tenant_id=$1::uuid AND status='active' AND id=ANY($2::uuid[])",
+        [input.tenantId, departmentIds],
+      );
+      if (validDepartments.length !== departmentIds.length) throw new Error("Unknown organization department");
       const users = await executor.query<{ id: string }>(`
         INSERT INTO users (email, name, email_verified, status)
         VALUES ($1, $2, true, 'active')
         RETURNING id
       `, [email, input.name.trim()]);
       const createdUserId = users[0]!.id;
+      if (password) {
+        await executor.execute(`
+          INSERT INTO auth_accounts (user_id, account_id, provider_id, password)
+          VALUES ($1::uuid, $1, 'credential', $2)
+        `, [createdUserId, password]);
+      }
       await executor.execute(`
-        INSERT INTO auth_accounts (user_id, account_id, provider_id, password)
-        VALUES ($1::uuid, $1, 'credential', $2)
-      `, [createdUserId, password]);
-      await executor.execute(`
-        INSERT INTO tenant_memberships (tenant_id, user_id, status, role, source)
-        VALUES ($1::uuid, $2::uuid, 'active', $3, 'manual')
-      `, [input.tenantId, createdUserId, input.role]);
+        INSERT INTO tenant_memberships (tenant_id, user_id, status, role, source, primary_department_id)
+        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::uuid)
+      `, [input.tenantId, createdUserId, googleSso ? "pending" : "active", input.role, googleSso ? "sso" : "manual", primaryDepartmentId]);
+      if (departmentIds.length > 0) {
+        await executor.execute(
+          `INSERT INTO department_memberships (tenant_id,department_id,user_id,role,source)
+           SELECT $1::uuid,id,$2::uuid,'member','manual'
+           FROM departments WHERE tenant_id=$1::uuid AND id=ANY($3::uuid[])`,
+          [input.tenantId, createdUserId, departmentIds],
+        );
+      }
       return createdUserId;
     });
     return (await this.getMembership(input.tenantId, userId))!;

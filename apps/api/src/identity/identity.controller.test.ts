@@ -174,6 +174,122 @@ describe("Enterprise identity API", () => {
       .expect(404);
   });
 
+  it("reserves Google administrator access without creating a password account", async () => {
+    app = await createApp();
+    const department = await request(app.getHttpServer())
+      .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/departments`)
+      .set(authHeader())
+      .send({ name: "Technology" })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/sso/connections`)
+      .set(authHeader())
+      .send({
+        kind: "oidc",
+        provider: "google",
+        slug: "google-workspace",
+        displayName: "Google Workspace",
+        status: "enabled",
+        clientId: "berry.apps.googleusercontent.com",
+        clientSecret: "google-client-secret",
+        domains: ["aesg.com"],
+        jitProvisioning: true,
+      })
+      .expect(201);
+
+    const pendingAdministrator = await request(app.getHttpServer())
+      .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/members`)
+      .set(authHeader())
+      .send({
+        email: "it2@aesg.com",
+        name: "IT Administrator",
+        role: "admin",
+        provisioning: "google_sso",
+        departmentIds: [department.body.id],
+        primaryDepartmentId: department.body.id,
+      })
+      .expect(201)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({
+          email: "it2@aesg.com",
+          role: "admin",
+          status: "pending",
+          source: "sso",
+          departmentIds: [department.body.id],
+          primaryDepartmentId: department.body.id,
+        });
+        expect(body).not.toHaveProperty("password");
+      });
+
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/members/${pendingAdministrator.body.userId}`)
+      .set(authHeader())
+      .send({ status: "disabled" })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({ role: "admin", status: "disabled" });
+      });
+
+    await request(app.getHttpServer())
+      .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/members`)
+      .set(memberAuthHeader())
+      .send({ email: "peer@aesg.com", role: "admin", provisioning: "google_sso" })
+      .expect(403);
+  });
+
+  it("allows only the owner to change an administrator role", async () => {
+    const repository = new InMemoryEnterpriseIdentityRepository();
+    const actor = await repository.createMembership({
+      tenantId: SELF_HOST_TENANT_ID,
+      email: "actor-admin@example.test",
+      name: "Actor Admin",
+      password: "Temporary-123!",
+      role: "admin",
+    });
+    const target = await repository.createMembership({
+      tenantId: SELF_HOST_TENANT_ID,
+      email: "target-admin@example.test",
+      name: "Target Admin",
+      password: "Temporary-123!",
+      role: "admin",
+    });
+    app = await createApp({ repository, adminUserId: actor.userId });
+
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/members/${target.userId}`)
+      .set(adminAuthHeader())
+      .send({ role: "member" })
+      .expect(403);
+    expect((await repository.getMembership(SELF_HOST_TENANT_ID, target.userId))?.role).toBe("admin");
+
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/members/${target.userId}`)
+      .set(adminAuthHeader())
+      .send({ status: "disabled" })
+      .expect(403);
+    expect((await repository.getMembership(SELF_HOST_TENANT_ID, target.userId))?.status).toBe("active");
+
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/members/${target.userId}`)
+      .set(authHeader())
+      .send({ role: "member" })
+      .expect(200);
+    expect((await repository.getMembership(SELF_HOST_TENANT_ID, target.userId))?.role).toBe("member");
+  });
+
+  it("rejects local member provisioning when the deployment is Google-only", async () => {
+    app = await createApp({ localMemberProvisioningEnabled: false });
+
+    await request(app.getHttpServer())
+      .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/members`)
+      .set(authHeader())
+      .send({ email: "password-user@aesg.com", name: "Password User", password: "Temporary-123!", role: "member" })
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.message).toContain("Password accounts are disabled");
+      });
+  });
+
   it("enforces RBAC, feature-flag role defaults, and resource ACL administration", async () => {
     app = await createApp();
 
@@ -322,14 +438,19 @@ describe("Enterprise identity API", () => {
   });
 });
 
-async function createApp(): Promise<INestApplication> {
+async function createApp(options: {
+  repository?: InMemoryEnterpriseIdentityRepository;
+  adminUserId?: string;
+  localMemberProvisioningEnabled?: boolean;
+} = {}): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [AgentApiModule.register({
       sessionHost: { useValue: fakeSessionHost() },
-      auth: { useValue: fakeAuthRuntime() },
+      auth: { useValue: fakeAuthRuntime(options.adminUserId) },
       identity: {
-        repository: { useValue: new InMemoryEnterpriseIdentityRepository() },
+        repository: { useValue: options.repository ?? new InMemoryEnterpriseIdentityRepository() },
         scimBearerToken: "berry-scim-test",
+        localMemberProvisioningEnabled: options.localMemberProvisioningEnabled,
       },
     })],
   })
@@ -349,12 +470,22 @@ function memberAuthHeader() {
   return { Authorization: "Bearer berry-member-session" };
 }
 
+function adminAuthHeader() {
+  return { Authorization: "Bearer berry-admin-session" };
+}
+
 function scimHeader() {
   return { Authorization: "Bearer berry-scim-test" };
 }
 
-function fakeAuthRuntime(): BerryAuthRuntime {
+function fakeAuthRuntime(adminUserId?: string): BerryAuthRuntime {
   const getSession: BerryAuthRuntime["getSession"] = async (headers) => {
+    if (headers.authorization === "Bearer berry-admin-session" && adminUserId) {
+      return {
+        session: { id: "auth_session_admin", userId: adminUserId },
+        user: { id: adminUserId, email: "actor-admin@example.test", name: "Actor Admin", emailVerified: true },
+      };
+    }
     if (headers.authorization === "Bearer berry-member-session") {
       return {
         session: { id: "auth_session_2", userId: "00000000-0000-7000-8000-000000000202" },

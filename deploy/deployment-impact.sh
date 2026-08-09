@@ -82,7 +82,7 @@ berry_impact_add_file() {
       berry_mark_service mem0
       berry_mark_service web
       ;;
-    deploy/compose.yaml)
+    deploy/compose.yaml|deploy/compose.aws.yaml)
       berry_mark_service api
       berry_mark_service worker
       berry_mark_service mem0
@@ -91,7 +91,7 @@ berry_impact_add_file() {
       berry_configure_roles=true
       berry_compose_changed=true
       ;;
-    deploy/Caddyfile)
+    deploy/Caddyfile|deploy/Caddyfile.storage|deploy/Caddyfile.native)
       berry_caddy_changed=true
       ;;
     apps/cli/*|apps/docs/*|apps/desktop/*|apps/extension/*|apps/mobile/*|packages/acp-adapter/*|packages/cli-npm/*|packages/host/*|packages/local-agent-protocol/*)

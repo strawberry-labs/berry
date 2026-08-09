@@ -5,8 +5,10 @@ import { deploymentRuntimeDescription, publicDeploymentModeFromEnv, tenantDeploy
 
 const root = resolve(import.meta.dirname, "../../..");
 const compose = readFileSync(resolve(root, "deploy/compose.yaml"), "utf8");
+const awsCompose = readFileSync(resolve(root, "deploy/compose.aws.yaml"), "utf8");
 const dockerfile = readFileSync(resolve(root, "Dockerfile"), "utf8");
 const envExample = readFileSync(resolve(root, "deploy/.env.example"), "utf8");
+const productionEnvExample = readFileSync(resolve(root, "deploy/.env.production.example"), "utf8");
 const helmValues = readFileSync(resolve(root, "deploy/helm/berry-platform/values.yaml"), "utf8");
 const helmConfig = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/configmap.yaml"), "utf8");
 const helmApi = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/api-deployment.yaml"), "utf8");
@@ -16,13 +18,15 @@ const helmHpa = readFileSync(resolve(root, "deploy/helm/berry-platform/templates
 const helmDatabaseBootstrap = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/database-bootstrap-job.yaml"), "utf8");
 const runbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md"), "utf8");
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
+const serviceRoleBootstrap = readFileSync(resolve(root, "apps/api/src/configure-service-roles.ts"), "utf8");
 const deploymentLauncher = readFileSync(resolve(root, "deploy/up.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
+const storageCaddyfile = readFileSync(resolve(root, "deploy/Caddyfile.storage"), "utf8");
 const composeApi = compose.split("\n  api:")[1]?.split("\n  worker:")[0] ?? "";
 const composeWorker = compose.split("\n  worker:")[1]?.split("\n  web:")[0] ?? "";
 
 describe("self-host compose deployment", () => {
-  it("runs api, web, and worker from one built image with Postgres, Redis, and MinIO", () => {
+  it("runs api, web, and worker with local MinIO or IAM-backed S3", () => {
     for (const service of ["caddy", "postgres", "db-migrate", "postgres-roles", "redis", "minio", "minio-init", "api", "worker", "web"]) {
       expect(compose).toContain(`  ${service}:`);
     }
@@ -45,7 +49,10 @@ describe("self-host compose deployment", () => {
     expect(compose).toContain("BERRY_BUDGET_FAIL_CLOSED:");
     expect(compose).toContain("BERRY_BILLING_PROVIDER:");
     expect(compose).toContain("STRIPE_BILLING_METER_EVENT_NAME:");
-    expect(compose).toContain("BERRY_ARTIFACT_S3_ENDPOINT: ${BERRY_ARTIFACT_S3_ENDPOINT:-http://minio:9000}");
+    expect(compose).toContain("BERRY_ARTIFACT_S3_ENDPOINT: ${BERRY_ARTIFACT_S3_ENDPOINT:-}");
+    expect(compose).toContain("BERRY_ARTIFACT_S3_ACCESS_KEY_ID: ${BERRY_ARTIFACT_S3_ACCESS_KEY_ID:-}");
+    expect(envExample).toContain("BERRY_ARTIFACT_S3_ENDPOINT=http://minio:9000");
+    expect(compose).toContain("BERRY_AUTH_LOGIN_METHODS: ${BERRY_AUTH_LOGIN_METHODS:-password}");
     expect(compose).toContain("mc mb --ignore-existing");
     expect(compose).toContain('127.0.0.1:${BERRY_API_PORT:-3001}:3000');
     expect(caddyfile).toContain("reverse_proxy @api api:3000");
@@ -54,7 +61,36 @@ describe("self-host compose deployment", () => {
     expect(caddyfile).toContain('Cache-Control "no-cache, no-transform"');
     expect(caddyfile).toContain("flush_interval -1");
     expect(caddyfile).toContain("protocols h1 h2");
+    expect(caddyfile).toContain("import {$BERRY_STORAGE_PROXY_IMPORT:");
+    expect(caddyfile).not.toContain("reverse_proxy minio:9000");
+    expect(storageCaddyfile).toContain("{$BERRY_FILES_DOMAIN}");
+    expect(storageCaddyfile).toContain("reverse_proxy minio:9000");
+    expect(compose).toContain("BERRY_STORAGE_PROXY_IMPORT:");
+    expect(compose).toContain("./Caddyfile.native:/etc/caddy/storage/native/storage.caddy:ro");
     expect(compose).not.toContain('"443:443/udp"');
+  });
+
+  it("uses RDS and excludes local database containers in the AWS profile", () => {
+    expect(awsCompose).toContain('profiles: ["local-database"]');
+    expect(awsCompose).toContain("depends_on: !override {}");
+    expect(awsCompose).toContain("BERRY_DATABASE_URL: ${BERRY_API_DATABASE_URL:");
+    expect(awsCompose).toContain("BERRY_DATABASE_URL: ${BERRY_WORKER_DATABASE_URL:");
+    expect(awsCompose).toContain("BERRY_MEM0_DATABASE_URL: ${BERRY_MEM0_DATABASE_URL:");
+    expect(deploymentLauncher).toContain("-f deploy/compose.yaml -f deploy/compose.aws.yaml");
+    for (const key of [
+      "BERRY_DATABASE_URL",
+      "BERRY_API_DATABASE_URL",
+      "BERRY_WORKER_DATABASE_URL",
+      "BERRY_PLATFORM_DATABASE_URL",
+      "BERRY_MEM0_DATABASE_URL",
+    ]) {
+      expect(productionEnvExample).toContain(`${key}=postgres://`);
+    }
+    expect(serviceRoleBootstrap).toContain("NOBYPASSRLS");
+    expect(serviceRoleBootstrap).not.toContain('"BYPASSRLS"');
+    expect(productionRunbook).toContain("aws s3api put-bucket-cors");
+    expect(productionRunbook).toContain('"AllowedOrigins":["https://ai.aesg.com"]');
+    expect(productionRunbook).toContain('"ExposeHeaders":["ETag"]');
   });
 
   it("uses direct E2B in production while keeping Docker and Router seams available", () => {
@@ -87,12 +123,20 @@ describe("self-host compose deployment", () => {
     expect(dockerfile).toContain("corepack pnpm --filter @berry/worker... build");
     expect(dockerfile).toContain("docker.io");
     expect(envExample).toContain("BERRY_AUTH_MODE=better-auth");
+    expect(envExample).toContain("BERRY_DEPLOYMENT_PROFILE=local");
     expect(envExample).toContain("BERRY_SETUP_OWNER_EMAIL=founder@local.test");
     expect(envExample).toContain("BERRY_SETUP_TOKEN=");
     expect(compose).toContain("BERRY_SETUP_OWNER_EMAIL:");
     expect(compose).toContain("BERRY_SETUP_TOKEN:");
     expect(deploymentLauncher).toContain('BERRY_AUTH_MODE must be better-auth');
-    expect(deploymentLauncher).toContain("One-time setup URL:");
+    expect(deploymentLauncher).toContain('[ "$deployment_profile" = "production" ]');
+    expect(deploymentLauncher).toContain('[ "$storage_mode" = "minio" ]');
+    expect(deploymentLauncher).toContain("The setup key is not printed.");
+    expect(deploymentLauncher).not.toContain("#setup=$setup_token");
+    expect(productionEnvExample).toContain("BERRY_DEPLOYMENT_PROFILE=production");
+    expect(productionEnvExample).toContain("BERRY_AUTH_LOGIN_METHODS=google");
+    expect(productionEnvExample).toContain("BERRY_OBJECT_STORAGE_MODE=aws");
+    expect(productionEnvExample).not.toContain("BERRY_FILES_DOMAIN=");
     expect(envExample).toContain("DEPLOYMENT_MODE=self-hosted");
     expect(envExample).toContain("BERRY_SCIM_BEARER_TOKEN=");
     expect(envExample).toContain("BERRY_BUDGETS_ENABLED=true");

@@ -298,7 +298,7 @@ export const OrgMembershipSchema = z.object({
   userId: z.string(),
   email: z.string().email(),
   name: z.string().default(""),
-  status: z.enum(["active", "disabled", "deprovisioned"]).default("active"),
+  status: z.enum(["pending", "active", "disabled", "deprovisioned"]).default("active"),
   role: z.string().default("member"),
   departmentIds: z.array(z.string()).default([]),
   primaryDepartmentId: z.string().nullable().optional(),

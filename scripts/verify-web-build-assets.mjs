@@ -9,11 +9,11 @@ const serverDir = resolve(webDist, "server");
 const clientDir = resolve(webDist, "client");
 const cssReferencePattern = /\/assets\/styles-[A-Za-z0-9_-]+\.css/g;
 const rootJavascriptBudget = {
-  // The account allowance read model and typed organization-admin client add
-  // a small amount to the shared shell. Retain tight raw and compressed guards
-  // with less than 1% headroom over the previous budgets.
+  // Deployment branding and auth-mode discovery add a small amount to the
+  // shared shell. The onboarding wizard remains a lazy chunk. Retain tight raw
+  // and compressed guards with less than 1% headroom over the previous budgets.
   rawBytes: 1_510_000,
-  gzipBytes: 453_000,
+  gzipBytes: 455_000,
 };
 const forbiddenRootPreloadPrefixes = [
   "management-experience-",

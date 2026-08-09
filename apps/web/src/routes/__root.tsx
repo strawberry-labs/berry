@@ -1,9 +1,13 @@
+import * as React from "react";
 import type { ReactNode } from "react";
 import { createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
-import { AppShell, loadFixtureShellData } from "@/components/app-shell";
+import { AuthBoundary } from "@/components/shell/auth-boundary";
 import { loadWebBootstrap } from "@/lib/config.functions";
+import { loadFixtureShellData } from "@/lib/shell-data";
 import { BERRY_THEME_BOOTSTRAP_SCRIPT } from "@/lib/theme";
 import appCss from "../styles.css?url";
+
+const AppShell = React.lazy(() => import("@/components/app-shell").then((module) => ({ default: module.AppShell })));
 
 export const Route = createRootRoute({
   loader: async () => {
@@ -26,9 +30,27 @@ export const Route = createRootRoute({
 
 function RootComponent() {
   const initial = Route.useLoaderData();
+  const fallback = <div className="auth-shell" role="status" aria-live="polite" aria-busy="true">Loading Berry…</div>;
+  const content = initial.config.demoMode ? (
+    <React.Suspense fallback={fallback}>
+      <AppShell initial={initial} user={null} />
+    </React.Suspense>
+  ) : (
+    <AuthBoundary
+      baseUrl={initial.config.apiBaseUrl ?? ""}
+      initialUser={initial.user}
+      sessionResolved={initial.sessionResolved}
+    >
+      {(user, onSignedOut) => (
+        <React.Suspense fallback={fallback}>
+          <AppShell initial={initial} user={user} onSignedOut={onSignedOut} />
+        </React.Suspense>
+      )}
+    </AuthBoundary>
+  );
   return (
     <RootDocument>
-      <AppShell initial={initial} />
+      {content}
     </RootDocument>
   );
 }

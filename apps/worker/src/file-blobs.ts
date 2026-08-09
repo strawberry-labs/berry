@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { FileBlobJobPayload, FileDeleteBlobJobPayload } from "./jobs.js";
 import { deleteEveryObjectVersion } from "./file-deletion.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { s3ClientOptions } from "./s3-client-options.js";
 
 const SEVEN_DAY_GRACE_SQL = "interval '7 days'";
 
@@ -36,13 +37,8 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
     const endpoint = env.BERRY_ARTIFACT_S3_ENDPOINT;
     const accessKeyId = env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
     const secretAccessKey = env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
-    if (!endpoint || !accessKeyId || !secretAccessKey) return null;
-    return new SqlFileBlobProcessor(executor, new S3Client({
-      endpoint,
-      region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-      forcePathStyle: true,
-      credentials: { accessKeyId, secretAccessKey },
-    }));
+    if (!env.BERRY_ARTIFACT_S3_BUCKET) return null;
+    return new SqlFileBlobProcessor(executor, new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })));
   }
 
   async verify(payload: FileBlobJobPayload): Promise<{ status: "verified" | "deduplicated" | "skipped"; sha256?: string }> {

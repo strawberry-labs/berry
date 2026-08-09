@@ -339,6 +339,16 @@ export const ConnectorSecretEnvelopeSchema = z.object({
 }).strict();
 export type ConnectorSecretEnvelope = z.infer<typeof ConnectorSecretEnvelopeSchema>;
 
+export function isConnectorEncryptionKeyValid(encodedKey: string | undefined): boolean {
+  if (!encodedKey?.trim()) return false;
+  try {
+    connectorKeyBytes(encodedKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function sealConnectorSecret(
   plaintext: string,
   encodedKey: string,

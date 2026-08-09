@@ -4,6 +4,7 @@ import {
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
   durableContextConfigFromEnv,
+  isConnectorEncryptionKeyValid,
   openConnectorSecret,
   openDurableSecret,
   sealConnectorSecret,
@@ -13,6 +14,13 @@ import {
 const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 describe("durable capability contract", () => {
+  it("accepts only connector keys that decode to exactly 32 bytes", () => {
+    expect(isConnectorEncryptionKeyValid(key)).toBe(true);
+    expect(isConnectorEncryptionKeyValid("connector-encryption-key")).toBe(false);
+    expect(isConnectorEncryptionKeyValid(Buffer.from("too-short").toString("base64"))).toBe(false);
+    expect(isConnectorEncryptionKeyValid(undefined)).toBe(false);
+  });
+
   it("allows files up to 350 MiB to be staged into a sandbox by default", () => {
     expect(durableContextConfigFromEnv({}).sandboxInputMaxBytes)
       .toBe(DEFAULT_SANDBOX_INPUT_MAX_BYTES);

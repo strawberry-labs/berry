@@ -38,7 +38,7 @@ export function GeneralSettingsScreen() {
 
   return <ManagementPage title="General" description="Choose how Berry looks and how it gets your attention.">
     <Section title="Appearance"><div className="grid divide-y divide-border">
-      <SettingRow icon={MonitorCog} title="Theme" description="Use Berry’s light, dark, or system appearance."><div className="w-40"><FormSelect value={theme} onChange={setTheme} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></div></SettingRow>
+      <SettingRow icon={MonitorCog} title="Theme" description="Use Berry’s light, dark, or system appearance."><div className="w-40"><FormSelect ariaLabel="Theme" value={theme} onChange={setTheme} options={[{ value: "system", label: "System" }, { value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} /></div></SettingRow>
       <SettingRow icon={Languages} title="Language" description="Berry follows your browser and operating system."><span className="text-sm text-muted-foreground">System default</span></SettingRow>
     </div></Section>
     <Section title="Communication preferences"><div className="grid divide-y divide-border">

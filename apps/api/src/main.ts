@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { BadRequestException, Body, Controller, Get, Inject, Module, NotFoundException, Param, Post, Res, type DynamicModule } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Get, Inject, Module, NotFoundException, Param, Post, Query, Res, type DynamicModule } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -60,6 +60,9 @@ import { deploymentRuntimeDescription } from "./deployment-mode.ts";
 import { createBerryAuthRuntime, type BerryAuthRuntime } from "./auth/auth-runtime.ts";
 import { PublicAuth } from "./auth/auth.decorators.ts";
 import { ConnectorsService } from "./connectors/connectors.service.ts";
+import { SetupService } from "./setup/setup.service.ts";
+import { s3ClientOptions, s3PresignClientOptions } from "./storage/s3-client-options.ts";
+import { ArtifactListQuerySchema } from "./storage/artifact-pagination.ts";
 
 @Controller()
 @PublicAuth()
@@ -91,23 +94,24 @@ class ArtifactController {
   constructor(@Inject(ARTIFACT_READ_CONFIG) private readonly config: ArtifactReadConfig) {}
 
   @Get()
-  async list() {
-    if (!this.config) return [];
-    const items: Array<ReturnType<typeof artifactLibraryItem>> = [];
-    let continuationToken: string | undefined;
-    do {
-      const page = await this.config.client.send(new ListObjectsV2Command({
-        Bucket: this.config.bucket,
-        Prefix: `${this.config.prefix}/`,
-        ContinuationToken: continuationToken,
-      }));
-      for (const object of page.Contents ?? []) {
-        if (!object.Key || object.Key.endsWith("/")) continue;
-        items.push(artifactLibraryItem(this.config.prefix, object.Key, object.Size ?? 0, object.LastModified));
-      }
-      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
-    } while (continuationToken);
-    return items.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  async list(@Query() rawQuery: Record<string, unknown>) {
+    const parsed = ArtifactListQuerySchema.safeParse(rawQuery);
+    if (!parsed.success) throw new BadRequestException(parsed.error.issues);
+    if (!this.config) return { items: [], nextCursor: null };
+    const page = await this.config.client.send(new ListObjectsV2Command({
+      Bucket: this.config.bucket,
+      Prefix: `${this.config.prefix}/`,
+      ContinuationToken: parsed.data.cursor,
+      MaxKeys: parsed.data.limit,
+    }));
+    const items = (page.Contents ?? [])
+      .filter((object) => Boolean(object.Key) && !object.Key!.endsWith("/"))
+      .map((object) => artifactLibraryItem(this.config!.prefix, object.Key!, object.Size ?? 0, object.LastModified))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return {
+      items,
+      nextCursor: page.IsTruncated ? page.NextContinuationToken ?? null : null,
+    };
   }
 
   @Post()
@@ -210,6 +214,13 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
   const personalCapabilities = new PersonalCapabilitiesService(database, env);
   const organizationCapabilities = new OrganizationCapabilitiesService(personalCapabilities, database);
   const auth = createAuthRuntime(env);
+  const identity = new PostgresEnterpriseIdentityRepository(
+    database,
+    Math.max(1, Math.floor(numberEnv(env.BERRY_AUTH_MAX_USERS, 10))),
+    env,
+  );
+  const connectors = new ConnectorsService(database, env);
+  const setup = new SetupService(database, identity, connectors, env);
   return {
     module: BerryApiMainModule,
     imports: [
@@ -233,14 +244,8 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
         },
         identity: {
           scimBearerToken: env.BERRY_SCIM_BEARER_TOKEN ?? null,
-          repository: {
-            inject: [CloudDatabaseService],
-            useFactory: (database: CloudDatabaseService) => new PostgresEnterpriseIdentityRepository(
-              database,
-              Math.max(1, Math.floor(numberEnv(env.BERRY_AUTH_MAX_USERS, 10))),
-              env,
-            ),
-          },
+          localMemberProvisioningEnabled: authLoginMethods(env).has("password"),
+          repository: { useValue: identity },
         },
         budget: { service: { useValue: budgetService }, allowanceRepository: new PostgresAllowanceRepository(database) },
         usage: {
@@ -281,7 +286,8 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
           dispatcher: { useValue: createAuditExportDispatcherFromEnv(env) },
         },
         auth: { useValue: auth },
-        connectors: { useValue: new ConnectorsService(database, env) },
+        connectors: { useValue: connectors },
+        setup: { useValue: setup },
       }),
     ],
     controllers: [HealthController, ArtifactController],
@@ -347,19 +353,9 @@ function createArtifactStore(env: NodeJS.ProcessEnv): S3CompatibleArtifactStore 
   const bucket = env.BERRY_ARTIFACT_S3_BUCKET;
   const accessKeyId = env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return undefined;
-  const client = new S3Client({
-    endpoint,
-    region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-    forcePathStyle: true,
-    credentials: { accessKeyId, secretAccessKey },
-  });
-  const uploadClient = new S3Client({
-    endpoint: env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT ?? endpoint,
-    region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-    forcePathStyle: true,
-    credentials: { accessKeyId, secretAccessKey },
-  });
+  if (!bucket) return undefined;
+  const client = new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey }));
+  const uploadClient = new S3Client(s3PresignClientOptions({ endpoint: env.BERRY_ARTIFACT_S3_PUBLIC_ENDPOINT ?? endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey }));
   return new S3CompatibleArtifactStore({
     bucket,
     prefix: env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts",
@@ -372,16 +368,11 @@ function createArtifactReadConfig(env: NodeJS.ProcessEnv): ArtifactReadConfig {
   const bucket = env.BERRY_ARTIFACT_S3_BUCKET;
   const accessKeyId = env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY;
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
+  if (!bucket) return null;
   return {
     bucket,
     prefix: (env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
-    client: new S3Client({
-      endpoint,
-      region: env.BERRY_ARTIFACT_S3_REGION ?? "us-east-1",
-      forcePathStyle: true,
-      credentials: { accessKeyId, secretAccessKey },
-    }),
+    client: new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })),
   };
 }
 
@@ -573,6 +564,11 @@ function corsConfig(env: NodeJS.ProcessEnv) {
 
 function csv(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function authLoginMethods(env: NodeJS.ProcessEnv): Set<string> {
+  const configured = csv(env.BERRY_AUTH_LOGIN_METHODS ?? "").map((method) => method.toLowerCase());
+  return new Set(configured.length > 0 ? configured : ["password"]);
 }
 
 function numberEnv(value: string | undefined, fallback: number): number {

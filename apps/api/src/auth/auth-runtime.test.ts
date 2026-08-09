@@ -5,6 +5,40 @@ import { describe, expect, it, vi } from "vitest";
 import { createBetterAuthOptions, RealBetterAuthRuntime, type BerryAuthDescription } from "./auth-runtime.ts";
 
 describe("Better Auth runtime config", () => {
+  it("recovers a missing Google JIT membership and caches the completed check", async () => {
+    const session = {
+      session: { id: "session_1", userId: "00000000-0000-7000-8000-000000000201" },
+      user: {
+        id: "00000000-0000-7000-8000-000000000201",
+        email: "member@example.test",
+        name: "Member",
+        emailVerified: true,
+      },
+    };
+    const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.includes("AS eligible")) return { rows: [{ eligible: true }] };
+      if (sql.includes("SELECT status FROM tenant_memberships")) return { rows: [{ status: "active" }] };
+      return { rows: [] };
+    });
+    const runtime = new RealBetterAuthRuntime(
+      { api: { getSession: vi.fn(async () => session) }, handler: vi.fn() } as never,
+      baseDescription(),
+      { connect: vi.fn(async () => ({ query, release: vi.fn() })) } as unknown as Pool,
+    );
+
+    await runtime.getSession({});
+    await runtime.getSession({});
+
+    const recoveryInserts = query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO tenant_memberships (tenant_id,user_id"));
+    expect(recoveryInserts).toHaveLength(1);
+    expect(recoveryInserts[0]?.[1]).toEqual([
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000201",
+    ]);
+    expect(query.mock.calls.find(([sql]) => sql.includes("UPDATE tenant_memberships"))?.[0]).toContain("status='pending'");
+    expect(query.mock.calls.some(([sql]) => sql.includes("'user'"))).toBe(true);
+  });
+
   it("authorizes sessions only while the configured organization membership is active", async () => {
     const query = vi.fn(async (sql: string) => ({
       rows: sql.includes("SELECT EXISTS") ? [{ active: false }] : [],
@@ -44,6 +78,7 @@ describe("Better Auth runtime config", () => {
     expect(description).toEqual({
       basePath: "/v1/auth",
       emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+      loginMode: "password",
       signupEnabled: true,
       setup: {
         required: false,
@@ -65,7 +100,7 @@ describe("Better Auth runtime config", () => {
       encryptOAuthTokens: true,
       accountLinking: {
         enabled: true,
-        trustedProviders: ["github", "email-password"],
+        trustedProviders: ["google", "github", "email-password"],
         requireLocalEmailVerified: true,
       },
     });
@@ -78,6 +113,85 @@ describe("Better Auth runtime config", () => {
     });
 
     expect(authOptions.account?.accountLinking?.requireLocalEmailVerified).toBe(true);
+  });
+
+  it("supports a Google-only deployment without exposing password login or signup", () => {
+    const { authOptions, description } = createBetterAuthOptions({
+      env: {
+        NODE_ENV: "production",
+        BETTER_AUTH_SECRET: "test-secret-with-more-than-thirty-two-characters",
+        BERRY_AUTH_LOGIN_METHODS: "google",
+        BERRY_AUTH_SIGNUP_ENABLED: "true",
+      },
+    });
+
+    expect(description).toMatchObject({ loginMode: "google", emailPassword: { enabled: false }, signupEnabled: false });
+    expect(authOptions.emailAndPassword).toMatchObject({ enabled: false });
+  });
+
+  it("rejects new sessions for blocked and offboarded organization memberships", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SELECT status FROM tenant_memberships")) return { rows: [{ status: "disabled" }] };
+      return { rows: [] };
+    });
+    const { authOptions } = createBetterAuthOptions({
+      database: { connect: vi.fn(async () => ({ query, release: vi.fn() })) } as unknown as Pool,
+      env: { NODE_ENV: "test" },
+    });
+    const beforeSessionCreate = (authOptions.databaseHooks as {
+      session?: { create?: { before?: (session: { userId: string }) => Promise<void> } };
+    }).session?.create?.before;
+
+    await expect(beforeSessionCreate?.({ userId: "00000000-0000-7000-8000-000000000202" }))
+      .rejects.toThrow("organization membership is not active");
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("SELECT status FROM tenant_memberships"),
+      ["00000000-0000-7000-8000-000000000001", "00000000-0000-7000-8000-000000000202"],
+    );
+  });
+
+  it("counts organization seats instead of lifetime user rows", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM sso_connections")) return { rows: [{
+        id: "00000000-0000-7000-8000-000000000711",
+        display_name: "Google Workspace",
+        client_id: "google-client.apps.googleusercontent.com",
+        client_secret_envelope: {},
+        domains: ["aesg.com"],
+        jit_provisioning: true,
+        updated_at: "2026-08-08T00:00:00.000Z",
+      }] };
+      if (sql.includes("SELECT EXISTS")) return { rows: [{ exists: true }] };
+      if (sql.includes("count(*)::text")) return { rows: [{ count: "10" }] };
+      return { rows: [] };
+    });
+    const { authOptions } = createBetterAuthOptions({
+      database: { connect: vi.fn(async () => ({ query, release: vi.fn() })) } as unknown as Pool,
+      env: {
+        NODE_ENV: "production",
+        BETTER_AUTH_SECRET: "test-secret-with-more-than-thirty-two-characters",
+        BERRY_AUTH_LOGIN_METHODS: "google",
+        BERRY_AUTH_MAX_USERS: "10",
+      },
+    });
+    const beforeUserCreate = (authOptions.databaseHooks as {
+      user?: { create?: { before?: (user: { email: string }, context: unknown) => Promise<void> } };
+    }).user?.create?.before;
+
+    await expect(beforeUserCreate?.(
+      { email: "new.user@aesg.com" },
+      { path: "/callback/:id", params: { id: "google" } },
+    )).rejects.toThrow("account limit");
+    expect(query.mock.calls.find(([sql]) => sql.includes("count(*)::text"))?.[0]).toContain("tenant_memberships");
+    expect(query.mock.calls.find(([sql]) => sql.includes("count(*)::text"))?.[0]).toContain("status <> 'deprovisioned'");
+  });
+
+  it("rejects the legacy password owner endpoint in Google-only mode", async () => {
+    const runtime = new RealBetterAuthRuntime(
+      { handler: vi.fn() } as never,
+      { ...baseDescription(), emailPassword: { enabled: false, minPasswordLength: 8, maxPasswordLength: 128 }, loginMode: "google" },
+    );
+    await expect(runtime.setupOwner({})).rejects.toMatchObject({ status: 400 });
   });
 
   it("adds GitHub OAuth only when the provider credentials are configured", () => {
@@ -302,19 +416,30 @@ describe("Better Auth runtime config", () => {
     const membershipSql = query.mock.calls
       .map(([sql]) => sql)
       .find((sql) => sql.includes("INSERT INTO tenant_memberships"));
-    expect(membershipSql).toContain("'member'");
+    expect(membershipSql).toContain("VALUES ($1::uuid, $2::uuid, 'active', $3, $4)");
     const membershipCall = query.mock.calls.find(([sql]) => sql.includes("INSERT INTO tenant_memberships"));
     expect(membershipCall?.[1]).toEqual([
       "00000000-0000-7000-8000-000000000001",
       "00000000-0000-7000-8000-000000000111",
+      "member",
       "signup",
     ]);
     expect(query.mock.calls.some(([sql]) => sql.includes("UPDATE workspaces"))).toBe(false);
-    expect(orgBudgetSql).toContain("DO NOTHING");
+    expect(orgBudgetSql).toContain("DO UPDATE");
   });
 
   it("allows Google JIT provisioning while local signup is closed and records an SSO membership", async () => {
     const connectionQuery = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.includes("FROM sso_connections")) return { rows: [{
+        id: "00000000-0000-7000-8000-000000000711",
+        display_name: "Google Workspace",
+        client_id: "google-client.apps.googleusercontent.com",
+        client_secret_envelope: {},
+        domains: ["aesg.com"],
+        jit_provisioning: true,
+        updated_at: "2026-08-08T00:00:00.000Z",
+      }] };
+      if (sql.includes("SELECT email FROM users")) return { rows: [{ email: "new.user@aesg.com" }] };
       if (sql.includes("SELECT EXISTS")) return { rows: [{ exists: true }] };
       return { rows: [] };
     });
@@ -345,8 +470,112 @@ describe("Better Auth runtime config", () => {
     expect(membershipCall?.[1]).toEqual([
       "00000000-0000-7000-8000-000000000001",
       "00000000-0000-7000-8000-000000000112",
+      "member",
       "sso",
     ]);
+  });
+
+  it("lets only the exact configured Google identity claim the first owner", async () => {
+    const connectionQuery = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.includes("FROM sso_connections")) return { rows: [{
+        id: "00000000-0000-7000-8000-000000000711",
+        display_name: "Google Workspace",
+        client_id: "google-client.apps.googleusercontent.com",
+        client_secret_envelope: {},
+        domains: ["aesg.com"],
+        jit_provisioning: true,
+        updated_at: "2026-08-08T00:00:00.000Z",
+      }] };
+      if (sql.includes("SELECT email FROM users")) return { rows: [{ email: "strawberry@aesg.com" }] };
+      if (sql.includes("AS ready")) return { rows: [{ ready: true }] };
+      if (sql.includes("SELECT EXISTS")) return { rows: [{ exists: false }] };
+      if (sql.includes("UPDATE tenants") || sql.includes("UPDATE workspaces")) return { rows: [], rowCount: 1 };
+      return { rows: [] };
+    });
+    const pool = {
+      connect: vi.fn(async () => ({ query: connectionQuery, release: vi.fn() })),
+      query: vi.fn(async () => ({ rows: [{ count: "0" }] })),
+    } as unknown as Pool;
+    const { authOptions } = createBetterAuthOptions({
+      database: pool,
+      env: {
+        NODE_ENV: "production",
+        BETTER_AUTH_SECRET: "test-secret-with-more-than-thirty-two-characters",
+        BERRY_AUTH_LOGIN_METHODS: "google",
+        BERRY_SETUP_OWNER_EMAIL: "strawberry@aesg.com",
+      },
+    });
+    const hooks = (authOptions.databaseHooks as {
+      user?: { create?: {
+        before?: (user: { email: string }, context: unknown) => Promise<void>;
+        after?: (user: { id: string }, context: unknown) => Promise<void>;
+      } };
+    }).user?.create;
+    const googleCallback = { path: "/callback/:id", params: { id: "google" } };
+
+    await expect(hooks?.before?.({ email: "someone.else@aesg.com" }, googleCallback)).rejects.toThrow("configured owner");
+    await expect(hooks?.before?.({ email: "strawberry@aesg.com" }, googleCallback)).resolves.toBeUndefined();
+    await hooks?.after?.({ id: "00000000-0000-7000-8000-000000000113" }, googleCallback);
+
+    expect(connectionQuery.mock.calls.find(([sql]) => sql.includes("AS ready"))?.[0]).toContain("foundationConfigured");
+    const membershipCall = connectionQuery.mock.calls.find(([sql]) => sql.includes("INSERT INTO tenant_memberships"));
+    expect(membershipCall?.[1]).toEqual([
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000113",
+      "owner",
+      "sso",
+    ]);
+    expect(connectionQuery.mock.calls.some(([sql]) => sql.includes("UPDATE workspaces"))).toBe(true);
+    expect(connectionQuery.mock.calls.some(([sql]) => sql.includes("setupComplete"))).toBe(true);
+  });
+
+  it("repairs an initial Google owner claim after the OAuth user transaction already committed", async () => {
+    const ownerId = "00000000-0000-7000-8000-000000000113";
+    const query = vi.fn(async (sql: string, _params?: readonly unknown[]) => {
+      if (sql.includes("role = 'owner'")) return { rows: [{ exists: false }] };
+      if (sql.includes("AS has_google_account")) {
+        return { rows: [{ email: "strawberry@aesg.com", email_verified: true, has_google_account: true }] };
+      }
+      if (sql.includes("AS eligible")) return { rows: [{ eligible: true }] };
+      if (sql.includes("SELECT status FROM tenant_memberships")) return { rows: [{ status: "active" }] };
+      if (sql.includes("connection.domains @>")) return { rows: [{ ready: true }] };
+      if (sql.includes("UPDATE tenants") || sql.includes("UPDATE workspaces")) return { rows: [], rowCount: 1 };
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const runtime = new RealBetterAuthRuntime(
+      {
+        handler: vi.fn(),
+        api: {
+          getSession: vi.fn(async () => ({
+            session: { id: "session_owner", userId: ownerId },
+            user: { id: ownerId, email: "strawberry@aesg.com", emailVerified: true },
+          })),
+        },
+      } as never,
+      { ...baseDescription(), emailPassword: { enabled: false, minPasswordLength: 8, maxPasswordLength: 128 }, loginMode: "google" },
+      { connect: vi.fn(async () => ({ query, release })) } as unknown as Pool,
+      {
+        BERRY_SETUP_OWNER_EMAIL: "strawberry@aesg.com",
+        BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS: "100000000",
+        BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS: "15000000",
+      },
+    );
+
+    await expect(runtime.getSession({})).resolves.toMatchObject({ user: { id: ownerId } });
+    await expect(runtime.getSession({})).resolves.toMatchObject({ user: { id: ownerId } });
+
+    expect(query.mock.calls.find(([sql]) => sql.includes("INSERT INTO tenant_memberships"))?.[1]).toEqual([
+      "00000000-0000-7000-8000-000000000001",
+      ownerId,
+      "owner",
+      "sso",
+    ]);
+    expect(query.mock.calls.some(([sql]) => sql.includes("setupComplete"))).toBe(true);
+    expect(query.mock.calls.some(([sql]) => sql.includes("UPDATE workspaces"))).toBe(true);
+    expect(query.mock.calls.filter(([sql]) => sql.includes("pg_advisory_xact_lock"))).toHaveLength(2);
+    expect(query.mock.calls.some(([sql, params]) => sql.includes("pg_advisory_xact_lock") && params?.[0] === `berry-owner-setup:00000000-0000-7000-8000-000000000001`)).toBe(true);
+    expect(release).toHaveBeenCalledTimes(2);
   });
 
   it("creates the first owner, claims the default workspace, and closes setup in one transaction", async () => {

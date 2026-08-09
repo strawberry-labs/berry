@@ -1,0 +1,9 @@
+{$BERRY_FILES_DOMAIN} {
+	reverse_proxy minio:9000
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}

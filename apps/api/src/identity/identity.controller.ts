@@ -24,12 +24,20 @@ import {
   type EnterpriseIdentityRepository,
 } from "./identity.repository.ts";
 
+export const LOCAL_MEMBER_PROVISIONING_ENABLED = Symbol("LOCAL_MEMBER_PROVISIONING_ENABLED");
+
 const CreateOrgMemberRequestSchema = z.object({
   email: z.string().trim().email().transform((email) => email.toLowerCase()),
-  name: z.string().trim().min(1).max(100),
-  password: z.string().min(8).max(128),
+  name: z.string().trim().max(100).optional(),
+  password: z.string().min(8).max(128).optional(),
   role: z.enum(["admin", "member"]).default("member"),
-}).strict();
+  provisioning: z.enum(["local", "google_sso"]).default("local"),
+  departmentIds: z.array(z.string().uuid()).max(100).default([]),
+  primaryDepartmentId: z.string().uuid().nullable().optional(),
+}).strict().superRefine((value, context) => {
+  if (value.provisioning === "local" && !value.password) context.addIssue({ code: z.ZodIssueCode.custom, path: ["password"], message: "Password is required for a local account" });
+  if (value.primaryDepartmentId && !value.departmentIds.includes(value.primaryDepartmentId)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["primaryDepartmentId"], message: "Primary department must be included in departments" });
+});
 
 const CreateDepartmentRequestSchema = z.object({
   parentId: z.string().nullable().optional(),
@@ -79,6 +87,7 @@ const UpsertResourceAclRequestSchema = z.object({
 export class IdentityController {
   constructor(
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly repository: EnterpriseIdentityRepository,
+    @Inject(LOCAL_MEMBER_PROVISIONING_ENABLED) private readonly localMemberProvisioningEnabled: boolean,
     @Optional() @Inject(AUDIT_SERVICE) private readonly audit?: AuditService,
   ) {}
 
@@ -105,8 +114,26 @@ export class IdentityController {
   async createMember(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
     await this.requirePermission(request, tenantId, "members:write");
     const parsed = parseBody(CreateOrgMemberRequestSchema, body);
+    const actor = await this.repository.getMembership(tenantId, request.auth!.user.id);
+    if (parsed.role === "admin" && actor?.role !== "owner") throw new ForbiddenException("Only the organization owner can add an administrator");
+    if (parsed.provisioning === "local" && !this.localMemberProvisioningEnabled) {
+      throw new BadRequestException("Password accounts are disabled for this Google-only deployment");
+    }
+    if (parsed.provisioning === "google_sso") {
+      const google = (await this.repository.listSsoConnections(tenantId)).find((connection) => connection.provider === "google" && connection.status === "enabled");
+      const domain = parsed.email.split("@")[1] ?? "";
+      if (!google?.domains.includes(domain)) throw new BadRequestException("The email must belong to the configured Google Workspace domain");
+    }
+    const validDepartments = new Set((await this.repository.listDepartments(tenantId)).map((department) => department.id));
+    if (parsed.departmentIds.some((departmentId) => !validDepartments.has(departmentId))) {
+      throw new BadRequestException("One or more selected departments do not belong to this organization");
+    }
     try {
-      const membership = OrgMembershipSchema.parse(await this.repository.createMembership({ tenantId, ...parsed }));
+      const membership = OrgMembershipSchema.parse(await this.repository.createMembership({
+        tenantId,
+        ...parsed,
+        name: parsed.name || parsed.email.split("@")[0] || parsed.email,
+      }));
       await this.auditAdminMutation(request, tenantId, "identity", "member-created", "user", membership.userId, membership);
       return membership;
     } catch (cause) {
@@ -133,6 +160,16 @@ export class IdentityController {
     }
     if (request.auth?.user.id === userId && parsed.status && parsed.status !== "active") {
       throw new BadRequestException("You cannot block or offboard your own account");
+    }
+    const actor = await this.repository.getMembership(tenantId, request.auth!.user.id);
+    const changesAdministratorRole = parsed.role !== undefined
+      && parsed.role !== current.role
+      && (current.role === "admin" || parsed.role === "admin");
+    const changesAdministratorAccess = current.role === "admin"
+      && parsed.status !== undefined
+      && parsed.status !== current.status;
+    if ((changesAdministratorRole || changesAdministratorAccess) && actor?.role !== "owner") {
+      throw new ForbiddenException("Only the organization owner can change administrator access");
     }
     const departmentIds = parsed.departmentIds ?? current.departmentIds;
     const primaryDepartmentId = parsed.primaryDepartmentId !== undefined

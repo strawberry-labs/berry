@@ -1,0 +1,33 @@
+# AWS EC2 production override. PostgreSQL lives in private RDS databases;
+# Redis and the application services remain on the single EC2 host.
+services:
+  postgres:
+    profiles: ["local-database"]
+
+  mem0-postgres:
+    profiles: ["local-database"]
+
+  db-migrate:
+    depends_on: !override {}
+    environment:
+      BERRY_DATABASE_URL: ${BERRY_DATABASE_URL:?BERRY_DATABASE_URL must point to the RDS application database}
+
+  postgres-roles:
+    environment:
+      BERRY_DATABASE_URL: ${BERRY_DATABASE_URL:?BERRY_DATABASE_URL must point to the RDS application database}
+
+  mem0:
+    depends_on: !override
+      embeddings:
+        condition: service_started
+    environment:
+      BERRY_MEM0_DATABASE_URL: ${BERRY_MEM0_DATABASE_URL:?BERRY_MEM0_DATABASE_URL must point to the RDS memory database}
+
+  api:
+    environment:
+      BERRY_DATABASE_URL: ${BERRY_API_DATABASE_URL:?BERRY_API_DATABASE_URL must use the RDS berry_api role}
+      BERRY_PLATFORM_DATABASE_URL: ${BERRY_PLATFORM_DATABASE_URL:?BERRY_PLATFORM_DATABASE_URL must use the RDS berry_platform role}
+
+  worker:
+    environment:
+      BERRY_DATABASE_URL: ${BERRY_WORKER_DATABASE_URL:?BERRY_WORKER_DATABASE_URL must use the RDS berry_worker role}

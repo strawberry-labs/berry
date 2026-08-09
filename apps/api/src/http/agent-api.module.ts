@@ -33,6 +33,8 @@ import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { DURABLE_TURN_RUNNER_ENABLED, DurableTurnService } from "../runtime/durable-turn.service.ts";
 import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
 import { ConnectorsController, OrganizationConnectorsController } from "../connectors/connectors.controller.ts";
+import { SetupModule } from "../setup/setup.module.ts";
+import type { SetupService } from "../setup/setup.service.ts";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -53,6 +55,7 @@ export type AgentApiModuleOptions = {
   durableRunnerEnabled?: boolean;
   durableContextEnabled?: boolean;
   connectors?: { useValue: ConnectorsService };
+  setup?: { useValue: SetupService };
 };
 
 @Module({})
@@ -86,6 +89,7 @@ export class AgentApiModule {
         PolicyDistributionModule.register({ ...(options.policyDistribution ?? {}), identity: options.policyDistribution?.identity ?? options.identity }),
         ManagementModule.register({ ...(options.management ?? {}), ...((options.management?.identity ?? options.identity) ? { identity: options.management?.identity ?? options.identity } : {}) }),
         FilePlatformModule,
+        ...(options.setup ? [SetupModule.register(options.setup.useValue)] : []),
         ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],

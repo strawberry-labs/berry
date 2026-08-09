@@ -4367,6 +4367,22 @@ CREATE POLICY connector_oauth_states_tenant_isolation ON connector_oauth_states
   USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+export const PLATFORM_ROLE_RLS_TABLES = [
+  "tenant_memberships",
+  "tenant_hostnames",
+  "usage_events",
+  "billing_credit_grants",
+  "billing_invoices",
+  "billing_meter_events",
+] as const;
+
+export const PLATFORM_ROLE_RLS_MIGRATION = PLATFORM_ROLE_RLS_TABLES.map((tableName) => `
+DROP POLICY IF EXISTS ${tableName}_platform_read ON ${tableName};
+CREATE POLICY ${tableName}_platform_read ON ${tableName}
+  FOR SELECT
+  USING (current_user = 'berry_platform');
+`.trim()).join("\n\n");
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -4472,4 +4488,5 @@ export const cloudMigrations = [
   { id: 44, name: "file_reference_safe_legacy_writer_compat_v1", sql: FILE_REFERENCE_SAFE_LEGACY_WRITER_COMPAT_MIGRATION },
   { id: 45, name: "connectors_v1", sql: CONNECTORS_MIGRATION },
   { id: 46, name: "google_workspace_sso_v1", sql: GOOGLE_WORKSPACE_SSO_MIGRATION },
+  { id: 47, name: "platform_role_rls_v1", sql: PLATFORM_ROLE_RLS_MIGRATION },
 ] as const;

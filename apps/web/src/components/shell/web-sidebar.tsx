@@ -2,7 +2,6 @@ import * as React from "react";
 import { DollarSign, LogOut } from "lucide-react";
 import type { AllowanceBalance, OrgPermission, Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
-import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { Kbd } from "@berry/desktop-ui/components/ui/kbd";
 import {
@@ -34,6 +33,7 @@ import { Archive, ArrowUp as Upload, CirclePlus, Ellipsis, FolderOpen, LayoutAli
 import type { SignedInUser } from "./auth-boundary";
 import type { ManagementKind } from "../management/management-navigation";
 import { WebSettingsNavigation } from "./web-settings-navigation";
+import { DeploymentBrandLogo, useDeploymentBrand } from "./deployment-brand";
 
 const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-dialog").then((module) => ({ default: module.ProjectUploadDialog })));
 
@@ -55,6 +55,7 @@ export function WebWindowChrome({ onHome, onSearch }: {
   onSearch: () => void;
 }) {
   const { isMobile, state, toggleSidebar } = useSidebar();
+  const brand = useDeploymentBrand();
   const sidebarCollapsed = state === "collapsed";
   const homeControlOpensSidebar = isMobile || sidebarCollapsed;
 
@@ -68,12 +69,12 @@ export function WebWindowChrome({ onHome, onSearch }: {
           type="button"
           className="berry-web-home-link"
           onClick={homeControlOpensSidebar ? toggleSidebar : onHome}
-          aria-label={homeControlOpensSidebar ? "Open sidebar" : "Berry home"}
+          aria-label={homeControlOpensSidebar ? "Open sidebar" : `${brand.applicationName} home`}
           title={homeControlOpensSidebar ? "Open sidebar" : undefined}
         >
-          <BerryLogo className="berry-web-home-logo size-5" alt="" />
+          <DeploymentBrandLogo className="berry-web-home-logo size-5" alt="" />
           <LayoutAlignLeft className="berry-web-sidebar-expand-icon" aria-hidden="true" />
-          <span className="berry-web-home-label">Berry</span>
+          <span className="berry-web-home-label">{brand.applicationName}</span>
         </button>
         <div className="berry-web-window-actions flex items-center">
           {!sidebarCollapsed ? <Button variant="ghost" size="icon-lg" onClick={onSearch} aria-label="Search" title="Search" data-web-search-trigger className="berry-web-header-icon"><Search /></Button> : null}
@@ -172,7 +173,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
           <Popover onOpenChange={(open) => { if (open) onRefreshAllowance(); }}>
             <PopoverTrigger asChild>
               <button type="button" className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2 text-left" aria-label="Open account and allowance">
-                <span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><BerryLogo className="size-full" alt="" /></span>
+                <span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><DeploymentBrandLogo className="size-full" alt="" /></span>
                 <span className="min-w-0 truncate text-sm font-semibold">{user?.name || user?.email || "Berry Cloud"}</span>
               </button>
             </PopoverTrigger>

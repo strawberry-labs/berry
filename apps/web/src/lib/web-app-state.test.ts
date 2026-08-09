@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getWebConfig } from "./env.server";
+import { getWebConfig, resolveDemoMode } from "./env.server";
 import { filterItems } from "./mentions";
 import { IDLE, reduceStream } from "@berry/desktop-ui/components/thread-stream";
 
@@ -40,5 +40,21 @@ describe("web shell state helpers", () => {
       if (previous === undefined) delete process.env.DEPLOYMENT_MODE;
       else process.env.DEPLOYMENT_MODE = previous;
     }
+  });
+
+  it("fails closed when a production API URL is missing", () => {
+    expect(() => resolveDemoMode({
+      apiBaseUrl: null,
+      configuredValue: undefined,
+      nodeEnv: "production",
+    })).toThrow("BERRY_WEB_API_BASE_URL is required");
+  });
+
+  it("allows production demo mode only when explicitly enabled", () => {
+    expect(resolveDemoMode({
+      apiBaseUrl: null,
+      configuredValue: "true",
+      nodeEnv: "production",
+    })).toBe(true);
   });
 });

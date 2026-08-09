@@ -103,10 +103,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
-RUN corepack enable
+RUN corepack enable \
+  && mkdir -p /data \
+  && chown node:node /data
 
 VOLUME ["/data"]
-EXPOSE 3000 3108 8010
+EXPOSE 3000 3010 3108 8010
 
 FROM runtime-base AS api
 
@@ -114,24 +116,32 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends docker.io ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build-api /out/apps/api /app/apps/api
+COPY --chown=node:node --from=build-api /out/apps/api /app/apps/api
+
+USER node
 
 CMD ["node", "apps/api/dist/main.js"]
 
 FROM runtime-base AS worker
 
-COPY --from=build-worker /out/apps/worker /app/apps/worker
+COPY --chown=node:node --from=build-worker /out/apps/worker /app/apps/worker
+
+USER node
 
 CMD ["node", "apps/worker/dist/main.js"]
 
 FROM runtime-base AS mem0
 
-COPY --from=build-mem0 /out/apps/mem0 /app/apps/mem0
+COPY --chown=node:node --from=build-mem0 /out/apps/mem0 /app/apps/mem0
+
+USER node
 
 CMD ["node", "apps/mem0/dist/main.js"]
 
 FROM runtime-base AS web
 
-COPY --from=build-web /out/apps/web /app/apps/web
+COPY --chown=node:node --from=build-web /out/apps/web /app/apps/web
+
+USER node
 
 CMD ["apps/web/node_modules/.bin/srvx", "--prod", "-s", "../client", "apps/web/dist/server/server.js"]

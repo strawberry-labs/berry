@@ -74,13 +74,23 @@ fi
 changed_files="$(git diff --name-only "$deployed_ref" "$target_ref")"
 git reset --hard "$target_ref"
 
-if grep -q '^BERRY_OBJECT_STORAGE_MODE=r2$' "$env_file"; then
+storage_mode="$(sed -n 's/^BERRY_OBJECT_STORAGE_MODE=//p' "$env_file" | tail -n 1)"
+if [ "$storage_mode" = "aws" ]; then
+  export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/native/*.caddy'
+  berry_runtime_services="caddy embeddings mem0 tika redis api worker web"
+  berry_initialize_minio=false
+  compose() {
+    docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml "$@"
+  }
+elif [ "$storage_mode" = "r2" ]; then
+  export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/native/*.caddy'
   berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis api worker web"
   berry_initialize_minio=false
   compose() {
     docker compose --env-file "$env_file" -f deploy/compose.yaml "$@"
   }
 else
+  export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/minio/*.caddy'
   berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis minio api worker web"
   berry_initialize_minio=true
   compose() {

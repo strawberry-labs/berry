@@ -379,10 +379,25 @@ export interface CreateDepartmentRequest {
 
 export interface CreateOrgMemberRequest {
   email: string;
-  name: string;
-  password: string;
+  name?: string | undefined;
+  password?: string | undefined;
   role: "admin" | "member";
+  provisioning?: "local" | "google_sso" | undefined;
+  departmentIds?: string[] | undefined;
+  primaryDepartmentId?: string | null | undefined;
 }
+
+export type BerryAuthConfig = {
+  loginMode: "password" | "google" | "mixed";
+  emailPassword: { enabled: boolean };
+  ssoProviders: Array<{ id: "google"; name: string; domain: string }>;
+};
+
+const BerryAuthConfigSchema = z.object({
+  loginMode: z.enum(["password", "google", "mixed"]).default("password"),
+  emailPassword: z.object({ enabled: z.boolean() }),
+  ssoProviders: z.array(z.object({ id: z.literal("google"), name: z.string(), domain: z.string() })).default([]),
+}).passthrough();
 
 export interface CreateSsoConnectionRequest {
   kind: "saml" | "oidc";
@@ -713,8 +728,11 @@ export class BerryApiClient {
     return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}/workspace/capture`, z.object({ state: CloudWorkspaceStateSchema, previews: z.array(CloudPreviewSchema), terminals: z.array(CloudTerminalSessionSchema) }));
   }
 
-  async listArtifacts(): Promise<ArtifactLibraryItem[]> {
-    return this.#request("/v1/artifacts", z.array(ArtifactLibraryItemSchema));
+  async listArtifacts(input: { cursor?: string; limit?: number } = {}, options: { signal?: AbortSignal } = {}): Promise<{ items: ArtifactLibraryItem[]; nextCursor: string | null }> {
+    return this.#request(`/v1/artifacts${usageQuery(input)}`, z.object({
+      items: z.array(ArtifactLibraryItemSchema),
+      nextCursor: z.string().nullable(),
+    }), options);
   }
 
   async uploadArtifact(input: { name: string; mediaType: string; dataUrl: string }): Promise<ArtifactLibraryItem> {
@@ -1089,6 +1107,10 @@ export class BerryApiClient {
   async currentOrganization(host?: string | undefined): Promise<Organization> {
     const suffix = host ? `?host=${encodeURIComponent(host)}` : "";
     return this.#request(`/v1/orgs/current${suffix}`, OrganizationSchema);
+  }
+
+  async authConfig(): Promise<BerryAuthConfig> {
+    return this.#request("/v1/auth/config", BerryAuthConfigSchema);
   }
 
   async listOrgMembers(tenantId: string): Promise<OrgMembership[]> {

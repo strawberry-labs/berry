@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, ForbiddenException, Inject, Inj
 import type { OnModuleDestroy } from "@nestjs/common";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
-import { betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
+import { APIError, betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
 import { hashPassword } from "better-auth/crypto";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { Pool, type PoolClient } from "pg";
@@ -29,7 +29,8 @@ export type BerryAuthSession = {
 
 export type BerryAuthDescription = {
   basePath: string;
-  emailPassword: { enabled: true; minPasswordLength: number; maxPasswordLength: number };
+  emailPassword: { enabled: boolean; minPasswordLength: number; maxPasswordLength: number };
+  loginMode?: "password" | "google" | "mixed";
   signupEnabled?: boolean;
   setup?: {
     required: boolean;
@@ -104,7 +105,10 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
 
   const trustedOrigins = parseCsv(env.BERRY_AUTH_TRUSTED_ORIGINS);
   const production = env.NODE_ENV === "production";
-  const signupEnabled = env.BERRY_AUTH_SIGNUP_ENABLED === "true" || (!production && env.BERRY_AUTH_SIGNUP_ENABLED !== "false");
+  const loginMethods = new Set(parseCsv(env.BERRY_AUTH_LOGIN_METHODS).map((method) => method.toLowerCase()));
+  const passwordEnabled = loginMethods.size === 0 || loginMethods.has("password");
+  const googleEnabled = loginMethods.has("google");
+  const signupEnabled = passwordEnabled && (env.BERRY_AUTH_SIGNUP_ENABLED === "true" || (!production && env.BERRY_AUTH_SIGNUP_ENABLED !== "false"));
   const maxUsers = positiveInteger(env.BERRY_AUTH_MAX_USERS, 10);
   const defaultOrgBudgetMicros = positiveInteger(env.BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS, 100_000_000);
   const defaultUserBudgetMicros = positiveInteger(env.BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS, 15_000_000);
@@ -116,14 +120,14 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
   }
   const tenantId = env.BERRY_TENANT_ID ?? SELF_HOST_TENANT_ID;
   const authOptions: BetterAuthOptions = {
-    appName: "Berry",
+    appName: env.BERRY_APPLICATION_NAME?.trim() || "Berry",
     basePath: AUTH_BASE_PATH,
     baseURL: env.BERRY_AUTH_BASE_URL ?? "http://localhost:3000",
     secret,
     ...(pool ? { database: pool } : {}),
     ...(trustedOrigins.length > 0 ? { trustedOrigins } : {}),
     emailAndPassword: {
-      enabled: true,
+      enabled: passwordEnabled,
       minPasswordLength: 8,
       maxPasswordLength: 128,
       requireEmailVerification: false,
@@ -141,47 +145,71 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
               const email = user.email.trim().toLowerCase();
               const domain = email.split("@")[1] ?? "";
               const ssoProvisioning = isGoogleSsoContext(context);
-              if (!await ownerExists(pool, tenantId)) {
-                throw new Error("Complete the one-time owner setup before creating member accounts.");
+              if (ssoProvisioning) {
+                const google = await loadEnabledGoogleSso(pool, tenantId);
+                if (!google || domain !== google.domain) throw new Error("Use an account from the configured Google Workspace domain.");
               }
-              if (!ssoProvisioning) {
+              const hasOwner = await ownerExists(pool, tenantId);
+              if (!hasOwner) {
+                if (!ssoProvisioning || !setupOwnerEmail || email !== setupOwnerEmail) {
+                  throw new Error("The configured owner must claim this deployment with Google before member accounts can be created.");
+                }
+                if (!await setupReadyForOwnerClaim(pool, tenantId)) {
+                  throw new Error("Complete every deployment setup step before claiming ownership.");
+                }
+              }
+              if (hasOwner && !ssoProvisioning) {
                 if (!signupEnabled) throw new Error("Account creation is disabled. Ask an administrator to invite you.");
                 if (allowedEmails.size > 0 && !allowedEmails.has(email)) throw new Error("This email address is not allowed to create an account.");
                 if (allowedDomains.size > 0 && !allowedDomains.has(domain)) throw new Error("This email domain is not allowed to create an account.");
               }
-              const count = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM users WHERE deleted_at IS NULL");
-              if (Number(count.rows[0]?.count ?? "0") >= maxUsers) throw new Error("This Berry instance has reached its account limit.");
+              if (await tenantSeatCount(pool, tenantId) >= maxUsers) throw new Error("This Berry instance has reached its account limit.");
             },
             after: async (user: { id: string }, context: unknown) => {
-              const membershipSource = isGoogleSsoContext(context) ? "sso" : "signup";
+              const googleProvisioning = isGoogleSsoContext(context);
+              const membershipSource = googleProvisioning ? "sso" : "signup";
               const client = await pool.connect();
               try {
                 await client.query("BEGIN");
                 await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
-                await client.query(
-                  `INSERT INTO tenant_memberships (tenant_id, user_id, status, role, source)
-                   VALUES ($1::uuid, $2::uuid, 'active', 'member', $3)
-                   ON CONFLICT (tenant_id, user_id) DO UPDATE SET status = 'active', updated_at = now()`,
-                  [tenantId, user.id, membershipSource],
-                );
-                await client.query(
-                  `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
-                   VALUES ($1::uuid, 'org', $1::text, 'month', $2, $3, 'active')
-                   ON CONFLICT (tenant_id, scope_type, scope_id, period) DO NOTHING`,
-                  [tenantId, Math.floor(defaultOrgBudgetMicros * 0.8), defaultOrgBudgetMicros],
-                );
-                await client.query(
-                  `INSERT INTO budget_limits (tenant_id, scope_type, scope_id, period, soft_limit_micros, hard_limit_micros, status)
-                   VALUES ($1::uuid, 'user', $2::text, 'month', $3, $4, 'active')
-                   ON CONFLICT (tenant_id, scope_type, scope_id, period) DO NOTHING`,
-                  [tenantId, user.id, Math.floor(defaultUserBudgetMicros * 0.8), defaultUserBudgetMicros],
-                );
+                await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`berry-owner-setup:${tenantId}`]);
+                const userResult = await client.query<{ email: string }>("SELECT email FROM users WHERE id=$1::uuid LIMIT 1", [user.id]);
+                const email = userResult.rows[0]?.email.trim().toLowerCase() ?? "";
+                const initialOwner = googleProvisioning && !await clientHasOwner(client, tenantId) && Boolean(setupOwnerEmail) && email === setupOwnerEmail;
+                if (initialOwner) {
+                  await completeInitialGoogleOwnerClaim(client, tenantId, user.id, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+                } else {
+                  await client.query(
+                    `INSERT INTO tenant_memberships (tenant_id, user_id, status, role, source)
+                     VALUES ($1::uuid, $2::uuid, 'active', $3, $4)
+                     ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+                       status = 'active',
+                       role = CASE WHEN tenant_memberships.role IN ('owner','admin') THEN tenant_memberships.role ELSE EXCLUDED.role END,
+                       source = CASE WHEN tenant_memberships.source = 'sso' THEN tenant_memberships.source ELSE EXCLUDED.source END,
+                       updated_at = now()`,
+                    [tenantId, user.id, "member", membershipSource],
+                  );
+                  await upsertInitialBudgets(client, tenantId, user.id, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+                }
                 await client.query("COMMIT");
               } catch (error) {
                 await client.query("ROLLBACK");
                 throw error;
               } finally {
                 client.release();
+              }
+            },
+          },
+        },
+        session: {
+          create: {
+            before: async (session: { userId: string }) => {
+              const status = await tenantMembershipStatus(pool, tenantId, session.userId);
+              if (status === "disabled" || status === "deprovisioned") {
+                throw APIError.from("FORBIDDEN", {
+                  code: "ORGANIZATION_MEMBERSHIP_INACTIVE",
+                  message: "Your organization membership is not active.",
+                });
               }
             },
           },
@@ -214,7 +242,7 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
       encryptOAuthTokens: true,
       accountLinking: {
         enabled: true,
-        trustedProviders: ["github", "email-password"],
+        trustedProviders: ["google", "github", "email-password"],
         requireLocalEmailVerified: true,
       },
       fields: {
@@ -250,7 +278,8 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
     authOptions,
     description: {
       basePath: AUTH_BASE_PATH,
-      emailPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+      emailPassword: { enabled: passwordEnabled, minPasswordLength: 8, maxPasswordLength: 128 },
+      loginMode: googleEnabled && !passwordEnabled ? "google" : googleEnabled ? "mixed" : "password",
       signupEnabled,
       setup: {
         required: false,
@@ -265,6 +294,48 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
   };
   if (pool) result.pool = pool;
   return result;
+}
+
+async function tenantSeatCount(pool: Pool, tenantId: string): Promise<number> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
+    const result = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM tenant_memberships
+       WHERE tenant_id=$1::uuid AND status <> 'deprovisioned'`,
+      [tenantId],
+    );
+    await client.query("COMMIT");
+    return Number(result.rows[0]?.count ?? "0");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function tenantMembershipStatus(pool: Pool, tenantId: string, userId: string): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
+    const result = await client.query<{ status: string }>(
+      `SELECT status FROM tenant_memberships
+       WHERE tenant_id=$1::uuid AND user_id=$2::uuid
+       LIMIT 1`,
+      [tenantId, userId],
+    );
+    await client.query("COMMIT");
+    return result.rows[0]?.status ?? null;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export function createBerryAuthRuntime(options: CreateBerryAuthOptions = {}): RealBetterAuthRuntime {
@@ -283,6 +354,8 @@ export function createBerryAuthRuntime(options: CreateBerryAuthOptions = {}): Re
 export class RealBetterAuthRuntime implements BerryAuthRuntime {
   private readonly nodeHandler: ReturnType<typeof toNodeHandler>;
   private googleHandlerCache?: { fingerprint: string; handler: ReturnType<typeof toNodeHandler> };
+  private readonly completedMembershipRecoveryChecks = new Set<string>();
+  private readonly completedOwnerRepairChecks = new Set<string>();
 
   constructor(
     private readonly auth: Auth,
@@ -299,9 +372,10 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
     if (!this.pool) return this.authDescription;
     const google = await loadEnabledGoogleSso(this.pool, this.tenantId);
     const googleUsable = google ? await isGoogleSsoUsable(google, this.env, this.tenantId) : false;
+    const setup = await setupDescription(this.pool, this.tenantId, this.env);
     return {
       ...this.authDescription,
-      setup: await setupDescription(this.pool, this.tenantId, this.env),
+      setup: this.authDescription.emailPassword.enabled ? setup : { ...setup, ownerEmail: null },
       ssoProviders: google && googleUsable
         ? [{ id: "google", name: google.displayName, domain: google.domain }]
         : [],
@@ -309,6 +383,9 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
   }
 
   async setupOwner(input: unknown): Promise<BerryOwnerSetupResult> {
+    if (!this.authDescription.emailPassword.enabled) {
+      throw new BadRequestException("Password-based owner setup is disabled. Complete the Google deployment wizard instead.");
+    }
     if (!this.pool) {
       throw new ServiceUnavailableException("Owner setup requires Postgres storage.");
     }
@@ -419,7 +496,34 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
     const session = await (this.auth.api.getSession as (context: { headers: Headers }) => Promise<unknown>)({
       headers: fromNodeHeaders(headers),
     });
-    return normalizeSession(session);
+    const normalized = normalizeSession(session);
+    if (normalized && this.pool) {
+      const setupOwnerEmail = normalizeEmail(this.env.BERRY_SETUP_OWNER_EMAIL);
+      if (setupOwnerEmail
+        && normalized.user.email.trim().toLowerCase() === setupOwnerEmail
+        && !this.completedOwnerRepairChecks.has(normalized.user.id)) {
+        const complete = await repairInitialGoogleOwnerClaim(
+          this.pool,
+          this.tenantId,
+          normalized.user.id,
+          setupOwnerEmail,
+          positiveInteger(this.env.BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS, 100_000_000),
+          positiveInteger(this.env.BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS, 15_000_000),
+        );
+        if (complete) this.completedOwnerRepairChecks.add(normalized.user.id);
+      }
+      if (!this.completedMembershipRecoveryChecks.has(normalized.user.id)) {
+        const complete = await recoverGoogleMembership(
+          this.pool,
+          this.tenantId,
+          normalized.user.id,
+          positiveInteger(this.env.BERRY_DEFAULT_ORG_MONTHLY_BUDGET_MICROS, 100_000_000),
+          positiveInteger(this.env.BERRY_DEFAULT_USER_MONTHLY_BUDGET_MICROS, 15_000_000),
+        );
+        if (complete) this.completedMembershipRecoveryChecks.add(normalized.user.id);
+      }
+    }
+    return normalized;
   }
 
   async requireSession(headers: IncomingHttpHeaders): Promise<BerryAuthSession> {
@@ -709,6 +813,211 @@ async function ownerExists(pool: Pool, tenantId: string): Promise<boolean> {
   } finally {
     client.release();
   }
+}
+
+async function setupReadyForOwnerClaim(pool: Pool, tenantId: string): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
+    const result = await client.query<{ ready: boolean }>(
+      `SELECT COALESCE((settings->'deploymentSetup'->>'foundationConfigured')::boolean,false)
+          AND COALESCE((settings->'deploymentSetup'->>'organizationConfigured')::boolean,false)
+          AND COALESCE((settings->'deploymentSetup'->>'connectorsConfigured')::boolean,false) AS ready
+       FROM tenants WHERE id=$1::uuid AND deleted_at IS NULL`,
+      [tenantId],
+    );
+    await client.query("COMMIT");
+    return result.rows[0]?.ready === true;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function recoverGoogleMembership(
+  pool: Pool,
+  tenantId: string,
+  userId: string,
+  defaultOrgBudgetMicros: number,
+  defaultUserBudgetMicros: number,
+): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`berry-google-membership:${tenantId}:${userId}`]);
+    const eligibility = await client.query<{ eligible: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM users user_record
+         WHERE user_record.id=$2::uuid
+           AND user_record.deleted_at IS NULL
+           AND user_record.email_verified=true
+           AND EXISTS (
+             SELECT 1 FROM auth_accounts account
+             WHERE account.user_id=user_record.id AND account.provider_id='google'
+           )
+           AND EXISTS (
+             SELECT 1 FROM sso_connections connection
+             WHERE connection.tenant_id=$1::uuid
+               AND connection.provider='google'
+               AND connection.kind='oidc'
+               AND connection.status='enabled'
+               AND connection.jit_provisioning=true
+               AND connection.domains @> jsonb_build_array(split_part(lower(user_record.email),'@',2))
+           )
+           AND EXISTS (
+             SELECT 1 FROM tenant_memberships owner_membership
+             WHERE owner_membership.tenant_id=$1::uuid
+               AND owner_membership.role='owner'
+               AND owner_membership.status='active'
+           )
+       ) AS eligible`,
+      [tenantId, userId],
+    );
+    if (eligibility.rows[0]?.eligible === true) {
+      await client.query(
+        `INSERT INTO tenant_memberships (tenant_id,user_id,status,role,source)
+         VALUES ($1::uuid,$2::uuid,'active','member','sso')
+         ON CONFLICT (tenant_id,user_id) DO NOTHING`,
+        [tenantId, userId],
+      );
+      await client.query(
+        `UPDATE tenant_memberships
+         SET status='active',source='sso',deprovisioned_at=NULL,updated_at=now()
+         WHERE tenant_id=$1::uuid AND user_id=$2::uuid AND status='pending'`,
+        [tenantId, userId],
+      );
+    }
+    const membership = await client.query<{ status: string }>(
+      `SELECT status FROM tenant_memberships
+       WHERE tenant_id=$1::uuid AND user_id=$2::uuid
+       LIMIT 1`,
+      [tenantId, userId],
+    );
+    const status = membership.rows[0]?.status;
+    if (status === "active") {
+      await upsertInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+    }
+    await client.query("COMMIT");
+    return status === "active" || (typeof status === "string" && status !== "pending");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function repairInitialGoogleOwnerClaim(
+  pool: Pool,
+  tenantId: string,
+  userId: string,
+  setupOwnerEmail: string | null,
+  defaultOrgBudgetMicros: number,
+  defaultUserBudgetMicros: number,
+): Promise<boolean> {
+  if (!setupOwnerEmail) return true;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenantId]);
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`berry-owner-setup:${tenantId}`]);
+    if (await clientHasOwner(client, tenantId)) {
+      await client.query("COMMIT");
+      return true;
+    }
+    const candidate = await client.query<{ email: string; email_verified: boolean; has_google_account: boolean }>(
+      `SELECT lower(user_record.email) AS email,
+              user_record.email_verified,
+              EXISTS (
+                SELECT 1 FROM auth_accounts account
+                WHERE account.user_id=user_record.id AND account.provider_id='google'
+              ) AS has_google_account
+       FROM users user_record
+       WHERE user_record.id=$1::uuid AND user_record.deleted_at IS NULL
+       LIMIT 1`,
+      [userId],
+    );
+    const ownerDomain = setupOwnerEmail.split("@")[1] ?? "";
+    if (candidate.rows[0]?.email !== setupOwnerEmail
+      || candidate.rows[0]?.email_verified !== true
+      || candidate.rows[0]?.has_google_account !== true
+      || !ownerDomain) {
+      await client.query("COMMIT");
+      return false;
+    }
+    const readiness = await client.query<{ ready: boolean }>(
+      `SELECT
+         NOT COALESCE((tenant.settings->>'setupComplete')::boolean,false)
+         AND COALESCE((tenant.settings->'deploymentSetup'->>'foundationConfigured')::boolean,false)
+         AND COALESCE((tenant.settings->'deploymentSetup'->>'organizationConfigured')::boolean,false)
+         AND COALESCE((tenant.settings->'deploymentSetup'->>'connectorsConfigured')::boolean,false)
+         AND EXISTS (
+           SELECT 1 FROM sso_connections connection
+           WHERE connection.tenant_id=tenant.id
+             AND connection.provider='google'
+             AND connection.kind='oidc'
+             AND connection.status='enabled'
+             AND connection.domains @> $2::jsonb
+         ) AS ready
+       FROM tenants tenant
+       WHERE tenant.id=$1::uuid AND tenant.deleted_at IS NULL`,
+      [tenantId, JSON.stringify([ownerDomain])],
+    );
+    if (readiness.rows[0]?.ready !== true) {
+      await client.query("COMMIT");
+      return false;
+    }
+    await completeInitialGoogleOwnerClaim(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
+    await client.query("COMMIT");
+    return true;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function completeInitialGoogleOwnerClaim(
+  client: PoolClient,
+  tenantId: string,
+  userId: string,
+  defaultOrgBudgetMicros: number,
+  defaultUserBudgetMicros: number,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO tenant_memberships (tenant_id, user_id, status, role, source)
+     VALUES ($1::uuid, $2::uuid, 'active', $3, $4)
+     ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+       status='active',role=EXCLUDED.role,source=EXCLUDED.source,deprovisioned_at=NULL,updated_at=now()`,
+    [tenantId, userId, "owner", "sso"],
+  );
+  const tenant = await client.query(
+    `UPDATE tenants SET
+       settings = jsonb_set(
+         settings || '{"setupComplete":true}'::jsonb,
+         '{deploymentSetup,completedAt}', to_jsonb(now()::text), true
+       ),
+       updated_at=now()
+     WHERE id=$1::uuid AND deleted_at IS NULL`,
+    [tenantId],
+  );
+  if (tenant.rowCount !== 1) throw new Error("The configured Berry tenant has not been seeded.");
+  const workspace = await client.query(
+    `UPDATE workspaces SET owner_id=$2::uuid,updated_at=now()
+     WHERE tenant_id=$1::uuid
+       AND (id=$3::uuid OR slug='default' OR settings->>'selfHostDefault'='true')
+       AND (owner_id IS NULL OR owner_id=$2::uuid)
+       AND deleted_at IS NULL`,
+    [tenantId, userId, SELF_HOST_WORKSPACE_ID],
+  );
+  if (workspace.rowCount !== 1) throw new Error("The default Berry workspace could not be claimed.");
+  await upsertInitialBudgets(client, tenantId, userId, defaultOrgBudgetMicros, defaultUserBudgetMicros);
 }
 
 async function clientHasOwner(client: PoolClient, tenantId: string): Promise<boolean> {

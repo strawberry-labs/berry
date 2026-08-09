@@ -13,6 +13,7 @@ const helmWorker = readFileSync(resolve(root, "deploy/helm/berry-platform/templa
 const helmHpa = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/hpa.yaml"), "utf8");
 const dedicatedRunbook = readFileSync(resolve(root, "deploy/dedicated-instance-runbook.md"), "utf8");
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
+const deploymentLauncher = readFileSync(resolve(root, "deploy/up.sh"), "utf8");
 const serverDeploy = readFileSync(resolve(root, "deploy/server-deploy.sh"), "utf8");
 const deploymentImpact = readFileSync(resolve(root, "deploy/deployment-impact.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
@@ -30,6 +31,7 @@ const requiredComposeSnippets = [
   "api:",
   "worker:",
   "web:",
+  "BERRY_CSP_EXTRA_FRAME_SOURCES:",
   "DEPLOYMENT_MODE:",
   "node\", \"apps/api/dist/main.js",
   "node\", \"apps/worker/dist/main.js",
@@ -74,6 +76,7 @@ const requiredComposeSnippets = [
   "image: ${BERRY_WORKER_IMAGE:-berry-worker:local}",
   "image: ${BERRY_MEM0_IMAGE:-berry-mem0:local}",
   "image: ${BERRY_WEB_IMAGE:-berry-web:local}",
+  "fetch('http://127.0.0.1:3010/readyz')",
 ];
 
 const requiredDockerfileSnippets = [
@@ -86,6 +89,7 @@ const requiredDockerfileSnippets = [
   "docker.io",
   "CMD [\"node\", \"apps/api/dist/main.js\"]",
   "CMD [\"node\", \"apps/mem0/dist/main.js\"]",
+  "EXPOSE 3000 3010 3108 8010",
 ];
 
 const requiredEnvSnippets = [
@@ -152,14 +156,16 @@ const requiredHelmTemplateSnippets = [
 
 assertContains("deploy/compose.yaml", compose, requiredComposeSnippets);
 assertContains("Dockerfile", dockerfile, requiredDockerfileSnippets);
+assertOccurrences("Dockerfile", dockerfile, "USER node", 4);
 assertContains("deploy/.env.example", envExample, requiredEnvSnippets);
 assertContains("deploy/helm/berry-platform/values.yaml", helmValues, requiredHelmSnippets);
 const helmMem0 = readFileSync(resolve(root, "deploy/helm/berry-platform/templates/mem0-deployment.yaml"), "utf8");
 assertContains("deploy/helm/berry-platform/templates/*", `${helmConfig}\n${helmApi}\n${helmWeb}\n${helmWorker}\n${helmMem0}\n${helmHpa}`, requiredHelmTemplateSnippets);
 assertContains("deploy/dedicated-instance-runbook.md", dedicatedRunbook, ["DEPLOYMENT_MODE=dedicated", "helm upgrade --install berry", "kubectl -n berry-acme create secret generic berry-postgres", "kubectl -n berry-acme create secret generic berry-billing", "kubectl -n berry-acme create secret generic berry-e2b"]);
-assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy @api api:3000", "reverse_proxy web:3108", "header @immutable_assets Cache-Control \"public, max-age=31536000, immutable\""]);
-assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=aesg-v2.berry.me", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS=", "BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY=", "BERRY_SANDBOX_TTL_SECONDS=300"]);
-assertContains("deploy/PRODUCTION.md", productionRunbook, ["aesg-v2.berry.me", "pause/reconnect", "deploy/backup.sh", "bak-sandbox-ttl-300"]);
+assertContains("deploy/Caddyfile", caddyfile, ["{$BERRY_DOMAIN}", "reverse_proxy @api api:3000", "reverse_proxy web:3108", "header @immutable_assets Cache-Control \"public, max-age=31536000, immutable\"", "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://apis.google.com", "frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com", "{$BERRY_CSP_EXTRA_FRAME_SOURCES:https://*.e2b.app}"]);
+assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=ai.aesg.com", "BERRY_AUTH_MODE=better-auth", "BERRY_WEB_API_INTERNAL_URL=http://api:3000", "BERRY_CSP_EXTRA_FRAME_SOURCES=https://*.e2b.app", "BERRY_ROUTER_COMPLETION_TRANSPORT=stream", "BERRY_ROUTER_MODELS_JSON=", "BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS=", "BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON=", "BERRY_CLOUD_MCP_SERVERS_JSON=", "BERRY_SANDBOX_PROVIDER=e2b", "E2B_API_KEY=", "BERRY_SANDBOX_TTL_SECONDS=300"]);
+assertContains("deploy/PRODUCTION.md", productionRunbook, ["ai.aesg.com", "pause/reconnect", "deploy/backup.sh", "bak-sandbox-ttl-300", "require IMDSv2", "metadata response hop limit to `2`", "EC2 role can access artifact S3"]);
+assertContains("deploy/up.sh", deploymentLauncher, ["BERRY_CONNECTOR_ENCRYPTION_KEY", "openssl base64 -d -A", 'connector_encryption_key_bytes" != "32"']);
 assertContains("deploy/server-deploy.sh", serverDeploy, ["max_sandbox_ttl_seconds=300", "Deployment automation will not replace the production environment file"]);
 assertContains("deploy/server-deploy.sh", serverDeploy, ["deployment-impact.sh", "compose build $berry_image_services", "berry_runtime_services=", "compose run --rm --no-deps minio-init", "--wait-timeout 120 $berry_runtime_services"]);
 assertContains("deploy/deployment-impact.sh", deploymentImpact, ["packages/db/*", "berry_run_migrations=true", "deploy/compose.yaml"]);
@@ -172,5 +178,12 @@ function assertContains(name, content, snippets) {
     if (!content.includes(snippet)) {
       throw new Error(`${name} missing required snippet: ${snippet}`);
     }
+  }
+}
+
+function assertOccurrences(name, content, snippet, expected) {
+  const actual = content.split(snippet).length - 1;
+  if (actual < expected) {
+    throw new Error(`${name} expected at least ${expected} occurrences of ${snippet}, found ${actual}`);
   }
 }

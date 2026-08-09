@@ -18,7 +18,6 @@ import {
 } from "@berry/desktop-ui/components/berry-thread-view";
 import { IDLE, reduceStream, reduceStreamDeltas, type StreamState } from "@berry/desktop-ui/components/thread-stream";
 import { Toaster } from "@berry/desktop-ui/components/ui/sonner";
-import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import type { ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -36,13 +35,15 @@ import {
 } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { FileSearch as FileSearchIcon } from "lucide-react";
 import { AtSign, Brain, Check, CircleHelp, ChevronDown, Ellipsis, FileText, GitBranch, Hand, Hash, ImagePlus, NotebookPen, PencilLine, Pin, PinOff, ShieldCheck, SlashSquare, Zap } from "@berry/desktop-ui/lib/icons";
-import { fixtureMessages, fixtureTasks, message } from "@/lib/fixtures";
+import { fixtureMessages, message } from "@/lib/fixtures";
 import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileDurableEventCursor, reconcileFetchedSessionMessages, type DurableEventSequences } from "@/lib/message-reconciliation";
-import { WebConfigSchema, type WebConfig } from "@/lib/config";
+import { WebConfigSchema } from "@/lib/config";
+import type { ShellData } from "@/lib/shell-data";
 import { parseCloudShellLocation, type ArtifactLibraryTab, type UserSettingsTab } from "@/lib/cloud-shell-state";
 import { MentionMenu, useStaticMentions } from "./mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "./prompt-editor";
-import { AuthBoundary, type SignedInUser } from "./shell/auth-boundary";
+import type { SignedInUser } from "./shell/auth-boundary";
+import { DeploymentBrandLogo } from "./shell/deployment-brand";
 import { TaskRouteState } from "./tasks/task-route-state";
 import { DurableRunStatus } from "./tasks/durable-run-status";
 import { Composer } from "./tasks/web-composer";
@@ -156,13 +157,7 @@ export function reduceDurableTurnState(
   return base;
 }
 
-export interface ShellData {
-  config: WebConfig;
-  tasks: Task[];
-  messages: Message[];
-  user: SignedInUser | null;
-  sessionResolved: boolean;
-}
+export type { ShellData } from "@/lib/shell-data";
 
 export function initialCloudContent(initial: ShellData): Pick<ShellData, "tasks" | "messages"> {
   return initial.config.demoMode
@@ -252,17 +247,12 @@ export function shouldShowComposerProjectSwitcher(messages: readonly unknown[]):
   return messages.length === 0;
 }
 
-export function AppShell({ initial }: { initial: ShellData }) {
-  if (initial.config.demoMode) return <CloudShell initial={initial} user={null} />;
-  return (
-    <AuthBoundary
-      baseUrl={initial.config.apiBaseUrl ?? ""}
-      initialUser={initial.user}
-      sessionResolved={initial.sessionResolved}
-    >
-      {(user, onSignedOut) => <CloudShell initial={initial} user={user} onSignedOut={onSignedOut} />}
-    </AuthBoundary>
-  );
+export function AppShell({ initial, user, onSignedOut }: {
+  initial: ShellData;
+  user: SignedInUser | null;
+  onSignedOut?: (() => void) | undefined;
+}) {
+  return <CloudShell initial={initial} user={user} onSignedOut={onSignedOut} />;
 }
 
 function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: SignedInUser | null; onSignedOut?: (() => void) | undefined }) {
@@ -352,7 +342,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [tasksLoaded, setTasksLoaded] = React.useState(initial.config.demoMode);
   const [taskRouteError, setTaskRouteError] = React.useState<"not-found" | "forbidden" | "failed" | null>(null);
   const [creatingProject, setCreatingProject] = React.useState(false);
-  const mainPanelRef = React.useRef<HTMLElement>(null);
+  const mainPanelRef = React.useRef<HTMLDivElement>(null);
   const [activeOrganizationId, setActiveOrganizationId] = React.useState(initial.config.activeOrganizationId);
   const activeOrganization = config.organizations.find((org) => org.id === activeOrganizationId) ?? config.organizations[0] ?? null;
   const fallbackOrgPermissions = React.useMemo(
@@ -2072,7 +2062,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           />
         )}
       >
-      <main ref={mainPanelRef} className="berry-web-main flex h-full min-h-0 flex-col">
+      <div ref={mainPanelRef} className="berry-web-main flex h-full min-h-0 flex-col">
         <div className={surface === "task" ? "contents" : "hidden"}>
         {activeTask && !activeTask.deletedAt ? (
         <>
@@ -2280,7 +2270,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           />
         ) : (
           <BerryWorkspaceHomeFrame
-            logo={<BerryLogo className="berry-home-greeting-logo" alt="" />}
+            logo={<DeploymentBrandLogo className="berry-home-greeting-logo" alt="" />}
             greeting={greeting()}
             help={<WebHelpMenu />}
             error={Object.values(resourceErrors).find(Boolean) ? <p className="composer-error" role="alert">{Object.values(resourceErrors).find(Boolean)}</p> : undefined}
@@ -2354,7 +2344,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             </React.Suspense>
           </div>
         ) : null}
-      </main>
+      </div>
       <ProjectCreationDialog
         container={mainPanelRef.current}
         open={creatingProject}
@@ -2463,19 +2453,4 @@ function LazySurfaceFallback({ label }: { label: string }) {
       <CircularActivitySpinner size={28} label={label} />
     </section>
   );
-}
-
-export function loadFixtureShellData(
-  config: WebConfig,
-  user: SignedInUser | null = null,
-  sessionResolved = config.demoMode,
-): ShellData {
-  const tasks = fixtureTasks();
-  return {
-    config,
-    tasks,
-    messages: fixtureMessages(tasks[0]?.activeSessionId ?? "session_cloud"),
-    user,
-    sessionResolved,
-  };
 }
