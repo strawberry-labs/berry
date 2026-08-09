@@ -42,6 +42,7 @@ Keep these values in the untracked `deploy/.env.production`:
 
 ```dotenv
 BERRY_AUTH_BASE_URL=https://ai.example.com
+BERRY_AUTH_GOOGLE_REDIRECT_URI=
 BERRY_AUTH_TRUSTED_ORIGINS=https://ai.example.com
 BERRY_AUTH_LOGIN_METHODS=google
 BERRY_AUTH_SIGNUP_ENABLED=false
@@ -107,7 +108,8 @@ Google APIs such as Drive or Gmail do not need to be enabled merely for SSO.
    https://ai.example.com
    ```
 
-6. Add this authorized redirect URI exactly, with no trailing slash:
+6. Add the redirect URI shown by Berry exactly, with no trailing slash. The
+   default is:
 
    ```text
    https://ai.example.com/v1/auth/callback/google
@@ -118,6 +120,11 @@ Google APIs such as Drive or Gmail do not need to be enabled merely for SSO.
 Google requires an exact redirect match, including scheme, host, path, case,
 port, and trailing slash. `redirect_uri_mismatch` nearly always means the URI
 above was entered differently or the credentials came from another client.
+
+If the organization already has an approved callback URI, set
+`BERRY_AUTH_GOOGLE_REDIRECT_URI` to that complete URI before starting Berry.
+It must use the same origin as `BERRY_AUTH_BASE_URL` and a path below
+`/v1/auth/`. Berry will display and use that URI throughout onboarding.
 
 For local development, create a different development OAuth client in the
 development Google Cloud project. Never add localhost URLs to the production
@@ -153,7 +160,7 @@ blanket **Trusted** access. See
    Never send or paste the complete tokenized URL into chat, email, or a ticket.
 2. Complete the foundation and organization steps.
 3. On **Google SSO**, enter the identity OAuth client.
-4. Confirm the displayed redirect URI is:
+4. Confirm the displayed redirect URI matches the Google client. By default it is:
 
    ```text
    https://ai.example.com/v1/auth/callback/google
@@ -195,7 +202,8 @@ and `hd` when restricting access to a Workspace domain.
 
 ### `redirect_uri_mismatch`
 
-The authorized redirect URI must be exactly:
+The authorized redirect URI must exactly match the value displayed by Berry.
+Without `BERRY_AUTH_GOOGLE_REDIRECT_URI`, it is:
 
 ```text
 https://ai.example.com/v1/auth/callback/google

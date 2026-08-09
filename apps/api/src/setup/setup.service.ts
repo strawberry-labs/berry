@@ -26,6 +26,7 @@ import type { ConnectorsService } from "../connectors/connectors.service.ts";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import type { EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { s3ClientOptions } from "../storage/s3-client-options.ts";
+import { resolveGoogleSsoRedirectUri } from "../auth/google-sso-callback.ts";
 
 const DomainSchema = z.string().trim().toLowerCase().regex(
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
@@ -214,7 +215,7 @@ export class SetupService {
         clientSecretConfigured: unlocked && Boolean(snapshot.sso?.client_secret_envelope),
         hostedDomain: domain,
         jitProvisioning: snapshot.sso?.jit_provisioning ?? true,
-        callbackUrl: `${this.publicBaseUrl()}/v1/auth/callback/google`,
+        callbackUrl: resolveGoogleSsoRedirectUri(this.env),
       },
       connectors: {
         configured: connectorsConfigured,

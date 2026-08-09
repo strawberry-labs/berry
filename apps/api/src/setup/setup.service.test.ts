@@ -132,6 +132,20 @@ describe("SetupService", () => {
     expect(JSON.stringify(status)).not.toContain("connector-plaintext-secret");
   });
 
+  it("publishes the configured enterprise SSO callback without changing the connector callback", async () => {
+    const service = setupService({
+      env: {
+        BERRY_AUTH_GOOGLE_REDIRECT_URI: "https://ai.aesg.com/v1/auth/sso/callback/aesg",
+      },
+    });
+    const value = service.unlock(setupToken, "127.0.0.1");
+
+    const status = await service.status(`berry_setup=${value}`);
+
+    expect(status.sso.callbackUrl).toBe("https://ai.aesg.com/v1/auth/sso/callback/aesg");
+    expect(status.connectors.callbackUrl).toBe("https://ai.aesg.com/v1/connectors/google/callback");
+  });
+
   it("keeps deployment and contact details private until setup is unlocked", async () => {
     const status = await setupService().status();
 

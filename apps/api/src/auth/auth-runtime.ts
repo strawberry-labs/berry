@@ -9,6 +9,11 @@ import { Pool, type PoolClient } from "pg";
 import { SELF_HOST_TENANT_ID, SELF_HOST_WORKSPACE_ID } from "@berry/db";
 import { ConnectorSecretEnvelopeSchema, openConnectorSecret, type ConnectorSecretEnvelope } from "@berry/shared";
 import { z } from "zod";
+import {
+  googleSsoCallbackPath,
+  normalizeGoogleSsoCallbackRequestUrl,
+  resolveGoogleSsoRedirectUri,
+} from "./google-sso-callback.ts";
 
 export const BERRY_AUTH_RUNTIME = Symbol("BERRY_AUTH_RUNTIME");
 
@@ -84,6 +89,7 @@ const OwnerSetupInputSchema = z.object({
 
 export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): { authOptions: BetterAuthOptions; description: BerryAuthDescription; pool?: Pool } {
   const env = options.env ?? process.env;
+  resolveGoogleSsoRedirectUri(env);
   const databaseUrl = env.BERRY_DATABASE_URL ?? env.DATABASE_URL;
   const pool = options.database ?? (databaseUrl ? new Pool({ connectionString: databaseUrl }) : undefined);
   const secret = env.BETTER_AUTH_SECRET ?? env.AUTH_SECRET ?? (env.NODE_ENV === "production" ? undefined : DEFAULT_DEV_SECRET);
@@ -353,6 +359,8 @@ export function createBerryAuthRuntime(options: CreateBerryAuthOptions = {}): Re
 @Injectable()
 export class RealBetterAuthRuntime implements BerryAuthRuntime {
   private readonly nodeHandler: ReturnType<typeof toNodeHandler>;
+  private readonly googleCallbackPath: string;
+  private readonly googleRedirectUri: string;
   private googleHandlerCache?: { fingerprint: string; handler: ReturnType<typeof toNodeHandler> };
   private readonly completedMembershipRecoveryChecks = new Set<string>();
   private readonly completedOwnerRepairChecks = new Set<string>();
@@ -366,6 +374,8 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
     private readonly baseAuthOptions?: BetterAuthOptions,
   ) {
     this.nodeHandler = toNodeHandler(auth);
+    this.googleCallbackPath = googleSsoCallbackPath(env);
+    this.googleRedirectUri = resolveGoogleSsoRedirectUri(env);
   }
 
   async describe(): Promise<BerryAuthDescription> {
@@ -556,7 +566,7 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
   }
 
   async handleNodeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!this.pool || !this.baseAuthOptions || !isGoogleAuthRequest(req)) {
+    if (!this.pool || !this.baseAuthOptions || !isGoogleAuthRequest(req, this.googleCallbackPath)) {
       await this.nodeHandler(req, res);
       return;
     }
@@ -581,6 +591,7 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
           google: {
             clientId: google.clientId,
             clientSecret,
+            redirectURI: this.googleRedirectUri,
             hd: google.domain,
             accessType: "online",
             disableSignUp: !google.jitProvisioning,
@@ -589,6 +600,7 @@ export class RealBetterAuthRuntime implements BerryAuthRuntime {
       });
       this.googleHandlerCache = { fingerprint, handler: toNodeHandler(googleAuth) };
     }
+    normalizeGoogleCallbackPath(req, this.googleCallbackPath);
     await this.googleHandlerCache.handler(req, res);
   }
 
@@ -747,15 +759,19 @@ function googleSsoFingerprint(record: GoogleWorkspaceSsoRecord, envelope: Connec
   })).digest("hex");
 }
 
-function isGoogleAuthRequest(req: IncomingMessage): boolean {
+function isGoogleAuthRequest(req: IncomingMessage, callbackPath: string): boolean {
   const path = new URL(req.url ?? "/", "http://berry.local").pathname;
-  if (path === `${AUTH_BASE_PATH}/callback/google`) return true;
+  if (path === `${AUTH_BASE_PATH}/callback/google` || path === callbackPath) return true;
   if (path !== `${AUTH_BASE_PATH}/sign-in/social`) return false;
   const body = (req as IncomingMessage & { body?: unknown }).body;
   return typeof body === "object"
     && body !== null
     && !Array.isArray(body)
     && (body as Record<string, unknown>).provider === "google";
+}
+
+function normalizeGoogleCallbackPath(req: IncomingMessage, callbackPath: string): void {
+  req.url = normalizeGoogleSsoCallbackRequestUrl(req.url, callbackPath);
 }
 
 function sanitizeGoogleSignInRequest(req: IncomingMessage): void {

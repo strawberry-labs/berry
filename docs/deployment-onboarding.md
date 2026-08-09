@@ -10,6 +10,7 @@ Set these server-side values before starting the API:
 NODE_ENV=production
 BERRY_AUTH_LOGIN_METHODS=google
 BERRY_AUTH_BASE_URL=https://ai.example.com
+BERRY_AUTH_GOOGLE_REDIRECT_URI=
 BERRY_WEB_PUBLIC_URL=https://ai.example.com
 BERRY_SETUP_OWNER_EMAIL=owner@example.com
 BERRY_SETUP_TOKEN=<at-least-32-random-characters>
@@ -38,6 +39,11 @@ Use these Google OAuth redirect URIs:
 https://ai.example.com/v1/auth/callback/google
 https://ai.example.com/v1/connectors/google/callback
 ```
+
+`BERRY_AUTH_GOOGLE_REDIRECT_URI` may override the first URI when an enterprise
+already has an approved SSO callback. The configured URI must use the same
+origin as `BERRY_AUTH_BASE_URL` and remain below `/v1/auth/`. The Google
+connector callback is separate and does not change.
 
 ## Users and administrators
 

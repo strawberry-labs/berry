@@ -239,6 +239,7 @@ services:
       BERRY_AUTH_MODE: ${BERRY_AUTH_MODE:-better-auth}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-replace-me-with-openssl-rand-base64-32}
       BERRY_AUTH_BASE_URL: ${BERRY_AUTH_BASE_URL:-https://ai.aesg.com}
+      BERRY_AUTH_GOOGLE_REDIRECT_URI: ${BERRY_AUTH_GOOGLE_REDIRECT_URI:-}
       BERRY_WEB_PUBLIC_URL: ${BERRY_WEB_PUBLIC_URL:-https://ai.aesg.com}
       BERRY_AUTH_TRUSTED_ORIGINS: ${BERRY_AUTH_TRUSTED_ORIGINS:-https://ai.aesg.com}
       BERRY_AUTH_LOGIN_METHODS: ${BERRY_AUTH_LOGIN_METHODS:-password}

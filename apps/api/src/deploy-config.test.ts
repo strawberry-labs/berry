@@ -53,6 +53,7 @@ describe("self-host compose deployment", () => {
     expect(compose).toContain("BERRY_ARTIFACT_S3_ACCESS_KEY_ID: ${BERRY_ARTIFACT_S3_ACCESS_KEY_ID:-}");
     expect(envExample).toContain("BERRY_ARTIFACT_S3_ENDPOINT=http://minio:9000");
     expect(compose).toContain("BERRY_AUTH_LOGIN_METHODS: ${BERRY_AUTH_LOGIN_METHODS:-password}");
+    expect(compose).toContain("BERRY_AUTH_GOOGLE_REDIRECT_URI: ${BERRY_AUTH_GOOGLE_REDIRECT_URI:-}");
     expect(compose).toContain("mc mb --ignore-existing");
     expect(compose).toContain('127.0.0.1:${BERRY_API_PORT:-3001}:3000');
     expect(caddyfile).toContain("reverse_proxy @api api:3000");
@@ -139,6 +140,7 @@ describe("self-host compose deployment", () => {
     expect(deploymentLauncher).not.toContain("#setup=$setup_token");
     expect(productionEnvExample).toContain("BERRY_DEPLOYMENT_PROFILE=production");
     expect(productionEnvExample).toContain("BERRY_AUTH_LOGIN_METHODS=google");
+    expect(productionEnvExample).toContain("BERRY_AUTH_GOOGLE_REDIRECT_URI=");
     expect(productionEnvExample).toContain("BERRY_OBJECT_STORAGE_MODE=aws");
     expect(productionEnvExample).not.toContain("BERRY_FILES_DOMAIN=");
     expect(envExample).toContain("DEPLOYMENT_MODE=self-hosted");
