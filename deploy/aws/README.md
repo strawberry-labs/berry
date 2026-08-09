@@ -63,9 +63,11 @@ After the stack completes:
 2. Create the `mem0` database and login through a private SSM-backed session.
 3. Fill only the five RDS URLs and two bucket names in the local
    `deploy/.env.production`.
-4. Copy the environment file to `/opt/berry/deploy/.env.production` through an
-   SSM-backed SSH session. Do not place it in S3, Parameter Store, command
-   history, user data, or CloudFormation parameters.
+4. Run `configure-production-env.sh`, then `transfer-production-env.sh`. The
+   transfer uses a one-time encrypted Secrets Manager value and removes both
+   the temporary secret and IAM permission when it finishes. Do not place the
+   environment in S3, Parameter Store, command history, user data, or
+   CloudFormation parameters.
 5. Deploy a pinned Git commit and run `./deploy/production-up.sh` on EC2.
 
 The RDS instance and both S3 buckets retain data if the stack is removed. EC2

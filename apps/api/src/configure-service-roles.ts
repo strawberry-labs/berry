@@ -14,16 +14,22 @@ export async function configureServiceRoles(env: NodeJS.ProcessEnv = process.env
     await executor.execute(`
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'berry_api') THEN CREATE ROLE berry_api; END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'berry_worker') THEN CREATE ROLE berry_worker; END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'berry_platform') THEN CREATE ROLE berry_platform; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'berry_api') THEN
+    CREATE ROLE berry_api NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'berry_worker') THEN
+    CREATE ROLE berry_worker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'berry_platform') THEN
+    CREATE ROLE berry_platform NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
 END
 $$
     `.trim());
     for (const [role, password] of Object.entries(passwords)) {
       const rows = await executor.query<{ statement: string }>(
         `SELECT format(
-          'ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
+          'ALTER ROLE %I LOGIN PASSWORD %L',
           $1::text,
           $2::text
         ) AS statement`,

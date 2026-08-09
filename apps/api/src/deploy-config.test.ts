@@ -87,9 +87,11 @@ describe("self-host compose deployment", () => {
       expect(productionEnvExample).toContain(`${key}=postgres://`);
     }
     expect(serviceRoleBootstrap).toContain("NOBYPASSRLS");
+    expect(serviceRoleBootstrap).toContain("'ALTER ROLE %I LOGIN PASSWORD %L'");
+    expect(serviceRoleBootstrap).not.toContain("ALTER ROLE %I LOGIN NOSUPERUSER");
     expect(serviceRoleBootstrap).not.toContain('"BYPASSRLS"');
     expect(productionRunbook).toContain("aws s3api put-bucket-cors");
-    expect(productionRunbook).toContain('"AllowedOrigins":["https://ai.aesg.com"]');
+    expect(productionRunbook).toContain('"AllowedOrigins":["https://ai.example.com"]');
     expect(productionRunbook).toContain('"ExposeHeaders":["ETag"]');
   });
 
