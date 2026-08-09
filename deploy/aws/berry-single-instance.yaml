@@ -547,6 +547,8 @@ Outputs:
     Description: Allocation ID. Resolve the actual address with ec2:DescribeAddresses.
   DatabaseEndpoint:
     Value: !GetAtt Database.Endpoint.Address
+  DatabaseName:
+    Value: !Ref DatabaseName
   DatabasePort:
     Value: !GetAtt Database.Endpoint.Port
   DatabaseSecretArn:
