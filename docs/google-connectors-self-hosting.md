@@ -1,10 +1,10 @@
 # Google connectors: self-hosting setup
 
 This runbook configures Berry's native **Google Workspace**, **Gmail**, and
-**Google Calendar** connectors for the AESG production origin:
+**Google Calendar** connectors for the production origin:
 
 ```text
-https://ai.aesg.com
+https://ai.example.com
 ```
 
 The setup uses one organization-owned Google OAuth web client. The client ID,
@@ -13,18 +13,18 @@ encrypted refresh token are stored in Berry's database. Only Berry's root
 connector-encryption key stays in the production environment.
 
 This authorization is separate from sign-in and does not change Berry's login
-policy. In the AESG Google-only profile, sign-in still uses the identity OAuth
-client while Drive, Gmail, and Calendar consent uses the connector client.
+policy. In the Google-only profile, sign-in still uses the identity OAuth client
+while Drive, Gmail, and Calendar consent uses the connector client.
 Adding connectors does not enable SCIM, user provisioning, or Domain-Wide
 Delegation.
 
 ## Decisions to make first
 
-1. Use a dedicated production Google Cloud project inside the AESG Google
+1. Use a dedicated production Google Cloud project inside the customer Google
    Cloud organization. Keep development in a separate project and OAuth
    client.
 2. Set the Google Auth Platform audience to **Internal** if every connecting
-   account is managed by the AESG Workspace organization. Use External only if
+   account is managed by the customer Workspace organization. Use External only if
    accounts outside that organization must connect; External introduces extra
    testing, publishing, and verification obligations.
 3. Decide the maximum access shown to members for each connector:
@@ -52,8 +52,8 @@ Put it only in the untracked `deploy/.env.production`:
 ```dotenv
 BERRY_CONNECTOR_ENCRYPTION_KEY=PASTE_THE_BASE64_VALUE
 BERRY_CONNECTOR_DECRYPTION_KEYS=
-BERRY_WEB_PUBLIC_URL=https://ai.aesg.com
-BERRY_AUTH_BASE_URL=https://ai.aesg.com
+BERRY_WEB_PUBLIC_URL=https://ai.example.com
+BERRY_AUTH_BASE_URL=https://ai.example.com
 ```
 
 Do not reuse `BETTER_AUTH_SECRET`, the durable capability key, a database
@@ -70,7 +70,7 @@ records have been re-encrypted and verified.
 ## 2. Create the Google Cloud project
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/).
-2. Select the AESG Cloud organization.
+2. Select the customer Cloud organization.
 3. Create a project such as `berry-connectors-production`.
 4. Record both the **project ID** and numeric **project number**. Picker uses
    the project number as its app ID.
@@ -119,22 +119,22 @@ Open **Google Cloud Console > Google Auth Platform**.
 Configure:
 
 - App name: `Berry`
-- User support email: an AESG-managed support address
-- App home page: `https://ai.aesg.com`
-- Privacy policy: the public privacy-policy URL approved by AESG
-- Terms: the public terms URL approved by AESG, if applicable
-- Authorized domain: `aesg.com`
-- Developer contact: a monitored AESG engineering/security mailbox
+- User support email: an organization-managed support address
+- App home page: `https://ai.example.com`
+- Privacy policy: the public privacy-policy URL approved by the organization
+- Terms: the public terms URL approved by the organization, if applicable
+- Authorized domain: `example.com`
+- Developer contact: a monitored organization engineering/security mailbox
 
 The privacy and terms links must be reachable without signing in. The in-app
 `/settings/privacy` page is not a substitute for a public OAuth policy page.
 
 ### Audience
 
-Choose **Internal** for an AESG-only rollout. Internal apps are limited to
+Choose **Internal** for an organization-only rollout. Internal apps are limited to
 accounts in the associated Workspace organization and avoid the External
-testing-user lifecycle. If Google shows `org_internal` for a legitimate AESG
-user, verify that the Cloud project belongs to the correct organization and
+testing-user lifecycle. If Google shows `org_internal` for a legitimate
+Workspace user, verify that the Cloud project belongs to the correct organization and
 that the user is in that organization.
 
 ### Data Access
@@ -202,13 +202,13 @@ Directory/Admin SDK scopes, or permanent-delete authority.
 4. Add this authorized JavaScript origin exactly:
 
    ```text
-   https://ai.aesg.com
+   https://ai.example.com
    ```
 
 5. Add this authorized redirect URI exactly, with no trailing slash:
 
    ```text
-   https://ai.aesg.com/v1/connectors/google/callback
+   https://ai.example.com/v1/connectors/google/callback
    ```
 
 6. Create the client and copy its client ID and client secret. The secret is
@@ -225,7 +225,7 @@ Do this when Google Workspace will use **Selected files**.
 2. Add an application restriction for websites/HTTP referrers:
 
    ```text
-   https://ai.aesg.com/*
+   https://ai.example.com/*
    ```
 
 3. Add an API restriction allowing only **Google Picker API**.
@@ -247,11 +247,11 @@ Use a Workspace administrator with the Security settings privilege.
 3. Open **Manage App Access**.
 4. Choose **Configure new app > OAuth App Name or Client ID**.
 5. Paste the complete `...apps.googleusercontent.com` client ID created above.
-6. Select the Berry web client, then select the AESG organizational unit(s)
+6. Select the Berry web client, then select the customer organizational unit(s)
    whose members may connect.
 7. Choose **Specific Google data**.
 8. Allow only the Google services/scopes from the Data Access list above that
-   correspond to the Berry connectors AESG will enable.
+   correspond to the Berry connectors the organization will enable.
 9. Confirm and save.
 
 Do not mark Berry **Trusted** merely to make consent work. Trusted gives the
@@ -259,7 +259,7 @@ app access to all Google services/scopes it requests. **Specific Google data**
 preserves the administrator's service boundary. Google notes that restricting
 Drive also restricts Forms, so configure and test those together.
 
-If AESG sets Gmail, Drive, or Calendar to Restricted under **Manage Google
+If the organization sets Gmail, Drive, or Calendar to Restricted under **Manage Google
 Services**, the Berry client must be configured as Specific Google data (or
 Trusted) before users can grant those scopes. Policy can be applied to a pilot
 organizational unit first.
@@ -272,12 +272,12 @@ organizational unit first.
 4. Enter:
    - OAuth client ID
    - OAuth client secret
-   - Hosted domain: the actual primary Workspace domain, normally `aesg.com`
+   - Hosted domain: the actual primary Workspace domain, normally `example.com`
    - Picker API key and project number when Selected files is used
 5. Confirm that Berry displays:
 
    ```text
-   https://ai.aesg.com/v1/connectors/google/callback
+   https://ai.example.com/v1/connectors/google/callback
    ```
 
 6. Save, then use **Test**. This checks Google's discovery endpoint and marks
@@ -299,7 +299,7 @@ experience with a pilot account.
 
 1. Open **Settings > Connectors**.
 2. Open one Google connector and choose Read or Full, if Full is allowed.
-3. Select **Connect**, choose the AESG account, review the consent screen, and
+3. Select **Connect**, choose the organization account, review the consent screen, and
    return to Berry.
 4. For Workspace Selected files, choose **Choose Drive files** and select test
    files in Picker.
@@ -352,7 +352,7 @@ Drive indexing, and Google Admin SDK operations.
   actually granted are all enforced at runtime.
 - Write/destructive actions still pass through Berry's tool approval flow.
 - Connector data may be sent to the model provider configured for the task.
-  AESG must ensure the selected provider and retention settings match its data
+  the organization must ensure the selected provider and retention settings match its data
   policy. Berry does not use Workspace data for generalized model training.
 - Do not use Domain-Wide Delegation for this feature. Per-user OAuth preserves
   Google permissions, consent, revocation, and account attribution.
@@ -403,7 +403,7 @@ gmail.googleapis.com
 apis.google.com
 ```
 
-Also keep `ai.aesg.com` in `BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS`; Berry's
+Also keep `ai.example.com` in `BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS`; Berry's
 native Google adapter is exposed to the agent runtime through a signed,
 short-lived internal MCP session on that origin. Add every published custom MCP
 hostname to the same allowlist.
@@ -417,7 +417,7 @@ or other internal ranges.
 ### `redirect_uri_mismatch`
 
 Compare Google's OAuth web-client entry to Berry's displayed callback. It must
-be exactly `https://ai.aesg.com/v1/connectors/google/callback`, without a
+be exactly `https://ai.example.com/v1/connectors/google/callback`, without a
 trailing slash. Confirm the request uses the intended production client ID.
 
 ### `Access blocked: Authorization Error` or `admin_policy_enforced`
@@ -431,7 +431,7 @@ by changing the app to Trusted without a security review.
 
 The selected account is outside the OAuth app's organization, or the Cloud
 project is not associated with the intended Workspace organization. Use the
-AESG account and verify project ownership/audience.
+organization account and verify project ownership/audience.
 
 ### Google does not return a refresh token
 
@@ -441,7 +441,7 @@ consent, but Google can omit a new refresh token when an older grant remains.
 
 ### Picker is blank or reports a developer-key error
 
-Verify Picker API is enabled, the API key permits `https://ai.aesg.com/*`, its
+Verify Picker API is enabled, the API key permits `https://ai.example.com/*`, its
 API restriction is Google Picker API, and Berry contains the numeric project
 number rather than the project ID. Also verify the connected Google account
 matches the OAuth token used by Picker.
@@ -455,7 +455,7 @@ and consent to the added scopes.
 
 ### External test users lose access after seven days
 
-For an AESG-only deployment, use an Internal audience in an organization-owned
+For an organization-only deployment, use an Internal audience in an organization-owned
 project. External apps left in Testing can have short-lived authorizations.
 
 ## Official references

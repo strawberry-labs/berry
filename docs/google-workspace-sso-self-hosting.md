@@ -1,12 +1,12 @@
 # Google Workspace SSO: self-hosting setup
 
-This runbook enables **Continue with Google** for the AESG deployment at:
+This runbook enables **Continue with Google** for the production deployment at:
 
 ```text
-https://ai.aesg.com
+https://ai.example.com
 ```
 
-The AESG production profile is Google-only. Set
+The production profile is Google-only. Set
 `BERRY_AUTH_LOGIN_METHODS=google`; the login page, owner claim, administrator
 reservations, and ordinary member access then use verified Workspace accounts.
 Berry does not expose email/password sign-in or permit local member accounts in
@@ -26,7 +26,7 @@ sign-in without automatically permitting Gmail, Drive, or Calendar access.
 
 You need:
 
-- a Google Cloud project owned by the AESG organization;
+- a Google Cloud project owned by the customer organization;
 - access to Google Cloud Console's Google Auth Platform pages;
 - a Google Workspace administrator with the Security settings privilege;
 - Berry owner/admin access;
@@ -41,8 +41,8 @@ add the Google client ID or secret to `.env`.
 Keep these values in the untracked `deploy/.env.production`:
 
 ```dotenv
-BERRY_AUTH_BASE_URL=https://ai.aesg.com
-BERRY_AUTH_TRUSTED_ORIGINS=https://ai.aesg.com
+BERRY_AUTH_BASE_URL=https://ai.example.com
+BERRY_AUTH_TRUSTED_ORIGINS=https://ai.example.com
 BERRY_AUTH_LOGIN_METHODS=google
 BERRY_AUTH_SIGNUP_ENABLED=false
 BETTER_AUTH_SECRET=YOUR_EXISTING_36_BYTE_BASE64_SECRET
@@ -57,7 +57,7 @@ credentials unreadable.
 
 ## 2. Configure Google Auth Platform
 
-In [Google Cloud Console](https://console.cloud.google.com/), open the AESG
+In [Google Cloud Console](https://console.cloud.google.com/), open the
 production project and then **Google Auth Platform**.
 
 ### Branding
@@ -65,18 +65,18 @@ production project and then **Google Auth Platform**.
 Configure:
 
 - App name: `Berry`
-- User support email: an AESG-managed address
-- Home page: `https://ai.aesg.com`
-- Privacy policy and terms: public AESG-approved URLs
-- Authorized domain: `aesg.com`
-- Developer contact: a monitored AESG engineering/security address
+- User support email: an organization-managed address
+- Home page: `https://ai.example.com`
+- Privacy policy and terms: public organization-approved URLs
+- Authorized domain: `example.com`
+- Developer contact: a monitored organization engineering/security address
 
 ### Audience
 
 Choose **Internal**. An Internal audience restricts authorization to accounts
 in the Google Cloud project's parent Workspace/Cloud Identity organization.
-If an AESG user gets `org_internal`, confirm the Cloud project belongs to the
-correct AESG organization.
+If a Workspace user gets `org_internal`, confirm the Cloud project belongs to
+the correct customer organization.
 
 Do not use Testing for production. Google documents that Testing authorization
 can expire after seven days and is subject to test-user limits.
@@ -104,13 +104,13 @@ Google APIs such as Drive or Gmail do not need to be enabled merely for SSO.
 5. Add this authorized JavaScript origin exactly:
 
    ```text
-   https://ai.aesg.com
+   https://ai.example.com
    ```
 
 6. Add this authorized redirect URI exactly, with no trailing slash:
 
    ```text
-   https://ai.aesg.com/v1/auth/callback/google
+   https://ai.example.com/v1/auth/callback/google
    ```
 
 7. Create the client and securely copy its client ID and client secret.
@@ -137,7 +137,7 @@ In [Google Admin console](https://admin.google.com/):
    **Trusted** merely to make login work.
 7. Save and allow time for the policy to propagate.
 
-If AESG's unconfigured-app policy already allows apps that request only basic
+If the organization's unconfigured-app policy already allows apps that request only basic
 Sign in with Google information, explicit configuration may not be required.
 Configuring the client is still useful because it makes the intended access and
 organizational-unit scope visible to administrators.
@@ -156,16 +156,16 @@ blanket **Trusted** access. See
 4. Confirm the displayed redirect URI is:
 
    ```text
-   https://ai.aesg.com/v1/auth/callback/google
+   https://ai.example.com/v1/auth/callback/google
    ```
 
 5. Paste the SSO OAuth client ID and client secret.
-6. Set the Workspace hosted domain to `aesg.com`.
-7. Keep **Create members on first sign-in** on if AESG wants just-in-time
+6. Set the Workspace hosted domain to `example.com`.
+7. Keep **Create members on first sign-in** on if the organization wants just-in-time
    provisioning. New users receive the `member` role; SSO cannot create an
    owner or admin.
 8. Save and continue through connector policy and review.
-9. Claim `strawberry@aesg.com` as owner with Google.
+9. Claim `owner@example.com` as owner with Google.
 
 After saving, the secret cannot be read back from the API or UI. To rotate it,
 enter the new client ID/secret pair and save again.
@@ -174,16 +174,16 @@ enter the new client ID/secret pair and save again.
 
 Keep the owner session open in one browser window.
 
-1. Open a private/incognito window at `https://ai.aesg.com/login`.
+1. Open a private/incognito window at `https://ai.example.com/login`.
 2. Confirm only **Continue with Google** appears.
-3. Sign in with an AESG Workspace account.
+3. Sign in with an organization-managed Workspace account.
 4. Confirm a personal Gmail account is rejected.
 5. If JIT is on, confirm the first login created one Berry member with source
    `sso` and role `member`.
 6. Disable that member in Berry and confirm its existing session no longer
    authorizes organization requests.
 7. Confirm Drive, Gmail, and Calendar consent was not requested during login.
-8. Pre-authorize `it2@aesg.com` as an administrator, sign in with that Google
+8. Pre-authorize `it-admin@example.com` as an administrator, sign in with that Google
    account, and confirm it receives the reserved admin role.
 
 Berry verifies Google's ID-token signature, issuer, audience, expiry, and the
@@ -198,7 +198,7 @@ and `hd` when restricting access to a Workspace domain.
 The authorized redirect URI must be exactly:
 
 ```text
-https://ai.aesg.com/v1/auth/callback/google
+https://ai.example.com/v1/auth/callback/google
 ```
 
 Check that the client ID pasted into Berry belongs to the same OAuth client.
@@ -215,7 +215,7 @@ Check that the client ID pasted into Berry belongs to the same OAuth client.
 
 The user is outside the Google Cloud project's parent organization, or the
 project is owned by the wrong organization. Do not solve this by changing the
-production app to External unless AESG intentionally wants outside accounts.
+production app to External unless the organization intentionally wants outside accounts.
 
 ### `access_blocked` or an admin-policy page
 

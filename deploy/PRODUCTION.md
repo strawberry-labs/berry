@@ -1,15 +1,18 @@
 # Berry single-box production deployment
 
-This topology is for one private organization at `ai.aesg.com`. Caddy is the only public container. It terminates TLS and serves the web app and API on one origin; RDS stays private in the VPC, while Redis and the application containers remain on Docker's internal network or loopback. Published files and audit exports use native AWS S3 in `eu-west-1` through the EC2 instance profile.
+This topology is for one private organization at `ai.example.com`. Caddy is the only public container. It terminates TLS and serves the web app and API on one origin; RDS stays private in the VPC, while Redis and the application containers remain on Docker's internal network or loopback. Published files and audit exports use native AWS S3 in `eu-west-1` through the EC2 instance profile.
+
+For a repeatable AWS installation, use the CloudFormation stack in
+[`deploy/aws`](./aws/README.md).
 
 ## Server and account prerequisites
 
 - One x86-64 EC2 instance in AWS Ireland (`eu-west-1`) running Ubuntu 24.04 LTS, with enough memory and disk to build the monorepo and run the Compose services. Since E2B provides execution and S3 stores files, the instance does not need local sandbox or object-storage capacity. Enable the instance metadata endpoint, require IMDSv2, and set the metadata response hop limit to `2` so the AWS SDK inside Docker can retrieve instance-profile credentials.
-- One Elastic IP attached to the EC2 instance. Keep GoDaddy nameservers and create one `A` record: host `ai` pointing to that Elastic IP. Add `AAAA` only when IPv6 is configured and reachable. Native S3 does not require a `files.ai.aesg.com` record.
-- Security-group ingress for TCP 80 and 443, and SSH from administrator IPs only. Do not expose 3001, 3108, 5432, 6379, 9000, or 9001.
+- One Elastic IP attached to the EC2 instance. Keep the domain's existing authoritative nameservers and create one `A` record: host `ai` pointing to that Elastic IP. Add `AAAA` only when IPv6 is configured and reachable. Native S3 does not require a `files.ai.example.com` record.
+- Security-group ingress for TCP 80 and 443 only. Use AWS Systems Manager Session Manager for administration; do not expose SSH, 3001, 3108, 5432, 6379, 9000, or 9001.
 - One private RDS PostgreSQL instance reachable only from the EC2 security group. Create separate `berry` and `mem0` databases, enable `pgcrypto` and `vector`, require TLS, and enable automated backups with point-in-time recovery.
 - Docker Engine with the Compose v2 plugin, Git, curl, openssl, and enough free disk to build the monorepo image.
-- Two private S3 buckets in `eu-west-1`, one for artifacts and one for audit exports. The EC2 instance profile needs `s3:ListBucket` on both buckets; artifact objects need `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion`, and `s3:AbortMultipartUpload`, while audit objects need only `s3:PutObject`. Keep Block Public Access enabled. Configure CORS only on the artifact bucket so `https://ai.aesg.com` can upload through presigned URLs and read the returned `ETag`; the audit bucket remains server-only.
+- Two private S3 buckets in `eu-west-1`, one for artifacts and one for audit exports. The EC2 instance profile needs `s3:ListBucket` on both buckets; artifact objects need `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion`, and `s3:AbortMultipartUpload`, while audit objects need only `s3:PutObject`. Keep Block Public Access enabled. Configure CORS only on the artifact bucket so `https://ai.example.com` can upload through presigned URLs and read the returned `ETag`; the audit bucket remains server-only.
 - BerryRouter inference URL/key, exact Router IDs for Kimi 2.6 and GLM 5.2, their input/output prices per million tokens, the chat-completions path, and an image model/path.
 - An E2B Cloud team with billing enabled, a server API key, and either the built-in `base` template or a reviewed custom template ID. The E2B key is injected only into the private API container and never reaches the web app or browser.
 - BerryCrawl public HTTPS MCP URL and bearer key.
@@ -27,7 +30,7 @@ Code execution does not pass through BerryRouter. The API uses the official E2B 
 
 `BERRY_E2B_TEMPLATE_ID=base` is enough for the first Node/Python test. For a controlled client deployment, build and pin a custom E2B template containing every required runtime and package. E2B compute size comes from that template/account configuration; `BERRY_SANDBOX_CPU_COUNT`, `BERRY_SANDBOX_MEMORY_MIB`, and `BERRY_SANDBOX_DISK_MIB` are Berry's metering estimates and must match the selected template. Set `BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS` to the selected template's total current price in USD micros/hour and `BERRY_BUDGET_SANDBOX_EXEC_ESTIMATE_MICROS` to a conservative pre-execution reservation. Berry reconciles the reservation against measured command runtime.
 
-Model turns, image generations, and direct E2B operations write first-party usage records. The sandbox provider records runtime and configured resource estimates; set the `BERRY_BUDGET_SANDBOX_*_ESTIMATE_MICROS` values from the actual E2B plan before enforcing hard dollar limits. For authoritative Router or BerryCrawl charges beyond built-in records, configure those services to send signed usage events to `POST https://ai.aesg.com/v1/orgs/00000000-0000-7000-8000-000000000001/usage/events` using the `router-prod` key ID and the matching secret from `BERRY_USAGE_SIGNING_SECRETS`.
+Model turns, image generations, and direct E2B operations write first-party usage records. The sandbox provider records runtime and configured resource estimates; set the `BERRY_BUDGET_SANDBOX_*_ESTIMATE_MICROS` values from the actual E2B plan before enforcing hard dollar limits. For authoritative Router or BerryCrawl charges beyond built-in records, configure those services to send signed usage events to `POST https://ai.example.com/v1/orgs/00000000-0000-7000-8000-000000000001/usage/events` using the `router-prod` key ID and the matching secret from `BERRY_USAGE_SIGNING_SECRETS`.
 
 ## First deployment
 
@@ -58,7 +61,7 @@ the bucket placeholder; do not apply this rule to the audit bucket.
 ```sh
 aws s3api put-bucket-cors \
   --bucket YOUR_ARTIFACT_BUCKET \
-  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.aesg.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}'
+  --cors-configuration '{"CORSRules":[{"AllowedOrigins":["https://ai.example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}'
 ```
 
 Before enabling Google Workspace, Gmail, or Calendar in the admin UI, complete
@@ -97,12 +100,12 @@ The onboarding system check is the authoritative S3 permission test. It runs a c
 
 ```sh
 docker compose --env-file deploy/.env.production -f deploy/compose.yaml -f deploy/compose.aws.yaml ps
-curl -fsS https://ai.aesg.com/healthz
-curl -I https://ai.aesg.com/
+curl -fsS https://ai.example.com/healthz
+curl -I https://ai.example.com/
 aws s3api head-bucket --bucket YOUR_ARTIFACT_BUCKET
 docker compose --env-file deploy/.env.production -f deploy/compose.yaml -f deploy/compose.aws.yaml exec -T api node -e "import('@aws-sdk/client-s3').then(async ({S3Client,HeadBucketCommand})=>{const client=new S3Client({region:process.env.BERRY_ARTIFACT_S3_REGION});await client.send(new HeadBucketCommand({Bucket:process.env.BERRY_ARTIFACT_S3_BUCKET}));client.destroy();console.log('EC2 role can access artifact S3')})"
 curl -i -X OPTIONS "https://YOUR_ARTIFACT_BUCKET.s3.eu-west-1.amazonaws.com/cors-smoke" \
-  -H 'Origin: https://ai.aesg.com' \
+  -H 'Origin: https://ai.example.com' \
   -H 'Access-Control-Request-Method: PUT' \
   -H 'Access-Control-Request-Headers: content-type'
 docker compose --env-file deploy/.env.production -f deploy/compose.yaml -f deploy/compose.aws.yaml logs --tail=200 api web worker caddy

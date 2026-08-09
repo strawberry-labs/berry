@@ -1,0 +1,563 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Berry single-instance production infrastructure: EC2, private RDS PostgreSQL,
+  native S3 storage, IAM, monitoring, budget alerts, and an existing Elastic IP.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: berry-production
+    AllowedPattern: "[a-z0-9-]+"
+    Description: Lowercase name used for resource names and tags.
+  DomainName:
+    Type: String
+    Description: Public Berry hostname without a scheme, for example ai.example.com.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC for the EC2 instance and RDS database.
+  AppSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for EC2. Its Availability Zone must match DatabaseAvailabilityZone.
+  DatabaseSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in different Availability Zones for the RDS subnet group.
+  DatabaseAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone shared by the EC2 instance and primary RDS database.
+  ElasticIpAllocationId:
+    Type: String
+    AllowedPattern: "eipalloc-[0-9a-f]+"
+    Description: Allocation ID of the existing Elastic IP used by DNS.
+  InstanceType:
+    Type: String
+    Default: c6a.2xlarge
+    AllowedValues:
+      - c6a.2xlarge
+      - c6i.2xlarge
+      - c7i.2xlarge
+      - m7i.2xlarge
+  RootVolumeSize:
+    Type: Number
+    Default: 200
+    MinValue: 100
+    MaxValue: 1000
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.m6g.xlarge
+    AllowedValues:
+      - db.m6g.xlarge
+      - db.m7g.xlarge
+      - db.r7g.large
+  DatabaseEngineVersion:
+    Type: String
+    Default: "16.14"
+    AllowedPattern: "16\\.[0-9]+"
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 16384
+  DatabaseMaxAllocatedStorage:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 16384
+  DatabaseName:
+    Type: String
+    Default: berry
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_]+"
+  DatabaseMasterUsername:
+    Type: String
+    Default: berry_owner
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_]+"
+  MonthlyBudget:
+    Type: Number
+    Default: 600
+    MinValue: 1
+  AlertEmail:
+    Type: String
+    AllowedPattern: "[^@]+@[^@]+"
+    Description: Email for AWS Budget and CloudWatch alarm notifications.
+  LatestUbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTPS ingress for Berry; administration uses SSM.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Caddy HTTP challenge and redirect
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Berry HTTPS
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Package, model, provider, S3, and SSM access
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-app
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL access from the Berry EC2 security group only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: PostgreSQL from Berry EC2
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-database
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - !Sub https://${DomainName}
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-artifacts
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+        - Key: berry:data
+          Value: artifacts
+
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-audit
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+        - Key: berry:data
+          Value: audit
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub RDS subnets for ${EnvironmentName}
+      SubnetIds: !Ref DatabaseSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-database
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub TLS and slow-query settings for ${EnvironmentName}
+      Family: postgres16
+      Parameters:
+        rds.force_ssl: "1"
+        log_min_duration_statement: "1000"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-postgres16
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-postgres
+      Engine: postgres
+      EngineVersion: !Ref DatabaseEngineVersion
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref DatabaseMasterUsername
+      ManageMasterUserPassword: true
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      MaxAllocatedStorage: !Ref DatabaseMaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: false
+      AvailabilityZone: !Ref DatabaseAvailabilityZone
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      Port: 5432
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: 02:00-03:00
+      PreferredMaintenanceWindow: sun:03:30-sun:04:30
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeleteAutomatedBackups: false
+      DeletionProtection: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-postgres
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+        - Key: berry:data
+          Value: primary
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ec2
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BerryStorageAndBootstrap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BucketMetadata
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListBucketVersions
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !GetAtt AuditBucket.Arn
+              - Sid: ArtifactObjects
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Sid: AuditObjects
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${AuditBucket.Arn}/*
+              - Sid: DatabaseBootstrapSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+      Tags:
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestUbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref AppSubnetId
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      AvailabilityZone: !Ref DatabaseAvailabilityZone
+      DisableApiTermination: true
+      EbsOptimized: true
+      InstanceInitiatedShutdownBehavior: stop
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+        InstanceMetadataTags: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            Iops: 3000
+            Throughput: 125
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y awscli ca-certificates curl docker-compose-v2 docker.io ec2-instance-connect git jq openssh-server postgresql-client unattended-upgrades unzip
+          systemctl enable --now docker
+          systemctl enable --now ssh
+          usermod -aG docker ubuntu
+          install -d -m 0750 -o ubuntu -g ubuntu /opt/berry
+          if ! swapon --show --noheadings | grep -q .; then
+            fallocate -l 8G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          fi
+          if command -v snap >/dev/null 2>&1; then
+            snap start amazon-ssm-agent || snap install amazon-ssm-agent --classic || true
+            snap start amazon-ssm-agent || true
+          fi
+          unattended-upgrade --dry-run --debug || true
+          touch /var/log/berry-bootstrap-ready
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-app
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+        - Key: berry:role
+          Value: application
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !Ref ElasticIpAllocationId
+      InstanceId: !Ref AppInstance
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${EnvironmentName} alerts
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+      Tags:
+        - Key: berry:environment
+          Value: !Ref EnvironmentName
+
+  InstanceCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub ${EnvironmentName} EC2 CPU is above 80 percent for 15 minutes.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref AppInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub ${EnvironmentName} EC2 failed an instance or system status check.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref AppInstance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  DatabaseCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub ${EnvironmentName} RDS CPU is above 80 percent for 15 minutes.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  DatabaseStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub ${EnvironmentName} RDS has less than 20 GiB free storage.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 21474836480
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${EnvironmentName}-monthly
+        BudgetLimit:
+          Amount: !Ref MonthlyBudget
+          Unit: USD
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+
+Outputs:
+  InstanceId:
+    Value: !Ref AppInstance
+  ElasticIp:
+    Value: !Ref ElasticIpAllocationId
+    Description: Allocation ID. Resolve the actual address with ec2:DescribeAddresses.
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabasePort:
+    Value: !GetAtt Database.Endpoint.Port
+  DatabaseSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  AuditBucketName:
+    Value: !Ref AuditBucket
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup
+  AlertTopicArn:
+    Value: !Ref AlertTopic
