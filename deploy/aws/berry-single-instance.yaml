@@ -367,7 +367,6 @@ Resources:
             DeleteOnTermination: true
             Encrypted: true
             Iops: 3000
-            Throughput: 125
             VolumeSize: !Ref RootVolumeSize
             VolumeType: gp3
       UserData:
