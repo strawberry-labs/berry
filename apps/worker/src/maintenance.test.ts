@@ -117,6 +117,36 @@ describe("SqlMaintenanceRunner", () => {
     expect(executions.some((call) => call.sql.includes("UPDATE workspace_files") && call.sql.includes("index_status='deleted'"))).toBe(true);
   });
 
+  it("expires tenant-scoped vision observations with the diagnostic retention window", async () => {
+    const tenantId = "00000000-0000-7000-8000-000000000001";
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("FROM maintenance_runs")) {
+          return [{ status: "running", cursor: { phase: "vision_observations" } }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+
+    await expect(new SqlMaintenanceRunner(executor).cleanup({
+      tenantId,
+      runId: "00000000-0000-7000-8000-000000000002",
+      batchSize: 25,
+      generation: 0,
+      eventRetentionDays: 30,
+      diagnosticRetentionDays: 45,
+      outboxRetentionDays: 7,
+    })).resolves.toMatchObject({ status: "running", phase: "knowledge_tombstones" });
+
+    const cleanup = queries.find((call) => call.sql.includes("DELETE FROM vision_observation_cache"));
+    expect(cleanup?.params).toEqual([tenantId, 45, 25]);
+    expect(cleanup?.sql).toContain("last_used_at");
+  });
+
   it("schedules blob deletion for a logical file that was already tombstoned", async () => {
     const tenantId = "00000000-0000-7000-8000-000000000001";
     const fileId = "00000000-0000-7000-8000-000000000010";

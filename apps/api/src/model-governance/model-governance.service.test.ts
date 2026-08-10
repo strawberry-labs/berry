@@ -107,6 +107,8 @@ describe("model governance scoped access", () => {
       },
       listDefaults: (id) => base.listDefaults(id),
       upsertDefault: (input) => base.upsertDefault(input),
+      listAuxiliaryDefaults: (id) => base.listAuxiliaryDefaults(id),
+      upsertAuxiliaryDefault: (input) => base.upsertAuxiliaryDefault(input),
     };
     const service = new ModelGovernanceService(repository);
 
@@ -121,6 +123,37 @@ describe("model governance scoped access", () => {
     });
 
     expect(policyWrites).toBe(0);
+  });
+
+  it("accepts only allowed vision-capable auxiliary defaults", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    await service.upsertPolicy({
+      tenantId,
+      providerId: "router",
+      model: "minimax-m3",
+      capabilities: { vision: true },
+      status: "allowed",
+    });
+    await service.upsertPolicy({
+      tenantId,
+      providerId: "router",
+      model: "deepseek-v4-flash",
+      capabilities: { vision: false },
+      status: "allowed",
+    });
+
+    await expect(service.upsertAuxiliaryDefault({
+      tenantId,
+      purpose: "vision",
+      providerId: "router",
+      model: "minimax-m3",
+    })).resolves.toMatchObject({ purpose: "vision", model: "minimax-m3" });
+    await expect(service.upsertAuxiliaryDefault({
+      tenantId,
+      purpose: "vision",
+      providerId: "router",
+      model: "deepseek-v4-flash",
+    })).rejects.toThrow("must declare vision support");
   });
 });
 

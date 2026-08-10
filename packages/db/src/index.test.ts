@@ -82,6 +82,7 @@ import {
   TENANT_SCOPED_TABLES,
   USAGE_PIPELINE_MIGRATION,
   USAGE_ROLLUPS_MIGRATION,
+  VISION_MODEL_ROUTING_MIGRATION,
   approvalKindEnum,
   approvalStatusEnum,
   cloudMigrations,
@@ -179,7 +180,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {
@@ -499,6 +500,16 @@ describe("cloud postgres schema", () => {
     expect(TWO_PROFILE_MODEL_GOVERNANCE_MIGRATION).toContain("DELETE FROM model_mode_defaults WHERE mode = 'cowork'");
     expect(TWO_PROFILE_MODEL_GOVERNANCE_MIGRATION).not.toContain("DROP TABLE");
     expect(TWO_PROFILE_MODEL_GOVERNANCE_MIGRATION).not.toContain("DROP COLUMN");
+  });
+
+  it("adds tenant-scoped vision defaults and reusable observations additively", () => {
+    expect(VISION_MODEL_ROUTING_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS model_auxiliary_defaults");
+    expect(VISION_MODEL_ROUTING_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS vision_observation_cache");
+    expect(VISION_MODEL_ROUTING_MIGRATION).toContain("UNIQUE (tenant_id, purpose)");
+    expect(VISION_MODEL_ROUTING_MIGRATION).toContain("UNIQUE (tenant_id, cache_key)");
+    expect(VISION_MODEL_ROUTING_MIGRATION).toContain("model_auxiliary_defaults_tenant_isolation");
+    expect(VISION_MODEL_ROUTING_MIGRATION).toContain("vision_observation_cache_tenant_isolation");
+    expect(VISION_MODEL_ROUTING_MIGRATION).not.toContain("DROP TABLE");
   });
 
   it("adds conversation kinds and owner-scoped General workspaces without deleting legacy fields", () => {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   ModelGovernanceDecisionSchema,
   OrganizationModelProviderSchema,
+  OrgAuxiliaryModelDefaultSchema,
   OrgAiAccessRuleSchema,
   OrgModelDefaultSchema,
   OrgModelPolicySchema,
@@ -12,6 +13,8 @@ import {
   type ModelGovernanceDecision,
   type OrganizationModelProvider,
   type OrganizationModelProviderUpsert,
+  type OrgAuxiliaryModelDefault,
+  type OrgAuxiliaryModelPurpose,
   type OrgAiAccessRule,
   type OrgAiAccessRuleUpsert,
   type OrgModelDefault,
@@ -45,6 +48,13 @@ export type UpsertModelDefaultInput = {
   enforce?: boolean | undefined;
 };
 
+export type UpsertAuxiliaryModelDefaultInput = {
+  tenantId: string;
+  purpose: OrgAuxiliaryModelPurpose;
+  providerId: string;
+  model: string;
+};
+
 export interface ModelGovernanceRepository {
   listProviders(tenantId: string): Promise<OrganizationModelProvider[]>;
   upsertProvider(tenantId: string, input: OrganizationModelProviderUpsert): Promise<OrganizationModelProvider>;
@@ -60,6 +70,8 @@ export interface ModelGovernanceRepository {
   upsertPolicy(input: UpsertModelPolicyInput): Promise<OrgModelPolicy>;
   listDefaults(tenantId: string): Promise<OrgModelDefault[]>;
   upsertDefault(input: UpsertModelDefaultInput): Promise<OrgModelDefault>;
+  listAuxiliaryDefaults(tenantId: string): Promise<OrgAuxiliaryModelDefault[]>;
+  upsertAuxiliaryDefault(input: UpsertAuxiliaryModelDefaultInput): Promise<OrgAuxiliaryModelDefault>;
 }
 
 export class ModelGovernanceService {
@@ -191,6 +203,30 @@ export class ModelGovernanceService {
     return this.repository.upsertDefault(input);
   }
 
+  async listAuxiliaryDefaults(tenantId: string): Promise<OrgAuxiliaryModelDefault[]> {
+    return this.repository.listAuxiliaryDefaults(tenantId);
+  }
+
+  async auxiliaryDefault(
+    tenantId: string,
+    purpose: OrgAuxiliaryModelPurpose,
+  ): Promise<OrgAuxiliaryModelDefault | null> {
+    return (await this.repository.listAuxiliaryDefaults(tenantId))
+      .find((entry) => entry.purpose === purpose) ?? null;
+  }
+
+  async upsertAuxiliaryDefault(input: UpsertAuxiliaryModelDefaultInput): Promise<OrgAuxiliaryModelDefault> {
+    const policy = (await this.repository.listPolicies(input.tenantId))
+      .find((entry) => entry.providerId === input.providerId && entry.model === input.model);
+    if (!policy || policy.status !== "allowed") {
+      throw new Error("The selected auxiliary model must be allowed in this organization");
+    }
+    if (input.purpose === "vision" && policy.capabilities.vision !== true) {
+      throw new Error("The selected vision model must declare vision support");
+    }
+    return this.repository.upsertAuxiliaryDefault(input);
+  }
+
   async resolve(input: {
     tenantId: string;
     mode: ConversationKind;
@@ -251,6 +287,7 @@ export class InMemoryModelGovernanceRepository implements ModelGovernanceReposit
   readonly #accessRules = new Map<string, OrgAiAccessRule>();
   readonly #policies = new Map<string, OrgModelPolicy>();
   readonly #defaults = new Map<string, OrgModelDefault>();
+  readonly #auxiliaryDefaults = new Map<string, OrgAuxiliaryModelDefault>();
 
   constructor(seed = true) {
     if (!seed) return;
@@ -393,6 +430,19 @@ export class InMemoryModelGovernanceRepository implements ModelGovernanceReposit
       updatedAt: now,
     });
     this.#defaults.set(defaultKey(input.tenantId, input.mode), entry);
+    return entry;
+  }
+
+  async listAuxiliaryDefaults(tenantId: string): Promise<OrgAuxiliaryModelDefault[]> {
+    return [...this.#auxiliaryDefaults.values()].filter((entry) => entry.tenantId === tenantId);
+  }
+
+  async upsertAuxiliaryDefault(input: UpsertAuxiliaryModelDefaultInput): Promise<OrgAuxiliaryModelDefault> {
+    const entry = OrgAuxiliaryModelDefaultSchema.parse({
+      ...input,
+      updatedAt: new Date().toISOString(),
+    });
+    this.#auxiliaryDefaults.set(auxiliaryDefaultKey(input.tenantId, input.purpose), entry);
     return entry;
   }
 }
@@ -554,6 +604,29 @@ RETURNING *
   async upsertDefault(input: UpsertModelDefaultInput): Promise<OrgModelDefault> {
     return this.database.withTenant(input.tenantId, async (executor) => upsertDefaultRow(executor, input));
   }
+
+  async listAuxiliaryDefaults(tenantId: string): Promise<OrgAuxiliaryModelDefault[]> {
+    return this.database.withTenant(tenantId, async (executor) => {
+      const rows = await executor.query<AuxiliaryModelDefaultRow>(
+        "SELECT * FROM model_auxiliary_defaults WHERE tenant_id = $1::uuid ORDER BY purpose",
+        [tenantId],
+      );
+      return rows.map(auxiliaryModelDefaultFromRow);
+    });
+  }
+
+  async upsertAuxiliaryDefault(input: UpsertAuxiliaryModelDefaultInput): Promise<OrgAuxiliaryModelDefault> {
+    return this.database.withTenant(input.tenantId, async (executor) => {
+      const rows = await executor.query<AuxiliaryModelDefaultRow>(`
+INSERT INTO model_auxiliary_defaults (tenant_id,purpose,provider_id,model,updated_at)
+VALUES ($1::uuid,$2,$3,$4,now())
+ON CONFLICT (tenant_id,purpose)
+DO UPDATE SET provider_id=excluded.provider_id,model=excluded.model,updated_at=now()
+RETURNING *
+      `.trim(), [input.tenantId, input.purpose, input.providerId, input.model]);
+      return auxiliaryModelDefaultFromRow(rows[0]!);
+    });
+  }
 }
 
 function decision(input: { tenantId: string; mode: ConversationKind; providerId?: string | null | undefined; model?: string | null | undefined }, providerId: string, model: string, allowed: boolean, enforced: boolean, reason: string, policy: OrgModelPolicy | null, modelDefault: OrgModelDefault | null, accessRule: OrgAiAccessRule | null): ModelGovernanceDecision {
@@ -629,6 +702,10 @@ function key(tenantId: string, providerId: string, model: string): string {
 
 function defaultKey(tenantId: string, mode: ConversationKind): string {
   return `${tenantId}:${mode}`;
+}
+
+function auxiliaryDefaultKey(tenantId: string, purpose: OrgAuxiliaryModelPurpose): string {
+  return `${tenantId}:${purpose}`;
 }
 
 async function upsertDefaultRow(executor: SqlExecutor, input: UpsertModelDefaultInput): Promise<OrgModelDefault> {
@@ -711,6 +788,16 @@ function modelDefaultFromRow(row: ModelDefaultRow): OrgModelDefault {
   });
 }
 
+function auxiliaryModelDefaultFromRow(row: AuxiliaryModelDefaultRow): OrgAuxiliaryModelDefault {
+  return OrgAuxiliaryModelDefaultSchema.parse({
+    tenantId: row.tenant_id,
+    purpose: row.purpose,
+    providerId: row.provider_id,
+    model: row.model,
+    updatedAt: iso(row.updated_at),
+  });
+}
+
 function iso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
@@ -770,5 +857,13 @@ type ModelDefaultRow = {
   provider_id: string;
   model: string;
   enforce: boolean;
+  updated_at: Date | string;
+};
+
+type AuxiliaryModelDefaultRow = {
+  tenant_id: string;
+  purpose: string;
+  provider_id: string;
+  model: string;
   updated_at: Date | string;
 };

@@ -824,6 +824,65 @@ describe("AgentApiController", () => {
     }));
   });
 
+  it("admits the governed vision adapter only for a text-only primary model", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "deepseek-v4-flash",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+      capabilities: { vision: false, cost: { input: 0.14, output: 0.28, cacheRead: 0.03 } },
+    });
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "minimax-m3",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+      capabilities: { vision: true, cost: { input: 0.3, output: 1.2, cacheRead: 0.06 } },
+    });
+    await repository.upsertAuxiliaryDefault({
+      tenantId: SELF_HOST_TENANT_ID,
+      purpose: "vision",
+      providerId: "router",
+      model: "minimax-m3",
+    });
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({ runId: "turn_vision", sessionId: input.sessionId }));
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: visionRuntimeConfig(),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Vision task" }).expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        input: "Describe the attached image",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+        model: "deepseek-v4-flash",
+      })
+      .expect(201);
+
+    expect(admit).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeRequest: expect.objectContaining({
+        model: "deepseek-v4-flash",
+        modelAcceptsImages: false,
+        builtInTools: expect.arrayContaining(["inspect_images"]),
+        vision: expect.objectContaining({
+          providerId: "router",
+          model: "minimax-m3",
+          modelPricing: expect.objectContaining({ input: 0.3, output: 1.2, cacheRead: 0.06 }),
+        }),
+      }),
+    }));
+  });
+
   it("reserves and reconciles successful model turns", async () => {
     const budget = new BudgetService({
       repository: new InMemoryBudgetRepository([{
@@ -1208,6 +1267,29 @@ function imageRuntimeConfig(): CloudRuntimeConfigService {
 
 function chatRuntimeConfig(): CloudRuntimeConfigService {
   return new CloudRuntimeConfigService(chatRuntimeEnv());
+}
+
+function visionRuntimeConfig(): CloudRuntimeConfigService {
+  return new CloudRuntimeConfigService({
+    ...chatRuntimeEnv(),
+    BERRY_ROUTER_DEFAULT_MODEL: "deepseek-v4-flash",
+    BERRY_ROUTER_MODELS_JSON: JSON.stringify([
+      {
+        id: "deepseek-v4-flash",
+        name: "DeepSeek V4 Flash",
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
+        capabilities: { vision: false, cost: { input: 0.14, output: 0.28, cacheRead: 0.03 } },
+      },
+      {
+        id: "minimax-m3",
+        name: "MiniMax M3",
+        contextWindow: 1_000_000,
+        maxOutputTokens: 524_288,
+        capabilities: { vision: true, cost: { input: 0.3, output: 1.2, cacheRead: 0.06 } },
+      },
+    ]),
+  });
 }
 
 function chatRuntimeEnv(): NodeJS.ProcessEnv {

@@ -672,6 +672,7 @@ function ModelsScreen({
         ? Promise.all([
             client.listOrgModels(tenantId, { includeBlocked: true }),
             client.listOrgModelDefaults(tenantId),
+            client.listOrgAuxiliaryModelDefaults(tenantId),
             client.listOrganizationModelProviders(tenantId),
             client.listOrgAiAccessRules(tenantId),
             permissions.includes("members:read")
@@ -687,11 +688,12 @@ function ModelsScreen({
             [],
             [],
             [],
+            [],
             config.departments.filter((item) => item.tenantId === tenantId),
           ],
-    [[], [], [], [], [], []] as any,
+    [[], [], [], [], [], [], []] as any,
   );
-  const [models, defaults, registeredProviders, accessRules, members, departments]: [any[], any[], any[], any[], any[], any[]] = r.data;
+  const [models, defaults, auxiliaryDefaults, registeredProviders, accessRules, members, departments]: [any[], any[], any[], any[], any[], any[], any[]] = r.data;
   const [query, setQuery] = React.useState("");
   const [provider, setProvider] = React.useState("all");
   const [status, setStatus] = React.useState("all");
@@ -776,6 +778,7 @@ function ModelsScreen({
     r.setData([
       (models ?? []).map((m) => (m.id === draft.id ? { ...m, ...draft } : m)),
       defaults,
+      auxiliaryDefaults,
       registeredProviders,
       accessRules,
       members,
@@ -801,8 +804,27 @@ function ModelsScreen({
         updatedAt: new Date().toISOString(),
       },
     ];
-    r.setData([models, next, registeredProviders, accessRules, members, departments]);
+    r.setData([models, next, auxiliaryDefaults, registeredProviders, accessRules, members, departments]);
     setMessage(`Set as the ${mode} default and recorded in the audit log.`);
+  };
+  const makeVisionDefault = async () => {
+    if (!draft || draft.capabilities?.vision !== true) return;
+    const saved = await client?.upsertOrgAuxiliaryModelDefault(tenantId, "vision", {
+      providerId: draft.providerId,
+      model: draft.model,
+    });
+    const next = [
+      ...(auxiliaryDefaults ?? []).filter((item) => item.purpose !== "vision"),
+      saved ?? {
+        tenantId,
+        purpose: "vision",
+        providerId: draft.providerId,
+        model: draft.model,
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+    r.setData([models, defaults, next, registeredProviders, accessRules, members, departments]);
+    setMessage("Set as the organization vision model and recorded in the audit log.");
   };
   const addModel = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -857,20 +879,20 @@ function ModelsScreen({
         || rule.resourceId !== input.resourceId
       ),
     ];
-    r.setData([models, defaults, registeredProviders, nextRules, members, departments]);
+    r.setData([models, defaults, auxiliaryDefaults, registeredProviders, nextRules, members, departments]);
     setAddingRule(false);
     setMessage("Scoped model access saved and recorded in the audit log.");
   };
   return (
     <ManagementPage
       title="Models"
-      description="Add provider models, record token pricing and context limits, control availability, and set Chat or Code defaults."
+      description="Add provider models, record token pricing and context limits, control availability, and choose Chat, Code, and vision defaults."
       eyebrow="AI & tools"
       actions={canWrite ? <><Button variant="secondary" onClick={() => setAddingRule(true)}><ShieldCheck />Access rule</Button><Button onClick={() => setAdding(true)}><Plus />Add model</Button></> : null}
     >
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
         <section
-          className="grid gap-3 sm:grid-cols-2"
+          className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
           aria-label="Model defaults"
         >
           {(["chat", "code"] as const).map((mode) => {
@@ -887,6 +909,16 @@ function ModelsScreen({
               </article>
             );
           })}
+          {(() => {
+            const visionDefault = (auxiliaryDefaults ?? []).find((item) => item.purpose === "vision");
+            return (
+              <article data-status={visionDefault ? "good" : "warning"}>
+                <span>Vision adapter</span>
+                <strong>{visionDefault ? modelNames.get(`${visionDefault.providerId}:${visionDefault.model}`) ?? visionDefault.model : "Not set"}</strong>
+                <small>{visionDefault ? `${visionDefault.providerId} · Used by text-only models` : "Choose a vision-capable model below"}</small>
+              </article>
+            );
+          })()}
         </section>
         <Toolbar>
           <SearchInput
@@ -1104,7 +1136,20 @@ function ModelsScreen({
                     >
                       Set as Code default
                     </Button>
+                    <Button
+                      variant="secondary"
+                      onClick={makeVisionDefault}
+                      disabled={draft.capabilities?.vision !== true
+                        || (auxiliaryDefaults ?? []).some((item) => item.purpose === "vision" && item.providerId === draft.providerId && item.model === draft.model)}
+                    >
+                      Set as vision model
+                    </Button>
                   </div>
+                  {draft.capabilities?.vision !== true ? (
+                    <p className="text-xs text-muted-foreground">
+                      Vision defaults must explicitly declare image-input support.
+                    </p>
+                  ) : null}
                 </>
               ) : null}
             </DetailDrawer>

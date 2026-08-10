@@ -94,4 +94,35 @@ describe("durable capability contract", () => {
       builtInTools: DURABLE_BASE_BUILT_IN_TOOLS,
     })).toThrow("Image intent requires the create_image tool");
   });
+
+  it("keeps the vision adapter paired with its admitted provider and model", () => {
+    const base = {
+      capabilityVersion: 1,
+      input: "inspect this",
+      providerId: "router",
+      provider: { id: "router", name: "Router", kind: "berry-router", baseUrl: "https://router.example/v1", defaultModel: "text-model" },
+      model: "text-model",
+      workspacePath: "/workspace",
+      workspaceId: "workspace",
+      permissionMode: "full-access",
+      reasoning: "off",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      modelAcceptsImages: false,
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "inspect_images"],
+      vision: {
+        providerId: "router",
+        provider: { id: "router", name: "Router", kind: "berry-router", baseUrl: "https://router.example/v1", defaultModel: "vision-model" },
+        model: "vision-model",
+        maxTokens: 2_048,
+        modelPricing: { input: 0.3, output: 1.2 },
+        estimatedCostMicros: "3600",
+      },
+    };
+    expect(DurableTurnRuntimeRequestSchema.parse(base).vision?.model).toBe("vision-model");
+    expect(() => DurableTurnRuntimeRequestSchema.parse({ ...base, builtInTools: DURABLE_BASE_BUILT_IN_TOOLS }))
+      .toThrow("Admitted vision configuration requires the inspect_images tool");
+    expect(() => DurableTurnRuntimeRequestSchema.parse({ ...base, modelAcceptsImages: true }))
+      .toThrow("Native vision models must receive images directly");
+  });
 });

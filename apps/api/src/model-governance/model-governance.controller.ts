@@ -5,6 +5,8 @@ import {
   ModelGovernanceDecisionSchema,
   ConversationKindSchema,
   JsonValueSchema,
+  OrgAuxiliaryModelDefaultSchema,
+  OrgAuxiliaryModelPurposeSchema,
   OrgAiAccessResourceSchema,
   OrgAiAccessRuleSchema,
   OrgAiAccessRuleUpsertSchema,
@@ -161,6 +163,47 @@ export class ModelGovernanceController {
       action: "default-upserted",
       targetType: "model_default",
       targetId: modelDefault.mode,
+      after: modelDefault as never,
+      metadata: { surface: "admin-api" },
+    });
+    return modelDefault;
+  }
+
+  @Get("/auxiliary-defaults")
+  async listAuxiliaryDefaults(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string) {
+    await this.requirePermission(request, tenantId, "models:read");
+    await this.synchronizeRuntimeCatalog(tenantId);
+    return z.array(OrgAuxiliaryModelDefaultSchema).parse(
+      await this.models.listAuxiliaryDefaults(tenantId),
+    );
+  }
+
+  @Put("/auxiliary-defaults/:purpose")
+  async upsertAuxiliaryDefault(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("purpose") purpose: string,
+    @Body() body: unknown,
+  ) {
+    await this.requirePermission(request, tenantId, "models:write");
+    await this.synchronizeRuntimeCatalog(tenantId);
+    const parsedPurpose = OrgAuxiliaryModelPurposeSchema.parse(purpose);
+    const parsed = parseBody(UpsertModelDefaultRequestSchema.omit({ enforce: true }), body);
+    let modelDefault;
+    try {
+      modelDefault = OrgAuxiliaryModelDefaultSchema.parse(
+        await this.models.upsertAuxiliaryDefault({ tenantId, purpose: parsedPurpose, ...parsed }),
+      );
+    } catch (cause) {
+      throw new BadRequestException(cause instanceof Error ? cause.message : "Invalid auxiliary model");
+    }
+    await this.audit?.append({
+      tenantId,
+      actorUserId: request.auth?.user.id ?? null,
+      category: "models",
+      action: "auxiliary-default-upserted",
+      targetType: "auxiliary_model_default",
+      targetId: modelDefault.purpose,
       after: modelDefault as never,
       metadata: { surface: "admin-api" },
     });

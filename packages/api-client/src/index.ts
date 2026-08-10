@@ -99,6 +99,7 @@ import {
   ManagedPolicyPublishRequestSchema,
   ManagedPolicyVersionSchema,
   OrganizationSchema,
+  OrgAuxiliaryModelDefaultSchema,
   OrgMembershipSchema,
   OrgModelDefaultSchema,
   OrgModelPolicySchema,
@@ -209,6 +210,7 @@ import {
   type ManagedPolicyPublishRequest,
   type ManagedPolicyVersion,
   type OrgPermission,
+  type OrgAuxiliaryModelDefault,
   type OrgModelDefault,
   type OrgModelPolicy,
   type Organization,
@@ -1438,6 +1440,25 @@ export class BerryApiClient {
       method: "PUT",
       body: input,
     });
+  }
+
+  async listOrgAuxiliaryModelDefaults(tenantId: string): Promise<OrgAuxiliaryModelDefault[]> {
+    return this.#request(
+      `/v1/orgs/${encodeURIComponent(tenantId)}/models/auxiliary-defaults`,
+      z.array(OrgAuxiliaryModelDefaultSchema),
+    );
+  }
+
+  async upsertOrgAuxiliaryModelDefault(
+    tenantId: string,
+    purpose: "vision",
+    input: Pick<UpsertOrgModelDefaultRequest, "providerId" | "model">,
+  ): Promise<OrgAuxiliaryModelDefault> {
+    return this.#request(
+      `/v1/orgs/${encodeURIComponent(tenantId)}/models/auxiliary-defaults/${encodeURIComponent(purpose)}`,
+      OrgAuxiliaryModelDefaultSchema,
+      { method: "PUT", body: input },
+    );
   }
 
   async resolveOrgModel(tenantId: string, input: ResolveOrgModelRequest): Promise<ModelGovernanceDecision> {
