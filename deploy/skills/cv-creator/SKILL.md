@@ -87,7 +87,7 @@ embedded headshot before asking the user for another upload:
 
 ```bash
 python /managed-skills/cv-creator/scripts/extract_profile_photo.py \
-  /workspace/input/candidate.docx \
+  /workspace/inputs/<file-id>/candidate.docx \
   --output /workspace/tmp/cv-creator/candidate/profile-photo.jpg
 ```
 
@@ -126,7 +126,7 @@ PDFs and the runtime has `CANOPYWAVE_API_KEY` configured:
 
 ```bash
 python /managed-skills/cv-creator/scripts/v3/run_cv_pipeline_v3.py \
-  /workspace/input/cvs \
+  /workspace/inputs/<batch-file-id>/cvs \
   --batch-root /workspace/tmp/cv-creator/batch \
   --deliverables-dir /workspace/outputs \
   --workers 4 \
