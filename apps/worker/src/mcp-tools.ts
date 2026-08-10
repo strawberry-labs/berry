@@ -119,9 +119,21 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       callId,
       (record(step.input.arguments) ?? {}) as never,
     );
-    const text = result.content.flatMap((part) =>
+    let text = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n").slice(0, 120_000);
+    const artifact = connectorArtifact(result.details);
+    const staged = artifact && this.base.stageAssociatedInputFiles
+      ? await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId])
+      : [];
+    if (artifact) {
+      const stagedArtifact = staged.find((item) => item.fileId === artifact.fileId);
+      text = [
+        `Imported ${artifact.name} into the Berry Library.`,
+        stagedArtifact ? `Sandbox path: ${stagedArtifact.path}` : "The file is stored as a Berry artifact.",
+        stagedArtifact ? documentProcessingHint(stagedArtifact.name, stagedArtifact.mediaType) : "",
+      ].filter(Boolean).join("\n");
+    }
     const parts = sanitizeMcpJournalValue(result.content);
     return {
       output: {
@@ -129,6 +141,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         tool: toolName,
         details: sanitizeMcpJournalValue(result.details),
         parts,
+        ...(staged.length ? { artifacts: staged.map((item) => ({ ...item })) } : {}),
       },
       summary: text ? `${toolName} returned results` : `${toolName} completed`,
     };
@@ -215,7 +228,7 @@ export function durableMcpToolPolicy(
   if (hints?.requiresApproval) {
     return {
       retryClass: hints.idempotent ? "idempotent_with_key" : "non_idempotent_manual",
-      requiresApproval: true,
+      requiresApproval: permissionMode !== "full-access",
       approvalKind: "mcp",
     };
   }
@@ -231,7 +244,7 @@ export function durableMcpToolPolicy(
   if (server.trustReadOnlyAnnotations !== true) {
     return {
       retryClass: "non_idempotent_manual",
-      requiresApproval: true,
+      requiresApproval: permissionMode !== "full-access",
       approvalKind: "mcp",
     };
   }
@@ -335,6 +348,25 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function connectorArtifact(value: unknown): { fileId: string; name: string; mediaType: string } | null {
+  const details = record(value);
+  const structured = record(details?.structuredContent);
+  const artifact = record(structured?.artifact);
+  const fileId = stringValue(artifact?.fileId);
+  const name = stringValue(artifact?.name);
+  const mediaType = stringValue(artifact?.mediaType);
+  return fileId && name && mediaType ? { fileId, name, mediaType } : null;
+}
+
+function documentProcessingHint(name: string, mediaType: string): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".pdf") || mediaType === "application/pdf") return "The PDF skill is active for structured reading; searchable extraction is queued through Tika.";
+  if (/\.(xlsx?|xlsm|csv)$/.test(lower) || /spreadsheet|excel|csv/.test(mediaType)) return "The XLSX skill is active for structured spreadsheet analysis; searchable extraction is queued through Tika.";
+  if (/\.docx?$/.test(lower) || /wordprocessingml|msword/.test(mediaType)) return "The DOCX skill is active for structured document analysis; searchable extraction is queued through Tika.";
+  if (/\.pptx?$/.test(lower) || /presentationml|powerpoint/.test(mediaType)) return "The PPTX skill is active for structured presentation analysis; searchable extraction is queued through Tika.";
+  return "Searchable extraction is queued through Tika.";
 }
 
 function jsonValue(value: unknown): JsonValue {

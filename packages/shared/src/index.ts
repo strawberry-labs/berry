@@ -976,11 +976,29 @@ export type QuestionPrompt = z.infer<typeof QuestionPromptSchema>;
 
 /** A durable answer record. `skipped` deliberately remains explicit so an
  * agent can distinguish "no answer yet" from a user choosing to move on. */
+export const QuestionAnswerAttachmentSchema = z.object({
+  fileId: z.string().uuid(),
+  name: z.string().trim().min(1).max(240),
+  mediaType: z.string().trim().min(1).max(255),
+  size: z.number().int().nonnegative(),
+  sourceKind: z.string().nullable().optional(),
+}).strict();
+export type QuestionAnswerAttachment = z.infer<typeof QuestionAnswerAttachmentSchema>;
+
 export const QuestionAnswerSchema = z.object({
   question: z.string().trim().min(1).max(2_000),
-  answer: z.string().trim().min(1).max(4_000),
+  answer: z.string().trim().max(4_000),
   selectedOptions: z.array(z.string().trim().min(1)).max(24).default([]),
+  attachments: z.array(QuestionAnswerAttachmentSchema).max(100).default([]),
   skipped: z.boolean().default(false),
+}).superRefine((answer, context) => {
+  if (!answer.skipped && answer.answer.length === 0 && answer.attachments.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["answer"],
+      message: "Text or an attachment is required unless the question is skipped",
+    });
+  }
 });
 export type QuestionAnswer = z.infer<typeof QuestionAnswerSchema>;
 
@@ -2122,7 +2140,7 @@ export type HostEvent = z.infer<typeof HostEventSchema>;
 export const TurnEndStatusSchema = z.enum(["completed", "cancelled", "failed"]);
 export type TurnEndStatus = z.infer<typeof TurnEndStatusSchema>;
 
-export const SessionNoteKindSchema = z.enum(["compacted", "resumed", "forked", "rewound", "steered", "followed-up", "limit-reached"]);
+export const SessionNoteKindSchema = z.enum(["compacting", "compacted", "resumed", "forked", "rewound", "steered", "followed-up", "limit-reached"]);
 export type SessionNoteKind = z.infer<typeof SessionNoteKindSchema>;
 
 /**
@@ -2540,7 +2558,7 @@ export const ArtifactLibraryItemSchema = z.object({
 });
 export type ArtifactLibraryItem = z.infer<typeof ArtifactLibraryItemSchema>;
 
-export const FileOriginSchema = z.enum(["user_upload", "sandbox_output", "image_generation", "browser_capture", "legacy_artifact"]);
+export const FileOriginSchema = z.enum(["user_upload", "sandbox_output", "image_generation", "browser_capture", "legacy_artifact", "connector_import"]);
 export const FileStatusSchema = z.enum(["initiated", "uploading", "scanning", "processing", "available", "failed", "quarantined", "deleted"]);
 export const FileAssociationRoleSchema = z.enum(["input", "output", "reference"]);
 
@@ -2594,7 +2612,13 @@ export const CloudWorkspaceStateSchema = z.object({
   taskId: z.string().min(1),
   sandboxId: z.string().min(1),
   status: z.enum(["running", "recovering", "failed"]),
-  root: z.literal("/workspace"),
+  root: z.string().min(1).refine((value) => {
+    const normalized = value.replaceAll("\\", "/");
+    const segments = normalized.split("/").filter(Boolean);
+    return normalized.startsWith("/")
+      && segments.length > 0
+      && !segments.some((segment) => segment === "." || segment === "..");
+  }, "Workspace root must be an absolute path without traversal segments"),
   provider: z.string().min(1),
   expiresAt: ISODateSchema.nullable(),
   updatedAt: ISODateSchema,

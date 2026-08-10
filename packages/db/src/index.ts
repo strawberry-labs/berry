@@ -52,7 +52,7 @@ export const uiModeEnum = pgEnum("ui_mode", ["chat", "code", "cowork"]);
 export const uiModeSourceEnum = pgEnum("ui_mode_source", ["classifier", "agent", "user"]);
 export const conversationKindEnum = pgEnum("conversation_kind", ["chat", "code"]);
 export const workspaceKindEnum = pgEnum("workspace_kind", ["project", "general"]);
-export const fileOriginEnum = pgEnum("file_origin", ["user_upload", "sandbox_output", "image_generation", "browser_capture", "legacy_artifact"]);
+export const fileOriginEnum = pgEnum("file_origin", ["user_upload", "sandbox_output", "image_generation", "browser_capture", "legacy_artifact", "connector_import"]);
 export const fileStatusEnum = pgEnum("file_status", ["initiated", "uploading", "scanning", "processing", "available", "failed", "quarantined", "deleted"]);
 export const fileAssociationRoleEnum = pgEnum("file_association_role", ["input", "output", "reference"]);
 export const fileDerivativeKindEnum = pgEnum("file_derivative_kind", ["thumbnail", "pdf_preview", "text_extract", "sheet_data", "slide_image"]);
@@ -424,7 +424,7 @@ export const sessions = pgTable("sessions", {
   status: sessionStatusEnum("status").notNull().default("active"),
   modelProviderId: text("model_provider_id"),
   model: text("model"),
-  permissionMode: permissionModeEnum("permission_mode").notNull().default("ask"),
+  permissionMode: permissionModeEnum("permission_mode").notNull().default("full-access"),
   runtimeMetadata: jsonObject("runtime_metadata"),
   createdAt,
   updatedAt,
@@ -1810,7 +1810,7 @@ CREATE TABLE sessions (
   status session_status NOT NULL DEFAULT 'active',
   model_provider_id text,
   model text,
-  permission_mode permission_mode NOT NULL DEFAULT 'ask',
+  permission_mode permission_mode NOT NULL DEFAULT 'full-access',
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   deleted_at timestamptz
@@ -4383,6 +4383,23 @@ CREATE POLICY ${tableName}_platform_read ON ${tableName}
   USING (current_user = 'berry_platform');
 `.trim()).join("\n\n");
 
+export const CONNECTOR_ARTIFACTS_AND_FULL_ACCESS_MIGRATION = `
+ALTER TYPE file_origin ADD VALUE IF NOT EXISTS 'connector_import';
+ALTER TABLE sessions ALTER COLUMN permission_mode SET DEFAULT 'full-access';
+DO $berry_full_access$
+DECLARE
+  target_tenant record;
+BEGIN
+  FOR target_tenant IN SELECT id FROM tenants ORDER BY id LOOP
+    PERFORM berry_set_tenant_id(target_tenant.id);
+    UPDATE sessions SET permission_mode = 'full-access', updated_at = now()
+    WHERE tenant_id = target_tenant.id AND permission_mode <> 'full-access';
+  END LOOP;
+  PERFORM set_config('berry.tenant_id', '', true);
+END;
+$berry_full_access$;
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -4489,4 +4506,5 @@ export const cloudMigrations = [
   { id: 45, name: "connectors_v1", sql: CONNECTORS_MIGRATION },
   { id: 46, name: "google_workspace_sso_v1", sql: GOOGLE_WORKSPACE_SSO_MIGRATION },
   { id: 47, name: "platform_role_rls_v1", sql: PLATFORM_ROLE_RLS_MIGRATION },
+  { id: 48, name: "connector_artifacts_and_full_access_v1", sql: CONNECTOR_ARTIFACTS_AND_FULL_ACCESS_MIGRATION },
 ] as const;

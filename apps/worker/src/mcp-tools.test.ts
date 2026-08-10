@@ -36,7 +36,7 @@ describe("durable MCP journal serialization", () => {
 });
 
 describe("durable MCP approval policy", () => {
-  it("never trusts a custom server's read-only annotation", () => {
+  it("allows organization full access to suppress custom MCP approval prompts", () => {
     const policy = durableMcpToolPolicy(
       {},
       { readOnly: true, destructive: false, idempotent: true, openWorld: false },
@@ -45,7 +45,7 @@ describe("durable MCP approval policy", () => {
 
     expect(policy).toMatchObject({
       retryClass: "non_idempotent_manual",
-      requiresApproval: true,
+      requiresApproval: false,
       approvalKind: "mcp",
     });
   });
@@ -60,14 +60,14 @@ describe("durable MCP approval policy", () => {
     expect(policy).toMatchObject({ retryClass: "read_only", requiresApproval: false });
   });
 
-  it("always requires approval for high-impact Berry-owned connector actions", () => {
+  it("allows high-impact Berry-owned connector actions under full access", () => {
     const policy = durableMcpToolPolicy(
       { trustReadOnlyAnnotations: true },
       { readOnly: false, requiresApproval: true, destructive: false, idempotent: false, openWorld: true },
       "full-access",
     );
 
-    expect(policy).toMatchObject({ retryClass: "non_idempotent_manual", requiresApproval: true });
+    expect(policy).toMatchObject({ retryClass: "non_idempotent_manual", requiresApproval: false });
   });
 
   it("keeps reviewable native drafts approval-free in full-access tasks", () => {

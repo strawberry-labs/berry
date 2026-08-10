@@ -57,24 +57,7 @@ export class FilePlatformController {
 
   @Get(":fileId")
   async get(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string) {
-    const row = await this.files.get(tenant(), user(request), z.string().uuid().parse(fileId));
-    return {
-      id: row.id,
-      name: row.display_name,
-      originalName: row.original_name,
-      mediaType: row.detected_media_type ?? row.media_type,
-      detectedMediaType: row.detected_media_type,
-      size: Number(row.size_bytes),
-      sha256: row.sha256,
-      origin: row.origin,
-      status: row.status,
-      createdAt: new Date(row.created_at).toISOString(),
-      updatedAt: new Date(row.updated_at).toISOString(),
-      taskIds: row.task_ids ?? [],
-      roles: row.roles ?? [],
-      downloadUrl: `/v1/files/${row.id}/content?download=1`,
-      previewUrl: `/v1/files/${row.id}/content`,
-    };
+    return this.files.describe(tenant(), user(request), z.string().uuid().parse(fileId));
   }
 
   @Post("/uploads")
@@ -115,7 +98,15 @@ export class FilePlatformController {
 
   @Get(":fileId/content")
   content(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Query("download") download: string | undefined, @Res() response: ServerResponse) {
-    return this.files.streamContent(tenant(), user(request), z.string().uuid().parse(fileId), typeof request.headers.range === "string" ? request.headers.range : undefined, response, download === "1");
+    return this.files.streamContent(
+      tenant(),
+      user(request),
+      z.string().uuid().parse(fileId),
+      typeof request.headers.range === "string" ? request.headers.range : undefined,
+      response,
+      download === "1",
+      typeof request.headers["if-none-match"] === "string" ? request.headers["if-none-match"] : undefined,
+    );
   }
 
   @Delete(":fileId")

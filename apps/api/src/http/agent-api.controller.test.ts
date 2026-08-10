@@ -192,7 +192,7 @@ describe("AgentApiController", () => {
         expect(body).toMatchObject({ id: taskId, workspaceId, activeSessionId: sessionId, conversationKind: "code" });
       });
     await expect(updatedEvent).resolves.toMatchObject({ data: { type: "task.updated", task: { id: taskId, conversationKind: "code" } } });
-    expect(first.body.session).toMatchObject({ id: sessionId, permissionMode: "plan" });
+    expect(first.body.session).toMatchObject({ id: sessionId, permissionMode: "full-access" });
 
     await request(app.getHttpServer()).get("/v1/tasks?workspaceKind=general").set(authHeader("berry-other-session")).expect(200).expect([]);
     await request(app.getHttpServer()).patch(`/v1/tasks/${taskId}`).set(authHeader("berry-other-session")).send({ conversationKind: "chat" }).expect(404);
@@ -269,7 +269,7 @@ describe("AgentApiController", () => {
       taskId: created.body.task.id,
       workspaceId: "workspace_cloud",
       input: "run",
-      permissionMode: "ask",
+      permissionMode: "full-access",
     }));
     await request(app.getHttpServer()).get("/v1/tasks").set(authHeader()).expect(200).expect(({ body }) => {
       expect(body[0]).toMatchObject({ id: created.body.task.id, status: "completed" });
@@ -533,10 +533,7 @@ describe("AgentApiController", () => {
     await request(app.getHttpServer()).get(`/v1/tasks/${taskId}/workspace/file?path=../secret`).set(authHeader()).expect(400);
 
     const terminal = await request(app.getHttpServer()).post(`/v1/tasks/${taskId}/workspace/terminals`).set(authHeader()).send({ cols: 90, rows: 30 }).expect(201);
-    await request(app.getHttpServer()).post(`/v1/tasks/${taskId}/workspace/terminals/${terminal.body.id}/input`).set(authHeader()).send({ input: "pwd" }).expect(403).expect(({ body }) => {
-      expect(body.code).toBe("approval_required");
-    });
-    await request(app.getHttpServer()).post(`/v1/tasks/${taskId}/workspace/terminals/${terminal.body.id}/input`).set(authHeader()).send({ input: "pwd", approved: true }).expect(201);
+    await request(app.getHttpServer()).post(`/v1/tasks/${taskId}/workspace/terminals/${terminal.body.id}/input`).set(authHeader()).send({ input: "pwd" }).expect(201);
     await request(app.getHttpServer()).get(`/v1/tasks/${taskId}/workspace/terminals/${terminal.body.id}/events`).set(authHeader()).expect(200).expect(({ body }) => {
       expect(body).toContainEqual(expect.objectContaining({ kind: "stdout" }));
     });
@@ -820,6 +817,7 @@ describe("AgentApiController", () => {
     expect(admit).toHaveBeenCalledWith(expect.objectContaining({
       runtimeRequest: expect.objectContaining({
         intent: "image_generation",
+        workspacePath: "/home/user/workspace",
         builtInTools: expect.arrayContaining(["create_image"]),
         imageGeneration: expect.objectContaining({ providerId: "router", model: "openai/gpt-image-2" }),
       }),
@@ -1202,6 +1200,7 @@ const fakeFilePlatformService = {
 function imageRuntimeConfig(): CloudRuntimeConfigService {
   return new CloudRuntimeConfigService({
     ...chatRuntimeEnv(),
+    BERRY_SANDBOX_CWD: "/home/user/workspace",
     BERRY_ROUTER_IMAGE_MODEL: "openai/gpt-image-2",
     BERRY_ROUTER_IMAGE_COST_MICROS: "10",
   });

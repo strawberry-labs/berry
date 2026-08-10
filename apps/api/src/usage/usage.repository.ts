@@ -199,7 +199,7 @@ export class PostgresUsageRepository implements UsageRepository {
   }
 
   async analytics(tenantId: string, query: UsageAnalyticsQuery): Promise<UsageAnalytics> {
-    return analyticsFromEvents(tenantId, query, await this.listEvents(tenantId, queryFilter(query)));
+    return this.database.withTenant(tenantId, (executor) => postgresAnalytics(executor, tenantId, query));
   }
 
   async requestPage(tenantId: string, query: UsageAnalyticsQuery, forceUserId?: string): Promise<UsageRequestPage> {
@@ -480,6 +480,275 @@ function analyticsFromEvents(tenantId: string, query: UsageAnalyticsQuery, event
     anomalies: explainAnomalies(events, query),
     unavailableDimensions: events.some((event) => event.agentId) ? [] : ["agent"],
   });
+}
+
+async function postgresAnalytics(
+  executor: SqlExecutor,
+  tenantId: string,
+  query: UsageAnalyticsQuery,
+): Promise<UsageAnalytics> {
+  const filter = usageWhere(tenantId, queryFilter(query));
+  const totalsRows = await executor.query<UsageAnalyticsTotalsRow>(`
+    SELECT
+      COUNT(*)::bigint AS requests,
+      COALESCE(SUM(cost_billed_micros), 0)::text AS billed_cost_micros,
+      COALESCE(SUM(tokens_in), 0)::bigint AS input_tokens,
+      COALESCE(SUM(tokens_out), 0)::bigint AS output_tokens,
+      COUNT(*) FILTER (WHERE status IN ('completed','success','succeeded'))::bigint AS successes,
+      percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms)
+        FILTER (WHERE latency_ms IS NOT NULL) AS latency_p50_ms,
+      percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms)
+        FILTER (WHERE latency_ms IS NOT NULL) AS latency_p95_ms,
+      percentile_disc(0.5) WITHIN GROUP (ORDER BY ttft_ms)
+        FILTER (WHERE ttft_ms IS NOT NULL) AS ttft_p50_ms,
+      percentile_disc(0.95) WITHIN GROUP (ORDER BY ttft_ms)
+        FILTER (WHERE ttft_ms IS NOT NULL) AS ttft_p95_ms,
+      COALESCE(SUM(tokens_cached), 0)::bigint AS cached_tokens,
+      COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
+      COUNT(*) FILTER (WHERE cache_eligible)::bigint AS cache_eligible_requests,
+      COUNT(*) FILTER (WHERE cache_eligible AND cache_read_tokens > 0)::bigint AS cache_hit_requests,
+      COALESCE(SUM(
+        CASE
+          WHEN jsonb_typeof(sandbox_usage->'minutes') = 'number'
+            THEN GREATEST(0, (sandbox_usage->>'minutes')::numeric)
+          WHEN jsonb_typeof(sandbox_usage->'duration_ms') = 'number'
+            THEN GREATEST(0, (sandbox_usage->>'duration_ms')::numeric) / 60000
+          WHEN jsonb_typeof(sandbox_usage->'cpu_ms') = 'number'
+            THEN GREATEST(0, (sandbox_usage->>'cpu_ms')::numeric) / 60000
+          ELSE 0
+        END
+      ), 0)::text AS sandbox_minutes,
+      COUNT(agent_id)::bigint AS attributed_agents
+    FROM usage_events
+    ${filter.where}
+  `, filter.params);
+
+  const bucketMs = usageBucketMs(new Date(query.from), new Date(query.to));
+  const seriesParams = [...filter.params, bucketMs];
+  const bucketParam = `$${seriesParams.length}`;
+  const seriesRows = await executor.query<UsageAnalyticsSeriesRow>(`
+    SELECT
+      to_timestamp(
+        floor(extract(epoch FROM ts) * 1000 / ${bucketParam}::double precision)
+        * ${bucketParam}::double precision / 1000
+      ) AS bucket,
+      COALESCE(SUM(cost_billed_micros), 0)::text AS billed_cost_micros,
+      COUNT(*)::bigint AS requests,
+      COALESCE(SUM(tokens_in + tokens_out), 0)::bigint AS tokens,
+      COUNT(*) FILTER (WHERE status IN ('completed','success','succeeded'))::bigint AS successes,
+      COUNT(*) FILTER (WHERE status NOT IN ('completed','success','succeeded'))::bigint AS failures
+    FROM usage_events
+    ${filter.where}
+    GROUP BY 1
+    ORDER BY 1
+  `, seriesParams);
+
+  const breakdownRows = await executor.query<UsageAnalyticsBreakdownRow>(`
+    WITH aggregated AS (
+      SELECT
+        dimension,
+        dimension_id,
+        COUNT(*)::bigint AS requests,
+        COALESCE(SUM(cost_billed_micros), 0)::text AS billed_cost_micros,
+        COALESCE(SUM(tokens_in + tokens_out), 0)::bigint AS tokens,
+        COALESCE(SUM(tokens_in), 0)::bigint AS input_tokens,
+        COALESCE(SUM(tokens_out), 0)::bigint AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
+        COUNT(*) FILTER (WHERE status NOT IN ('completed','success','succeeded'))::bigint AS failures,
+        percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms)
+          FILTER (WHERE latency_ms IS NOT NULL) AS latency_p50_ms,
+        percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms)
+          FILTER (WHERE latency_ms IS NOT NULL) AS latency_p95_ms
+      FROM usage_events
+      CROSS JOIN LATERAL (VALUES
+        ('department', department_id::text),
+        ('member', user_id::text),
+        ('model', model),
+        ('provider', provider),
+        ('feature', feature),
+        ('workspace', workspace_id::text),
+        ('agent', agent_id),
+        ('status', status)
+      ) AS dimensions(dimension, dimension_id)
+      ${filter.where}
+      GROUP BY dimension, dimension_id
+    ), ranked AS (
+      SELECT aggregated.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY dimension
+          ORDER BY billed_cost_micros::numeric DESC, requests DESC, dimension_id NULLS LAST
+        ) AS dimension_rank
+      FROM aggregated
+    )
+    SELECT * FROM ranked
+    WHERE dimension_rank <= 100
+    ORDER BY dimension, dimension_rank
+  `, filter.params);
+
+  const totals = totalsRows[0];
+  const requestCount = numberFromDb(totals?.requests);
+  const inputTokens = numberFromDb(totals?.input_tokens);
+  const outputTokens = numberFromDb(totals?.output_tokens);
+  const elapsedDays = Math.max(
+    1,
+    (new Date(query.to).getTime() - new Date(query.from).getTime()) / 86_400_000,
+  );
+  const to = new Date(query.to);
+  const monthDays = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth() + 1, 0)).getUTCDate();
+  const totalCost = BigInt(totals?.billed_cost_micros ?? "0");
+  const projection = totalCost * BigInt(Math.max(1, Math.round(monthDays / elapsedDays)));
+  const series = seriesRows.map((row) => ({
+    ts: iso(row.bucket),
+    billedCostMicros: String(row.billed_cost_micros),
+    requests: numberFromDb(row.requests),
+    tokens: numberFromDb(row.tokens),
+    successes: numberFromDb(row.successes),
+    failures: numberFromDb(row.failures),
+  }));
+  const breakdowns: Record<string, Array<{
+    dimension: string;
+    id: string | null;
+    label: string;
+    requests: number;
+    billedCostMicros: string;
+    tokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    errorRate: number | null;
+    latencyP50Ms: number | null;
+    latencyP95Ms: number | null;
+  }>> = {
+    departments: [], members: [], models: [], providers: [], features: [], workspaces: [], agents: [], statuses: [],
+  };
+  const breakdownKey: Record<string, keyof typeof breakdowns> = {
+    department: "departments",
+    member: "members",
+    model: "models",
+    provider: "providers",
+    feature: "features",
+    workspace: "workspaces",
+    agent: "agents",
+    status: "statuses",
+  };
+  for (const row of breakdownRows) {
+    const key = breakdownKey[row.dimension];
+    if (!key) continue;
+    const requests = numberFromDb(row.requests);
+    const failures = numberFromDb(row.failures);
+    breakdowns[key]!.push({
+      dimension: row.dimension,
+      id: row.dimension_id,
+      label: row.dimension_id ?? "unattributed",
+      requests,
+      billedCostMicros: String(row.billed_cost_micros),
+      tokens: numberFromDb(row.tokens),
+      inputTokens: numberFromDb(row.input_tokens),
+      outputTokens: numberFromDb(row.output_tokens),
+      cacheReadTokens: numberFromDb(row.cache_read_tokens),
+      cacheWriteTokens: numberFromDb(row.cache_write_tokens),
+      errorRate: requests ? failures / requests : null,
+      latencyP50Ms: nullableNumberFromDb(row.latency_p50_ms),
+      latencyP95Ms: nullableNumberFromDb(row.latency_p95_ms),
+    });
+  }
+
+  return UsageAnalyticsSchema.parse({
+    tenantId,
+    from: query.from,
+    to: query.to,
+    totals: {
+      billedCostMicros: totalCost.toString(),
+      requests: requestCount,
+      tokens: inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      successRate: requestCount ? numberFromDb(totals?.successes) / requestCount : null,
+      projectedMonthEndMicros: requestCount ? projection.toString() : null,
+    },
+    series,
+    breakdowns,
+    performance: {
+      latencyP50Ms: nullableNumberFromDb(totals?.latency_p50_ms),
+      latencyP95Ms: nullableNumberFromDb(totals?.latency_p95_ms),
+      ttftP50Ms: nullableNumberFromDb(totals?.ttft_p50_ms),
+      ttftP95Ms: nullableNumberFromDb(totals?.ttft_p95_ms),
+      cachedTokens: numberFromDb(totals?.cached_tokens),
+      cacheReadTokens: numberFromDb(totals?.cache_read_tokens),
+      cacheWriteTokens: numberFromDb(totals?.cache_write_tokens),
+      cacheEligibleRequests: numberFromDb(totals?.cache_eligible_requests),
+      cacheHitRequests: numberFromDb(totals?.cache_hit_requests),
+      sandboxMinutes: numberFromDb(totals?.sandbox_minutes),
+    },
+    anomalies: explainSeriesAnomalies(series, query),
+    unavailableDimensions: numberFromDb(totals?.attributed_agents) > 0 ? [] : ["agent"],
+  });
+}
+
+function explainSeriesAnomalies(
+  series: Array<{ ts: string; billedCostMicros: string; requests: number; successes: number; failures: number }>,
+  query: UsageAnalyticsQuery,
+) {
+  if (series.length < 4) return [];
+  const split = Math.max(1, Math.floor(series.length * 0.75));
+  const baseline = series.slice(0, split);
+  const observed = series.slice(split);
+  const definitions = [
+    {
+      kind: "spend" as const,
+      label: "Unusual spend",
+      base: average(baseline.map((point) => Number(point.billedCostMicros))),
+      value: average(observed.map((point) => Number(point.billedCostMicros))),
+      unit: "micros per period",
+    },
+    {
+      kind: "failures" as const,
+      label: "Elevated failure rate",
+      base: ratio(
+        baseline.reduce((sum, point) => sum + point.failures, 0),
+        baseline.reduce((sum, point) => sum + point.requests, 0),
+      ),
+      value: ratio(
+        observed.reduce((sum, point) => sum + point.failures, 0),
+        observed.reduce((sum, point) => sum + point.requests, 0),
+      ),
+      unit: "ratio",
+    },
+  ];
+  const windowStart = observed[0]?.ts ?? query.from;
+  return definitions
+    .filter((entry) => entry.base > 0 && entry.value >= entry.base * 1.5)
+    .map((entry) => ({
+      id: `${entry.kind}:${windowStart}`,
+      kind: entry.kind,
+      severity: entry.value >= entry.base * 2 ? "error" as const : "warning" as const,
+      label: entry.label,
+      baseline: entry.base,
+      observed: entry.value,
+      unit: entry.unit,
+      windowStart,
+      windowEnd: query.to,
+      dimension: { kind: "organization", id: null, label: "Organization" },
+      explanation: `${entry.label}: observed ${formatNumber(entry.value)} ${entry.unit}, compared with a baseline of ${formatNumber(entry.base)} during the earlier part of this window.`,
+    }));
+}
+
+function ratio(numerator: number, denominator: number): number {
+  return denominator > 0 ? numerator / denominator : 0;
+}
+
+function numberFromDb(value: unknown): number {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function nullableNumberFromDb(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function usageSeries(events: CloudUsageEventRecord[], query: UsageAnalyticsQuery) {
@@ -825,4 +1094,47 @@ type UsageRollupRow = {
   cache_write_tokens: number;
   cost_raw_micros: string;
   cost_billed_micros: string;
+};
+
+type UsageAnalyticsTotalsRow = {
+  requests: number | string;
+  billed_cost_micros: string;
+  input_tokens: number | string;
+  output_tokens: number | string;
+  successes: number | string;
+  latency_p50_ms: number | string | null;
+  latency_p95_ms: number | string | null;
+  ttft_p50_ms: number | string | null;
+  ttft_p95_ms: number | string | null;
+  cached_tokens: number | string;
+  cache_read_tokens: number | string;
+  cache_write_tokens: number | string;
+  cache_eligible_requests: number | string;
+  cache_hit_requests: number | string;
+  sandbox_minutes: number | string;
+  attributed_agents: number | string;
+};
+
+type UsageAnalyticsSeriesRow = {
+  bucket: Date | string;
+  billed_cost_micros: string;
+  requests: number | string;
+  tokens: number | string;
+  successes: number | string;
+  failures: number | string;
+};
+
+type UsageAnalyticsBreakdownRow = {
+  dimension: string;
+  dimension_id: string | null;
+  requests: number | string;
+  billed_cost_micros: string;
+  tokens: number | string;
+  input_tokens: number | string;
+  output_tokens: number | string;
+  cache_read_tokens: number | string;
+  cache_write_tokens: number | string;
+  failures: number | string;
+  latency_p50_ms: number | string | null;
+  latency_p95_ms: number | string | null;
 };

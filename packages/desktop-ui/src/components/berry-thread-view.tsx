@@ -460,9 +460,11 @@ function BerryHistoricalUserMessage({ message, adapter }: { message: Message; ad
           ))}
           {bodyParts.length > 0 ? (
             <BerryUserMessageBubble>
-              {bodyParts.map((part) => (
-                <BerryMessagePartBody key={part.id} part={part} plain />
-              ))}
+              <CollapsibleSubmittedPrompt>
+                {bodyParts.map((part) => (
+                  <BerryMessagePartBody key={part.id} part={part} plain />
+                ))}
+              </CollapsibleSubmittedPrompt>
             </BerryUserMessageBubble>
           ) : null}
         </BerryUserMessageStack>
@@ -755,6 +757,46 @@ export function BerryUserMessageBubble({ children }: { children: React.ReactNode
       className="berry-user-message ml-auto flex max-w-[775px] flex-col gap-2 rounded-[18px] bg-secondary px-4 py-3 font-sans text-[16px] leading-6 text-secondary-foreground shadow-[inset_0_0_0_1px_rgb(255_255_255/0.08)]"
     >
       {children}
+    </div>
+  );
+}
+
+const SUBMITTED_PROMPT_LINE_LIMIT = 12;
+
+export function CollapsibleSubmittedPrompt({ children }: { children: React.ReactNode }) {
+  const contentRef = React.useRef<HTMLDivElement>(null);
+  const [expanded, setExpanded] = React.useState(false);
+  const [overflowing, setOverflowing] = React.useState(false);
+
+  React.useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    const measure = () => setOverflowing(content.scrollHeight > content.clientHeight + 1);
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(content);
+    return () => observer?.disconnect();
+  }, [children, expanded]);
+
+  return (
+    <div className="grid min-w-0 gap-1.5">
+      <div
+        ref={contentRef}
+        className={cn("min-w-0", !expanded && "overflow-hidden [display:-webkit-box] [-webkit-box-orient:vertical]")}
+        style={expanded ? undefined : { WebkitLineClamp: SUBMITTED_PROMPT_LINE_LIMIT }}
+      >
+        {children}
+      </div>
+      {overflowing || expanded ? (
+        <button
+          type="button"
+          className="w-fit rounded-md text-xs font-medium text-[var(--berry-text-secondary)] underline-offset-2 hover:text-[var(--berry-text-primary)] hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--berry-focus)]"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      ) : null}
     </div>
   );
 }

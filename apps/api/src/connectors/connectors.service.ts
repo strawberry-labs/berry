@@ -26,6 +26,7 @@ import {
   googleConnectorScopes,
   googleToolCatalog,
   googleToolsRequiringApproval,
+  type DriveArtifactImport,
   type GoogleConnectorKey,
 } from "./google-tools.ts";
 
@@ -123,6 +124,8 @@ type ConnectorSession = {
   userId: string;
   connectorKey: GoogleConnectorKey;
   accessLevel: ConnectorAccessLevel;
+  taskId?: string;
+  sessionId?: string;
   exp: number;
 };
 
@@ -605,7 +608,7 @@ export class ConnectorsService {
     }
   }
 
-  async runtime(tenantId: string, userId: string): Promise<McpServerSpec[]> {
+  async runtime(tenantId: string, userId: string, context: { taskId?: string; sessionId?: string } = {}): Promise<McpServerSpec[]> {
     const rows = await this.database.withTenant(tenantId, (db) => db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE enabled=true AND publication_status='published' ORDER BY kind, name"));
     const servers: McpServerSpec[] = [];
     for (const row of rows) {
@@ -616,7 +619,7 @@ export class ConnectorsService {
         const grantedScopes = connection.granted_scopes ?? [];
         const tools = googleToolCatalog(row.connector_key, accessLevel, grantedScopes);
         if (!tools.length) continue;
-        const credential = this.#signSession({ tenantId, userId, connectorKey: row.connector_key, accessLevel, exp: Math.floor(Date.now() / 1000) + 20 * 60 });
+        const credential = this.#signSession({ tenantId, userId, connectorKey: row.connector_key, accessLevel, ...context, exp: Math.floor(Date.now() / 1000) + 20 * 60 });
         servers.push({
           id: row.id,
           name: row.name,
@@ -669,7 +672,21 @@ export class ConnectorsService {
     return servers;
   }
 
-  async handleGoogleMcp(authorization: string | undefined, connectorKey: string, request: unknown): Promise<{ status: number; body?: unknown }> {
+  async handleGoogleMcp(
+    authorization: string | undefined,
+    connectorKey: string,
+    request: unknown,
+    options: {
+      importDriveArtifact?: (context: {
+        tenantId: string;
+        userId: string;
+        taskId: string;
+        sessionId: string;
+        connectorKey: GoogleConnectorKey;
+        accountEmail: string | null;
+      }, input: DriveArtifactImport) => Promise<unknown>;
+    } = {},
+  ): Promise<{ status: number; body?: unknown }> {
     if (!isGoogleKey(connectorKey)) return { status: 404, body: rpcError(null, -32601, "Unknown connector") };
     const credential = bearer(authorization);
     if (!credential) return { status: 401, body: rpcError(null, -32001, "Connector authorization is required") };
@@ -692,8 +709,27 @@ export class ConnectorsService {
       const name = requiredTokenString(params.name, "tool name");
       const args = params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {};
       const accessToken = await this.#googleAccessToken(session.tenantId, row, connection);
-      const result = await executeGoogleTool(connectorKey, accessLevel, name, accessToken, args, connection.account_email, grantedScopes);
-      return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false } } };
+      const driveArtifactImporter = session.taskId && session.sessionId && options.importDriveArtifact
+        ? (artifact: DriveArtifactImport) => options.importDriveArtifact!({
+            tenantId: session.tenantId,
+            userId: session.userId,
+            taskId: session.taskId!,
+            sessionId: session.sessionId!,
+            connectorKey,
+            accountEmail: connection.account_email,
+          }, artifact)
+        : undefined;
+      const result = await executeGoogleTool(
+        connectorKey,
+        accessLevel,
+        name,
+        accessToken,
+        args,
+        connection.account_email,
+        grantedScopes,
+        driveArtifactImporter ? { driveArtifactImporter } : {},
+      );
+      return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: googleToolText(result) }], structuredContent: result, isError: false } } };
     } catch (cause) {
       return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: cause instanceof Error ? cause.message : "Google connector tool failed" }], isError: true } } };
     }
@@ -947,7 +983,9 @@ export class ConnectorsService {
     const actual = Buffer.from(signature, "base64url");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new BadRequestException("Connector token signature is invalid");
     const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as ConnectorSession;
-    if (!parsed.tenantId || !parsed.userId || !isGoogleKey(parsed.connectorKey) || !["read", "full"].includes(parsed.accessLevel) || parsed.exp < Math.floor(Date.now() / 1000)) throw new BadRequestException("Connector token is invalid or expired");
+    const hasTaskContext = Boolean(parsed.taskId || parsed.sessionId);
+    if (!parsed.tenantId || !parsed.userId || !isGoogleKey(parsed.connectorKey) || !["read", "full"].includes(parsed.accessLevel) || parsed.exp < Math.floor(Date.now() / 1000)
+      || (hasTaskContext && (!isUuid(parsed.taskId) || !isUuid(parsed.sessionId)))) throw new BadRequestException("Connector token is invalid or expired");
     return parsed;
   }
   #find(connectors: Connector[], id: string): Connector { const connector = connectors.find((item) => item.id === id); if (!connector) throw new NotFoundException("Connector not found"); return connector; }
@@ -978,6 +1016,27 @@ function rpcRequest(value: unknown): { id: string | number | null; method: strin
 function rpcError(id: string | number | null, code: number, message: string) { return { jsonrpc: "2.0", id, error: { code, message } }; }
 function requiredObject(value: unknown, name: string): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new BadRequestException(`${name} is required`); return value as Record<string, unknown>; }
 function requiredTokenString(value: unknown, name: string): string { if (typeof value !== "string" || !value.trim()) throw new BadRequestException(`${name} is required`); return value; }
+function isUuid(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function googleToolText(result: unknown): string {
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const artifact = (result as Record<string, unknown>).artifact;
+    if (artifact && typeof artifact === "object" && !Array.isArray(artifact)) {
+      const item = artifact as Record<string, unknown>;
+      return JSON.stringify({
+        artifact: {
+          fileId: item.fileId,
+          name: item.name,
+          mediaType: item.mediaType,
+          size: item.size,
+          status: item.status,
+          reused: item.reused,
+          library: true,
+        },
+      });
+    }
+  }
+  return JSON.stringify(result);
+}
 
 async function googleTokenRequest(body: Record<string, string>): Promise<Record<string, unknown>> {
   const response = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(body), signal: AbortSignal.timeout(20_000) });

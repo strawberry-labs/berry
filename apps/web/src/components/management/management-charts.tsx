@@ -141,21 +141,23 @@ export function DualTrend({
             <p className="mb-2 text-xs font-medium text-muted-foreground">
               {requestLabel}
             </p>
-            <BklitBarChart
+            <BklitAreaChart
               data={chartPoints}
               xDataKey="label"
               aspectRatio="auto"
               className="settings-chart"
               margin={{ left: 12, right: 12, top: 12, bottom: 28 }}
-              barGap={0.34}
             >
               <BklitGrid horizontal strokeDasharray="3,3" />
-              <BklitBar
+              <BklitArea
                 dataKey="requests"
                 fill={ringCssVars.ring3}
-                lineCap={4}
+                fillOpacity={0.18}
+                gradientToOpacity={0.02}
+                stroke={ringCssVars.ring3}
+                strokeWidth={2}
               />
-              <BarXAxis maxLabels={6} />
+              <BklitXAxis numTicks={5} />
               <BklitTooltip
                 rows={(point: Record<string, unknown>) => [
                   {
@@ -167,7 +169,7 @@ export function DualTrend({
                   },
                 ]}
               />
-            </BklitBarChart>
+            </BklitAreaChart>
           </div>
         </>
       ) : (

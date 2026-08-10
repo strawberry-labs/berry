@@ -22,10 +22,24 @@ const SCOPE = {
 } as const;
 
 const GOOGLE_TOOL_OUTPUT_LIMIT_BYTES = 10 * 1024 * 1024;
+export const GOOGLE_DRIVE_IMPORT_LIMIT_BYTES = 100 * 1024 * 1024;
+export const GOOGLE_DRIVE_IMPORT_TIMEOUT_MS = 30 * 60 * 1000;
 const GOOGLE_ERROR_BODY_LIMIT_BYTES = 1024 * 1024;
 
 type ScopeRequirement = { all?: string[]; any?: string[] };
-type ToolContext = { accountEmail: string | null };
+export type DriveArtifactImport = {
+  sourceFileId: string;
+  sourceRevision: string;
+  sourceMimeType: string;
+  exportMimeType: string | null;
+  name: string;
+  contentType: string;
+  declaredSize: number | null;
+  metadata: Record<string, unknown>;
+  body: ReadableStream<Uint8Array>;
+};
+export type DriveArtifactImporter = (input: DriveArtifactImport) => Promise<unknown>;
+type ToolContext = { accountEmail: string | null; driveArtifactImporter?: DriveArtifactImporter };
 type ToolDefinition = McpCachedTool & {
   access: GoogleAccessLevel;
   approvalRequired: boolean;
@@ -75,7 +89,7 @@ const workspaceTools: ToolDefinition[] = [
     (token, input) => searchDriveFiles(token, { ...input, query: "trashed = false", orderBy: "modifiedTime desc" })),
   tool("drive_get_file_metadata", "Get safe metadata and current capabilities for one Drive file.", object({ fileId: string("Drive file ID.") }, ["fileId"]), "read", driveReadScopes,
     async (token, input) => driveFilePreflight(token, requiredString(input.fileId, "fileId"), "read")),
-  tool("drive_read_file", "Read or export an eligible Drive file. Text is returned directly and binary content is base64 encoded.", object({ fileId: string("Drive file ID."), exportMimeType: string("Optional export MIME type for Google-native files.") }, ["fileId"]), "read", driveReadScopes, readDriveFile),
+  tool("drive_read_file", "Import an eligible Drive file into Berry. The file is streamed into private object storage, added to the Library, and staged in the task sandbox without placing file bytes in model context.", object({ fileId: string("Drive file ID."), exportMimeType: string("Optional export MIME type for Google-native files.") }, ["fileId"]), "read", driveReadScopes, readDriveFile),
   tool("drive_list_children", "List eligible files directly inside a Drive folder.", object({ folderId: string("Folder ID."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token.") }, ["folderId"]), "read", driveReadScopes,
     (token, input) => searchDriveFiles(token, { query: `'${escapeDriveQuery(requiredString(input.folderId, "folderId"))}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken })),
   tool("drive_list_permissions", "List existing Drive permissions without changing sharing.", object({ fileId: string("Drive file ID."), pageSize: integer("Maximum permissions.", 1, 100), pageToken: string("Continuation token.") }, ["fileId"]), "read", driveReadScopes, async (token, input) => {
@@ -199,10 +213,10 @@ export function googleToolsRequiringApproval(connector: GoogleConnectorKey, acce
     .map((item) => item.name);
 }
 
-export async function executeGoogleTool(connector: GoogleConnectorKey, access: GoogleAccessLevel, name: string, token: string, input: Record<string, unknown>, accountEmail: string | null, grantedScopes: readonly string[]): Promise<unknown> {
+export async function executeGoogleTool(connector: GoogleConnectorKey, access: GoogleAccessLevel, name: string, token: string, input: Record<string, unknown>, accountEmail: string | null, grantedScopes: readonly string[], context: { driveArtifactImporter?: DriveArtifactImporter } = {}): Promise<unknown> {
   const definition = toolsByConnector[connector].find((candidate) => candidate.name === name);
   if (!definition || (access === "read" && definition.access === "full") || !scopeAllows(definition.scopes, grantedScopes)) throw new Error(`Tool ${name} is not authorized for this connection`);
-  return definition.run(token, input, { accountEmail });
+  return definition.run(token, input, { accountEmail, ...context });
 }
 
 function scopeAllows(requirement: ScopeRequirement, granted: readonly string[]): boolean {
@@ -215,7 +229,7 @@ function availableGoogleTools(connector: GoogleConnectorKey, access: GoogleAcces
     .filter((item) => (access === "full" || item.access === "read") && (!grantedScopes || scopeAllows(item.scopes, grantedScopes)));
 }
 
-const DRIVE_FIELDS = "id,name,mimeType,size,modifiedTime,createdTime,webViewLink,iconLink,owners,parents,trashed,driveId,capabilities,contentRestrictions,downloadRestrictions,linkShareMetadata,copyRequiresWriterPermission,viewersCanCopyContent,hasAugmentedPermissions,resourceKey";
+const DRIVE_FIELDS = "id,name,mimeType,size,version,headRevisionId,md5Checksum,sha256Checksum,modifiedTime,createdTime,webViewLink,iconLink,owners,parents,trashed,driveId,capabilities,contentRestrictions,downloadRestrictions,linkShareMetadata,copyRequiresWriterPermission,viewersCanCopyContent,hasAugmentedPermissions,resourceKey";
 function driveUrl(path: string, query: Record<string, QueryValue> = {}) { return apiUrl("https://www.googleapis.com/drive/v3/", path, query); }
 function docsUrl(path: string, query: Record<string, QueryValue> = {}) { return apiUrl("https://docs.googleapis.com/v1/", path, query); }
 function sheetsUrl(path: string, query: Record<string, QueryValue> = {}) { return apiUrl("https://sheets.googleapis.com/v4/", path, query); }
@@ -273,15 +287,38 @@ async function driveFilePreflight(token: string, fileId: string, operation: "rea
   if (Array.isArray(file.contentRestrictions) && file.contentRestrictions.some((item) => record(item)?.readOnly === true) && operation === "edit") throw new Error("Drive file is read-only due to a content restriction");
   return file;
 }
-async function readDriveFile(token: string, input: Record<string, unknown>): Promise<unknown> {
+async function readDriveFile(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> {
   const fileId = requiredString(input.fileId, "fileId"); const metadata = await driveFilePreflight(token, fileId, "download"); const mimeType = requiredString(metadata.mimeType, "mimeType");
   if (mimeType === "application/vnd.google-apps.folder") throw new Error("Drive folders cannot be downloaded");
+  if (!context.driveArtifactImporter) throw new Error("Drive artifact storage is unavailable for this task");
   const googleMime = mimeType.startsWith("application/vnd.google-apps."); const exportMimeType = optionalString(input.exportMimeType) ?? defaultExportMime(mimeType);
-  const response = await googleFetch(token, googleMime ? driveUrl(`files/${encodeURIComponent(fileId)}/export`, { mimeType: exportMimeType }) : driveUrl(`files/${encodeURIComponent(fileId)}`, { alt: "media", supportsAllDrives: true }));
+  const response = await googleFetch(
+    token,
+    googleMime
+      ? driveUrl(`files/${encodeURIComponent(fileId)}/export`, { mimeType: exportMimeType })
+      : driveUrl(`files/${encodeURIComponent(fileId)}`, { alt: "media", supportsAllDrives: true }),
+    { signal: AbortSignal.timeout(GOOGLE_DRIVE_IMPORT_TIMEOUT_MS) },
+  );
   if (!response.ok) throw googleError(response.status, await readBoundedText(response, GOOGLE_ERROR_BODY_LIMIT_BYTES, "Google API error response exceeds Berry's 1 MB limit"));
-  const bytes = await readBoundedBody(response, GOOGLE_TOOL_OUTPUT_LIMIT_BYTES, "Drive content exceeds Berry's 10 MB tool-output limit");
-  const contentType = response.headers.get("content-type")?.split(";")[0] ?? exportMimeType ?? mimeType; const textual = contentType.startsWith("text/") || contentType === "application/json" || contentType.includes("csv");
-  return { ...metadata, contentType, encoding: textual ? "text" : "base64", content: textual ? new TextDecoder().decode(bytes) : Buffer.from(bytes).toString("base64") };
+  if (!response.body) throw new Error("Google Drive returned an empty response body");
+  const declaredSize = optionalContentLength(response.headers.get("content-length"));
+  if (declaredSize !== null && declaredSize > GOOGLE_DRIVE_IMPORT_LIMIT_BYTES) {
+    await response.body.cancel().catch(() => undefined);
+    throw new Error("Drive content exceeds Berry's 100 MB import limit");
+  }
+  const contentType = response.headers.get("content-type")?.split(";")[0] ?? exportMimeType ?? mimeType;
+  const sourceRevision = driveSourceRevision(metadata);
+  return context.driveArtifactImporter({
+    sourceFileId: fileId,
+    sourceRevision,
+    sourceMimeType: mimeType,
+    exportMimeType: googleMime ? exportMimeType : null,
+    name: driveArtifactName(requiredString(metadata.name, "name"), contentType, googleMime),
+    contentType,
+    declaredSize,
+    metadata,
+    body: response.body,
+  });
 }
 
 async function readBoundedText(response: Response, maximumBytes: number, limitMessage: string): Promise<string> {
@@ -376,7 +413,37 @@ function createCalendarEvent(token: string, input: Record<string, unknown>) { co
 async function updateCalendarEvent(token: string, input: Record<string, unknown>): Promise<unknown> { const calendarId = optionalString(input.calendarId) ?? "primary"; const eventId = requiredString(input.eventId, "eventId"); const current = await googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`)) as Record<string, unknown>; if (current.recurringEventId && optionalStringArray(input.recurrence)?.length) throw new Error("Changing recurrence on one occurrence is not supported"); const updated = { ...current, ...eventResource(input), id: current.id, etag: current.etag }; return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none", conferenceDataVersion: input.createMeet === true || current.conferenceData ? 1 : undefined }), { method: "PUT", ...(typeof current.etag === "string" ? { headers: { "if-match": current.etag } } : {}), body: jsonBody(updated) }); }
 async function respondToEvent(token: string, input: Record<string, unknown>, context: ToolContext): Promise<unknown> { const calendarId = optionalString(input.calendarId) ?? "primary"; const eventId = requiredString(input.eventId, "eventId"); const event = await googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`)) as Record<string, unknown>; const attendees = Array.isArray(event.attendees) ? event.attendees.map((value) => ({ ...requiredObject(value, "attendee") })) : []; const attendee = attendees.find((value) => value.self === true || (context.accountEmail && value.email === context.accountEmail)); if (!attendee) throw new Error("The connected account is not an attendee on this event"); attendee.responseStatus = requiredEnum(input.responseStatus, ["accepted", "declined", "tentative"], "responseStatus"); return googleJson(token, calendarUrl(`calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, { sendUpdates: optionalString(input.sendUpdates) ?? "none" }), { method: "PUT", ...(typeof event.etag === "string" ? { headers: { "if-match": event.etag } } : {}), body: jsonBody({ ...event, attendees }) }); }
 
-function defaultExportMime(mimeType: string): string { if (mimeType === "application/vnd.google-apps.document") return "text/plain"; if (mimeType === "application/vnd.google-apps.spreadsheet") return "text/csv"; return "application/pdf"; }
+function defaultExportMime(mimeType: string): string {
+  if (mimeType === "application/vnd.google-apps.document") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (mimeType === "application/vnd.google-apps.spreadsheet") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (mimeType === "application/vnd.google-apps.presentation") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  return "application/pdf";
+}
+function optionalContentLength(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+function driveSourceRevision(metadata: Record<string, unknown>): string {
+  return optionalString(metadata.headRevisionId)
+    ?? optionalString(metadata.version)
+    ?? optionalString(metadata.sha256Checksum)
+    ?? optionalString(metadata.md5Checksum)
+    ?? optionalString(metadata.modifiedTime)
+    ?? requiredString(metadata.id, "id");
+}
+function driveArtifactName(name: string, mediaType: string, exported: boolean): string {
+  if (!exported) return name;
+  const extension = mediaType === "application/pdf" ? ".pdf"
+    : mediaType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ? ".docx"
+      : mediaType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ? ".xlsx"
+        : mediaType === "application/vnd.openxmlformats-officedocument.presentationml.presentation" ? ".pptx"
+          : mediaType === "text/csv" ? ".csv"
+            : mediaType.startsWith("text/") ? ".txt"
+              : "";
+  if (!extension || name.toLowerCase().endsWith(extension)) return name;
+  return `${name}${extension}`;
+}
 function escapeDriveQuery(value: string): string { return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'"); }
 function jsonBody(value: unknown): string { return JSON.stringify(value); }
 function compact<T extends Record<string, unknown>>(value: T): T { return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T; }

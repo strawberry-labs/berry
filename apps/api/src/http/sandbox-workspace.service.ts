@@ -12,7 +12,7 @@ import type { SandboxExecEvent, SandboxProvider } from "@berry/sandbox-contract"
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 
 export const SANDBOX_WORKSPACE_SERVICE = Symbol("SANDBOX_WORKSPACE_SERVICE");
-const ROOT = "/workspace" as const;
+const DEFAULT_ROOT = "/workspace" as const;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_TERMINAL_INPUT = 16_384;
 const MAX_TERMINAL_OUTPUT = 262_144;
@@ -38,7 +38,7 @@ export class PostgresSandboxWorkspaceRepository implements SandboxWorkspaceRepos
       tenant_id: string; task_id: string; sandbox_id: string; status: "running" | "recovering" | "failed"; root: string; provider: string; expires_at: Date | string | null; updated_at: Date | string;
     }>("SELECT tenant_id, task_id, sandbox_id, status, root, provider, expires_at, updated_at FROM sandbox_workspaces WHERE task_id = $1", [taskId]));
     const row = rows[0];
-    return row ? { tenantId: row.tenant_id, taskId: row.task_id, sandboxId: row.sandbox_id, status: row.status, root: ROOT, provider: row.provider, expiresAt: iso(row.expires_at), updatedAt: iso(row.updated_at)! } : null;
+    return row ? { tenantId: row.tenant_id, taskId: row.task_id, sandboxId: row.sandbox_id, status: row.status, root: row.root, provider: row.provider, expiresAt: iso(row.expires_at), updatedAt: iso(row.updated_at)! } : null;
   }
   async put(record: WorkspaceRecord): Promise<void> {
     await this.database.withTenant(record.tenantId, (db) => db.execute(`
@@ -53,6 +53,7 @@ export type SandboxWorkspaceServiceOptions = {
   provider: SandboxProvider;
   repository?: SandboxWorkspaceRepository;
   image?: string;
+  root?: string;
   ttlSeconds?: number;
 };
 
@@ -61,6 +62,7 @@ export class SandboxWorkspaceService {
   readonly #provider: SandboxProvider;
   readonly #repository: SandboxWorkspaceRepository;
   readonly #image: string;
+  readonly #root: string;
   readonly #ttlSeconds: number;
   readonly #terminals = new Map<string, TerminalRecord>();
   readonly #previews = new Map<string, CloudPreview[]>();
@@ -69,6 +71,7 @@ export class SandboxWorkspaceService {
     this.#provider = options.provider;
     this.#repository = options.repository ?? new InMemorySandboxWorkspaceRepository();
     this.#image = options.image ?? "node:22-bookworm";
+    this.#root = workspaceRoot(options.root ?? DEFAULT_ROOT);
     this.#ttlSeconds = options.ttlSeconds ?? 300;
   }
 
@@ -102,9 +105,9 @@ export class SandboxWorkspaceService {
       task_id: taskId,
       session_id: sessionId,
       image: this.#image,
-      cwd: ROOT,
+      cwd: this.#root,
       ttl_seconds: this.#ttlSeconds,
-      writable_roots: [ROOT],
+      writable_roots: [this.#root],
       network_policy: { egress: "off", allowedDomains: [] },
       metadata: { surface: "web-code-workspace" },
     });
@@ -113,7 +116,7 @@ export class SandboxWorkspaceService {
       taskId,
       sandboxId: sandbox.sandbox_id,
       status: "running",
-      root: ROOT,
+      root: this.#root,
       provider: sandbox.provider,
       expiresAt: sandbox.expires_at,
       updatedAt: new Date().toISOString(),
@@ -122,21 +125,21 @@ export class SandboxWorkspaceService {
     return publicState(record);
   }
 
-  async listFiles(state: CloudWorkspaceState, path: string = ROOT): Promise<CloudWorkspaceFileEntry[]> {
-    const safePath = workspacePath(path);
+  async listFiles(state: CloudWorkspaceState, path: string = state.root): Promise<CloudWorkspaceFileEntry[]> {
+    const safePath = workspacePath(path, state.root);
     const result = await this.#provider.files.list({ sandbox_id: state.sandboxId, path: safePath, recursive: false });
     return result.entries.slice(0, 2_000).map((entry) => ({ path: entry.path, type: entry.type, sizeBytes: entry.size_bytes, mtime: entry.mtime }));
   }
 
   async readFile(state: CloudWorkspaceState, path: string) {
-    const result = await this.#provider.files.read({ sandbox_id: state.sandboxId, path: workspacePath(path), encoding: "utf8" });
+    const result = await this.#provider.files.read({ sandbox_id: state.sandboxId, path: workspacePath(path, state.root), encoding: "utf8" });
     if (result.size_bytes > MAX_FILE_BYTES || Buffer.byteLength(result.content, "utf8") > MAX_FILE_BYTES) throw new Error("File exceeds the 1 MB browser editor limit");
     return { path: result.path, content: result.content, sizeBytes: result.size_bytes, mtime: result.mtime };
   }
 
   async writeFile(state: CloudWorkspaceState, path: string, content: string) {
     if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) throw new Error("File exceeds the 1 MB browser editor limit");
-    const result = await this.#provider.files.write({ sandbox_id: state.sandboxId, path: workspacePath(path), encoding: "utf8", content });
+    const result = await this.#provider.files.write({ sandbox_id: state.sandboxId, path: workspacePath(path, state.root), encoding: "utf8", content });
     return { path: result.path, sizeBytes: result.size_bytes, mtime: result.mtime };
   }
 
@@ -176,7 +179,7 @@ export class SandboxWorkspaceService {
     const controller = new AbortController();
     terminal.controller = controller;
     try {
-      for await (const event of this.#provider.exec({ sandbox_id: state.sandboxId, request_id: `web-terminal-${randomUUID()}`, command: ["sh", "-lc", input], cwd: ROOT, timeout_ms: 120_000 }, { signal: controller.signal })) {
+      for await (const event of this.#provider.exec({ sandbox_id: state.sandboxId, request_id: `web-terminal-${randomUUID()}`, command: ["sh", "-lc", input], cwd: state.root, timeout_ms: 120_000 }, { signal: controller.signal })) {
         this.#consumeExec(terminal, event);
       }
       if (terminal.status === "running") terminal.status = "exited";
@@ -214,7 +217,7 @@ export class SandboxWorkspaceService {
 
   async #execText(state: CloudWorkspaceState, command: string, limit: number): Promise<string> {
     let output = "";
-    for await (const event of this.#provider.exec({ sandbox_id: state.sandboxId, request_id: `web-workspace-${randomUUID()}`, command: ["sh", "-lc", command], cwd: ROOT, timeout_ms: 30_000 })) {
+    for await (const event of this.#provider.exec({ sandbox_id: state.sandboxId, request_id: `web-workspace-${randomUUID()}`, command: ["sh", "-lc", command], cwd: state.root, timeout_ms: 30_000 })) {
       if (event.kind === "stdout" || event.kind === "stderr") output = (output + event.data).slice(0, limit);
     }
     return output;
@@ -239,12 +242,26 @@ export class SandboxWorkspaceService {
   }
 }
 
-function workspacePath(path: string): string {
-  const value = path.trim().replaceAll("\\", "/");
-  const absolute = value.startsWith("/") ? value : `${ROOT}/${value}`;
-  const segments = absolute.split("/").filter(Boolean);
-  if (segments[0] !== "workspace" || segments.some((segment) => segment === "." || segment === "..")) throw new BadRequestException("Path is outside the sandbox workspace");
+function workspaceRoot(path: string): string {
+  const value = path.trim().replaceAll("\\", "/").replace(/\/+$/, "");
+  const segments = value.split("/").filter(Boolean);
+  if (!value.startsWith("/") || segments.length === 0 || segments.some((segment) => segment === "." || segment === "..")) {
+    throw new BadRequestException("Sandbox workspace root must be an absolute path without traversal segments");
+  }
   return `/${segments.join("/")}`;
+}
+
+function workspacePath(path: string, root: string): string {
+  const safeRoot = workspaceRoot(root);
+  const value = path.trim().replaceAll("\\", "/");
+  const absolute = value.startsWith("/") ? value : `${safeRoot}/${value}`;
+  const segments = absolute.split("/").filter(Boolean);
+  const normalized = `/${segments.join("/")}`;
+  if (
+    (normalized !== safeRoot && !normalized.startsWith(`${safeRoot}/`))
+    || segments.some((segment) => segment === "." || segment === "..")
+  ) throw new BadRequestException("Path is outside the sandbox workspace");
+  return normalized;
 }
 
 function publicState(record: WorkspaceRecord): CloudWorkspaceState { const { tenantId: _, ...state } = record; return state; }

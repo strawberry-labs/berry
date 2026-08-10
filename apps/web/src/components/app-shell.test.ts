@@ -3,9 +3,14 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
 import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
-import { allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
+import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
+  it("uses the account name and then email for the sidebar avatar fallback", () => {
+    expect(accountAvatarInitial({ name: " strawberry", email: "user@example.com" })).toBe("S");
+    expect(accountAvatarInitial({ name: "", email: "user@example.com" })).toBe("U");
+  });
+
   it("does not issue live requests for fixture task and session identifiers", () => {
     const fixture = {
       config: { demoMode: false },

@@ -19,7 +19,13 @@ export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpe
 
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange} title="Search Berry" description="Search conversations and actions">
-      <CommandInput autoFocus placeholder="Search conversations and actions…" aria-label="Search conversations and actions" />
+      <CommandInput
+        autoFocus
+        placeholder="Search conversations and actions…"
+        aria-label="Search conversations and actions"
+        className="berry-command-search-input"
+        wrapperClassName="berry-command-search-wrapper"
+      />
       <CommandList>
         <CommandEmpty>No conversations or actions found.</CommandEmpty>
         <CommandGroup heading="Actions">

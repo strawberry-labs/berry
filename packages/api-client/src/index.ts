@@ -1054,10 +1054,19 @@ export class BerryApiClient {
       answer: string;
       answerMessageId?: string | undefined;
       selectedOptions?: string[] | undefined;
-      answers?: Array<{ question: string; answer: string; selectedOptions?: string[] | undefined; skipped?: boolean | undefined }> | undefined;
+      answers?: Array<{
+        question: string;
+        answer: string;
+        selectedOptions?: string[] | undefined;
+        attachments?: Array<{ fileId: string; name: string; mediaType: string; size: number; sourceKind?: string | null | undefined }> | undefined;
+        skipped?: boolean | undefined;
+      }> | undefined;
     },
-  ): Promise<{ ok: boolean }> {
-    return this.#request(`/v1/questions/${encodeURIComponent(questionId)}/answer`, z.object({ ok: z.boolean() }), {
+  ): Promise<{ ok: boolean; message?: Message | undefined }> {
+    return this.#request(`/v1/questions/${encodeURIComponent(questionId)}/answer`, z.object({
+      ok: z.boolean(),
+      message: MessageSchema.optional(),
+    }), {
       method: "POST",
       body: input,
     });

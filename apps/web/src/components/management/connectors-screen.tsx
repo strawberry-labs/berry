@@ -304,6 +304,11 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
     <Button disabled={!canWrite} onClick={() => setCustomOpen(true)}><Plus />Custom MCP</Button>
   </>}>
     <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
+      <div className="grid gap-3 sm:grid-cols-3" aria-label="Connector status summary">
+        <ConnectorSummary label="Native apps enabled" value={`${googleApps.filter((connector) => connector.enabled).length} of ${googleApps.length}`} detail={googleConfigured ? "Google OAuth is configured" : "Google OAuth setup required"} tone={googleConfigured ? "good" : "warning"} />
+        <ConnectorSummary label="Custom MCP published" value={String(custom.filter((connector) => connector.publicationStatus === "published" && connector.enabled).length)} detail={`${custom.length} saved connector${custom.length === 1 ? "" : "s"}`} tone="neutral" />
+        <ConnectorSummary label="Connection authority" value="Organization policy" detail="Users connect only within the limits below" tone="neutral" />
+      </div>
       <Section title="Google apps" description="The OAuth app is configured once. Each user then connects their own Google account.">
         {canReadGoogleConfiguration ? <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2.5">
           <span><b className="block text-sm font-medium">Google OAuth client</b><small className="text-xs text-muted-foreground">{resource.data.google.configured ? `${resource.data.google.status} · ${resource.data.google.clientId}` : "Not configured"}</small></span>
@@ -375,6 +380,10 @@ function ConnectorCard({ connector, onClick }: { connector: Connector; onClick: 
     <ConnectorIcon connector={connector} />
     <span className="min-w-0 flex-1"><span className="flex items-start justify-between gap-2"><b className="text-sm font-medium text-foreground">{connector.name}</b>{connected ? <StatusPill tone="good">Connected</StatusPill> : <Plus className="size-4 text-muted-foreground transition-colors group-hover:text-foreground" />}</span><span className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{connector.description}</span><span className="mt-2 block text-[11px] text-muted-foreground">{connector.services.join(" · ")}</span></span>
   </button>;
+}
+
+function ConnectorSummary({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: "good" | "warning" | "neutral" }) {
+  return <div className="rounded-xl border border-border bg-card p-3.5"><div className="flex items-start justify-between gap-2"><span className="text-xs font-medium text-muted-foreground">{label}</span><StatusPill tone={tone}>{tone === "good" ? "Ready" : tone === "warning" ? "Setup" : "Managed"}</StatusPill></div><b className="mt-2 block text-lg font-medium tabular-nums text-foreground">{value}</b><p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{detail}</p></div>;
 }
 
 function ConnectorIcon({ connector, large = false }: { connector: Connector; large?: boolean }) {

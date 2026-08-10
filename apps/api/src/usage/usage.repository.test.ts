@@ -28,14 +28,16 @@ function repository() {
 }
 
 describe("PostgresUsageRepository pagination", () => {
-  it("does not cap analytics to an arbitrary event count", async () => {
+  it("aggregates analytics in Postgres without materializing all-time events", async () => {
     const { usage, statements } = repository();
 
     await usage.analytics(TENANT_ID, query());
 
-    expect(statements).toHaveLength(1);
-    expect(statements[0]?.sql).not.toMatch(/LIMIT\s+10000/i);
-    expect(statements[0]?.sql).not.toMatch(/LIMIT\s+\$/i);
+    expect(statements).toHaveLength(3);
+    expect(statements.every((statement) => !/SELECT\s+\*\s+FROM\s+usage_events/i.test(statement.sql))).toBe(true);
+    expect(statements[0]?.sql).toContain("SUM(cost_billed_micros)");
+    expect(statements[1]?.sql).toContain("GROUP BY 1");
+    expect(statements[2]?.sql).toContain("dimension_rank <= 100");
   });
 
   it("paginates request logs in newest-first order at the database", async () => {

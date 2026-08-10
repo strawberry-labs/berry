@@ -332,7 +332,17 @@ describe("durable turn runner", () => {
     });
 
     expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect(repository.events).toContainEqual({
+      kind: "session.note",
+      note: "compacting",
+      detail: "Context auto-compacting",
+    });
     expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("calling_model");
+    expect(repository.events).toContainEqual({
+      kind: "session.note",
+      note: "compacted",
+      detail: "Context compacted from 2000 to 100 tokens.",
+    });
     expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("finalizing");
     expect(compactions).toBe(1);
     expect(modelCalls).toBe(1);
@@ -509,6 +519,54 @@ describe("durable turn runner", () => {
       .filter((event): event is Extract<AgentStreamEvent, { kind: "message.delta" }> => event.kind === "message.delta")
       .map((event) => event.delta)
       .join("")).toBe("Hello world");
+  });
+
+  it("keeps consuming reasoning deltas while a journal write is in flight", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    let releaseJournalWrite!: () => void;
+    const journalWriteReleased = new Promise<void>((resolve) => { releaseJournalWrite = resolve; });
+    let journalWriteStarted!: () => void;
+    const journalWriteStartedPromise = new Promise<void>((resolve) => { journalWriteStarted = resolve; });
+    let blockFirstDelta = true;
+    const appendEvents = repository.appendEvents.bind(repository);
+    repository.appendEvents = async (current, events) => {
+      if (blockFirstDelta && events.some((event) => event.kind === "message.delta")) {
+        blockFirstDelta = false;
+        journalWriteStarted();
+        await journalWriteReleased;
+      }
+      await appendEvents(current, events);
+    };
+    let consumedSecondDelta = false;
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        await context.emitDelta("First thought. ", "reasoning");
+        await context.emitDelta("Second thought.", "reasoning");
+        consumedSecondDelta = true;
+        return {
+          text: "Done.",
+          reasoning: "First thought. Second thought.",
+          inputTokens: 2,
+          outputTokens: 4,
+          toolCalls: [],
+        };
+      },
+    }, noTools(), { owner: "worker-smooth-reasoning" });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await journalWriteStartedPromise;
+    // Let the model continuation run after the journal promise reports that
+    // persistence is blocked. It must not be waiting on that blocked write.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(consumedSecondDelta).toBe(true);
+    releaseJournalWrite();
+    await execution;
+
+    expect(repository.events
+      .filter((event): event is Extract<AgentStreamEvent, { kind: "message.delta" }> => event.kind === "message.delta")
+      .map((event) => event.delta)
+      .join(""))
+      .toBe("First thought. Second thought.");
   });
 
   it("feeds a read-only tool exception back to the model instead of failing the turn", async () => {
@@ -977,7 +1035,7 @@ describe("durable turn runner", () => {
       provider: { id: "router", name: "Berry Router", kind: "berry-router", baseUrl: "https://router.example.test/v1", defaultModel: "kimi-2.6" },
       model: "kimi-2.6",
       conversationKind: "chat",
-      workspacePath: "/workspace",
+      workspacePath: "/home/user/workspace",
       workspaceId: "00000000-0000-7000-8000-000000000004",
       permissionMode: "ask",
       reasoning: "medium",
@@ -1054,7 +1112,7 @@ describe("durable turn runner", () => {
     const userContent = request?.messages.find((message) => message.role === "user")?.content;
     expect(Array.isArray(userContent)).toBe(true);
     expect(JSON.stringify(userContent)).toContain(
-      "Sandbox path: /workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
+      "Sandbox path: /home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
     expect(JSON.stringify(userContent)).toContain(
       "read_file extracts its text",

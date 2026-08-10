@@ -6,6 +6,7 @@ const TENANT_ID = "00000000-0000-7000-8000-000000000001";
 const USER_ID = "00000000-0000-7000-8000-000000000201";
 const TASK_ID = "00000000-0000-7000-8000-000000000202";
 const WORKSPACE_ID = "00000000-0000-7000-8000-000000000203";
+const SESSION_ID = "00000000-0000-7000-8000-000000000206";
 
 describe("FilePlatformService.list", () => {
   it("keeps searches tenant- and membership-scoped while treating wildcard input literally", async () => {
@@ -203,6 +204,35 @@ describe("FilePlatformService.streamContent", () => {
     expect(client.send).toHaveBeenCalledWith(expect.objectContaining({
       input: expect.objectContaining({ Bucket: "berry-test", Key: "objects/history.png", VersionId: "version-7" }),
     }));
+    expect(response.setHeader).toHaveBeenCalledWith("ETag", '"digest"');
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "private, max-age=31536000, immutable");
+    expect(response.end).toHaveBeenCalledOnce();
+  });
+
+  it("returns 304 without transferring a cached image again", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000204";
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => sql.includes("SELECT f.*") ? [{
+        id: fileId, owner_user_id: USER_ID, original_name: "cached.png", display_name: "cached.png",
+        media_type: "image/png", detected_media_type: null, size_bytes: 3, sha256: "content-digest",
+        bucket: "berry-test", object_key: "cached.png", etag: "storage-etag", object_version_id: null,
+        origin: "image_generation", status: "available", created_at: new Date(), updated_at: new Date(),
+        task_ids: [TASK_ID], roles: ["output"],
+      }] as T[] : [] as T[],
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const client = { send: vi.fn() };
+    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const service = new FilePlatformService(database as never, {
+      client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
+      maxUploadBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
+    } as never);
+
+    await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never, false, 'W/"content-digest"');
+
+    expect(response.statusCode).toBe(304);
+    expect(client.send).not.toHaveBeenCalled();
     expect(response.end).toHaveBeenCalledOnce();
   });
 });
@@ -236,6 +266,233 @@ describe("FilePlatformService.get", () => {
     );
     expect(associationAccess).toContain("access_task.user_id = $2::uuid");
     expect(associationAccess).toContain("access_task.user_id IS NULL AND access_task.deleted_at IS NULL");
+  });
+});
+
+describe("FilePlatformService.importConnectorArtifact", () => {
+  it("streams a Drive revision into S3 and registers one retry-stable input artifact", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const createdAt = new Date();
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM tasks") && sql.includes("workspace_id")) return [{ id: TASK_ID, workspace_id: WORKSPACE_ID }] as T[];
+        if (sql.includes("FROM sessions s")) return [{ id: SESSION_ID }] as T[];
+        if (sql.includes("WHERE f.tenant_id=$1::uuid") && sql.includes("f.origin='connector_import'")) return [] as T[];
+        if (sql.includes("INSERT INTO files")) return [{
+          id: "00000000-0000-8000-8000-000000000999",
+          blob_id: "00000000-0000-8000-8000-000000000998",
+          owner_user_id: USER_ID,
+          original_name: "Quarterly report.pdf",
+          display_name: "Quarterly report.pdf",
+          media_type: "application/pdf",
+          detected_media_type: null,
+          size_bytes: 12,
+          sha256: "unused",
+          bucket: "berry-test",
+          object_key: "artifact",
+          etag: "etag",
+          object_version_id: "version-1",
+          origin: "connector_import",
+          status: "available",
+          metadata: { connectorKey: "google-workspace", sourceFileId: "drive-1", sourceRevision: "revision-7", exportMimeType: null },
+          created_at: createdAt,
+          updated_at: createdAt,
+        }] as T[];
+        if (sql.includes("SELECT f.id, f.blob_id") && sql.includes("FOR UPDATE OF f")) {
+          return [{ id: "00000000-0000-8000-8000-000000000999", blob_id: "00000000-0000-8000-8000-000000000998" }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const uploadedBodies: Uint8Array[] = [];
+    const client = {
+      send: vi.fn(async (command: { constructor: { name: string }; input?: { Body?: Uint8Array } }) => {
+        if (command.constructor.name === "CreateMultipartUploadCommand") return { UploadId: "drive-upload-1" };
+        if (command.constructor.name === "UploadPartCommand") {
+          uploadedBodies.push(command.input?.Body ?? new Uint8Array());
+          return { ETag: '"part-etag"' };
+        }
+        if (command.constructor.name === "CompleteMultipartUploadCommand") return { ETag: '"etag"', VersionId: "version-1" };
+        throw new Error(`Unexpected S3 command: ${command.constructor.name}`);
+      }),
+    };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024 * 1024,
+      maxIndexableBytes: 0,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+    const bytes = new TextEncoder().encode("hello drive!");
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } });
+
+    await expect(service.importConnectorArtifact(TENANT_ID, USER_ID, {
+      connectorKey: "google-workspace",
+      accountEmail: "person@example.com",
+      sourceFileId: "drive-1",
+      sourceRevision: "revision-7",
+      sourceMimeType: "application/pdf",
+      exportMimeType: null,
+      name: "Quarterly report.pdf",
+      contentType: "application/pdf",
+      declaredSize: bytes.byteLength,
+      sourceMetadata: { id: "drive-1", version: "7" },
+      body,
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+    })).resolves.toEqual({ artifact: expect.objectContaining({
+      origin: "connector_import",
+      sourceFileId: "drive-1",
+      sourceRevision: "revision-7",
+      library: true,
+      reused: false,
+    }) });
+
+    expect(Buffer.concat(uploadedBodies.map((item) => Buffer.from(item))).toString("utf8")).toBe("hello drive!");
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO file_library_entries"))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO file_associations"))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO workspace_files"))).toBe(true);
+  });
+
+  it("keeps concurrent retry cleanup isolated on unversioned object storage", async () => {
+    let artifactLookup = 0;
+    const queries: string[] = [];
+    const winner = {
+      id: "00000000-0000-8000-8000-000000000999",
+      blob_id: "00000000-0000-8000-8000-000000000998",
+      owner_user_id: USER_ID,
+      original_name: "Quarterly report.pdf",
+      display_name: "Quarterly report.pdf",
+      media_type: "application/pdf",
+      detected_media_type: null,
+      size_bytes: 5,
+      sha256: "winner-digest",
+      bucket: "berry-test",
+      object_key: "winner-object-key",
+      etag: "winner-etag",
+      object_version_id: null,
+      origin: "connector_import",
+      status: "available",
+      metadata: { connectorKey: "google-workspace", sourceFileId: "drive-race", sourceRevision: "revision-7", exportMimeType: null },
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM tasks") && sql.includes("workspace_id")) return [{ id: TASK_ID, workspace_id: WORKSPACE_ID }] as T[];
+        if (sql.includes("FROM sessions s")) return [{ id: SESSION_ID }] as T[];
+        if (sql.includes("f.origin='connector_import'")) {
+          artifactLookup += 1;
+          return (artifactLookup % 2 === 0 ? [winner] : []) as T[];
+        }
+        if (sql.includes("SELECT f.id, f.blob_id") && sql.includes("FOR UPDATE OF f")) {
+          return [{ id: winner.id, blob_id: winner.blob_id }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const uploadedKeys: string[] = [];
+    const deletedKeys: string[] = [];
+    let upload = 0;
+    const client = {
+      send: vi.fn(async (command: { constructor: { name: string }; input?: { Key?: string } }) => {
+        if (command.constructor.name === "CreateMultipartUploadCommand") {
+          uploadedKeys.push(command.input?.Key ?? "");
+          upload += 1;
+          return { UploadId: `drive-race-${upload}` };
+        }
+        if (command.constructor.name === "UploadPartCommand") return { ETag: `"part-${upload}"` };
+        if (command.constructor.name === "CompleteMultipartUploadCommand") return { ETag: `"complete-${upload}"` };
+        if (command.constructor.name === "DeleteObjectCommand") {
+          deletedKeys.push(command.input?.Key ?? "");
+          return {};
+        }
+        throw new Error(`Unexpected S3 command: ${command.constructor.name}`);
+      }),
+    };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024 * 1024,
+      maxIndexableBytes: 0,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+    const importArtifact = () => service.importConnectorArtifact(TENANT_ID, USER_ID, {
+      connectorKey: "google-workspace",
+      accountEmail: "person@example.com",
+      sourceFileId: "drive-race",
+      sourceRevision: "revision-7",
+      sourceMimeType: "application/pdf",
+      exportMimeType: null,
+      name: "Quarterly report.pdf",
+      contentType: "application/pdf",
+      declaredSize: 5,
+      sourceMetadata: { id: "drive-race", version: "7" },
+      body: new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode("hello")); controller.close(); } }),
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+    });
+
+    await expect(importArtifact()).resolves.toEqual({ artifact: expect.objectContaining({ reused: true }) });
+    await expect(importArtifact()).resolves.toEqual({ artifact: expect.objectContaining({ reused: true }) });
+
+    expect(new Set(uploadedKeys).size).toBe(2);
+    expect(deletedKeys.sort()).toEqual([...uploadedKeys].sort());
+    expect(deletedKeys).not.toContain(winner.object_key);
+    expect(queries.filter((sql) => sql.includes("pg_advisory_xact_lock"))).toHaveLength(2);
+  });
+
+  it("rejects a Drive stream above the 100 MB bounded-ingestion limit", async () => {
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM tasks") && sql.includes("workspace_id")) return [{ id: TASK_ID, workspace_id: WORKSPACE_ID }] as T[];
+        if (sql.includes("FROM sessions s")) return [{ id: SESSION_ID }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const client = { send: vi.fn(async (command: { constructor: { name: string } }) => command.constructor.name === "CreateMultipartUploadCommand" ? { UploadId: "drive-upload-2" } : {}) };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024 * 1024 * 1024,
+      maxIndexableBytes: 100 * 1024 * 1024,
+      partSize: 16 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array([1])); controller.close(); } });
+    await expect(service.importConnectorArtifact(TENANT_ID, USER_ID, {
+      connectorKey: "google-workspace",
+      accountEmail: null,
+      sourceFileId: "drive-large",
+      sourceRevision: "revision-1",
+      sourceMimeType: "application/pdf",
+      exportMimeType: null,
+      name: "large.pdf",
+      contentType: "application/pdf",
+      declaredSize: 100 * 1024 * 1024 + 1,
+      sourceMetadata: {},
+      body,
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+    })).rejects.toThrow("100 MB");
+    expect(client.send).not.toHaveBeenCalled();
   });
 });
 

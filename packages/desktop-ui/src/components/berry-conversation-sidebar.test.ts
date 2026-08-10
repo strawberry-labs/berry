@@ -4,6 +4,7 @@ import {
   INITIAL_CONVERSATION_SECTION_STATE,
   conversationSectionReducer,
   conversationsForKind,
+  taskIsInProgress,
   visibleConversationSlice,
 } from "./berry-conversation-sidebar";
 
@@ -83,5 +84,10 @@ describe("Berry conversation sidebar model", () => {
     state = conversationSectionReducer(state, { type: "toggle-all", projectIds: ["project_1", "project_2"] });
     expect(state.allCollapsed).toBe(false);
     expect(state.collapsedProjects.size).toBe(0);
+  });
+
+  it("shows activity only until a task reaches a terminal status", () => {
+    expect(["queued", "running", "waiting-for-approval"].map((status) => taskIsInProgress(task(status, "chat", { status: status as Task["status"] })))).toEqual([true, true, true]);
+    expect(["completed", "failed", "cancelled"].map((status) => taskIsInProgress(task(status, "chat", { status: status as Task["status"] })))).toEqual([false, false, false]);
   });
 });

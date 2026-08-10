@@ -142,6 +142,10 @@ export function visibleConversationSlice(tasks: Task[], expanded: boolean): { vi
   return { visible: tasks.slice(0, INITIAL_CONVERSATION_COUNT), hiddenCount: tasks.length - INITIAL_CONVERSATION_COUNT };
 }
 
+export function taskIsInProgress(task: Pick<Task, "status">): boolean {
+  return task.status === "queued" || task.status === "running" || task.status === "waiting-for-approval";
+}
+
 export function BerryConversationSidebarContent(props: BerryConversationSidebarContentProps) {
   const [sectionState, dispatch] = React.useReducer(conversationSectionReducer, INITIAL_CONVERSATION_SECTION_STATE);
   const [optimisticKind, setOptimisticKind] = React.useState(props.selectedKind);
@@ -396,11 +400,20 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
     <>
       {tasks.map((task) => {
         return (
-          <SidebarMenuItem key={task.id} className="berry-sidebar-task-item">
+          <SidebarMenuItem key={task.id} className="berry-sidebar-task-item group/task">
             <SidebarMenuButton type="button" isActive={task.id === activeTaskId} onClick={() => onOpen(task.id)} className={cn("berry-sidebar-task-row pr-14!", indented && "pl-8")}>
               <span className="berry-sidebar-row-title min-w-0 flex-1" title={task.title}>{task.title}</span>
             </SidebarMenuButton>
             <ConversationActions task={task} onTogglePinned={onTogglePinned} onArchive={onArchive} onDelete={onDelete} onRename={onRename} onShare={onShare} />
+            {taskIsInProgress(task) ? (
+              <CircularActivitySpinner
+                size={15}
+                label={`${task.title} is in progress`}
+                className="berry-sidebar-task-spinner pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 transition-opacity group-hover/task:opacity-0 group-focus-within/task:opacity-0"
+                durationMs={1_400}
+                phaseOffsetMs={task.id.length * 73}
+              />
+            ) : null}
           </SidebarMenuItem>
         );
       })}

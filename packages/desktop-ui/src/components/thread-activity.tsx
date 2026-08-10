@@ -1706,6 +1706,19 @@ export function ActivityNote({
   children: string;
   note?: SessionNoteKind;
 }) {
+  if (note === "compacting") {
+    return (
+      <div
+        data-session-note={note}
+        className="flex items-center gap-2 py-1 text-[13px] text-muted-foreground"
+        role="status"
+        aria-live="polite"
+      >
+        <CircularActivitySpinner size={14} label={children} />
+        <span className="berry-shimmer font-medium">{children}</span>
+      </div>
+    );
+  }
   const active = note === "followed-up";
   return (
     <div data-session-note={note} className="flex items-center gap-2 py-1 text-xs text-muted-foreground">

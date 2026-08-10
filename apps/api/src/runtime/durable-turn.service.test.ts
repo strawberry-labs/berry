@@ -749,6 +749,86 @@ describe("DurableTurnService", () => {
     });
   });
 
+  it("associates question uploads and persists their message parts in the answer transaction", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000009";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_questions q")) {
+          return [{
+            id: questionId,
+            run_id: runId,
+            session_id: sessionId,
+            step_id: stepId,
+            tool_call_id: null,
+            question: "Upload the brief",
+            status: "pending",
+            run_state: "waiting",
+            task_id: taskId,
+            created_at: "2026-07-28T00:00:00.000Z",
+          }] as T[];
+        }
+        if (sql.includes("FROM tasks") && sql.includes("workspace_id")) {
+          return [{ id: taskId, workspace_id: workspaceId }] as T[];
+        }
+        if (sql.includes("SELECT f.id, f.blob_id")) {
+          return [{ id: fileId, blob_id: null }] as T[];
+        }
+        if (sql.includes("SELECT f.*") && sql.includes("f.owner_user_id")) {
+          return [{
+            id: fileId,
+            blob_id: null,
+            owner_user_id: userId,
+            display_name: "brief.pdf",
+            original_name: "brief.pdf",
+            media_type: "application/pdf",
+            detected_media_type: "application/pdf",
+            size_bytes: 42,
+            bucket: "files",
+            object_key: "brief.pdf",
+            etag: null,
+            object_version_id: null,
+            origin: "user_upload",
+            status: "available",
+            created_at: "2026-07-28T00:00:00.000Z",
+            updated_at: "2026-07-28T00:00:00.000Z",
+          }] as T[];
+        }
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 1 }] as T[];
+        if (sql.includes("COUNT(*) FILTER")) return [{ sequence: 2, iteration: 2 }] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 4 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.answerQuestion(tenantId, userId, questionId, {
+      answer: "Upload the brief: Attached files: brief.pdf",
+      answerMessageId: userId,
+      answers: [{
+        question: "Upload the brief",
+        answer: "",
+        attachments: [{ fileId, name: "client-name.pdf", mediaType: "text/plain", size: 1 }],
+      }],
+    })).resolves.toBe(true);
+
+    const associationIndex = executions.findIndex(({ sql }) => sql.includes("INSERT INTO file_associations"));
+    const answerIndex = executions.findIndex(({ sql }) => sql.includes("UPDATE turn_questions"));
+    expect(associationIndex).toBeGreaterThanOrEqual(0);
+    expect(answerIndex).toBeGreaterThan(associationIndex);
+    expect(executions[associationIndex]?.params).toContain(userId);
+    const attachmentPart = executions.find(({ sql, params }) =>
+      sql.includes("'attachment'") && params.includes(userId));
+    expect(JSON.parse(String(attachmentPart?.params[2]))).toMatchObject({
+      fileId,
+      name: "brief.pdf",
+      mediaType: "application/pdf",
+      size: 42,
+    });
+  });
+
   it("treats an identical answered question as a successful replay", async () => {
     const updates: string[] = [];
     const storedAnswer = {

@@ -147,6 +147,8 @@ export interface SandboxSnapshotObjectStore {
 }
 
 export class SandboxContinuityManager implements DurableTurnToolExecutor {
+  readonly #stagedInputFileIds = new Map<string, Set<string>>();
+
   constructor(
     private readonly provider: SandboxProvider,
     private readonly repository: SandboxSnapshotRepository,
@@ -169,7 +171,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   ) {}
 
   async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
-    const requestedSandboxImages = requestedSandboxImagePaths(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const requestedSandboxImages = requestedSandboxImagePaths(snapshot, workspaceRoot);
     const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn"))
       .filter((file) => file.mediaType.startsWith("image/"));
     if (requestedSandboxImages.length === 0 && attachedImages.length === 0) return [];
@@ -225,15 +228,36 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     return parts;
   }
 
+  async stageAssociatedInputFiles(snapshot: DurableTurnSnapshot, fileIds: readonly string[]): Promise<readonly {
+    fileId: string;
+    name: string;
+    mediaType: string;
+    path: string;
+  }[]> {
+    const sandbox = await this.ensureSandbox(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const selected = new Set(fileIds);
+    const files = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
+      .filter((file) => selected.has(file.fileId));
+    await this.stageInputFiles(snapshot, sandbox.id, this.repository, selected);
+    return files.map((file) => ({
+      fileId: file.fileId,
+      name: file.name,
+      mediaType: file.mediaType,
+      path: durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot),
+    }));
+  }
+
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const sandbox = await this.ensureSandbox(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const args = objectValue(step.input.arguments);
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "read_file") {
-      const path = safeReadablePath(stringValue(args.path) ?? "");
+      const path = safeReadablePath(stringValue(args.path) ?? "", workspaceRoot);
       const mediaType = binaryMediaType(path);
       if (mediaType === "application/pdf") {
-        const content = await extractPdfText(this.provider, sandbox.id, path, step);
+        const content = await extractPdfText(this.provider, sandbox.id, path, step, workspaceRoot);
         return {
           output: {
             path,
@@ -268,7 +292,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "list_files") {
-      const path = safeReadablePath(stringValue(args.path) ?? "/workspace");
+      const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
       const result = await this.provider.files.list({
         sandbox_id: sandbox.id,
         path,
@@ -289,7 +313,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "write_file") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "");
+      const path = safeWorkspacePath(stringValue(args.path) ?? "", workspaceRoot);
       const content = stringValue(args.content, true) ?? "";
       const result = await this.provider.files.write({
         sandbox_id: sandbox.id,
@@ -304,7 +328,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "edit_file") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "");
+      const path = safeWorkspacePath(stringValue(args.path) ?? "", workspaceRoot);
       const oldString = stringValue(args.old_string, true);
       const newString = stringValue(args.new_string, true) ?? "";
       if (oldString === null || oldString.length === 0) throw new Error("edit_file requires a non-empty old_string");
@@ -327,41 +351,41 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (toolName === "apply_patch") {
       const patch = stringValue(args.patch, true);
       if (!patch) throw new Error("apply_patch requires a patch");
-      const result = await applySandboxPatch(this.provider, sandbox.id, patch, step.id);
+      const result = await applySandboxPatch(this.provider, sandbox.id, patch, step.id, workspaceRoot);
       return { output: result, summary: "Applied workspace patch", sandbox };
     }
     if (toolName === "glob") {
       const pattern = stringValue(args.pattern);
       if (!pattern) throw new Error("glob requires a pattern");
-      const path = safeReadablePath(stringValue(args.path) ?? "/workspace");
+      const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
       const result = await sandboxCommand(this.provider, sandbox.id, step.id, [
         "sh", "-c",
         'root="$1"; pattern="$2"; if command -v rg >/dev/null 2>&1; then cd "$root" && rg --files -g "$pattern"; else find "$root" -type f -print; fi',
         "berry-glob", path, pattern,
-      ], this.options.cwd ?? "/workspace");
+      ], workspaceRoot);
       const files = result.split("\n").filter(Boolean).slice(0, 10_000);
       return { output: { path, pattern, files }, summary: `Matched ${files.length} files`, sandbox };
     }
     if (toolName === "grep") {
       const pattern = stringValue(args.pattern, true);
       if (!pattern) throw new Error("grep requires a pattern");
-      const path = safeReadablePath(stringValue(args.path) ?? "/workspace");
+      const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
       const result = await sandboxCommand(this.provider, sandbox.id, step.id, [
         "sh", "-c",
         'root="$1"; pattern="$2"; ignore="$3"; if command -v rg >/dev/null 2>&1; then [ "$ignore" = 1 ] && flag=-i || flag=; rg -n --column --color never $flag -- "$pattern" "$root" || [ $? -eq 1 ]; else grep -RIn -- "$pattern" "$root" || [ $? -eq 1 ]; fi',
         "berry-grep", path, pattern, args.ignore_case === true ? "1" : "0",
-      ], this.options.cwd ?? "/workspace");
+      ], workspaceRoot);
       return { output: { path, pattern, matches: result.slice(0, 1_000_000) }, summary: `Searched ${path}`, sandbox };
     }
     if (toolName === "git_status" || toolName === "git_diff" || toolName === "git_log" || toolName === "git_checkpoint") {
       const command = toolName === "git_status"
         ? ["git", "status", "--short", "--branch"]
         : toolName === "git_diff"
-          ? ["git", "diff", "--", ...(stringValue(args.path) ? [safeWorkspacePath(stringValue(args.path)!)] : [])]
+          ? ["git", "diff", "--", ...(stringValue(args.path) ? [safeWorkspacePath(stringValue(args.path)!, workspaceRoot)] : [])]
           : toolName === "git_log"
             ? ["git", "log", `-${Math.min(100, Math.max(1, numberValue(args.limit) ?? 10))}`, "--oneline", "--decorate"]
             : ["sh", "-c", 'git add -A && git commit -m "$1"', "berry-checkpoint", stringValue(args.message) ?? "Berry checkpoint"];
-      const output = await sandboxCommand(this.provider, sandbox.id, step.id, command, this.options.cwd ?? "/workspace");
+      const output = await sandboxCommand(this.provider, sandbox.id, step.id, command, workspaceRoot);
       return { output: { command: toolName, output }, summary: `${toolName} completed`, sandbox };
     }
     if (toolName === "create_image") {
@@ -375,7 +399,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         : [];
       const referenceImageUrls: string[] = [];
       for (const reference of references) {
-        const path = safeReadablePath(reference);
+        const path = safeReadablePath(reference, workspaceRoot);
         const mediaType = binaryMediaType(path);
         if (!mediaType?.startsWith("image/")) throw new Error(`Reference is not a supported image: ${path}`);
         const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
@@ -396,7 +420,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         : await downloadGeneratedImage(first.url);
       if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
       const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp)$/i, "");
-      const path = `/workspace/outputs/${title}.png`;
+      const path = `${workspaceRoot}/outputs/${title}.png`;
       await this.provider.files.write({ sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64" });
       if (!this.objects) throw new Error("Artifact object storage is not configured");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -443,7 +467,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
     if (toolName === "persist_artifact") {
       if (!this.objects) throw new Error("Artifact object storage is not configured");
-      const path = safeOutputPath(stringValue(args.path) ?? "");
+      const path = safeOutputPath(stringValue(args.path) ?? "", workspaceRoot);
       const source = await this.provider.files.read({
         sandbox_id: sandbox.id,
         path,
@@ -504,7 +528,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sandbox_id: sandbox.id,
         request_id: step.idempotencyKey ?? step.id,
         command: ["sh", "-lc", command],
-        cwd: this.options.cwd ?? "/workspace",
+        cwd: workspaceRoot,
         timeout_ms: numberValue(args.timeoutMs) ?? 120_000,
       })) {
         if (event.kind === "stdout") output.push(event.data);
@@ -526,9 +550,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     if (!snapshot.sandboxId || !this.objects) return [];
     const sandbox = await this.ensureSandbox(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     let listed;
     try {
-      listed = await this.provider.files.list({ sandbox_id: sandbox.id, path: "/workspace/outputs", recursive: true });
+      listed = await this.provider.files.list({ sandbox_id: sandbox.id, path: `${workspaceRoot}/outputs`, recursive: true });
     } catch {
       return [];
     }
@@ -539,12 +564,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const path = name === "persist_artifact"
         ? stringValue(objectValue(step.input.arguments).path)
         : stringValue(objectValue(step.output).visionPath);
-      return path ? [safeOutputPath(path)] : [];
+      return path ? [safeOutputPath(path, workspaceRoot)] : [];
     }));
     const previouslyPublished = new Set<string>();
     for (const output of await this.repository.publishedOutputs?.(snapshot.tenantId, snapshot.sessionId) ?? []) {
       try {
-        previouslyPublished.add(`${safeOutputPath(output.sourcePath)}\0${output.sha256}`);
+        previouslyPublished.add(`${safeOutputPath(output.sourcePath, workspaceRoot)}\0${output.sha256}`);
       } catch {
         // Ignore malformed legacy metadata. The live sandbox path still goes
         // through safeOutputPath below before it can be read or published.
@@ -553,7 +578,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const results: TurnToolResult[] = [];
     for (const entry of listed.entries) {
       if (entry.type !== "file" || explicitlyPersisted.has(entry.path) || !isDurableArtifact(entry.path)) continue;
-      const path = safeOutputPath(entry.path);
+      const path = safeOutputPath(entry.path, workspaceRoot);
       const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
       const bytes = Buffer.from(source.content, "base64");
       if (bytes.byteLength === 0) continue;
@@ -693,6 +718,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             path: this.options.cwd ?? "/workspace",
             recursive: false,
           });
+          // The in-memory staged-file set is intentionally process-local. On
+          // worker restart or lease handoff, re-stage the run's durable input
+          // associations before a tool is allowed to execute.
+          await this.stageInputFiles(snapshot, snapshot.sandboxId!, repository);
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
@@ -763,12 +792,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       metadata: { runId: snapshot.id },
     });
     const restorePoint = latest ?? continuity?.snapshot ?? null;
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (restorePoint && this.objects) {
       const archive = JSON.parse(Buffer.from(await this.objects.get(restorePoint.objectKey)).toString("utf8")) as SnapshotArchive;
       for (const file of archive.files) {
         await this.provider.files.write({
           sandbox_id: handle.sandbox_id,
-          path: safeWorkspacePath(file.path),
+          path: safeWorkspacePath(file.path, workspaceRoot),
           content: file.content,
           encoding: "base64",
           ...(file.mode !== undefined ? { mode: file.mode } : {}),
@@ -800,23 +830,32 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     snapshot: DurableTurnSnapshot,
     sandboxId: string,
     repository: SandboxSnapshotRepository = this.repository,
+    selectedFileIds?: ReadonlySet<string>,
   ): Promise<void> {
-    const files = await repository.inputFiles(snapshot.tenantId, snapshot.id);
+    const staged = this.#stagedInputFileIds.get(sandboxId) ?? new Set<string>();
+    this.#stagedInputFileIds.set(sandboxId, staged);
+    const files = (await repository.inputFiles(snapshot.tenantId, snapshot.id))
+      .filter((file) => (!selectedFileIds || selectedFileIds.has(file.fileId)) && !staged.has(file.fileId));
     if (files.length === 0) return;
     if (!this.objects) throw new Error("Input file object storage is not configured");
     for (const file of files) {
       const maxInputBytes = this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES;
       if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
-      const path = durableAttachmentPath({ fileId: file.fileId, name: file.name });
+      const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+      const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
+      const directoryOutput: string[] = [];
       for await (const event of this.provider.exec({
         sandbox_id: sandboxId,
         request_id: `${snapshot.id}:stage:${file.fileId}`,
         command: ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))],
+        cwd: workspaceRoot,
         timeout_ms: 30_000,
       })) {
+        if (event.kind === "stdout" || event.kind === "stderr") directoryOutput.push(event.data);
         if (event.kind === "error") throw new Error(event.message);
         if (event.kind === "exit" && event.exit_code !== 0) {
-          throw new Error(`Unable to prepare the sandbox directory for ${file.name}`);
+          const detail = directoryOutput.join("").trim().slice(-2_000);
+          throw new Error(`Unable to prepare the sandbox directory for ${file.name}${detail ? `: ${detail}` : ""}`);
         }
       }
       await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name);
@@ -835,6 +874,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         }
       }
       if (written !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
+      staged.add(file.fileId);
     }
   }
 
@@ -910,14 +950,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }
 }
 
-function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot): string[] {
+function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot = "/workspace"): string[] {
+  const inputRoot = `${safeWorkspaceRoot(workspaceRoot)}/inputs/`;
   const paths = snapshot.steps.flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read_file" && toolName !== "create_image") return [];
     const output = objectValue(step.output);
     const path = stringValue(output.visionPath);
-    if (!path || path.startsWith("/workspace/inputs/")) return [];
+    if (!path || path.startsWith(inputRoot)) return [];
     return binaryMediaType(path)?.startsWith("image/") ? [path] : [];
   });
   return [...new Set(paths)].slice(-MAX_MODEL_IMAGES).reverse();
@@ -1026,13 +1067,13 @@ SELECT DISTINCT f.id AS file_id,f.display_name,f.media_type,
 FROM turn_runs r
 JOIN file_associations a
   ON a.tenant_id=r.tenant_id AND a.session_id=r.session_id AND a.role='input'
-  AND a.created_at<=r.created_at
-  AND ($3::text='session' OR a.message_id=r.request_message_id)
+  AND ($3::text='session' OR a.message_id=r.request_message_id OR a.turn_id=r.id::text)
 JOIN files f
   ON f.tenant_id=a.tenant_id AND f.id=a.file_id
 LEFT JOIN file_blobs blob
   ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
+  AND (a.created_at<=r.created_at OR a.turn_id=r.id::text OR f.origin='connector_import')
   AND f.status IN ('processing', 'available', 'failed')
   AND f.deleted_at IS NULL
   AND (
@@ -1042,8 +1083,8 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
       WHERE u.tenant_id=f.tenant_id AND u.file_id=f.id AND u.status='completed'
     )
     OR (
-      f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact')
-      AND f.status='available'
+      f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact','connector_import')
+      AND (f.status='available' OR (f.origin='connector_import' AND f.status='processing'))
     )
   )
 ORDER BY f.id ASC
@@ -1488,27 +1529,28 @@ async function applySandboxPatch(
   sandboxId: string,
   patch: string,
   requestId: string,
+  workspaceRoot: string,
 ): Promise<JsonValue> {
   const operations = parsePatch(patch);
   const result = { added: [] as string[], updated: [] as string[], deleted: [] as string[] };
   for (const operation of operations) {
-    const target = safeWorkspacePath(operation.path);
+    const target = safeWorkspacePath(operation.path, workspaceRoot);
     if (operation.kind === "add") {
       await provider.files.write({ sandbox_id: sandboxId, path: target, content: operation.content, encoding: "utf8" });
       result.added.push(operation.path);
       continue;
     }
     if (operation.kind === "delete") {
-      await sandboxCommand(provider, sandboxId, `${requestId}:delete`, ["rm", "--", target], "/workspace");
+      await sandboxCommand(provider, sandboxId, `${requestId}:delete`, ["rm", "--", target], workspaceRoot);
       result.deleted.push(operation.path);
       continue;
     }
     const existing = await provider.files.read({ sandbox_id: sandboxId, path: target, encoding: "utf8" });
     const content = applyPatchHunks(operation.path, existing.content, operation.hunks);
-    const destination = operation.moveTo ? safeWorkspacePath(operation.moveTo) : target;
+    const destination = operation.moveTo ? safeWorkspacePath(operation.moveTo, workspaceRoot) : target;
     await provider.files.write({ sandbox_id: sandboxId, path: destination, content, encoding: "utf8" });
     if (operation.moveTo) {
-      await sandboxCommand(provider, sandboxId, `${requestId}:move`, ["rm", "--", target], "/workspace");
+      await sandboxCommand(provider, sandboxId, `${requestId}:move`, ["rm", "--", target], workspaceRoot);
       result.updated.push(operation.moveTo);
     } else {
       result.updated.push(operation.path);
@@ -1633,22 +1675,35 @@ function excludedSnapshotPath(path: string, root: string): boolean {
     || /(?:secret|credential|token|private[-_.]?key)/i.test(relative);
 }
 
-function safeWorkspacePath(value: string): string {
-  return safeSandboxPath(value, ["workspace"], "Sandbox writes must remain under /workspace");
+function safeWorkspaceRoot(value: string): string {
+  const normalized = value.trim().replaceAll("\\", "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  if (!normalized.startsWith("/") || parts.length === 0 || parts.includes("..") || parts.includes(".")) {
+    throw new Error("Sandbox workspace root must be an absolute path without traversal segments");
+  }
+  return `/${parts.join("/")}`;
 }
 
-function safeReadablePath(value: string): string {
+function safeWorkspacePath(value: string, workspaceRoot = "/workspace"): string {
+  const root = safeWorkspaceRoot(workspaceRoot);
+  return safeSandboxPath(value, root, [root], `Sandbox writes must remain under ${root}`);
+}
+
+function safeReadablePath(value: string, workspaceRoot = "/workspace"): string {
+  const root = safeWorkspaceRoot(workspaceRoot);
   return safeSandboxPath(
     value,
-    ["workspace", "managed-skills"],
-    "Sandbox reads must remain under /workspace or /managed-skills",
+    root,
+    [root, "/managed-skills"],
+    `Sandbox reads must remain under ${root} or /managed-skills`,
   );
 }
 
-function safeOutputPath(value: string): string {
-  const path = safeWorkspacePath(value);
-  if (!path.startsWith("/workspace/outputs/") && !path.startsWith("/workspace/output/")) {
-    throw new Error("Artifacts must be created under /workspace/outputs");
+function safeOutputPath(value: string, workspaceRoot = "/workspace"): string {
+  const root = safeWorkspaceRoot(workspaceRoot);
+  const path = safeWorkspacePath(value, root);
+  if (!path.startsWith(`${root}/outputs/`) && !path.startsWith(`${root}/output/`)) {
+    throw new Error(`Artifacts must be created under ${root}/outputs`);
   }
   return path;
 }
@@ -1662,14 +1717,21 @@ function safeArtifactName(value: string): string {
     .slice(0, 180) || "artifact";
 }
 
-function safeSandboxPath(value: string, roots: readonly string[], errorMessage: string): string {
+function safeSandboxPath(
+  value: string,
+  workspaceRoot: string,
+  roots: readonly string[],
+  errorMessage: string,
+): string {
   const normalized = value.trim().replaceAll("\\", "/");
-  const absolute = normalized.startsWith("/") ? normalized : `/workspace/${normalized}`;
+  const absolute = normalized.startsWith("/") ? normalized : `${workspaceRoot}/${normalized}`;
   const parts = absolute.split("/").filter(Boolean);
-  if (!parts[0] || !roots.includes(parts[0]) || parts.includes("..") || parts.includes(".")) {
+  const path = `/${parts.join("/")}`;
+  const withinRoot = roots.some((root) => path === root || path.startsWith(`${root}/`));
+  if (!parts[0] || !withinRoot || parts.includes("..") || parts.includes(".")) {
     throw new Error(errorMessage);
   }
-  return `/${parts.join("/")}`;
+  return path;
 }
 
 async function extractPdfText(
@@ -1677,6 +1739,7 @@ async function extractPdfText(
   sandboxId: string,
   path: string,
   step: DurableTurnStep,
+  workspaceRoot: string,
 ): Promise<string> {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -1685,7 +1748,7 @@ async function extractPdfText(
     sandbox_id: sandboxId,
     request_id: `${step.idempotencyKey ?? step.id}:pdf-text`,
     command: ["pdftotext", "-layout", path, "-"],
-    cwd: "/workspace",
+    cwd: workspaceRoot,
     timeout_ms: 120_000,
   })) {
     if (event.kind === "stdout") stdout.push(event.data);

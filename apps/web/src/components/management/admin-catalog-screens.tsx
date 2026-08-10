@@ -9,7 +9,6 @@ import {
   ShieldCheck,
   Trash2,
   Upload,
-  X,
 } from "lucide-react";
 import {
   OrgPermissionSchema,
@@ -105,14 +104,15 @@ function RolesScreen({
     [] as any[],
   );
   const [selected, setSelected] = React.useState<string | null>(null);
-  const [query, setQuery] = React.useState("");
   const [draft, setDraft] = React.useState<Set<OrgPermission> | null>(null);
   const [message, setMessage] = React.useState("");
-  const roles = r.data.filter((role: any) =>
-    role.role.toLowerCase().includes(query.toLowerCase()),
-  );
+  const roleOrder = new Map([["owner", 0], ["admin", 1], ["member", 2]]);
+  const roles = [...r.data].sort((left: any, right: any) => (roleOrder.get(left.role) ?? 99) - (roleOrder.get(right.role) ?? 99) || left.role.localeCompare(right.role));
   const active = r.data.find((role: any) => role.role === selected) ?? null;
   const isSystem = active?.source === "system";
+  React.useEffect(() => {
+    if (roles.length > 0 && !roles.some((role: any) => role.role === selected)) setSelected(roles[0].role);
+  }, [r.data, selected]);
   React.useEffect(() => {
     setDraft(active ? new Set(active.permissions) : null);
     setMessage("");
@@ -149,54 +149,17 @@ function RolesScreen({
   return (
     <ManagementPage
       title="Roles & permissions"
-      description="Define what each role can read and manage. System roles are locked; clone them to customize."
+      description="Review organization roles horizontally, then inspect each permission group below."
       eyebrow="Access"
     >
-      <div className="grid gap-4 lg:grid-cols-[minmax(220px,280px)_minmax(0,1fr)]">
-        <div className="grid min-w-0 gap-3">
-          <Toolbar>
-            <SearchInput
-              label="Search roles"
-              value={query}
-              onChange={setQuery}
-              placeholder="Search roles"
-            />
-          </Toolbar>
-          <AsyncState
-            loading={r.loading}
-            error={r.error}
-            onRetry={r.retry}
-            empty={roles.length === 0}
-          >
-            <ul
-              className="grid list-none gap-1 p-0 [&_button]:grid [&_button]:h-auto [&_button]:w-full [&_button]:gap-1.5 [&_button]:rounded-lg [&_button]:border [&_button]:border-border [&_button]:p-2.5 [&_button]:text-left"
-              aria-label="Roles"
-            >
-              {roles.map((role: any) => (
-                <li key={role.role}>
-                  <Button
-                    type="button"
-                    aria-current={selected === role.role ? "true" : undefined}
-                    onClick={() => setSelected(role.role)}
-                  >
-                    <span className="text-sm font-medium">
-                      {humanize(role.role)}
-                    </span>
-                    <span className="flex items-center gap-2 [&_small]:text-xs [&_small]:text-muted-foreground">
-                      <StatusPill
-                        tone={role.source === "system" ? "neutral" : "info"}
-                      >
-                        {role.source === "system" ? "System" : "Custom"}
-                      </StatusPill>
-                      <small>{role.permissions.length} permissions</small>
-                    </span>
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </AsyncState>
-        </div>
-        <div className="min-w-0">
+      <AsyncState loading={r.loading} error={r.error} onRetry={r.retry} empty={roles.length === 0} emptyTitle="No roles configured">
+        <div className="grid min-w-0 gap-4">
+          <TabBar
+            label="Organization roles"
+            active={selected ?? ""}
+            onSelect={setSelected}
+            tabs={roles.map((role: any) => ({ id: role.role, label: `${humanize(role.role)} · ${role.permissions.length}` }))}
+          />
           {active && draft ? (
             <Section
               title={humanize(active.role)}
@@ -214,7 +177,7 @@ function RolesScreen({
                 ) : null
               }
             >
-              <div className="grid gap-4">
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {PERMISSION_DOMAINS.map((domain) => {
                   const perms = ALL_PERMISSIONS.filter(
                     (p) => domainOf(p) === domain.id,
@@ -252,7 +215,7 @@ function RolesScreen({
             </div>
           )}
         </div>
-      </div>
+      </AsyncState>
     </ManagementPage>
   );
 }
@@ -1234,6 +1197,7 @@ function SkillsMcpScreen({
     { skills: true, mcp: true },
   );
   const [tab, setTab] = React.useState("skill");
+  const [skillSource, setSkillSource] = React.useState<"upload" | "paste">("upload");
   const [query, setQuery] = React.useState("");
   const [assignment, setAssignment] = React.useState("all");
   const [active, setActive] = React.useState<number | null>(null);
@@ -1246,6 +1210,13 @@ function SkillsMcpScreen({
     packageFiles: [] as string[],
     fileName: "",
     assignment: "default-on" as OrgCapabilityAssignment,
+    allowUserDisable: true,
+  });
+  const [mcpDraft, setMcpDraft] = React.useState({
+    name: "",
+    description: "",
+    url: "",
+    assignment: "available" as OrgCapabilityAssignment,
     allowUserDisable: true,
   });
   const canWrite = tab === "skill" ? canWriteSkills : canWriteMcp;
@@ -1330,6 +1301,7 @@ function SkillsMcpScreen({
         packageFiles: imported.packageFiles,
         fileName: imported.fileName,
       }));
+      setSkillSource("upload");
     } catch (cause) {
       setImportError(
         cause instanceof Error
@@ -1374,6 +1346,31 @@ function SkillsMcpScreen({
     });
     setMessage(`$${saved.name} is now available to the organization.`);
   };
+  const saveMcp = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!client) return;
+    setImportError("");
+    try {
+      const url = new URL(mcpDraft.url);
+      if (url.protocol !== "https:") throw new Error("Remote MCP servers must use HTTPS.");
+      const capabilityId = `${mcpDraft.name}-${url.hostname}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-|-$/g, "");
+      const saved = await client.upsertOrganizationCapability(tenantId, {
+        kind: "mcp",
+        capabilityId,
+        name: mcpDraft.name.trim(),
+        description: mcpDraft.description.trim(),
+        assignment: mcpDraft.assignment,
+        allowUserDisable: mcpDraft.assignment === "required" || mcpDraft.assignment === "blocked" ? false : mcpDraft.allowUserDisable,
+        config: { url: url.toString(), transport: "streamable-http" },
+      });
+      r.setData([saved, ...r.data.filter((item: any) => !(item.kind === saved.kind && item.capabilityId === saved.capabilityId))]);
+      setAdding(false);
+      setMcpDraft({ name: "", description: "", url: "", assignment: "available", allowUserDisable: true });
+      setMessage(`${saved.name} MCP server is now available to the organization.`);
+    } catch (cause) {
+      setImportError(cause instanceof Error ? cause.message : "Could not add this MCP server.");
+    }
+  };
   const removeCapability = async (capability: any) => {
     if (!client) return;
     await client.deleteOrganizationCapability(tenantId, capability.id);
@@ -1397,7 +1394,7 @@ function SkillsMcpScreen({
       description="Choose organization capabilities and how they are assigned to members."
       eyebrow="AI controls"
       actions={
-        tab === "skill" && canWriteSkills ? (
+        canWrite ? (
           <Button
             onClick={() => {
               setAdding(true);
@@ -1406,7 +1403,7 @@ function SkillsMcpScreen({
             }}
           >
             <Plus aria-hidden />
-            Add organization skill
+            {tab === "skill" ? "Add organization skill" : "Add MCP server"}
           </Button>
         ) : null
       }
@@ -1454,53 +1451,51 @@ function SkillsMcpScreen({
         open={adding && tab === "skill"}
         onOpenChange={setAdding}
         title={review ? "Review organization skill" : "Add organization skill"}
-        description="Import an Agent Skills package or paste SKILL.md, then choose how it is assigned."
+        description={review ? "Confirm the reviewed package and organization assignment." : "Select one source, provide the skill, then review it before publishing."}
         size="lg"
+        footer={!review ? <>
+          <Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button>
+          <Button type="submit" form="organization-skill-source-form"><ShieldCheck aria-hidden />Review skill</Button>
+        </> : <>
+          <Button type="button" variant="secondary" onClick={() => setReview(null)}>Back</Button>
+          <Button type="button" onClick={() => void saveSkill()}><Check aria-hidden />Add to organization</Button>
+        </>}
       >
         {!review ? (
           <form
-            className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
+            id="organization-skill-source-form"
+            className="grid gap-4"
             onSubmit={reviewSkill}
           >
-            <label
-              className="settings-skill-dropzone"
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => {
-                event.preventDefault();
-                void selectSkillFile(event.dataTransfer.files[0]);
-              }}
-            >
-              <input
-                type="file"
-                accept=".skill,.zip,.md,text/markdown,application/zip"
-                onChange={(event) =>
-                  void selectSkillFile(event.currentTarget.files?.[0])
-                }
-              />
-              <Upload aria-hidden />
-              <span>
-                <b>
-                  {skillDraft.fileName || "Choose or drop a .skill package"}
-                </b>
-                <small>.skill, .zip, or SKILL.md · up to 5 MB</small>
-              </span>
-            </label>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
-              Or paste SKILL.md
-              <Textarea
-                className="min-h-32 resize-y"
-                required
-                value={skillDraft.content}
-                onChange={(event) =>
-                  setSkillDraft({
-                    ...skillDraft,
-                    content: event.currentTarget.value,
-                    fileName: "",
-                    packageFiles: [],
-                  })
-                }
-              />
-            </label>
+            <TabBar label="Skill source" active={skillSource} onSelect={(value) => setSkillSource(value as "upload" | "paste")} tabs={[{ id: "upload", label: "Upload package" }, { id: "paste", label: "Paste SKILL.md" }]} />
+            {skillSource === "upload" ? (
+              <label
+                className="settings-skill-dropzone"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  void selectSkillFile(event.dataTransfer.files[0]);
+                }}
+              >
+                <input type="file" accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectSkillFile(event.currentTarget.files?.[0])} />
+                <Upload aria-hidden />
+                <span className="grid gap-0.5">
+                  <b>{skillDraft.fileName || "Choose or drop a .skill package"}</b>
+                  <small>.skill, .zip, or SKILL.md · up to 5 MB</small>
+                </span>
+              </label>
+            ) : (
+              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+                SKILL.md content
+                <Textarea
+                  className="min-h-48 resize-y font-mono text-xs"
+                  required
+                  value={skillDraft.content}
+                  placeholder="---\nname: example\ndescription: ...\n---"
+                  onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [] })}
+                />
+              </label>
+            )}
             {importError ? (
               <div
                 className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
@@ -1509,18 +1504,6 @@ function SkillsMcpScreen({
                 {importError}
               </div>
             ) : null}
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => setAdding(false)}
-            >
-              <X aria-hidden />
-              Cancel
-            </Button>
-            <Button>
-              <ShieldCheck aria-hidden />
-              Review
-            </Button>
           </form>
         ) : (
           <div className="grid gap-3 [&_dl]:grid [&_dl]:gap-3 sm:[&_dl]:grid-cols-3 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:text-sm">
@@ -1580,9 +1563,9 @@ function SkillsMcpScreen({
               />
             </label>
             <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-              <span>
+              <span className="grid min-w-0 gap-0.5">
                 Allow user disable
-                <small>Members can turn off default-on skills.</small>
+                <small className="text-xs font-normal text-muted-foreground">Members can turn off default-on skills.</small>
               </span>
               <ManagementSwitch
                 checked={skillDraft.allowUserDisable}
@@ -1596,17 +1579,28 @@ function SkillsMcpScreen({
                 aria-label="Allow user disable"
               />
             </label>
-            <div className="flex flex-wrap justify-end gap-2">
-              <Button variant="secondary" onClick={() => setReview(null)}>
-                Back
-              </Button>
-              <Button onClick={() => void saveSkill()}>
-                <Check aria-hidden />
-                Add to organization
-              </Button>
-            </div>
           </div>
         )}
+      </ManagementDialog>
+      <ManagementDialog
+        open={adding && tab === "mcp"}
+        onOpenChange={setAdding}
+        title="Add organization MCP server"
+        description="Register a remote HTTPS MCP endpoint, then choose how it is assigned to members."
+        size="lg"
+        footer={<><Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button><Button type="submit" form="organization-mcp-form"><Plus aria-hidden />Add MCP server</Button></>}
+      >
+        <form id="organization-mcp-form" className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground" onSubmit={saveMcp}>
+          <label>Name<Input required autoFocus value={mcpDraft.name} onChange={(event) => setMcpDraft({ ...mcpDraft, name: event.currentTarget.value })} placeholder="Company knowledge" /></label>
+          <label>Assignment<FormSelect value={mcpDraft.assignment} onChange={(assignment) => setMcpDraft({ ...mcpDraft, assignment: assignment as OrgCapabilityAssignment })} options={[{ value: "required", label: "Required" }, { value: "default-on", label: "Default on" }, { value: "available", label: "Available" }, { value: "blocked", label: "Blocked" }]} /></label>
+          <label className="sm:col-span-2">Remote MCP URL<Input required type="url" value={mcpDraft.url} onChange={(event) => setMcpDraft({ ...mcpDraft, url: event.currentTarget.value })} placeholder="https://mcp.example.com/mcp" /></label>
+          <label className="sm:col-span-2">Description<Textarea className="min-h-24 resize-y" value={mcpDraft.description} onChange={(event) => setMcpDraft({ ...mcpDraft, description: event.currentTarget.value })} /></label>
+          <label className="sm:col-span-2 flex-row items-center justify-between rounded-lg border border-border px-3 py-2.5 text-sm text-foreground">
+            <span className="grid gap-0.5">Allow member disable<small className="text-xs font-normal text-muted-foreground">Members can turn off this server unless it is required.</small></span>
+            <ManagementSwitch checked={mcpDraft.allowUserDisable} disabled={mcpDraft.assignment === "required" || mcpDraft.assignment === "blocked"} onCheckedChange={(allowUserDisable) => setMcpDraft({ ...mcpDraft, allowUserDisable })} aria-label="Allow member disable" />
+          </label>
+          {importError ? <p className="sm:col-span-2 text-xs text-destructive" role="alert">{importError}</p> : null}
+        </form>
       </ManagementDialog>
       <Section
         title="Personal additions"
@@ -1614,9 +1608,9 @@ function SkillsMcpScreen({
       >
         <div className="grid gap-2">
           <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-            <span>
+            <span className="grid min-w-0 gap-0.5">
               Personal skills
-              <small>Members can import and manage their own skills.</small>
+              <small className="text-xs font-normal text-muted-foreground">Members can import and manage their own skills.</small>
             </span>
             <ManagementSwitch
               checked={policy.data.skills}
@@ -1628,9 +1622,9 @@ function SkillsMcpScreen({
             />
           </label>
           <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-            <span>
+            <span className="grid min-w-0 gap-0.5">
               Personal MCP servers
-              <small>Members can add their own remote MCP servers.</small>
+              <small className="text-xs font-normal text-muted-foreground">Members can add their own remote MCP servers.</small>
             </span>
             <ManagementSwitch
               checked={policy.data.mcp}
@@ -1751,9 +1745,9 @@ function SkillsMcpScreen({
               />
             </fieldset>
             <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-              <span>
+              <span className="grid min-w-0 gap-0.5">
                 Allow user disable
-                <small>Members can turn this off for themselves.</small>
+                <small className="text-xs font-normal text-muted-foreground">Members can turn this off for themselves.</small>
               </span>
               <ManagementSwitch
                 checked={Boolean(detail.allowUserDisable)}

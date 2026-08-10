@@ -10,6 +10,7 @@ import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
 import { InMemoryEnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { InMemoryModelGovernanceRepository, ModelGovernanceService } from "./model-governance.service.ts";
+import { synchronizeRuntimeModels, synchronizeRuntimeProviders } from "./model-governance.controller.ts";
 
 describe("Model governance API", () => {
   let app: INestApplication | null = null;
@@ -117,6 +118,30 @@ describe("Model governance API", () => {
       .expect(({ body }) => {
         expect(body.some((entry: { model: string }) => entry.model === "legacy-risky")).toBe(true);
       });
+  });
+
+  it("projects the deployed Berry Router and its real models into management", () => {
+    const env = {
+      BERRY_API_MODEL_MODE: "live",
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_API_KEY: "secret",
+      BERRY_ROUTER_DEFAULT_MODEL: "kimi-2.6",
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([
+        { id: "kimi-2.6", name: "Kimi 2.6", capabilities: { tools: true, reasoning: true } },
+        { id: "glm-5.2", name: "GLM 5.2", capabilities: { tools: true, reasoning: true } },
+      ]),
+      BERRY_ROUTER_IMAGE_COST_MICROS: "0",
+    } satisfies NodeJS.ProcessEnv;
+    const stale = new InMemoryModelGovernanceRepository();
+
+    expect(synchronizeRuntimeProviders(SELF_HOST_TENANT_ID, [], env)).toEqual([
+      expect.objectContaining({ providerId: "router", displayName: "Berry Router", status: "active", defaultModel: "kimi-2.6" }),
+    ]);
+    return stale.listPolicies(SELF_HOST_TENANT_ID).then((policies) => {
+      const models = synchronizeRuntimeModels(SELF_HOST_TENANT_ID, policies, env);
+      expect(models.map((model) => model.displayName)).toEqual(["GLM 5.2", "Kimi 2.6"]);
+      expect(models.some((model) => model.model === "berry/auto")).toBe(false);
+    });
   });
 });
 

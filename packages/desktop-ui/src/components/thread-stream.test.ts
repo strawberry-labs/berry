@@ -39,6 +39,49 @@ describe("live timeline rendering window", () => {
     expect(state.timelineOmitted).toBeGreaterThan(0);
     expect(state.timeline).toContainEqual(expect.objectContaining({ kind: "tool", toolCallId: "still-running" }));
   });
+
+  it("replaces the live compaction row with the completed token summary", () => {
+    let state = reduceStream(IDLE, { kind: "turn.start", turnId: "turn_compact" });
+    state = reduceStream(state, {
+      kind: "session.note",
+      note: "compacting",
+      detail: "Context auto-compacting",
+    });
+    expect(state.timeline).toEqual([{
+      kind: "note",
+      note: "compacting",
+      text: "Context auto-compacting",
+    }]);
+
+    state = reduceStream(state, {
+      kind: "session.note",
+      note: "compacted",
+      detail: "Context compacted from 224792 to 16161 tokens.",
+    });
+    expect(state.timeline).toEqual([{
+      kind: "note",
+      note: "compacted",
+      text: "Context compacted from 224792 to 16161 tokens.",
+    }]);
+  });
+
+  it("removes a transient compaction row when the turn fails", () => {
+    let state = reduceStream(IDLE, { kind: "turn.start", turnId: "turn_compact" });
+    state = reduceStream(state, {
+      kind: "session.note",
+      note: "compacting",
+      detail: "Context auto-compacting",
+    });
+    state = reduceStream(state, {
+      kind: "turn.end",
+      status: "failed",
+      turnId: "turn_compact",
+    });
+
+    expect(state.timeline).toEqual([]);
+    expect(state.turnActive).toBe(false);
+    expect(state.endStatus).toBe("failed");
+  });
 });
 
 describe("image generation stream state", () => {

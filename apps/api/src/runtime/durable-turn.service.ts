@@ -12,6 +12,7 @@ import {
   type TurnState,
 } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.js";
+import { associateInputFilesInTransaction } from "../files/file-platform.service.js";
 import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.js";
 
 export const DURABLE_TURN_RUNNER_ENABLED = Symbol("DURABLE_TURN_RUNNER_ENABLED");
@@ -825,6 +826,30 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
     });
   }
 
+  async questionContext(tenantId: string, userId: string, questionId: string): Promise<{
+    runId: string;
+    taskId: string;
+    sessionId: string;
+  } | null> {
+    if (!this.enabled) return null;
+    return this.database.withTenant(tenantId, async (executor) => {
+      const rows = await executor.query<{ run_id: string; task_id: string; session_id: string }>(
+        `
+SELECT q.run_id,r.task_id,q.session_id
+FROM turn_questions q
+JOIN turn_runs r ON r.tenant_id=q.tenant_id AND r.id=q.run_id
+JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
+WHERE q.tenant_id=$1::uuid AND q.id=$2::uuid AND t.user_id=$3::uuid
+  AND q.status IN ('pending','answered')
+LIMIT 1
+        `.trim(),
+        [tenantId, questionId, userId],
+      );
+      const row = rows[0];
+      return row ? { runId: row.run_id, taskId: row.task_id, sessionId: row.session_id } : null;
+    });
+  }
+
   async answerQuestion(
     tenantId: string,
     userId: string,
@@ -837,6 +862,13 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
         question: string;
         answer: string;
         selectedOptions?: readonly string[] | undefined;
+        attachments?: ReadonlyArray<{
+          fileId: string;
+          name: string;
+          mediaType: string;
+          size: number;
+          sourceKind?: string | null | undefined;
+        }> | undefined;
         skipped?: boolean | undefined;
       }> | undefined;
     },
@@ -870,7 +902,7 @@ FOR UPDATE OF q,r
         );
         const question = rows[0];
         if (!question) return false;
-        const normalizedAnswer = {
+        const submittedAnswer = {
           answer: answer.answer,
           answerMessageId: answer.answerMessageId ?? null,
           selectedOptions: [...(answer.selectedOptions ?? [])],
@@ -879,31 +911,18 @@ FOR UPDATE OF q,r
               question: item.question,
               answer: item.answer,
               selectedOptions: [...(item.selectedOptions ?? [])],
+              ...(item.attachments?.length ? { attachments: [...item.attachments] } : {}),
               skipped: item.skipped === true,
             })),
           } : {}),
         };
         if (question.status === "answered") {
           const priorAnswer = recordValue(question.answer);
-          return jsonValuesEqual(priorAnswer, normalizedAnswer);
+          return questionAnswersEquivalent(priorAnswer, submittedAnswer);
         }
         if (question.status !== "pending" || question.run_state !== "waiting" || !question.step_id) {
           return false;
         }
-        const responseText = answer.answers?.length
-          ? answer.answers
-              .map((item) => `${item.question}: ${item.skipped ? "Skipped" : item.answer}`)
-              .join("\n")
-          : answer.answer;
-        await transaction.execute(
-          `
-UPDATE turn_questions
-SET status='answered',answer=$3::jsonb,answered_at=now()
-WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
-          `.trim(),
-          [tenantId, questionId, JSON.stringify(normalizedAnswer)],
-        );
-
         const messageRows = await transaction.query<{ id: string }>(
           answer.answerMessageId
             ? `
@@ -934,6 +953,65 @@ VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'user','complete')
             `.trim(),
             [answerMessageId, tenantId, question.session_id, question.task_id],
           );
+        }
+
+        const requestedFileIds = (answer.answers ?? []).flatMap((item) =>
+          (item.attachments ?? []).map((attachment) => attachment.fileId));
+        const resolvedFiles = await associateInputFilesInTransaction(
+          transaction,
+          tenantId,
+          userId,
+          {
+            fileIds: requestedFileIds,
+            taskId: question.task_id,
+            sessionId: question.session_id,
+            messageId: answerMessageId,
+            turnId: question.run_id,
+          },
+        );
+        const filesById = new Map(resolvedFiles.map((file) => [file.fileId, file]));
+        const governedAnswers = answer.answers?.map((item) => ({
+          ...item,
+          ...(item.attachments?.length
+            ? { attachments: item.attachments.map((attachment) => filesById.get(attachment.fileId) ?? attachment) }
+            : {}),
+        }));
+        const normalizedAnswer = {
+          answer: answer.answer,
+          answerMessageId,
+          selectedOptions: [...(answer.selectedOptions ?? [])],
+          ...(governedAnswers ? {
+            answers: governedAnswers.map((item) => ({
+              question: item.question,
+              answer: item.answer,
+              selectedOptions: [...(item.selectedOptions ?? [])],
+              ...(item.attachments?.length ? { attachments: [...item.attachments] } : {}),
+              skipped: item.skipped === true,
+            })),
+          } : {}),
+        };
+        const workspacePath = configuredSandboxWorkspacePath();
+        const responseText = governedAnswers?.length
+          ? governedAnswers
+              .map((item) => {
+                const response = item.skipped ? "Skipped" : item.answer.trim();
+                const files = item.attachments?.length
+                  ? `Attached files:\n${item.attachments.map((attachment) => `- ${workspacePath}/inputs/${attachment.fileId}/${safeQuestionAttachmentName(attachment.name)}`).join("\n")}`
+                  : "";
+                return `${item.question}: ${[response, files].filter(Boolean).join("\n")}`;
+              })
+              .join("\n")
+          : answer.answer;
+        await transaction.execute(
+          `
+UPDATE turn_questions
+SET status='answered',answer=$3::jsonb,answered_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
+          `.trim(),
+          [tenantId, questionId, JSON.stringify(normalizedAnswer)],
+        );
+
+        if (!messageRows[0]) {
           await transaction.execute(
             `
 INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
@@ -941,6 +1019,15 @@ VALUES ($1::uuid,$2::uuid,'text',$3::jsonb,0)
             `.trim(),
             [tenantId, answerMessageId, JSON.stringify(responseText)],
           );
+          for (const [index, attachment] of resolvedFiles.entries()) {
+            await transaction.execute(
+              `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'attachment',$3::jsonb,$4)
+              `.trim(),
+              [tenantId, answerMessageId, JSON.stringify(messageAttachmentContent(attachment)), index + 1],
+            );
+          }
         }
 
         const entryId = randomUUID();
@@ -968,9 +1055,18 @@ WHERE tenant_id=$1::uuid AND session_id=$2::uuid
           "UPDATE session_entries SET is_leaf_marker=false WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true",
           [tenantId, question.session_id],
         );
+        const artifacts = (governedAnswers ?? []).flatMap((item) => (item.attachments ?? []).map((attachment) => ({
+          fileId: attachment.fileId,
+          name: attachment.name,
+          mediaType: attachment.mediaType,
+          size: attachment.size,
+          path: `${workspacePath}/inputs/${attachment.fileId}/${safeQuestionAttachmentName(attachment.name)}`,
+          source: "question-answer",
+        })));
         const toolResult = {
-          questions: answer.answers ?? [{ question: question.question, answer: answer.answer, selectedOptions: answer.selectedOptions ?? [] }],
+          questions: governedAnswers ?? [{ question: question.question, answer: answer.answer, selectedOptions: answer.selectedOptions ?? [] }],
           ...normalizedAnswer,
+          ...(artifacts.length > 0 ? { artifacts } : {}),
         };
         const payload = {
           type: "message",
@@ -2590,6 +2686,65 @@ VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb)
 
 function iso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
+}
+
+function configuredSandboxWorkspacePath(): string {
+  const normalized = (process.env.BERRY_SANDBOX_CWD?.trim() || "/workspace")
+    .replaceAll("\\", "/")
+    .replace(/\/+$/, "");
+  return normalized || "/workspace";
+}
+
+function safeQuestionAttachmentName(value: string): string {
+  const basename = value.trim().replaceAll("\\", "/").split("/").at(-1) ?? "";
+  const normalized = basename
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/[^\p{L}\p{N}._() -]+/gu, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+  return normalized && normalized !== "." && normalized !== ".." ? normalized : "attachment";
+}
+
+function questionAnswersEquivalent(
+  prior: Record<string, unknown> | null,
+  submitted: Record<string, unknown>,
+): boolean {
+  const identity = (value: Record<string, unknown> | null, includeMessageId: boolean) => {
+    const root = value ?? {};
+    return {
+    answer: typeof root.answer === "string" ? root.answer : "",
+    ...(includeMessageId ? { answerMessageId: root.answerMessageId ?? null } : {}),
+    selectedOptions: stringArray(root.selectedOptions),
+    answers: Array.isArray(root.answers)
+      ? root.answers.map((candidate) => {
+          const item = recordValue(candidate) ?? {};
+          return {
+            question: typeof item.question === "string" ? item.question : "",
+            answer: typeof item.answer === "string" ? item.answer : "",
+            selectedOptions: stringArray(item.selectedOptions),
+            skipped: item.skipped === true,
+            attachments: Array.isArray(item.attachments)
+              ? item.attachments.map((attachment) => {
+                  const file = recordValue(attachment) ?? {};
+                  return typeof file.fileId === "string" ? file.fileId : "";
+                })
+              : [],
+          };
+        })
+      : [],
+    };
+  };
+  const includeMessageId = submitted.answerMessageId !== null
+    && submitted.answerMessageId !== undefined;
+  return jsonValuesEqual(identity(prior, includeMessageId), identity(submitted, includeMessageId));
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 interface EventRow {

@@ -1,7 +1,7 @@
 import * as React from "react";
 import { ArrowUp, Play, Plus, Square } from "lucide-react";
 import { type BerryApiClient, type ImageGenerationCapabilityStatus } from "@berry/api-client";
-import { messageAttachmentContent, parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type Workspace } from "@berry/shared";
+import { parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
 import { Button } from "@berry/desktop-ui/components/ui/button";
@@ -365,20 +365,25 @@ export function Composer({
     if (!question || !activeTask?.activeSessionId || !client) throw new Error("This question is no longer available. Refresh and try again.");
     const sessionId = activeTask.activeSessionId;
     const transcript = questionAnswerTranscript(answers);
+    const answerAttachments = answers.flatMap((answer) => answer.attachments);
     const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
-    const optimisticMessageId = onUserMessage(transcript, sessionId, activeTask.id, undefined, answerMessageId);
-    const persistedMessage = await client.appendMessage(sessionId, {
-      messageId: answerMessageId,
-      role: "user",
-      parts: [{ kind: "text", content: transcript }],
-    });
-    if (optimisticMessageId) onUserMessagePersisted(sessionId, optimisticMessageId, persistedMessage);
-    await client.answerQuestion(question.questionId, {
+    const result = await client.answerQuestion(question.questionId, {
       answer: questionToolAnswer(answers),
       answerMessageId,
       selectedOptions: answers.flatMap((item) => item.selectedOptions),
       answers,
     });
+    if (!result.ok) throw new Error("This question was already answered or is no longer active.");
+    const optimisticMessageId = onUserMessage(
+      transcript,
+      sessionId,
+      activeTask.id,
+      answerAttachments,
+      answerMessageId,
+    );
+    if (optimisticMessageId && result.message) {
+      onUserMessagePersisted(sessionId, optimisticMessageId, result.message);
+    }
   }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
 
   const continueInterruptedTurn = React.useCallback(async () => {
@@ -593,6 +598,24 @@ export function Composer({
     setPendingUploads((current) => current.filter((item) => item.id !== upload.id));
   }, []);
 
+  const uploadQuestionFiles = React.useCallback(async (files: readonly File[]): Promise<ComposerQuestionAnswer["attachments"]> => {
+    if (!client || !activeTask?.activeSessionId) throw new Error("This question is no longer available. Refresh and try again.");
+    if (files.length > 100) throw new Error("Attach no more than 100 files to one answer.");
+    const stored = await mapWithConcurrency(files, 2, async (file) => client.uploadFile(file, {
+      taskId: activeTask.id,
+      sessionId: activeTask.activeSessionId!,
+    }));
+    return stored.map((file) => ({
+      id: file.id,
+      fileId: file.id,
+      name: file.name,
+      mediaType: file.mediaType,
+      size: file.size,
+      sourceKind: "object-storage",
+      previewUrl: file.previewUrl,
+    }));
+  }, [activeTask, client]);
+
   const handlePaste = React.useCallback((event: ClipboardEvent) => {
     const files = filesFromDataTransfer(event.clipboardData);
     if (files.length > 0) {
@@ -734,7 +757,7 @@ export function Composer({
         before={
           <>
             <MentionMenu controller={mentions} />
-            {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} /> : null}
+            {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} onUploadFiles={uploadQuestionFiles} /> : null}
             {variant === "thread" && (planProgress || queuedFollowUps.length > 0) ? (
               <div className="berry-thread-composer-stack">
                 {planProgress ? <PlanProgressPill plan={planProgress} /> : null}

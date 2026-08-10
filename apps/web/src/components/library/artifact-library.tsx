@@ -106,8 +106,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
   }, [beginRequest, client, isCurrentRequest, loadingMore, nextCursor, search, selectedProjectId]);
   const images = items.filter((item) => item.mediaType.startsWith("image/"));
   const documents = items.filter((item) => !item.mediaType.startsWith("image/"));
-  const visibleImages = images;
-  const visibleDocuments = documents;
+  const visibleItems = libraryItemsForTab(items, tab);
   const libraryImageViews = React.useMemo<GeneratedImageView[]>(() => images.map((item) => ({
     id: item.id,
     src: item.previewUrl,
@@ -180,34 +179,24 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
         </div>
       ) : null}
       {state === "error" ? <LibraryStatus title="The library could not be loaded" detail={error} action={<Button size="sm" onClick={() => void refresh()}>Try again</Button>} /> : null}
-      {state === "ready" && items.length === 0 ? <LibraryStatus title={search ? "No matching files" : tab === "all" ? "No files yet" : tab === "images" ? "No images yet" : "No documents yet"} detail={search ? "Try a different file name or clear the search." : "Upload a file in chat or ask Berry to create one. It will show up here."} /> : null}
+      {state === "ready" && visibleItems.length === 0 ? <LibraryStatus title={search ? "No matching files" : tab === "all" ? "No files yet" : tab === "images" ? "No images yet" : "No documents yet"} detail={search ? "Try a different file name or clear the search." : "Upload a file in chat or ask Berry to create one. It will show up here."} /> : null}
 
-      {state === "ready" && (tab === "all" || tab === "images") && visibleImages.length > 0 ? (
-        <div className="berry-library-image-grid">
-          {visibleImages.map((item) => (
-            <article key={item.id} className="berry-library-image-card">
-              <button type="button" className="berry-library-image-card-open" onClick={() => setSelected(item)}>
-                <div className="berry-library-image-preview"><img src={item.previewUrl} alt={item.name} loading="lazy" /></div>
+      {state === "ready" && visibleItems.length > 0 ? (
+        <div className="berry-library-grid">
+          {visibleItems.map((item) => {
+            const isImage = item.mediaType.startsWith("image/");
+            return (
+            <article key={item.id} className="berry-library-item-card">
+              <button type="button" className="berry-library-item-open" onClick={() => setSelected(item)}>
+                <div className="berry-library-item-preview">
+                  {isImage ? <img src={item.previewUrl} alt={item.name} loading="lazy" /> : <FileTypeIcon path={item.name} className="size-11" />}
+                </div>
                 <ArtifactMeta item={item} />
               </button>
               <Button variant="ghost" size="icon-sm" className="berry-library-delete" onClick={() => setPendingDelete(item)} aria-label={`Remove ${item.name} from Library`} title={`Remove ${item.name} from Library`}><Trash2 /></Button>
             </article>
-          ))}
-        </div>
-      ) : null}
-
-      {state === "ready" && (tab === "all" || tab === "documents") && visibleDocuments.length > 0 ? (
-        <div className={`berry-library-document-list${tab === "all" && visibleImages.length > 0 ? " berry-library-all-documents" : ""}`}>
-          {visibleDocuments.map((item) => (
-            <article key={item.id} className="berry-library-document-row">
-              <button type="button" className="berry-library-document-open" onClick={() => setSelected(item)}>
-                <span className="berry-library-file-icon"><FileTypeIcon path={item.name} className="size-10" /></span>
-                <ArtifactMeta item={item} />
-                <span className="berry-library-open">Open</span>
-              </button>
-              <Button variant="ghost" size="icon-sm" onClick={() => setPendingDelete(item)} aria-label={`Remove ${item.name} from Library`} title={`Remove ${item.name} from Library`}><Trash2 /></Button>
-            </article>
-          ))}
+            );
+          })}
         </div>
       ) : null}
       {state === "ready" && nextCursor ? <Button className="berry-library-load-more" variant="outline" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more files"}</Button> : null}
@@ -242,6 +231,12 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
 
 export function projectFilterWorkspaces(workspaces: readonly Workspace[]): Workspace[] {
   return workspaces.filter((workspace) => workspace.workspaceKind === "project");
+}
+
+export function libraryItemsForTab(items: readonly StoredFile[], tab: ArtifactLibraryTab): StoredFile[] {
+  if (tab === "images") return items.filter((item) => item.mediaType.startsWith("image/"));
+  if (tab === "documents") return items.filter((item) => !item.mediaType.startsWith("image/"));
+  return [...items];
 }
 
 function useDebouncedValue(value: string, delayMs: number): string {

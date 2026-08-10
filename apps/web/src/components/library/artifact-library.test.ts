@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Workspace } from "@berry/shared";
-import { projectFilterWorkspaces } from "./artifact-library";
+import type { StoredFile, Workspace } from "@berry/shared";
+import { libraryItemsForTab, projectFilterWorkspaces } from "./artifact-library";
 
 const workspace = (id: string, workspaceKind: Workspace["workspaceKind"]): Workspace => ({
 	id,
@@ -21,5 +21,17 @@ describe("projectFilterWorkspaces", () => {
 		expect(projectFilterWorkspaces([workspace("project", "project"), workspace("general", "general")])).toEqual([
 			workspace("project", "project"),
 		]);
+	});
+});
+
+describe("libraryItemsForTab", () => {
+	it("preserves the API order when images and documents share All", () => {
+		const files = [
+			{ id: "document", mediaType: "application/pdf" },
+			{ id: "image", mediaType: "image/png" },
+			{ id: "sheet", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+		] as StoredFile[];
+		expect(libraryItemsForTab(files, "all").map((file) => file.id)).toEqual(["document", "image", "sheet"]);
+		expect(libraryItemsForTab(files, "images").map((file) => file.id)).toEqual(["image"]);
 	});
 });

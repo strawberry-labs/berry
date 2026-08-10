@@ -18,6 +18,7 @@ import {
   type OrgModelPolicy,
 } from "@berry/shared";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
+import type { BerryModelProviderInfo } from "@berry/local-agent";
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
 
 export const MODEL_GOVERNANCE_SERVICE = Symbol("MODEL_GOVERNANCE_SERVICE");
@@ -63,6 +64,84 @@ export interface ModelGovernanceRepository {
 
 export class ModelGovernanceService {
   constructor(private readonly repository: ModelGovernanceRepository) {}
+
+  async synchronizeRuntimeCatalog(tenantId: string, provider: BerryModelProviderInfo): Promise<void> {
+    const runtimeModels = provider.models ?? [];
+    if (runtimeModels.length === 0) return;
+    const [policies, defaults] = await Promise.all([
+      this.repository.listPolicies(tenantId),
+      this.repository.listDefaults(tenantId),
+    ]);
+    const policiesByModel = new Map(
+      policies
+        .filter((policy) => policy.providerId === provider.id)
+        .map((policy) => [policy.model, policy]),
+    );
+
+    for (const model of runtimeModels) {
+      const existing = policiesByModel.get(model.id);
+      const metadata = {
+        ...jsonObject(existing?.metadata),
+        source: "runtime-catalog",
+      };
+      const desired = {
+        tenantId,
+        providerId: provider.id,
+        model: model.id,
+        displayName: model.name ?? model.id,
+        presetId: provider.kind === "berry-router" ? "berry-router" : existing?.presetId ?? null,
+        apiType: model.apiType ?? provider.apiType ?? existing?.apiType ?? null,
+        capabilities: model.capabilities ?? existing?.capabilities ?? {},
+        status: existing?.status ?? "allowed" as const,
+        enforce: existing?.enforce ?? false,
+        modeAllow: existing?.modeAllow ?? ["chat", "code"] as ConversationKind[],
+        metadata,
+      };
+      if (!existing || !runtimePolicyMatches(existing, desired)) {
+        await this.repository.upsertPolicy(desired);
+      }
+    }
+
+    const runtimeModelIds = new Set(runtimeModels.map((model) => model.id));
+    const staleAlias = policiesByModel.get("berry/auto");
+    if (!runtimeModelIds.has("berry/auto") && staleAlias) {
+      const desired = {
+        tenantId,
+        providerId: provider.id,
+        model: staleAlias.model,
+        displayName: staleAlias.displayName,
+        presetId: staleAlias.presetId,
+        apiType: staleAlias.apiType,
+        capabilities: staleAlias.capabilities,
+        status: "blocked" as const,
+        enforce: staleAlias.enforce,
+        modeAllow: staleAlias.modeAllow,
+        metadata: {
+          ...jsonObject(staleAlias.metadata),
+          source: "runtime-catalog",
+          retiredReason: "not-in-runtime-catalog",
+        },
+      };
+      if (!runtimePolicyMatches(staleAlias, desired)) {
+        await this.repository.upsertPolicy(desired);
+      }
+    }
+
+    if (runtimeModelIds.has("berry/auto")) return;
+    const runtimeDefault = runtimeModelIds.has(provider.defaultModel)
+      ? provider.defaultModel
+      : runtimeModels[0]!.id;
+    for (const modelDefault of defaults) {
+      if (modelDefault.providerId !== provider.id || modelDefault.model !== "berry/auto") continue;
+      await this.repository.upsertDefault({
+        tenantId,
+        mode: modelDefault.mode,
+        providerId: provider.id,
+        model: runtimeDefault,
+        enforce: modelDefault.enforce,
+      });
+    }
+  }
 
   listProviders(tenantId: string) {
     return this.repository.listProviders(tenantId);
@@ -496,6 +575,37 @@ function decision(input: { tenantId: string; mode: ConversationKind; providerId?
 
 function comparePolicy(left: OrgModelPolicy, right: OrgModelPolicy): number {
   return left.providerId.localeCompare(right.providerId) || left.model.localeCompare(right.model);
+}
+
+function jsonObject(value: JsonValue | undefined): Record<string, JsonValue> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, JsonValue>
+    : {};
+}
+
+function runtimePolicyMatches(
+  existing: OrgModelPolicy,
+  desired: Omit<UpsertModelPolicyInput, "tenantId"> & { tenantId: string },
+): boolean {
+  return existing.displayName === (desired.displayName ?? null)
+    && existing.presetId === (desired.presetId ?? null)
+    && existing.apiType === (desired.apiType ?? null)
+    && existing.status === desired.status
+    && existing.enforce === desired.enforce
+    && canonicalJson(existing.capabilities) === canonicalJson(desired.capabilities)
+    && canonicalJson(existing.modeAllow) === canonicalJson(desired.modeAllow)
+    && canonicalJson(existing.metadata) === canonicalJson(desired.metadata);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function compareAccessRule(left: OrgAiAccessRule, right: OrgAiAccessRule): number {

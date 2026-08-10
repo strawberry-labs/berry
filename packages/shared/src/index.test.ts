@@ -72,6 +72,7 @@ describe("AgentStreamEventSchema", () => {
         openWorld: true,
       },
       { kind: "usage", inputTokens: 100, outputTokens: 25, model: "berry/router-auto" },
+      { kind: "session.note", note: "compacting", detail: "Context auto-compacting" },
       { kind: "session.note", note: "compacted" },
       { kind: "mode.changed", mode: "code", source: "classifier", reason: "Repository inspection requested", applied: true, pinnedByUser: false },
       { kind: "error", message: "provider unavailable" },

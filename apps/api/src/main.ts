@@ -234,6 +234,7 @@ export function createApiMainModule(env: NodeJS.ProcessEnv = process.env): Dynam
           provider: contractProvider,
           repository: new PostgresSandboxWorkspaceRepository(database),
           image: env.BERRY_SANDBOX_IMAGE ?? "node:22-bookworm",
+          root: env.BERRY_SANDBOX_CWD ?? "/workspace",
           ttlSeconds: sandboxTtlSeconds(env),
         }) },
         personalCapabilities: { useValue: personalCapabilities },

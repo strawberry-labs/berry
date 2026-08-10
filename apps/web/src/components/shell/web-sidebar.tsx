@@ -3,6 +3,7 @@ import { DollarSign, LogOut } from "lucide-react";
 import type { AllowanceBalance, OrgPermission, Task, Workspace } from "@berry/shared";
 import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { Button } from "@berry/desktop-ui/components/ui/button";
+import { Avatar, AvatarFallback, AvatarImage } from "@berry/desktop-ui/components/ui/avatar";
 import { Kbd } from "@berry/desktop-ui/components/ui/kbd";
 import {
   AlertDialog,
@@ -173,11 +174,14 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
           <Popover onOpenChange={(open) => { if (open) onRefreshAllowance(); }}>
             <PopoverTrigger asChild>
               <button type="button" className="berry-connect-button flex h-11 min-w-0 flex-1 items-center gap-3 px-2 text-left" aria-label="Open account and allowance">
-                <span className="berry-connect-avatar flex size-8 shrink-0 items-center justify-center rounded-full p-1"><DeploymentBrandLogo className="size-full" alt="" /></span>
+                <Avatar size="sm" className="berry-connect-avatar">
+                  {user?.image ? <AvatarImage src={user.image} alt="" className="object-cover" /> : null}
+                  <AvatarFallback className="bg-[var(--berry-accent-soft)] font-semibold text-[var(--berry-text-primary)]">{accountAvatarInitial(user)}</AvatarFallback>
+                </Avatar>
                 <span className="min-w-0 truncate text-sm font-semibold">{user?.name || user?.email || "Berry Cloud"}</span>
               </button>
             </PopoverTrigger>
-            <PopoverContent side="top" align="start" sideOffset={8} className="w-72 p-3">
+            <PopoverContent side="top" align="start" sideOffset={8} collisionPadding={8} className="w-60 max-w-[calc(100vw-1rem)] p-3">
               <div className="grid gap-3">
                 <div className="min-w-0">
                   <strong className="block truncate text-sm">{user?.name || "Berry account"}</strong>
@@ -232,6 +236,10 @@ export function allowanceProgress(allowance: AllowanceBalance): number {
   if (!allowance.effectiveLimitMicros || allowance.effectiveLimitMicros === "0") return 0;
   const consumed = Number(allowance.usedMicros) + Number(allowance.reservedMicros);
   return Math.min(100, (consumed / Number(allowance.effectiveLimitMicros)) * 100);
+}
+
+export function accountAvatarInitial(user: Pick<SignedInUser, "name" | "email"> | null): string {
+  return (user?.name?.trim()[0] || user?.email?.trim()[0] || "?").toUpperCase();
 }
 
 export function formatAllowanceResetDate(value: string): string {

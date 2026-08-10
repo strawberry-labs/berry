@@ -614,7 +614,9 @@ describe("SandboxContinuityManager", () => {
     const provider = {
       kind: "e2b",
       create: vi.fn(),
-      exec: vi.fn(),
+      exec: async function* () {
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
       files: {
         read: vi.fn(async (input: { path: string }) => ({
           path: input.path,
@@ -658,7 +660,7 @@ describe("SandboxContinuityManager", () => {
       put: vi.fn(),
       putArtifact: vi.fn(),
       get: vi.fn(),
-      getSource: vi.fn(async () => attached),
+      getSource: vi.fn(async (key: string) => key.endsWith("brief.pdf") ? new Uint8Array(5) : attached),
     } satisfies SandboxSnapshotObjectStore;
     const manager = new SandboxContinuityManager(provider, repository, objects, {
       image: "berry-sandbox",
@@ -692,7 +694,9 @@ describe("SandboxContinuityManager", () => {
       path: "/workspace/outputs/chart.png",
       encoding: "base64",
     });
-    expect(objects.getSource).toHaveBeenCalledOnce();
+    // The existing sandbox is re-staged after a worker handoff, then the image
+    // is read once more for model vision content.
+    expect(objects.getSource).toHaveBeenCalledTimes(3);
     expect(objects.getSource).toHaveBeenCalledWith(
       "artifacts/tenants/t/reference.png",
       "reference-version-7",
@@ -1027,6 +1031,7 @@ describe("SandboxContinuityManager", () => {
 
   it("stages message-associated input files before the first tool runs", async () => {
     const staged = new Map<string, Uint8Array[]>();
+    const execInputs: Array<{ command: string[]; stdin?: string; cwd?: string }> = [];
     const provider = {
       kind: "e2b",
       create: vi.fn(async () => ({
@@ -1034,7 +1039,8 @@ describe("SandboxContinuityManager", () => {
         provider: "e2b",
         status: "running",
       })),
-      exec: async function* (input: { command: string[]; stdin?: string }) {
+      exec: async function* (input: { command: string[]; stdin?: string; cwd?: string }) {
+        execInputs.push(input);
         if (input.command[0] === "sh" && input.command[2]?.includes("base64 -d")) {
           const path = input.command[4]!;
           const chunks = staged.get(path) ?? [];
@@ -1086,22 +1092,73 @@ describe("SandboxContinuityManager", () => {
     } satisfies SandboxSnapshotObjectStore;
     const manager = new SandboxContinuityManager(provider, repository, objects, {
       image: "berry-sandbox",
+      cwd: "/home/user/workspace",
     });
 
-    const result = await manager.execute(snapshot(), listFilesStep());
+    const result = await manager.execute(snapshot(), toolStep("list_files", {
+      path: "/home/user/workspace",
+      recursive: true,
+    }));
 
     expect(objects.streamSource).toHaveBeenCalledWith(
       "artifacts/tenants/t/files/candidate.pdf",
       350 * 1024 * 1024,
       undefined,
     );
-    const path = "/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf";
+    const path = "/home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf";
+    expect(execInputs[0]).toMatchObject({
+      command: ["mkdir", "-p", "/home/user/workspace/inputs/00000000-0000-7000-8000-000000000099"],
+      cwd: "/home/user/workspace",
+    });
     const stagedBytes = Buffer.concat(staged.get(path)!.map((chunk) => Buffer.from(chunk)));
     expect(stagedBytes).toHaveLength((256 * 1024) + 2);
     expect(stagedBytes.subarray(-2)).toEqual(Buffer.from([2, 3]));
     expect(result.output).toMatchObject({
       entries: [expect.objectContaining({ path })],
     });
+  });
+
+  it("preserves sandbox stderr when attachment directory preparation fails", async () => {
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-1", provider: "e2b", status: "running" })),
+      exec: async function* () {
+        yield { kind: "stderr", data: "mkdir: cannot create directory: Permission denied\n" };
+        yield { kind: "exit", exit_code: 1, signal: null };
+      },
+      files: { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => [{
+        fileId: "00000000-0000-7000-8000-000000000099",
+        name: "Pasted text.txt",
+        mediaType: "text/plain",
+        sizeBytes: 4,
+        objectKey: "artifacts/pasted.txt",
+      }]),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(async () => new Uint8Array([1, 2, 3, 4])),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      cwd: "/home/user/workspace",
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("list_files", {
+      path: "/home/user/workspace",
+    }))).rejects.toThrow(
+      "Unable to prepare the sandbox directory for Pasted text.txt: mkdir: cannot create directory: Permission denied",
+    );
   });
 
   it("reuses the previous live sandbox for a follow-up turn in the same session", async () => {
@@ -1213,8 +1270,9 @@ describe("SandboxContinuityManager", () => {
 
     expect(query).toContain("u.status='completed'");
     expect(query).toContain("a.session_id=r.session_id");
-    expect(query).toContain("f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact')");
-    expect(query).toContain("f.status='available'");
+    expect(query).toContain("a.turn_id=r.id::text");
+    expect(query).toContain("f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact','connector_import')");
+    expect(query).toContain("f.origin='connector_import' AND f.status='processing'");
   });
 
   it("loads previously published output paths and hashes for session deduplication", async () => {

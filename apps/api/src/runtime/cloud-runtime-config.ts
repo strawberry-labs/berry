@@ -60,6 +60,7 @@ interface CloudImageGenerationConfig {
 
 export interface CloudRuntimeConfig {
   managed: boolean;
+  workspacePath: string;
   promptCacheEnabled: boolean;
   provider: BerryModelProviderInfo | null;
   apiKey: string | undefined;
@@ -103,10 +104,14 @@ export class CloudRuntimeConfigService {
           model: request.model,
         });
         if (organizationProvider) {
+          const provider = withAuthoritativeRuntimeCatalog(
+            organizationProvider.provider,
+            this.config.provider,
+          );
           return {
             provider: this.config.promptCacheEnabled
-              ? organizationProvider.provider
-              : withoutPromptCaching(organizationProvider.provider),
+              ? provider
+              : withoutPromptCaching(provider),
             apiKey: organizationProvider.apiKey,
             ...(organizationProvider.credentialRef ? { credentialRef: organizationProvider.credentialRef } : {}),
             mcpServers: this.config.mcpServers,
@@ -153,7 +158,10 @@ export class CloudRuntimeConfigService {
     let provider = this.config.provider;
     if (this.organizationProviders) {
       try {
-        provider = (await this.organizationProviders.resolve(tenantId))?.provider ?? provider;
+        const organizationProvider = (await this.organizationProviders.resolve(tenantId))?.provider;
+        provider = organizationProvider
+          ? withAuthoritativeRuntimeCatalog(organizationProvider, provider)
+          : provider;
       } catch (cause) {
         throw new ServiceUnavailableException(
           cause instanceof Error ? cause.message : "Organization provider catalog is unavailable",
@@ -271,6 +279,23 @@ export class CloudRuntimeConfigService {
   }
 }
 
+function withAuthoritativeRuntimeCatalog(
+  organizationProvider: BerryModelProviderInfo,
+  runtimeProvider: BerryModelProviderInfo | null,
+): BerryModelProviderInfo {
+  if (!runtimeProvider || runtimeProvider.id !== organizationProvider.id) {
+    return organizationProvider;
+  }
+  const models = runtimeProvider.models ?? organizationProvider.models;
+  return {
+    ...organizationProvider,
+    name: runtimeProvider.name,
+    kind: runtimeProvider.kind,
+    defaultModel: runtimeProvider.defaultModel,
+    ...(models ? { models } : {}),
+  };
+}
+
 function requestProviderId(value: unknown): string | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const id = (value as Record<string, unknown>).id;
@@ -358,6 +383,7 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
   const imageCostMicros = imageModel ? nonnegativeIntegerString(env.BERRY_ROUTER_IMAGE_COST_MICROS, live) : null;
   return {
     managed: provider !== null,
+    workspacePath: absoluteWorkspacePath(env.BERRY_SANDBOX_CWD),
     promptCacheEnabled: env.BERRY_PROMPT_CACHE_ENABLED?.trim().toLowerCase() !== "false",
     provider,
     apiKey: first(env.BERRY_ROUTER_API_KEY, env.BERRY_INFERENCE_API_KEY),
@@ -380,6 +406,15 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
       : null,
     providerMaxOutputTokens: positiveInteger(env.BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS) ?? (live ? 16_384 : undefined),
   };
+}
+
+function absoluteWorkspacePath(value: string | undefined): string {
+  const normalized = (value?.trim() || "/workspace").replaceAll("\\", "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  if (!normalized.startsWith("/") || parts.length === 0 || parts.includes(".") || parts.includes("..")) {
+    throw new Error("BERRY_SANDBOX_CWD must be an absolute path without traversal segments");
+  }
+  return `/${parts.join("/")}`;
 }
 
 function parseCompletionTransport(value: string | undefined): "stream" | "buffered" {

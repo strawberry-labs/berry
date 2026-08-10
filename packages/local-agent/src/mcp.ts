@@ -152,14 +152,17 @@ export function validatedRemoteMcpUrl(rawUrl: string): URL {
   }
 }
 
-function contentToToolResult(content: unknown): AgentToolResult<Record<string, unknown>> {
+function contentToToolResult(content: unknown, structuredContent?: unknown): AgentToolResult<Record<string, unknown>> {
   const parts = Array.isArray(content) ? content : [];
   const texts = parts
     .filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as { type?: string }).type === "text")
     .map((part) => part.text);
   return {
     content: [{ type: "text", text: texts.join("\n") || "(no output)" }],
-    details: { raw: parts as unknown as Record<string, unknown> } as Record<string, unknown>,
+    details: {
+      raw: parts as unknown as Record<string, unknown>,
+      ...(structuredContent !== undefined ? { structuredContent } : {}),
+    } as Record<string, unknown>,
   };
 }
 
@@ -326,11 +329,11 @@ export class McpToolSource {
   async #call(client: Client, name: string, args: Record<string, unknown>): Promise<AgentToolResult<Record<string, unknown>>> {
     const result = await client.callTool({ name, arguments: args });
     if (result.isError) {
-      const failure = contentToToolResult(result.content);
+      const failure = contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
       const text = failure.content[0];
       throw new Error(text && text.type === "text" ? text.text : "MCP tool failed");
     }
-    return contentToToolResult(result.content);
+    return contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
   }
 
   listTools(): AgentTool[] {

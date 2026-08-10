@@ -1,13 +1,17 @@
 import * as React from "react";
-import { Download, X } from "lucide-react";
+import { Download, Filter } from "lucide-react";
 import type { UsageAnalyticsQuery, UsageRequestDetail } from "@berry/shared";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@berry/desktop-ui/components/ui/popover";
 import {
   AsyncState,
   Button,
   DataTable,
   DetailDrawer,
   FormSelect,
-  Input,
   ManagementPage,
   MetricGrid,
   Section,
@@ -23,6 +27,14 @@ import {
   OutcomeBars,
 } from "./management-charts";
 import { useResource, type ManagementScreenProps } from "./management-context";
+import {
+  calculateCacheMetric,
+  inferUsageRangePreset,
+  UsageRangeControl,
+  usageRangeForPreset,
+  type UsageDateRange,
+  type UsageRangePreset,
+} from "./usage-controls";
 
 const VIEWS = [
   "overview",
@@ -59,12 +71,15 @@ export function AnalyticsScreen({
   const [view, setView] = React.useState<View>(
     VIEWS.find((item) => item === search.get("view")) ?? "overview",
   );
-  const [range, setRange] = React.useState({
-    from: (
-      search.get("from") ?? new Date(Date.now() - 30 * 86_400_000).toISOString()
-    ).slice(0, 10),
-    to: (search.get("to") ?? new Date().toISOString()).slice(0, 10),
-  });
+  const initialRange = React.useMemo<UsageDateRange>(() => {
+    const preset = usageRangeForPreset("month");
+    return {
+      from: (search.get("from") ?? preset.from).slice(0, 10),
+      to: (search.get("to") ?? preset.to).slice(0, 10),
+    };
+  }, [search]);
+  const [range, setRange] = React.useState(initialRange);
+  const [rangePreset, setRangePreset] = React.useState<UsageRangePreset>(() => inferUsageRangePreset(initialRange));
   const [filters, setFilters] = React.useState<UsageFilters>({
     memberId: search.get("memberId") ?? "",
     departmentId: search.get("departmentId") ?? "",
@@ -82,6 +97,12 @@ export function AnalyticsScreen({
     limit: 50,
   } as UsageAnalyticsQuery;
   const queryKey = JSON.stringify(query);
+  const hasUsageFilters = Object.values(filters).some(Boolean);
+  const facetQuery: UsageAnalyticsQuery = {
+    from: query.from,
+    to: query.to,
+    limit: 50,
+  };
   const analytics = useResource(
     `analytics:${tenantId}:${queryKey}`,
     async () =>
@@ -90,6 +111,13 @@ export function AnalyticsScreen({
         : demoAnalytics(
             config.usageDashboards.find((item) => item.tenantId === tenantId),
           ),
+    null as any,
+  );
+  const facetAnalytics = useResource(
+    `analytics-facets:${tenantId}:${range.from}:${range.to}:${hasUsageFilters}`,
+    async () => client && hasUsageFilters
+      ? client.usageAnalytics(tenantId, facetQuery)
+      : null,
     null as any,
   );
   const requests = useResource(
@@ -136,9 +164,6 @@ export function AnalyticsScreen({
     }
     history.replaceState(null, "", `${location.pathname}?${params}`);
   }
-  function updateFilter(key: keyof UsageFilters, value: string) {
-    update(view, range, { ...filters, [key]: value === "all" ? "" : value });
-  }
   async function openRequest(requestId: string) {
     if (client) setDetail(await client.usageRequestDetail(tenantId, requestId));
   }
@@ -150,13 +175,15 @@ export function AnalyticsScreen({
         0,
       )
     : 0;
-  const cacheHitRate =
-    data && data.performance.cacheEligibleRequests > 0
-      ? data.performance.cacheHitRequests /
-        data.performance.cacheEligibleRequests
-      : null;
+  const cacheMetric = calculateCacheMetric({
+    inputTokens: Number(data?.totals.inputTokens ?? 0),
+    cacheReadTokens: Number(data?.performance.cacheReadTokens ?? 0),
+    cacheEligibleRequests: Number(data?.performance.cacheEligibleRequests ?? 0),
+    cacheHitRequests: Number(data?.performance.cacheHitRequests ?? 0),
+  });
+  const cacheHitRate = cacheMetric.value;
   const [members, departments] = directory.data as [any[], any[]];
-  const hasFilters = Object.values(filters).some(Boolean);
+  const activeFilterCount = Object.values(filters).filter(Boolean).length;
 
   return (
     <ManagementPage
@@ -164,7 +191,25 @@ export function AnalyticsScreen({
       description="Inspect organization spend, tokens, cache behavior, models, people, and individual redacted requests from one filterable view."
       eyebrow="Usage & billing"
       actions={
-        permissions.includes("usage:export") ? (
+        <>
+          <UsageRangeControl
+            preset={rangePreset}
+            range={range}
+            onChange={(nextPreset, nextRange) => {
+              setRangePreset(nextPreset);
+              update(view, nextRange, filters);
+            }}
+          />
+          <UsageFiltersPopover
+            filters={filters}
+            activeCount={activeFilterCount}
+            members={members}
+            departments={departments}
+            data={facetAnalytics.data ?? data}
+            onApply={(nextFilters) => update(view, range, nextFilters)}
+            onClear={() => update(view, range, emptyUsageFilters())}
+          />
+          {permissions.includes("usage:export") ? (
           <Button
             variant="secondary"
             disabled={!client}
@@ -177,7 +222,8 @@ export function AnalyticsScreen({
             <Download />
             Export CSV
           </Button>
-        ) : null
+          ) : null}
+        </>
       }
     >
       <Toolbar>
@@ -198,77 +244,6 @@ export function AnalyticsScreen({
             </Button>
           ))}
         </div>
-        <div className="flex flex-wrap gap-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
-          <label>
-            From
-            <Input
-              type="date"
-              value={range.from}
-              onChange={(event) =>
-                update(view, { ...range, from: event.currentTarget.value })
-              }
-            />
-          </label>
-          <label>
-            To
-            <Input
-              type="date"
-              value={range.to}
-              onChange={(event) =>
-                update(view, { ...range, to: event.currentTarget.value })
-              }
-            />
-          </label>
-        </div>
-      </Toolbar>
-      <Toolbar>
-        <div className="grid flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-6 [&>label]:grid [&>label]:min-w-0 [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
-          <UsageFilter
-            label="Person"
-            value={filters.memberId}
-            onChange={(value) => updateFilter("memberId", value)}
-            options={members.map((member) => ({ value: member.userId, label: member.name || member.email }))}
-          />
-          <UsageFilter
-            label="Department"
-            value={filters.departmentId}
-            onChange={(value) => updateFilter("departmentId", value)}
-            options={departments.map((department) => ({ value: department.id, label: department.name }))}
-          />
-          <UsageFilter
-            label="Provider"
-            value={filters.provider}
-            onChange={(value) => updateFilter("provider", value)}
-            options={breakdownOptions(data?.breakdowns.providers, filters.provider)}
-          />
-          <UsageFilter
-            label="Model"
-            value={filters.model}
-            onChange={(value) => updateFilter("model", value)}
-            options={breakdownOptions(data?.breakdowns.models, filters.model)}
-          />
-          <UsageFilter
-            label="Feature"
-            value={filters.feature}
-            onChange={(value) => updateFilter("feature", value)}
-            options={breakdownOptions(data?.breakdowns.features, filters.feature)}
-          />
-          <UsageFilter
-            label="Status"
-            value={filters.status}
-            onChange={(value) => updateFilter("status", value)}
-            options={breakdownOptions(data?.breakdowns.statuses, filters.status)}
-          />
-        </div>
-        {hasFilters ? (
-          <Button
-            variant="ghost"
-            onClick={() => update(view, range, emptyUsageFilters())}
-          >
-            <X />
-            Clear filters
-          </Button>
-        ) : null}
       </Toolbar>
       <AsyncState
         loading={analytics.loading}
@@ -306,11 +281,12 @@ export function AnalyticsScreen({
                   value: formatNumber(data.performance.cacheWriteTokens),
                 },
                 {
-                  label: "Cache hit rate",
+                  label: cacheMetric.label,
                   value:
                     cacheHitRate == null
                       ? "—"
                       : `${Math.round(cacheHitRate * 100)}%`,
+                  hint: cacheMetric.hint,
                 },
                 {
                   label: "Success rate",
@@ -703,6 +679,120 @@ export function AnalyticsScreen({
         </DetailDrawer>
       ) : null}
     </ManagementPage>
+  );
+}
+
+function UsageFiltersPopover({
+  filters,
+  activeCount,
+  members,
+  departments,
+  data,
+  onApply,
+  onClear,
+}: {
+  filters: UsageFilters;
+  activeCount: number;
+  members: any[];
+  departments: any[];
+  data: any;
+  onApply: (filters: UsageFilters) => void;
+  onClear: () => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [draft, setDraft] = React.useState(filters);
+
+  React.useEffect(() => {
+    if (!open) setDraft(filters);
+  }, [filters, open]);
+
+  const updateDraft = (key: keyof UsageFilters, value: string) => {
+    setDraft((current) => ({ ...current, [key]: value === "all" ? "" : value }));
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button variant="secondary" aria-label={activeCount ? `Filters, ${activeCount} active` : "Filters"}>
+          <Filter />
+          Filters
+          {activeCount ? (
+            <span className="inline-flex size-5 items-center justify-center rounded-full bg-foreground text-[11px] tabular-nums text-background">
+              {activeCount}
+            </span>
+          ) : null}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        collisionPadding={12}
+        className="w-[min(34rem,calc(100vw-1.5rem))] p-0"
+      >
+        <div className="border-b border-border px-4 py-3">
+          <p className="text-sm font-medium text-foreground">Filter organization usage</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">Narrow every metric and report in the current view.</p>
+        </div>
+        <div className="grid gap-3 p-4 sm:grid-cols-2 [&>label]:grid [&>label]:min-w-0 [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground">
+          <UsageFilter
+            label="Person"
+            value={draft.memberId}
+            onChange={(value) => updateDraft("memberId", value)}
+            options={members.map((member) => ({ value: member.userId, label: member.name || member.email }))}
+          />
+          <UsageFilter
+            label="Department"
+            value={draft.departmentId}
+            onChange={(value) => updateDraft("departmentId", value)}
+            options={departments.map((department) => ({ value: department.id, label: department.name }))}
+          />
+          <UsageFilter
+            label="Provider"
+            value={draft.provider}
+            onChange={(value) => updateDraft("provider", value)}
+            options={breakdownOptions(data?.breakdowns.providers, draft.provider)}
+          />
+          <UsageFilter
+            label="Model"
+            value={draft.model}
+            onChange={(value) => updateDraft("model", value)}
+            options={breakdownOptions(data?.breakdowns.models, draft.model)}
+          />
+          <UsageFilter
+            label="Feature"
+            value={draft.feature}
+            onChange={(value) => updateDraft("feature", value)}
+            options={breakdownOptions(data?.breakdowns.features, draft.feature)}
+          />
+          <UsageFilter
+            label="Status"
+            value={draft.status}
+            onChange={(value) => updateDraft("status", value)}
+            options={breakdownOptions(data?.breakdowns.statuses, draft.status)}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-2 border-t border-border px-4 py-3">
+          <Button
+            variant="ghost"
+            disabled={!Object.values(draft).some(Boolean) && activeCount === 0}
+            onClick={() => {
+              setDraft(emptyUsageFilters());
+              onClear();
+              setOpen(false);
+            }}
+          >
+            Clear
+          </Button>
+          <Button
+            onClick={() => {
+              onApply(draft);
+              setOpen(false);
+            }}
+          >
+            Apply filters
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 

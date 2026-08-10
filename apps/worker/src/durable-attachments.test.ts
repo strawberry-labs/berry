@@ -19,4 +19,16 @@ describe("durable attachments", () => {
       "Sandbox path: /workspace/inputs/00000000-0000-7000-8000-000000000001/project brief.pdf",
     );
   });
+
+  it("uses the provider workspace root when it differs from /workspace", () => {
+    const attachment = {
+      fileId: "00000000-0000-7000-8000-000000000001",
+      name: "Pasted text.txt",
+    };
+
+    expect(durableAttachmentPath(attachment, "/home/user/workspace"))
+      .toBe("/home/user/workspace/inputs/00000000-0000-7000-8000-000000000001/Pasted text.txt");
+    expect(durableAttachmentPrompt(attachment, "/home/user/workspace"))
+      .toContain("Sandbox path: /home/user/workspace/inputs/");
+  });
 });

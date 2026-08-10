@@ -108,6 +108,10 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     return this.base.modelContent?.(snapshot) ?? [];
   }
 
+  async stageAssociatedInputFiles(snapshot: DurableTurnSnapshot, fileIds: readonly string[]) {
+    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds) ?? [];
+  }
+
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     return this.base.finalize?.(snapshot) ?? [];
   }

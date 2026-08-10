@@ -25,6 +25,9 @@ import {
   OrganizationProviderHealthCheckError,
   type OrganizationProviderRuntime,
 } from "./organization-provider-runtime.service.ts";
+import { createCloudRuntimeConfigFromEnv } from "../runtime/cloud-runtime-config.ts";
+
+const RUNTIME_CATALOG_TIMESTAMP = new Date().toISOString();
 
 const UpsertModelPolicyRequestSchema = z.object({
   providerId: z.string().trim().min(1),
@@ -70,8 +73,10 @@ export class ModelGovernanceController {
   @Get()
   async listModels(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query("mode") mode?: string, @Query("includeBlocked") includeBlocked?: string) {
     await this.requirePermission(request, tenantId, "models:read");
+    await this.synchronizeRuntimeCatalog(tenantId);
     const parsedMode = mode ? parseConversationKind(mode) : undefined;
-    return z.array(OrgModelPolicySchema).parse(await this.models.listModels(tenantId, { mode: parsedMode, includeBlocked: includeBlocked === "true" }));
+    const stored = await this.models.listModels(tenantId, { mode: parsedMode, includeBlocked: includeBlocked === "true" });
+    return z.array(OrgModelPolicySchema).parse(synchronizeRuntimeModels(tenantId, stored));
   }
 
   @Put("/policies")
@@ -136,6 +141,7 @@ export class ModelGovernanceController {
   @Get("/defaults")
   async listDefaults(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string) {
     await this.requirePermission(request, tenantId, "models:read");
+    await this.synchronizeRuntimeCatalog(tenantId);
     return z.array(OrgModelDefaultSchema).parse(await this.models.listDefaults(tenantId));
   }
 
@@ -160,6 +166,7 @@ export class ModelGovernanceController {
   @Post("/resolve")
   async resolve(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
     await this.requirePermission(request, tenantId, "models:read");
+    await this.synchronizeRuntimeCatalog(tenantId);
     const parsed = parseBody(ResolveModelRequestSchema, body);
     const userId = request.auth?.user.id ?? null;
     const membership = userId ? await this.identity.getMembership(tenantId, userId) : null;
@@ -192,6 +199,11 @@ export class ModelGovernanceController {
     }
   }
 
+  private async synchronizeRuntimeCatalog(tenantId: string): Promise<void> {
+    const provider = runtimeProviderConfiguration()?.provider;
+    if (provider) await this.models.synchronizeRuntimeCatalog(tenantId, provider);
+  }
+
   private async requirePermission(request: AuthenticatedRequest, tenantId: string, permission: OrgPermission): Promise<void> {
     OrgPermissionSchema.parse(permission);
     const allowed = await this.identity.authorize(request.auth!.user.id, tenantId, permission);
@@ -212,7 +224,7 @@ export class ModelProviderController {
   async list(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string) {
     await this.requirePermission(request, tenantId, "models:read");
     return z.array(OrganizationModelProviderSchema).parse(
-      await this.models.listProviders(tenantId),
+      synchronizeRuntimeProviders(tenantId, await this.models.listProviders(tenantId)),
     );
   }
 
@@ -290,6 +302,102 @@ export class ModelProviderController {
     const allowed = await this.identity.authorize(request.auth!.user.id, tenantId, permission);
     if (!allowed) throw new ForbiddenException(`Missing organization permission: ${permission}`);
   }
+}
+
+function runtimeProviderConfiguration(env: NodeJS.ProcessEnv = process.env) {
+  try {
+    return createCloudRuntimeConfigFromEnv(env);
+  } catch {
+    return null;
+  }
+}
+
+export function synchronizeRuntimeProviders(
+  tenantId: string,
+  stored: Array<z.infer<typeof OrganizationModelProviderSchema>>,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const runtime = runtimeProviderConfiguration(env);
+  const provider = runtime?.provider;
+  if (!provider) return stored;
+  const synchronized = OrganizationModelProviderSchema.parse({
+    id: `runtime:${provider.id}`,
+    tenantId,
+    providerId: provider.id,
+    displayName: provider.name,
+    kind: provider.kind,
+    apiType: provider.apiType,
+    baseUrl: provider.baseUrl,
+    endpointPath: provider.endpointPath ?? null,
+    modelsPath: provider.modelsPath ?? null,
+    authType: provider.authType,
+    credentialRef: runtime.credentialRef ?? null,
+    defaultModel: provider.defaultModel,
+    enabled: true,
+    status: "active",
+    lastTestedAt: RUNTIME_CATALOG_TIMESTAMP,
+    createdAt: RUNTIME_CATALOG_TIMESTAMP,
+    updatedAt: RUNTIME_CATALOG_TIMESTAMP,
+  });
+  const existing = stored.find((candidate) => candidate.providerId === provider.id);
+  if (existing?.status === "active") {
+    const merged = OrganizationModelProviderSchema.parse({
+      ...existing,
+      displayName: provider.name,
+      kind: provider.kind,
+      apiType: provider.apiType,
+      baseUrl: provider.baseUrl,
+      endpointPath: provider.endpointPath ?? null,
+      modelsPath: provider.modelsPath ?? null,
+      authType: provider.authType,
+      defaultModel: provider.defaultModel,
+      enabled: true,
+      status: "active",
+    });
+    return [merged, ...stored.filter((candidate) => candidate.providerId !== provider.id)];
+  }
+  return [synchronized, ...stored.filter((candidate) => candidate.providerId !== provider.id)];
+}
+
+export function synchronizeRuntimeModels(
+  tenantId: string,
+  stored: Array<z.infer<typeof OrgModelPolicySchema>>,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const provider = runtimeProviderConfiguration(env)?.provider;
+  if (!provider || !provider.models?.length) return stored;
+  const runtimeIds = new Set(provider.models.map((model) => model.id));
+  const retained = stored.filter((policy) => !(
+    policy.providerId === provider.id
+    && policy.model === "berry/auto"
+    && !runtimeIds.has(policy.model)
+    && typeof policy.metadata === "object"
+    && policy.metadata !== null
+    && !Array.isArray(policy.metadata)
+    && policy.metadata.source === "self-host-seed"
+  ));
+  const byKey = new Map(retained.map((policy) => [`${policy.providerId}:${policy.model}`, policy]));
+  for (const model of provider.models) {
+    const key = `${provider.id}:${model.id}`;
+    const existing = byKey.get(key);
+    byKey.set(key, OrgModelPolicySchema.parse({
+      id: existing?.id ?? `runtime:${provider.id}:${model.id}`,
+      tenantId,
+      providerId: provider.id,
+      model: model.id,
+      displayName: model.name ?? model.id,
+      presetId: provider.kind === "berry-router" ? "berry-router" : existing?.presetId ?? null,
+      apiType: model.apiType ?? provider.apiType,
+      capabilities: model.capabilities ?? existing?.capabilities ?? {},
+      status: existing?.status ?? "allowed",
+      enforce: existing?.enforce ?? false,
+      modeAllow: existing?.modeAllow ?? ["chat", "code"],
+      metadata: { ...(typeof existing?.metadata === "object" && existing.metadata !== null && !Array.isArray(existing.metadata) ? existing.metadata : {}), source: "runtime-catalog" },
+      createdAt: existing?.createdAt ?? RUNTIME_CATALOG_TIMESTAMP,
+      updatedAt: RUNTIME_CATALOG_TIMESTAMP,
+    }));
+  }
+  return [...byKey.values()].sort((left, right) => (left.displayName ?? left.model).localeCompare(right.displayName ?? right.model));
 }
 
 function parseBody<TSchema extends z.ZodTypeAny>(schema: TSchema, body: unknown): z.infer<TSchema> {

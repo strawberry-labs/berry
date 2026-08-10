@@ -30,6 +30,7 @@ describe("cloud runtime configuration", () => {
         content: "Use BerryCrawl and cite every factual claim.",
       }]),
       BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS: "crawl.example.test,registry.npmjs.org",
+      BERRY_SANDBOX_CWD: "/home/user/workspace/",
     });
 
     expect(config.provider).toMatchObject({
@@ -38,6 +39,7 @@ describe("cloud runtime configuration", () => {
       defaultModel: "kimi-2.6",
     });
     expect(config.apiKey).toBe("router-secret");
+    expect(config.workspacePath).toBe("/home/user/workspace");
     expect(config.mcpServers[0]).toMatchObject({
       credential: "crawl-secret",
       credentialKey: "env:BERRYCRAWL_API_KEY",
@@ -88,6 +90,35 @@ describe("cloud runtime configuration", () => {
 
     const resolved = await service.resolve(SELF_HOST_TENANT_ID, {});
     expect(resolved.provider.models?.[0]?.capabilities?.promptCaching).toBeUndefined();
+  });
+
+  it("uses the deployment model catalog over stale organization policies", async () => {
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "kimi-2.6",
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([
+        { id: "kimi-2.6", name: "Kimi 2.6" },
+        { id: "glm-5.2", name: "GLM 5.2" },
+      ]),
+    }, {
+      resolve: async () => ({
+        provider: {
+          id: "router",
+          name: "Old Router",
+          kind: "berry-router",
+          baseUrl: "https://router.example.test/v1",
+          defaultModel: "berry/auto",
+          models: [{ id: "berry/auto", name: "Berry Router Auto" }],
+        },
+        apiKey: "secret",
+        credentialRef: "env:BERRY_ROUTER_API_KEY",
+      }),
+      testAndActivate: async () => { throw new Error("not used"); },
+    });
+
+    const resolved = await service.resolve(SELF_HOST_TENANT_ID, {});
+    expect(resolved.provider.defaultModel).toBe("kimi-2.6");
+    expect(resolved.provider.models?.map((model) => model.id)).toEqual(["kimi-2.6", "glm-5.2"]);
   });
 
   it("does not trust a client-supplied Worker credential reference", async () => {

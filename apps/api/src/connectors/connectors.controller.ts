@@ -26,6 +26,7 @@ import { PublicAuth } from "../auth/auth.decorators.ts";
 import { ENTERPRISE_IDENTITY_REPOSITORY, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { CONNECTORS, ConnectorsService } from "./connectors.service.ts";
 import type { GoogleConnectorKey } from "./google-tools.ts";
+import { FilePlatformService } from "../files/file-platform.service.ts";
 
 const GoogleKeySchema = z.enum(["google-workspace", "gmail", "google-calendar"]);
 const OAuthStartSchema = z.object({ accessLevel: ConnectorAccessLevelSchema.default("read") }).strict();
@@ -64,6 +65,7 @@ export class ConnectorsController {
   constructor(
     @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
     @Inject(AUDIT_SERVICE) private readonly audit: AuditService,
+    @Inject(FilePlatformService) private readonly files: FilePlatformService,
   ) {}
 
   @Get()
@@ -125,7 +127,27 @@ export class ConnectorsController {
   @PublicAuth()
   @Post("mcp/:connectorKey")
   async googleMcp(@Headers("authorization") authorization: string | undefined, @Param("connectorKey") connectorKey: string, @Body() body: unknown, @Res() response: ServerResponse) {
-    const result = await this.connectors.handleGoogleMcp(authorization, connectorKey, body);
+    const result = await this.connectors.handleGoogleMcp(authorization, connectorKey, body, {
+      importDriveArtifact: (context, artifact) => this.files.importConnectorArtifact(
+        context.tenantId,
+        context.userId,
+        {
+          connectorKey: context.connectorKey,
+          accountEmail: context.accountEmail,
+          sourceFileId: artifact.sourceFileId,
+          sourceRevision: artifact.sourceRevision,
+          sourceMimeType: artifact.sourceMimeType,
+          exportMimeType: artifact.exportMimeType,
+          name: artifact.name,
+          contentType: artifact.contentType,
+          declaredSize: artifact.declaredSize,
+          sourceMetadata: artifact.metadata,
+          body: artifact.body,
+          taskId: context.taskId,
+          sessionId: context.sessionId,
+        },
+      ),
+    });
     response.statusCode = result.status;
     if (result.body === undefined) return response.end();
     response.setHeader("content-type", "application/json");

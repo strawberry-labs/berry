@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   InMemoryModelGovernanceRepository,
   ModelGovernanceService,
+  type ModelGovernanceRepository,
 } from "./model-governance.service.ts";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
@@ -38,6 +39,88 @@ describe("model governance scoped access", () => {
       reason: "blocked_by_organization_rule",
       accessRule: { scopeType: "org", scopeId: tenantId },
     });
+  });
+
+  it("persists runtime models and replaces the stale seeded default", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository());
+    await service.synchronizeRuntimeCatalog(tenantId, {
+      id: "router",
+      name: "Berry Router",
+      kind: "berry-router",
+      baseUrl: "https://router.example.test/v1",
+      apiType: "openai-chat-completions",
+      defaultModel: "kimi-2.6",
+      models: [
+        { id: "kimi-2.6", name: "Kimi 2.6", capabilities: { tools: true, reasoning: true } },
+        { id: "glm-5.2", name: "GLM 5.2", capabilities: { tools: true, reasoning: true } },
+      ],
+    });
+
+    expect(await service.listDefaults(tenantId)).toEqual([
+      expect.objectContaining({ mode: "chat", providerId: "router", model: "kimi-2.6" }),
+      expect.objectContaining({ mode: "code", providerId: "router", model: "kimi-2.6" }),
+    ]);
+    expect(await service.resolve({ tenantId, mode: "chat", providerId: "router" })).toMatchObject({
+      allowed: true,
+      model: "kimi-2.6",
+    });
+    expect((await service.listModels(tenantId)).map((model) => model.model)).toEqual(expect.arrayContaining(["kimi-2.6", "glm-5.2"]));
+    expect(await service.resolve({ tenantId, mode: "chat", providerId: "router", model: "berry/auto" })).toMatchObject({
+      allowed: false,
+      reason: "model_blocked",
+    });
+    expect(await service.listModels(tenantId, { includeBlocked: true })).toContainEqual(
+      expect.objectContaining({
+        model: "berry/auto",
+        status: "blocked",
+        metadata: expect.objectContaining({ retiredReason: "not-in-runtime-catalog" }),
+      }),
+    );
+  });
+
+  it("does not rewrite an unchanged jsonb policy when object keys are reordered", async () => {
+    const base = new InMemoryModelGovernanceRepository(false);
+    await base.upsertPolicy({
+      tenantId,
+      providerId: "router",
+      model: "kimi-2.6",
+      displayName: "Kimi 2.6",
+      presetId: "berry-router",
+      apiType: "openai-chat-completions",
+      capabilities: { vision: true, tools: true },
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+      metadata: { source: "runtime-catalog" },
+    });
+    let policyWrites = 0;
+    const repository: ModelGovernanceRepository = {
+      listProviders: (id) => base.listProviders(id),
+      upsertProvider: (id, input) => base.upsertProvider(id, input),
+      updateProviderHealth: (id, providerId, status, testedAt) => base.updateProviderHealth(id, providerId, status, testedAt),
+      listAccessRules: (id, resource) => base.listAccessRules(id, resource),
+      upsertAccessRule: (id, input) => base.upsertAccessRule(id, input),
+      listPolicies: (id) => base.listPolicies(id),
+      upsertPolicy: async (input) => {
+        policyWrites += 1;
+        return base.upsertPolicy(input);
+      },
+      listDefaults: (id) => base.listDefaults(id),
+      upsertDefault: (input) => base.upsertDefault(input),
+    };
+    const service = new ModelGovernanceService(repository);
+
+    await service.synchronizeRuntimeCatalog(tenantId, {
+      id: "router",
+      name: "Berry Router",
+      kind: "berry-router",
+      baseUrl: "https://router.example.test/v1",
+      apiType: "openai-chat-completions",
+      defaultModel: "kimi-2.6",
+      models: [{ id: "kimi-2.6", name: "Kimi 2.6", capabilities: { tools: true, vision: true } }],
+    });
+
+    expect(policyWrites).toBe(0);
   });
 });
 

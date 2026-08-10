@@ -47,8 +47,9 @@ type FileRow = {
   object_key: string;
   etag: string | null;
   object_version_id: string | null;
-  origin: "user_upload" | "sandbox_output" | "image_generation" | "browser_capture" | "legacy_artifact";
+  origin: "user_upload" | "sandbox_output" | "image_generation" | "browser_capture" | "legacy_artifact" | "connector_import";
   status: "initiated" | "uploading" | "scanning" | "processing" | "available" | "failed" | "quarantined" | "deleted";
+  metadata?: Record<string, unknown>;
   created_at: Date | string;
   updated_at: Date | string;
   deleted_at?: Date | string | null;
@@ -189,6 +190,10 @@ export class FilePlatformService {
 
   async get(tenantId: string, userId: string, fileId: string): Promise<FileRow> {
     return this.database.withTenant(tenantId, async (executor) => this.requireAccessibleFile(executor, tenantId, userId, fileId));
+  }
+
+  async describe(tenantId: string, userId: string, fileId: string) {
+    return fileDto(await this.get(tenantId, userId, fileId));
   }
 
   async initiateUpload(tenantId: string, userId: string, input: {
@@ -642,16 +647,14 @@ export class FilePlatformService {
     return { ok: true };
   }
 
-  async associateInputFiles(tenantId: string, userId: string, input: { fileIds: string[]; taskId: string; sessionId: string; messageId?: string }) {
-    if (input.fileIds.length === 0) return;
-    await this.database.withTenant(tenantId, async (executor) => {
-      await requireTask(executor, tenantId, input.taskId, userId);
-      for (const fileId of [...new Set(input.fileIds)].sort()) {
-        await lockFileForReference(executor, tenantId, fileId);
-        await this.requireAccessibleFile(executor, tenantId, userId, fileId);
-        await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, ...(input.messageId ? { messageId: input.messageId } : {}), role: "input", userId });
-      }
-    });
+  async associateInputFiles(tenantId: string, userId: string, input: { fileIds: string[]; taskId: string; sessionId: string; messageId?: string; turnId?: string }) {
+    if (input.fileIds.length === 0) return [];
+    return this.database.withTenant(tenantId, (executor) => associateInputFilesInTransaction(
+      executor,
+      tenantId,
+      userId,
+      input,
+    ));
   }
 
   async runtimeAttachments(tenantId: string, userId: string, attachments: Array<{ fileId?: string | undefined; id?: string | undefined; name: string; mediaType: string; size: number; sourceKind?: string | null | undefined; dataUrl?: string | null | undefined; textContent?: string | null | undefined; localPath?: string | null | undefined }>, context: { taskId: string; sessionId: string }) {
@@ -694,6 +697,136 @@ export class FilePlatformService {
     }
     await this.associateInputFiles(tenantId, userId, { fileIds: resolved.flatMap((item) => "fileId" in item && typeof item.fileId === "string" ? [item.fileId] : []), ...context });
     return resolved;
+  }
+
+  async importConnectorArtifact(tenantId: string, userId: string, input: {
+    connectorKey: string;
+    accountEmail: string | null;
+    sourceFileId: string;
+    sourceRevision: string;
+    sourceMimeType: string;
+    exportMimeType: string | null;
+    name: string;
+    contentType: string;
+    declaredSize: number | null;
+    sourceMetadata: Record<string, unknown>;
+    body: ReadableStream<Uint8Array>;
+    taskId: string;
+    sessionId: string;
+  }) {
+    const config = this.requireConfig();
+    const name = safeFileName(input.name);
+    const identity = [
+      tenantId,
+      userId,
+      input.connectorKey,
+      input.sourceFileId,
+      input.sourceRevision,
+      input.exportMimeType ?? input.sourceMimeType,
+    ].join("\u0000");
+    const fileId = stableUuid(identity);
+    const uploadAttemptId = randomUUID();
+    const objectKey = `${config.prefix}/tenants/${tenantId}/users/${userId}/files/${fileId}/imports/${uploadAttemptId}/${name}`;
+    const existing = await this.database.withTenant(tenantId, async (executor) => {
+      const task = await requireTask(executor, tenantId, input.taskId, userId);
+      await requireSessionForTask(executor, tenantId, input.sessionId, input.taskId, userId);
+      const file = await connectorImportFile(executor, tenantId, fileId, userId);
+      if (!file) return null;
+      assertConnectorIdentity(file, input);
+      await reviveLibraryEntry(executor, tenantId, userId, fileId);
+      await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
+      await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+      return file;
+    });
+    if (existing) {
+      await input.body.cancel().catch(() => undefined);
+      return connectorArtifactDto(existing, input, true);
+    }
+
+    const maximumBytes = Math.min(100 * 1024 * 1024, config.maxUploadBytes);
+    const stored = await storeBoundedMultipart(config, {
+      objectKey,
+      body: input.body,
+      contentType: input.contentType || "application/octet-stream",
+      declaredSize: input.declaredSize,
+      maximumBytes,
+      fileId,
+      name,
+    });
+    let registered = false;
+    try {
+      const file = await this.database.withTenant(tenantId, async (executor) => {
+        await lockConnectorImport(executor, fileId);
+        const task = await requireTask(executor, tenantId, input.taskId, userId);
+        await requireSessionForTask(executor, tenantId, input.sessionId, input.taskId, userId);
+        const raced = await connectorImportFile(executor, tenantId, fileId, userId);
+        if (raced) {
+          assertConnectorIdentity(raced, input);
+          await reviveLibraryEntry(executor, tenantId, userId, fileId);
+          await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
+          await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+          return { file: raced, reused: true };
+        }
+        const blobId = randomUUID();
+        const shouldIndex = this.#durableConfig.projectKnowledgeEnabled && stored.size <= config.maxIndexableBytes;
+        const metadata = connectorImportMetadata(input);
+        await executor.execute(`
+          INSERT INTO file_blobs (
+            id, tenant_id, bucket, object_key, size_bytes, sha256, etag,
+            object_version_id, verification_status, metadata
+          ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, 'unverified', $9::jsonb)
+        `, [blobId, tenantId, config.bucket, objectKey, stored.size, stored.sha256, stored.etag, stored.versionId, JSON.stringify({ source: "google-drive", expectedSha256: stored.sha256, ...metadata })]);
+        const [created] = await executor.query<FileRow>(`
+          INSERT INTO files (
+            id, tenant_id, owner_user_id, blob_id, original_name, display_name,
+            media_type, size_bytes, sha256, bucket, object_key, etag,
+            object_version_id, origin, status, metadata
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $5, $6, $7, $8,
+            $9, $10, $11, $12, 'connector_import', $13::file_status, $14::jsonb
+          )
+          RETURNING *
+        `, [fileId, tenantId, userId, blobId, name, input.contentType || "application/octet-stream", stored.size, stored.sha256, config.bucket, objectKey, stored.etag, stored.versionId, shouldIndex ? "processing" : "available", JSON.stringify(metadata)]);
+        if (!created) throw new Error("Unable to register the Drive artifact");
+        await reviveLibraryEntry(executor, tenantId, userId, fileId);
+        await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
+        await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+        await enqueueBlobVerification(executor, tenantId, blobId);
+        if (shouldIndex) {
+          await enqueueConnectorKnowledgeExtraction(executor, {
+            tenantId,
+            userId,
+            workspaceId: task.workspace_id,
+            taskId: input.taskId,
+            fileId,
+            revision: input.sourceRevision,
+            contentHash: stored.sha256,
+            title: name,
+            mediaType: input.contentType,
+            objectKey,
+          });
+        }
+        return { file: created, reused: false };
+      });
+      registered = !file.reused;
+      if (file.reused) {
+        await config.client.send(new DeleteObjectCommand({
+          Bucket: config.bucket,
+          Key: objectKey,
+          ...(stored.versionId ? { VersionId: stored.versionId } : {}),
+        })).catch(() => undefined);
+      }
+      return connectorArtifactDto(file.file, input, file.reused);
+    } catch (cause) {
+      if (!registered) {
+        await config.client.send(new DeleteObjectCommand({
+          Bucket: config.bucket,
+          Key: objectKey,
+          ...(stored.versionId ? { VersionId: stored.versionId } : {}),
+        })).catch(() => undefined);
+      }
+      throw cause;
+    }
   }
 
   async registerSandboxOutput(tenantId: string, userId: string, input: { key: string; name: string; mediaType: string; size?: number; taskId: string; sessionId: string; turnId?: string; origin?: "sandbox_output" | "image_generation" | "browser_capture" }) {
@@ -810,10 +943,28 @@ export class FilePlatformService {
     });
   }
 
-  async streamContent(tenantId: string, userId: string, fileId: string, range: string | undefined, response: ServerResponse, download = false) {
+  async streamContent(
+    tenantId: string,
+    userId: string,
+    fileId: string,
+    range: string | undefined,
+    response: ServerResponse,
+    download = false,
+    ifNoneMatch?: string,
+  ) {
     const config = this.requireConfig();
     const file = await this.get(tenantId, userId, fileId);
     if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
+    const etag = contentEntityTag(file);
+    response.setHeader("ETag", etag);
+    response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    response.setHeader("Vary", "Authorization, Cookie");
+    response.setHeader("Accept-Ranges", "bytes");
+    if (!range && requestEntityTagMatches(ifNoneMatch, etag)) {
+      response.statusCode = 304;
+      response.end();
+      return;
+    }
     const object = await config.client.send(new GetObjectCommand({
       Bucket: file.bucket,
       Key: file.object_key,
@@ -826,7 +977,6 @@ export class FilePlatformService {
     if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
     if (object.ContentRange) response.setHeader("Content-Range", object.ContentRange);
     response.setHeader("Accept-Ranges", object.AcceptRanges ?? "bytes");
-    response.setHeader("Cache-Control", "private, max-age=300");
     response.setHeader("Content-Disposition", `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(file.display_name)}`);
     for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
       if (!response.write(chunk)) await once(response, "drain");
@@ -942,6 +1092,261 @@ export class FilePlatformService {
   }
 }
 
+type ConnectorImportIdentity = {
+  connectorKey: string;
+  accountEmail: string | null;
+  sourceFileId: string;
+  sourceRevision: string;
+  sourceMimeType: string;
+  exportMimeType: string | null;
+  sourceMetadata: Record<string, unknown>;
+};
+
+function connectorImportMetadata(input: ConnectorImportIdentity): Record<string, unknown> {
+  return {
+    source: "google-drive",
+    connectorKey: input.connectorKey,
+    accountEmail: input.accountEmail,
+    sourceFileId: input.sourceFileId,
+    sourceRevision: input.sourceRevision,
+    sourceMimeType: input.sourceMimeType,
+    exportMimeType: input.exportMimeType,
+    sourceModifiedTime: typeof input.sourceMetadata.modifiedTime === "string" ? input.sourceMetadata.modifiedTime : null,
+    sourceWebViewLink: typeof input.sourceMetadata.webViewLink === "string" ? input.sourceMetadata.webViewLink : null,
+  };
+}
+
+function connectorArtifactDto(
+  row: FileRow,
+  input: ConnectorImportIdentity,
+  reused: boolean,
+): Record<string, unknown> {
+  return {
+    artifact: {
+      fileId: row.id,
+      name: row.display_name,
+      mediaType: row.detected_media_type ?? row.media_type,
+      size: Number(row.size_bytes),
+      status: row.status,
+      origin: "connector_import",
+      source: "google-drive",
+      sourceFileId: input.sourceFileId,
+      sourceRevision: input.sourceRevision,
+      exportMimeType: input.exportMimeType,
+      reused,
+      library: true,
+    },
+  };
+}
+
+async function connectorImportFile(
+  executor: SqlExecutor,
+  tenantId: string,
+  fileId: string,
+  userId: string,
+): Promise<FileRow | null> {
+  const [row] = await executor.query<FileRow>(`
+    SELECT f.*, ${FILE_PHYSICAL_COLUMNS}
+    FROM files f
+    LEFT JOIN file_blobs blob ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
+    WHERE f.tenant_id=$1::uuid AND f.id=$2::uuid AND f.owner_user_id=$3::uuid
+      AND f.origin='connector_import' AND f.deleted_at IS NULL
+      AND f.status IN ('processing','available')
+    FOR UPDATE OF f
+  `, [tenantId, fileId, userId]);
+  return row ?? null;
+}
+
+async function lockConnectorImport(executor: SqlExecutor, fileId: string): Promise<void> {
+  await executor.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+    [`berry:connector-import:${fileId}`],
+  );
+}
+
+function assertConnectorIdentity(row: FileRow, input: ConnectorImportIdentity): void {
+  const metadata = row.metadata ?? {};
+  if (metadata.connectorKey !== input.connectorKey
+    || metadata.sourceFileId !== input.sourceFileId
+    || metadata.sourceRevision !== input.sourceRevision
+    || (metadata.exportMimeType ?? null) !== input.exportMimeType) {
+    throw new ConflictException("Drive artifact identity conflicts with an existing file");
+  }
+}
+
+async function requireSessionForTask(
+  executor: SqlExecutor,
+  tenantId: string,
+  sessionId: string,
+  taskId: string,
+  userId: string,
+): Promise<void> {
+  const [session] = await executor.query<{ id: string }>(`
+    SELECT s.id
+    FROM sessions s
+    JOIN tasks t ON t.tenant_id=s.tenant_id AND t.id=s.task_id
+    WHERE s.tenant_id=$1::uuid AND s.id=$2::uuid AND s.task_id=$3::uuid
+      AND (s.user_id=$4::uuid OR (s.user_id IS NULL AND (t.user_id=$4::uuid OR t.user_id IS NULL)))
+  `, [tenantId, sessionId, taskId, userId]);
+  if (!session) throw new NotFoundException("Task session not found");
+}
+
+async function linkWorkspaceFile(executor: SqlExecutor, input: {
+  tenantId: string;
+  workspaceId: string;
+  fileId: string;
+  taskId: string;
+  userId: string;
+}): Promise<void> {
+  await executor.execute(`
+    INSERT INTO workspace_files (
+      tenant_id, workspace_id, file_id, visibility, originating_task_id,
+      index_status, created_by_user_id
+    ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'task_only', $4::uuid, 'pending', $5::uuid)
+    ON CONFLICT (tenant_id, workspace_id, file_id) DO UPDATE SET
+      visibility='task_only',
+      originating_task_id=COALESCE(workspace_files.originating_task_id, EXCLUDED.originating_task_id),
+      deleted_at=NULL,
+      updated_at=now()
+  `, [input.tenantId, input.workspaceId, input.fileId, input.taskId, input.userId]);
+}
+
+async function enqueueConnectorKnowledgeExtraction(executor: SqlExecutor, input: {
+  tenantId: string;
+  userId: string;
+  workspaceId: string;
+  taskId: string;
+  fileId: string;
+  revision: string;
+  contentHash: string;
+  title: string;
+  mediaType: string;
+  objectKey: string;
+}): Promise<void> {
+  const [source] = await executor.query<{ id: string }>(`
+    INSERT INTO knowledge_sources (
+      tenant_id, user_id, workspace_id, source_type, source_id, source_revision,
+      content_hash, title, visibility, extraction_status, index_status,
+      extractor_version, chunker_version, metadata
+    ) VALUES (
+      $1::uuid, $2::uuid, $3::uuid, 'file', $4::uuid::text, $5, $6, $7,
+      'task_only', 'pending', 'pending', 'tika-v1', 'recursive-v1',
+      jsonb_build_object('fileId',$4::uuid,'mediaType',$8,'objectKey',$9,'taskId',$10::uuid,'source','google-drive')
+    )
+    ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
+    DO UPDATE SET tombstoned_at=NULL, failure_reason=NULL, extraction_status='pending',
+      index_status='pending', vector_ready=false, updated_at=now()
+    RETURNING id
+  `, [input.tenantId, input.userId, input.workspaceId, input.fileId, input.revision, input.contentHash, input.title, input.mediaType, input.objectKey, input.taskId]);
+  if (!source) throw new Error("Unable to queue Drive artifact extraction");
+  await executor.execute(`
+    INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
+    VALUES ($1::uuid, 'knowledge.extract', $2, $3, $4::jsonb)
+    ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+  `, [input.tenantId, source.id, `knowledge.extract:${source.id}:${input.revision}`, JSON.stringify({ tenantId: input.tenantId, sourceId: source.id, revision: input.revision })]);
+}
+
+async function storeBoundedMultipart(config: FileStorageConfig, input: {
+  objectKey: string;
+  body: ReadableStream<Uint8Array>;
+  contentType: string;
+  declaredSize: number | null;
+  maximumBytes: number;
+  fileId: string;
+  name: string;
+}): Promise<{ size: number; sha256: string; etag: string | null; versionId: string | null }> {
+  if (input.declaredSize !== null && input.declaredSize > input.maximumBytes) {
+    await input.body.cancel().catch(() => undefined);
+    throw new BadRequestException("Drive files are limited to 100 MB");
+  }
+  const created = await config.client.send(new CreateMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: input.objectKey,
+    ContentType: input.contentType,
+    Metadata: { "file-id": input.fileId, "original-name": encodeURIComponent(input.name), source: "google-drive" },
+  }));
+  if (!created.UploadId) throw new Error("Object storage did not return a multipart upload id");
+  const reader = input.body.getReader();
+  const hash = createHash("sha256");
+  const completedParts: CompletedPart[] = [];
+  let partChunks: Buffer[] = [];
+  let partBytes = 0;
+  let total = 0;
+  const uploadPart = async (): Promise<void> => {
+    if (partBytes === 0) return;
+    const body = Buffer.concat(partChunks, partBytes);
+    const partNumber = completedParts.length + 1;
+    const uploaded = await config.client.send(new UploadPartCommand({
+      Bucket: config.bucket,
+      Key: input.objectKey,
+      UploadId: created.UploadId,
+      PartNumber: partNumber,
+      Body: body,
+      ContentLength: body.byteLength,
+    }));
+    if (!uploaded.ETag) throw new Error(`Object storage did not return an ETag for Drive part ${partNumber}`);
+    completedParts.push({ PartNumber: partNumber, ETag: uploaded.ETag });
+    partChunks = [];
+    partBytes = 0;
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      let offset = 0;
+      total += value.byteLength;
+      if (total > input.maximumBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new BadRequestException("Drive files are limited to 100 MB");
+      }
+      hash.update(value);
+      while (offset < value.byteLength) {
+        const take = Math.min(config.partSize - partBytes, value.byteLength - offset);
+        partChunks.push(Buffer.from(value.subarray(offset, offset + take)));
+        partBytes += take;
+        offset += take;
+        if (partBytes === config.partSize) await uploadPart();
+      }
+    }
+    if (input.declaredSize !== null && total !== input.declaredSize) {
+      throw new BadRequestException("The Drive response size did not match its declared size");
+    }
+    if (total === 0) {
+      await config.client.send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: input.objectKey, UploadId: created.UploadId })).catch(() => undefined);
+      const stored = await config.client.send(new PutObjectCommand({
+        Bucket: config.bucket,
+        Key: input.objectKey,
+        Body: new Uint8Array(),
+        ContentType: input.contentType,
+        Metadata: { "file-id": input.fileId, "original-name": encodeURIComponent(input.name), source: "google-drive" },
+      }));
+      return { size: 0, sha256: hash.digest("hex"), etag: cleanEtag(stored.ETag), versionId: stored.VersionId ?? null };
+    }
+    await uploadPart();
+    const completed = await config.client.send(new CompleteMultipartUploadCommand({
+      Bucket: config.bucket,
+      Key: input.objectKey,
+      UploadId: created.UploadId,
+      MultipartUpload: { Parts: completedParts },
+    }));
+    return { size: total, sha256: hash.digest("hex"), etag: cleanEtag(completed.ETag), versionId: completed.VersionId ?? null };
+  } catch (cause) {
+    await reader.cancel().catch(() => undefined);
+    await config.client.send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: input.objectKey, UploadId: created.UploadId })).catch(() => undefined);
+    throw cause;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function stableUuid(value: string): string {
+  const bytes = Buffer.from(createHash("sha256").update(value).digest().subarray(0, 16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x80;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function sandboxArtifactFileId(prefix: string, objectKey: string): string | null {
   const relative = objectKey.slice(prefix.length + 1);
   const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -971,6 +1376,7 @@ function expectedPartBytes(upload: UploadRow, partNumber: number): number {
 }
 
 function fileDto(row: FileRow) {
+  const version = encodeURIComponent(contentCacheVersion(row));
   return {
     id: row.id,
     name: row.display_name,
@@ -990,9 +1396,29 @@ function fileDto(row: FileRow) {
     ...(row.index_status ? { indexStatus: row.index_status } : {}),
     ...(row.vector_ready !== undefined && row.vector_ready !== null ? { vectorReady: row.vector_ready } : {}),
     ...(row.failure_reason !== undefined ? { indexFailureReason: row.failure_reason } : {}),
-    downloadUrl: `/v1/files/${row.id}/content?download=1`,
-    previewUrl: `/v1/files/${row.id}/content`,
+    downloadUrl: `/v1/files/${row.id}/content?download=1&v=${version}`,
+    previewUrl: `/v1/files/${row.id}/content?v=${version}`,
   };
+}
+
+function contentCacheVersion(row: FileRow): string {
+  return row.sha256
+    ?? row.object_version_id
+    ?? row.etag
+    ?? `${row.id}-${new Date(row.updated_at).getTime()}`;
+}
+
+function contentEntityTag(row: FileRow): string {
+  const opaque = contentCacheVersion(row).replace(/["\\]/g, "");
+  return `"${opaque}"`;
+}
+
+function requestEntityTagMatches(header: string | undefined, etag: string): boolean {
+  if (!header) return false;
+  return header.split(",").some((candidate) => {
+    const value = candidate.trim();
+    return value === "*" || value === etag || value.replace(/^W\//, "") === etag;
+  });
 }
 
 function resolvePhysicalFile(row: FileRow): FileRow {
@@ -1069,6 +1495,76 @@ async function requireTask(executor: SqlExecutor, tenantId: string, taskId: stri
   `, [tenantId, taskId, userId]);
   if (!task) throw new NotFoundException("Task not found");
   return task;
+}
+
+export async function associateInputFilesInTransaction(
+  executor: SqlExecutor,
+  tenantId: string,
+  userId: string,
+  input: {
+    fileIds: string[];
+    taskId: string;
+    sessionId: string;
+    messageId?: string;
+    turnId?: string;
+  },
+): Promise<Array<{
+  fileId: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  sourceKind: "object-storage";
+}>> {
+  if (input.fileIds.length === 0) return [];
+  await requireTask(executor, tenantId, input.taskId, userId);
+  const resolved: Array<{
+    fileId: string;
+    name: string;
+    mediaType: string;
+    size: number;
+    sourceKind: "object-storage";
+  }> = [];
+  for (const fileId of [...new Set(input.fileIds)].sort()) {
+    await lockFileForReference(executor, tenantId, fileId);
+    const [file] = await executor.query<FileRow>(`
+      SELECT f.*, ${FILE_PHYSICAL_COLUMNS}
+      FROM files f
+      LEFT JOIN file_blobs blob
+        ON blob.tenant_id = f.tenant_id AND blob.id = f.blob_id
+      WHERE f.tenant_id = $1::uuid AND f.id = $2::uuid
+        AND f.owner_user_id = $3::uuid AND f.deleted_at IS NULL
+        AND (
+          f.blob_id IS NULL OR (
+            blob.id IS NOT NULL AND blob.deleted_at IS NULL
+            AND blob.verification_status <> 'deleted'
+          )
+        )
+      FOR UPDATE OF f
+    `, [tenantId, fileId, userId]);
+    if (!file) throw new NotFoundException("File not found");
+    const physical = resolvePhysicalFile(file);
+    if (physical.status !== "available" && physical.status !== "processing") {
+      throw new BadRequestException(`File ${physical.display_name} is not available`);
+    }
+    await associate(executor, {
+      tenantId,
+      fileId,
+      taskId: input.taskId,
+      sessionId: input.sessionId,
+      ...(input.messageId ? { messageId: input.messageId } : {}),
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      role: "input",
+      userId,
+    });
+    resolved.push({
+      fileId: physical.id,
+      name: physical.display_name,
+      mediaType: physical.detected_media_type ?? physical.media_type,
+      size: Number(physical.size_bytes),
+      sourceKind: "object-storage",
+    });
+  }
+  return resolved;
 }
 
 async function requireWorkspaceAccess(executor: SqlExecutor, tenantId: string, userId: string, workspaceId: string) {

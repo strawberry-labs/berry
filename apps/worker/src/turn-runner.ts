@@ -306,6 +306,12 @@ export interface DurableTurnToolExecutor {
   modelContent?(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
   execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult>;
+  stageAssociatedInputFiles?(snapshot: DurableTurnSnapshot, fileIds: readonly string[]): Promise<readonly {
+    fileId: string;
+    name: string;
+    mediaType: string;
+    path: string;
+  }[]>;
   finalize?(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]>;
 }
 
@@ -449,6 +455,18 @@ export class DurableTurnRunner {
         `Model request failed after ${step.attempt} attempts.`,
       );
     }
+    const stagedArtifactFileIds = snapshot.steps.flatMap((candidate) => {
+      if (candidate.state !== "completed") return [];
+      const output = record(candidate.output);
+      if (!Array.isArray(output?.artifacts)) return [];
+      return output.artifacts.flatMap((artifact) => {
+        const fileId = stringValue(record(artifact)?.fileId);
+        return fileId ? [fileId] : [];
+      });
+    });
+    if (stagedArtifactFileIds.length > 0) {
+      await this.tools.stageAssociatedInputFiles?.(snapshot, [...new Set(stagedArtifactFileIds)]);
+    }
     const [extensionTools, additionalUserContent] = await this.withHeartbeat(snapshot, async () => Promise.all([
       this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
       this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
@@ -479,6 +497,11 @@ export class DurableTurnRunner {
           },
           retryClass: "idempotent_with_key",
           idempotencyKey: `${snapshot.id}:compact:${snapshot.entries.at(-1)?.entryId ?? "empty"}`,
+        }],
+        events: [{
+          kind: "session.note",
+          note: "compacting",
+          detail: "Context auto-compacting",
         }],
         nextAction: "Create a portable checkpoint before the next model request",
       });
@@ -1453,9 +1476,17 @@ async function waitForPromiseSettlement(promise: Promise<unknown>, timeoutMs: nu
 }
 
 class DurableMessageEventWriter {
+  static readonly FLUSH_INTERVAL_MS = 50;
+  static readonly FLUSH_CHARACTER_LIMIT = 256;
+  static readonly MAX_UNPERSISTED_CHARACTERS = 16_384;
+
   readonly #pending: Array<Extract<AgentStreamEvent, { kind: "message.delta" }>> = [];
   #pendingCharacters = 0;
-  #lastFlushAt = 0;
+  #unpersistedCharacters = 0;
+  #lastEnqueueAt = 0;
+  #flushTimer: NodeJS.Timeout | null = null;
+  #flushChain: Promise<void> = Promise.resolve();
+  #failure: unknown = null;
 
   constructor(
     private readonly repository: DurableTurnRepository,
@@ -1465,6 +1496,7 @@ class DurableMessageEventWriter {
 
   async write(delta: string, channel: "text" | "reasoning"): Promise<void> {
     if (!delta) return;
+    this.#throwIfFailed();
     const previous = this.#pending.at(-1);
     if (previous?.channel === channel) {
       previous.delta += delta;
@@ -1472,18 +1504,70 @@ class DurableMessageEventWriter {
       this.#pending.push({ kind: "message.delta", messageId: this.messageId, delta, channel });
     }
     this.#pendingCharacters += delta.length;
-    const now = Date.now();
-    if (this.#lastFlushAt === 0 || now - this.#lastFlushAt >= 80 || this.#pendingCharacters >= 256) {
-      await this.flush();
+    this.#unpersistedCharacters += delta.length;
+
+    if (
+      this.#lastEnqueueAt === 0
+      || this.#pendingCharacters >= DurableMessageEventWriter.FLUSH_CHARACTER_LIMIT
+    ) {
+      this.#enqueuePending();
+    } else {
+      this.#scheduleFlush();
+    }
+
+    // Keep provider consumption independent from ordinary journal latency,
+    // while retaining bounded memory and backpressure if persistence stalls.
+    if (this.#unpersistedCharacters >= DurableMessageEventWriter.MAX_UNPERSISTED_CHARACTERS) {
+      this.#enqueuePending();
+      await this.#flushChain;
+      this.#throwIfFailed();
     }
   }
 
   async flush(): Promise<void> {
+    if (this.#flushTimer) {
+      clearTimeout(this.#flushTimer);
+      this.#flushTimer = null;
+    }
+    this.#enqueuePending();
+    await this.#flushChain;
+    this.#throwIfFailed();
+  }
+
+  #scheduleFlush(): void {
+    if (this.#flushTimer) return;
+    const elapsed = Date.now() - this.#lastEnqueueAt;
+    const delay = Math.max(0, DurableMessageEventWriter.FLUSH_INTERVAL_MS - elapsed);
+    this.#flushTimer = setTimeout(() => {
+      this.#flushTimer = null;
+      this.#enqueuePending();
+    }, delay);
+    this.#flushTimer.unref?.();
+  }
+
+  #enqueuePending(): void {
     if (this.#pending.length === 0) return;
+    if (this.#flushTimer) {
+      clearTimeout(this.#flushTimer);
+      this.#flushTimer = null;
+    }
     const events = this.#pending.splice(0, this.#pending.length);
+    const characters = this.#pendingCharacters;
     this.#pendingCharacters = 0;
-    await this.repository.appendEvents(this.snapshot, events);
-    this.#lastFlushAt = Date.now();
+    this.#lastEnqueueAt = Date.now();
+    this.#flushChain = this.#flushChain.then(async () => {
+      if (this.#failure) return;
+      try {
+        await this.repository.appendEvents(this.snapshot, events);
+        this.#unpersistedCharacters = Math.max(0, this.#unpersistedCharacters - characters);
+      } catch (error) {
+        this.#failure = error;
+      }
+    });
+  }
+
+  #throwIfFailed(): void {
+    if (this.#failure) throw this.#failure;
   }
 }
 
@@ -2678,7 +2762,7 @@ function durableToolPolicy(name: string, permissionMode: string): {
   if (name === "git_checkpoint") {
     return {
       retryClass: "non_idempotent_manual",
-      requiresApproval: true,
+      requiresApproval: permissionMode !== "full-access",
       approvalKind: "shell",
     };
   }
@@ -2774,7 +2858,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "When the user explicitly asks you to remember or forget a durable personal fact or preference, call remember_memory or forget_memory when that tool is declared. Confirm the change only after the tool succeeds.",
   "When the user explicitly asks you to ask questions, collect requirements, or clarify choices, call ask_user_question so the frontend renders the interactive question UI. Do not print the questionnaire as ordinary prose.",
   "When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call compose_message so it renders as an editable writing block. Use one variant unless genuinely different strategies are useful, reuse the same draft id for revisions, and do not repeat the draft body in prose after the tool succeeds.",
-  "When you create a final downloadable file, save it under /workspace/outputs and call persist_artifact before saying it is ready.",
+  "When you create a final downloadable file, save it in the runtime workspace's outputs directory and call persist_artifact before saying it is ready.",
   "Explain the final result clearly.",
 ].join("\n\n");
 
@@ -2784,7 +2868,7 @@ export const DURABLE_IMAGE_TOOL_SELECTION_PROMPT = [
   "Prefer create_image over shell scripts or general file tools when generative image editing is likely to produce the better visual result.",
   "Treat requests to preserve a person, face, product, pose, or other reference detail as constraints for the create_image prompt; preservation constraints alone are not a reason to fall back to shell processing.",
   "Use deterministic file or code tools instead only when the requested operation itself is non-generative, such as resizing, cropping, format conversion, metadata changes, or a pixel-exact transform, or when the user explicitly forbids generative AI.",
-  "create_image already saves the generated file under /workspace/outputs and publishes it into the task. After it succeeds, use its returned image and artifact directly; do not search for, copy, or call persist_artifact on that same generated file unless the user asks for another transformed deliverable.",
+  "create_image already saves the generated file in the runtime workspace's outputs directory and publishes it into the task. After it succeeds, use its returned image and artifact directly; do not search for, copy, or call persist_artifact on that same generated file unless the user asks for another transformed deliverable.",
 ].join(" ");
 
 export function durableImageToolSelectionPrompt(toolNames: readonly string[]): string {
@@ -2800,6 +2884,7 @@ function modelMessages(
 } {
   const checkpoint = snapshot.portableCheckpoint ?? snapshot.runtimeRequest.portableCheckpoint;
   const runtime = durableRuntimeRequest(snapshot);
+  const workspacePath = durableWorkspacePath(snapshot, runtime?.workspacePath);
   const skills = durableSkills(snapshot);
   const skillInstructions = formatSkillsForSystemPrompt(skills);
   const stableSystemPrompt = [
@@ -2824,14 +2909,16 @@ function modelMessages(
     runtime
       ? [
           "Runtime environment:",
-          `- Workspace: ${runtime.workspacePath}`,
+          `- Workspace root: ${workspacePath}`,
+          `- Attached inputs: ${workspacePath}/inputs`,
+          `- Final outputs: ${workspacePath}/outputs`,
           `- Permission mode: ${runtime.permissionMode}`,
           `- Provider: ${runtime.provider.id}`,
           `- Model: ${runtime.model ?? runtime.provider.defaultModel}`,
           `- Reasoning: ${runtime.reasoning}`,
         ].join("\n")
       : "",
-    automaticDurableAttachmentSkill(skills, runtime?.attachments ?? []),
+    automaticDurableAttachmentSkill(skills, runtime?.attachments ?? [], snapshot.steps),
   ].filter(Boolean).join("\n\n");
   const system = [stableSystemPrompt, dynamicSystem].filter(Boolean).join("\n\n");
   const messages: ChatMessage[] = [{ role: "system", content: system }];
@@ -2840,9 +2927,9 @@ function modelMessages(
     const message = record(payload?.message);
     const role = stringValue(message?.role);
     if (role === "system") {
-      messages.push({ role: "system", content: contentText(message?.content) });
+      messages.push({ role: "system", content: contentText(message?.content, workspacePath) });
     } else if (role === "user") {
-      messages.push({ role: "user", content: contentText(message?.content) });
+      messages.push({ role: "user", content: contentText(message?.content, workspacePath) });
     } else if (role === "assistant") {
       const toolCalls = Array.isArray(message?.content)
         ? message.content.flatMap((part) => {
@@ -2871,7 +2958,7 @@ function modelMessages(
         role: "tool",
         toolCallId: stringValue(message?.toolCallId) ?? entry.entryId,
         ...(stringValue(message?.toolName) ? { name: stringValue(message?.toolName)! } : {}),
-        content: contentText(message?.content),
+        content: contentText(message?.content, workspacePath),
       });
     }
   }
@@ -2899,7 +2986,7 @@ function modelMessages(
     }
     const lastUser = messages[lastUserIndex];
     if (lastUser) {
-      const text = contentText(lastUser.content);
+      const text = contentText(lastUser.content, workspacePath);
       lastUser.content = [
         ...(text ? [{ type: "text" as const, text }] : []),
         ...additionalUserContent,
@@ -2947,9 +3034,21 @@ function durableToolResultText(output: JsonValue): string {
 function automaticDurableAttachmentSkill(
   skills: readonly DurableSkill[],
   attachments: DurableTurnRuntimeRequest["attachments"],
+  steps: readonly DurableTurnStep[] = [],
 ): string {
   const installed = new Map(skills.map((skill) => [skill.name.toLowerCase(), skill]));
-  const selected = attachments.flatMap((attachment) => {
+  const stagedArtifacts = steps.flatMap((step) => {
+    if (step.state !== "completed") return [];
+    const output = record(step.output);
+    if (!Array.isArray(output?.artifacts)) return [];
+    return output.artifacts.flatMap((candidate) => {
+      const artifact = record(candidate);
+      const name = stringValue(artifact?.name);
+      const mediaType = stringValue(artifact?.mediaType);
+      return name && mediaType ? [{ name, mediaType }] : [];
+    });
+  });
+  const selected = [...attachments, ...stagedArtifacts].flatMap((attachment) => {
     const name = attachment.name.toLowerCase();
     const mediaType = attachment.mediaType.toLowerCase();
     if (name.endsWith(".pdf") || mediaType === "application/pdf") return ["pdf"];
@@ -3246,13 +3345,13 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "persist_artifact",
-      description: "Publish one completed file from /workspace/outputs into durable task storage so the user can open and download it.",
+      description: "Publish one completed file from the runtime workspace's outputs directory into durable task storage so the user can open and download it.",
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path"],
         properties: {
-          path: { type: "string", description: "Completed file path under /workspace/outputs" },
+          path: { type: "string", description: "Completed file path under the runtime workspace's outputs directory" },
           name: { type: "string", description: "Optional user-facing filename" },
           media_type: { type: "string", description: "Optional MIME type; inferred from the filename when omitted" },
         },
@@ -3287,7 +3386,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "create_image",
-      description: "Generate or materially edit an image, save it under /workspace/outputs, and publish it into the task. Prefer this tool for image creation, background replacement, compositing, object addition/removal, and visual restyling when generative editing will produce a better result than shell-based image processing. Pass existing workspace images through reference_image_paths and express subject-preservation requirements in the prompt. The returned image is already published; do not copy, search for, or persist_artifact the same file again. Use deterministic file tools only for non-generative crop, resize, conversion, metadata, or pixel-exact transforms, or when the user forbids generative AI.",
+      description: "Generate or materially edit an image, save it in the runtime workspace's outputs directory, and publish it into the task. Prefer this tool for image creation, background replacement, compositing, object addition/removal, and visual restyling when generative editing will produce a better result than shell-based image processing. Pass existing workspace images through reference_image_paths and express subject-preservation requirements in the prompt. The returned image is already published; do not copy, search for, or persist_artifact the same file again. Use deterministic file tools only for non-generative crop, resize, conversion, metadata, or pixel-exact transforms, or when the user forbids generative AI.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -4068,7 +4167,7 @@ function assistantContentText(value: unknown): string {
   }).filter(Boolean).join("\n");
 }
 
-function contentText(value: unknown): string {
+function contentText(value: unknown, workspacePath = "/workspace"): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return "";
   return value.map((part) => {
@@ -4084,8 +4183,14 @@ function contentText(value: unknown): string {
       name,
       mediaType: stringValue(attachment?.mediaType),
       size: numberValue(attachment?.size),
-    });
+    }, workspacePath);
   }).filter(Boolean).join("\n");
+}
+
+function durableWorkspacePath(snapshot: DurableTurnSnapshot, runtimePath?: string): string {
+  const configured = process.env.BERRY_SANDBOX_CWD?.trim();
+  const value = configured || runtimePath || stringValue(snapshot.runtimeRequest.workspacePath) || "/workspace";
+  return value.replaceAll("\\", "/").replace(/\/+$/, "") || "/workspace";
 }
 
 function safeJson(value: string): JsonValue {

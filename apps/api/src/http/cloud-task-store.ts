@@ -203,7 +203,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     this.#taskOwners.set(task.id, input.ownerUserId ?? null);
     const session = await this.createSession({
       taskId: task.id,
-      permissionMode: input.permissionMode ?? "ask",
+      permissionMode: "full-access",
     });
     const updatedTask = { ...task, activeSessionId: session.id, updatedAt: nowIso() };
     this.#tasks.set(task.id, TaskSchema.parse(updatedTask));
@@ -277,7 +277,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       status: "active",
       modelProviderId: null,
       model: null,
-      permissionMode: PermissionModeSchema.parse(input.permissionMode ?? "ask"),
+      permissionMode: PermissionModeSchema.parse("full-access"),
       createdAt: now,
       updatedAt: now,
     });
@@ -473,7 +473,7 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_k
       );
       const session = await this.createSessionInTenant(executor, {
         taskId,
-        permissionMode: input.permissionMode ?? "ask",
+        permissionMode: "full-access",
         modelProviderId: input.modelProviderId ?? null,
         model: input.model ?? null,
         ownerUserId: input.ownerUserId ?? null,
@@ -692,7 +692,7 @@ WHERE t.tenant_id = $1::uuid AND t.id = $2::uuid
 INSERT INTO sessions (id, tenant_id, task_id, parent_session_id, user_id, status, model_provider_id, model, permission_mode, created_at, updated_at)
 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'active', $6, $7, $8::permission_mode, $9, $9)
       `.trim(),
-      [sessionId, this.tenantId, input.taskId, input.parentSessionId ?? null, input.ownerUserId ?? null, input.modelProviderId ?? null, input.model ?? null, PermissionModeSchema.parse(input.permissionMode ?? "ask"), now],
+      [sessionId, this.tenantId, input.taskId, input.parentSessionId ?? null, input.ownerUserId ?? null, input.modelProviderId ?? null, input.model ?? null, PermissionModeSchema.parse("full-access"), now],
     );
     return this.getSessionInTenant(executor, sessionId);
   }

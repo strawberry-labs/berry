@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, updateCustomAnswerDraft } from "./composer-question-overlay.tsx";
+import { normalizeQuestionDraft, questionAnswerTranscript, questionInteractionLocked, questionToolAnswer, stableQuestionAnswerMessageId, updateCustomAnswerDraft } from "./composer-question-overlay.tsx";
 
 describe("question answer summaries", () => {
   const answers = [
-    { question: "Which environment?", answer: "Production", selectedOptions: ["Production"], skipped: false },
-    { question: "What should be omitted?", answer: "Skipped", selectedOptions: [], skipped: true },
+    { question: "Which environment?", answer: "Production", selectedOptions: ["Production"], attachments: [], skipped: false },
+    { question: "What should be omitted?", answer: "Skipped", selectedOptions: [], attachments: [], skipped: true },
   ];
 
   it("creates a compact user-visible Q&A transcript", () => {
@@ -31,9 +31,44 @@ describe("question answer summaries", () => {
         question: "Monthly allowance?",
         answer: "SAR 5,000",
         selectedOptions: [],
+        attachments: [],
         skipped: false,
         mode: "custom",
       },
     });
+  });
+
+  it("turns an untouched or blank custom answer into an explicit skip", () => {
+    expect(normalizeQuestionDraft("Optional context?", undefined)).toMatchObject({
+      answer: "Skipped",
+      skipped: true,
+      mode: "skipped",
+    });
+    expect(normalizeQuestionDraft("Optional context?", {
+      question: "Optional context?",
+      answer: "   ",
+      selectedOptions: [],
+      attachments: [],
+      skipped: false,
+      mode: "custom",
+    })).toMatchObject({ answer: "Skipped", skipped: true, mode: "skipped" });
+  });
+
+  it("accepts an attachment-only custom answer", () => {
+    const attachment = { fileId: "550e8400-e29b-41d4-a716-446655440000", name: "brief.pdf", mediaType: "application/pdf", size: 42 };
+    expect(normalizeQuestionDraft("Upload the brief", {
+      question: "Upload the brief",
+      answer: "",
+      selectedOptions: [],
+      attachments: [attachment],
+      skipped: false,
+      mode: "custom",
+    })).toMatchObject({ answer: "", attachments: [attachment], skipped: false });
+  });
+
+  it("locks navigation and submission for the full attachment upload", () => {
+    expect(questionInteractionLocked(false, true)).toBe(true);
+    expect(questionInteractionLocked(true, false)).toBe(true);
+    expect(questionInteractionLocked(false, false)).toBe(false);
   });
 });

@@ -1511,6 +1511,7 @@ Result:
                   "note": {
                     "type": "string",
                     "enum": [
+                      "compacting",
                       "compacted",
                       "resumed",
                       "forked",

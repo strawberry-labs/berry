@@ -10,6 +10,12 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
   const [message, setMessage] = React.useState("");
   React.useEffect(() => { if (resource.data) setDraft(resource.data); }, [resource.data]);
   const writable = permissions.includes("org_settings:write");
+  const branding = (draft?.branding && typeof draft.branding === "object" && !Array.isArray(draft.branding) ? draft.branding : {}) as Record<string, unknown>;
+  const applicationName = typeof branding.applicationName === "string" ? branding.applicationName : "Berry";
+  const accentColor = typeof branding.accentColor === "string" ? branding.accentColor : "#7c6df2";
+  const updateBranding = (next: Record<string, unknown>) => {
+    if (draft) setDraft({ ...draft, branding: { ...branding, ...next } as OrganizationProfile["branding"] });
+  };
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
@@ -21,13 +27,16 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
     resource.retry();
   }
 
-  return <ManagementPage title="Profile & domains" description="Organization identity, verified domains, contacts, legal links, and deployment metadata." eyebrow="Organization">
+  return <ManagementPage title="Organization settings" description="Edit the identity and branding first configured during onboarding. SSO and connector administration remain available in their dedicated settings." eyebrow="Organization">
     <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry} empty={!resource.data} emptyTitle="Profile unavailable">
       {draft ? <>
         <Section title="Organization profile" description={writable ? "Changes are visible across Berry." : "Your role can view this managed profile but cannot change it."}>
           <form className="grid gap-3 sm:grid-cols-2" onSubmit={save}>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Name<Input disabled={!writable} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Application name<Input disabled={!writable} value={applicationName} onChange={(event) => updateBranding({ applicationName: event.currentTarget.value })} /></label>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Slug<Input disabled={!writable} pattern="[a-z0-9-]+" value={draft.slug} onChange={(event) => setDraft({ ...draft, slug: event.currentTarget.value })} /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Logo URL<Input disabled={!writable} type="url" value={draft.logoUrl ?? ""} onChange={(event) => setDraft({ ...draft, logoUrl: event.currentTarget.value || null })} placeholder="https://example.com/logo.svg" /></label>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Accent color<span className="flex items-center gap-2"><Input className="w-14 shrink-0 p-1" disabled={!writable} type="color" value={accentColor} onChange={(event) => updateBranding({ accentColor: event.currentTarget.value })} /><Input disabled={!writable} pattern="#[0-9A-Fa-f]{6}" value={accentColor} onChange={(event) => updateBranding({ accentColor: event.currentTarget.value })} /></span></label>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Timezone<Input disabled={!writable} value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.currentTarget.value })} /></label>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Language<Input disabled={!writable} value={draft.language} onChange={(event) => setDraft({ ...draft, language: event.currentTarget.value })} /></label>
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Support contact<Input disabled={!writable} type="email" value={draft.supportEmail ?? ""} onChange={(event) => setDraft({ ...draft, supportEmail: event.currentTarget.value || null })} /></label>

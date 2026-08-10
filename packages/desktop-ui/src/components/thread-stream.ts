@@ -210,6 +210,21 @@ function timelineEntryRunning(entry: TimelineEntry): boolean {
   );
 }
 
+function applySessionNote(
+  timeline: TimelineEntry[],
+  note: NoteEntry,
+): TimelineEntry[] {
+  if (note.note !== "compacting" && note.note !== "compacted") {
+    return [...timeline, note];
+  }
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const entry = timeline[index];
+    if (entry?.kind !== "note" || entry.note !== "compacting") continue;
+    return timeline.map((candidate, candidateIndex) => candidateIndex === index ? note : candidate);
+  }
+  return [...timeline, note];
+}
+
 export function reduceStream(state: StreamState, event: AgentStreamEvent): StreamState {
   switch (event.kind) {
     case "turn.start":
@@ -372,17 +387,35 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
       // transcript. Older runtimes can still send this marker, but rendering
       // it duplicates the same action as a decorative divider.
       if (event.note === "steered") return state;
-      return {
-        ...state,
-        ...boundedTimeline(state, [...state.timeline, { kind: "note", note: event.note, text: event.detail ?? event.note }]),
-      };
+      {
+        const note: NoteEntry = { kind: "note", note: event.note, text: event.detail ?? event.note };
+        const timeline = applySessionNote(state.timeline, note);
+        return {
+          ...state,
+          ...boundedTimeline(state, timeline),
+        };
+      }
     case "mode.changed":
       // Legacy streams remain decodable, but presentation changes are user-driven.
       return state;
     case "error":
       return { ...state, error: event.message };
-    case "turn.end":
-      return { ...state, turnActive: false, approval: null, question: null, endStatus: event.status };
+    case "turn.end": {
+      // Failed and cancelled compactions do not emit a completed note. Clear
+      // the transient marker when the turn terminates so replay cannot leave a
+      // permanent "Context auto-compacting" spinner behind.
+      const timeline = state.timeline.filter(
+        (entry) => entry.kind !== "note" || entry.note !== "compacting",
+      );
+      return {
+        ...state,
+        ...boundedTimeline(state, timeline),
+        turnActive: false,
+        approval: null,
+        question: null,
+        endStatus: event.status,
+      };
+    }
     default:
       return state;
   }

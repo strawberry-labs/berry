@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Test } from "@nestjs/testing";
-import { ApiEventStreamService, DURABLE_EVENT_POLL_MS } from "./event-stream.service.ts";
+import { ApiEventStreamService, DURABLE_EVENT_IDLE_POLL_MS, DURABLE_EVENT_POLL_MS } from "./event-stream.service.ts";
 import { DurableTurnService } from "../runtime/durable-turn.service.ts";
 
 afterEach(() => vi.useRealTimers());
@@ -134,6 +134,56 @@ describe("ApiEventStreamService", () => {
       { kind: "message.start", messageId: "message-1", role: "assistant" },
       { kind: "message.delta", messageId: "message-1", delta: "hello", channel: "text" },
     ]);
+    subscription.unsubscribe();
+  });
+
+  it("emits live reasoning before the terminal turn event", async () => {
+    vi.useFakeTimers();
+    const runId = "00000000-0000-7000-8000-000000000021";
+    const pages = [
+      [],
+      [envelope(runId, 1, { kind: "message.delta", messageId: "message-1", delta: "Checking", channel: "reasoning" })],
+      [envelope(runId, 2, { kind: "turn.end", turnId: runId, status: "completed" })],
+    ];
+    let call = 0;
+    const durable = {
+      eventsAfter: async () => pages[Math.min(call++, pages.length - 1)]!,
+    } as unknown as DurableTurnService;
+    const service = new ApiEventStreamService(durable);
+    const received: Array<MessageEvent<unknown> & { id?: string }> = [];
+    const stream = await service.streamDurable(
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000002",
+      null,
+    );
+    const subscription = stream.subscribe((event) => received.push(event));
+
+    await vi.advanceTimersByTimeAsync(DURABLE_EVENT_POLL_MS);
+    expect(received.map((event) => event.data)).toEqual([
+      { kind: "message.delta", messageId: "message-1", delta: "Checking", channel: "reasoning" },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(DURABLE_EVENT_POLL_MS);
+    expect(received.at(-1)?.data).toEqual({ kind: "turn.end", turnId: runId, status: "completed" });
+    subscription.unsubscribe();
+  });
+
+  it("backs off database reads while a durable turn has no new events", async () => {
+    vi.useFakeTimers();
+    const durable = {
+      eventsAfter: vi.fn(async () => []),
+    } as unknown as DurableTurnService;
+    const service = new ApiEventStreamService(durable);
+    const stream = await service.streamDurable(
+      "00000000-0000-7000-8000-000000000001",
+      "00000000-0000-7000-8000-000000000002",
+      null,
+    );
+    const subscription = stream.subscribe();
+
+    await vi.advanceTimersByTimeAsync(DURABLE_EVENT_IDLE_POLL_MS * 2);
+
+    expect(durable.eventsAfter).toHaveBeenCalledTimes(5);
     subscription.unsubscribe();
   });
 });

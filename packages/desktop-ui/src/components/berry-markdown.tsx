@@ -2,7 +2,9 @@ import * as React from "react";
 import { memo, type ReactNode } from "react";
 import { useTheme } from "next-themes";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { toast } from "sonner";
 import type { BundledLanguage, BundledTheme, ThemedToken } from "shiki";
 
@@ -161,7 +163,6 @@ function MarkdownTable({ children, className, ...props }: React.ComponentProps<"
 /* Markdown body (Berry AP / MessageResponse).                                */
 /* ------------------------------------------------------------------------ */
 
-const NO_PLUGINS: never[] = [];
 const FILE_PATH_RE = /((?:\.{0,2}\/|\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.[A-Za-z0-9_+-]+)(?::(\d+))?/g;
 
 function openFilePath(path: string, line?: number) {
@@ -222,8 +223,8 @@ export const Markdown = memo(function Markdown({
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={NO_PLUGINS}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
         components={{
           h1: ({ className: c, ...props }) => <h1 className={cn("mt-6 mb-4 text-lg font-semibold", c)} {...props} />,
           h2: ({ className: c, ...props }) => <h2 className={cn("mt-6 mb-4 text-base font-semibold", c)} {...props} />,

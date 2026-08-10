@@ -45,7 +45,6 @@ import { PromptEditor, type PromptEditorHandle } from "./prompt-editor";
 import type { SignedInUser } from "./shell/auth-boundary";
 import { DeploymentBrandLogo } from "./shell/deployment-brand";
 import { TaskRouteState } from "./tasks/task-route-state";
-import { DurableRunStatus } from "./tasks/durable-run-status";
 import { Composer } from "./tasks/web-composer";
 import { Thread } from "./tasks/web-task-view";
 import { planProgressFromConversation } from "./tasks/plan-progress-pill";
@@ -2185,7 +2184,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onViewTaskFiles={() => setTaskFilesOpen(true)}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
             />
-            <DurableRunStatus state={durableState} />
             <Composer
               config={config}
               activeTask={activeTask}

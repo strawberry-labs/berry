@@ -86,6 +86,7 @@ export const ADMIN_AREAS: readonly AdminArea[] = [
     id: "identity-security",
     label: "Identity & security",
     tabs: [
+      { id: "sso-scim", label: "SSO & SCIM", permission: "sso:read" },
       { id: "authentication", label: "Sign-in", permission: "auth_policy:read" },
       { id: "managed-policy", label: "Managed policy", permission: "policy:read" },
       { id: "service-accounts", label: "Service accounts", permission: "service_accounts:read" },
@@ -148,7 +149,7 @@ export const ADMIN_NAV: NavGroup[] = [
     { id: "access-control", label: "Access control", icon: Lock, permissions: ["rbac:read", "acl:read"] },
     { id: "ai-tools", label: "AI & tools", icon: Bot, permissions: ["models:read", "mcp:read", "org:read", "feature_flags:read", "guardrails:read"] },
     { id: "usage-billing", label: "Usage & billing", icon: LineChart, permissions: ["usage:read", "budgets:read", "billing:read", "reports:read"] },
-    { id: "identity-security", label: "Identity & security", icon: ShieldCheck, permissions: ["auth_policy:read", "policy:read", "service_accounts:read"] },
+    { id: "identity-security", label: "Identity & security", icon: ShieldCheck, permissions: ["sso:read", "auth_policy:read", "policy:read", "service_accounts:read"] },
     { id: "data-privacy", label: "Data & privacy", icon: Database, permission: "data_policy:read" },
     { id: "audit-log", label: "Audit log", icon: FileClock, permission: "audit:read" },
     { id: "organization", label: "Organization", icon: Landmark, permission: "org_settings:read" },

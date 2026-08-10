@@ -17,6 +17,7 @@ import {
   Section,
   StatusPill,
   SuccessMessage,
+  Switch,
   Toolbar,
   formatDateTime,
   formatMoney,
@@ -35,6 +36,13 @@ import { ReportsAlertsScreen } from "./reports-alerts-screen";
 import { AnalyticsScreen } from "./analytics-screen";
 import { AdminCatalogScreen } from "./admin-catalog-screens";
 import { AdminConnectorsScreen } from "./connectors-screen";
+import {
+  calculateCacheMetric,
+  UsageRangeControl,
+  usageRangeForPreset,
+  type UsageDateRange,
+  type UsageRangePreset,
+} from "./usage-controls";
 import {
   adminAreaForTab,
   resolvedAdminTab,
@@ -107,11 +115,12 @@ export function AdminScreen({
   );
 }
 function Overview({ client, config, tenantId }: ManagementScreenProps) {
-  const now = new Date(),
-    to = now.toISOString(),
-    from = new Date(now.getTime() - 30 * 864e5).toISOString();
+  const [preset, setPreset] = React.useState<UsageRangePreset>("month");
+  const [range, setRange] = React.useState<UsageDateRange>(() => usageRangeForPreset("month"));
+  const from = `${range.from}T00:00:00.000Z`;
+  const to = `${range.to}T23:59:59.999Z`;
   const r = useResource(
-    `overview:${tenantId}`,
+    `overview:${tenantId}:${from}:${to}`,
     async () =>
       client
         ? Promise.all([
@@ -130,11 +139,27 @@ function Overview({ client, config, tenantId }: ManagementScreenProps) {
     [] as any,
   );
   const [members, usage, health, audit] = r.data;
+  const cacheMetric = calculateCacheMetric({
+    inputTokens: Number(usage?.totals?.inputTokens ?? 0),
+    cacheReadTokens: Number(usage?.performance?.cacheReadTokens ?? 0),
+    cacheEligibleRequests: Number(usage?.performance?.cacheEligibleRequests ?? 0),
+    cacheHitRequests: Number(usage?.performance?.cacheHitRequests ?? 0),
+  });
   return (
     <ManagementPage
       title="Overview"
       description="Operational health, adoption, spend, and recent administration activity."
       eyebrow="Organization administration"
+      actions={
+        <UsageRangeControl
+          preset={preset}
+          range={range}
+          onChange={(nextPreset, nextRange) => {
+            setPreset(nextPreset);
+            setRange(nextRange);
+          }}
+        />
+      }
     >
       <AsyncState
         loading={r.loading}
@@ -176,6 +201,23 @@ function Overview({ client, config, tenantId }: ManagementScreenProps) {
                       : `${Math.round(usage.totals.successRate * 100)}%`,
                   status:
                     (usage.totals?.successRate ?? 1) < 0.9 ? "warning" : "good",
+                },
+                {
+                  label: "Input tokens",
+                  value: formatNumber(usage.totals?.inputTokens ?? 0),
+                },
+                {
+                  label: cacheMetric.label,
+                  value: cacheMetric.value == null ? "—" : `${Math.round(cacheMetric.value * 100)}%`,
+                  hint: cacheMetric.hint,
+                },
+                {
+                  label: "Cache-read tokens",
+                  value: formatNumber(usage.performance?.cacheReadTokens ?? 0),
+                },
+                {
+                  label: "P95 latency",
+                  value: usage.performance?.latencyP95Ms == null ? "—" : `${Math.round(usage.performance.latencyP95Ms)} ms`,
                 },
               ]}
             />
@@ -233,6 +275,7 @@ function Overview({ client, config, tenantId }: ManagementScreenProps) {
                     usage.totals?.successRate ??
                     derivedSuccessRate(usage.series ?? usage.burnDown ?? [])
                   }
+                  cacheRate={cacheMetric.value}
                   attributionRate={
                     (usage.totals?.requests ?? 0) > 0
                       ? (
@@ -1859,66 +1902,43 @@ function PolicyScreen({
               ) : null
             }
           >
-            <div className="grid gap-3 sm:grid-cols-2">
-              {Object.entries(r.data)
-                .filter(([k]) => !["tenantId", "updatedAt"].includes(k))
-                .map(([k, v]) => (
-                  <label key={k}>
-                    <span>{human(k)}</span>
-                    {typeof v === "boolean" ? (
-                      <Checkbox
-                        checked={v}
-                        disabled={!permissions.includes(write as any)}
-                        onCheckedChange={(checked) =>
-                          r.setData({ ...r.data, [k]: checked === true })
-                        }
-                      />
-                    ) : typeof v === "number" ? (
-                      <Input
-                        type="number"
-                        value={v}
-                        disabled={!permissions.includes(write as any)}
-                        onChange={(e) =>
-                          r.setData({
-                            ...r.data,
-                            [k]: Number(e.currentTarget.value),
-                          })
-                        }
-                      />
-                    ) : Array.isArray(v) ? (
-                      <Input
-                        value={v.join(", ")}
-                        disabled={!permissions.includes(write as any)}
-                        onChange={(e) =>
-                          r.setData({
-                            ...r.data,
-                            [k]: e.currentTarget.value
-                              .split(",")
-                              .map((x) => x.trim())
-                              .filter(Boolean),
-                          })
-                        }
-                      />
-                    ) : typeof v === "object" ? (
-                      <code>{JSON.stringify(v)}</code>
-                    ) : (
-                      <Input
-                        value={String(v ?? "")}
-                        disabled={!permissions.includes(write as any)}
-                        onChange={(e) =>
-                          r.setData({ ...r.data, [k]: e.currentTarget.value })
-                        }
-                      />
-                    )}
-                  </label>
-                ))}
-            </div>
+            {kind === "execution" ? (
+              <div className="grid gap-4">
+                <PolicyFieldGroup title="Sandbox" description="Execution availability and interaction requirements." keys={["sandboxEnabled", "codeExecutionEnabled", "approvalRequired"]} value={r.data} disabled={!permissions.includes(write as any)} onChange={r.setData} />
+                <PolicyFieldGroup title="Network" description="Outbound policy, domain boundaries, and available tool classes." keys={["outboundNetwork", "allowedDomains", "blockedDomains", "allowedToolClasses"]} value={r.data} disabled={!permissions.includes(write as any)} onChange={r.setData} />
+                <PolicyFieldGroup title="Limits" description="Per-run, concurrency, request-rate, token, and sandbox-minute quotas." keys={["maxRunSeconds", "maxConcurrency", "requestsPerMinute", "tokenQuota", "sandboxMinuteQuota"]} value={r.data} disabled={!permissions.includes(write as any)} onChange={r.setData} />
+              </div>
+            ) : (
+              <PolicyFieldsGrid value={r.data} disabled={!permissions.includes(write as any)} onChange={r.setData} />
+            )}
             {message ? <SuccessMessage>{message}</SuccessMessage> : null}
           </Section>
         ) : null}
       </AsyncState>
     </ManagementPage>
   );
+}
+
+function PolicyFieldGroup({ title, description, keys, value, disabled, onChange }: { title: string; description: string; keys: string[]; value: Record<string, any>; disabled: boolean; onChange: (value: any) => void }) {
+  return <div className="rounded-xl border border-border bg-card p-4"><h3 className="text-sm font-medium text-foreground">{title}</h3><p className="mt-1 text-xs text-muted-foreground">{description}</p><PolicyFieldsGrid keys={keys} value={value} disabled={disabled} onChange={onChange} /></div>;
+}
+
+function PolicyFieldsGrid({ keys, value, disabled, onChange }: { keys?: string[]; value: Record<string, any>; disabled: boolean; onChange: (value: any) => void }) {
+  const entries = Object.entries(value).filter(([key]) => !["tenantId", "updatedAt"].includes(key) && (!keys || keys.includes(key)));
+  return <div className="mt-3 grid gap-3 sm:grid-cols-2">{entries.map(([key, fieldValue]) => <label key={key} className="grid min-w-0 gap-1.5"><span className="text-xs font-medium text-foreground">{human(key)}</span>{typeof fieldValue === "boolean" ? <span className="flex h-9 items-center"><Switch checked={fieldValue} disabled={disabled} onCheckedChange={(checked) => onChange({ ...value, [key]: checked })} /></span> : typeof fieldValue === "number" ? <Input type="number" value={fieldValue} disabled={disabled} onChange={(event) => onChange({ ...value, [key]: Number(event.currentTarget.value) })} /> : Array.isArray(fieldValue) ? <Input value={fieldValue.join(", ")} disabled={disabled} onChange={(event) => onChange({ ...value, [key]: event.currentTarget.value.split(",").map((item) => item.trim()).filter(Boolean) })} /> : typeof fieldValue === "object" && fieldValue !== null ? <code className="overflow-auto rounded-md bg-muted/30 p-2 text-xs">{JSON.stringify(fieldValue)}</code> : <Input value={String(fieldValue ?? "")} disabled={disabled} onChange={(event) => onChange({ ...value, [key]: event.currentTarget.value })} />}{executionFieldHint(key) ? <span className="text-[11px] leading-4 text-muted-foreground">{executionFieldHint(key)}</span> : null}</label>)}</div>;
+}
+
+function executionFieldHint(key: string): string | null {
+  return ({
+    maxRunSeconds: "Seconds per run",
+    maxConcurrency: "Concurrent runs",
+    requestsPerMinute: "Requests per minute",
+    tokenQuota: "Organization token quota",
+    sandboxMinuteQuota: "Sandbox minutes",
+    allowedDomains: "Comma-separated domains",
+    blockedDomains: "Comma-separated domains",
+    allowedToolClasses: "Comma-separated tool classes",
+  } as Record<string, string>)[key] ?? null;
 }
 function ServiceAccounts({
   client,

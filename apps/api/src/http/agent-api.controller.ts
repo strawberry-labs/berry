@@ -16,7 +16,6 @@ import {
   MessageRoleSchema,
   MobileDeviceRegistrationCreateSchema,
   PermissionModeSchema,
-  QuestionAnswerSchema,
   ReasoningLevelSchema,
   resolveModelCapabilities,
   sealDurableSecret,
@@ -232,12 +231,36 @@ const ApprovalDecisionRequestSchema = ApprovalDecisionSchema.pick({ decision: tr
   reason: true,
 });
 
+const ApiQuestionAnswerAttachmentSchema = z.object({
+  fileId: z.string().uuid(),
+  name: z.string().trim().min(1).max(240),
+  mediaType: z.string().trim().min(1).max(255),
+  size: z.number().int().nonnegative(),
+  sourceKind: z.string().nullable().optional(),
+}).strict();
+
+const ApiQuestionAnswerSchema = z.object({
+  question: z.string().trim().min(1).max(2_000),
+  answer: z.string().trim().max(4_000),
+  selectedOptions: z.array(z.string().trim().min(1)).max(24).default([]),
+  attachments: z.array(ApiQuestionAnswerAttachmentSchema).max(100).default([]),
+  skipped: z.boolean().default(false),
+}).superRefine((answer, context) => {
+  if (!answer.skipped && !answer.answer && answer.attachments.length === 0) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["answer"], message: "Text or an attachment is required unless the question is skipped" });
+  }
+});
+
 const AnswerQuestionRequestSchema = z.object({
-  answer: z.string().trim().min(1),
+  answer: z.string().trim().max(20_000),
   answerMessageId: z.string().uuid().optional(),
   selectedOptions: z.array(z.string()).max(24).optional(),
-  answers: z.array(QuestionAnswerSchema).min(1).max(5).optional(),
-}).strict();
+  answers: z.array(ApiQuestionAnswerSchema).min(1).max(5).optional(),
+}).strict().superRefine((request, context) => {
+  if (!request.answer && !request.answers?.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["answer"], message: "An answer or attachment is required" });
+  }
+});
 const RecoveryActionSchema = z.object({
   action: z.enum(["retry", "mark-complete", "cancel"]),
 }).strict();
@@ -471,7 +494,11 @@ export class AgentApiController {
 
   @Post("/tasks")
   async createTask(@Req() httpRequest: AuthenticatedRequest, @Body() body: unknown) {
-    return this.store.createTask({ ...parseBody(CreateTaskRequestSchema, body), ownerUserId: httpRequest.auth?.user.id ?? null });
+    return this.store.createTask({
+      ...parseBody(CreateTaskRequestSchema, body),
+      permissionMode: "full-access",
+      ownerUserId: httpRequest.auth?.user.id ?? null,
+    });
   }
 
   @Get("/tasks")
@@ -688,7 +715,7 @@ export class AgentApiController {
     return this.store.createSession({
       taskId,
       parentSessionId: request.parentSessionId,
-      permissionMode: request.permissionMode,
+      permissionMode: "full-access",
     });
   }
 
@@ -781,10 +808,11 @@ export class AgentApiController {
     const baseRuntime = await this.runtimeConfig.resolve(tenantId, request);
     const [effectiveRuntime, connectorRuntime, departmentId] = await Promise.all([
       this.organizationCapabilities.effective(tenantId, userId),
-      this.connectors.runtime(tenantId, userId),
+      this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId }),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
     const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers, ...connectorRuntime], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
+    await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, resolvedRuntime.provider);
     const providerId = resolvedRuntime.provider.id;
     const mode = conversationKindFromTask(task);
     const modelDecision = await this.modelGovernance.resolve({
@@ -1000,9 +1028,12 @@ export class AgentApiController {
           provider,
           model: governedRequest.model ?? null,
           conversationKind: mode,
-          workspacePath: request.workspacePath,
+          // The sandbox root is deployment infrastructure, not a client
+          // preference. Keep model-visible paths aligned with the provider's
+          // actual writable root for new and resumed durable runs.
+          workspacePath: this.runtimeConfig.config.workspacePath,
           workspaceId: governedRequest.workspaceId ?? task.workspaceId,
-          permissionMode: governedRequest.permissionMode ?? session.permissionMode,
+          permissionMode: "full-access",
           reasoning: governedRequest.reasoning ?? "off",
           continueInterruptedTurn: request.continueInterruptedTurn === true,
           maxTokens: governedRequest.maxTokens ?? 8_000,
@@ -1068,7 +1099,7 @@ export class AgentApiController {
         sessionId,
         taskId: task.id,
         workspaceId: governedRequest.workspaceId ?? task.workspaceId,
-        permissionMode: governedRequest.permissionMode ?? session.permissionMode,
+        permissionMode: "full-access",
         attachments: normalizeAttachments(runtimeAttachments),
         images: imagesFromAttachments(runtimeAttachments),
         onAssistantMessage: (message) => {
@@ -1388,14 +1419,22 @@ export class AgentApiController {
   ) {
     const request = parseBody(AnswerQuestionRequestSchema, body);
     if (this.durableTurns.enabled) {
-      return {
-        ok: await this.durableTurns.answerQuestion(
-          tenantIdFromRequest(httpRequest),
-          httpRequest.auth!.user.id,
-          questionId,
-          request,
-        ),
-      };
+      const tenantId = tenantIdFromRequest(httpRequest);
+      const userId = httpRequest.auth!.user.id;
+      const context = await this.durableTurns.questionContext(tenantId, userId, questionId);
+      if (!context) throw new NotFoundException("Question not found");
+      const ok = await this.durableTurns.answerQuestion(
+        tenantId,
+        userId,
+        questionId,
+        request,
+      );
+      const message = ok && request.answerMessageId
+        ? (await this.store.listMessages(context.sessionId)).find(
+            (candidate) => candidate.id === request.answerMessageId,
+          )
+        : undefined;
+      return { ok, ...(message ? { message } : {}) };
     }
     return {
       ok: this.sessionHost.resolveQuestion(questionId, {

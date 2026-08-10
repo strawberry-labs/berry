@@ -3,7 +3,11 @@ import { AgentStreamEventSchema, HostPushEventSchema, type AgentStreamEvent, typ
 import { Observable, Subject } from "rxjs";
 import { DurableTurnService, parseEventCursor } from "../runtime/durable-turn.service.js";
 
-export const DURABLE_EVENT_POLL_MS = 150;
+// Keep active text visibly live, then back off quickly while a turn is quiet
+// (for example during a long tool call). Recursive scheduling also guarantees
+// that one slow query cannot overlap the next database read.
+export const DURABLE_EVENT_POLL_MS = 100;
+export const DURABLE_EVENT_IDLE_POLL_MS = 1_000;
 
 @Injectable()
 export class ApiEventStreamService {
@@ -48,8 +52,9 @@ export class ApiEventStreamService {
     let initial = await durableTurns.eventsAfter(tenantId, sessionId, normalizedCursor, 500, connectedAt);
     return new Observable((subscriber) => {
       let closed = false;
-      let polling = false;
       let lastCursor = normalizedCursor;
+      let pollDelay = DURABLE_EVENT_POLL_MS;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const seen = new Set<string>();
       const seenOrder: string[] = [];
       const emit = (envelope: typeof initial[number]) => {
@@ -68,8 +73,7 @@ export class ApiEventStreamService {
       for (const envelope of initial) emit(envelope);
       initial = [];
       const poll = async () => {
-        if (closed || polling) return;
-        polling = true;
+        if (closed) return;
         try {
           const events = await durableTurns.eventsAfter(
             tenantId,
@@ -79,17 +83,26 @@ export class ApiEventStreamService {
             lastCursor ? undefined : connectedAt,
           );
           for (const envelope of events) emit(envelope);
+          pollDelay = events.length > 0
+            ? DURABLE_EVENT_POLL_MS
+            : Math.min(DURABLE_EVENT_IDLE_POLL_MS, pollDelay * 2);
         } catch (error) {
-          if (!closed) subscriber.error(error);
+          if (!closed) {
+            closed = true;
+            subscriber.error(error);
+          }
         } finally {
-          polling = false;
+          if (!closed) schedule();
         }
       };
-      const timer = setInterval(() => void poll(), DURABLE_EVENT_POLL_MS);
-      timer.unref?.();
+      const schedule = () => {
+        timer = setTimeout(() => void poll(), pollDelay);
+        timer.unref?.();
+      };
+      schedule();
       return () => {
         closed = true;
-        clearInterval(timer);
+        if (timer) clearTimeout(timer);
       };
     });
   }

@@ -56,7 +56,11 @@ export function ProjectSwitcher({
           className="berry-project-switcher-popover berry-compact-selector-surface w-[min(320px,calc(100vw-26px))] p-0"
           >
           <Command>
-            <CommandInput placeholder="Search projects…" />
+            <CommandInput
+              placeholder="Search projects…"
+              className="berry-command-search-input"
+              wrapperClassName="berry-command-search-wrapper"
+            />
             <CommandList>
             <CommandEmpty>No projects found.</CommandEmpty>
             {projects.length > 0 ? (
