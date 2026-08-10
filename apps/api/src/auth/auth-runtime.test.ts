@@ -115,6 +115,34 @@ describe("Better Auth runtime config", () => {
     expect(authOptions.account?.accountLinking?.requireLocalEmailVerified).toBe(true);
   });
 
+  it("allows enterprise Google sign-in bursts without weakening other auth limits", () => {
+    const { authOptions } = createBetterAuthOptions({
+      env: {
+        NODE_ENV: "production",
+        BETTER_AUTH_SECRET: "test-secret-with-more-than-thirty-two-characters",
+        BERRY_AUTH_LOGIN_METHODS: "google",
+        BERRY_AUTH_RATE_LIMIT_WINDOW_SECONDS: "60",
+        BERRY_AUTH_RATE_LIMIT_MAX: "30",
+        BERRY_AUTH_SOCIAL_SIGN_IN_RATE_LIMIT_WINDOW_SECONDS: "60",
+        BERRY_AUTH_SOCIAL_SIGN_IN_RATE_LIMIT_MAX: "600",
+        BERRY_AUTH_IP_ADDRESS_HEADERS: "X-Berry-Client-IP, X-Forwarded-For",
+      },
+    });
+
+    expect(authOptions.rateLimit).toMatchObject({
+      enabled: true,
+      window: 60,
+      max: 30,
+      customRules: {
+        "/sign-in/social": { window: 60, max: 600 },
+      },
+    });
+    expect(authOptions.advanced?.ipAddress?.ipAddressHeaders).toEqual([
+      "x-berry-client-ip",
+      "x-forwarded-for",
+    ]);
+  });
+
   it("supports a Google-only deployment without exposing password login or signup", () => {
     const { authOptions, description } = createBetterAuthOptions({
       env: {

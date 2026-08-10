@@ -54,9 +54,12 @@ describe("self-host compose deployment", () => {
     expect(envExample).toContain("BERRY_ARTIFACT_S3_ENDPOINT=http://minio:9000");
     expect(compose).toContain("BERRY_AUTH_LOGIN_METHODS: ${BERRY_AUTH_LOGIN_METHODS:-password}");
     expect(compose).toContain("BERRY_AUTH_GOOGLE_REDIRECT_URI: ${BERRY_AUTH_GOOGLE_REDIRECT_URI:-}");
+    expect(compose).toContain("BERRY_AUTH_IP_ADDRESS_HEADERS: ${BERRY_AUTH_IP_ADDRESS_HEADERS:-x-berry-client-ip,x-forwarded-for}");
+    expect(compose).toContain("BERRY_AUTH_SOCIAL_SIGN_IN_RATE_LIMIT_MAX: ${BERRY_AUTH_SOCIAL_SIGN_IN_RATE_LIMIT_MAX:-600}");
     expect(compose).toContain("mc mb --ignore-existing");
     expect(compose).toContain('127.0.0.1:${BERRY_API_PORT:-3001}:3000');
     expect(caddyfile).toContain("reverse_proxy @api api:3000");
+    expect(caddyfile).toContain("header_up X-Berry-Client-IP {http.request.remote.host}");
     expect(caddyfile).toContain("reverse_proxy web:3108");
     expect(caddyfile).toContain("not path /v1/sessions/*/events /v1/tasks/*/events");
     expect(caddyfile).toContain('Cache-Control "no-cache, no-transform"');
