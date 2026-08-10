@@ -327,6 +327,48 @@ export class AgentApiController {
     return { image, decision };
   }
 
+  async #resolveVisionAdapter(
+    tenantId: string,
+    userId: string | null,
+    departmentId: string | null,
+    mode: ConversationKind,
+  ) {
+    const selected = await this.modelGovernance.auxiliaryDefault(tenantId, "vision");
+    if (!selected) return null;
+    const decision = await this.modelGovernance.resolve({
+      tenantId,
+      mode,
+      providerId: selected.providerId,
+      model: selected.model,
+      userId,
+      departmentId,
+    });
+    if (!decision.allowed || decision.policy?.capabilities.vision !== true) return null;
+    const runtime = await this.runtimeConfig.resolve(tenantId, {
+      provider: { id: selected.providerId },
+      model: selected.model,
+    });
+    const model = runtime.provider.models?.find((candidate) => candidate.id === selected.model);
+    if (resolveModelCapabilities(model).vision !== true) return null;
+    const maxTokens = Math.min(
+      resolveModelCapabilities(model).context?.maxOutputTokens ?? 2_048,
+      4_096,
+    );
+    return {
+      providerId: selected.providerId,
+      provider: await durableProviderTransport(runtime.provider, runtime.apiKey, runtime.credentialRef),
+      model: selected.model,
+      maxTokens,
+      modelPricing: modelCostSnapshot(runtime.provider, selected.model),
+      estimatedCostMicros: budgetEstimateFromRequest({
+        provider: runtime.provider,
+        model: selected.model,
+        estimatedInputTokens: 12_000,
+        estimatedOutputTokens: maxTokens,
+      }).toString(),
+    };
+  }
+
   #assertImageGenerationAvailable(access: {
     image: ReturnType<CloudRuntimeConfigService["imageGenerationInfo"]>;
     decision: ModelGovernanceDecision | null;
@@ -936,7 +978,8 @@ export class AgentApiController {
       } : {}),
     };
     const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedRequest.model);
-    const contextWindowTokens = resolveModelCapabilities(governedModel).context?.windowTokens
+    const governedCapabilities = resolveModelCapabilities(governedModel);
+    const contextWindowTokens = governedCapabilities.context?.windowTokens
       ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     const pricingSnapshot = modelCostSnapshot(governedRequest.provider, governedRequest.model);
     const hasModelPricing = Object.values(pricingSnapshot).some((value) => typeof value === "number");
@@ -1003,7 +1046,7 @@ export class AgentApiController {
       try {
         const imageInfo = imageAccess.image;
         const imageDecision = imageAccess.decision;
-        const [provider, mcpServers] = await Promise.all([
+        const [provider, mcpServers, vision] = await Promise.all([
           durableProviderTransport(
             governedRequest.provider,
             resolvedRuntime.apiKey,
@@ -1012,10 +1055,14 @@ export class AgentApiController {
           Promise.all(governedRequest.mcpServers
             .filter((server) => server.enabled && server.trusted)
             .map((server) => durableMcpServer(server))),
+          governedCapabilities.vision === true
+            ? Promise.resolve(null)
+            : this.#resolveVisionAdapter(tenantId, userId, departmentId, mode),
         ]);
         const builtInTools = [
           ...DURABLE_BASE_BUILT_IN_TOOLS,
           ...(imageInfo && imageDecision?.allowed ? ["create_image" as const] : []),
+          ...(vision ? ["inspect_images" as const] : []),
           ...(governedRequest.extraSkills.some((skill) => !skill.disableModelInvocation)
             ? ["activate_skill" as const]
             : []),
@@ -1038,10 +1085,12 @@ export class AgentApiController {
           continueInterruptedTurn: request.continueInterruptedTurn === true,
           maxTokens: governedRequest.maxTokens ?? 8_000,
           contextWindowTokens,
+          modelAcceptsImages: governedCapabilities.vision === true,
           modelPricing: pricingSnapshot,
           networkPolicy: governedRequest.networkPolicy,
           builtInTools,
           ...(imageInfo && imageDecision?.allowed ? { imageGeneration: imageInfo } : {}),
+          ...(vision ? { vision } : {}),
           mcpServers,
           extraSkills: governedRequest.extraSkills.map((skill) => ({
             name: skill.name,

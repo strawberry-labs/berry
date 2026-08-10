@@ -334,6 +334,19 @@ export const modelModeDefaults = pgTable("model_mode_defaults", {
   index("model_mode_defaults_tenant_provider_idx").on(table.tenantId, table.providerId),
 ]);
 
+export const modelAuxiliaryDefaults = pgTable("model_auxiliary_defaults", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  purpose: text("purpose").notNull(),
+  providerId: text("provider_id").notNull(),
+  model: text("model").notNull(),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("model_auxiliary_defaults_tenant_purpose_unique").on(table.tenantId, table.purpose),
+  index("model_auxiliary_defaults_tenant_provider_idx").on(table.tenantId, table.providerId),
+]);
+
 export const modelConversationKindDefaults = pgTable("model_conversation_kind_defaults", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
@@ -1066,6 +1079,22 @@ export const usageEvents = pgTable("usage_events", {
   index("usage_events_tenant_workspace_ts_idx").on(table.tenantId, table.workspaceId, table.ts),
   index("usage_events_tenant_agent_ts_idx").on(table.tenantId, table.agentId, table.ts),
   check("usage_events_nonnegative_tokens", sql`${table.tokensIn} >= 0 AND ${table.tokensOut} >= 0 AND ${table.tokensCached} >= 0 AND ${table.cacheReadTokens} >= 0 AND ${table.cacheWriteTokens} >= 0`),
+]);
+
+export const visionObservationCache = pgTable("vision_observation_cache", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  cacheKey: text("cache_key").notNull(),
+  providerId: text("provider_id").notNull(),
+  model: text("model").notNull(),
+  promptVersion: text("prompt_version").notNull(),
+  imageCount: integer("image_count").notNull(),
+  observation: text("observation").notNull(),
+  createdAt,
+  lastUsedAt: timestamp("last_used_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("vision_observation_cache_tenant_key_unique").on(table.tenantId, table.cacheKey),
+  index("vision_observation_cache_tenant_last_used_idx").on(table.tenantId, table.lastUsedAt),
 ]);
 
 export const usageRollups = pgTable("usage_rollups", {
@@ -4400,6 +4429,41 @@ END;
 $berry_full_access$;
 `.trim();
 
+export const VISION_MODEL_ROUTING_MIGRATION = `
+CREATE TABLE IF NOT EXISTS model_auxiliary_defaults (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  purpose text NOT NULL CHECK (purpose IN ('vision')),
+  provider_id text NOT NULL,
+  model text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, purpose)
+);
+CREATE INDEX IF NOT EXISTS model_auxiliary_defaults_tenant_provider_idx
+  ON model_auxiliary_defaults (tenant_id, provider_id);
+
+CREATE TABLE IF NOT EXISTS vision_observation_cache (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  cache_key text NOT NULL,
+  provider_id text NOT NULL,
+  model text NOT NULL,
+  prompt_version text NOT NULL,
+  image_count integer NOT NULL CHECK (image_count > 0),
+  observation text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_used_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, cache_key)
+);
+CREATE INDEX IF NOT EXISTS vision_observation_cache_tenant_last_used_idx
+  ON vision_observation_cache (tenant_id, last_used_at DESC);
+
+${tenantRlsSql("model_auxiliary_defaults")}
+
+${tenantRlsSql("vision_observation_cache")}
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -4507,4 +4571,5 @@ export const cloudMigrations = [
   { id: 46, name: "google_workspace_sso_v1", sql: GOOGLE_WORKSPACE_SSO_MIGRATION },
   { id: 47, name: "platform_role_rls_v1", sql: PLATFORM_ROLE_RLS_MIGRATION },
   { id: 48, name: "connector_artifacts_and_full_access_v1", sql: CONNECTOR_ARTIFACTS_AND_FULL_ACCESS_MIGRATION },
+  { id: 49, name: "vision_model_routing_v1", sql: VISION_MODEL_ROUTING_MIGRATION },
 ] as const;

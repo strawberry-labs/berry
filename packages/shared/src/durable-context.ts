@@ -516,6 +516,7 @@ export const DurableBuiltInToolNameSchema = z.enum([
   "git_log",
   "git_checkpoint",
   "create_image",
+  "inspect_images",
   "activate_skill",
 ]);
 export type DurableBuiltInToolName = z.infer<typeof DurableBuiltInToolNameSchema>;
@@ -605,6 +606,16 @@ export const DurableImageGenerationCapabilitySchema = z.object({
 }).strict();
 export type DurableImageGenerationCapability = z.infer<typeof DurableImageGenerationCapabilitySchema>;
 
+export const DurableVisionCapabilitySchema = z.object({
+  providerId: z.string().min(1),
+  provider: DurableProviderTransportSchema,
+  model: z.string().min(1),
+  maxTokens: z.number().int().positive().max(16_384).default(2_048),
+  modelPricing: JsonObjectSchema.default({}),
+  estimatedCostMicros: z.string().regex(/^\d+$/),
+}).strict();
+export type DurableVisionCapability = z.infer<typeof DurableVisionCapabilitySchema>;
+
 export const TurnIntentSchema = z.enum(["image_generation"]);
 export type TurnIntent = z.infer<typeof TurnIntentSchema>;
 
@@ -626,10 +637,12 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   continueInterruptedTurn: z.boolean().default(false),
   maxTokens: z.number().int().positive(),
   contextWindowTokens: z.number().int().positive(),
+  modelAcceptsImages: z.boolean().default(true),
   modelPricing: JsonObjectSchema.default({}),
   networkPolicy: JsonObjectSchema.optional(),
   builtInTools: z.array(DurableBuiltInToolNameSchema),
   imageGeneration: DurableImageGenerationCapabilitySchema.optional(),
+  vision: DurableVisionCapabilitySchema.optional(),
   mcpServers: z.array(DurableMcpServerSchema).default([]),
   extraSkills: z.array(DurableSkillSchema).default([]),
   attachments: z.array(z.object({
@@ -651,6 +664,16 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   }
   if (hasImageTool && !request.imageGeneration) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "The create_image tool requires admitted image generation configuration" });
+  }
+  const hasVisionTool = request.builtInTools.includes("inspect_images");
+  if (hasVisionTool && !request.vision) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["vision"], message: "The inspect_images tool requires admitted vision configuration" });
+  }
+  if (request.vision && !hasVisionTool) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["builtInTools"], message: "Admitted vision configuration requires the inspect_images tool" });
+  }
+  if (request.vision && request.modelAcceptsImages) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["vision"], message: "Native vision models must receive images directly without an auxiliary adapter" });
   }
 });
 export type DurableTurnRuntimeRequest = z.infer<typeof DurableTurnRuntimeRequestSchema>;

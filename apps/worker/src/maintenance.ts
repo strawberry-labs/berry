@@ -6,7 +6,7 @@ import type {
 import type { SqlExecutor } from "./sql-repositories.js";
 
 const BackfillPhaseSchema = z.enum(["workspace_files", "file_sources", "task_outcomes", "verify_file_blobs"]);
-const CleanupPhaseSchema = z.enum(["expired_memory", "turn_events", "retrieval_snapshots", "knowledge_tombstones", "orphan_budget_reservations", "orphan_files", "runtime_outbox"]);
+const CleanupPhaseSchema = z.enum(["expired_memory", "turn_events", "retrieval_snapshots", "vision_observations", "knowledge_tombstones", "orphan_budget_reservations", "orphan_files", "runtime_outbox"]);
 const BackfillCursorSchema = z.object({
   phase: BackfillPhaseSchema.default("workspace_files"),
   lastId: z.string().uuid().nullable().default(null),
@@ -446,6 +446,18 @@ export class SqlMaintenanceRunner implements MaintenanceRunner {
         )
         RETURNING snapshot.id
       `, [payload.tenantId, payload.diagnosticRetentionDays, payload.batchSize]);
+    } else if (phase === "vision_observations") {
+      rows = await executor.query<{ id: string }>(`
+        DELETE FROM vision_observation_cache observation
+        WHERE observation.id IN (
+          SELECT id FROM vision_observation_cache
+          WHERE tenant_id = $1::uuid
+            AND last_used_at < now() - ($2::int * interval '1 day')
+          ORDER BY last_used_at ASC, id ASC
+          LIMIT $3
+        )
+        RETURNING observation.id
+      `, [payload.tenantId, payload.diagnosticRetentionDays, payload.batchSize]);
     } else if (phase === "knowledge_tombstones") {
       rows = await executor.query<{ id: string }>(`
         DELETE FROM knowledge_sources source
@@ -866,7 +878,8 @@ function nextBackfillPhase(phase: z.infer<typeof BackfillPhaseSchema>): z.infer<
 function nextCleanupPhase(phase: z.infer<typeof CleanupPhaseSchema>): z.infer<typeof CleanupPhaseSchema> | null {
   if (phase === "expired_memory") return "turn_events";
   if (phase === "turn_events") return "retrieval_snapshots";
-  if (phase === "retrieval_snapshots") return "knowledge_tombstones";
+  if (phase === "retrieval_snapshots") return "vision_observations";
+  if (phase === "vision_observations") return "knowledge_tombstones";
   if (phase === "knowledge_tombstones") return "orphan_budget_reservations";
   if (phase === "orphan_budget_reservations") return "orphan_files";
   if (phase === "orphan_files") return "runtime_outbox";

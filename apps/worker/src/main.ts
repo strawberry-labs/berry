@@ -34,6 +34,7 @@ import { createDurableTurnToolsFromEnv } from "./mcp-tools.ts";
 import { S3FileObjectDeleter, SqlFileDeletionReceiptStore } from "./file-deletion.ts";
 import { SqlFileBlobProcessor } from "./file-blobs.ts";
 import { closeServer, startWorkerReadinessServer } from "./readiness.ts";
+import { DurableVisionToolExecutor, SqlVisionObservationCache } from "./vision-tools.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const durableConfig = durableContextConfigFromEnv(env);
@@ -98,8 +99,13 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   );
   const personalMemory = createPersonalMemoryProviderFromEnv(env);
   const memoryRepository = new SqlWorkerMemoryRepository(executor);
-  const memoryTools = new DurablePersonalMemoryToolExecutor(
+  const visionTools = new DurableVisionToolExecutor(
     sandboxContinuity,
+    new SqlVisionObservationCache(executor),
+    env,
+  );
+  const memoryTools = new DurablePersonalMemoryToolExecutor(
+    visionTools,
     memoryRepository,
     personalMemory,
     durableConfig.memoryEnabled,

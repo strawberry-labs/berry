@@ -1307,6 +1307,18 @@ export const OrgModelDefaultSchema = z.object({
 });
 export type OrgModelDefault = z.infer<typeof OrgModelDefaultSchema>;
 
+export const OrgAuxiliaryModelPurposeSchema = z.enum(["vision"]);
+export type OrgAuxiliaryModelPurpose = z.infer<typeof OrgAuxiliaryModelPurposeSchema>;
+
+export const OrgAuxiliaryModelDefaultSchema = z.object({
+  tenantId: z.string(),
+  purpose: OrgAuxiliaryModelPurposeSchema,
+  providerId: z.string(),
+  model: z.string(),
+  updatedAt: ISODateSchema,
+});
+export type OrgAuxiliaryModelDefault = z.infer<typeof OrgAuxiliaryModelDefaultSchema>;
+
 export const ModelGovernanceDecisionSchema = z.object({
   tenantId: z.string(),
   mode: LegacyConversationKindSchema,
@@ -2223,6 +2235,7 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     outputTokens: z.number(),
     totalTokens: z.number().int().nonnegative().optional(),
     costRawMicros: z.string().regex(/^\d+$/).optional(),
+    pricingSource: z.enum(["measured", "estimated"]).optional(),
     cacheReadTokens: z.number().int().nonnegative().optional(),
     cacheWriteTokens: z.number().int().nonnegative().optional(),
     cacheCreationTokens1h: z.number().int().nonnegative().optional(),
