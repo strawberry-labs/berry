@@ -474,6 +474,58 @@ describe("router client", () => {
     expect(text.join("")).toBe("answer");
   });
 
+  it("normalizes MiniMax M3 think tags split across streaming chunks", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.setHeader("Content-Type", "text/event-stream");
+      response.write('data: {"id":"1","model":"canopywave/minimax/minimax-m3","choices":[{"delta":{"content":"<thi"}}]}\n\n');
+      response.write('data: {"id":"1","model":"canopywave/minimax/minimax-m3","choices":[{"delta":{"content":"nk>Need current"}}]}\n\n');
+      response.write('data: {"id":"1","model":"canopywave/minimax/minimax-m3","choices":[{"delta":{"content":" sources.</thi"}}]}\n\n');
+      response.write('data: {"id":"1","model":"canopywave/minimax/minimax-m3","choices":[{"delta":{"content":"nk>Here is the answer."},"finish_reason":"stop"}]}\n\n');
+      response.end("data: [DONE]\n\n");
+    });
+    const client = new OpenRouterCompatibleClient({
+      provider: {
+        baseUrl,
+        defaultModel: "canopywave/minimax/minimax-m3",
+        kind: "berry-router",
+        name: "Berry Router",
+      },
+      apiKey: "key",
+    });
+    const reasoning: string[] = [];
+    const text: string[] = [];
+    for await (const chunk of client.stream({ messages: [{ role: "user", content: "latest news" }] })) {
+      if (chunk.reasoningDelta) reasoning.push(chunk.reasoningDelta);
+      if (chunk.delta) text.push(chunk.delta);
+    }
+    expect(reasoning.join("")).toBe("Need current sources.");
+    expect(text.join("")).toBe("Here is the answer.");
+  });
+
+  it("normalizes MiniMax M3 think tags in non-streaming responses", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        id: "1",
+        model: "canopywave/minimax/minimax-m3",
+        choices: [{ message: { content: "<think>Check first.</think>Visible answer." }, finish_reason: "stop" }],
+      }));
+    });
+    const client = new OpenRouterCompatibleClient({
+      provider: {
+        baseUrl,
+        defaultModel: "canopywave/minimax/minimax-m3",
+        kind: "berry-router",
+        name: "Berry Router",
+      },
+      apiKey: "key",
+    });
+    await expect(client.complete({ messages: [{ role: "user", content: "hi" }] })).resolves.toMatchObject({
+      content: "Visible answer.",
+      reasoning: "Check first.",
+    });
+  });
+
   it("maps Ollama native NDJSON chat, tools, reasoning, and usage", async () => {
     let body: Record<string, unknown> = {};
     let authorization: string | undefined;

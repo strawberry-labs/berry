@@ -412,6 +412,67 @@ export class OpenAIImageGenerationClient {
  * OpenAI-compatible Chat Completions transport (OpenAI, OpenRouter, Fireworks,
  * llama.cpp/Ollama/LM Studio local servers, Berry Router).
  */
+const THINK_OPEN_TAG = "<think>";
+const THINK_CLOSE_TAG = "</think>";
+
+function usesThinkTaggedReasoning(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return normalized === "minimax-m3" || normalized.endsWith("/minimax-m3");
+}
+
+function markerPrefixSuffixLength(value: string, marker: string): number {
+  const maxLength = Math.min(value.length, marker.length - 1);
+  for (let length = maxLength; length > 0; length -= 1) {
+    if (value.endsWith(marker.slice(0, length))) return length;
+  }
+  return 0;
+}
+
+class ThinkTaggedContentParser {
+  #channel: "text" | "reasoning" = "text";
+  #pending = "";
+
+  push(content: string, final = false): { text: string; reasoning: string } {
+    this.#pending += content;
+    let text = "";
+    let reasoning = "";
+
+    const append = (value: string) => {
+      if (this.#channel === "reasoning") reasoning += value;
+      else text += value;
+    };
+
+    while (this.#pending.length > 0) {
+      const marker = this.#channel === "text" ? THINK_OPEN_TAG : THINK_CLOSE_TAG;
+      const markerIndex = this.#pending.indexOf(marker);
+      if (markerIndex >= 0) {
+        append(this.#pending.slice(0, markerIndex));
+        this.#pending = this.#pending.slice(markerIndex + marker.length);
+        this.#channel = this.#channel === "text" ? "reasoning" : "text";
+        continue;
+      }
+
+      if (final) {
+        append(this.#pending);
+        this.#pending = "";
+        break;
+      }
+
+      const retainedLength = markerPrefixSuffixLength(this.#pending, marker);
+      const readyLength = this.#pending.length - retainedLength;
+      append(this.#pending.slice(0, readyLength));
+      this.#pending = this.#pending.slice(readyLength);
+      break;
+    }
+
+    return { text, reasoning };
+  }
+
+  finish(): { text: string; reasoning: string } {
+    return this.push("", true);
+  }
+}
+
 export class OpenAIChatCompletionsClient {
   readonly #provider: ProviderTransportInfo;
   readonly #apiKey: string | undefined;
@@ -432,17 +493,23 @@ export class OpenAIChatCompletionsClient {
     const payload = (await response.json()) as OpenAICompletionResponse;
     const choice = payload.choices[0];
     if (!choice) throw new RouterClientError("Provider returned no choices", response.status, JSON.stringify(payload));
+    const model = payload.model ?? options.model ?? this.#provider.defaultModel;
+    const rawContent = choice.message?.content ?? "";
+    const taggedContent = usesThinkTaggedReasoning(model)
+      ? new ThinkTaggedContentParser().push(rawContent, true)
+      : { text: rawContent, reasoning: "" };
     const nativeToolCalls = normalizeToolCalls(choice.message?.tool_calls);
-    const kimiToolCalls = nativeToolCalls ? undefined : parseKimiToolCalls(choice.message?.content ?? "");
+    const kimiToolCalls = nativeToolCalls ? undefined : parseKimiToolCalls(taggedContent.text);
     const result: ChatCompletionResult = {
       id: payload.id,
-      model: payload.model ?? options.model ?? this.#provider.defaultModel,
-      content: kimiToolCalls?.content ?? choice.message?.content ?? "",
+      model,
+      content: kimiToolCalls?.content ?? taggedContent.text,
       finishReason: kimiToolCalls ? "tool_calls" : choice.finish_reason ?? null,
       raw: payload as unknown as JsonValue,
     };
-    const reasoning = choice.message?.reasoning ?? choice.message?.reasoning_content;
-    if (typeof reasoning === "string" && reasoning.length > 0) result.reasoning = reasoning;
+    const nativeReasoning = choice.message?.reasoning ?? choice.message?.reasoning_content;
+    const reasoning = `${typeof nativeReasoning === "string" ? nativeReasoning : ""}${taggedContent.reasoning}`;
+    if (reasoning.length > 0) result.reasoning = reasoning;
     const toolCalls = nativeToolCalls ?? kimiToolCalls?.toolCalls;
     if (toolCalls) result.toolCalls = toolCalls;
     const usage = normalizeUsage(payload.usage);
@@ -458,6 +525,8 @@ export class OpenAIChatCompletionsClient {
     const response = await this.#post({ ...options, stream: true });
     const requestedModel = options.model ?? this.#provider.defaultModel;
     const headerUsage = normalizeUsageHeaders(response.headers);
+    const taggedContentParser = usesThinkTaggedReasoning(requestedModel) ? new ThinkTaggedContentParser() : undefined;
+    let lastChunk: ChatCompletionChunk | undefined;
     try {
       for await (const event of parseSse(response)) {
         if (event === "[DONE]") break;
@@ -472,15 +541,21 @@ export class OpenAIChatCompletionsClient {
         }
         const choice = payload.choices[0];
         if (!choice && !payload.usage) continue;
+        const rawContent = choice?.delta?.content ?? "";
+        const taggedContent = taggedContentParser?.push(rawContent, Boolean(choice?.finish_reason)) ?? {
+          text: rawContent,
+          reasoning: "",
+        };
         const chunk: ChatCompletionChunk = {
           id: payload.id,
           model: payload.model ?? options.model ?? this.#provider.defaultModel,
-          delta: choice?.delta?.content ?? "",
+          delta: taggedContent.text,
           finishReason: choice?.finish_reason ?? null,
           raw: payload as unknown as JsonValue,
         };
-        const reasoningDelta = choice?.delta?.reasoning ?? choice?.delta?.reasoning_content;
-        if (typeof reasoningDelta === "string" && reasoningDelta.length > 0) {
+        const nativeReasoningDelta = choice?.delta?.reasoning ?? choice?.delta?.reasoning_content;
+        const reasoningDelta = `${typeof nativeReasoningDelta === "string" ? nativeReasoningDelta : ""}${taggedContent.reasoning}`;
+        if (reasoningDelta.length > 0) {
           chunk.reasoningDelta = reasoningDelta;
         }
         const toolCalls = normalizeToolCallDeltas(choice?.delta?.tool_calls);
@@ -490,7 +565,19 @@ export class OpenAIChatCompletionsClient {
         if (finalUsage) chunk.usage = finalUsage;
         const attribution = routerAttribution(this.#provider, requestedModel, response.headers, rawPayload);
         if (attribution) chunk.attribution = attribution;
+        lastChunk = chunk;
         yield chunk;
+      }
+      const trailingContent = taggedContentParser?.finish();
+      if (lastChunk && trailingContent && (trailingContent.text.length > 0 || trailingContent.reasoning.length > 0)) {
+        yield {
+          id: lastChunk.id,
+          model: lastChunk.model,
+          delta: trailingContent.text,
+          ...(trailingContent.reasoning.length > 0 ? { reasoningDelta: trailingContent.reasoning } : {}),
+          finishReason: null,
+          raw: lastChunk.raw,
+        };
       }
     } catch (error) {
       if (error instanceof RouterClientError || options.signal?.aborted) throw error;
