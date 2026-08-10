@@ -16,27 +16,44 @@ describe("formatSkillsForSystemPrompt", () => {
 	it("adds mandatory format routing when the complete AESG artifact set is visible", () => {
 		const prompt = formatSkillsForSystemPrompt([
 			skill("AESG branding", "aesg-branding"),
+			skill("CV Creator", "cv-creator"),
 			skill("AESG Word documents", "docx"),
 			skill("AESG PDF documents", "pdf"),
 			skill("AESG PowerPoint presentations", "pptx"),
 			skill("AESG Excel workbooks", "xlsx"),
 		]);
 
-		expect(prompt).toContain("# AESG Artifact Skill Routing");
-		expect(prompt).toContain('activate the skill named "AESG branding" and every matching format skill');
-		expect(prompt).toContain('route to "AESG branding" then "AESG Word documents"');
-		expect(prompt).toContain("default to DOCX");
+		expect(prompt).toContain("# AESG artifact workspace");
+		expect(prompt).toContain('activate "AESG branding" and the matching skill');
+		expect(prompt).toContain('activate "AESG branding" and "CV Creator"');
+		expect(prompt).toContain("`/workspace/inputs/<file-id>/<filename>`");
+		expect(prompt).toContain("`/managed-skills/<skill-id>` (read-only)");
+		expect(prompt).toContain("Final deliverables only: `/workspace/outputs`");
 	});
 
 	it("omits AESG routing when a required skill is unavailable to the model", () => {
 		const prompt = formatSkillsForSystemPrompt([
 			skill("AESG branding", "aesg-branding"),
+			skill("CV Creator", "cv-creator"),
 			skill("AESG Word documents", "docx"),
 			skill("AESG PDF documents", "pdf"),
 			skill("AESG PowerPoint presentations", "pptx"),
 			skill("AESG Excel workbooks", "xlsx", true),
 		]);
 
-		expect(prompt).not.toContain("# AESG Artifact Skill Routing");
+		expect(prompt).not.toContain("# AESG artifact workspace");
+	});
+
+	it("keeps format routing when the optional CV skill is unavailable", () => {
+		const prompt = formatSkillsForSystemPrompt([
+			skill("AESG branding", "aesg-branding"),
+			skill("AESG Word documents", "docx"),
+			skill("AESG PDF documents", "pdf"),
+			skill("AESG PowerPoint presentations", "pptx"),
+			skill("AESG Excel workbooks", "xlsx"),
+		]);
+
+		expect(prompt).toContain("# AESG artifact workspace");
+		expect(prompt).not.toContain("For a CV or resume");
 	});
 });

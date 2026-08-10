@@ -63,7 +63,7 @@ export const template = Template({
     { user: "root" },
   )
   .runCmd(
-    "id -u user >/dev/null 2>&1 || useradd --create-home --shell /bin/bash user; mkdir -p /workspace/input /workspace/outputs /workspace/tmp /workspace/rendered /workspace/.berry; ln -sfn /workspace/outputs /workspace/output; ln -sfn /opt/aesg/skills /workspace/.berry/managed-skills; ln -sfn /opt/aesg/skills /managed-skills; chmod -R a+rX /opt/aesg; chown -R user:user /workspace",
+    "id -u user >/dev/null 2>&1 || useradd --create-home --shell /bin/bash user; mkdir -p /workspace/input /workspace/inputs /workspace/outputs /workspace/tmp /workspace/rendered /workspace/.berry; ln -sfn /workspace/outputs /workspace/output; ln -sfn /opt/aesg/skills /workspace/.berry/managed-skills; ln -sfn /opt/aesg/skills /managed-skills; chmod -R a+rX /opt/aesg; chown -R user:user /workspace",
     { user: "root" },
   )
   .setEnvs({
