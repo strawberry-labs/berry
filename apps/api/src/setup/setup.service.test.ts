@@ -146,6 +146,15 @@ describe("SetupService", () => {
     expect(status.connectors.callbackUrl).toBe("https://ai.aesg.com/v1/connectors/google/callback");
   });
 
+  it("publishes versioned Berry branding URLs for S3-backed logo and favicon files", async () => {
+    const logoFileId = "00000000-0000-7000-8000-000000000204";
+    const faviconFileId = "00000000-0000-7000-8000-000000000205";
+    const status = await setupService({ profileBranding: { applicationName: "AESG AI", logoFileId, faviconFileId } }).status();
+
+    expect(status.organization.logoUrl).toBe(`/v1/branding/logo?v=${logoFileId}`);
+    expect(status.organization.faviconUrl).toBe(`/v1/branding/favicon?v=${faviconFileId}`);
+  });
+
   it("keeps deployment and contact details private until setup is unlocked", async () => {
     const status = await setupService().status();
 
@@ -268,6 +277,7 @@ function setupService(overrides: {
     storage: ReturnType<typeof vi.fn>;
   };
   deploymentSetup?: Record<string, unknown>;
+  profileBranding?: Record<string, unknown>;
   env?: NodeJS.ProcessEnv;
 } = {}) {
   const deploymentSetup: Record<string, unknown> = {
@@ -285,7 +295,7 @@ function setupService(overrides: {
       query: async (sql: string) => {
         if (sql.includes("SELECT name, settings FROM tenants")) return [{ name: "AESG", settings: { deploymentSetup } }];
         if (sql.includes("SELECT settings FROM tenants")) return [{ settings: { deploymentSetup } }];
-        if (sql.includes("FROM organization_profiles")) return [{ logo_url: null, support_email: "support@aesg.com", security_email: "security@aesg.com", timezone: "Asia/Dubai", branding: { applicationName: "AESG AI" } }];
+        if (sql.includes("FROM organization_profiles")) return [{ logo_url: null, support_email: "support@aesg.com", security_email: "security@aesg.com", timezone: "Asia/Dubai", branding: overrides.profileBranding ?? { applicationName: "AESG AI" } }];
         if (sql.includes("FROM sso_connections")) return [{ client_id: "sso.apps.googleusercontent.com", client_secret_envelope: { ciphertext: "sso-plaintext-secret" }, domains: ["aesg.com"], jit_provisioning: true, status: "enabled" }];
         if (sql.includes("FROM connector_provider_credentials")) return [{ client_id: "connectors.apps.googleusercontent.com", client_secret_envelope: { ciphertext: "connector-plaintext-secret" }, picker_api_key_envelope: { ciphertext: "picker-secret" }, picker_project_number: "123456789012" }];
         if (sql.includes("FROM organization_connectors")) return [{ connector_key: "google-workspace", enabled: true, max_access_level: "read", workspace_access_mode: "selected_files" }];

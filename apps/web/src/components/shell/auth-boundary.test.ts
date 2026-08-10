@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { authDestination, oauthErrorMessage, sanitizedAuthUrl } from "./auth-boundary.tsx";
+import { resolveDeploymentBrandAssetUrl } from "./deployment-brand.tsx";
 import { deploymentAccentTokens } from "./deployment-accent.ts";
 import { googleSsoRequest } from "./google-sso-button.tsx";
 
@@ -26,6 +27,18 @@ describe("authDestination", () => {
       loading: false,
       pathname: "/login",
     })).toBe("/");
+  });
+});
+
+describe("resolveDeploymentBrandAssetUrl", () => {
+  it("resolves Berry branding paths against a separate API origin", () => {
+    expect(resolveDeploymentBrandAssetUrl("https://api.example.test", "/v1/branding/logo?v=file"))
+      .toBe("https://api.example.test/v1/branding/logo?v=file");
+  });
+
+  it("preserves an external legacy logo URL", () => {
+    expect(resolveDeploymentBrandAssetUrl("https://api.example.test", "https://assets.example.test/logo.svg"))
+      .toBe("https://assets.example.test/logo.svg");
   });
 });
 

@@ -58,6 +58,8 @@ describe("reference-safe logical file garbage collection", () => {
     expect(referenceQuery).toContain("JOIN workspace_files");
     expect(referenceQuery).toContain("FROM file_uploads");
     expect(referenceQuery).toContain("upload.status IN ('uploading')");
+    expect(referenceQuery).toContain("FROM organization_profiles profile");
+    expect(referenceQuery).toContain("profile.branding->>'faviconFileId'");
     expect(referenceQuery).not.toContain("task.deleted_at");
   });
 

@@ -3490,7 +3490,22 @@ export type AuthenticationPolicy = z.infer<typeof AuthenticationPolicySchema>;
 export const DataGovernancePolicySchema = z.object({ tenantId: z.string(), conversationRetentionDays: z.number().int().nonnegative(), temporaryChatHours: z.number().int().nonnegative(), retentionByDataType: z.record(z.number().int().nonnegative()), residency: z.string(), piiFilterMode: z.enum(["off", "warn", "block"]), credentialFilterMode: z.enum(["off", "warn", "block"]), moderationHookConfigured: z.boolean(), legalHoldEnabled: z.boolean(), updatedAt: ISODateSchema });
 export type DataGovernancePolicy = z.infer<typeof DataGovernancePolicySchema>;
 export const OrganizationDomainSchema = z.object({ id: z.string(), domain: z.string(), status: z.enum(["pending", "verified", "failed"]), customDomain: z.boolean(), verifiedAt: ISODateSchema.nullable() });
-export const OrganizationProfileSchema = z.object({ tenantId: z.string(), name: z.string(), slug: z.string(), logoUrl: z.string().nullable(), timezone: z.string(), language: z.string(), supportEmail: z.string().email().nullable(), securityEmail: z.string().email().nullable(), deploymentMode: z.string(), region: z.string().nullable(), announcements: z.array(z.object({ id: z.string(), message: z.string(), active: z.boolean() })), termsUrl: z.string().url().nullable(), privacyUrl: z.string().url().nullable(), branding: z.record(JsonValueSchema), domains: z.array(OrganizationDomainSchema), updatedAt: ISODateSchema });
+export const OrganizationBrandingAssetKindSchema = z.enum(["logo", "favicon"]);
+export type OrganizationBrandingAssetKind = z.infer<typeof OrganizationBrandingAssetKindSchema>;
+export const ORGANIZATION_LOGO_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/svg+xml"] as const;
+export const ORGANIZATION_FAVICON_MEDIA_TYPES = ["image/png", "image/webp", "image/svg+xml", "image/x-icon", "image/vnd.microsoft.icon"] as const;
+export const ORGANIZATION_LOGO_MAX_BYTES = 5 * 1024 * 1024;
+export const ORGANIZATION_FAVICON_MAX_BYTES = 1024 * 1024;
+export const OrganizationBrandingSchema = z.record(JsonValueSchema).superRefine((branding, context) => {
+  for (const key of ["logoFileId", "faviconFileId"] as const) {
+    const value = branding[key];
+    if (value !== undefined && value !== null && !z.string().uuid().safeParse(value).success) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: `${key} must be a Berry file ID` });
+    }
+  }
+});
+export type OrganizationBranding = z.infer<typeof OrganizationBrandingSchema>;
+export const OrganizationProfileSchema = z.object({ tenantId: z.string(), name: z.string(), slug: z.string(), logoUrl: z.string().nullable(), timezone: z.string(), language: z.string(), supportEmail: z.string().email().nullable(), securityEmail: z.string().email().nullable(), deploymentMode: z.string(), region: z.string().nullable(), announcements: z.array(z.object({ id: z.string(), message: z.string(), active: z.boolean() })), termsUrl: z.string().url().nullable(), privacyUrl: z.string().url().nullable(), branding: OrganizationBrandingSchema, domains: z.array(OrganizationDomainSchema), updatedAt: ISODateSchema });
 export type OrganizationProfile = z.infer<typeof OrganizationProfileSchema>;
 
 export const ServiceAccountSchema = z.object({ id: z.string(), tenantId: z.string(), name: z.string(), status: z.enum(["active", "revoked", "expired"]), permissions: z.array(OrgPermissionSchema), departmentId: z.string().nullable(), resourceRestrictions: z.array(z.object({ type: z.string(), id: z.string() })), expiresAt: ISODateSchema.nullable(), lastUsedAt: ISODateSchema.nullable(), tokenLast4: z.string(), createdAt: ISODateSchema, updatedAt: ISODateSchema });
