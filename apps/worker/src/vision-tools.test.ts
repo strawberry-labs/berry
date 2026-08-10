@@ -87,10 +87,40 @@ describe("DurableVisionToolExecutor", () => {
     const executor = new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" });
     const snapshot = visionSnapshot();
     await executor.execute(snapshot, visionStep({ mode: "focused", question: "What does the label say?" }));
+    snapshot.steps = [{ ...visionStep({ mode: "focused", question: "What does the label say?" }), state: "completed" }];
     await executor.execute(snapshot, visionStep({ mode: "focused", question: "What color is the helmet?" }));
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
     expect(JSON.parse(String(request?.body))).toMatchObject({ max_tokens: 1_024 });
+  });
+
+  it("reuses the first focused observation by stable user intent when the model paraphrases its question", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
+      id: "vision-response",
+      model: "minimax-m3",
+      choices: [{ message: { content: "The model name is GPT-5.5." }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const cache = new MemoryVisionCache();
+    const base: DurableTurnToolExecutor = {
+      modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
+      execute: async () => { throw new Error("unexpected base execution"); },
+    };
+    const executor = new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" });
+
+    await executor.execute(
+      visionSnapshot(),
+      visionStep({ mode: "focused", question: "What exact AI model name is most prominent?" }),
+    );
+    const repeated = await executor.execute(
+      visionSnapshot(),
+      visionStep({ mode: "focused", question: "Quote the prominent model identifier." }),
+    );
+
+    expect(repeated.output).toMatchObject({ vision: { cacheHit: true } });
+    expect(repeated.usage).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("guides text-only models to one task-directed inspection without searching for attachments", () => {

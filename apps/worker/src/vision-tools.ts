@@ -135,7 +135,16 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       .flatMap((part) => part.type === "image_url" ? [part] : []);
     if (images.length === 0) throw new Error("No inspectable images are available in this turn");
 
-    const cacheKey = visionCacheKey(runtime.vision.providerId, runtime.vision.model, images, mode, question);
+    const focusIdentity = mode === "focused"
+      ? focusedCacheIdentity(snapshot, runtime.input, question!)
+      : undefined;
+    const cacheKey = visionCacheKey(
+      runtime.vision.providerId,
+      runtime.vision.model,
+      images,
+      mode,
+      focusIdentity,
+    );
     const cached = await this.cache.get(snapshot.tenantId, cacheKey);
     if (cached) {
       return {
@@ -215,7 +224,7 @@ function visionCacheKey(
   model: string,
   images: readonly Extract<ChatContentPart, { type: "image_url" }>[],
   mode: "overview" | "focused",
-  question: string | undefined,
+  focusIdentity: { scope: "turn-intent" | "question"; value: string } | undefined,
 ): string {
   const hash = createHash("sha256");
   hash.update(VISION_PROMPT_VERSION);
@@ -231,9 +240,25 @@ function visionCacheKey(
   }
   if (mode === "focused") {
     hash.update("\0");
-    hash.update(normalizeQuestion(question ?? ""));
+    hash.update(focusIdentity?.scope ?? "question");
+    hash.update("\0");
+    hash.update(normalizeQuestion(focusIdentity?.value ?? ""));
   }
   return hash.digest("hex");
+}
+
+function focusedCacheIdentity(
+  snapshot: DurableTurnSnapshot,
+  turnInput: string,
+  question: string,
+): { scope: "turn-intent" | "question"; value: string } {
+  const hasPriorInspection = (snapshot.steps ?? []).some((step) => {
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    return step.state === "completed" && toolName === "inspect_images";
+  });
+  return hasPriorInspection
+    ? { scope: "question", value: question }
+    : { scope: "turn-intent", value: turnInput };
 }
 
 function visionOutput(
