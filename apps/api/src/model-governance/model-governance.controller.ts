@@ -75,8 +75,12 @@ export class ModelGovernanceController {
     await this.requirePermission(request, tenantId, "models:read");
     await this.synchronizeRuntimeCatalog(tenantId);
     const parsedMode = mode ? parseConversationKind(mode) : undefined;
-    const stored = await this.models.listModels(tenantId, { mode: parsedMode, includeBlocked: includeBlocked === "true" });
-    return z.array(OrgModelPolicySchema).parse(synchronizeRuntimeModels(tenantId, stored));
+    const includeBlockedModels = includeBlocked === "true";
+    const stored = await this.models.listModels(tenantId, { includeBlocked: true });
+    const synchronized = synchronizeRuntimeModels(tenantId, stored)
+      .filter((policy) => includeBlockedModels || policy.status === "allowed")
+      .filter((policy) => !parsedMode || policy.modeAllow.includes(parsedMode));
+    return z.array(OrgModelPolicySchema).parse(synchronized);
   }
 
   @Put("/policies")

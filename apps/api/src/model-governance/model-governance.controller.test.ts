@@ -4,7 +4,7 @@ import { Test } from "@nestjs/testing";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import type { SessionHost } from "@berry/local-agent";
 import request from "supertest";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { AgentApiModule } from "../http/agent-api.module.ts";
@@ -18,6 +18,7 @@ describe("Model governance API", () => {
   afterEach(async () => {
     await app?.close();
     app = null;
+    vi.unstubAllEnvs();
   });
 
   it("filters allowed models through /models and resolves enforced per-mode defaults", async () => {
@@ -117,6 +118,40 @@ describe("Model governance API", () => {
       .expect(200)
       .expect(({ body }) => {
         expect(body.some((entry: { model: string }) => entry.model === "legacy-risky")).toBe(true);
+      });
+  });
+
+  it("keeps blocked runtime-catalog models out of the selectable list", async () => {
+    vi.stubEnv("BERRY_API_MODEL_MODE", "live");
+    vi.stubEnv("BERRY_ROUTER_INFERENCE_BASE_URL", "https://router.example.test/v1");
+    vi.stubEnv("BERRY_ROUTER_API_KEY", "test-router-key");
+    vi.stubEnv("BERRY_ROUTER_DEFAULT_MODEL", "runtime-fast");
+    vi.stubEnv("BERRY_ROUTER_MODELS_JSON", JSON.stringify([
+      { id: "runtime-fast", name: "Runtime Fast", capabilities: { tools: true } },
+    ]));
+    vi.stubEnv("BERRY_ROUTER_IMAGE_COST_MICROS", "0");
+    app = await createApp();
+
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/models/policies`)
+      .set(authHeader())
+      .send({ providerId: "router", model: "runtime-fast", status: "blocked" })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/models`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.some((entry: { model: string }) => entry.model === "runtime-fast")).toBe(false);
+      });
+
+    await request(app.getHttpServer())
+      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/models?includeBlocked=true`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toContainEqual(expect.objectContaining({ model: "runtime-fast", status: "blocked" }));
       });
   });
 
