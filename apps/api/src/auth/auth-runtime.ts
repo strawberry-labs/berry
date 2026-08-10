@@ -110,7 +110,10 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
   }
 
   const trustedOrigins = parseCsv(env.BERRY_AUTH_TRUSTED_ORIGINS);
+  const authIpAddressHeaders = parseCsv(env.BERRY_AUTH_IP_ADDRESS_HEADERS).map((header) => header.toLowerCase());
   const production = env.NODE_ENV === "production";
+  const socialSignInRateLimitWindow = positiveInteger(env.BERRY_AUTH_SOCIAL_SIGN_IN_RATE_LIMIT_WINDOW_SECONDS, 60);
+  const socialSignInRateLimitMax = positiveInteger(env.BERRY_AUTH_SOCIAL_SIGN_IN_RATE_LIMIT_MAX, 600);
   const loginMethods = new Set(parseCsv(env.BERRY_AUTH_LOGIN_METHODS).map((method) => method.toLowerCase()));
   const passwordEnabled = loginMethods.size === 0 || loginMethods.has("password");
   const googleEnabled = loginMethods.has("google");
@@ -142,6 +145,12 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
       enabled: production,
       window: positiveInteger(env.BERRY_AUTH_RATE_LIMIT_WINDOW_SECONDS, 60),
       max: positiveInteger(env.BERRY_AUTH_RATE_LIMIT_MAX, 60),
+      customRules: {
+        "/sign-in/social": {
+          window: socialSignInRateLimitWindow,
+          max: socialSignInRateLimitMax,
+        },
+      },
     },
     ...(pool ? {
       databaseHooks: {
@@ -274,6 +283,11 @@ export function createBetterAuthOptions(options: CreateBerryAuthOptions = {}): {
     },
     advanced: {
       useSecureCookies: production,
+      ...(authIpAddressHeaders.length > 0 ? {
+        ipAddress: {
+          ipAddressHeaders: authIpAddressHeaders,
+        },
+      } : {}),
       database: {
         generateId: "uuid",
       },

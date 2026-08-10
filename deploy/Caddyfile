@@ -39,6 +39,7 @@
 
 	@api path /v1/* /healthz /readyz
 	reverse_proxy @api api:3000 {
+		header_up X-Berry-Client-IP {http.request.remote.host}
 		flush_interval -1
 	}
 
