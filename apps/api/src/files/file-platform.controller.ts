@@ -1,7 +1,9 @@
 import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Post, Query, Req, Res, UnauthorizedException } from "@nestjs/common";
-import type { ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
+import { OrganizationBrandingAssetKindSchema } from "@berry/shared";
 import { z } from "zod";
+import { PublicAuth } from "../auth/auth.decorators.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { FilePlatformService } from "./file-platform.service.ts";
 
@@ -112,6 +114,28 @@ export class FilePlatformController {
   @Delete(":fileId")
   remove(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string) {
     return this.files.removeFromLibrary(tenant(), user(request), parse(z.string().uuid(), fileId));
+  }
+}
+
+@Controller("/v1/branding")
+@PublicAuth()
+export class BrandingAssetController {
+  constructor(@Inject(FilePlatformService) private readonly files: FilePlatformService) {}
+
+  @Get(":kind")
+  content(
+    @Req() request: IncomingMessage,
+    @Param("kind") kind: string,
+    @Query("v") version: string | undefined,
+    @Res() response: ServerResponse,
+  ) {
+    return this.files.streamBrandingAsset(
+      tenant(),
+      parse(OrganizationBrandingAssetKindSchema, kind),
+      version,
+      response,
+      typeof request.headers["if-none-match"] === "string" ? request.headers["if-none-match"] : undefined,
+    );
   }
 }
 

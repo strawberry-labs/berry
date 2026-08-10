@@ -97,6 +97,11 @@ export async function garbageCollectFileIfUnreferenced(
         SELECT 1 FROM file_uploads upload
         WHERE upload.tenant_id = $1::uuid AND upload.file_id = $2::uuid
           AND upload.status IN ('uploading')
+      ) OR EXISTS (
+        SELECT 1 FROM organization_profiles profile
+        WHERE profile.tenant_id = $1::uuid
+          AND (profile.branding->>'logoFileId' = $2::uuid::text
+            OR profile.branding->>'faviconFileId' = $2::uuid::text)
       )
     ) AS reference_exists
   `, [tenantId, fileId]);

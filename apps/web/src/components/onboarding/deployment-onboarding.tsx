@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import GoogleSsoButton from "../shell/google-sso-button.tsx";
+import { resolveDeploymentBrandAssetUrl } from "../shell/deployment-brand.tsx";
 
 type StepStatus = "complete" | "current" | "pending";
 
@@ -151,12 +152,13 @@ export function DeploymentOnboarding({ baseUrl, initialToken }: { baseUrl: strin
   if (loading) return <SetupLoading />;
   if (!status) return <SetupFailure error={error || "Setup status is unavailable."} onRetry={() => window.location.reload()} />;
   if (status.required && !status.unlocked) return <SetupUnlock status={status} busy={busy} error={error} onSubmit={unlock} />;
+  const logoUrl = resolveDeploymentBrandAssetUrl(baseUrl, status.organization.logoUrl);
 
   return (
     <main className="berry-onboarding-shell" aria-label="Berry deployment onboarding">
       <aside className="berry-onboarding-rail">
         <div className="berry-onboarding-brand">
-          {status.organization.logoUrl ? <img src={status.organization.logoUrl} alt="" /> : <BerryLogo alt="" />}
+          {logoUrl ? <img src={logoUrl} alt="" /> : <BerryLogo alt="" />}
           <div><strong>{status.applicationName}</strong><span>Deployment setup</span></div>
         </div>
         <nav aria-label="Setup progress">

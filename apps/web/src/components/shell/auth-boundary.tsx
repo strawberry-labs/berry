@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
-import { DEFAULT_DEPLOYMENT_BRAND, DeploymentBrandContext, DeploymentBrandLogo, useDeploymentBrand, type DeploymentBrand } from "./deployment-brand.tsx";
+import { DEFAULT_DEPLOYMENT_BRAND, DeploymentBrandContext, DeploymentBrandLogo, resolveDeploymentBrandAssetUrl, useDeploymentBrand, type DeploymentBrand } from "./deployment-brand.tsx";
 
 const GoogleSsoButton = React.lazy(() => import("./google-sso-button.tsx"));
 const DeploymentOnboarding = React.lazy(() => import("../onboarding/deployment-onboarding.tsx").then((module) => ({ default: module.DeploymentOnboarding })));
@@ -18,6 +18,19 @@ export function authDestination(input: {
   return input.pathname === "/login" ? "/" : null;
 }
 
+export function applyDeploymentFavicon(url: string | null): void {
+  const existing = document.head.querySelector<HTMLLinkElement>('link[data-berry-organization-favicon="true"]');
+  if (!url) {
+    existing?.remove();
+    return;
+  }
+  const link = existing ?? document.createElement("link");
+  link.rel = "icon";
+  link.href = url;
+  link.dataset.berryOrganizationFavicon = "true";
+  if (!existing) document.head.append(link);
+}
+
 export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }: {
   baseUrl: string;
   initialUser: SignedInUser | null;
@@ -29,16 +42,29 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
   const [user, setUser] = React.useState<SignedInUser | null>(initialUser);
   const [loading, setLoading] = React.useState(!sessionResolved);
   const [brand, setBrand] = React.useState<DeploymentBrand>(DEFAULT_DEPLOYMENT_BRAND);
+  const [brandRevision, setBrandRevision] = React.useState(0);
+
+  React.useEffect(() => {
+    const refreshBrand = () => setBrandRevision((revision) => revision + 1);
+    window.addEventListener("berry:deployment-brand-changed", refreshBrand);
+    return () => window.removeEventListener("berry:deployment-brand-changed", refreshBrand);
+  }, []);
 
   React.useEffect(() => {
     let cancelled = false;
     void fetch(`${baseUrl}/v1/setup`, { credentials: "include" })
-      .then(async (response) => response.ok ? response.json() as Promise<{ applicationName?: string; organization?: { logoUrl?: string | null; accentColor?: string | null } }> : null)
+      .then(async (response) => response.ok ? response.json() as Promise<{ applicationName?: string; organization?: { logoUrl?: string | null; faviconUrl?: string | null; accentColor?: string | null } }> : null)
       .then(async (value) => {
         if (cancelled || !value) return;
-        const next = { applicationName: value.applicationName?.trim() || "Berry", logoUrl: value.organization?.logoUrl ?? null, accentColor: value.organization?.accentColor ?? null };
+        const next = {
+          applicationName: value.applicationName?.trim() || "Berry",
+          logoUrl: resolveDeploymentBrandAssetUrl(baseUrl, value.organization?.logoUrl),
+          faviconUrl: resolveDeploymentBrandAssetUrl(baseUrl, value.organization?.faviconUrl),
+          accentColor: value.organization?.accentColor ?? null,
+        };
         setBrand(next);
         document.title = next.applicationName;
+        applyDeploymentFavicon(next.faviconUrl);
         const { deploymentAccentTokens } = await import("./deployment-accent.ts");
         if (cancelled) return;
         const accent = deploymentAccentTokens(next.accentColor);
@@ -53,7 +79,7 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
-  }, [baseUrl]);
+  }, [baseUrl, brandRevision]);
 
   const refreshSession = React.useCallback(async () => {
     setLoading(true);

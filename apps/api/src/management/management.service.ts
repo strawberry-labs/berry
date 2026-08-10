@@ -1,14 +1,17 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { BadRequestException } from "@nestjs/common";
 import {
   AlertDestinationSchema, AlertEventSchema, AlertRuleSchema, AuthenticationPolicySchema, DataGovernancePolicySchema,
   DeliveryAttemptSchema, ExecutionNetworkPolicySchema, OrganizationProfileSchema, ReportRunSchema, ReportScheduleSchema,
   SavedAnalyticsViewSchema, ServiceAccountSchema, ServiceAccountTokenResponseSchema,
+  ORGANIZATION_FAVICON_MAX_BYTES, ORGANIZATION_FAVICON_MEDIA_TYPES, ORGANIZATION_LOGO_MAX_BYTES, ORGANIZATION_LOGO_MEDIA_TYPES,
   type AlertDestination, type AlertEvent, type AlertRule, type AlertRuleCreate, type AuthenticationPolicy,
   type DataGovernancePolicy, type DeliveryAttempt, type ExecutionNetworkPolicy, type OrganizationProfile,
   type ReportRun, type ReportSchedule, type ReportScheduleCreate, type SavedAnalyticsView, type SavedAnalyticsViewCreate,
-  type ServiceAccount, type ServiceAccountCreate, type ServiceAccountTokenResponse,
+  type ServiceAccount, type ServiceAccountCreate, type ServiceAccountTokenResponse, type OrganizationBrandingAssetKind,
 } from "@berry/shared";
-import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
+import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
+import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.ts";
 
 export const MANAGEMENT_SERVICE = Symbol("MANAGEMENT_SERVICE");
 export type DestinationInput = { kind:"email"|"webhook";label:string;emailRecipients:string[];secret?:string|undefined };
@@ -22,7 +25,7 @@ export interface ManagementRepository {
   getExecution(tenantId:string):Promise<ExecutionNetworkPolicy>; setExecution(tenantId:string,input:PolicyInput<ExecutionNetworkPolicy>):Promise<ExecutionNetworkPolicy>;
   getAuthentication(tenantId:string):Promise<AuthenticationPolicy>; setAuthentication(tenantId:string,input:PolicyInput<AuthenticationPolicy>):Promise<AuthenticationPolicy>;
   getData(tenantId:string):Promise<DataGovernancePolicy>; setData(tenantId:string,input:PolicyInput<DataGovernancePolicy>):Promise<DataGovernancePolicy>;
-  getProfile(tenantId:string):Promise<OrganizationProfile>; setProfile(tenantId:string,input:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt" >):Promise<OrganizationProfile>;
+  getProfile(tenantId:string):Promise<OrganizationProfile>; setProfile(tenantId:string,userId:string,input:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt" >):Promise<OrganizationProfile>;
   listServiceAccounts(tenantId:string):Promise<ServiceAccount[]>; createServiceAccount(tenantId:string,userId:string,input:ServiceAccountCreate,tokenHash:string,last4:string):Promise<ServiceAccount>; revokeServiceAccount(tenantId:string,id:string):Promise<ServiceAccount>;
 }
 
@@ -35,7 +38,7 @@ export class ManagementService {
   getExecution(t:string){return this.repository.getExecution(t);} setExecution(t:string,i:PolicyInput<ExecutionNetworkPolicy>){return this.repository.setExecution(t,i);}
   getAuthentication(t:string){return this.repository.getAuthentication(t);} setAuthentication(t:string,i:PolicyInput<AuthenticationPolicy>){return this.repository.setAuthentication(t,i);}
   getData(t:string){return this.repository.getData(t);} setData(t:string,i:PolicyInput<DataGovernancePolicy>){return this.repository.setData(t,i);}
-  getProfile(t:string){return this.repository.getProfile(t);} setProfile(t:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){return this.repository.setProfile(t,i);}
+  getProfile(t:string){return this.repository.getProfile(t);} setProfile(t:string,u:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){return this.repository.setProfile(t,u,i);}
   listServiceAccounts(t:string){return this.repository.listServiceAccounts(t);}
   async createServiceAccount(t:string,u:string,i:ServiceAccountCreate):Promise<ServiceAccountTokenResponse>{const token=`berry_sa_${randomBytes(32).toString("base64url")}`;const account=await this.repository.createServiceAccount(t,u,i,createHash("sha256").update(token).digest("hex"),token.slice(-4));return ServiceAccountTokenResponseSchema.parse({account,token});}
   async rotateServiceAccount(t:string,u:string,id:string):Promise<ServiceAccountTokenResponse>{const existing=(await this.repository.listServiceAccounts(t)).find((row)=>row.id===id);if(!existing)throw new Error("Service account not found");await this.repository.revokeServiceAccount(t,id);return this.createServiceAccount(t,u,{name:`${existing.name} rotated`,permissions:existing.permissions,departmentId:existing.departmentId,resourceRestrictions:existing.resourceRestrictions,expiresAt:existing.expiresAt});}
@@ -52,7 +55,7 @@ export class InMemoryManagementRepository implements ManagementRepository {
   async getExecution(t:string){return this.policy(t,"execution",ExecutionNetworkPolicySchema,executionDefaults(t));} async setExecution(t:string,i:PolicyInput<ExecutionNetworkPolicy>){return this.setPolicy(t,"execution",ExecutionNetworkPolicySchema,{...i,tenantId:t,updatedAt:now()});}
   async getAuthentication(t:string){return this.policy(t,"authentication",AuthenticationPolicySchema,authenticationDefaults(t));} async setAuthentication(t:string,i:PolicyInput<AuthenticationPolicy>){return this.setPolicy(t,"authentication",AuthenticationPolicySchema,{...i,tenantId:t,updatedAt:now()});}
   async getData(t:string){return this.policy(t,"data",DataGovernancePolicySchema,dataDefaults(t));} async setData(t:string,i:PolicyInput<DataGovernancePolicy>){return this.setPolicy(t,"data",DataGovernancePolicySchema,{...i,tenantId:t,updatedAt:now()});}
-  async getProfile(t:string){return this.policy(t,"profile",OrganizationProfileSchema,profileDefaults(t));} async setProfile(t:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){const current=await this.getProfile(t);return this.setPolicy(t,"profile",OrganizationProfileSchema,{...i,tenantId:t,domains:current.domains,updatedAt:now()});}
+  async getProfile(t:string){return this.policy(t,"profile",OrganizationProfileSchema,profileDefaults(t));} async setProfile(t:string,_u:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){const current=await this.getProfile(t);return this.setPolicy(t,"profile",OrganizationProfileSchema,{...i,tenantId:t,domains:current.domains,updatedAt:now()});}
   async listServiceAccounts(t:string){return this.list<ServiceAccount>(t,"accounts");} async createServiceAccount(t:string,_u:string,i:ServiceAccountCreate,_h:string,last4:string){const n=now();return this.add(t,"accounts",ServiceAccountSchema.parse({...i,id:randomUUID(),tenantId:t,status:"active",departmentId:i.departmentId??null,expiresAt:i.expiresAt??null,lastUsedAt:null,tokenLast4:last4,createdAt:n,updatedAt:n}));} async revokeServiceAccount(t:string,id:string){const rows=this.list<ServiceAccount>(t,"accounts");const index=rows.findIndex((r)=>r.id===id);if(index<0)throw new Error("Service account not found");rows[index]=ServiceAccountSchema.parse({...rows[index],status:"revoked",updatedAt:now()});this.rows.set(`${t}:accounts`,rows);return rows[index]!;}
   private policy<T>(t:string,k:string,s:{parse(v:unknown):T},d:T){return s.parse(this.policies.get(`${t}:${k}`)??d);} private setPolicy<T>(t:string,k:string,s:{parse(v:unknown):T},v:unknown){const row=s.parse(v);this.policies.set(`${t}:${k}`,row);return row;}
 }
@@ -72,7 +75,24 @@ export class PostgresManagementRepository implements ManagementRepository {
   getExecution(t:string){return this.getJsonPolicy(t,"execution_network_policies",ExecutionNetworkPolicySchema,executionDefaults(t));} setExecution(t:string,i:PolicyInput<ExecutionNetworkPolicy>){return this.setJsonPolicy(t,"execution_network_policies",ExecutionNetworkPolicySchema,{...i,tenantId:t,updatedAt:now()});}
   getAuthentication(t:string){return this.getJsonPolicy(t,"authentication_policies",AuthenticationPolicySchema,authenticationDefaults(t));} setAuthentication(t:string,i:PolicyInput<AuthenticationPolicy>){return this.setJsonPolicy(t,"authentication_policies",AuthenticationPolicySchema,{...i,tenantId:t,updatedAt:now()});}
   getData(t:string){return this.getJsonPolicy(t,"data_governance_policies",DataGovernancePolicySchema,dataDefaults(t));} setData(t:string,i:PolicyInput<DataGovernancePolicy>){return this.setJsonPolicy(t,"data_governance_policies",DataGovernancePolicySchema,{...i,tenantId:t,updatedAt:now()});}
-  getProfile(t:string){return this.database.withTenant(t,async db=>{const r=(await db.query<any>(`SELECT
+  getProfile(t:string){return this.database.withTenant(t,(db)=>loadProfile(db,t));}
+  setProfile(t:string,u:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){return this.database.withTenant(t,async db=>{const previousAssetIds=await currentBrandingAssetIds(db,t);await validateBrandingAssets(db,t,u,i.branding);await db.execute("UPDATE tenants SET name=$2,slug=$3,updated_at=now() WHERE id=$1::uuid",[t,i.name,i.slug]);await db.execute(`INSERT INTO organization_profiles (tenant_id,logo_url,timezone,language,support_email,security_email,announcements,terms_url,privacy_url,branding,updated_by) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11::uuid) ON CONFLICT (tenant_id) DO UPDATE SET logo_url=excluded.logo_url,timezone=excluded.timezone,language=excluded.language,support_email=excluded.support_email,security_email=excluded.security_email,announcements=excluded.announcements,terms_url=excluded.terms_url,privacy_url=excluded.privacy_url,branding=excluded.branding,updated_by=excluded.updated_by,updated_at=now()`,[t,i.logoUrl,i.timezone,i.language,i.supportEmail,i.securityEmail,JSON.stringify(i.announcements),i.termsUrl,i.privacyUrl,JSON.stringify(i.branding),u]);const nextAssetIds=new Set(brandingAssetReferences(i.branding).map((asset)=>asset.fileId));for(const fileId of previousAssetIds){if(!nextAssetIds.has(fileId))await garbageCollectFileIfUnreferenced(db,t,fileId);}return loadProfile(db,t);});}
+  listServiceAccounts(t:string){return this.database.withTenant(t,async db=>(await db.query<any>("SELECT * FROM service_accounts WHERE tenant_id=$1::uuid ORDER BY created_at DESC",[t])).map(accountRow));}
+  createServiceAccount(t:string,u:string,i:ServiceAccountCreate,h:string,last4:string){return this.database.withTenant(t,async db=>accountRow((await db.query<any>("INSERT INTO service_accounts (tenant_id,name,permissions,department_id,resource_restrictions,token_hash,token_last4,expires_at,created_by) VALUES ($1::uuid,$2,$3::jsonb,$4::uuid,$5::jsonb,$6,$7,$8,$9::uuid) RETURNING *",[t,i.name,JSON.stringify(i.permissions),i.departmentId??null,JSON.stringify(i.resourceRestrictions),h,last4,i.expiresAt??null,u]))[0]));}
+  revokeServiceAccount(t:string,id:string){return this.database.withTenant(t,async db=>accountRow((await db.query<any>("UPDATE service_accounts SET status='revoked',token_hash=encode(digest(gen_random_uuid()::text,'sha256'),'hex'),updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid RETURNING *",[t,id]))[0]));}
+  private getJsonPolicy<T>(t:string,table:string,schema:{parse(value:unknown):T},fallback:T){return this.database.withTenant(t,async db=>{const row=(await db.query<{policy:unknown}>(`SELECT policy FROM ${table} WHERE tenant_id=$1::uuid`,[t]))[0];return row?schema.parse(row.policy):fallback;});}
+  private setJsonPolicy<T>(t:string,table:string,schema:{parse(value:unknown):T},value:unknown){const parsed=schema.parse(value);return this.database.withTenant(t,async db=>{await db.execute(`INSERT INTO ${table}(tenant_id,policy) VALUES($1::uuid,$2::jsonb) ON CONFLICT(tenant_id) DO UPDATE SET policy=excluded.policy,updated_at=now()`,[t,JSON.stringify(parsed)]);return parsed;});}
+}
+
+type BrandingAssetRow = { id:string; media_type:string; detected_media_type:string|null; size_bytes:string|number; status:string };
+const BRANDING_MEDIA_TYPES:Record<OrganizationBrandingAssetKind,ReadonlySet<string>>={
+  logo:new Set(ORGANIZATION_LOGO_MEDIA_TYPES),
+  favicon:new Set(ORGANIZATION_FAVICON_MEDIA_TYPES),
+};
+const BRANDING_MAX_BYTES:Record<OrganizationBrandingAssetKind,number>={logo:ORGANIZATION_LOGO_MAX_BYTES,favicon:ORGANIZATION_FAVICON_MAX_BYTES};
+
+async function loadProfile(db:SqlExecutor,tenantId:string):Promise<OrganizationProfile>{
+  const [row]=await db.query<any>(`SELECT
     t.id tenant_id,
     t.name tenant_name,
     t.slug tenant_slug,
@@ -90,13 +110,59 @@ export class PostgresManagementRepository implements ManagementRepository {
     COALESCE(p.updated_at,t.updated_at) updated_at
    FROM tenants t
    LEFT JOIN organization_profiles p ON p.tenant_id=t.id
-   WHERE t.id=$1::uuid`,[t]))[0];const domains=(await db.query<any>("SELECT * FROM organization_domains WHERE tenant_id=$1::uuid ORDER BY domain",[t])).map(domainRow);return r?profileRow(r,domains):profileDefaults(t);});}
-  setProfile(t:string,i:Omit<OrganizationProfile,"tenantId"|"domains"|"updatedAt">){return this.database.withTenant(t,async db=>{await db.execute("UPDATE tenants SET name=$2,slug=$3,updated_at=now() WHERE id=$1::uuid",[t,i.name,i.slug]);await db.execute(`INSERT INTO organization_profiles (tenant_id,logo_url,timezone,language,support_email,security_email,announcements,terms_url,privacy_url,branding) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb) ON CONFLICT (tenant_id) DO UPDATE SET logo_url=excluded.logo_url,timezone=excluded.timezone,language=excluded.language,support_email=excluded.support_email,security_email=excluded.security_email,announcements=excluded.announcements,terms_url=excluded.terms_url,privacy_url=excluded.privacy_url,branding=excluded.branding,updated_at=now()`,[t,i.logoUrl,i.timezone,i.language,i.supportEmail,i.securityEmail,JSON.stringify(i.announcements),i.termsUrl,i.privacyUrl,JSON.stringify(i.branding)]);return this.getProfile(t);});}
-  listServiceAccounts(t:string){return this.database.withTenant(t,async db=>(await db.query<any>("SELECT * FROM service_accounts WHERE tenant_id=$1::uuid ORDER BY created_at DESC",[t])).map(accountRow));}
-  createServiceAccount(t:string,u:string,i:ServiceAccountCreate,h:string,last4:string){return this.database.withTenant(t,async db=>accountRow((await db.query<any>("INSERT INTO service_accounts (tenant_id,name,permissions,department_id,resource_restrictions,token_hash,token_last4,expires_at,created_by) VALUES ($1::uuid,$2,$3::jsonb,$4::uuid,$5::jsonb,$6,$7,$8,$9::uuid) RETURNING *",[t,i.name,JSON.stringify(i.permissions),i.departmentId??null,JSON.stringify(i.resourceRestrictions),h,last4,i.expiresAt??null,u]))[0]));}
-  revokeServiceAccount(t:string,id:string){return this.database.withTenant(t,async db=>accountRow((await db.query<any>("UPDATE service_accounts SET status='revoked',token_hash=encode(digest(gen_random_uuid()::text,'sha256'),'hex'),updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid RETURNING *",[t,id]))[0]));}
-  private getJsonPolicy<T>(t:string,table:string,schema:{parse(value:unknown):T},fallback:T){return this.database.withTenant(t,async db=>{const row=(await db.query<{policy:unknown}>(`SELECT policy FROM ${table} WHERE tenant_id=$1::uuid`,[t]))[0];return row?schema.parse(row.policy):fallback;});}
-  private setJsonPolicy<T>(t:string,table:string,schema:{parse(value:unknown):T},value:unknown){const parsed=schema.parse(value);return this.database.withTenant(t,async db=>{await db.execute(`INSERT INTO ${table}(tenant_id,policy) VALUES($1::uuid,$2::jsonb) ON CONFLICT(tenant_id) DO UPDATE SET policy=excluded.policy,updated_at=now()`,[t,JSON.stringify(parsed)]);return parsed;});}
+   WHERE t.id=$1::uuid`,[tenantId]);
+  const domains=(await db.query<any>("SELECT * FROM organization_domains WHERE tenant_id=$1::uuid ORDER BY domain",[tenantId])).map(domainRow);
+  return row?profileRow(row,domains):profileDefaults(tenantId);
+}
+
+async function validateBrandingAssets(db:SqlExecutor,tenantId:string,userId:string,branding:OrganizationProfile["branding"]):Promise<void>{
+  const requested=brandingAssetReferences(branding);
+  if(requested.length===0)return;
+  const fileIds=[...new Set(requested.map((asset)=>asset.fileId))];
+  const rows=await db.query<BrandingAssetRow>(`
+    SELECT id,media_type,detected_media_type,size_bytes,status
+    FROM files f
+    WHERE f.tenant_id=$1::uuid AND f.id=ANY($3::uuid[]) AND f.deleted_at IS NULL
+      AND (
+        f.owner_user_id=$2::uuid OR EXISTS (
+          SELECT 1 FROM organization_profiles profile
+          WHERE profile.tenant_id=f.tenant_id
+            AND (profile.branding->>'logoFileId'=f.id::text OR profile.branding->>'faviconFileId'=f.id::text)
+        )
+      )
+    FOR SHARE OF f
+  `,[tenantId,userId,fileIds]);
+  const byId=new Map(rows.map((row)=>[row.id,row]));
+  for(const asset of requested){
+    const file=byId.get(asset.fileId);
+    if(!file||!(["available","processing"] as const).includes(file.status as "available"|"processing"))throw new BadRequestException(`The selected ${asset.kind} is not an available Berry file owned by you`);
+    const mediaType=(file.detected_media_type??file.media_type).toLowerCase();
+    if(!BRANDING_MEDIA_TYPES[asset.kind].has(mediaType))throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must use a supported image format`);
+    if(Number(file.size_bytes)>BRANDING_MAX_BYTES[asset.kind])throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must be ${asset.kind==="logo"?"5 MB":"1 MB"} or smaller`);
+  }
+}
+
+function brandingAssetReferences(branding:OrganizationProfile["branding"]):Array<{kind:OrganizationBrandingAssetKind;fileId:string}>{
+  return (["logo","favicon"] as const).flatMap((kind)=>{
+    const value=branding[`${kind}FileId`];
+    return typeof value==="string"?[{kind,fileId:value}]:[];
+  });
+}
+
+async function currentBrandingAssetIds(db:SqlExecutor,tenantId:string):Promise<Set<string>>{
+  const [profile]=await db.query<{branding:unknown}>(`
+    SELECT (
+      SELECT organization_profile.branding
+      FROM organization_profiles organization_profile
+      WHERE organization_profile.tenant_id=tenant.id
+      LIMIT 1
+    ) AS branding
+    FROM tenants tenant
+    WHERE tenant.id=$1::uuid
+    FOR UPDATE OF tenant
+  `,[tenantId]);
+  const branding=profile?.branding&&typeof profile.branding==="object"&&!Array.isArray(profile.branding)?profile.branding as Record<string,unknown>:{};
+  return new Set([branding.logoFileId,branding.faviconFileId].filter((value):value is string=>typeof value==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)));
 }
 
 const executionDefaults=(t:string)=>ExecutionNetworkPolicySchema.parse({tenantId:t,sandboxEnabled:true,codeExecutionEnabled:true,approvalRequired:true,outboundNetwork:"allowlist",allowedDomains:[],blockedDomains:[],allowedToolClasses:[],maxRunSeconds:900,maxConcurrency:5,requestsPerMinute:60,tokenQuota:null,sandboxMinuteQuota:null,updatedAt:now()});

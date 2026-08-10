@@ -10,13 +10,21 @@ import {
   S3Client,
   UploadPartCommand,
   type CompletedPart,
+  type GetObjectCommandOutput,
   type HeadObjectCommandOutput,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash, randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { once } from "node:events";
-import { durableContextConfigFromEnv } from "@berry/shared";
+import {
+  ORGANIZATION_FAVICON_MAX_BYTES,
+  ORGANIZATION_FAVICON_MEDIA_TYPES,
+  ORGANIZATION_LOGO_MAX_BYTES,
+  ORGANIZATION_LOGO_MEDIA_TYPES,
+  durableContextConfigFromEnv,
+  type OrganizationBrandingAssetKind,
+} from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
 import { garbageCollectFileIfUnreferenced } from "./file-lifecycle.ts";
 
@@ -984,6 +992,67 @@ export class FilePlatformService {
     response.end();
   }
 
+  async streamBrandingAsset(
+    tenantId: string,
+    kind: OrganizationBrandingAssetKind,
+    version: string | undefined,
+    response: ServerResponse,
+    ifNoneMatch?: string,
+  ) {
+    const config = this.requireConfig();
+    const file = await this.database.withTenant(tenantId, async (executor) => {
+      const [profile] = await executor.query<{ branding: unknown }>(
+        "SELECT branding FROM organization_profiles WHERE tenant_id=$1::uuid LIMIT 1",
+        [tenantId],
+      );
+      const branding = profile?.branding && typeof profile.branding === "object" && !Array.isArray(profile.branding)
+        ? profile.branding as Record<string, unknown>
+        : {};
+      const fileId = branding[`${kind}FileId`];
+      if (typeof fileId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(fileId) || (version && version !== fileId)) {
+        throw new NotFoundException("Branding asset not found");
+      }
+      const [row] = await executor.query<FileRow>(`
+        SELECT f.*, ${FILE_PHYSICAL_COLUMNS}
+        FROM files f
+        LEFT JOIN file_blobs blob ON blob.id=f.blob_id AND blob.tenant_id=f.tenant_id
+        WHERE f.tenant_id=$1::uuid AND f.id=$2::uuid AND f.deleted_at IS NULL
+        LIMIT 1
+      `, [tenantId, fileId]);
+      if (!row || (row.status !== "available" && row.status !== "processing")) throw new NotFoundException("Branding asset not found");
+      return resolvePhysicalFile(row);
+    });
+    assertPublicBrandingFile(file, kind);
+    const etag = contentEntityTag(file);
+    if (requestEntityTagMatches(ifNoneMatch, etag)) {
+      setPublicBrandingHeaders(response, etag);
+      response.statusCode = 304;
+      response.end();
+      return;
+    }
+    let object: GetObjectCommandOutput;
+    try {
+      object = await config.client.send(new GetObjectCommand({
+        Bucket: file.bucket,
+        Key: file.object_key,
+        ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+      }));
+      if (!object.Body) throw new NotFoundException("Branding asset content is unavailable");
+    } catch (cause) {
+      response.setHeader("Cache-Control", "no-store");
+      throw cause;
+    }
+    setPublicBrandingHeaders(response, etag);
+    response.statusCode = 200;
+    response.setHeader("Content-Type", file.detected_media_type ?? object.ContentType ?? file.media_type);
+    if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
+    response.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(file.display_name)}`);
+    for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
+      if (!response.write(chunk)) await once(response, "drain");
+    }
+    response.end();
+  }
+
   private requireConfig(): FileStorageConfig {
     if (!this.config) throw new BadRequestException("File storage is not configured");
     return this.config;
@@ -1419,6 +1488,23 @@ function requestEntityTagMatches(header: string | undefined, etag: string): bool
     const value = candidate.trim();
     return value === "*" || value === etag || value.replace(/^W\//, "") === etag;
   });
+}
+
+function assertPublicBrandingFile(file: FileRow, kind: OrganizationBrandingAssetKind): void {
+  const mediaType = (file.detected_media_type ?? file.media_type).toLowerCase();
+  const allowed = kind === "logo" ? ORGANIZATION_LOGO_MEDIA_TYPES : ORGANIZATION_FAVICON_MEDIA_TYPES;
+  const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
+  if (!(allowed as readonly string[]).includes(mediaType) || Number(file.size_bytes) > maximumBytes) {
+    throw new NotFoundException("Branding asset not found");
+  }
+}
+
+function setPublicBrandingHeaders(response: ServerResponse, etag: string): void {
+  response.setHeader("ETag", etag);
+  response.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  response.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
 }
 
 function resolvePhysicalFile(row: FileRow): FileRow {

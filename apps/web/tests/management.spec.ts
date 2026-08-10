@@ -60,6 +60,30 @@ test("organization admin routes support direct navigation and validated analytic
   await expect(page.getByRole("heading", { name: "Spend limits" })).toBeVisible();
 });
 
+test("organization branding uploads and timezone selection stay usable on narrow screens", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/admin/profile-domains");
+  await expect(page.getByRole("heading", { name: "Organization settings" })).toBeVisible();
+  await expect(page.getByText("Organization logo", { exact: true })).toBeVisible();
+  await expect(page.getByText("Browser favicon", { exact: true })).toBeVisible();
+
+  await page.getByLabel("Upload organization logo").setInputFiles({
+    name: "aesg-logo.svg",
+    mimeType: "image/svg+xml",
+    buffer: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32"/></svg>'),
+  });
+  await expect(page.getByText("Ready to save")).toBeVisible();
+
+  await page.getByRole("button", { name: "Choose organization timezone" }).click();
+  await page.getByPlaceholder("Search city, region, or UTC offset…").fill("UTC+4");
+  await page.getByRole("option", { name: /Dubai.*UTC\+4/ }).click();
+  await expect(page.getByRole("button", { name: "Choose organization timezone" })).toContainText("Dubai");
+  await expect(page.getByRole("button", { name: "Choose organization timezone" })).toContainText("UTC+4");
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+});
+
 test("management navigation uses the shared mobile sidebar sheet", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/settings/privacy");

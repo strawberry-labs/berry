@@ -189,6 +189,8 @@ export class SetupService {
     const connectorsConfigured = draft.connectorsConfigured === true && Boolean(snapshot.connector?.client_id && snapshot.connector.client_secret_envelope);
     const currentStep = completed ? 5 : !systemReady || !foundationConfigured ? 1 : !organizationConfigured ? 2 : !ssoConfigured ? 3 : !connectorsConfigured ? 4 : 5;
     const applicationName = stringValue(draft.applicationName) ?? stringValue(branding.applicationName) ?? "Berry";
+    const logoFileId = uuidValue(branding.logoFileId);
+    const faviconFileId = uuidValue(branding.faviconFileId);
     const byKey = new Map(snapshot.builtIns.map((item) => [item.connector_key, item]));
     return {
       required: !completed,
@@ -203,7 +205,8 @@ export class SetupService {
         configured: organizationConfigured,
         name: snapshot.tenant.name,
         applicationName,
-        logoUrl: snapshot.profile?.logo_url ?? null,
+        logoUrl: logoFileId ? `/v1/branding/logo?v=${encodeURIComponent(logoFileId)}` : snapshot.profile?.logo_url ?? null,
+        faviconUrl: faviconFileId ? `/v1/branding/favicon?v=${encodeURIComponent(faviconFileId)}` : null,
         accentColor: stringValue(draft.accentColor) ?? stringValue(branding.accentColor) ?? "#7c6df2",
         supportEmail: unlocked ? snapshot.profile?.support_email ?? null : null,
         securityEmail: unlocked ? snapshot.profile?.security_email ?? null : null,
@@ -606,6 +609,11 @@ function record(value: unknown): Record<string, unknown> {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function uuidValue(value: unknown): string | null {
+  const candidate = stringValue(value);
+  return candidate && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate) ? candidate : null;
 }
 
 function normalizeEmail(value: string | undefined): string | null {
