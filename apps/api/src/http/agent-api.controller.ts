@@ -22,6 +22,7 @@ import {
   TaskStatusSchema,
   TurnIntentSchema,
   TurnStateSchema,
+  VISION_ADAPTER_MAX_OUTPUT_TOKENS,
   WorkspaceKindSchema,
   type AgentStreamEvent,
   type ConversationKind,
@@ -352,7 +353,7 @@ export class AgentApiController {
     if (resolveModelCapabilities(model).vision !== true) return null;
     const maxTokens = Math.min(
       resolveModelCapabilities(model).context?.maxOutputTokens ?? 2_048,
-      4_096,
+      VISION_ADAPTER_MAX_OUTPUT_TOKENS,
     );
     return {
       providerId: selected.providerId,

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   AgentStreamEventSchema,
   DurableTurnRuntimeRequestSchema,
+  VISION_ADAPTER_MAX_OUTPUT_TOKENS,
   type AgentStreamEvent,
   type JsonValue,
 } from "@berry/shared";
@@ -20,8 +21,10 @@ import {
   type TurnToolResult,
 } from "./turn-runner.js";
 
-const VISION_PROMPT_VERSION = "vision-observation-v1";
+const VISION_PROMPT_VERSION = "vision-observation-v2";
 const DEFAULT_OVERVIEW_QUESTION = "Produce a comprehensive reusable observation of these images.";
+const FOCUSED_MAX_OUTPUT_TOKENS = 1_024;
+const MAX_OBSERVATION_CHARACTERS = 24_000;
 
 export interface VisionObservationCache {
   get(tenantId: string, cacheKey: string): Promise<string | null>;
@@ -154,13 +157,16 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     content.push({
       type: "text",
       text: mode === "overview"
-        ? `${prompt}\n\nCover: concise overview; exact visible text/OCR; layout and spatial relationships; objects, people, colors, and notable details; charts and tables with values where legible; uncertainty and unreadable regions. Keep the response below 2,000 words.`
-        : `Answer this visual question precisely: ${prompt}\n\nState uncertainty and distinguish observed facts from inference. Keep the response below 1,000 words.`,
+        ? `${prompt}\n\nReturn a compact visual digest: overall meaning; high-salience exact text/OCR; layout and spatial relationships; notable objects, people, colors, charts, and tables; uncertainty or unreadable regions. Omit decorative detail that will not help answer later questions. Stay below 750 words.`
+        : `Answer this visual question directly: ${prompt}\n\nQuote exact visible evidence where useful. Distinguish observation from inference and state uncertainty briefly. Stay below 450 words.`,
     });
     const result = await client.complete({
       model: runtime.vision.model,
       temperature: 0,
-      maxTokens: runtime.vision.maxTokens,
+      maxTokens: Math.min(
+        runtime.vision.maxTokens,
+        mode === "overview" ? VISION_ADAPTER_MAX_OUTPUT_TOKENS : FOCUSED_MAX_OUTPUT_TOKENS,
+      ),
       messages: [
         {
           role: "system",
@@ -175,7 +181,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       ],
       metadata: { "Idempotency-Key": step.idempotencyKey ?? `${snapshot.id}:${step.id}` },
     });
-    const observation = result.content.trim().slice(0, 80_000);
+    const observation = result.content.trim().slice(0, MAX_OBSERVATION_CHARACTERS);
     if (!observation) throw new Error("The vision model returned an empty observation");
     await this.cache.put({
       tenantId: snapshot.tenantId,

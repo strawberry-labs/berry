@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DURABLE_BASE_BUILT_IN_TOOLS, DurableTurnRuntimeRequestSchema } from "@berry/shared";
-import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
+import {
+  DURABLE_VISION_TOOL_SELECTION_PROMPT,
+  type DurableTurnSnapshot,
+  type DurableTurnStep,
+  type DurableTurnToolExecutor,
+} from "./turn-runner.js";
 import { DurableVisionToolExecutor, type VisionObservationCache } from "./vision-tools.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -27,7 +32,7 @@ describe("DurableVisionToolExecutor", () => {
   });
 
   it("withholds raw pixels from a text-only model and reuses cached observations without a second charge", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
       id: "vision-response",
       model: "minimax-m3",
       choices: [{ message: { content: "## Overview\nA red safety helmet on a desk." }, finish_reason: "stop" }],
@@ -63,10 +68,12 @@ describe("DurableVisionToolExecutor", () => {
     expect(second.output).toMatchObject({ vision: { cacheHit: true } });
     expect(second.usage).toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    expect(JSON.parse(String(request?.body))).toMatchObject({ max_tokens: 1_536 });
   });
 
   it("keeps focused observations separate by normalized question", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
       id: "vision-response",
       model: "minimax-m3",
       choices: [{ message: { content: "The label reads AESG." }, finish_reason: "stop" }],
@@ -82,6 +89,14 @@ describe("DurableVisionToolExecutor", () => {
     await executor.execute(snapshot, visionStep({ mode: "focused", question: "What does the label say?" }));
     await executor.execute(snapshot, visionStep({ mode: "focused", question: "What color is the helmet?" }));
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    expect(JSON.parse(String(request?.body))).toMatchObject({ max_tokens: 1_024 });
+  });
+
+  it("guides text-only models to one task-directed inspection without searching for attachments", () => {
+    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("call focused mode directly");
+    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("do not search for them with list_files, read_file, or shell tools");
+    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("call read_file once");
   });
 
   it("uses the admitted per-call estimate when the vision provider omits usage", async () => {

@@ -4,6 +4,10 @@ const DateTimeSchema = z.string().datetime({ offset: true });
 const NonEmptyIdSchema = z.string().min(1);
 const JsonObjectSchema = z.record(z.unknown());
 
+// Keep admission estimates and the worker's overview request on the same
+// bounded output ceiling. Focused inspections use a smaller worker-only cap.
+export const VISION_ADAPTER_MAX_OUTPUT_TOKENS = 1_536;
+
 export const MemoryScopeSchema = z.enum(["personal", "project"]);
 export type MemoryScope = z.infer<typeof MemoryScopeSchema>;
 
