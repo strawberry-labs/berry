@@ -877,6 +877,8 @@ describe("AgentApiController", () => {
         vision: expect.objectContaining({
           providerId: "router",
           model: "minimax-m3",
+          maxTokens: 1_536,
+          estimatedCostMicros: "5444",
           modelPricing: expect.objectContaining({ input: 0.3, output: 1.2, cacheRead: 0.06 }),
         }),
       }),

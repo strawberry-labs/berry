@@ -1342,6 +1342,13 @@ Result:
                     "type": "string",
                     "pattern": "^\\d+$"
                   },
+                  "pricingSource": {
+                    "type": "string",
+                    "enum": [
+                      "measured",
+                      "estimated"
+                    ]
+                  },
                   "cacheReadTokens": {
                     "type": "integer",
                     "minimum": 0
