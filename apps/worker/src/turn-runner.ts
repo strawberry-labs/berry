@@ -6,6 +6,8 @@ import {
   shouldCompact,
 } from "@berry/harness";
 import {
+  BufferedChatCompletionClient,
+  ContentFallbackChatCompletionClient,
   conversationProfilePrompt,
   createBerryModel,
   createProviderStreamFn,
@@ -264,6 +266,8 @@ export interface TurnModelToolIntent {
 export interface TurnModelResult {
   text: string;
   reasoning?: string;
+  finishReason?: string | null;
+  providerResponseId?: string;
   inputTokens: number;
   outputTokens: number;
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
@@ -314,6 +318,49 @@ export interface DurableTurnToolExecutor {
     path: string;
   }[]>;
   finalize?(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]>;
+}
+
+const OUTPUT_REPETITION_WINDOW = 1_024;
+const OUTPUT_REPETITION_MAX_PERIOD = 128;
+const OUTPUT_REPETITION_CHECK_INTERVAL = 128;
+const MODEL_CONTEXT_SAFETY_TOKENS = 1_024;
+
+interface RepetitionChannelState {
+  tail: string;
+  observed: number;
+  nextCheck: number;
+}
+
+/** Stops only exact, sustained output cycles; ordinary repeated prose is left alone. */
+export class ExactOutputRepetitionGuard {
+  readonly #channels: Record<"text" | "reasoning", RepetitionChannelState> = {
+    text: { tail: "", observed: 0, nextCheck: OUTPUT_REPETITION_WINDOW },
+    reasoning: { tail: "", observed: 0, nextCheck: OUTPUT_REPETITION_WINDOW },
+  };
+
+  observe(delta: string, channel: "text" | "reasoning"): void {
+    if (!delta) return;
+    const state = this.#channels[channel];
+    state.observed += delta.length;
+    state.tail = `${state.tail}${delta}`.slice(-OUTPUT_REPETITION_WINDOW * 2);
+    if (state.observed < state.nextCheck || state.tail.length < OUTPUT_REPETITION_WINDOW) return;
+    state.nextCheck = state.observed + OUTPUT_REPETITION_CHECK_INTERVAL;
+    const suffix = state.tail.slice(-OUTPUT_REPETITION_WINDOW);
+    for (let period = 1; period <= OUTPUT_REPETITION_MAX_PERIOD; period += 1) {
+      let repeats = true;
+      for (let index = period; index < suffix.length; index += 1) {
+        if (suffix[index] !== suffix[index % period]) {
+          repeats = false;
+          break;
+        }
+      }
+      if (repeats) {
+        throw new DurableTurnTerminalError(
+          `The model entered an exact repeating ${channel} loop. Berry stopped the output after ${state.observed} characters to prevent runaway token use. Retry the task or select another model.`,
+        );
+      }
+    }
+  }
 }
 
 export class DurableTurnRunner {
@@ -537,9 +584,25 @@ export class DurableTurnRunner {
       });
       return "compacting";
     }
+    const effectiveMaxTokens = contextAwareMaxOutputTokens(snapshot, this.options, activeContextTokens);
+    if (effectiveMaxTokens < 1) {
+      const contextWindow = modelContextWindow(snapshot, this.options);
+      throw new DurableTurnTerminalError(
+        `The estimated model input (${activeContextTokens} tokens) leaves no output capacity in the ${contextWindow}-token context window. Compact the task or use a model with a larger context window.`,
+      );
+    }
+    const modelSnapshot = effectiveMaxTokens === numberValue(snapshot.runtimeRequest.maxTokens)
+      ? snapshot
+      : {
+          ...snapshot,
+          runtimeRequest: {
+            ...snapshot.runtimeRequest,
+            maxTokens: effectiveMaxTokens,
+          },
+        };
     const budget = await this.repository.reserveNextModelCall?.(
       snapshot,
-      estimateNextModelCallCost(snapshot, activeContextTokens).toString(),
+      estimateNextModelCallCost(snapshot, activeContextTokens, effectiveMaxTokens).toString(),
     );
     if (budget && !budget.allowed) {
       await this.finishForBudget(snapshot, budget.reason ?? "Your spend limit has been reached.");
@@ -562,10 +625,11 @@ export class DurableTurnRunner {
       { kind: "message.start", messageId, role: "assistant" },
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
-    const result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress }) => {
+    const repetitionGuard = new ExactOutputRepetitionGuard();
+    const result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress, abort }) => {
       const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
       try {
-        return await this.model.call(snapshot, step, {
+        return await this.model.call(modelSnapshot, step, {
           messageId,
           tools: definitions,
           additionalUserContent,
@@ -573,6 +637,12 @@ export class DurableTurnRunner {
           reportProgress,
           emitDelta: async (delta, channel) => {
             reportProgress();
+            try {
+              repetitionGuard.observe(delta, channel);
+            } catch (error) {
+              abort(error);
+              throw error;
+            }
             await writer.write(delta, channel);
           },
           policyForTool: (name) => this.tools.policy?.(snapshot, name, permissionMode)
@@ -602,13 +672,56 @@ export class DurableTurnRunner {
       );
     }
 
+    const responseEndEvents: AgentStreamEvent[] = [
+      { kind: "message.end", messageId },
+      ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
+    ];
+    const normalizedFinishReason = result.finishReason?.toLowerCase() ?? null;
+    if (normalizedFinishReason === "length" || normalizedFinishReason === "max_tokens") {
+      const activeModelStep = latestStep(snapshot.steps, "model.call");
+      if (activeModelStep) activeModelStep.output = {
+        messageId,
+        text: result.text,
+        toolCallIds: result.toolCalls.map((call) => call.id),
+        finishReason: result.finishReason ?? "length",
+        ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+        reasoningCharacters: result.reasoning?.length ?? 0,
+      };
+      await this.repository.appendEvents(snapshot, responseEndEvents);
+      throw new DurableTurnTerminalError(
+        `The provider stopped because the ${effectiveMaxTokens}-token output limit was reached before the model completed its response. Berry preserved the provider finish reason instead of reporting this as an empty response. Retry with a model that advertises a larger output limit.`,
+      );
+    }
+    if (normalizedFinishReason === "content_filter") {
+      const activeModelStep = latestStep(snapshot.steps, "model.call");
+      if (activeModelStep) activeModelStep.output = {
+        messageId,
+        text: result.text,
+        toolCallIds: result.toolCalls.map((call) => call.id),
+        finishReason: result.finishReason ?? "content_filter",
+        ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+      };
+      await this.repository.appendEvents(snapshot, responseEndEvents);
+      throw new DurableTurnTerminalError(
+        "The provider stopped the response because its content filter was triggered.",
+      );
+    }
+
     const emptyResponse = !result.text.trim() && result.toolCalls.length === 0;
     if (emptyResponse) {
-      const emptyEvents: AgentStreamEvent[] = [
-        { kind: "message.end", messageId },
-        ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
-      ];
+      const emptyEvents = responseEndEvents;
+      const emptyOutput: JsonValue = {
+        messageId,
+        text: "",
+        toolCallIds: [],
+        emptyResponse: true,
+        finishReason: result.finishReason ?? null,
+        ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+        reasoningCharacters: result.reasoning?.length ?? 0,
+      };
       if (record(step.input)?.recoveryReason === "empty_response") {
+        const activeModelStep = latestStep(snapshot.steps, "model.call");
+        if (activeModelStep) activeModelStep.output = emptyOutput;
         await this.repository.appendEvents(snapshot, emptyEvents);
         throw new DurableTurnTerminalError(
           "The model returned an empty response twice. Berry stopped the run instead of incorrectly marking it complete. Retry the task or select another configured model.",
@@ -622,7 +735,7 @@ export class DurableTurnRunner {
           {
             ...step,
             state: "completed",
-            output: { messageId, text: "", toolCallIds: [], emptyResponse: true },
+            output: emptyOutput,
           },
           {
             id: randomUUID(),
@@ -656,6 +769,9 @@ export class DurableTurnRunner {
         timestamp: new Date().toISOString(),
         message: {
           role: "assistant",
+          ...(result.toolCalls.length > 0 && result.reasoning
+            ? { reasoningContent: result.reasoning }
+            : {}),
           content: [
             ...(result.text ? [{ type: "text", text: result.text }] : []),
             ...result.toolCalls.map((call) => ({
@@ -708,6 +824,8 @@ export class DurableTurnRunner {
             messageId,
             text: result.text,
             toolCallIds: result.toolCalls.map((call) => call.id),
+            finishReason: result.finishReason ?? null,
+            ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
           },
           sessionEntryId: messageId,
         },
@@ -1427,7 +1545,7 @@ export class DurableTurnRunner {
 
   private async withHeartbeat<T>(
     snapshot: DurableTurnSnapshot,
-    operation: (control: { signal: AbortSignal; reportProgress(): void }) => Promise<T>,
+    operation: (control: { signal: AbortSignal; reportProgress(): void; abort(reason?: unknown): void }) => Promise<T>,
     limits: { label?: string; abortable?: boolean; idleTimeoutMs?: number; maxDurationMs?: number } = {},
   ): Promise<T> {
     const leaseSeconds = this.options.leaseSeconds ?? 90;
@@ -1484,15 +1602,31 @@ export class DurableTurnRunner {
     }
     reportProgress();
     try {
-      const operationPromise = operation({ signal: controller.signal, reportProgress });
+      const operationPromise = operation({
+        signal: controller.signal,
+        reportProgress,
+        abort: (reason) => {
+          if (limits.abortable && !controller.signal.aborted) controller.abort(reason);
+        },
+      });
       let result: T;
       try {
         if (limits.abortable) {
-          const aborted = new Promise<never>((_, reject) => {
-            controller.signal.addEventListener("abort", () => {
-              reject(longOperationAbortError(timeoutFailure, heartbeatFailure));
-            }, { once: true });
-          });
+          const aborted = controller.signal.aborted
+            ? Promise.reject(longOperationAbortError(
+                timeoutFailure,
+                heartbeatFailure,
+                controller.signal.reason,
+              ))
+            : new Promise<never>((_, reject) => {
+                controller.signal.addEventListener("abort", () => {
+                  reject(longOperationAbortError(
+                    timeoutFailure,
+                    heartbeatFailure,
+                    controller.signal.reason,
+                  ));
+                }, { once: true });
+              });
           result = await Promise.race([operationPromise, aborted]);
         } else {
           // Non-abort-aware operations may perform external side effects. Keep
@@ -1505,7 +1639,7 @@ export class DurableTurnRunner {
             operationPromise,
             this.options.abortCleanupTimeoutMs ?? 15_000,
           );
-          throw longOperationAbortError(timeoutFailure, heartbeatFailure);
+          throw longOperationAbortError(timeoutFailure, heartbeatFailure, controller.signal.reason);
         }
         if (timeoutFailure || heartbeatFailure) {
           throw longOperationAbortError(timeoutFailure, heartbeatFailure);
@@ -1531,7 +1665,8 @@ export class DurableTurnRunner {
 function longOperationAbortError(
   timeoutFailure: DurableTurnRetryableError | null,
   heartbeatFailure: unknown,
-): DurableTurnRetryableError {
+  abortReason?: unknown,
+): Error {
   if (timeoutFailure) return timeoutFailure;
   if (heartbeatFailure instanceof DurableTurnRetryableError) return heartbeatFailure;
   if (heartbeatFailure) {
@@ -1540,6 +1675,7 @@ function longOperationAbortError(
       heartbeatFailure,
     );
   }
+  if (abortReason instanceof Error) return abortReason;
   return new DurableTurnRetryableError("Long-running operation was aborted");
 }
 
@@ -2037,7 +2173,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
 
 export class RouterDurableTurnModel implements DurableTurnModel {
   constructor(
-    private readonly client: OpenAIChatCompletionsClient,
+    private readonly client: Pick<OpenAIChatCompletionsClient, "stream">,
     private readonly modelName: string,
     private readonly cache: {
       provider: string;
@@ -2093,6 +2229,8 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       cacheCreationTokens5m?: number;
     } | undefined;
     let servedModel = model;
+    let finishReason: string | null = null;
+    let providerResponseId: string | undefined;
     const selectedReasoningEffort = reasoningEffort(snapshot.runtimeRequest.reasoning);
     const kimiSectionStart = "<|tool_calls_section_begin|>";
     const emitVisibleText = async (value: string) => {
@@ -2133,6 +2271,8 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     })) {
       context.reportProgress?.();
       servedModel = chunk.model || servedModel;
+      if (chunk.id) providerResponseId = chunk.id;
+      if (chunk.finishReason) finishReason = chunk.finishReason;
       await acceptTextDelta(chunk.delta);
       if (chunk.reasoningDelta) {
         rawReasoning += chunk.reasoningDelta;
@@ -2219,6 +2359,8 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     return {
       text,
       ...(rawReasoning ? { reasoning: rawReasoning } : {}),
+      finishReason,
+      ...(providerResponseId ? { providerResponseId } : {}),
       inputTokens: finalUsage?.inputTokens ?? 0,
       outputTokens: finalUsage?.outputTokens ?? 0,
       ...(usage ? { usage } : {}),
@@ -2267,8 +2409,17 @@ export class SnapshotProviderDurableTurnModel implements DurableTurnModel {
     const apiKey = await resolveDurableCredential(provider, this.env);
     const model = runtime.model ?? provider.defaultModel;
     if (provider.apiType === "openai-chat-completions") {
+      const compatible = new OpenAIChatCompletionsClient({ provider: provider as never, apiKey });
+      const streamed = provider.completionTransport === "buffered"
+        ? new BufferedChatCompletionClient(compatible)
+        : provider.completionFallback === "buffered"
+          ? new ContentFallbackChatCompletionClient(
+              compatible,
+              new BufferedChatCompletionClient(compatible),
+            )
+          : compatible;
       return new RouterDurableTurnModel(
-        new OpenAIChatCompletionsClient({ provider: provider as never, apiKey }),
+        streamed,
         model,
         {
           provider: provider.id,
@@ -2370,6 +2521,7 @@ async function callProviderStream(
   return {
     text,
     ...(reasoning ? { reasoning } : {}),
+    finishReason: assistant.stopReason,
     inputTokens: assistant.usage.input,
     outputTokens: assistant.usage.output,
     usage,
@@ -2396,6 +2548,9 @@ function chatMessageToPi(
     }] as unknown as Parameters<BerryStreamFn>[1]["messages"];
   }
   const assistantContent: Array<Record<string, unknown>> = [];
+  if (message.reasoningContent) {
+    assistantContent.push({ type: "thinking", thinking: message.reasoningContent });
+  }
   if (typeof content === "string" && content) assistantContent.push({ type: "text", text: content });
   else if (Array.isArray(content)) assistantContent.push(...content);
   for (const call of message.toolCalls ?? []) {
@@ -2586,10 +2741,11 @@ export function usageCostMicros(
 function estimateNextModelCallCost(
   snapshot: DurableTurnSnapshot,
   estimatedInputTokens = estimateActiveContextTokens(snapshot),
+  maxOutputTokens = numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
 ): bigint {
   return usageCostMicros({
     inputTokens: estimatedInputTokens,
-    outputTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
+    outputTokens: maxOutputTokens,
   }, snapshot.runtimeRequest.modelPricing);
 }
 
@@ -2618,6 +2774,33 @@ function shouldCompactSnapshot(
     contextWindow,
     DEFAULT_COMPACTION_SETTINGS,
   );
+}
+
+function modelContextWindow(
+  snapshot: DurableTurnSnapshot,
+  options: { contextWindowTokens?: number },
+): number {
+  return numberValue(snapshot.runtimeRequest.contextWindowTokens)
+    ?? options.contextWindowTokens
+    ?? 128_000;
+}
+
+function contextAwareMaxOutputTokens(
+  snapshot: DurableTurnSnapshot,
+  options: { contextWindowTokens?: number },
+  estimatedInputTokens: number,
+): number {
+  const contextWindow = modelContextWindow(snapshot, options);
+  const requestedMaxOutputTokens = Math.max(
+    1,
+    Math.floor(numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000),
+  );
+  const safetyTokens = Math.min(
+    MODEL_CONTEXT_SAFETY_TOKENS,
+    Math.max(1, Math.floor(contextWindow * 0.01)),
+  );
+  const remainingOutputTokens = Math.floor(contextWindow - estimatedInputTokens - safetyTokens);
+  return Math.min(requestedMaxOutputTokens, Math.max(0, remainingOutputTokens));
 }
 
 function completedCompactionForCurrentTail(snapshot: DurableTurnSnapshot): DurableTurnStep | null {
@@ -3090,6 +3273,9 @@ function modelMessages(
       messages.push({
         role: "assistant",
         content: assistantContentText(message?.content),
+        ...(toolCalls.length > 0 && stringValue(message?.reasoningContent)
+          ? { reasoningContent: stringValue(message?.reasoningContent)! }
+          : {}),
         ...(toolCalls.length > 0 ? { toolCalls } : {}),
       });
     } else if (role === "toolResult") {

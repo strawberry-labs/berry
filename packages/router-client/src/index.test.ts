@@ -12,6 +12,7 @@ import {
   OpenAIResponsesClient,
   OpenRouterCompatibleClient,
   parseKimiToolCalls,
+  parseSse,
   type ChatCompletionChunk,
   listProviderModels,
   redactSecrets,
@@ -43,6 +44,25 @@ async function withServer(handler: (request: IncomingMessage, response: ServerRe
 }
 
 describe("router client", () => {
+  it("cancels an SSE response body when the consumer stops early", async () => {
+    let cancelled = false;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: first\n\ndata: second\n\n"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }));
+
+    for await (const event of parseSse(response)) {
+      expect(event).toBe("first");
+      break;
+    }
+
+    expect(cancelled).toBe(true);
+  });
+
   it("generates an image through the OpenAI-compatible Image API", async () => {
     const requests: Array<{ path: string; auth: string | null; body: string }> = [];
     const baseUrl = await withServer((request, response) => {
@@ -601,6 +621,71 @@ describe("router client", () => {
     ]);
   });
 
+  it("replays reasoning_content with an assistant tool call", async () => {
+    let requestBody: Record<string, unknown> = {};
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += String(chunk); });
+      request.on("end", () => {
+        requestBody = JSON.parse(raw) as Record<string, unknown>;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ id: "1", model: "m", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }));
+      });
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "m", kind: "openai-compatible", name: "test" },
+      apiKey: "key",
+    });
+    await client.complete({
+      messages: [{
+        role: "assistant",
+        content: null,
+        reasoningContent: "I need the file contents first.",
+        toolCalls: [{
+          id: "call_1",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"/workspace/input.txt"}' },
+        }],
+      }],
+    });
+    expect(requestBody.messages).toEqual([{
+      role: "assistant",
+      content: null,
+      reasoning_content: "I need the file contents first.",
+      tool_calls: [{
+        id: "call_1",
+        type: "function",
+        function: { name: "read_file", arguments: '{"path":"/workspace/input.txt"}' },
+      }],
+    }]);
+  });
+
+  it("counts provider-reported reasoning tokens when visible output is zero", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        id: "1",
+        model: "m",
+        choices: [{ message: { content: "", reasoning_content: "thinking" }, finish_reason: "length" }],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 0,
+          total_tokens: 10,
+          completion_tokens_details: { reasoning_tokens: 4096 },
+        },
+      }));
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "m", kind: "openai-compatible", name: "test" },
+      apiKey: "key",
+    });
+    await expect(client.complete({ messages: [{ role: "user", content: "solve" }] }))
+      .resolves.toMatchObject({
+        finishReason: "length",
+        usage: { inputTokens: 10, outputTokens: 4096, totalTokens: 4106 },
+      });
+  });
+
   it("fetches available models from the /models endpoint", async () => {
     let method: string | undefined;
     let authHeader: string | undefined;
@@ -611,7 +696,7 @@ describe("router client", () => {
       response.end(
         JSON.stringify({
           data: [
-            { id: "z-model", owned_by: "acme" },
+            { id: "z-model", owned_by: "acme", max_output_tokens: 384_000 },
             { id: "a-model", owned_by: "openai" },
             { id: "m-model", owned_by: "anthropic" },
           ],
@@ -627,6 +712,7 @@ describe("router client", () => {
     expect(authHeader).toBe("Bearer key");
     expect(models.map((m) => m.id)).toEqual(["a-model", "m-model", "z-model"]);
     expect(models[0]).toMatchObject({ id: "a-model", name: "a-model", ownedBy: "openai" });
+    expect(models[2]).toMatchObject({ id: "z-model", maxOutputTokens: 384_000 });
   });
 
   it("surfaces a RouterClientError when the /models endpoint fails", async () => {

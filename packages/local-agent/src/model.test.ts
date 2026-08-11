@@ -346,6 +346,7 @@ describe("BerryModelAdapter", () => {
         {
           role: "assistant",
           content: [
+            { type: "thinking", thinking: "Need to inspect the file first." },
             { type: "text", text: "" },
             { type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "a.txt" } },
           ],
@@ -380,6 +381,7 @@ describe("BerryModelAdapter", () => {
     expect(messages[2]).toMatchObject({
       role: "assistant",
       content: null,
+      reasoningContent: "Need to inspect the file first.",
       toolCalls: [{ id: "call_1", type: "function", function: { name: "read_file", arguments: '{"path":"a.txt"}' } }],
     });
     expect(messages[3]).toMatchObject({ role: "tool", toolCallId: "call_1", name: "read_file", content: "file body" });

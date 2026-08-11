@@ -410,7 +410,7 @@ export function createCloudRuntimeConfigFromEnv(env: NodeJS.ProcessEnv): CloudRu
           costMicros: imageCostMicros,
         }
       : null,
-    providerMaxOutputTokens: positiveInteger(env.BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS) ?? (live ? 16_384 : undefined),
+    providerMaxOutputTokens: positiveInteger(env.BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS),
   };
 }
 
@@ -433,8 +433,8 @@ function positiveInteger(value: string | undefined): number | undefined {
   if (!value?.trim()) return undefined;
   if (!/^\d+$/.test(value.trim())) throw new Error("BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS must be a positive integer");
   const parsed = Number(value.trim());
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 32_000) {
-    throw new Error("BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS must be between 1 and 32000");
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 1_000_000) {
+    throw new Error("BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS must be between 1 and 1000000");
   }
   return parsed;
 }

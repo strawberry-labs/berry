@@ -399,6 +399,10 @@ export function contextToChatMessages(context: Context, options: { includeImages
         .filter((part): part is TextContent => part.type === "text")
         .map((part) => part.text)
         .join("");
+      const reasoningContent = message.content
+        .filter((part): part is ThinkingContent => part.type === "thinking")
+        .map((part) => part.thinking)
+        .join("");
       const toolCalls: ChatToolCall[] = message.content
         .filter((part): part is ToolCall => part.type === "toolCall")
         .map((part) => ({
@@ -411,6 +415,7 @@ export function contextToChatMessages(context: Context, options: { includeImages
         content: text.length > 0 ? text : toolCalls.length > 0 ? null : "",
       };
       if (toolCalls.length > 0) chatMessage.toolCalls = toolCalls;
+      if (toolCalls.length > 0 && reasoningContent) chatMessage.reasoningContent = reasoningContent;
       messages.push(chatMessage);
       continue;
     }

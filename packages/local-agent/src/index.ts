@@ -39,6 +39,8 @@ export { SandboxEnforcer, assertShellWritePolicy, resolveSandboxHelper, seatbelt
 export {
   AnthropicMessagesAdapter,
   BerryModelAdapter,
+  BufferedChatCompletionClient,
+  ContentFallbackChatCompletionClient,
   contextToAnthropicMessages,
   contextToAnthropicTools,
   contextToChatMessages,

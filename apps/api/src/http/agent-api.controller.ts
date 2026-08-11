@@ -88,6 +88,7 @@ Never invent facts, requirements, attachments, audiences, deadlines, examples, o
 const PROMPT_IMPROVEMENT_TIMEOUT_MS = 30_000;
 const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
 const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
+const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 16_384;
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -1103,6 +1104,15 @@ export class AgentApiController {
         decision: modelDecision,
       });
     }
+    const governedModelId = request.model ?? modelDecision.model;
+    const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedModelId);
+    const governedCapabilities = resolveModelCapabilities(governedModel);
+    const advertisedMaxOutputTokens = governedCapabilities.context?.maxOutputTokens;
+    const configuredMaxOutputTokens = resolvedRuntime.providerMaxOutputTokens;
+    const modelMaxOutputTokens = advertisedMaxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT_TOKENS;
+    const governedMaxOutputTokens = configuredMaxOutputTokens
+      ? Math.min(modelMaxOutputTokens, configuredMaxOutputTokens)
+      : modelMaxOutputTokens;
     const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, mode);
     if (request.intent === "image_generation") this.#assertImageGenerationAvailable(imageAccess);
     const [groundingContext, portableCheckpoint] = await Promise.all([
@@ -1122,11 +1132,11 @@ export class AgentApiController {
       ...request,
       provider: resolvedRuntime.provider,
       apiKey: resolvedRuntime.apiKey,
-      model: request.model ?? modelDecision.model,
+      model: governedModelId,
       mcpServers: resolvedRuntime.mcpServers,
       extraSkills: resolvedRuntime.extraSkills,
       networkPolicy: resolvedRuntime.networkPolicy,
-      maxTokens: resolvedRuntime.providerMaxOutputTokens,
+      maxTokens: governedMaxOutputTokens,
       projectTrusted: true,
       groundingContext,
       ...(portableCheckpoint ? { portableCheckpoint } : {}),
@@ -1215,8 +1225,6 @@ export class AgentApiController {
         },
       } : {}),
     };
-    const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedRequest.model);
-    const governedCapabilities = resolveModelCapabilities(governedModel);
     const contextWindowTokens = governedCapabilities.context?.windowTokens
       ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     const pricingSnapshot = modelCostSnapshot(governedRequest.provider, governedRequest.model);

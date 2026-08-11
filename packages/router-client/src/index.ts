@@ -11,6 +11,8 @@ export interface ChatToolCall {
 export interface ChatMessage {
   role: ChatRole;
   content: ChatMessageContent;
+  /** Provider reasoning that must be replayed with an assistant tool call. */
+  reasoningContent?: string;
   name?: string;
   toolCallId?: string;
   toolCalls?: ChatToolCall[];
@@ -251,7 +253,7 @@ export async function listProviderModels(options: RouterClientOptions): Promise<
       }
       if (typeof entry?.owned_by === "string") model.ownedBy = entry.owned_by;
       const contextWindow = positiveNumber(entry?.max_input_tokens) ?? positiveNumber(entry?.context_length);
-      const maxOutputTokens = positiveNumber(entry?.max_tokens);
+      const maxOutputTokens = positiveNumber(entry?.max_output_tokens) ?? positiveNumber(entry?.max_tokens);
       if (contextWindow) model.contextWindow = contextWindow;
       if (maxOutputTokens) model.maxOutputTokens = maxOutputTokens;
       const capabilities = normalizeProviderModelCapabilities(entry?.capabilities, contextWindow, maxOutputTokens);
@@ -848,6 +850,9 @@ export class AnthropicMessagesClient {
 
 function serializeMessage(message: ChatMessage): Record<string, unknown> {
   const wire: Record<string, unknown> = { role: message.role, content: message.content };
+  if (message.role === "assistant" && message.reasoningContent) {
+    wire.reasoning_content = message.reasoningContent;
+  }
   if (message.name) wire.name = message.name;
   if (message.toolCallId) wire.tool_call_id = message.toolCallId;
   if (message.toolCalls && message.toolCalls.length > 0) wire.tool_calls = message.toolCalls;
@@ -896,22 +901,37 @@ export async function* parseSse(response: Response): AsyncGenerator<string> {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = parseSseDataBlock(block);
-      if (data !== undefined) yield data;
-      boundary = buffer.indexOf("\n\n");
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        completed = true;
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = parseSseDataBlock(block);
+        if (data !== undefined) yield data;
+        boundary = buffer.indexOf("\n\n");
+      }
     }
+    buffer += decoder.decode();
+    const data = parseSseDataBlock(buffer);
+    if (data !== undefined) yield data;
+  } finally {
+    if (!completed) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The provider may have already closed the stream after an abort.
+      }
+    }
+    reader.releaseLock();
   }
-  buffer += decoder.decode();
-  const data = parseSseDataBlock(buffer);
-  if (data !== undefined) yield data;
 }
 
 export async function* parseNdjson(response: Response): AsyncGenerator<Record<string, unknown>> {
@@ -989,11 +1009,16 @@ function normalizeUsage(usage: OpenAIUsage | undefined): ChatCompletionUsage | u
     ?? usage.cache_read_input_tokens
     ?? 0;
   const cacheWriteTokens = usage.cache_creation_input_tokens ?? 0;
+  const inputTokens = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+  const explicitOutputTokens = usage.completion_tokens ?? usage.output_tokens ?? 0;
+  const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens
+    ?? usage.output_tokens_details?.reasoning_tokens
+    ?? 0;
+  const outputTokens = Math.max(explicitOutputTokens, reasoningTokens);
   return {
-    inputTokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
-    outputTokens: usage.completion_tokens ?? usage.output_tokens ?? 0,
-    totalTokens: usage.total_tokens
-      ?? (usage.prompt_tokens ?? usage.input_tokens ?? 0) + (usage.completion_tokens ?? usage.output_tokens ?? 0),
+    inputTokens,
+    outputTokens,
+    totalTokens: Math.max(usage.total_tokens ?? 0, inputTokens + outputTokens),
     cacheReadTokens,
     cacheWriteTokens,
     cacheCreationTokens1h: usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
@@ -1234,6 +1259,7 @@ interface ProviderModelEntry {
   context_length?: number;
   max_input_tokens?: number;
   max_tokens?: number;
+  max_output_tokens?: number;
   capabilities?: {
     image_input?: { supported?: boolean };
     thinking?: { supported?: boolean };
@@ -1252,6 +1278,8 @@ interface OpenAIUsage {
   total_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number };
   input_tokens_details?: { cached_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number };
+  output_tokens_details?: { reasoning_tokens?: number };
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_creation?: {

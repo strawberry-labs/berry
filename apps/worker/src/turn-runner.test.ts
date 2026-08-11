@@ -120,6 +120,90 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("reports a provider length stop instead of retrying it as an empty response", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      contextWindowTokens: 1_000_000,
+      maxTokens: 384_000,
+    };
+    const repository = new FakeTurnRepository(current);
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return {
+          text: "",
+          reasoning: "unfinished reasoning",
+          finishReason: "length",
+          providerResponseId: "completion-cut-off",
+          inputTokens: 50,
+          outputTokens: 384_000,
+          toolCalls: [],
+        };
+      },
+    }, noTools(), { owner: "worker-length-stop" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(modelCalls).toBe(1);
+    expect(repository.current.error).toContain("384000-token output limit");
+    expect(repository.current.steps.filter((step) => step.type === "model.call")).toHaveLength(1);
+    expect(repository.current.steps.at(-1)?.output).toMatchObject({
+      finishReason: "length",
+      providerResponseId: "completion-cut-off",
+      reasoningCharacters: 20,
+    });
+  });
+
+  it("stops a sustained exact reasoning loop before it can consume the full model allowance", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let providerAborted = false;
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        context.signal?.addEventListener("abort", () => {
+          providerAborted = true;
+        }, { once: true });
+        await context.emitDelta("loop".repeat(300), "reasoning");
+        return { text: "", inputTokens: 1, outputTokens: 300, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-output-loop" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(repository.current.error).toContain("exact repeating reasoning loop");
+    expect(providerAborted).toBe(true);
+  });
+
+  it("caps the model output allowance to the remaining context capacity", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      contextWindowTokens: 100_000,
+      maxTokens: 60_000,
+    };
+    current.entries[0]!.payload = {
+      type: "message",
+      message: { role: "user", content: "x".repeat(200_000) },
+    };
+    const repository = new FakeTurnRepository(current);
+    let receivedMaxTokens = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async (modelSnapshot) => {
+        receivedMaxTokens = Number(modelSnapshot.runtimeRequest.maxTokens);
+        return { text: "Done.", inputTokens: 50_000, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-context-headroom" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "finalizing" });
+    expect(receivedMaxTokens).toBeGreaterThan(0);
+    expect(receivedMaxTokens).toBeLessThanOrEqual(49_000);
+  });
+
   it("reclaims an expired lease from the persisted pending model step", async () => {
     const pending = modelStep("pending", 1);
     const state = snapshot("calling_model", [admittedStep(), pending]);
@@ -1256,6 +1340,8 @@ describe("durable turn runner", () => {
     expect(result).toMatchObject({
       text: "Searching",
       reasoning: "Need current sources.",
+      finishReason: "tool_calls",
+      providerResponseId: "completion-1",
       inputTokens: 10,
       outputTokens: 4,
       usage: { costRawMicros: "18" },
@@ -1266,6 +1352,81 @@ describe("durable turn runner", () => {
         requiresApproval: false,
       }],
     });
+  });
+
+  it("persists and replays interleaved reasoning with assistant tool calls", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    const toolCallId = randomUUID();
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({
+        text: "",
+        reasoning: "I need the file contents before answering.",
+        finishReason: "tool_calls",
+        inputTokens: 10,
+        outputTokens: 8,
+        toolCalls: [{
+          id: toolCallId,
+          name: "read_file",
+          input: { path: "/workspace/input.txt" },
+          retryClass: "read_only",
+          idempotencyKey: null,
+          requiresApproval: false,
+          approvalKind: "file-edit",
+        }],
+      }),
+    }, noTools(), { owner: "worker-reasoning-persist" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "executing_tool" });
+    expect(repository.current.entries.at(-1)?.payload).toMatchObject({
+      message: {
+        role: "assistant",
+        reasoningContent: "I need the file contents before answering.",
+      },
+    });
+
+    let replayedRequest: ChatCompletionOptions | undefined;
+    const replayClient = {
+      stream: async function* (options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
+        replayedRequest = options;
+        yield {
+          id: "completion-2",
+          model: "deepseek-v4-flash",
+          delta: "Done.",
+          finishReason: "stop",
+          raw: {},
+        };
+      },
+    } as unknown as OpenAIChatCompletionsClient;
+    const model = new RouterDurableTurnModel(replayClient, "deepseek-v4-flash", {
+      provider: "router",
+      route: "/chat/completions",
+      capabilityForModel: () => ({
+        supported: false,
+        cacheKey: false,
+        cacheControl: false,
+        retention: [],
+        minimumTokens: 1_024,
+      }),
+    });
+    await model.call(repository.current, modelStep("pending", 3), {
+      messageId: randomUUID(),
+      tools: [],
+      emitDelta: async () => undefined,
+      policyForTool: () => ({
+        retryClass: "read_only",
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      }),
+    });
+    expect(replayedRequest?.messages.find((message) => message.role === "assistant"))
+      .toMatchObject({
+        reasoningContent: "I need the file contents before answering.",
+        toolCalls: [{ id: toolCallId }],
+      });
   });
 
   it("casts persisted tool statuses to the PostgreSQL enum", async () => {

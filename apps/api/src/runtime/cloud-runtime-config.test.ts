@@ -49,7 +49,7 @@ describe("cloud runtime configuration", () => {
     expect(config.networkPolicy).toEqual({ egress: "on", allowedDomains: ["crawl.example.test", "registry.npmjs.org"] });
     expect(config.provider?.completionTransport).toBe("stream");
     expect(config.provider?.completionFallback).toBe("buffered");
-    expect(config.providerMaxOutputTokens).toBe(16_384);
+    expect(config.providerMaxOutputTokens).toBeUndefined();
     expect(config.imageGeneration).toEqual({
       endpoint: "https://router.example.test/v1/images/generations",
       editsEndpoint: "https://router.example.test/v1/images/edits",
@@ -188,12 +188,18 @@ describe("cloud runtime configuration", () => {
       BERRY_ROUTER_DEFAULT_MODEL: "glm-5.2",
       BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS: "2048",
     }).providerMaxOutputTokens).toBe(2_048);
+    expect(createCloudRuntimeConfigFromEnv({
+      BERRY_API_MODEL_MODE: "live",
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "deepseek-v4-flash",
+      BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS: "384000",
+    }).providerMaxOutputTokens).toBe(384_000);
     expect(() => createCloudRuntimeConfigFromEnv({
       BERRY_API_MODEL_MODE: "live",
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_DEFAULT_MODEL: "glm-5.2",
       BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS: "0",
-    })).toThrow("between 1 and 32000");
+    })).toThrow("between 1 and 1000000");
   });
 
   it("relays real Image API partials and returns the completed frame", async () => {
