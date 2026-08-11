@@ -18,12 +18,13 @@ describe("OrganizationCapabilitiesService", () => {
 
     let effective = await service.effective(tenantId, userId);
     expect(effective.rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ capabilityId: "required", enabled: true, locked: true, reason: "required" }),
+      expect.objectContaining({ capabilityId: "required", enabled: true, locked: true, reason: "required", description: "", content: expect.stringContaining("# required") }),
       expect.objectContaining({ capabilityId: "default", enabled: true, reason: "default" }),
       expect.objectContaining({ capabilityId: "available", enabled: false, locked: false, reason: "available" }),
       expect.objectContaining({ capabilityId: "blocked", enabled: false, reason: "blocked" }),
-      expect.objectContaining({ provenance: "personal", enabled: true, reason: "personal" }),
+      expect.objectContaining({ provenance: "personal", enabled: true, reason: "personal", description: "personal", content: personalContent }),
     ]));
+    expect(effective.rows.find((item) => item.capabilityId === "blocked")).not.toHaveProperty("content");
     await service.setOverride(tenantId, userId, "skill", "default", false);
     await service.setOverride(tenantId, userId, "skill", "available", true);
     effective = await service.effective(tenantId, userId);

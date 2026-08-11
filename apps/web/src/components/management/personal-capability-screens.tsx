@@ -1,13 +1,41 @@
 import * as React from "react";
+import { useNavigate } from "@tanstack/react-router";
 import {
+  ArrowLeft,
   Check,
+  Code2,
+  EllipsisVertical,
+  Eye,
   FlaskConical,
+  Info,
+  MessageCircle,
   Plus,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
 import { BerryApiError, type BerryApiClient } from "@berry/api-client";
+import { Markdown } from "@berry/desktop-ui/components/berry-markdown";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@berry/desktop-ui/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@berry/desktop-ui/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@berry/desktop-ui/components/ui/tooltip";
 import type {
   EffectiveCapability,
   PersonalMcpServer,
@@ -37,6 +65,7 @@ type SkillCatalogRow = {
   capabilityId: string;
   name: string;
   description: string;
+  content: string | null;
   enabled: boolean;
   locked: boolean;
   provenance: "organization" | "personal" | "self-host-bootstrap";
@@ -76,6 +105,7 @@ export function PersonalSkillsScreen({
   config,
   tenantId,
 }: ManagementScreenProps) {
+  const navigate = useNavigate();
   const [query, setQuery] = React.useState("");
   const [draft, setDraft] = React.useState(emptyDraft);
   const [creating, setCreating] = React.useState(false);
@@ -136,6 +166,9 @@ export function PersonalSkillsScreen({
         skill.capabilityId,
         enabled,
       );
+    setSelected((current) =>
+      current?.key === skill.key ? { ...current, enabled } : current,
+    );
     resource.retry();
   }
 
@@ -165,6 +198,12 @@ export function PersonalSkillsScreen({
           : "Could not read this skill package",
       );
     }
+  }
+
+  function tryInChat(skill: SkillCatalogRow) {
+    window.localStorage.setItem("berry.web.pendingPrompt", `$${skill.capabilityId} `);
+    setSelected(null);
+    void navigate({ to: "/" });
   }
 
   return (
@@ -351,50 +390,250 @@ export function PersonalSkillsScreen({
         />
       </AsyncState>
       {selected ? (
-        <Detail title={`$${selected.name}`} onClose={() => setSelected(null)}>
-          <p>{selected.description}</p>
-          <dl>
-            <div>
-              <dt>Provided by</dt>
-              <dd>
-                {selected.provenance === "organization"
-                  ? "Organization"
-                  : selected.provenance === "personal"
-                    ? "You"
-                    : "Deployment"}
-              </dd>
-            </div>
-            <div>
-              <dt>Assignment</dt>
-              <dd>{selected.assignment ?? selected.reason}</dd>
-            </div>
-            {selected.personal ? (
-              <>
-                <div>
-                  <dt>Version</dt>
-                  <dd>{selected.personal.version ?? "Unversioned"}</dd>
-                </div>
-                <div>
-                  <dt>Hash</dt>
-                  <dd>
-                    <code>{selected.personal.hash}</code>
-                  </dd>
-                </div>
-              </>
-            ) : null}
-          </dl>
-          {selected.personal ? (
-            <Button
-              variant="secondary"
-              onClick={() => void remove(selected.personal!)}
-            >
-              <Trash2 aria-hidden />
-              Delete skill
-            </Button>
-          ) : null}
-        </Detail>
+        <SkillDetailsDialog
+          key={selected.key}
+          skill={selected}
+          hasClient={Boolean(client)}
+          onClose={() => setSelected(null)}
+          onToggle={(enabled) => toggle(selected, enabled)}
+          onTryInChat={() => tryInChat(selected)}
+          onUninstall={selected.personal ? () => remove(selected.personal!) : undefined}
+        />
       ) : null}
     </ManagementPage>
+  );
+}
+
+type SkillViewMode = "rendered" | "source";
+
+export function skillMarkdownBody(content: string): string {
+  const normalized = content.replace(/\r\n?/g, "\n");
+  if (!normalized.startsWith("---\n")) return normalized;
+  const delimiter = normalized.indexOf("\n---\n", 4);
+  if (delimiter < 0) return normalized;
+  return normalized.slice(delimiter + 5).trimStart();
+}
+
+function SkillDetailsDialog({
+  skill,
+  hasClient,
+  onClose,
+  onToggle,
+  onTryInChat,
+  onUninstall,
+}: {
+  skill: SkillCatalogRow;
+  hasClient: boolean;
+  onClose: () => void;
+  onToggle: (enabled: boolean) => Promise<void>;
+  onTryInChat: () => void;
+  onUninstall?: (() => Promise<void>) | undefined;
+}) {
+  const [view, setView] = React.useState<SkillViewMode>("rendered");
+  const [descriptionExpanded, setDescriptionExpanded] = React.useState(false);
+  const [busy, setBusy] = React.useState<"toggle" | "uninstall" | null>(null);
+  const [actionError, setActionError] = React.useState("");
+  const provider = skill.provenance === "organization"
+    ? "your organization"
+    : skill.provenance === "personal"
+      ? "you"
+      : "this deployment";
+  const descriptionCanExpand = skill.description.length > 220;
+  const markdown = skill.content ? skillMarkdownBody(skill.content) : "";
+  const controlHint = skillControlHint(skill, hasClient);
+
+  async function changeEnabled(enabled: boolean) {
+    setActionError("");
+    setBusy("toggle");
+    try {
+      await onToggle(enabled);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Could not update this skill");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function uninstall() {
+    if (!onUninstall) return;
+    setActionError("");
+    setBusy("uninstall");
+    try {
+      await onUninstall();
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Could not uninstall this skill");
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        showCloseButton={false}
+        className="flex h-[min(92dvh,920px)] w-[calc(100vw-1rem)] max-w-none flex-col gap-0 overflow-hidden rounded-[18px] border border-[var(--berry-border)] bg-[var(--berry-main-bg)] p-0 shadow-[var(--berry-shadow-floating)] sm:w-[calc(100vw-2rem)] sm:max-w-[min(1440px,calc(100vw-2rem))]"
+      >
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-[var(--berry-border-subtle)] px-3 sm:px-5">
+          <DialogClose asChild>
+            <Button variant="ghost" className="h-8 gap-2 px-2 text-sm font-medium">
+              <ArrowLeft aria-hidden />
+              Skills
+            </Button>
+          </DialogClose>
+          <DialogClose asChild>
+            <Button variant="ghost" size="icon-sm" aria-label="Close skill details">
+              <X aria-hidden />
+            </Button>
+          </DialogClose>
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col gap-4 p-4 sm:p-5">
+          <div className="grid shrink-0 gap-3">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="flex min-w-0 items-center gap-2">
+                  <DialogTitle className="truncate text-lg leading-6 font-semibold text-[var(--berry-text-primary)]">
+                    {skill.name}
+                  </DialogTitle>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button variant="ghost" size="icon-xs" aria-label={`About ${skill.name}`}>
+                          <Info aria-hidden />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent sideOffset={6}>
+                        {skill.assignment ? `${skill.assignment.replace("-", " ")} organization skill` : `${skill.reason.replace("-", " ")} skill`}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+                <p className="mt-0.5 text-xs text-[var(--berry-text-secondary)]">by {provider}</p>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1.5">
+                <ManagementSwitch
+                  checked={skill.enabled}
+                  disabled={!hasClient || skill.locked || busy !== null}
+                  onCheckedChange={(enabled) => void changeEnabled(enabled)}
+                  aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
+                  title={controlHint}
+                />
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="icon-sm" aria-label={`More actions for ${skill.name}`}>
+                      <EllipsisVertical aria-hidden />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48 border-[var(--berry-border)] bg-[var(--berry-card-bg)]">
+                    <DropdownMenuItem onSelect={onTryInChat}>
+                      <MessageCircle aria-hidden />
+                      Try in chat
+                    </DropdownMenuItem>
+                    {onUninstall ? (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          disabled={busy !== null}
+                          onSelect={() => void uninstall()}
+                        >
+                          <Trash2 aria-hidden />
+                          {busy === "uninstall" ? "Uninstalling…" : "Uninstall"}
+                        </DropdownMenuItem>
+                      </>
+                    ) : null}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </div>
+
+            <DialogDescription
+              className={`max-w-none text-sm leading-6 text-[var(--berry-text-primary)] ${descriptionExpanded ? "" : "line-clamp-2"}`}
+            >
+              {skill.description}
+            </DialogDescription>
+            {descriptionCanExpand ? (
+              <Button
+                variant="ghost"
+                className="h-auto w-fit p-0 text-xs text-[var(--berry-accent)] hover:bg-transparent"
+                onClick={() => setDescriptionExpanded((expanded) => !expanded)}
+                aria-expanded={descriptionExpanded}
+              >
+                {descriptionExpanded ? "See less" : "See more"}
+              </Button>
+            ) : null}
+            {actionError ? (
+              <p role="alert" className="text-xs text-[var(--berry-danger)]">{actionError}</p>
+            ) : null}
+          </div>
+
+          <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--berry-border)] bg-[var(--berry-surface-inset)]" aria-label={`${skill.name} files`}>
+            <div className="flex min-h-12 shrink-0 items-center justify-between gap-3 border-b border-[var(--berry-border-subtle)] px-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="rounded-lg border border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-3 py-1.5 text-sm font-medium text-[var(--berry-text-primary)]">
+                  SKILL.md
+                </span>
+                <span className="text-xs text-[var(--berry-text-tertiary)]">1 file</span>
+              </div>
+              <div className="flex rounded-lg bg-[var(--berry-control-bg)] p-0.5" role="group" aria-label="Skill content view">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className={view === "rendered" ? "bg-[var(--berry-selected)] text-[var(--berry-text-primary)]" : "text-[var(--berry-text-secondary)]"}
+                  onClick={() => setView("rendered")}
+                  aria-label="Rendered Markdown"
+                  aria-pressed={view === "rendered"}
+                >
+                  <Eye aria-hidden />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className={view === "source" ? "bg-[var(--berry-selected)] text-[var(--berry-text-primary)]" : "text-[var(--berry-text-secondary)]"}
+                  onClick={() => setView("source")}
+                  aria-label="Markdown source"
+                  aria-pressed={view === "source"}
+                >
+                  <Code2 aria-hidden />
+                </Button>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-auto overscroll-contain">
+              {!skill.content ? (
+                <div className="grid min-h-full place-items-center p-8 text-center">
+                  <div className="max-w-md">
+                    <p className="text-sm font-medium text-[var(--berry-text-primary)]">SKILL.md is not available</p>
+                    <p className="mt-1 text-xs leading-5 text-[var(--berry-text-secondary)]">
+                      This offline deployment entry only publishes skill metadata. Connect to Berry to load the organization definition.
+                    </p>
+                  </div>
+                </div>
+              ) : view === "rendered" ? (
+                <Markdown className="mx-auto max-w-5xl px-5 py-6 text-[14px] leading-7 tracking-normal text-[var(--berry-text-primary)] sm:px-8 sm:py-8">
+                  {markdown}
+                </Markdown>
+              ) : (
+                <SkillSource content={skill.content} />
+              )}
+            </div>
+          </section>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SkillSource({ content }: { content: string }) {
+  return (
+    <div className="min-w-max py-4 font-mono text-xs leading-6 text-[var(--berry-text-primary)]">
+      {content.replace(/\r\n?/g, "\n").split("\n").map((line, index) => (
+        <div className="grid grid-cols-[3.25rem_minmax(0,1fr)] px-4" key={`${index}:${line}`}>
+          <span className="select-none pe-4 text-right text-[var(--berry-text-tertiary)]" aria-hidden>{index + 1}</span>
+          <code className="whitespace-pre pe-6">{line || " "}</code>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -420,8 +659,10 @@ function buildSkillRows(
       capabilityId: item.capabilityId,
       name: item.name,
       description:
-        deployedByName.get(item.name.toLowerCase())?.description ??
-        "Managed by your organization",
+        item.description?.trim()
+        || deployedByName.get(item.name.toLowerCase())?.description
+        || "Managed by your organization",
+      content: item.content ?? null,
       enabled: item.enabled,
       locked: item.locked,
       provenance: "organization",
@@ -435,6 +676,7 @@ function buildSkillRows(
       capabilityId: item.id,
       name: item.name,
       description: item.description,
+      content: item.content,
       enabled: item.enabled,
       locked: false,
       provenance: "personal",
@@ -445,12 +687,13 @@ function buildSkillRows(
   }
   for (const item of deployed) {
     const key = item.name.replace(/^\$/, "").toLowerCase();
-    if (!rows.has(key))
+    if (!isManagedSkillDuplicate(item.name, effective) && !rows.has(key))
       rows.set(key, {
         key: `deployment:${item.id}`,
         capabilityId: item.id,
         name: item.name.replace(/^\$/, ""),
         description: item.description,
+        content: null,
         enabled: item.enabled,
         locked: true,
         provenance: "self-host-bootstrap",
@@ -461,6 +704,18 @@ function buildSkillRows(
   return [...rows.values()].sort(
     (a, b) =>
       a.provenance.localeCompare(b.provenance) || a.name.localeCompare(b.name),
+  );
+}
+
+export function isManagedSkillDuplicate(
+  deployedName: string,
+  effective: EffectiveCapability[],
+): boolean {
+  const key = deployedName.replace(/^\$/, "").toLowerCase();
+  return effective.some((item) =>
+    item.kind === "skill"
+    && item.provenance === "organization"
+    && item.capabilityId.replace(/^\$/, "").toLowerCase() === key,
   );
 }
 

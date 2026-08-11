@@ -227,6 +227,28 @@ export class ModelGovernanceService {
     return this.repository.upsertAuxiliaryDefault(input);
   }
 
+  async resolveAuxiliary(input: {
+    tenantId: string;
+    purpose: OrgAuxiliaryModelPurpose;
+    mode: ConversationKind;
+    userId?: string | null | undefined;
+    departmentId?: string | null | undefined;
+  }): Promise<ModelGovernanceDecision | null> {
+    const selected = await this.auxiliaryDefault(input.tenantId, input.purpose);
+    if (!selected) return null;
+    const request = {
+      ...input,
+      providerId: selected.providerId,
+      model: selected.model,
+    };
+    const policy = (await this.repository.listPolicies(input.tenantId))
+      .find((entry) => entry.providerId === selected.providerId && entry.model === selected.model) ?? null;
+    if (!policy || policy.status === "blocked") {
+      return decision(request, selected.providerId, selected.model, false, true, policy ? "model_blocked" : "not_in_enforced_allowlist", policy, null, null);
+    }
+    return this.#resolveAccess(request, selected.providerId, selected.model, policy, null);
+  }
+
   async resolve(input: {
     tenantId: string;
     mode: ConversationKind;
@@ -255,6 +277,23 @@ export class ModelGovernanceService {
     if (policy && !policy.modeAllow.includes(input.mode)) return decision(input, providerId, model, false, policy.enforce, "mode_not_allowed", policy, modeDefault, null);
     if (!policy && enforcedAllowList) return decision(input, providerId, model, false, true, "not_in_enforced_allowlist", null, modeDefault, null);
 
+    return this.#resolveAccess(input, providerId, model, policy, modeDefault);
+  }
+
+  async #resolveAccess(
+    input: {
+      tenantId: string;
+      mode: ConversationKind;
+      providerId?: string | null | undefined;
+      model?: string | null | undefined;
+      userId?: string | null | undefined;
+      departmentId?: string | null | undefined;
+    },
+    providerId: string,
+    model: string,
+    policy: OrgModelPolicy | null,
+    modeDefault: OrgModelDefault | null,
+  ): Promise<ModelGovernanceDecision> {
     const rules = await this.repository.listAccessRules(input.tenantId, {
       resourceType: "model",
       resourceId: modelResourceId(providerId, model),
