@@ -579,8 +579,8 @@ export class BerryApiClient {
 
   async listPersonalSkills(): Promise<PersonalSkill[]> { return this.#request("/v1/me/skills", z.array(PersonalSkillSchema)); }
   async reviewPersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[] }): Promise<PersonalSkillReview> { return this.#request("/v1/me/skills/review", PersonalSkillReviewSchema, { method: "POST", body: input }); }
-  async savePersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[]; enabled?: boolean; trusted?: boolean; confirmedHash: string }): Promise<PersonalSkill> { return this.#request("/v1/me/skills", PersonalSkillSchema, { method: "POST", body: input }); }
-  async updatePersonalSkill(id: string, input: { enabled?: boolean; trusted?: boolean }): Promise<PersonalSkill> { return this.#request(`/v1/me/skills/${encodeURIComponent(id)}`, PersonalSkillSchema, { method: "PATCH", body: input }); }
+  async savePersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[]; enabled?: boolean }): Promise<PersonalSkill> { return this.#request("/v1/me/skills", PersonalSkillSchema, { method: "POST", body: input }); }
+  async updatePersonalSkill(id: string, input: { enabled: boolean }): Promise<PersonalSkill> { return this.#request(`/v1/me/skills/${encodeURIComponent(id)}`, PersonalSkillSchema, { method: "PATCH", body: input }); }
   async deletePersonalSkill(id: string): Promise<{ ok: boolean }> { return this.#request(`/v1/me/skills/${encodeURIComponent(id)}`, z.object({ ok: z.boolean() }), { method: "DELETE" }); }
 
   async listPersonalMcpServers(): Promise<PersonalMcpServer[]> { return this.#request("/v1/me/mcp", z.array(PersonalMcpServerSchema)); }
@@ -629,7 +629,7 @@ export class BerryApiClient {
     });
   }
 
-  async improvePrompt(input: { prompt: string }, options: { signal?: AbortSignal } = {}): Promise<{ prompt: string; model: string }> {
+  async improvePrompt(input: { prompt: string; skills?: string[] }, options: { signal?: AbortSignal } = {}): Promise<{ prompt: string; model: string }> {
     return this.#request("/v1/prompts/improve", PromptImprovementResponseSchema, {
       method: "POST",
       body: input,

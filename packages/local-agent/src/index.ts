@@ -114,6 +114,7 @@ export {
   type BrowserToolBridge,
   type BrowserToolMethod,
   type MemoryToolBridge,
+  type PersonalSkillToolBridge,
   type WebToolBridge,
   type WebToolMethod,
 } from "./tools.ts";

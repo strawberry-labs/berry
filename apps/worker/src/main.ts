@@ -35,6 +35,7 @@ import { S3FileObjectDeleter, SqlFileDeletionReceiptStore } from "./file-deletio
 import { SqlFileBlobProcessor } from "./file-blobs.ts";
 import { closeServer, startWorkerReadinessServer } from "./readiness.ts";
 import { DurableVisionToolExecutor, SqlVisionObservationCache } from "./vision-tools.ts";
+import { DurablePersonalSkillToolExecutor } from "./personal-skills/tools.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const durableConfig = durableContextConfigFromEnv(env);
@@ -110,7 +111,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     personalMemory,
     durableConfig.memoryEnabled,
   );
-  const durableTools = createDurableTurnToolsFromEnv(env, memoryTools);
+  const personalSkillTools = new DurablePersonalSkillToolExecutor(memoryTools, executor);
+  const durableTools = createDurableTurnToolsFromEnv(env, personalSkillTools);
   const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
   const fileBlobs = SqlFileBlobProcessor.fromEnv(env, executor);
   const worker = createBerryWorker({

@@ -1,7 +1,7 @@
 # AESG artifact sandbox
 
 This is the reproducible E2B image used by the AESG Berry deployment. It
-contains the six managed skills under `deploy/skills`, retained sanitized
+contains the seven managed skills under `deploy/skills`, retained sanitized
 templates, deterministic generators, Office/PDF renderers, and exact licensed
 Verdana files supplied at build time.
 

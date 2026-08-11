@@ -3,7 +3,6 @@ import {
   Check,
   FlaskConical,
   Plus,
-  ShieldCheck,
   Trash2,
   Upload,
   X,
@@ -13,7 +12,6 @@ import type {
   EffectiveCapability,
   PersonalMcpServer,
   PersonalSkill,
-  PersonalSkillReview,
 } from "@berry/shared";
 import { readBrowserSkillImport } from "@/lib/skill-import";
 import {
@@ -79,7 +77,6 @@ export function PersonalSkillsScreen({
   tenantId,
 }: ManagementScreenProps) {
   const [query, setQuery] = React.useState("");
-  const [review, setReview] = React.useState<PersonalSkillReview | null>(null);
   const [draft, setDraft] = React.useState(emptyDraft);
   const [creating, setCreating] = React.useState(false);
   const [selected, setSelected] = React.useState<SkillCatalogRow | null>(null);
@@ -105,44 +102,27 @@ export function PersonalSkillsScreen({
     [resource.data, config.skills, query],
   );
 
-  async function preview(event: React.FormEvent) {
+  async function install(event: React.FormEvent) {
     event.preventDefault();
     if (!client) return;
     setImportError("");
     try {
-      setReview(
-        await client.reviewPersonalSkill({
-          content: draft.content,
-          source: draft.source,
-          sourceUrl: draft.sourceUrl || null,
-          packageFiles: draft.packageFiles,
-        }),
-      );
+      await client.savePersonalSkill({
+        content: draft.content,
+        source: draft.source,
+        sourceUrl: draft.sourceUrl || null,
+        packageFiles: draft.packageFiles,
+        enabled: true,
+      });
+      setCreating(false);
+      setDraft(emptyDraft);
+      setMessage("Skill imported and enabled for your account.");
+      resource.retry();
     } catch (cause) {
       setImportError(
-        cause instanceof Error ? cause.message : "Skill review failed",
+        cause instanceof Error ? cause.message : "Skill import failed",
       );
     }
-  }
-
-  async function confirm() {
-    if (!client || !review) return;
-    await client.savePersonalSkill({
-      content: draft.content,
-      source: draft.source,
-      sourceUrl: draft.sourceUrl || null,
-      packageFiles: draft.packageFiles,
-      enabled: false,
-      trusted: false,
-      confirmedHash: review.hash,
-    });
-    setCreating(false);
-    setReview(null);
-    setDraft(emptyDraft);
-    setMessage(
-      "Skill imported. Trust it, then turn it on when you are ready to use it.",
-    );
-    resource.retry();
   }
 
   async function toggle(skill: SkillCatalogRow, enabled: boolean) {
@@ -159,16 +139,6 @@ export function PersonalSkillsScreen({
     resource.retry();
   }
 
-  async function setTrusted(skill: PersonalSkill, trusted: boolean) {
-    if (!client) return;
-    await client.updatePersonalSkill(skill.id, {
-      trusted,
-      ...(trusted ? {} : { enabled: false }),
-    });
-    setSelected(null);
-    resource.retry();
-  }
-
   async function remove(skill: PersonalSkill) {
     if (!client) return;
     await client.deletePersonalSkill(skill.id);
@@ -179,7 +149,6 @@ export function PersonalSkillsScreen({
   async function selectFile(file: File | undefined) {
     if (!file) return;
     setImportError("");
-    setReview(null);
     try {
       const imported = await readBrowserSkillImport(file);
       setDraft({
@@ -201,14 +170,13 @@ export function PersonalSkillsScreen({
   return (
     <ManagementPage
       title="Skills"
-      description="Review personal and organization-provided capabilities before enabling them."
+      description="Import your own skills or use capabilities provided by your organization."
       eyebrow="Tools & connections"
       actions={
         <Button
           disabled={!client}
           onClick={() => {
             setCreating(true);
-            setReview(null);
             setImportError("");
           }}
         >
@@ -229,21 +197,19 @@ export function PersonalSkillsScreen({
       <ManagementDialog
         open={creating}
         onOpenChange={setCreating}
-        title={review ? "Review skill" : "Import a skill"}
-        description="Import an Agent Skills package, paste SKILL.md, or load a GitHub SKILL.md URL."
+        title="Import a skill"
+        description="Import a skill package, paste SKILL.md, or load a GitHub SKILL.md URL. Valid skills are enabled for your account immediately."
         size="lg"
       >
-        {!review ? (
-          <form
-            className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
-            onSubmit={preview}
-          >
+        <form
+          className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
+          onSubmit={install}
+        >
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
               Source
               <FormSelect
                 value={draft.source}
                 onChange={(source) => {
-                  setReview(null);
                   setImportError("");
                   setDraft({
                     ...emptyDraft,
@@ -330,81 +296,11 @@ export function PersonalSkillsScreen({
               <X />
               Cancel
             </Button>
-            <Button>
-              <ShieldCheck />
-              Review
+            <Button type="submit">
+              <Check />
+              Import and enable
             </Button>
           </form>
-        ) : (
-          <div className="grid gap-3 [&_dl]:grid [&_dl]:gap-3 sm:[&_dl]:grid-cols-3 [&_dt]:text-xs [&_dt]:text-muted-foreground [&_dd]:text-sm">
-            <dl>
-              <div>
-                <dt>Skill</dt>
-                <dd>${review.name}</dd>
-              </div>
-              <div>
-                <dt>Description</dt>
-                <dd>{review.description}</dd>
-              </div>
-              <div>
-                <dt>Version</dt>
-                <dd>{review.version ?? "Not specified"}</dd>
-              </div>
-              <div>
-                <dt>Package</dt>
-                <dd>
-                  {review.resources.length
-                    ? `${review.resources.length + 1} files`
-                    : "SKILL.md only"}
-                </dd>
-              </div>
-              <div>
-                <dt>Content hash</dt>
-                <dd>
-                  <code>{review.hash}</code>
-                </dd>
-              </div>
-            </dl>
-            {review.compatibility ? (
-              <p className="text-xs text-muted-foreground">
-                Compatibility: {review.compatibility}
-              </p>
-            ) : null}
-            {review.resources.length ? (
-              <div className="grid gap-1 rounded-lg bg-muted/40 px-3 py-2.5 [&_b]:text-xs [&_span]:break-words [&_span]:font-mono [&_span]:text-xs [&_span]:text-muted-foreground">
-                <b>Included resources</b>
-                <span>
-                  {review.resources.slice(0, 8).join(" · ")}
-                  {review.resources.length > 8
-                    ? ` · +${review.resources.length - 8} more`
-                    : ""}
-                </span>
-              </div>
-            ) : null}
-            {review.warnings.length ? (
-              <div
-                className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-                role="alert"
-              >
-                {review.warnings.join(" · ")}
-              </div>
-            ) : (
-              <p className="flex items-center gap-2 rounded-lg border border-[var(--berry-success)]/25 bg-[var(--berry-success)]/5 px-3 py-2 text-xs text-[var(--berry-success)]">
-                <Check />
-                No review warnings found.
-              </p>
-            )}
-            <div className="flex flex-wrap justify-end gap-2">
-              <Button variant="secondary" onClick={() => setReview(null)}>
-                Back
-              </Button>
-              <Button onClick={confirm}>
-                <Check />
-                Import disabled
-              </Button>
-            </div>
-          </div>
-        )}
       </ManagementDialog>
       <AsyncState
         loading={resource.loading}
@@ -434,26 +330,15 @@ export function PersonalSkillsScreen({
                 : skill.provenance === "personal"
                   ? "You"
                   : "Deployment",
-              skill.personal && !skill.personal.trusted ? (
-                <span className="inline-flex flex-wrap items-center gap-1.5">
-                  <StatusPill tone="warning">Trust required</StatusPill>
-                  <Button variant="ghost" size="xs" onClick={() => setSelected(skill)}>Review &amp; trust</Button>
-                </span>
-              ) : (
-                <StatusPill tone={skill.locked ? "neutral" : "info"}>
-                  {skill.assignment
-                    ? skill.assignment.replace("-", " ")
-                    : skill.reason}
-                </StatusPill>
-              ),
+              <StatusPill tone={skill.locked ? "neutral" : "info"}>
+                {skill.assignment
+                  ? skill.assignment.replace("-", " ")
+                  : skill.reason}
+              </StatusPill>,
               <span className="inline-flex items-center gap-2 [&_small]:max-w-40 [&_small]:text-xs [&_small]:text-[var(--berry-text-secondary)]">
                 <ManagementSwitch
                   checked={skill.enabled}
-                  disabled={
-                    !client ||
-                    skill.locked ||
-                    Boolean(skill.personal && !skill.personal.trusted)
-                  }
+                  disabled={!client || skill.locked}
                   onCheckedChange={(enabled) => void toggle(skill, enabled)}
                   aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
                   aria-describedby={hintId}
@@ -499,28 +384,13 @@ export function PersonalSkillsScreen({
             ) : null}
           </dl>
           {selected.personal ? (
-            <>
-              <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-                <span>
-                  Trust this skill
-                  <small>Trusted skills can run when enabled.</small>
-                </span>
-                <ManagementSwitch
-                  checked={selected.personal.trusted}
-                  onCheckedChange={(trusted) =>
-                    void setTrusted(selected.personal!, trusted)
-                  }
-                  aria-label="Trust this skill"
-                />
-              </label>
-              <Button
-                variant="secondary"
-                onClick={() => void remove(selected.personal!)}
-              >
-                <Trash2 aria-hidden />
-                Delete skill
-              </Button>
-            </>
+            <Button
+              variant="secondary"
+              onClick={() => void remove(selected.personal!)}
+            >
+              <Trash2 aria-hidden />
+              Delete skill
+            </Button>
           ) : null}
         </Detail>
       ) : null}
@@ -565,7 +435,7 @@ function buildSkillRows(
       capabilityId: item.id,
       name: item.name,
       description: item.description,
-      enabled: item.enabled && item.trusted,
+      enabled: item.enabled,
       locked: false,
       provenance: "personal",
       assignment: null,
@@ -599,8 +469,6 @@ export function skillControlHint(
   hasClient: boolean,
 ): string {
   if (!hasClient) return "Connect to Berry to change this setting";
-  if (skill.personal && !skill.personal.trusted)
-    return "Review and trust before enabling";
   if (skill.locked)
     return skill.enabled
       ? "Required by your organization"

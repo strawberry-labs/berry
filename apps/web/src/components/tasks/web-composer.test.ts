@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AttachmentInput } from "@berry/shared";
 import type { QueuedFollowUp } from "@/lib/queued-follow-ups";
 import {
+  composerSkillMentions,
   filesFromDataTransfer,
   improvableComposerPrompt,
   PASTED_TEXT_ATTACHMENT_THRESHOLD,
@@ -18,6 +19,18 @@ describe("improvableComposerPrompt", () => {
     expect(improvableComposerPrompt("   ")).toBe("");
     expect(improvableComposerPrompt("__berry_create_image__")).toBe("");
     expect(improvableComposerPrompt("__berry_create_image__  Make a launch poster ")).toBe("Make a launch poster");
+  });
+});
+
+describe("composerSkillMentions", () => {
+  it("captures only complete selected skill tokens for atomic restoration", () => {
+    const skills = [
+      { id: "research", name: "research", description: "Research", enabled: true },
+      { id: "report", name: "report", description: "Report", enabled: true },
+    ];
+    expect(composerSkillMentions("Use $research for this, not $report-draft", skills)).toEqual([
+      { id: "skill:research", category: "skills", label: "research", markdown: "$research" },
+    ]);
   });
 });
 

@@ -91,6 +91,17 @@ export interface BerryToolsOptions {
   imageGeneration?: ImageGenerationToolBridge;
   /** Host-owned scoped memory mutations. Identity is bound by the host. */
   memory?: MemoryToolBridge;
+  /** Host-owned personal skill installation. Identity is bound by the host. */
+  personalSkills?: PersonalSkillToolBridge;
+}
+
+export interface PersonalSkillToolBridge {
+  save(input: { content: string }): Promise<{
+    id: string;
+    name: string;
+    description: string;
+    enabled: boolean;
+  }>;
 }
 
 export interface MemoryToolBridge {
@@ -207,6 +218,7 @@ const TOOL_RISKS: Record<string, BerryToolRisk> = {
   read_file: "read",
   read_attachment: "read",
   activate_skill: "read",
+  save_personal_skill: "file-edit",
   ask_user_question: "read",
   list_dir: "read",
   glob: "read",
@@ -623,6 +635,28 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
             resources: selected.resources ?? [],
             alreadyActive: false,
           });
+        },
+      )
+    : undefined;
+
+  const savePersonalSkill = options.personalSkills
+    ? defineTool(
+        "save_personal_skill",
+        "Save personal skill",
+        "Create or update a validated Berry skill in the current user's personal Skills library. Use this only when the user asks to create, install, or update a skill. Send the complete SKILL.md; the host binds ownership to the signed-in user and enables it immediately.",
+        Type.Object({
+          content: Type.String({
+            minLength: 1,
+            maxLength: 262_144,
+            description: "Complete SKILL.md with YAML frontmatter containing lowercase-hyphen name and a clear description",
+          }),
+        }),
+        async (_id, params) => {
+          const saved = await options.personalSkills!.save({ content: String(params.content ?? "") });
+          return textResult(
+            `Saved $${saved.name} to the current user's Skills library. It is enabled and will be available to new turns.`,
+            { skill: saved },
+          );
         },
       )
     : undefined;
@@ -1255,7 +1289,7 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
     );
   }
 
-  const tools = [readFile, readAttachment, skillTool, askUserQuestion, composeMessage, createImage, rememberMemory, forgetMemory, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
+  const tools = [readFile, readAttachment, skillTool, savePersonalSkill, askUserQuestion, composeMessage, createImage, rememberMemory, forgetMemory, writeFileTool, editFile, applyPatchTool, listDir, glob, grep, bash, todoWrite, gitStatus, gitDiff, gitLog, gitCheckpoint].filter((tool): tool is AgentTool => Boolean(tool));
   if (persistArtifact) tools.push(persistArtifact);
   tools.push(...browserTools);
   tools.push(...webTools);

@@ -55,6 +55,7 @@ import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repositor
 import { AUDIT_SERVICE, type AuditService } from "../audit/audit.service.ts";
 import { SANDBOX_WORKSPACE_SERVICE, SandboxWorkspaceService } from "./sandbox-workspace.service.ts";
 import { ORGANIZATION_CAPABILITIES, OrganizationCapabilitiesService } from "./organization-capabilities.service.ts";
+import { PERSONAL_CAPABILITIES, PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
@@ -71,6 +72,7 @@ export const PROMPT_IMPROVEMENT_MODEL = "canopywave/deepseek/deepseek-v4-flash";
 const PROMPT_IMPROVEMENT_SYSTEM_PROMPT = `You improve a user's draft prompt for another AI assistant.
 
 Return only the improved prompt. Do not answer or execute the prompt. Do not add an introduction, label, explanation, quotation marks, or Markdown fence.
+Do not output hidden reasoning or <think> tags.
 
 Make the prompt more effective by:
 - stating the goal and requested action clearly;
@@ -78,12 +80,14 @@ Make the prompt more effective by:
 - organizing complex work into a clear sequence of tasks or deliverables;
 - retaining examples, source references, URLs, paths, code, data, names, and other literal details;
 - preserving the user's language, intent, facts, requirements, and safety constraints;
+- preserving every required Berry skill token such as $research exactly once or more, unchanged, and incorporating it into the improved instruction;
 - keeping it concise enough to avoid unnecessary context and token use.
 
 Never invent facts, requirements, attachments, audiences, deadlines, examples, or preferences the user did not provide. Do not ask the downstream model to reveal hidden chain-of-thought. When reasoning matters, request a concise rationale, verification, or step-by-step result instead.`;
 
 const PROMPT_IMPROVEMENT_TIMEOUT_MS = 30_000;
 const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
+const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -312,6 +316,7 @@ export class AgentApiController {
     @Inject(SANDBOX_WORKSPACE_SERVICE) private readonly sandboxWorkspace: SandboxWorkspaceService,
     @Inject(AUDIT_SERVICE) private readonly audit: AuditService,
     @Inject(ORGANIZATION_CAPABILITIES) private readonly organizationCapabilities: OrganizationCapabilitiesService,
+    @Inject(PERSONAL_CAPABILITIES) private readonly personalCapabilities: PersonalCapabilitiesService,
     @Inject(FilePlatformService) private readonly files: FilePlatformService,
     @Inject(KnowledgeService) private readonly knowledge: KnowledgeService,
     @Inject(MemoryService) private readonly memory: MemoryService,
@@ -498,11 +503,13 @@ export class AgentApiController {
 
     const requestId = `prompt_improve_${randomUUID()}`;
     const startedAt = Date.now();
-    const estimatedInputTokens = estimatePromptTokens(`${PROMPT_IMPROVEMENT_SYSTEM_PROMPT}\n${request.prompt}`);
+    const requiredSkills = promptImprovementSkills(request.prompt, request.skills);
+    const modelInput = promptImprovementModelInput(request.prompt, requiredSkills);
+    const estimatedInputTokens = estimatePromptTokens(`${PROMPT_IMPROVEMENT_SYSTEM_PROMPT}\n${modelInput}`);
     const maxOutputTokens = Math.min(
       runtime.providerMaxOutputTokens ?? PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS,
       PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS,
-      Math.max(512, estimatePromptTokens(request.prompt) * 2),
+      Math.max(PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS, estimatePromptTokens(request.prompt) * 2),
     );
     const estimatedOutputTokens = maxOutputTokens;
     const estimatedCostMicros = budgetEstimateFromRequest({
@@ -538,11 +545,11 @@ export class AgentApiController {
         model: PROMPT_IMPROVEMENT_MODEL,
         messages: [
           { role: "system", content: PROMPT_IMPROVEMENT_SYSTEM_PROMPT },
-          { role: "user", content: request.prompt },
+          { role: "user", content: modelInput },
         ],
         temperature: 0.2,
         maxTokens: maxOutputTokens,
-        reasoningEffort: "low",
+        reasoningEffort: "minimal",
         signal: controller.signal,
       });
     } catch (error) {
@@ -639,7 +646,10 @@ export class AgentApiController {
 
     let improvedPrompt: string;
     try {
-      improvedPrompt = normalizeImprovedPrompt(result.content);
+      improvedPrompt = preservePromptSkillTokens(
+        normalizeImprovedPrompt(result.content),
+        requiredSkills,
+      );
     } catch (error) {
       await recordResultUsage("failed", 0);
       throw error;
@@ -1152,6 +1162,13 @@ export class AgentApiController {
               : null;
           return { forgotten: Boolean(forgotten), memoryId: forgotten?.id ?? null };
         },
+      },
+      personalSkills: {
+        save: ({ content }: { content: string }) => this.personalCapabilities.saveSkill(tenantId, userId, {
+          content,
+          source: "text",
+          enabled: true,
+        }),
       },
       ...(imageAccess.image && imageAccess.decision?.allowed ? {
         imageGeneration: {
@@ -2240,6 +2257,35 @@ export function normalizeImprovedPrompt(raw: string): string {
     });
   }
   return prompt;
+}
+
+export function promptImprovementSkills(prompt: string, requested: readonly string[]): string[] {
+  return [...new Set(requested)].filter((name) =>
+    new RegExp(`\\$${escapeRegExp(name)}(?![a-z0-9-])`).test(prompt)
+  );
+}
+
+export function promptImprovementModelInput(prompt: string, skills: readonly string[]): string {
+  if (skills.length === 0) return prompt;
+  return [
+    `Required Berry skill tokens (preserve verbatim and incorporate into the rewritten prompt): ${skills.map((name) => `$${name}`).join(", ")}`,
+    "",
+    "Draft prompt:",
+    prompt,
+  ].join("\n");
+}
+
+export function preservePromptSkillTokens(prompt: string, skills: readonly string[]): string {
+  const missing = skills.filter((name) =>
+    !new RegExp(`\\$${escapeRegExp(name)}(?![a-z0-9-])`).test(prompt)
+  );
+  return missing.length > 0
+    ? `${missing.map((name) => `$${name}`).join(" ")}\n\n${prompt}`
+    : prompt;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function promptImprovementUsageEvent(input: {

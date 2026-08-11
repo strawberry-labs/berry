@@ -28,14 +28,10 @@ describe("personal capability screens", () => {
     await expect(loadPersonalSkillResource(client, "tenant_1")).rejects.toMatchObject({ status: 503 });
   });
 
-  it("explains every disabled skill control", () => {
+  it("explains managed and offline skill controls", () => {
     expect(skillControlHint({ enabled: true, locked: true }, true)).toBe("Required by your organization");
     expect(skillControlHint({ enabled: false, locked: true }, true)).toBe("Disabled by your organization");
-    expect(skillControlHint({
-      enabled: false,
-      locked: false,
-      personal: { trusted: false } as never,
-    }, true)).toBe("Review and trust before enabling");
+    expect(skillControlHint({ enabled: false, locked: false, personal: {} as never }, true)).toBe("Off");
     expect(skillControlHint({ enabled: false, locked: false }, false)).toBe("Connect to Berry to change this setting");
   });
 });

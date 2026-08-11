@@ -18,7 +18,7 @@ import { InMemoryUsageRepository, USAGE_REPOSITORY, type UsageRepository } from 
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissionReplay } from "../runtime/durable-turn.service.ts";
-import { normalizeImprovedPrompt, PROMPT_IMPROVEMENT_MODEL, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -32,6 +32,16 @@ describe("AgentApiController", () => {
   it("normalizes prompt-only model output without altering the rewritten content", () => {
     expect(normalizeImprovedPrompt("Improved prompt: Write a three-part executive summary.")).toBe("Write a three-part executive summary.");
     expect(normalizeImprovedPrompt("```text\nUse the attached report to identify five risks.\n```")).toBe("Use the attached report to identify five risks.");
+  });
+
+  it("preserves explicitly selected Berry skill tokens in improved prompts", () => {
+    const prompt = "Find the latest AI news with $research";
+    expect(promptImprovementSkills(prompt, ["research", "missing"])).toEqual(["research"]);
+    expect(promptImprovementModelInput(prompt, ["research"])).toContain("Required Berry skill tokens");
+    expect(preservePromptSkillTokens("Find and cite the latest AI news.", ["research"]))
+      .toBe("$research\n\nFind and cite the latest AI news.");
+    expect(preservePromptSkillTokens("Use $research to find and cite the latest AI news.", ["research"]))
+      .toBe("Use $research to find and cite the latest AI news.");
   });
 
   it("improves prompts with the fixed low-cost model and records measured usage", async () => {
@@ -92,6 +102,30 @@ describe("AgentApiController", () => {
       .send({ prompt: "   " })
       .expect(400);
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("keeps a selected skill when the improvement model omits it", async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
+      id: "completion_prompt_improve_skill",
+      model: PROMPT_IMPROVEMENT_MODEL,
+      choices: [{ message: { content: "Find and cite five current AI news stories from reliable sources." }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 80, completion_tokens: 18, total_tokens: 98 },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchImpl);
+    app = await createApp(fakeSessionHost(), { runtimeConfig: promptImprovementRuntimeConfig() });
+
+    await request(app.getHttpServer())
+      .post("/v1/prompts/improve")
+      .set(authHeader())
+      .send({ prompt: "What is the latest AI news? $research", skills: ["research"] })
+      .expect(201)
+      .expect(({ body }) => expect(body.prompt).toBe(
+        "$research\n\nFind and cite five current AI news stories from reliable sources.",
+      ));
+
+    const upstream = JSON.parse(String(fetchImpl.mock.calls[0]![1]!.body)) as Record<string, unknown>;
+    expect(upstream).toMatchObject({ reasoning: { effort: "minimal" }, max_tokens: 1_024 });
+    expect(JSON.stringify(upstream.messages)).toContain("$research");
   });
 
   it("fingerprints the request payload independently from its operation key", () => {
@@ -613,8 +647,7 @@ describe("AgentApiController", () => {
     const startTurn = vi.fn(() => ({ turnId: "turn_capabilities" }));
     app = await createApp(fakeSessionHost({ startTurn }));
     const skillContent = "---\nname: review-helper\ndescription: Reviews changes\n---\n# Review helper\nCheck tests.";
-    const review = await request(app.getHttpServer()).post("/v1/me/skills/review").set(authHeader()).send({ name: "review-helper", description: "Reviews changes", content: skillContent, source: "text" }).expect(201);
-    const skill = await request(app.getHttpServer()).post("/v1/me/skills").set(authHeader()).send({ name: "review-helper", description: "Reviews changes", content: skillContent, source: "text", confirmedHash: review.body.hash, trusted: true, enabled: true }).expect(201);
+    const skill = await request(app.getHttpServer()).post("/v1/me/skills").set(authHeader()).send({ name: "review-helper", description: "Reviews changes", content: skillContent, source: "text", enabled: true }).expect(201);
     await request(app.getHttpServer()).get("/v1/me/skills").set(authHeader()).expect(200).expect(({ body }) => expect(body).toContainEqual(expect.objectContaining({ id: skill.body.id, trusted: true })));
     await request(app.getHttpServer()).get("/v1/me/skills").set(authHeader("berry-other-session")).expect(200).expect([]);
 

@@ -93,4 +93,40 @@ describe("PersonalCapabilitiesService personalization", () => {
       mcpServers: [expect.not.objectContaining({ credential: expect.anything() })],
     });
   });
+
+  it("refreshes skills written by durable workers after the user was loaded", async () => {
+    const tenantId = "00000000-0000-7000-8000-000000000001";
+    const userId = "user-1";
+    let skillRows: Record<string, unknown>[] = [];
+    const database = {
+      withTenant: async (_tenantId: string, operation: (executor: unknown) => Promise<unknown>) => operation({
+        execute: async () => undefined,
+        query: async (sql: string) => sql.includes("FROM personal_skills") ? skillRows : [],
+      }),
+    };
+    const service = new PersonalCapabilitiesService(database as never);
+
+    await expect(service.listSkills(tenantId, userId)).resolves.toEqual([]);
+    skillRows = [{
+      id: "skill_external",
+      tenant_id: tenantId,
+      user_id: userId,
+      name: "decision-brief",
+      description: "Create decision briefs",
+      content: "---\nname: decision-brief\ndescription: Create decision briefs\n---\n\nWrite the brief.",
+      enabled: true,
+      trusted: true,
+      source: "text",
+      source_url: null,
+      version: null,
+      hash: "hash",
+      diagnostics: [],
+      created_at: "2026-08-11T00:00:00.000Z",
+      updated_at: "2026-08-11T00:00:00.000Z",
+    }];
+
+    await expect(service.listSkills(tenantId, userId)).resolves.toEqual([
+      expect.objectContaining({ id: "skill_external", name: "decision-brief", enabled: true }),
+    ]);
+  });
 });

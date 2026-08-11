@@ -3132,6 +3132,21 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
   {
     type: "function" as const,
     function: {
+      name: "save_personal_skill",
+      description: "Create or update a validated Berry skill in the current signed-in user's personal Skills library. Use only when the user asks to create, install, or update a skill.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["content"],
+        properties: {
+          content: { type: "string", minLength: 1, maxLength: 262_144 },
+        },
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
       name: "ask_user_question",
       description: "Show the frontend's interactive question UI for up to five tightly related decisions, then suspend the durable turn until the user answers. Always use this tool when the user explicitly asks you to ask them questions; do not write those questions as ordinary prose.",
       parameters: {

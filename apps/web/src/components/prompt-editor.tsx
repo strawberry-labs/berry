@@ -149,23 +149,51 @@ export interface PromptEditorHandle {
   focus: () => void;
   clear: () => void;
   setText: (text: string) => void;
+  setTextWithMentions: (text: string, mentions: PromptMentionConfig[]) => void;
   insertText: (text: string) => void;
   insertMention: (config: PromptMentionConfig, trigger: MentionTrigger) => void;
   insertPromptToken: (config: PromptMentionConfig) => void;
 }
 
-function replaceEditorText(editor: LexicalEditor, text: string): void {
+function replaceEditorText(editor: LexicalEditor, text: string, mentions: PromptMentionConfig[] = []): void {
   editor.update(() => {
     const root = $getRoot();
     root.clear();
     const paragraph = $createParagraphNode();
     text.split("\n").forEach((line, index) => {
       if (index > 0) paragraph.append($createLineBreakNode());
-      if (line) paragraph.append($createTextNode(line));
+      if (line) appendPromptLine(paragraph, line, mentions);
     });
     root.append(paragraph);
     paragraph.selectEnd();
   });
+}
+
+function appendPromptLine(
+  paragraph: ReturnType<typeof $createParagraphNode>,
+  line: string,
+  mentions: PromptMentionConfig[],
+): void {
+  const byMarkdown = new Map(mentions.map((mention) => [mention.markdown, mention]));
+  const tokens = [...byMarkdown.keys()].sort((left, right) => right.length - left.length);
+  if (tokens.length === 0) {
+    paragraph.append($createTextNode(line));
+    return;
+  }
+  const pattern = new RegExp(`(${tokens.map(escapeRegExp).join("|")})(?![a-z0-9-])`, "g");
+  let offset = 0;
+  for (const match of line.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > offset) paragraph.append($createTextNode(line.slice(offset, index)));
+    const config = byMarkdown.get(match[0]);
+    if (config) paragraph.append($createPromptMentionNode(config));
+    offset = index + match[0].length;
+  }
+  if (offset < line.length) paragraph.append($createTextNode(line.slice(offset)));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function MentionDetectPlugin({ mentionsRef }: { mentionsRef: React.RefObject<PromptEditorMentions | null> }) {
@@ -377,6 +405,12 @@ export const PromptEditor = React.forwardRef(function PromptEditor(
       const editor = editorBox.current.editor;
       if (!editor) return;
       replaceEditorText(editor, text);
+      editor.focus();
+    },
+    setTextWithMentions: (text: string, mentions: PromptMentionConfig[]) => {
+      const editor = editorBox.current.editor;
+      if (!editor) return;
+      replaceEditorText(editor, text, mentions);
       editor.focus();
     },
     insertText: (text: string) => {
