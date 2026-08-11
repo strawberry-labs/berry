@@ -330,6 +330,7 @@ export class DurableTurnRunner {
       maxModelAttempts?: number;
       maxModelIterations?: number;
       maxTurnDurationMs?: number;
+      modelPreparationTimeoutMs?: number;
       modelIdleTimeoutMs?: number;
       modelMaxDurationMs?: number;
       abortCleanupTimeoutMs?: number;
@@ -471,6 +472,13 @@ export class DurableTurnRunner {
         `Model request failed after ${step.attempt} attempts.`,
       );
     }
+    await this.repository.commit(snapshot, {
+      expectedState: "calling_model",
+      nextState: "calling_model",
+      steps: [{ ...step, state: "running", incrementAttempt: true }],
+      nextAction: "Preparing tools and files for the model request",
+      keepLease: true,
+    });
     const stagedArtifactFileIds = snapshot.steps.flatMap((candidate) => {
       if (candidate.state !== "completed") return [];
       const output = record(candidate.output);
@@ -480,13 +488,19 @@ export class DurableTurnRunner {
         return fileId ? [fileId] : [];
       });
     });
-    if (stagedArtifactFileIds.length > 0) {
-      await this.tools.stageAssociatedInputFiles?.(snapshot, [...new Set(stagedArtifactFileIds)]);
-    }
-    const [extensionTools, additionalUserContent] = await this.withHeartbeat(snapshot, async () => Promise.all([
-      this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
-      this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
-    ]));
+    const [extensionTools, additionalUserContent] = await this.withHeartbeat(snapshot, async () => {
+      if (stagedArtifactFileIds.length > 0) {
+        await this.tools.stageAssociatedInputFiles?.(snapshot, [...new Set(stagedArtifactFileIds)]);
+      }
+      return Promise.all([
+        this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
+        this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
+      ]);
+    }, {
+      label: "Model input preparation",
+      abortable: true,
+      maxDurationMs: this.options.modelPreparationTimeoutMs ?? 120_000,
+    });
     const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
     const activeContextTokens = estimateActiveContextTokensForDecision(
       snapshot,
@@ -540,7 +554,6 @@ export class DurableTurnRunner {
         ...step,
         state: "running",
         output: { streamMessageId: messageId },
-        incrementAttempt: true,
       }],
       nextAction: "Model request in progress",
       keepLease: true,

@@ -189,6 +189,33 @@ describe("durable turn runner", () => {
     expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);
   });
 
+  it("bounds model input preparation before the provider request starts", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "unexpected", inputTokens: 0, outputTokens: 0, toolCalls: [] };
+      },
+    }, {
+      definitions: async () => new Promise<never>(() => undefined),
+      execute: async () => ({ output: {}, summary: "unused" }),
+    }, {
+      owner: "worker-preparation-timeout",
+      modelPreparationTimeoutMs: 5,
+      abortCleanupTimeoutMs: 5,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Model input preparation exceeded its maximum duration");
+    expect(modelCalls).toBe(0);
+    expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);
+    expect(repository.current.leaseOwner).toBe("");
+  });
+
   it("keeps the turn lease until an aborted model request finishes cleanup", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),

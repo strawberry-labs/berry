@@ -154,6 +154,10 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
           positiveInteger(env.BERRY_MAX_TURN_DURATION_MS) ?? 7_200_000,
           21_600_000,
         ),
+        modelPreparationTimeoutMs: Math.min(
+          positiveInteger(env.BERRY_MODEL_PREPARATION_TIMEOUT_MS) ?? 120_000,
+          300_000,
+        ),
         compactor,
       },
     ),
