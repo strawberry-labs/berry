@@ -18,7 +18,7 @@ import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 export const PERSONAL_CAPABILITIES = Symbol("PERSONAL_CAPABILITIES");
 const MAX_SKILL_BYTES = 262_144;
 
-type SkillInput = { name?: string | undefined; description?: string | undefined; content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; version?: string | null | undefined; packageFiles?: string[] | undefined; enabled?: boolean | undefined; trusted?: boolean | undefined };
+export type PersonalSkillInput = { name?: string | undefined; description?: string | undefined; content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; version?: string | null | undefined; packageFiles?: string[] | undefined; enabled?: boolean | undefined };
 type McpInput = { name: string; url: string; transport: "http-sse" | "streamable-http"; auth: "none" | "bearer" | "oauth"; credential?: string | undefined; enabled?: boolean | undefined; trusted?: boolean | undefined };
 type ToggleInput = { enabled?: boolean | undefined; trusted?: boolean | undefined };
 
@@ -63,9 +63,14 @@ export class PersonalCapabilitiesService {
     return profile;
   }
 
-  async listSkills(tenantId: string, userId: string) { await this.#load(tenantId, userId); return [...this.#skills.values()].filter((item) => owns(item, tenantId, userId)); }
+  async listSkills(tenantId: string, userId: string) {
+    const wasLoaded = this.#loaded.has(`${tenantId}:${userId}`);
+    await this.#load(tenantId, userId);
+    if (wasLoaded && this.database) await this.#refreshSkills(tenantId, userId);
+    return [...this.#skills.values()].filter((item) => owns(item, tenantId, userId));
+  }
 
-  async previewSkill(input: SkillInput): Promise<{ review: PersonalSkillReview; content: string }> {
+  async previewSkill(input: PersonalSkillInput): Promise<{ review: PersonalSkillReview; content: string }> {
     const source = input.source ?? "text";
     const content = source === "git" ? await fetchApprovedSkill(input.sourceUrl) : input.content ?? "";
     validateSkillContent(content);
@@ -73,18 +78,19 @@ export class PersonalCapabilitiesService {
     if (input.name?.trim() && input.name.trim() !== metadata.name) throw new BadRequestException(`Skill name must match SKILL.md frontmatter (${metadata.name})`);
     if (input.description?.trim() && input.description.trim() !== metadata.description) throw new BadRequestException("Skill description must match SKILL.md frontmatter");
     const packageFiles = [...new Set(input.packageFiles ?? [])].sort();
-    const warnings = [/ignore (all|previous) instructions/i, /curl\s+.*\|\s*(sh|bash)/i].filter((pattern) => pattern.test(content)).map(() => "Skill contains instructions that require careful trust review.");
-    if (packageFiles.some((path) => path.startsWith("scripts/"))) warnings.push("This skill package includes executable scripts. Review them before trusting the skill.");
+    const warnings = [/ignore (all|previous) instructions/i, /curl\s+.*\|\s*(sh|bash)/i].filter((pattern) => pattern.test(content)).map(() => "Skill contains instructions that should be inspected before use.");
+    if (packageFiles.some((path) => path.startsWith("scripts/"))) warnings.push("This skill package includes executable scripts. Inspect them before use.");
     return { content, review: { ...metadata, source, hash: sha256(content), bytes: Buffer.byteLength(content), warnings, resources: packageFiles.filter((path) => path !== "SKILL.md"), hasScripts: packageFiles.some((path) => path.startsWith("scripts/")) } };
   }
 
-  async saveSkill(tenantId: string, userId: string, input: SkillInput & { id?: string; confirmedHash: string }): Promise<PersonalSkill> {
+  async saveSkill(tenantId: string, userId: string, input: PersonalSkillInput & { id?: string }): Promise<PersonalSkill> {
     await this.#load(tenantId, userId);
     const preview = await this.previewSkill(input);
-    if (preview.review.hash !== input.confirmedHash) throw new BadRequestException("Skill changed after review; review it again");
-    const existing = input.id ? this.#skill(input.id, tenantId, userId) : null;
+    const existing = input.id
+      ? this.#skill(input.id, tenantId, userId)
+      : [...this.#skills.values()].find((item) => owns(item, tenantId, userId) && item.name === preview.review.name) ?? null;
     const now = new Date().toISOString();
-    const skill: PersonalSkill = { id: existing?.id ?? `skill_${randomUUID()}`, tenantId, userId, name: preview.review.name, description: preview.review.description, content: preview.content, enabled: input.enabled ?? existing?.enabled ?? false, trusted: input.trusted ?? existing?.trusted ?? false, source: preview.review.source, sourceUrl: input.sourceUrl ?? null, version: input.version ?? preview.review.version, hash: preview.review.hash, diagnostics: preview.review.warnings, createdAt: existing?.createdAt ?? now, updatedAt: now };
+    const skill: PersonalSkill = { id: existing?.id ?? `skill_${randomUUID()}`, tenantId, userId, name: preview.review.name, description: preview.review.description, content: preview.content, enabled: input.enabled ?? existing?.enabled ?? true, trusted: true, source: preview.review.source, sourceUrl: input.sourceUrl ?? null, version: input.version ?? preview.review.version, hash: preview.review.hash, diagnostics: preview.review.warnings, createdAt: existing?.createdAt ?? now, updatedAt: now };
     this.#skills.set(skill.id, skill); await this.#persistSkill(skill); return skill;
   }
 
@@ -145,7 +151,7 @@ export class PersonalCapabilitiesService {
   pollOAuth(tenantId: string, userId: string, state: string) { const flow = this.#oauth.get(state); if (!flow || flow.expiresAt < Date.now() || flow.tenantId !== tenantId || flow.userId !== userId) throw new BadRequestException("OAuth state is invalid or expired"); return { status: flow.complete ? "complete" as const : "pending" as const, serverId: flow.complete ? flow.serverId : null }; }
 
   async runtime(tenantId: string, userId: string): Promise<{ skills: AgentSkill[]; mcpServers: McpServerSpec[] }> {
-    const skills = (await this.listSkills(tenantId, userId)).filter((item) => item.enabled && item.trusted).map((item) => ({ name: item.name, description: item.description, content: item.content, filePath: `/personal-skills/${item.id}/SKILL.md`, scope: "registered" as const, disableModelInvocation: false, resources: [] }));
+    const skills = (await this.listSkills(tenantId, userId)).filter((item) => item.enabled).map((item) => ({ name: item.name, description: item.description, content: item.content, filePath: `/personal-skills/${item.id}/SKILL.md`, scope: "registered" as const, disableModelInvocation: false, resources: [] }));
     const enabledMcp = (await this.listMcp(tenantId, userId)).filter((item) => item.enabled && item.trusted);
     for (const item of enabledMcp) {
       if (item.auth !== "none" && item.credentialRef && !this.#secrets.has(item.credentialRef)) {
@@ -180,6 +186,20 @@ export class PersonalCapabilitiesService {
       this.#mcp.set(item.id, item);
     }
     if (profiles[0]) this.#profiles.set(key, PersonalizationProfileSchema.parse({ nickname:str(profiles[0],"nickname"),occupation:str(profiles[0],"occupation"),about:str(profiles[0],"about"),customInstructions:str(profiles[0],"custom_instructions"),updatedAt:date(profiles[0],"updated_at") }));
+  }
+  async #refreshSkills(tenantId: string, userId: string) {
+    if (!this.database) return;
+    const rows = await this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>(
+      "SELECT * FROM personal_skills WHERE user_id = $1",
+      [userId],
+    ));
+    for (const [id, item] of this.#skills) {
+      if (owns(item, tenantId, userId)) this.#skills.delete(id);
+    }
+    for (const row of rows) {
+      const item = skillRow(row);
+      this.#skills.set(item.id, item);
+    }
   }
   async #persistSkill(skill: PersonalSkill) { if (!this.database) return; await this.database.withTenant(skill.tenantId, (db) => db.execute(`INSERT INTO personal_skills (id, tenant_id, user_id, name, description, content, enabled, trusted, source, source_url, version, hash, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,content=EXCLUDED.content,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,source=EXCLUDED.source,source_url=EXCLUDED.source_url,version=EXCLUDED.version,hash=EXCLUDED.hash,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [skill.id,skill.tenantId,skill.userId,skill.name,skill.description,skill.content,skill.enabled,skill.trusted,skill.source,skill.sourceUrl,skill.version,skill.hash,JSON.stringify(skill.diagnostics),skill.createdAt,skill.updatedAt])); }
   async #persistMcp(server: PersonalMcpServer) { if (!this.database) return; const envelope = server.credentialRef ? this.#secretEnvelopes.get(server.credentialRef) : undefined; await this.database.withTenant(server.tenantId, (db) => db.execute(`INSERT INTO personal_mcp_servers (id, tenant_id, user_id, name, url, transport, auth, credential_ref, credential_envelope, enabled, trusted, health, tool_count, last_checked_at, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14::timestamptz,$15::jsonb,$16::timestamptz,$17::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,transport=EXCLUDED.transport,auth=EXCLUDED.auth,credential_ref=EXCLUDED.credential_ref,credential_envelope=EXCLUDED.credential_envelope,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,health=EXCLUDED.health,tool_count=EXCLUDED.tool_count,last_checked_at=EXCLUDED.last_checked_at,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [server.id,server.tenantId,server.userId,server.name,server.url,server.transport,server.auth,server.credentialRef,envelope ? JSON.stringify(envelope) : null,server.enabled,server.trusted,server.health,server.toolCount,server.lastCheckedAt,JSON.stringify(server.diagnostics),server.createdAt,server.updatedAt])); }

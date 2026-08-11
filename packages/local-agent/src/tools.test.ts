@@ -42,6 +42,7 @@ describe("createBerryTools", () => {
   it("classifies tool risks", () => {
     expect(riskForToolName("read_file")).toBe("read");
     expect(riskForToolName("activate_skill")).toBe("read");
+    expect(riskForToolName("save_personal_skill")).toBe("file-edit");
     expect(riskForToolName("ask_user_question")).toBe("read");
     expect(riskForToolName("compose_message")).toBe("read");
     expect(riskForToolName("write_file")).toBe("file-edit");
@@ -160,6 +161,25 @@ describe("createBerryTools", () => {
     expect(activated).toContain("<file>references/style.md</file>");
     expect(await run(tools, "activate_skill", { name: "release-notes" })).toContain("skill_already_active");
     await expect(run(tools, "activate_skill", { name: "missing" })).rejects.toThrow();
+  });
+
+  it("saves a personal skill through the identity-bound host bridge", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "berry-tools-"));
+    tempDirs.push(dir);
+    const received: string[] = [];
+    const tools = new Map(createBerryTools({
+      workspacePath: dir,
+      personalSkills: {
+        async save({ content }) {
+          received.push(content);
+          return { id: "skill_1", name: "brief-writer", description: "Write briefs", enabled: true };
+        },
+      },
+    }).map((tool) => [tool.name, tool]));
+    const content = "---\nname: brief-writer\ndescription: Write briefs\n---\n\nWrite a concise brief.";
+
+    await expect(run(tools, "save_personal_skill", { content })).resolves.toContain("$brief-writer");
+    expect(received).toEqual([content]);
   });
 
   it("exposes untrusted web search and fetch results with source URLs", async () => {

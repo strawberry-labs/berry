@@ -46,6 +46,7 @@ import {
   type BrowserToolBridge,
   type ImageGenerationToolBridge,
   type MemoryToolBridge,
+  type PersonalSkillToolBridge,
   type WebToolBridge,
 } from "./tools.ts";
 import { recordUsage } from "./usage.ts";
@@ -160,6 +161,8 @@ export interface StartTurnOptions {
   portableCheckpoint?: SessionCheckpointV2;
   /** Host-bound explicit memory operations. */
   memory?: MemoryToolBridge;
+  /** Host-bound personal skill installation for the authenticated user. */
+  personalSkills?: PersonalSkillToolBridge;
   /** Trusted plugin-contributed command hooks. User/workspace hooks are loaded from disk. */
   extraHooks?: JsonValue[];
   systemPrompt?: string;
@@ -922,6 +925,7 @@ export class BerryAgentRuntime {
       options.web?.configKey ?? "no-web-tools",
       options.imageGeneration ? "image-generation" : "no-image-generation",
       options.memory ? "memory-tools" : "no-memory-tools",
+      options.personalSkills ? "personal-skill-tools" : "no-personal-skill-tools",
       options.systemPrompt?.trim() ?? "",
       (options.images?.length ?? 0) > 0 ? "with-images" : "text-only",
       sessionTarget ? [sessionTarget.goalText, sessionTarget.tokenBudget, sessionTarget.timeBudgetMin] : null,
@@ -979,6 +983,7 @@ export class BerryAgentRuntime {
         ...(options.web ? { web: options.web } : {}),
         ...(options.imageGeneration ? { imageGeneration: options.imageGeneration } : {}),
         ...(options.memory ? { memory: options.memory } : {}),
+        ...(options.personalSkills ? { personalSkills: options.personalSkills } : {}),
         ...(this.#artifactStore ? { artifactStore: this.#artifactStore } : {}),
         subagents: subagents.map((agent) => ({ name: agent.name, description: agent.description })),
         spawnSubagent: (params) => this.#spawnSubagent(options, params),

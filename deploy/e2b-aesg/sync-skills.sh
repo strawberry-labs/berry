@@ -87,6 +87,7 @@ sync_skill "docx" "AESG Word documents" "Template-preserving AESG reports, lette
 sync_skill "pdf" "AESG PDF documents" "AESG PDF generation through the approved Word templates, with structural and visual QA"
 sync_skill "xlsx" "AESG Excel workbooks" "Branded multi-sheet AESG workbooks with formulas, validation, formatting, and charts"
 sync_skill "pptx" "AESG PowerPoint presentations" "AESG General Template presentations using approved masters, semantic layouts, and imagery"
+sync_skill "skill-creator" "Skill Creator" "Create or update Berry skills and install them directly into each member's personal Skills library"
 
 compose exec -T postgres psql -U berry -d berry -Atc \
   "SELECT capability_id || '|' || name || '|' || assignment || '|' || content_hash FROM organization_capabilities WHERE tenant_id='$tenant_id'::uuid AND kind='skill' ORDER BY capability_id;"

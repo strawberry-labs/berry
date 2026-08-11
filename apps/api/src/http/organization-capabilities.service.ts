@@ -60,8 +60,8 @@ export class OrganizationCapabilitiesService {
     return (await this.personal.previewSkill(input)).review;
   }
   async remove(tenantId: string, id: string) { const record = (await this.list(tenantId)).find((item) => item.id === id); if (!record) return { ok: false }; this.#records.delete(id); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM organization_capabilities WHERE id=$1", [id])); return { ok: true }; }
-  async settings(tenantId: string) { if (!this.database) return this.#settings.get(tenantId) ?? { skills: true, mcp: true }; const rows = await this.database.withTenant(tenantId, (db) => db.query<{ allow_personal_skills: boolean; allow_personal_mcp: boolean }>("SELECT allow_personal_skills,allow_personal_mcp FROM organization_capability_settings")); return rows[0] ? { skills: rows[0].allow_personal_skills, mcp: rows[0].allow_personal_mcp } : { skills: true, mcp: true }; }
-  async updateSettings(tenantId: string, value: { skills: boolean; mcp: boolean }) { this.#settings.set(tenantId, value); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("INSERT INTO organization_capability_settings (tenant_id,allow_personal_skills,allow_personal_mcp) VALUES ($1::uuid,$2,$3) ON CONFLICT (tenant_id) DO UPDATE SET allow_personal_skills=EXCLUDED.allow_personal_skills,allow_personal_mcp=EXCLUDED.allow_personal_mcp,updated_at=now()", [tenantId,value.skills,value.mcp])); return value; }
+  async settings(tenantId: string) { if (!this.database) return { skills: true, mcp: this.#settings.get(tenantId)?.mcp ?? true }; const rows = await this.database.withTenant(tenantId, (db) => db.query<{ allow_personal_mcp: boolean }>("SELECT allow_personal_mcp FROM organization_capability_settings")); return { skills: true, mcp: rows[0]?.allow_personal_mcp ?? true }; }
+  async updateSettings(tenantId: string, value: { skills: boolean; mcp: boolean }) { const next = { skills: true, mcp: value.mcp }; this.#settings.set(tenantId, next); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("INSERT INTO organization_capability_settings (tenant_id,allow_personal_skills,allow_personal_mcp) VALUES ($1::uuid,true,$2) ON CONFLICT (tenant_id) DO UPDATE SET allow_personal_skills=true,allow_personal_mcp=EXCLUDED.allow_personal_mcp,updated_at=now()", [tenantId,value.mcp])); return next; }
   async setOverride(tenantId: string, userId: string, kind: "skill" | "mcp", capabilityId: string, enabled: boolean) { const row = { tenantId,userId,kind,capabilityId,enabled,updatedAt:new Date().toISOString() }; this.#overrides.set(`${tenantId}:${userId}:${kind}:${capabilityId}`, row); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("INSERT INTO capability_user_overrides (tenant_id,user_id,kind,capability_id,enabled) VALUES ($1::uuid,$2,$3,$4,$5) ON CONFLICT (tenant_id,user_id,kind,capability_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_at=now()", [tenantId,userId,kind,capabilityId,enabled])); return row; }
   async managedPolicy(tenantId: string) {
     const [records, personalAdditions] = await Promise.all([this.list(tenantId), this.settings(tenantId)]);
@@ -92,11 +92,26 @@ export class OrganizationCapabilitiesService {
       const reason: EffectiveCapability["reason"] = item.assignment === "blocked" ? "blocked" : item.assignment === "required" ? "required" : userCanChange && override?.enabled === false ? "user-disabled" : userCanChange && override?.enabled === true ? "user-enabled" : item.assignment === "default-on" ? "default" : "available";
       rows.push({ kind:item.kind,capabilityId:item.capabilityId,name:item.name,enabled:enabled && item.assignment !== "blocked",locked:!userCanChange,assignment:item.assignment,provenance:"organization",reason,contentHash:item.contentHash });
       if (!enabled || item.assignment === "blocked") continue;
-      if (item.kind === "skill") { const config = object(item.config); const content = typeof config.content === "string" ? config.content : ""; if (content) skills.push({ name:item.name,description:item.description,content,filePath:`/managed-skills/${item.capabilityId}/SKILL.md`,scope:"registered",disableModelInvocation:false,resources:[] }); }
+      if (item.kind === "skill") {
+        const config = object(item.config);
+        const content = typeof config.content === "string" ? config.content : "";
+        if (content) {
+          const metadata = parseAgentSkillMarkdown(content);
+          skills.push({
+            name: metadata.name,
+            description: metadata.description,
+            content,
+            filePath: `/managed-skills/${item.capabilityId}/SKILL.md`,
+            scope: "registered",
+            disableModelInvocation: false,
+            resources: [],
+          });
+        }
+      }
       else { const config = object(item.config); if (typeof config.url === "string") mcpServers.push({ id:item.capabilityId,name:item.name,transport:config.transport === "http-sse" ? "http-sse" : "streamable-http",command:null,args:[],url:config.url,env:{},enabled:true,trusted:true,credentialKey:typeof config.credentialRef === "string" ? config.credentialRef : null }); }
     }
     const blocked = new Set(org.filter((item) => item.assignment === "blocked").map((item) => `${item.kind}:${item.capabilityId}`));
-    for (const skill of personal.skills) { const id = skill.name.toLowerCase(); const denied = !settings.skills || blocked.has(`skill:${id}`); rows.push({kind:"skill",capabilityId:id,name:skill.name,enabled:!denied,locked:denied,assignment:null,provenance:"personal",reason:denied?"personal-blocked":"personal",contentHash:hashContent({content:skill.content})}); if (!denied) skills.push(skill); }
+    for (const skill of personal.skills) { const id = skill.name.toLowerCase(); rows.push({kind:"skill",capabilityId:id,name:skill.name,enabled:true,locked:false,assignment:null,provenance:"personal",reason:"personal",contentHash:hashContent({content:skill.content})}); skills.push(skill); }
     for (const server of personal.mcpServers) { const denied = !settings.mcp || blocked.has(`mcp:${server.id}`); rows.push({kind:"mcp",capabilityId:server.id,name:server.name,enabled:!denied,locked:denied,assignment:null,provenance:"personal",reason:denied?"personal-blocked":"personal",contentHash:null}); if (!denied) mcpServers.push(server); }
     return { rows, skills, mcpServers };
   }

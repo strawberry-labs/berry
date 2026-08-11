@@ -24,6 +24,7 @@ try {
   const dependencyChecks = [
     ["AESG branding skill", "test -d /managed-skills/aesg-branding"],
     ["CV Creator skill", "test -f /managed-skills/cv-creator/scripts/generate_cv_from_spec.py"],
+    ["Skill Creator skill", "test -f /managed-skills/skill-creator/SKILL.md"],
     ["DOCX skill", "test -f /managed-skills/docx/scripts/create_aesg_docx.py"],
     ["PDF skill", "test -f /managed-skills/pdf/scripts/create_aesg_pdf.py"],
     ["XLSX skill", "test -f /managed-skills/xlsx/scripts/create_aesg_xlsx.py"],

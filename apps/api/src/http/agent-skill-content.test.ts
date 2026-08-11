@@ -21,7 +21,7 @@ describe("Agent Skills imports", () => {
     expect(parseAgentSkillMarkdown(content)).toMatchObject({ name: "release-notes", version: "1.2.0", compatibility: "Requires git" });
     const result = await new PersonalCapabilitiesService().previewSkill({ content, source: "upload", packageFiles: ["SKILL.md", "scripts/check.sh", "references/style.md"] });
     expect(result.review).toMatchObject({ name: "release-notes", version: "1.2.0", hasScripts: true, resources: ["references/style.md", "scripts/check.sh"] });
-    expect(result.review.warnings).toContain("This skill package includes executable scripts. Review them before trusting the skill.");
+    expect(result.review.warnings).toContain("This skill package includes executable scripts. Inspect them before use.");
   });
 
   it.each([
@@ -32,11 +32,13 @@ describe("Agent Skills imports", () => {
     await expect(new PersonalCapabilitiesService().previewSkill({ content })).rejects.toThrow();
   });
 
-  it("imports reviewed personal skills disabled and untrusted", async () => {
+  it("installs validated personal skills enabled without a trust approval", async () => {
     const content = "---\nname: safe-skill\ndescription: A reviewed skill\n---\nBody";
     const service = new PersonalCapabilitiesService();
-    const preview = await service.previewSkill({ content });
-    const saved = await service.saveSkill("00000000-0000-4000-8000-000000000001", "user_1", { content, confirmedHash: preview.review.hash });
-    expect(saved).toMatchObject({ enabled: false, trusted: false, name: "safe-skill" });
+    const saved = await service.saveSkill("00000000-0000-4000-8000-000000000001", "user_1", { content });
+    expect(saved).toMatchObject({ enabled: true, trusted: true, name: "safe-skill" });
+    await expect(service.runtime("00000000-0000-4000-8000-000000000001", "user_1")).resolves.toMatchObject({
+      skills: [expect.objectContaining({ name: "safe-skill" })],
+    });
   });
 });

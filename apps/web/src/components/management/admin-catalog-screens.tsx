@@ -1227,7 +1227,6 @@ function SkillsMcpScreen({
 }: ManagementScreenProps) {
   const canWriteSkills = permissions.includes("skills:write");
   const canWriteMcp = permissions.includes("mcp:write");
-  const canWritePolicies = canWriteSkills && canWriteMcp;
   const r = useResource(
     `capabilities:${tenantId}`,
     async () => (client ? client.listOrganizationCapabilities(tenantId) : []),
@@ -1648,24 +1647,10 @@ function SkillsMcpScreen({
         </form>
       </ManagementDialog>
       <Section
-        title="Personal additions"
-        description="Control whether members can add their own capabilities."
+        title="Personal MCP servers"
+        description="Personal skills are always available. Control whether members can add remote MCP servers."
       >
         <div className="grid gap-2">
-          <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
-            <span className="grid min-w-0 gap-0.5">
-              Personal skills
-              <small className="text-xs font-normal text-muted-foreground">Members can import and manage their own skills.</small>
-            </span>
-            <ManagementSwitch
-              checked={policy.data.skills}
-              disabled={!canWritePolicies}
-              onCheckedChange={(skills) =>
-                void updatePersonalPolicy({ ...policy.data, skills })
-              }
-              aria-label="Allow personal skills"
-            />
-          </label>
           <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
             <span className="grid min-w-0 gap-0.5">
               Personal MCP servers
@@ -1673,7 +1658,7 @@ function SkillsMcpScreen({
             </span>
             <ManagementSwitch
               checked={policy.data.mcp}
-              disabled={!canWritePolicies}
+              disabled={!canWriteMcp}
               onCheckedChange={(mcp) =>
                 void updatePersonalPolicy({ ...policy.data, mcp })
               }

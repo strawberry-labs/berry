@@ -522,6 +522,7 @@ export const DurableBuiltInToolNameSchema = z.enum([
   "create_image",
   "inspect_images",
   "activate_skill",
+  "save_personal_skill",
 ]);
 export type DurableBuiltInToolName = z.infer<typeof DurableBuiltInToolNameSchema>;
 
@@ -541,6 +542,7 @@ export const DURABLE_BASE_BUILT_IN_TOOLS: readonly DurableBuiltInToolName[] = [
   "git_diff",
   "git_log",
   "git_checkpoint",
+  "save_personal_skill",
 ] as const;
 
 export const DurableProviderTransportSchema = z.object({

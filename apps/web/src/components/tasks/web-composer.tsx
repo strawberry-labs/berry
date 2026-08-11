@@ -13,7 +13,7 @@ import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
-import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
+import { PromptEditor, type PromptEditorHandle, type PromptMentionConfig } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
 import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, type ComposerQuestionAnswer } from "./composer-question-overlay";
@@ -71,6 +71,22 @@ export function prunePastedTextPresentations(
 const CREATE_IMAGE_TOKEN = "__berry_create_image__";
 export function improvableComposerPrompt(text: string): string {
   return text.replaceAll(CREATE_IMAGE_TOKEN, "").trim();
+}
+export function composerSkillMentions(
+  text: string,
+  skills: WebConfig["skills"],
+): PromptMentionConfig[] {
+  return skills.flatMap((skill) => {
+    const name = skill.name.replace(/^\$/, "").trim();
+    const markdown = `$${name}`;
+    const pattern = new RegExp(`${escapeComposerRegExp(markdown)}(?![a-z0-9-])`);
+    return pattern.test(text)
+      ? [{ id: `skill:${skill.id}`, category: "skills" as const, label: name, markdown }]
+      : [];
+  });
+}
+function escapeComposerRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function insertCreateImageToken(editor: PromptEditorHandle | null): void {
   editor?.insertPromptToken({
@@ -403,6 +419,7 @@ export function Composer({
     const prompt = improvableComposerPrompt(text);
     if (!client || !prompt || improvingPrompt) return;
     const originalText = text;
+    const skillMentions = composerSkillMentions(prompt, config.skills);
     const preserveCreateImageMode = originalText.includes(CREATE_IMAGE_TOKEN);
     const controller = new AbortController();
     promptImprovementControllerRef.current?.abort();
@@ -410,7 +427,10 @@ export function Composer({
     setPromptImproveError("");
     setImprovingPrompt(true);
     try {
-      const result = await client.improvePrompt({ prompt }, { signal: controller.signal });
+      const result = await client.improvePrompt({
+        prompt,
+        skills: skillMentions.map((mention) => mention.markdown.slice(1)),
+      }, { signal: controller.signal });
       if (latestTextRef.current !== originalText) {
         if (improvableComposerPrompt(latestTextRef.current)) {
           setPromptImproveError("Your draft changed while Berry was improving it. Run Improve prompt again to use the latest text.");
@@ -418,7 +438,7 @@ export function Composer({
         return;
       }
       setComposerText(result.prompt);
-      editorRef.current?.setText(result.prompt);
+      editorRef.current?.setTextWithMentions(result.prompt, skillMentions);
       setCreateImageMode(preserveCreateImageMode);
       if (preserveCreateImageMode) {
         window.requestAnimationFrame(() => insertCreateImageToken(editorRef.current));
@@ -431,7 +451,7 @@ export function Composer({
         setImprovingPrompt(false);
       }
     }
-  }, [client, improvingPrompt, setComposerText, text]);
+  }, [client, config.skills, improvingPrompt, setComposerText, text]);
 
   const continueInterruptedTurn = React.useCallback(async () => {
     if (!onContinueTurn || working || editingFollowUp || pendingUploads.length > 0) return;

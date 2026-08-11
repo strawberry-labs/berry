@@ -6,6 +6,7 @@ export * from "./durable-context.ts";
 export * from "./checkpoint.ts";
 export * from "./retrieval.ts";
 export * from "./memory.ts";
+export * from "./agent-skill-content.ts";
 
 /**
  * Pre-1.0 host protocol version shared by desktop, host, CLI, and future
@@ -82,6 +83,7 @@ export type ImageGenerationResponse = z.infer<typeof ImageGenerationResponseSche
 
 export const PromptImprovementRequestSchema = z.object({
   prompt: z.string().trim().min(1).max(100_000),
+  skills: z.array(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)).max(50).default([]),
 }).strict();
 export type PromptImprovementRequest = z.infer<typeof PromptImprovementRequestSchema>;
 
@@ -3588,6 +3590,10 @@ export {
   findModelProviderPreset,
   type ModelProviderPreset,
 } from "./model-presets.ts";
+export {
+  parseAgentSkillMarkdown,
+  type AgentSkillMetadata,
+} from "./agent-skill-content.ts";
 
 export function nowIso(): string {
   return new Date().toISOString();
