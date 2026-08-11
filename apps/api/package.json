@@ -19,6 +19,7 @@
     "@berry/desktop-db": "workspace:*",
     "@berry/local-agent": "workspace:*",
     "@berry/personal-memory": "workspace:*",
+    "@berry/router-client": "workspace:*",
     "@berry/sandbox-contract": "workspace:*",
     "@berry/shared": "workspace:*",
     "@nestjs/common": "11.1.28",

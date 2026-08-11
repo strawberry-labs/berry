@@ -80,6 +80,17 @@ export const ImageGenerationResponseSchema = z.object({
 }).passthrough();
 export type ImageGenerationResponse = z.infer<typeof ImageGenerationResponseSchema>;
 
+export const PromptImprovementRequestSchema = z.object({
+  prompt: z.string().trim().min(1).max(100_000),
+}).strict();
+export type PromptImprovementRequest = z.infer<typeof PromptImprovementRequestSchema>;
+
+export const PromptImprovementResponseSchema = z.object({
+  prompt: z.string().trim().min(1).max(100_000),
+  model: z.string().trim().min(1),
+}).strict();
+export type PromptImprovementResponse = z.infer<typeof PromptImprovementResponseSchema>;
+
 export const GeneratedImageContentSchema = z.object({
   src: z.string().min(1),
   fileId: z.string().uuid().optional(),

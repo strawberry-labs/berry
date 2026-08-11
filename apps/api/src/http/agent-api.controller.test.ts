@@ -18,7 +18,7 @@ import { InMemoryUsageRepository, USAGE_REPOSITORY, type UsageRepository } from 
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissionReplay } from "../runtime/durable-turn.service.ts";
-import { turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { normalizeImprovedPrompt, PROMPT_IMPROVEMENT_MODEL, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -26,6 +26,72 @@ describe("AgentApiController", () => {
   afterEach(async () => {
     await app?.close();
     app = null;
+    vi.unstubAllGlobals();
+  });
+
+  it("normalizes prompt-only model output without altering the rewritten content", () => {
+    expect(normalizeImprovedPrompt("Improved prompt: Write a three-part executive summary.")).toBe("Write a three-part executive summary.");
+    expect(normalizeImprovedPrompt("```text\nUse the attached report to identify five risks.\n```")).toBe("Use the attached report to identify five risks.");
+  });
+
+  it("improves prompts with the fixed low-cost model and records measured usage", async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
+      id: "completion_prompt_improve",
+      model: PROMPT_IMPROVEMENT_MODEL,
+      choices: [{ message: { content: "Improved prompt: Write a concise executive summary for senior leaders, followed by three prioritized recommendations." }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 120, completion_tokens: 24, total_tokens: 144, prompt_tokens_details: { cached_tokens: 80 } },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const usageRepository = new InMemoryUsageRepository();
+    app = await createApp(fakeSessionHost(), {
+      runtimeConfig: promptImprovementRuntimeConfig(),
+      usageRepository,
+    });
+
+    await request(app.getHttpServer())
+      .post("/v1/prompts/improve")
+      .set(authHeader())
+      .send({ prompt: "summarize this for leadership" })
+      .expect(201)
+      .expect(({ body }) => expect(body).toEqual({
+        prompt: "Write a concise executive summary for senior leaders, followed by three prioritized recommendations.",
+        model: PROMPT_IMPROVEMENT_MODEL,
+      }));
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const upstreamRequest = fetchImpl.mock.calls[0]![1]!;
+    const upstreamBody = JSON.parse(String(upstreamRequest.body)) as Record<string, unknown>;
+    expect(upstreamBody).toMatchObject({ model: PROMPT_IMPROVEMENT_MODEL, stream: false, temperature: 0.2 });
+    expect(upstreamBody).not.toHaveProperty("tools");
+    expect(upstreamBody.messages).toEqual([
+      expect.objectContaining({ role: "system", content: expect.stringContaining("Return only the improved prompt") }),
+      { role: "user", content: "summarize this for leadership" },
+    ]);
+    const usageEvents = await usageRepository.listEvents(SELF_HOST_TENANT_ID);
+    expect(usageEvents).toEqual([
+      expect.objectContaining({
+        feature: "prompt.improve",
+        provider: "router",
+        model: PROMPT_IMPROVEMENT_MODEL,
+        tokensIn: 120,
+        tokensOut: 24,
+        cacheReadTokens: 80,
+        status: "completed",
+      }),
+    ]);
+  });
+
+  it("rejects blank prompt improvements before calling the model", async () => {
+    const fetchImpl = vi.fn();
+    vi.stubGlobal("fetch", fetchImpl);
+    app = await createApp(fakeSessionHost(), { runtimeConfig: promptImprovementRuntimeConfig() });
+
+    await request(app.getHttpServer())
+      .post("/v1/prompts/improve")
+      .set(authHeader())
+      .send({ prompt: "   " })
+      .expect(400);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("fingerprints the request payload independently from its operation key", () => {
@@ -1269,6 +1335,26 @@ function imageRuntimeConfig(): CloudRuntimeConfigService {
 
 function chatRuntimeConfig(): CloudRuntimeConfigService {
   return new CloudRuntimeConfigService(chatRuntimeEnv());
+}
+
+function promptImprovementRuntimeConfig(): CloudRuntimeConfigService {
+  return new CloudRuntimeConfigService({
+    ...chatRuntimeEnv(),
+    BERRY_ROUTER_API_KEY: "router-test-key",
+    BERRY_ROUTER_DEFAULT_MODEL: PROMPT_IMPROVEMENT_MODEL,
+    BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
+      id: PROMPT_IMPROVEMENT_MODEL,
+      name: "DeepSeek V4 Flash",
+      contextWindow: 1_000_000,
+      maxOutputTokens: 384_000,
+      capabilities: {
+        tools: true,
+        reasoning: true,
+        json: true,
+        cost: { input: 0.14, output: 0.28, cacheRead: 0.03 },
+      },
+    }]),
+  });
 }
 
 function visionRuntimeConfig(): CloudRuntimeConfigService {
