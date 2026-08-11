@@ -105,6 +105,7 @@ import {
   OrgModelPolicySchema,
   OrgPermissionSchema,
   PermissionModeSchema,
+  PromptImprovementResponseSchema,
   ResourceAclPrincipalTypeSchema,
   ResourceAclSchema,
   RolePermissionSetSchema,
@@ -625,6 +626,14 @@ export class BerryApiClient {
     return this.#request("/v1/images/generations", ImageGenerationResponseSchema, {
       method: "POST",
       body: input,
+    });
+  }
+
+  async improvePrompt(input: { prompt: string }, options: { signal?: AbortSignal } = {}): Promise<{ prompt: string; model: string }> {
+    return this.#request("/v1/prompts/improve", PromptImprovementResponseSchema, {
+      method: "POST",
+      body: input,
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   }
 

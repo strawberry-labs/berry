@@ -65,6 +65,9 @@ importers:
       '@berry/personal-memory':
         specifier: workspace:*
         version: link:../../packages/personal-memory
+      '@berry/router-client':
+        specifier: workspace:*
+        version: link:../../packages/router-client
       '@berry/sandbox-contract':
         specifier: workspace:*
         version: link:../../packages/sandbox-contract

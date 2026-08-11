@@ -3,6 +3,7 @@ import type { AttachmentInput } from "@berry/shared";
 import type { QueuedFollowUp } from "@/lib/queued-follow-ups";
 import {
   filesFromDataTransfer,
+  improvableComposerPrompt,
   PASTED_TEXT_ATTACHMENT_THRESHOLD,
   PASTED_TEXT_INLINE_LIMIT,
   pastedTextMode,
@@ -11,6 +12,14 @@ import {
   resolveComposerPrimaryAction,
   uploadProgressDescription,
 } from "./web-composer.tsx";
+
+describe("improvableComposerPrompt", () => {
+  it("appears only for meaningful composer text and excludes the create-image token", () => {
+    expect(improvableComposerPrompt("   ")).toBe("");
+    expect(improvableComposerPrompt("__berry_create_image__")).toBe("");
+    expect(improvableComposerPrompt("__berry_create_image__  Make a launch poster ")).toBe("Make a launch poster");
+  });
+});
 
 const file = { name: "project-brief.pdf", size: 128, type: "application/pdf" } as File;
 

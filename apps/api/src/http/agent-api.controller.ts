@@ -1,6 +1,7 @@
-import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, Inject, NotFoundException, Param, Patch, Post, Put, Query, Req, ServiceUnavailableException, Sse } from "@nestjs/common";
+import { BadGatewayException, BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, HttpException, Inject, NotFoundException, Param, Patch, Post, Put, Query, Req, RequestTimeoutException, ServiceUnavailableException, Sse } from "@nestjs/common";
 import { createHash, randomUUID } from "node:crypto";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
+import { OpenAIChatCompletionsClient, RouterClientError, type ChatCompletionUsage } from "@berry/router-client";
 import {
   AgentStreamEventSchema,
   ApprovalDecisionSchema,
@@ -16,6 +17,7 @@ import {
   MessageRoleSchema,
   MobileDeviceRegistrationCreateSchema,
   PermissionModeSchema,
+  PromptImprovementRequestSchema,
   ReasoningLevelSchema,
   resolveModelCapabilities,
   sealDurableSecret,
@@ -63,6 +65,25 @@ import {
   type EnterpriseIdentityRepository,
 } from "../identity/identity.repository.ts";
 import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
+
+export const PROMPT_IMPROVEMENT_MODEL = "canopywave/deepseek/deepseek-v4-flash";
+
+const PROMPT_IMPROVEMENT_SYSTEM_PROMPT = `You improve a user's draft prompt for another AI assistant.
+
+Return only the improved prompt. Do not answer or execute the prompt. Do not add an introduction, label, explanation, quotation marks, or Markdown fence.
+
+Make the prompt more effective by:
+- stating the goal and requested action clearly;
+- adding useful specificity, context, background, target audience, tone, output format, length, constraints, and success criteria when supported by the draft;
+- organizing complex work into a clear sequence of tasks or deliverables;
+- retaining examples, source references, URLs, paths, code, data, names, and other literal details;
+- preserving the user's language, intent, facts, requirements, and safety constraints;
+- keeping it concise enough to avoid unnecessary context and token use.
+
+Never invent facts, requirements, attachments, audiences, deadlines, examples, or preferences the user did not provide. Do not ask the downstream model to reveal hidden chain-of-thought. When reasoning matters, request a concise rationale, verification, or step-by-step result instead.`;
+
+const PROMPT_IMPROVEMENT_TIMEOUT_MS = 30_000;
+const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -439,6 +460,192 @@ export class AgentApiController {
             },
       },
     };
+  }
+
+  @Post("/prompts/improve")
+  async improvePrompt(@Req() httpRequest: AuthenticatedRequest, @Body() body: unknown) {
+    const request = parseBody(PromptImprovementRequestSchema, body);
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const userId = httpRequest.auth?.user.id ?? null;
+    const departmentId = await this.#primaryDepartmentId(tenantId, userId);
+    const runtime = await this.runtimeConfig.resolve(tenantId, {
+      provider: { id: "router" },
+      model: PROMPT_IMPROVEMENT_MODEL,
+    });
+    const model = runtime.provider.models?.find((candidate) => candidate.id === PROMPT_IMPROVEMENT_MODEL);
+    if (!model) {
+      throw new ServiceUnavailableException({
+        code: "prompt_improvement_model_unavailable",
+        message: "Prompt improvement is not configured for this deployment.",
+      });
+    }
+    await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
+    const decision = await this.modelGovernance.resolve({
+      tenantId,
+      mode: "chat",
+      providerId: runtime.provider.id,
+      model: PROMPT_IMPROVEMENT_MODEL,
+      userId,
+      departmentId,
+    });
+    if (!decision.allowed) {
+      throw new ForbiddenException({
+        code: "prompt_improvement_model_blocked",
+        message: modelGovernanceMessage(decision.reason),
+        decision,
+      });
+    }
+
+    const requestId = `prompt_improve_${randomUUID()}`;
+    const startedAt = Date.now();
+    const estimatedInputTokens = estimatePromptTokens(`${PROMPT_IMPROVEMENT_SYSTEM_PROMPT}\n${request.prompt}`);
+    const maxOutputTokens = Math.min(
+      runtime.providerMaxOutputTokens ?? PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS,
+      PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS,
+      Math.max(512, estimatePromptTokens(request.prompt) * 2),
+    );
+    const estimatedOutputTokens = maxOutputTokens;
+    const estimatedCostMicros = budgetEstimateFromRequest({
+      provider: runtime.provider,
+      model: PROMPT_IMPROVEMENT_MODEL,
+      estimatedInputTokens,
+      estimatedOutputTokens,
+    });
+    await this.budgets.reserve({
+      tenantId,
+      requestId,
+      userId,
+      departmentId,
+      taskId: null,
+      sessionId: null,
+      feature: "prompt.improve",
+      provider: runtime.provider.id,
+      model: PROMPT_IMPROVEMENT_MODEL,
+      estimatedCostMicros,
+      estimatedTokens: estimatedInputTokens + estimatedOutputTokens,
+      metadata: { promptLength: request.prompt.length },
+    });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PROMPT_IMPROVEMENT_TIMEOUT_MS);
+    let result: Awaited<ReturnType<OpenAIChatCompletionsClient["complete"]>>;
+    try {
+      result = await new OpenAIChatCompletionsClient({
+        provider: runtime.provider,
+        apiKey: runtime.apiKey,
+        appName: "Berry Prompt Improver",
+      }).complete({
+        model: PROMPT_IMPROVEMENT_MODEL,
+        messages: [
+          { role: "system", content: PROMPT_IMPROVEMENT_SYSTEM_PROMPT },
+          { role: "user", content: request.prompt },
+        ],
+        temperature: 0.2,
+        maxTokens: maxOutputTokens,
+        reasoningEffort: "low",
+        signal: controller.signal,
+      });
+    } catch (error) {
+      await Promise.all([
+        this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n }),
+        this.usageRepository.ingestInternal(tenantId, promptImprovementUsageEvent({
+          requestId,
+          userId,
+          departmentId,
+          provider: runtime.provider.id,
+          model: PROMPT_IMPROVEMENT_MODEL,
+          requestedModel: PROMPT_IMPROVEMENT_MODEL,
+          promptLength: request.prompt.length,
+          resultLength: 0,
+          usage: estimatedPromptImprovementUsage(0, 0),
+          actualCostMicros: 0n,
+          pricingSource: "estimated",
+          finishReason: null,
+          startedAt,
+          status: "failed",
+        })),
+      ]).catch(() => undefined);
+      if (controller.signal.aborted) {
+        throw new RequestTimeoutException({
+          code: "prompt_improvement_timeout",
+          message: "Prompt improvement took too long. Please try again.",
+        });
+      }
+      if (error instanceof RouterClientError && error.status === 429) {
+        throw new HttpException({
+          code: "prompt_improvement_rate_limited",
+          message: "Prompt improvement is busy right now. Please try again shortly.",
+        }, 429);
+      }
+      throw new BadGatewayException({
+        code: "prompt_improvement_failed",
+        message: "Berry could not improve this prompt. Please try again.",
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const recordResultUsage = async (status: "completed" | "failed", resultLength: number) => {
+      const usage = result.usage ?? estimatedPromptImprovementUsage(
+        estimatedInputTokens,
+        resultLength > 0 ? estimatePromptTokens(result.content) : 0,
+      );
+      const usageEvent: AgentStreamEvent = {
+        kind: "usage",
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+        cacheCreationTokens1h: usage.cacheCreationTokens1h ?? 0,
+        cacheCreationTokens5m: usage.cacheCreationTokens5m ?? 0,
+        requestedModel: PROMPT_IMPROVEMENT_MODEL,
+        model: result.model,
+        servedProvider: result.attribution?.servedProvider ?? runtime.provider.id,
+        servedModel: result.attribution?.servedModel ?? result.model,
+        pricingSource: result.usage ? "measured" : "estimated",
+      };
+      const actualCostMicros = usageCostMicros(usageEvent, estimatedCostMicros, runtime.provider);
+      await Promise.all([
+        this.budgets.reconcile({
+          tenantId,
+          requestId,
+          actualCostMicros,
+          usage: {
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            provider: usageEvent.servedProvider ?? runtime.provider.id,
+            model: usageEvent.servedModel ?? result.model,
+          },
+        }),
+        this.usageRepository.ingestInternal(tenantId, promptImprovementUsageEvent({
+          requestId,
+          userId,
+          departmentId,
+          provider: usageEvent.servedProvider ?? runtime.provider.id,
+          model: usageEvent.servedModel ?? result.model,
+          requestedModel: PROMPT_IMPROVEMENT_MODEL,
+          promptLength: request.prompt.length,
+          resultLength,
+          usage,
+          actualCostMicros,
+          pricingSource: result.usage ? "measured" : "estimated",
+          finishReason: result.finishReason,
+          startedAt,
+          status,
+        })),
+      ]);
+    };
+
+    let improvedPrompt: string;
+    try {
+      improvedPrompt = normalizeImprovedPrompt(result.content);
+    } catch (error) {
+      await recordResultUsage("failed", 0);
+      throw error;
+    }
+    await recordResultUsage("completed", improvedPrompt.length);
+    return { prompt: improvedPrompt, model: PROMPT_IMPROVEMENT_MODEL };
   }
 
   @Post("/images/generations")
@@ -2002,6 +2209,94 @@ function contextStatsAttachments(attachments: z.infer<typeof AttachmentInputSche
     ...(attachment.localPath !== undefined ? { localPath: attachment.localPath } : {}),
     ...(attachment.sourceKind !== undefined ? { sourceKind: attachment.sourceKind } : {}),
   }));
+}
+
+function estimatePromptTokens(value: string): number {
+  return Math.max(1, Math.ceil(value.length / 4));
+}
+
+function estimatedPromptImprovementUsage(inputTokens: number, outputTokens: number): ChatCompletionUsage {
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cacheCreationTokens1h: 0,
+    cacheCreationTokens5m: 0,
+  };
+}
+
+export function normalizeImprovedPrompt(raw: string): string {
+  let prompt = raw.trim();
+  prompt = prompt.replace(/^<think>[\s\S]*?<\/think>\s*/i, "").trim();
+  const fenced = prompt.match(/^```(?:[\w-]+)?\s*\n?([\s\S]*?)\n?```$/);
+  if (fenced?.[1]) prompt = fenced[1].trim();
+  prompt = prompt.replace(/^(?:(?:here(?:'s| is)\s+)?(?:the\s+)?(?:improved|rewritten|revised|enhanced)\s+prompt\s*:\s*)/i, "").trim();
+  if (!prompt) {
+    throw new BadGatewayException({
+      code: "prompt_improvement_empty",
+      message: "The prompt improvement model returned an empty prompt. Please try again.",
+    });
+  }
+  return prompt;
+}
+
+function promptImprovementUsageEvent(input: {
+  requestId: string;
+  userId: string | null;
+  departmentId: string | null;
+  provider: string;
+  model: string;
+  requestedModel: string;
+  promptLength: number;
+  resultLength: number;
+  usage: ChatCompletionUsage;
+  actualCostMicros: bigint;
+  pricingSource: "measured" | "estimated";
+  finishReason: string | null;
+  startedAt: number;
+  status: "completed" | "failed";
+}) {
+  const cacheReadTokens = input.usage.cacheReadTokens ?? 0;
+  return {
+    requestId: input.requestId,
+    userId: input.userId,
+    departmentId: input.departmentId,
+    workspaceId: null,
+    taskId: null,
+    sessionId: null,
+    toolCallId: null,
+    feature: "prompt.improve",
+    provider: input.provider,
+    model: input.model,
+    tokensIn: input.usage.inputTokens,
+    tokensOut: input.usage.outputTokens,
+    tokensCached: cacheReadTokens,
+    cacheReadTokens,
+    cacheWriteTokens: input.usage.cacheWriteTokens ?? 0,
+    cacheCreationTokens1h: input.usage.cacheCreationTokens1h ?? 0,
+    cacheCreationTokens5m: input.usage.cacheCreationTokens5m ?? 0,
+    cacheEligible: cacheReadTokens > 0,
+    cacheProvider: cacheReadTokens > 0 ? input.provider : null,
+    cacheKeyHash: null,
+    promptManifestHash: null,
+    cacheMissReason: null,
+    sandboxUsage: {},
+    costRawMicros: input.actualCostMicros.toString(),
+    costBilledMicros: input.actualCostMicros.toString(),
+    latencyMs: Date.now() - input.startedAt,
+    ttftMs: null,
+    status: input.status,
+    metadata: {
+      requestedModel: input.requestedModel,
+      promptLength: input.promptLength,
+      resultLength: input.resultLength,
+      pricingSource: input.pricingSource,
+      finishReason: input.finishReason,
+    },
+    ts: new Date().toISOString(),
+  };
 }
 
 function imageUsageEvent(input: {

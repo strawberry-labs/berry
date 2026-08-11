@@ -3,6 +3,27 @@ import type { ManagedPolicyBundle } from "@berry/shared";
 import { BerryApiClient, BerryApiError } from "./index.ts";
 
 describe("BerryApiClient", () => {
+  it("improves a composer prompt without creating a chat turn", async () => {
+    const fetchImpl = vi.fn(async () => json({
+      prompt: "Write a concise executive summary with three recommendations.",
+      model: "canopywave/deepseek/deepseek-v4-flash",
+    }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.improvePrompt({ prompt: "summarize this" })).resolves.toEqual({
+      prompt: "Write a concise executive summary with three recommendations.",
+      model: "canopywave/deepseek/deepseek-v4-flash",
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/prompts/improve",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ prompt: "summarize this" }),
+        credentials: "include",
+      }),
+    );
+  });
+
   it("passes library searches and cancellation through to the file API", async () => {
     const fetchImpl = vi.fn(async () => json({ items: [], nextCursor: null }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });

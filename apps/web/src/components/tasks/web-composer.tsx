@@ -1,6 +1,6 @@
 import * as React from "react";
-import { ArrowUp, Play, Plus, Square } from "lucide-react";
-import { type BerryApiClient, type ImageGenerationCapabilityStatus } from "@berry/api-client";
+import { ArrowUp, LoaderCircle, Play, Plus, Square, WandSparkles } from "lucide-react";
+import { BerryApiError, type BerryApiClient, type ImageGenerationCapabilityStatus } from "@berry/api-client";
 import { parseSlashCommand, type AttachmentInput, type ContextStats, type Message, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type Workspace } from "@berry/shared";
 import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
@@ -69,6 +69,9 @@ export function prunePastedTextPresentations(
 }
 
 const CREATE_IMAGE_TOKEN = "__berry_create_image__";
+export function improvableComposerPrompt(text: string): string {
+  return text.replaceAll(CREATE_IMAGE_TOKEN, "").trim();
+}
 function insertCreateImageToken(editor: PromptEditorHandle | null): void {
   editor?.insertPromptToken({
     id: "mode:create-image",
@@ -182,6 +185,8 @@ export function Composer({
   const [savingPastedText, setSavingPastedText] = React.useState(false);
   const [pastedTextError, setPastedTextError] = React.useState("");
   const [uploadError, setUploadError] = React.useState("");
+  const [promptImproveError, setPromptImproveError] = React.useState("");
+  const [improvingPrompt, setImprovingPrompt] = React.useState(false);
   const [fileDragActive, setFileDragActive] = React.useState(false);
   const [createImageMode, setCreateImageMode] = React.useState(false);
   const [contextStatsResult, setContextStatsResult] = React.useState<{ sessionId: string; stats: ContextStats } | undefined>();
@@ -192,6 +197,8 @@ export function Composer({
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const pastedTextCountRef = React.useRef(0);
   const uploadControllersRef = React.useRef(new Map<string, AbortController>());
+  const promptImprovementControllerRef = React.useRef<AbortController | null>(null);
+  const latestTextRef = React.useRef(text);
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[]; createImageMode: boolean } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
@@ -200,6 +207,11 @@ export function Composer({
   const contextStatsRefreshPendingRef = React.useRef(false);
   const contextStatsRefreshRef = React.useRef<() => Promise<void>>(async () => {});
   const contextStatsInputRef = React.useRef({ model, text, attachments });
+  const setComposerText = React.useCallback((next: string) => {
+    latestTextRef.current = next;
+    setText(next);
+  }, []);
+  latestTextRef.current = text;
   contextStatsInputRef.current = { model, text, attachments };
   const contextSessionId = activeTask?.activeSessionId ?? null;
   const contextStats = contextStatsResult?.sessionId === contextSessionId
@@ -295,9 +307,9 @@ export function Composer({
     const pending = window.localStorage.getItem("berry.web.pendingPrompt");
     if (!pending) return;
     window.localStorage.removeItem("berry.web.pendingPrompt");
-    setText(pending);
+    setComposerText(pending);
     window.requestAnimationFrame(() => editorRef.current?.insertText(pending));
-  }, []);
+  }, [setComposerText]);
   const composerModels = React.useMemo(
     () => config.providers.flatMap((provider) => provider.models.map((item) => ({ id: item.id, label: item.name ?? item.id, capabilities: item.capabilities }))).filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index),
     [config.providers],
@@ -319,13 +331,13 @@ export function Composer({
     const editingImage = followUp.intent === "image_generation";
     const editableInput = editingImage ? followUp.input.replace(/^Create image\s*\n?/, "") : followUp.input;
     setCreateImageMode(editingImage);
-    setText(editableInput);
+    setComposerText(editableInput);
     setAttachments(followUp.attachments);
     window.requestAnimationFrame(() => {
       editorRef.current?.setText(editableInput);
       if (editingImage) insertCreateImageToken(editorRef.current);
     });
-  }, [attachments, createImageMode, editingFollowUp, onEditingFollowUpChange, queuedFollowUps, savingQueuedEdit, text]);
+  }, [attachments, createImageMode, editingFollowUp, onEditingFollowUpChange, queuedFollowUps, savingQueuedEdit, setComposerText, text]);
 
   const cancelQueuedEdit = React.useCallback(() => {
     const draft = queueEditDraftRef.current;
@@ -335,11 +347,11 @@ export function Composer({
     onEditingFollowUpChange(null);
     setEditingFollowUp(null);
     setCreateImageMode(draft?.createImageMode ?? false);
-    setText(draft?.text ?? "");
+    setComposerText(draft?.text ?? "");
     setAttachments(draft?.attachments ?? []);
     editorRef.current?.setText(draft?.text.replaceAll(CREATE_IMAGE_TOKEN, "") ?? "");
     if (draft?.createImageMode) insertCreateImageToken(editorRef.current);
-  }, [onEditingFollowUpChange]);
+  }, [onEditingFollowUpChange, setComposerText]);
 
   React.useEffect(() => () => {
     if (editingFollowUpRef.current) onEditingFollowUpChange(null);
@@ -348,6 +360,7 @@ export function Composer({
   React.useEffect(() => () => {
     for (const controller of uploadControllersRef.current.values()) controller.abort();
     uploadControllersRef.current.clear();
+    promptImprovementControllerRef.current?.abort();
   }, []);
 
   const reorderQueuedFollowUps = React.useCallback((sessionId: string, orderedIds: string[]) => {
@@ -386,6 +399,40 @@ export function Composer({
     }
   }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
 
+  const improvePrompt = React.useCallback(async () => {
+    const prompt = improvableComposerPrompt(text);
+    if (!client || !prompt || improvingPrompt) return;
+    const originalText = text;
+    const preserveCreateImageMode = originalText.includes(CREATE_IMAGE_TOKEN);
+    const controller = new AbortController();
+    promptImprovementControllerRef.current?.abort();
+    promptImprovementControllerRef.current = controller;
+    setPromptImproveError("");
+    setImprovingPrompt(true);
+    try {
+      const result = await client.improvePrompt({ prompt }, { signal: controller.signal });
+      if (latestTextRef.current !== originalText) {
+        if (improvableComposerPrompt(latestTextRef.current)) {
+          setPromptImproveError("Your draft changed while Berry was improving it. Run Improve prompt again to use the latest text.");
+        }
+        return;
+      }
+      setComposerText(result.prompt);
+      editorRef.current?.setText(result.prompt);
+      setCreateImageMode(preserveCreateImageMode);
+      if (preserveCreateImageMode) {
+        window.requestAnimationFrame(() => insertCreateImageToken(editorRef.current));
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted) setPromptImproveError(promptImprovementErrorMessage(cause));
+    } finally {
+      if (promptImprovementControllerRef.current === controller) {
+        promptImprovementControllerRef.current = null;
+        setImprovingPrompt(false);
+      }
+    }
+  }, [client, improvingPrompt, setComposerText, text]);
+
   const continueInterruptedTurn = React.useCallback(async () => {
     if (!onContinueTurn || working || editingFollowUp || pendingUploads.length > 0) return;
     setContinuing(true);
@@ -420,7 +467,7 @@ export function Composer({
         onEditingFollowUpChange(null);
         setEditingFollowUp(null);
         setCreateImageMode(draft?.createImageMode ?? false);
-        setText(draft?.text ?? "");
+        setComposerText(draft?.text ?? "");
         setAttachments(draft?.attachments ?? []);
         editorRef.current?.setText(draft?.text.replaceAll(CREATE_IMAGE_TOKEN, "") ?? "");
         if (draft?.createImageMode) insertCreateImageToken(editorRef.current);
@@ -438,7 +485,7 @@ export function Composer({
       setUploadError("");
       try {
         await onCommand(command.name, command.args);
-        setText("");
+        setComposerText("");
         setCreateImageMode(false);
         editorRef.current?.clear();
       } catch (cause) {
@@ -456,7 +503,7 @@ export function Composer({
           ...(intent ? { intent } : {}),
           attachments,
         }));
-        setText("");
+        setComposerText("");
         setCreateImageMode(false);
         editorRef.current?.clear();
         setAttachments([]);
@@ -464,7 +511,7 @@ export function Composer({
       }
 
       if (!client) {
-        setText("");
+        setComposerText("");
         setCreateImageMode(false);
         editorRef.current?.clear();
         setAttachments([]);
@@ -472,7 +519,7 @@ export function Composer({
       }
       try {
         await onSteerMessage(activeTask, input, attachments, intent);
-        setText("");
+        setComposerText("");
         setCreateImageMode(false);
         editorRef.current?.clear();
         setAttachments([]);
@@ -491,7 +538,7 @@ export function Composer({
     setUploadError("");
     const requestMessageId = globalThis.crypto.randomUUID();
     onUserMessage(input, sessionId, task.id, attachments, requestMessageId);
-    setText("");
+    setComposerText("");
     setCreateImageMode(false);
     editorRef.current?.clear();
     try {
@@ -521,7 +568,7 @@ export function Composer({
     } finally {
       setBusy(false);
     }
-  }, [activeTask, attachments, client, continueInterruptedTurn, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, text, variant, working]);
+  }, [activeTask, attachments, client, continueInterruptedTurn, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, setComposerText, text, variant, working]);
 
   const addFiles = React.useCallback(async (files: FileList | readonly File[] | null, options: { pastedText?: string; pastedTextMode?: Exclude<PastedTextMode, "native"> } = {}) => {
     if (!files?.length) return;
@@ -734,6 +781,7 @@ export function Composer({
   }, []);
 
   const hasDraft = text.trim().length > 0 || attachments.length > 0;
+  const showImprovePrompt = improvableComposerPrompt(text).length > 0;
   const uploadInProgress = pendingUploads.some((upload) => upload.state === "uploading");
   const primaryAction = editingFollowUp
     ? "send"
@@ -847,7 +895,7 @@ export function Composer({
             autoFocus
             mentions={mentions}
             onPasteEvent={handlePaste}
-            onChange={(next) => { setText(next); setCreateImageMode(next.includes(CREATE_IMAGE_TOKEN)); }}
+            onChange={(next) => { setComposerText(next); setCreateImageMode(next.includes(CREATE_IMAGE_TOKEN)); setPromptImproveError(""); }}
             onSubmit={(event) => void submit(event)}
             onEscape={editingFollowUp ? cancelQueuedEdit : undefined}
           />
@@ -857,6 +905,28 @@ export function Composer({
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-lg" className="berry-composer-icon-button size-8 rounded-[9px]" aria-label="Add context"><Plus /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-64"><DropdownMenuItem className="berry-create-image-menu-item" disabled={!imageGenerationCapability.available} onClick={enableCreateImageMode} title={imageGenerationCapability.available ? undefined : imageGenerationCapability.message ?? "Image generation is unavailable"}><ImagePlus /><strong className="berry-create-image-menu-label">Create image</strong>{!imageGenerationCapability.available ? <span className="ml-auto text-xs text-muted-foreground">Unavailable</span> : null}</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => fileInputRef.current?.click()}><ImagePlus /> Add attachment</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onClick={() => editorRef.current?.insertText("@")}><AtSign /> Insert @ mention</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("#")}><Hash /> Insert # conversation</DropdownMenuItem><DropdownMenuItem onClick={() => editorRef.current?.insertText("/")}><SlashSquare /> Insert / command</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
           <span className="min-w-0 flex-1" />
           {contextSessionId ? <ContextWindowRing stats={contextStats} /> : null}
+          {showImprovePrompt ? (
+            <TooltipProvider delayDuration={250}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-lg"
+                    className="berry-composer-icon-button size-8 shrink-0 rounded-[9px] text-muted-foreground transition-[background-color,color,opacity,transform] active:scale-[0.96] motion-reduce:transform-none motion-reduce:transition-none"
+                    aria-label={improvingPrompt ? "Improving prompt" : "Improve prompt"}
+                    disabled={improvingPrompt}
+                    onClick={() => void improvePrompt()}
+                  >
+                    {improvingPrompt
+                      ? <LoaderCircle className="animate-spin motion-reduce:animate-none" aria-hidden />
+                      : <WandSparkles aria-hidden />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top" showArrow={false}>Improve prompt</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : null}
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" className="berry-pill-control min-w-0 max-w-[min(42vw,240px)] shrink gap-1.5 text-muted-foreground"><span className="berry-composer-model-label min-w-0 truncate">{selectedComposerModel?.label ?? model ?? "Managed model"}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Model</DropdownMenuLabel>{composerModels.map((item) => <DropdownMenuItem key={item.id} onClick={() => { onModelChange(item.id); const nextLevels = reasoningLevelsForModel(item); if (!nextLevels.includes(reasoning)) onReasoningChange(nextLevels[0] ?? "off"); }}><span className="truncate">{item.label}</span>{item.id === model ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Reasoning level" aria-pressed={reasoning !== "off"} title={`Reasoning ${reasoning}`} className="berry-pill-control gap-1.5"><Brain /><span className="hidden md:inline">{reasoningLabel(reasoning)}</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="berry-compact-selector-surface w-52"><DropdownMenuLabel>Reasoning for {selectedComposerModel?.label ?? "model"}</DropdownMenuLabel>{reasoningLevels.map((level) => <DropdownMenuItem key={level} onClick={() => onReasoningChange(level)}><Brain /><span>{reasoningLabel(level)}</span>{level === reasoning ? <Check className="ml-auto" /> : null}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
           {primaryAction === "stop" && !editingFollowUp ? (
@@ -891,6 +961,7 @@ export function Composer({
         </div>
       </BerryComposerFrame>
       {uploadError ? <p className="composer-error" role="alert">{uploadError}</p> : null}
+      {promptImproveError ? <p className="composer-error" role="alert">{promptImproveError}</p> : null}
     </div>
     {pastedTextDraft ? (
       <React.Suspense fallback={null}>
@@ -1034,6 +1105,14 @@ export function uploadProgressDescription(uploadedBytes: number, totalBytes: num
   if (uploadedBytes <= 0 || totalBytes <= 0) return `Uploading · ${total}`;
   const percent = Math.min(100, Math.max(1, Math.round((uploadedBytes / totalBytes) * 100)));
   return `Uploading ${percent}% · ${total}`;
+}
+
+function promptImprovementErrorMessage(cause: unknown): string {
+  if (cause instanceof BerryApiError && cause.body && typeof cause.body === "object") {
+    const message = (cause.body as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return "Berry could not improve this prompt. Please try again.";
 }
 
 export function filesFromDataTransfer(dataTransfer: Pick<DataTransfer, "files" | "items"> | null): File[] {
