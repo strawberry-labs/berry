@@ -90,10 +90,15 @@ export class OrganizationCapabilitiesService {
       const userCanChange = item.assignment === "available" || item.assignment === "default-on" && item.allowUserDisable;
       const enabled = item.assignment === "required" || item.assignment === "default-on" && !(userCanChange && override?.enabled === false) || item.assignment === "available" && override?.enabled === true;
       const reason: EffectiveCapability["reason"] = item.assignment === "blocked" ? "blocked" : item.assignment === "required" ? "required" : userCanChange && override?.enabled === false ? "user-disabled" : userCanChange && override?.enabled === true ? "user-enabled" : item.assignment === "default-on" ? "default" : "available";
-      rows.push({ kind:item.kind,capabilityId:item.capabilityId,name:item.name,enabled:enabled && item.assignment !== "blocked",locked:!userCanChange,assignment:item.assignment,provenance:"organization",reason,contentHash:item.contentHash });
+      const config = object(item.config);
+      rows.push({
+        kind:item.kind,capabilityId:item.capabilityId,name:item.name,description:item.description,
+        enabled:enabled && item.assignment !== "blocked",locked:!userCanChange,assignment:item.assignment,
+        provenance:"organization",reason,contentHash:item.contentHash,
+        ...(item.kind === "skill" && item.assignment !== "blocked" && typeof config.content === "string" ? { content: config.content } : {}),
+      });
       if (!enabled || item.assignment === "blocked") continue;
       if (item.kind === "skill") {
-        const config = object(item.config);
         const content = typeof config.content === "string" ? config.content : "";
         if (content) {
           const metadata = parseAgentSkillMarkdown(content);
@@ -111,7 +116,7 @@ export class OrganizationCapabilitiesService {
       else { const config = object(item.config); if (typeof config.url === "string") mcpServers.push({ id:item.capabilityId,name:item.name,transport:config.transport === "http-sse" ? "http-sse" : "streamable-http",command:null,args:[],url:config.url,env:{},enabled:true,trusted:true,credentialKey:typeof config.credentialRef === "string" ? config.credentialRef : null }); }
     }
     const blocked = new Set(org.filter((item) => item.assignment === "blocked").map((item) => `${item.kind}:${item.capabilityId}`));
-    for (const skill of personal.skills) { const id = skill.name.toLowerCase(); rows.push({kind:"skill",capabilityId:id,name:skill.name,enabled:true,locked:false,assignment:null,provenance:"personal",reason:"personal",contentHash:hashContent({content:skill.content})}); skills.push(skill); }
+    for (const skill of personal.skills) { const id = skill.name.toLowerCase(); rows.push({kind:"skill",capabilityId:id,name:skill.name,description:skill.description,content:skill.content,enabled:true,locked:false,assignment:null,provenance:"personal",reason:"personal",contentHash:hashContent({content:skill.content})}); skills.push(skill); }
     for (const server of personal.mcpServers) { const denied = !settings.mcp || blocked.has(`mcp:${server.id}`); rows.push({kind:"mcp",capabilityId:server.id,name:server.name,enabled:!denied,locked:denied,assignment:null,provenance:"personal",reason:denied?"personal-blocked":"personal",contentHash:null}); if (!denied) mcpServers.push(server); }
     return { rows, skills, mcpServers };
   }

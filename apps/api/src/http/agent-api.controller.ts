@@ -360,36 +360,33 @@ export class AgentApiController {
     departmentId: string | null,
     mode: ConversationKind,
   ) {
-    const selected = await this.modelGovernance.auxiliaryDefault(tenantId, "vision");
-    if (!selected) return null;
-    const decision = await this.modelGovernance.resolve({
+    const decision = await this.modelGovernance.resolveAuxiliary({
       tenantId,
+      purpose: "vision",
       mode,
-      providerId: selected.providerId,
-      model: selected.model,
       userId,
       departmentId,
     });
-    if (!decision.allowed || decision.policy?.capabilities.vision !== true) return null;
+    if (!decision?.allowed || decision.policy?.capabilities.vision !== true) return null;
     const runtime = await this.runtimeConfig.resolve(tenantId, {
-      provider: { id: selected.providerId },
-      model: selected.model,
+      provider: { id: decision.providerId },
+      model: decision.model,
     });
-    const model = runtime.provider.models?.find((candidate) => candidate.id === selected.model);
+    const model = runtime.provider.models?.find((candidate) => candidate.id === decision.model);
     if (resolveModelCapabilities(model).vision !== true) return null;
     const maxTokens = Math.min(
       resolveModelCapabilities(model).context?.maxOutputTokens ?? 2_048,
       VISION_ADAPTER_MAX_OUTPUT_TOKENS,
     );
     return {
-      providerId: selected.providerId,
+      providerId: decision.providerId,
       provider: await durableProviderTransport(runtime.provider, runtime.apiKey, runtime.credentialRef),
-      model: selected.model,
+      model: decision.model,
       maxTokens,
-      modelPricing: modelCostSnapshot(runtime.provider, selected.model),
+      modelPricing: modelCostSnapshot(runtime.provider, decision.model),
       estimatedCostMicros: budgetEstimateFromRequest({
         provider: runtime.provider,
-        model: selected.model,
+        model: decision.model,
         estimatedInputTokens: 12_000,
         estimatedOutputTokens: maxTokens,
       }).toString(),
@@ -443,9 +440,25 @@ export class AgentApiController {
       this.#primaryDepartmentId(tenantId, userId),
     ]);
     if (!catalog) return null;
+    const runtime = await this.runtimeConfig.resolve(tenantId, {});
+    await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
+    const modelDecisions = await Promise.all(catalog.models.map((model) => this.modelGovernance.resolve({
+      tenantId,
+      mode: "chat",
+      providerId: catalog.providerId,
+      model: model.id,
+      userId,
+      departmentId,
+    })));
+    const visibleModels = catalog.models.filter((_, index) => modelDecisions[index]?.allowed === true);
+    const visibleDefault = visibleModels.some((model) => model.id === catalog.defaultModel)
+      ? catalog.defaultModel
+      : visibleModels[0]?.id ?? catalog.defaultModel;
     const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, "chat");
     return {
       ...catalog,
+      defaultModel: visibleDefault,
+      models: visibleModels,
       skills: [...catalog.skills, ...effective.skills.map((skill) => ({ id: skill.filePath, name: skill.name, description: skill.description, enabled: true }))],
       mcpServers: [
         ...catalog.mcpServers,

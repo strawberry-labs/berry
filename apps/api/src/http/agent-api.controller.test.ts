@@ -940,7 +940,7 @@ describe("AgentApiController", () => {
       model: "minimax-m3",
       status: "allowed",
       enforce: false,
-      modeAllow: ["chat", "code"],
+      modeAllow: [],
       capabilities: { vision: true, cost: { input: 0.3, output: 1.2, cacheRead: 0.06 } },
     });
     await repository.upsertAuxiliaryDefault({
@@ -982,6 +982,40 @@ describe("AgentApiController", () => {
         }),
       }),
     }));
+  });
+
+  it("hides auxiliary-only models from the chat model catalog", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "deepseek-v4-flash",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+      capabilities: { vision: false },
+    });
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "minimax-m3",
+      status: "allowed",
+      enforce: false,
+      modeAllow: [],
+      capabilities: { vision: true },
+    });
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: visionRuntimeConfig(),
+    });
+
+    await request(app.getHttpServer())
+      .get("/v1/models/catalog")
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.models.map((model: { id: string }) => model.id)).toEqual(["deepseek-v4-flash"]);
+      });
   });
 
   it("reserves and reconciles successful model turns", async () => {

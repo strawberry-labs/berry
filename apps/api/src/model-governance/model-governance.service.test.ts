@@ -133,6 +133,7 @@ describe("model governance scoped access", () => {
       model: "minimax-m3",
       capabilities: { vision: true },
       status: "allowed",
+      modeAllow: [],
     });
     await service.upsertPolicy({
       tenantId,
@@ -148,6 +149,17 @@ describe("model governance scoped access", () => {
       providerId: "router",
       model: "minimax-m3",
     })).resolves.toMatchObject({ purpose: "vision", model: "minimax-m3" });
+    await expect(service.resolve({
+      tenantId,
+      mode: "chat",
+      providerId: "router",
+      model: "minimax-m3",
+    })).resolves.toMatchObject({ allowed: false, reason: "mode_not_allowed" });
+    await expect(service.resolveAuxiliary({
+      tenantId,
+      purpose: "vision",
+      mode: "chat",
+    })).resolves.toMatchObject({ allowed: true, model: "minimax-m3" });
     await expect(service.upsertAuxiliaryDefault({
       tenantId,
       purpose: "vision",

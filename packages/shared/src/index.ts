@@ -2807,6 +2807,7 @@ export const EffectiveCapabilitySchema = z.object({
   kind: z.enum(["skill", "mcp"]), capabilityId: z.string(), name: z.string(), enabled: z.boolean(), locked: z.boolean(),
   assignment: OrgCapabilityAssignmentSchema.nullable(), provenance: z.enum(["organization", "personal", "self-host-bootstrap"]),
   reason: z.enum(["required", "default", "user-enabled", "user-disabled", "available", "blocked", "personal", "personal-blocked"]), contentHash: z.string().nullable(),
+  description: z.string().optional(), content: z.string().optional(),
 });
 export type EffectiveCapability = z.infer<typeof EffectiveCapabilitySchema>;
 
