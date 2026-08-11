@@ -139,4 +139,34 @@ describe("processBerryWorkerJob", () => {
     }, dependencies)).rejects.toThrow();
     expect(remove).not.toHaveBeenCalled();
   });
+
+  it("acknowledges a durable turn outbox delivery before running the turn", async () => {
+    const dependencies = testDependencies();
+    const order: string[] = [];
+    dependencies.outboxReceipts = {
+      async acknowledge(receiptTenantId, outboxId, aggregateId) {
+        order.push(`receipt:${receiptTenantId}:${outboxId}:${aggregateId}`);
+      },
+    };
+    dependencies.turnRunner = {
+      async execute(payload: { runId: string }) {
+        order.push(`turn:${payload.runId}`);
+        return { runId: payload.runId, state: "calling_model" };
+      },
+    } as never;
+    const outboxId = "00000000-0000-7000-8000-000000000011";
+    const runId = "00000000-0000-7000-8000-000000000012";
+
+    await processBerryWorkerJob("turn.execute", {
+      outboxId,
+      tenantId,
+      runId,
+      reason: "continue",
+    }, dependencies);
+
+    expect(order).toEqual([
+      `receipt:${tenantId}:${outboxId}:${runId}`,
+      `turn:${runId}`,
+    ]);
+  });
 });

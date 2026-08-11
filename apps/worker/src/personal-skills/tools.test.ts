@@ -53,4 +53,39 @@ describe("DurablePersonalSkillToolExecutor", () => {
     } as never)).rejects.toThrow("YAML frontmatter");
     expect(execute).not.toHaveBeenCalled();
   });
+
+  it("imports a large skill from a completed workspace SKILL.md path", async () => {
+    const content = "---\nname: imported-skill\ndescription: Imported from the durable workspace\n---\n\nUse the supplied workflow.";
+    const execute = vi.fn(async () => undefined);
+    const read = vi.fn(async () => ({
+      output: { path: "/workspace/skills/imported/SKILL.md", content, sizeBytes: content.length },
+      summary: "read",
+    }));
+    const tools = new DurablePersonalSkillToolExecutor({ execute: read }, {
+      execute,
+      query: vi.fn(async () => []),
+    });
+
+    await expect(tools.execute({ tenantId: "tenant", userId: "user" } as never, {
+      id: "step_path",
+      type: "tool.save_personal_skill",
+      input: {
+        toolName: "save_personal_skill",
+        arguments: { path: "/workspace/skills/imported/SKILL.md" },
+      },
+    } as never)).resolves.toMatchObject({
+      output: { skill: { name: "imported-skill" } },
+    });
+    expect(read).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({
+      type: "tool.read_file",
+      input: expect.objectContaining({
+        toolName: "read_file",
+        arguments: { path: "/workspace/skills/imported/SKILL.md" },
+      }),
+    }));
+    expect(execute).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO personal_skills"),
+      expect.arrayContaining([content]),
+    );
+  });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { BerryQueueClient } from "./bullmq.js";
-import { outboxJobId, RuntimeOutboxDispatcher } from "./outbox.js";
+import { outboxJobId, RuntimeOutboxDispatcher, SqlRuntimeOutboxDeliveryReceipts } from "./outbox.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
@@ -8,6 +8,20 @@ const runId = "00000000-0000-7000-8000-000000000002";
 const outboxId = "00000000-0000-7000-8000-000000000003";
 
 describe("RuntimeOutboxDispatcher", () => {
+  it("acknowledges delivery and defers lease recovery in one statement", async () => {
+    const execute = vi.fn(async () => undefined);
+
+    await new SqlRuntimeOutboxDeliveryReceipts({
+      execute,
+      query: vi.fn(async () => []),
+    }).acknowledge(tenantId, outboxId, runId);
+
+    expect(execute).toHaveBeenCalledWith(
+      expect.stringMatching(/WITH acknowledged[\s\S]*UPDATE turn_runs[\s\S]*SET updated_at=now\(\)/),
+      [tenantId, outboxId, runId],
+    );
+  });
+
   it("uses a fresh queue identity when blob verification is explicitly re-enqueued", () => {
     expect(outboxJobId("file.verify-blob", outboxId, 1)).not.toBe(outboxJobId("file.verify-blob", outboxId, 2));
   });
@@ -40,8 +54,9 @@ describe("RuntimeOutboxDispatcher", () => {
 
     await expect(dispatcher.dispatchDue()).resolves.toBe(1);
 
-    expect(enqueue).toHaveBeenCalledWith("file.verify-blob", { tenantId, blobId: runId }, {
+    expect(enqueue).toHaveBeenCalledWith("file.verify-blob", { tenantId, blobId: runId, outboxId }, {
       jobId: `outbox-file-verify-blob-${outboxId}-delivery-1`,
+      priority: 20,
     });
     expect(statements.some((sql) => sql.includes("Awaiting worker delivery receipt"))).toBe(true);
     expect(statements.some((sql) => sql.includes("SET completed_at = now()"))).toBe(false);
@@ -146,7 +161,7 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(statements.at(-1)).toContain("UPDATE runtime_outbox");
   });
 
-  it("uses the unique outbox row for the BullMQ job id", async () => {
+  it("keeps a turn outbox row pending until its queued job starts", async () => {
     let claimed = false;
     const executor: SqlExecutor = {
       execute: vi.fn(async () => undefined),
@@ -178,8 +193,12 @@ describe("RuntimeOutboxDispatcher", () => {
     await expect(dispatcher.dispatchDue()).resolves.toBe(1);
     expect(enqueue).toHaveBeenCalledWith(
       "turn.execute",
-      { tenantId, runId, reason: "continue" },
-      { jobId: `outbox-turn-execute-${outboxId}` },
+      { tenantId, runId, reason: "continue", outboxId },
+      { jobId: `outbox-turn-execute-${outboxId}-delivery-1`, priority: 1 },
+    );
+    expect(executor.execute).toHaveBeenCalledWith(
+      expect.stringContaining("Awaiting worker delivery receipt"),
+      expect.any(Array),
     );
   });
 
@@ -229,9 +248,10 @@ describe("RuntimeOutboxDispatcher", () => {
       fileId: runId,
       bucket: "berry-test",
       keys: ["artifacts/file.png"],
-    }, { jobId: `outbox-file-delete-object-${outboxId}-delivery-1` });
+    }, { jobId: `outbox-file-delete-object-${outboxId}-delivery-1`, priority: 20 });
     expect(enqueue).toHaveBeenNthCalledWith(2, "file.delete-object", expect.any(Object), {
       jobId: `outbox-file-delete-object-${outboxId}-delivery-2`,
+      priority: 20,
     });
     const receiptWaits = statements.filter(({ sql }) => sql.includes("Awaiting worker delivery receipt"));
     expect(receiptWaits).toHaveLength(2);

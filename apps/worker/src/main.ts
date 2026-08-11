@@ -8,7 +8,7 @@ import { SqlManagementJobRepository, SqlTaskTitleRepository, SqlUsageRollupRepos
 import { KnowledgeProcessor } from "./knowledge/processor.ts";
 import { SqlKnowledgeRepository } from "./knowledge/repository.ts";
 import { DocumentExtractor, KnowledgeChunker, S3KnowledgeObjectStore, createEmbeddingProviderFromEnv, type KnowledgeObjectStore } from "./knowledge/services.ts";
-import { RuntimeOutboxDispatcher } from "./outbox.ts";
+import { RuntimeOutboxDispatcher, SqlRuntimeOutboxDeliveryReceipts } from "./outbox.ts";
 import { createMemoryOperationGenerator } from "./memory/generator.ts";
 import { MemoryProcessor } from "./memory/processor.ts";
 import { SqlWorkerMemoryRepository } from "./memory/repository.ts";
@@ -146,6 +146,14 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
           positiveInteger(env.BERRY_MODEL_MAX_DURATION_MS) ?? 900_000,
           1_800_000,
         ),
+        maxModelIterations: Math.min(
+          positiveInteger(env.BERRY_MAX_MODEL_ITERATIONS) ?? 80,
+          200,
+        ),
+        maxTurnDurationMs: Math.min(
+          positiveInteger(env.BERRY_MAX_TURN_DURATION_MS) ?? 7_200_000,
+          21_600_000,
+        ),
         compactor,
       },
     ),
@@ -153,6 +161,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     maintenance: new SqlMaintenanceRunner(executor),
     ...(fileDeleter ? { fileDeleter } : {}),
     ...(fileBlobs ? { fileBlobs } : {}),
+    outboxReceipts: new SqlRuntimeOutboxDeliveryReceipts(executor),
     tenantContext: {
       run: (tenantId, callback) => executor.runWithTenant(tenantId, callback),
     },

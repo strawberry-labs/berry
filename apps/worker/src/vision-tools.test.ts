@@ -150,6 +150,27 @@ describe("DurableVisionToolExecutor", () => {
       pricingSource: "estimated",
     });
   });
+
+  it("blocks repeated adapter calls after a failure until a new image is exposed", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const base: DurableTurnToolExecutor = {
+      modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
+      execute: async () => { throw new Error("unexpected base execution"); },
+    };
+    const snapshot = visionSnapshot();
+    snapshot.steps = [{
+      ...visionStep(),
+      sequence: 1,
+      state: "failed",
+      error: "The vision model returned an empty observation",
+    }];
+
+    await expect(new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" })
+      .execute(snapshot, { ...visionStep(), sequence: 3 }))
+      .rejects.toThrow("no new image was exposed");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 class MemoryVisionCache implements VisionObservationCache {

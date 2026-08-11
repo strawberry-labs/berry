@@ -73,6 +73,7 @@ export class RuntimeOutboxDispatcher {
         WHERE r.tenant_id=$1::uuid
           AND r.state NOT IN ('completed','failed','cancelled','recovery_required','waiting')
           AND (r.lease_expires_at IS NULL OR r.lease_expires_at <= now())
+          AND r.updated_at <= now() - interval '5 seconds'
           AND NOT EXISTS (
             SELECT 1 FROM runtime_outbox pending
             WHERE pending.tenant_id=r.tenant_id
@@ -159,13 +160,21 @@ export class RuntimeOutboxDispatcher {
                   ...(isRecord(row.payload) ? row.payload : {}),
                   outboxId: row.id,
                 })
-            : row.payload as BerryWorkerJobMap[typeof name];
+              : requiresDeliveryReceipt(name)
+                ? {
+                    ...(isRecord(row.payload) ? row.payload : {}),
+                    outboxId: row.id,
+                  } as BerryWorkerJobMap[typeof name]
+                : row.payload as BerryWorkerJobMap[typeof name];
           await this.queue.enqueue(
             name,
             payload as BerryWorkerJobMap[typeof name],
-            { jobId: outboxJobId(name, row.id, row.attempts) },
+            {
+              jobId: outboxJobId(name, row.id, row.attempts),
+              priority: outboxJobPriority(name),
+            },
           );
-          if (name === "file.delete-object" || name === "file.delete-blob" || name === "file.verify-blob") await this.deferForDeliveryReceipt(row);
+          if (requiresDeliveryReceipt(name)) await this.deferForDeliveryReceipt(row);
           else await this.complete(row);
           dispatched += 1;
         } catch (error) {
@@ -216,7 +225,7 @@ export class RuntimeOutboxDispatcher {
   }
 
   private async deferForDeliveryReceipt(row: OutboxRow): Promise<void> {
-    const retryMs = Math.max(30_000, this.options.deliveryReceiptRetryMs ?? 300_000);
+    const retryMs = Math.max(30_000, this.options.deliveryReceiptRetryMs ?? 900_000);
     await this.withTenant(row.tenant_id, async (executor) => {
       await executor.execute(`
         UPDATE runtime_outbox
@@ -276,9 +285,52 @@ export class RuntimeOutboxDispatcher {
 
 export function outboxJobId(name: BerryWorkerJobName, outboxId: string, attempt = 1): string {
   const base = `outbox-${name.replaceAll(".", "-")}-${outboxId}`;
-  return name === "file.delete-object" || name === "file.delete-blob" || name === "file.verify-blob"
+  return requiresDeliveryReceipt(name)
     ? `${base}-delivery-${attempt}`
     : base;
+}
+
+export interface RuntimeOutboxDeliveryReceipts {
+  acknowledge(tenantId: string, outboxId: string, aggregateId?: string): Promise<void>;
+}
+
+export class SqlRuntimeOutboxDeliveryReceipts implements RuntimeOutboxDeliveryReceipts {
+  constructor(private readonly executor: SqlExecutor) {}
+
+  async acknowledge(tenantId: string, outboxId: string, aggregateId?: string): Promise<void> {
+    await this.executor.execute(`
+WITH acknowledged AS (
+  UPDATE runtime_outbox
+  SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,
+      last_error=NULL,updated_at=now()
+  WHERE tenant_id=$1::uuid AND id=$2::uuid AND completed_at IS NULL
+  RETURNING id
+)
+UPDATE turn_runs
+SET updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$3::uuid
+  AND EXISTS (SELECT 1 FROM acknowledged)
+    `.trim(), [tenantId, outboxId, aggregateId ?? null]);
+  }
+}
+
+export function acknowledgeDeliveryAtStart(name: BerryWorkerJobName): boolean {
+  return name === "turn.execute" || name === "turn.resume" || name === "sandbox.snapshot";
+}
+
+function requiresDeliveryReceipt(name: BerryWorkerJobName): boolean {
+  return acknowledgeDeliveryAtStart(name)
+    || name === "file.delete-object"
+    || name === "file.delete-blob"
+    || name === "file.verify-blob";
+}
+
+function outboxJobPriority(name: BerryWorkerJobName): number {
+  if (name === "turn.execute" || name === "turn.resume") return 1;
+  if (name === "title.generate" || name === "session.compact") return 5;
+  if (name === "sandbox.snapshot") return 50;
+  if (name === "context.backfill" || name === "context.cleanup") return 100;
+  return 20;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

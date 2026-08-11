@@ -658,6 +658,54 @@ describe("durable turn runner", () => {
     });
   });
 
+  it("stops after two identical tool failures instead of starting a third loop", async () => {
+    const first = {
+      ...toolStep("failed", "idempotent", false),
+      sequence: 1,
+      error: "Arguments must include content; raw is not supported",
+    };
+    const second = {
+      ...toolStep("failed", "idempotent", false),
+      sequence: 2,
+      error: "Arguments must include content; raw is not supported",
+    };
+    const pending = { ...toolStep("pending", "idempotent", false), sequence: 3 };
+    let executions = 0;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second, pending]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: {}, summary: "unexpected" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(executions).toBe(0);
+    expect(repository.current.error).toContain("failed twice with the same argument shape");
+  });
+
+  it("stops a turn that exceeds the total model iteration limit", async () => {
+    const steps = Array.from({ length: 81 }, (_, index) => ({
+      ...modelStep(index === 80 ? "pending" : "completed", index + 1),
+      id: randomUUID(),
+      idempotencyKey: `${runId}:model:${index + 1}`,
+    }));
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), ...steps]));
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "unexpected", inputTokens: 0, outputTokens: 0, toolCalls: [] };
+      },
+    }, noTools(), { maxModelIterations: 80 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(modelCalls).toBe(0);
+    expect(repository.current.error).toContain("80-step model safety limit");
+  });
+
   it("advertises compose_message as a no-approval presentation tool", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),

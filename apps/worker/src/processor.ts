@@ -10,6 +10,7 @@ import type { SandboxContinuityManager } from "./sandbox-continuity.js";
 import type { MaintenanceRunner } from "./maintenance.js";
 import type { FileObjectDeleter } from "./file-deletion.js";
 import type { FileBlobProcessor } from "./file-blobs.js";
+import { acknowledgeDeliveryAtStart, type RuntimeOutboxDeliveryReceipts } from "./outbox.js";
 
 export interface BerryWorkerDependencies {
   titles: TaskTitleRepository;
@@ -24,6 +25,7 @@ export interface BerryWorkerDependencies {
   maintenance?: MaintenanceRunner | undefined;
   fileDeleter?: FileObjectDeleter | undefined;
   fileBlobs?: FileBlobProcessor | undefined;
+  outboxReceipts?: RuntimeOutboxDeliveryReceipts | undefined;
   tenantContext?: {
     run<T>(tenantId: string, callback: () => Promise<T>): Promise<T>;
   } | undefined;
@@ -35,13 +37,18 @@ export async function processBerryWorkerJob(
   dependencies: BerryWorkerDependencies,
 ): Promise<unknown> {
   const jobName = BerryWorkerJobNameSchema.parse(name);
+  const payload = parseWorkerJob(jobName, data);
   if (dependencies.tenantContext) {
-    const payload = parseWorkerJob(jobName, data);
     const nestedDependencies = { ...dependencies, tenantContext: undefined };
     return dependencies.tenantContext.run(
       payload.tenantId,
       () => processBerryWorkerJob(jobName, payload, nestedDependencies),
     );
+  }
+  if (acknowledgeDeliveryAtStart(jobName) && dependencies.outboxReceipts) {
+    const outboxId = "outboxId" in payload ? payload.outboxId : undefined;
+    const runId = "runId" in payload ? payload.runId : undefined;
+    if (outboxId) await dependencies.outboxReceipts.acknowledge(payload.tenantId, outboxId, runId);
   }
   if (jobName === "title.generate") {
     const payload = TitleGenJobPayloadSchema.parse(data);

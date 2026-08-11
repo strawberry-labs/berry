@@ -22,6 +22,7 @@ export const CompactionJobPayloadSchema = z.object({
 export type CompactionJobPayload = z.infer<typeof CompactionJobPayloadSchema>;
 
 export const TurnExecuteJobPayloadSchema = z.object({
+  outboxId: z.string().uuid().optional(),
   tenantId: z.string().uuid(),
   runId: z.string().uuid(),
   reason: z.enum(["admitted", "continue", "lease-recovery", "approval-resolved", "retry"]).default("continue"),
@@ -34,6 +35,7 @@ export const TurnResumeJobPayloadSchema = TurnExecuteJobPayloadSchema.extend({
 export type TurnResumeJobPayload = z.infer<typeof TurnResumeJobPayloadSchema>;
 
 export const SandboxSnapshotJobPayloadSchema = z.object({
+  outboxId: z.string().uuid().optional(),
   tenantId: z.string().uuid(),
   runId: z.string().uuid(),
   reason: z.enum(["interval", "before-wait", "before-finalize", "manual"]).default("interval"),

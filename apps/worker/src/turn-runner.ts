@@ -328,6 +328,8 @@ export class DurableTurnRunner {
       snapshotIntervalSeconds?: number;
       contextWindowTokens?: number;
       maxModelAttempts?: number;
+      maxModelIterations?: number;
+      maxTurnDurationMs?: number;
       modelIdleTimeoutMs?: number;
       modelMaxDurationMs?: number;
       abortCleanupTimeoutMs?: number;
@@ -449,6 +451,19 @@ export class DurableTurnRunner {
         nextAction: "Finalize the already completed model turn",
       });
       return "finalizing";
+    }
+    const maxModelIterations = Math.max(1, this.options.maxModelIterations ?? 80);
+    if (modelIteration(snapshot.steps) > maxModelIterations) {
+      throw new DurableTurnTerminalError(
+        `The task exceeded the ${maxModelIterations}-step model safety limit. Berry stopped it to prevent an agent loop.`,
+      );
+    }
+    const maxTurnDurationMs = Math.max(60_000, this.options.maxTurnDurationMs ?? 2 * 60 * 60 * 1_000);
+    if (Date.now() - Date.parse(snapshot.createdAt) > maxTurnDurationMs) {
+      const durationMinutes = Math.round(maxTurnDurationMs / 60_000);
+      throw new DurableTurnTerminalError(
+        `The task exceeded the ${durationMinutes}-minute execution safety limit. Berry stopped it to prevent an abandoned or looping task from blocking other work.`,
+      );
     }
     const maxModelAttempts = Math.max(1, this.options.maxModelAttempts ?? 3);
     if (step.attempt >= maxModelAttempts) {
@@ -786,6 +801,12 @@ export class DurableTurnRunner {
     }
     const toolCallId = stringValue(step.input.toolCallId) ?? step.id;
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    const repeatedFailure = repeatedToolFailure(snapshot, step);
+    if (repeatedFailure) {
+      throw new DurableTurnTerminalError(
+        `${toolName} failed twice with the same argument shape and error. Berry stopped the task to prevent an agent loop. Last error: ${repeatedFailure}`,
+      );
+    }
     if (toolName === "ask_user_question") {
       const questions = durableQuestionItems(step.input.arguments);
       const first = questions[0];
@@ -1012,7 +1033,7 @@ export class DurableTurnRunner {
       result = builtInPresentationToolResult(snapshot, toolName, step.input.arguments)
         ?? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
     } catch (error) {
-      if (error instanceof DurableTurnRetryableError) {
+      if (error instanceof DurableTurnRetryableError || error instanceof DurableTurnTerminalError) {
         throw error;
       }
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000);
@@ -2502,6 +2523,28 @@ function modelIteration(steps: readonly DurableTurnStep[]): number {
   return steps.filter((step) => step.type === "model.call").length;
 }
 
+function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
+  const shape = toolArgumentShape(step.input.arguments);
+  const failures = snapshot.steps
+    .filter((candidate) =>
+      candidate.type === step.type
+      && candidate.state === "failed"
+      && toolArgumentShape(candidate.input.arguments) === shape
+      && typeof candidate.error === "string"
+      && candidate.error.trim().length > 0
+    )
+    .slice(-2);
+  if (failures.length < 2) return null;
+  const previous = failures[0]!.error!.trim();
+  const latest = failures[1]!.error!.trim();
+  return previous === latest ? latest.slice(0, 1_000) : null;
+}
+
+function toolArgumentShape(value: unknown): string {
+  const input = record(value);
+  return input ? Object.keys(input).sort().join(",") : typeof value;
+}
+
 export function usageCostMicros(
   usage: {
     inputTokens: number;
@@ -2912,7 +2955,10 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "Use the tools declared for this turn when workspace inspection, changes, or current information are required.",
   "Tool arguments are structured JSON. Send the declared fields directly (for example, write_file receives path and content; run_command receives command). Never JSON-stringify the entire argument object inside raw or another field.",
   "The runtime environment below gives the exact workspace root for this turn. Use that exact root. If a skill or example says /workspace, treat it as a placeholder for the runtime root; never assume /workspace exists.",
+  "Sandbox persistence is selective. Inputs are already durable and the workspace inputs directory must not be copied. Put disposable clones, package caches, extracted intermediates, and build trees under system /tmp, outside the runtime workspace. Keep only user-authored working files in the workspace and final deliverables in its outputs directory.",
+  "run_command uses Bash. Check for an installed command before downloading or compiling a replacement, and keep large dependency trees in system /tmp.",
   "Keep each tool argument manageable. When file content could exceed roughly 12,000 characters, write a first chunk and append one manageable chunk per later tool turn with append_file and the preceding sizeBytes. Do not retry the same truncated payload.",
+  "For a large personal skill, write its complete SKILL.md in manageable chunks inside the runtime workspace, then call save_personal_skill once with path. Do not place a large skill document directly inside a tool argument.",
   "Read a tool error before retrying and correct its path, schema, or strategy. Do not repeat an identical failed call more than once.",
   "For requests about current web information, call an available MCP research or search tool before answering. Never claim browsing is unavailable when a relevant tool is declared.",
   "When the user explicitly asks you to remember or forget a durable personal fact or preference, call remember_memory or forget_memory when that tool is declared. Confirm the change only after the tool succeeds.",
@@ -3186,14 +3232,18 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "save_personal_skill",
-      description: "Create or update a validated Berry skill in the current signed-in user's personal Skills library. Use only when the user asks to create, install, or update a skill.",
+      description: "Create or update a validated Berry skill in the current signed-in user's personal Skills library. For content over roughly 12,000 characters, first write SKILL.md in manageable workspace chunks and pass path. Use only when the user asks to create, install, or update a skill.",
       parameters: {
         type: "object",
         additionalProperties: false,
-        required: ["content"],
         properties: {
           content: { type: "string", minLength: 1, maxLength: 262_144 },
+          path: { type: "string", description: "Workspace path to a completed SKILL.md; use this for large skills" },
         },
+        oneOf: [
+          { required: ["content"] },
+          { required: ["path"] },
+        ],
       },
     },
   },

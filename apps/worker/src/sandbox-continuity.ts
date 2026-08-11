@@ -34,7 +34,10 @@ const MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_MODEL_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_MODEL_IMAGES = 5;
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
+const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
+const MAX_SNAPSHOT_FILES = 5_000;
+const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
 
@@ -131,6 +134,11 @@ export interface SandboxSnapshotRepository {
     sandboxId: string,
     operation: (repository: SandboxSnapshotRepository) => Promise<T>,
   ): Promise<T>;
+  tryWithSandboxLifecycleLock?<T>(
+    tenantId: string,
+    sandboxId: string,
+    operation: (repository: SandboxSnapshotRepository) => Promise<T>,
+  ): Promise<T | null>;
 }
 
 export interface SandboxSnapshotObjectStore {
@@ -158,6 +166,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       cwd?: string;
       ttlSeconds?: number;
       maxInputBytes?: number;
+      intervalSnapshotTimeoutMs?: number;
       terminalSnapshotTimeoutMs?: number;
       terminalSuspendTimeoutMs?: number;
       imageGeneration?: {
@@ -172,9 +181,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 
   async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    const requestedSandboxImages = requestedSandboxImagePaths(snapshot, workspaceRoot);
     const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn"))
       .filter((file) => file.mediaType.startsWith("image/"));
+    const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
+    const requestedSandboxImages = requestedSandboxImagePaths(snapshot, workspaceRoot)
+      .filter((path) => {
+        const attachmentId = sandboxAttachmentId(path, workspaceRoot);
+        return !attachmentId || !attachedImageIds.has(attachmentId);
+      });
     if (requestedSandboxImages.length === 0 && attachedImages.length === 0) return [];
 
     const parts: ChatContentPart[] = [];
@@ -565,7 +579,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       for await (const event of this.provider.exec({
         sandbox_id: sandbox.id,
         request_id: step.idempotencyKey ?? step.id,
-        command: ["sh", "-lc", command],
+        command: ["bash", "-lc", command],
         cwd: workspaceRoot,
         timeout_ms: numberValue(args.timeoutMs) ?? 120_000,
       })) {
@@ -648,7 +662,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
     const candidate = await this.repository.loadRun(payload.tenantId, payload.runId);
     if (!candidate.sandboxId) return { noOp: true };
-    return this.withSandboxLifecycleLock(payload.tenantId, candidate.sandboxId, async (repository) => {
+    const preserveWithLock = async (repository: SandboxSnapshotRepository) => {
       const run = await repository.loadRun(payload.tenantId, payload.runId);
       if (!run.sandboxId || run.sandboxId !== candidate.sandboxId) return { noOp: true };
       const terminal = payload.reason === "before-finalize";
@@ -665,8 +679,18 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
 
       let preservationCompleted = false;
+      const snapshotTimeoutMs = terminal || beforeWait
+        ? this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS
+        : this.options.intervalSnapshotTimeoutMs ?? DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS;
       const preserve = async () => {
-        const archive = await this.capture(run.sandboxId!);
+        const archive = await this.capture(run.sandboxId!, Date.now() + snapshotTimeoutMs);
+        const current = await repository.loadRun(payload.tenantId, payload.runId);
+        if (!current.sandboxId || current.sandboxId !== run.sandboxId) {
+          return { noOp: true };
+        }
+        if (payload.reason === "interval" && TERMINAL_RUN_STATES.has(current.runState)) {
+          return { noOp: true };
+        }
         const bytes = Buffer.from(JSON.stringify(archive));
         const contentHash = createHash("sha256")
           .update(JSON.stringify({ version: archive.version, files: archive.files }))
@@ -680,9 +704,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
         await this.objects.put(key, bytes);
         const record = await repository.persist({
-          run,
-          provider: run.sandboxProvider ?? this.provider.kind,
-          sandboxId: run.sandboxId!,
+          run: current,
+          provider: current.sandboxProvider ?? this.provider.kind,
+          sandboxId: current.sandboxId!,
           objectKey: key,
           contentHash,
         });
@@ -691,14 +715,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
       let observedPaused = false;
       try {
-        const bounded = terminal || beforeWait;
-        return bounded
-          ? await withTimeout(
-              preserve(),
-              this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS,
-              `${terminal ? "Terminal" : "Waiting"} sandbox snapshot`,
-            )
-          : await preserve();
+        return await withTimeout(
+          preserve(),
+          snapshotTimeoutMs,
+          `${terminal ? "Terminal" : beforeWait ? "Waiting" : "Interval"} sandbox snapshot`,
+        );
       } catch (error) {
         if (!isSandboxPausedError(error)) throw error;
         observedPaused = true;
@@ -738,7 +759,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           }
         }
       }
-    });
+    };
+    if (payload.reason === "interval" && this.repository.tryWithSandboxLifecycleLock) {
+      return await this.repository.tryWithSandboxLifecycleLock(
+        payload.tenantId,
+        candidate.sandboxId,
+        preserveWithLock,
+      ) ?? { noOp: true };
+    }
+    return this.withSandboxLifecycleLock(payload.tenantId, candidate.sandboxId, preserveWithLock);
   }
 
   private async ensureSandbox(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
@@ -966,16 +995,24 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
   }
 
-  private async capture(sandboxId: string): Promise<SnapshotArchive> {
+  private async capture(sandboxId: string, deadlineAt: number): Promise<SnapshotArchive> {
     const root = this.options.cwd ?? "/workspace";
     const list = await this.provider.files.list({ sandbox_id: sandboxId, path: root, recursive: true });
+    const candidates = list.entries.filter((entry) =>
+      entry.type === "file"
+      && !excludedSnapshotPath(entry.path, root)
+      && entry.size_bytes <= 25 * 1024 * 1024
+    );
+    if (candidates.length > MAX_SNAPSHOT_FILES) {
+      throw new Error(`Sandbox snapshot exceeds the ${MAX_SNAPSHOT_FILES.toLocaleString("en-US")} file safety limit`);
+    }
+    const candidateBytes = candidates.reduce((total, entry) => total + entry.size_bytes, 0);
+    if (candidateBytes > MAX_SNAPSHOT_BYTES) {
+      throw new Error("Sandbox snapshot exceeds the 250 MB safety limit");
+    }
     const files: SnapshotArchive["files"] = [];
-    let total = 0;
-    for (const entry of list.entries) {
-      if (entry.type !== "file" || excludedSnapshotPath(entry.path, root)) continue;
-      if (entry.size_bytes > 25 * 1024 * 1024) continue;
-      total += entry.size_bytes;
-      if (total > 250 * 1024 * 1024) throw new Error("Sandbox snapshot exceeds the 250 MB safety limit");
+    for (const entry of candidates) {
+      if (Date.now() >= deadlineAt) throw new Error("Sandbox snapshot exceeded its time limit");
       const file = await this.provider.files.read({
         sandbox_id: sandboxId,
         path: entry.path,
@@ -989,17 +1026,23 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 }
 
 function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot = "/workspace"): string[] {
-  const inputRoot = `${safeWorkspaceRoot(workspaceRoot)}/inputs/`;
   const paths = snapshot.steps.flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read_file" && toolName !== "create_image") return [];
     const output = objectValue(step.output);
     const path = stringValue(output.visionPath);
-    if (!path || path.startsWith(inputRoot)) return [];
+    if (!path) return [];
     return binaryMediaType(path)?.startsWith("image/") ? [path] : [];
   });
   return [...new Set(paths)].slice(-MAX_MODEL_IMAGES).reverse();
+}
+
+function sandboxAttachmentId(path: string, workspaceRoot = "/workspace"): string | null {
+  const prefix = `${safeWorkspaceRoot(workspaceRoot)}/inputs/`;
+  if (!path.startsWith(prefix)) return null;
+  const fileId = path.slice(prefix.length).split("/", 1)[0]?.trim();
+  return fileId || null;
 }
 
 export class SqlSandboxSnapshotRepository implements SandboxSnapshotRepository {
@@ -1355,6 +1398,22 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
       return operation(new SqlSandboxSnapshotRepository(executor));
     });
   }
+
+  async tryWithSandboxLifecycleLock<T>(
+    tenantId: string,
+    sandboxId: string,
+    operation: (repository: SandboxSnapshotRepository) => Promise<T>,
+  ): Promise<T | null> {
+    if (!this.executor.transaction) return operation(this);
+    return this.executor.transaction(async (executor) => {
+      const rows = await executor.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked",
+        [`${tenantId}:${sandboxId}`],
+      );
+      if (rows[0]?.locked !== true) return null;
+      return operation(new SqlSandboxSnapshotRepository(executor));
+    });
+  }
 }
 
 export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore {
@@ -1698,7 +1757,9 @@ function imageDimensions(value: string): { width: number; height: number } {
 function excludedSnapshotPath(path: string, root: string): boolean {
   const relative = path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path;
   const parts = relative.split("/");
-  return parts.some((part) => [
+  return parts[0] === "tmp"
+    || parts[0] === "inputs"
+    || parts.some((part) => [
     ".git",
     "node_modules",
     ".next",

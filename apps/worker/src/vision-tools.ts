@@ -123,6 +123,12 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "inspect_images") return this.base.execute(snapshot, step);
+    const priorFailure = latestUnresolvedVisionFailure(snapshot, step.sequence);
+    if (priorFailure) {
+      throw new Error(
+        `Vision inspection already failed and no new image was exposed afterward. Do not retry inspect_images in this turn. Previous error: ${priorFailure}`,
+      );
+    }
     const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
     if (!runtime.vision) throw new Error("Vision inspection was not admitted for this turn");
     const args = record(step.input.arguments);
@@ -302,6 +308,26 @@ function visionUsageEvent(
 
 function normalizeQuestion(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function latestUnresolvedVisionFailure(snapshot: DurableTurnSnapshot, beforeSequence: number): string | null {
+  const failure = [...(snapshot.steps ?? [])].reverse().find((candidate) => {
+    const toolName = stringValue(candidate.input.toolName) ?? candidate.type.slice(5);
+    return candidate.sequence < beforeSequence
+      && candidate.state === "failed"
+      && toolName === "inspect_images"
+      && typeof candidate.error === "string"
+      && candidate.error.length > 0;
+  });
+  if (!failure) return null;
+  const newImage = (snapshot.steps ?? []).some((candidate) => {
+    if (candidate.sequence <= failure.sequence || candidate.sequence >= beforeSequence || candidate.state !== "completed") {
+      return false;
+    }
+    const output = record(candidate.output);
+    return typeof output?.visionPath === "string" && output.visionPath.length > 0;
+  });
+  return newImage ? null : failure.error!.slice(0, 1_000);
 }
 
 function record(value: unknown): Record<string, unknown> | null {

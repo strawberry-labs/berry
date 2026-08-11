@@ -11,9 +11,10 @@ import type {
   TurnToolResult,
 } from "../turn-runner.js";
 
-const SavePersonalSkillInputSchema = z.object({
-  content: z.string().min(1).max(262_144),
-}).strict();
+const SavePersonalSkillInputSchema = z.union([
+  z.object({ content: z.string().min(1).max(262_144) }).strict(),
+  z.object({ path: z.string().trim().min(1).max(4_096) }).strict(),
+]);
 
 export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor {
   constructor(
@@ -52,9 +53,18 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "save_personal_skill") return this.base.execute(snapshot, step);
 
-    const input = SavePersonalSkillInputSchema.parse(step.input.arguments ?? {});
-    const metadata = parseAgentSkillMarkdown(input.content);
-    const hash = createHash("sha256").update(input.content).digest("hex");
+    const parsedInput = SavePersonalSkillInputSchema.safeParse(step.input.arguments ?? {});
+    if (!parsedInput.success) {
+      throw new Error(
+        "save_personal_skill requires exactly one field: content for a small skill, or path to a completed workspace SKILL.md for a large skill. Never send raw.",
+      );
+    }
+    const input = parsedInput.data;
+    const content = "content" in input
+      ? input.content
+      : await this.readSkillContent(snapshot, step, input.path);
+    const metadata = parseAgentSkillMarkdown(content);
+    const hash = createHash("sha256").update(content).digest("hex");
     const deterministicId = `skill_${createHash("sha256")
       .update(`${snapshot.tenantId}\0${snapshot.userId}\0${metadata.name}`)
       .digest("hex")
@@ -83,7 +93,7 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at=now()
 WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=EXCLUDED.user_id
       `.trim(),
-      [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, input.content, metadata.version, hash],
+      [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, content, metadata.version, hash],
     );
     return {
       output: {
@@ -96,6 +106,31 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       },
       summary: `Saved $${metadata.name} to the current user's Skills library`,
     };
+  }
+
+  private async readSkillContent(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    path: string,
+  ): Promise<string> {
+    const result = await this.base.execute(snapshot, {
+      ...step,
+      type: "tool.read_file",
+      input: {
+        ...step.input,
+        toolName: "read_file",
+        arguments: { path },
+      },
+    });
+    const output = result.output && typeof result.output === "object" && !Array.isArray(result.output)
+      ? result.output
+      : null;
+    const content = typeof output?.content === "string" ? output.content : null;
+    if (!content) throw new Error("The skill path did not resolve to a readable text file");
+    if (Buffer.byteLength(content, "utf8") > 262_144) {
+      throw new Error("SKILL.md exceeds the 256 KiB personal skill limit");
+    }
+    return content;
   }
 }
 

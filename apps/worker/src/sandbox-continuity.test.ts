@@ -308,6 +308,149 @@ describe("SandboxContinuityManager", () => {
     expect(provider.suspend).not.toHaveBeenCalled();
   });
 
+  it("skips an interval snapshot immediately when the sandbox lifecycle lock is busy", async () => {
+    const provider = {
+      kind: "e2b",
+      files: { list: vi.fn(), read: vi.fn(), write: vi.fn() },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(async () => ({
+        tenantId: "00000000-0000-7000-8000-000000000002",
+        runId: "00000000-0000-7000-8000-000000000001",
+        sessionId: "00000000-0000-7000-8000-000000000004",
+        taskId: "00000000-0000-7000-8000-000000000003",
+        sandboxProvider: "e2b",
+        sandboxId: "sandbox-busy",
+        sandboxState: "running",
+        runState: "calling_model",
+        sessionLeafId: null,
+      })),
+      continuity: vi.fn(),
+      latest: vi.fn(),
+      inputFiles: vi.fn(),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(),
+      tryWithSandboxLifecycleLock: vi.fn(async () => null),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+
+    await expect(manager.snapshot({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      reason: "interval",
+    })).resolves.toEqual({ noOp: true });
+    expect(provider.files.list).not.toHaveBeenCalled();
+  });
+
+  it("does not persist durable inputs or disposable workspace tmp files", async () => {
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: Buffer.from("keep").toString("base64"),
+      size_bytes: 4,
+    }));
+    const provider = {
+      kind: "e2b",
+      files: {
+        list: vi.fn(async () => ({
+          path: "/workspace",
+          entries: [
+            { path: "/workspace/tmp/toolchain/file.c", type: "file", size_bytes: 4, mtime: null },
+            { path: "/workspace/inputs/file-1/source.pdf", type: "file", size_bytes: 4, mtime: null },
+            { path: "/workspace/notes.md", type: "file", size_bytes: 4, mtime: null },
+          ],
+        })),
+        read,
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const run = {
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      sessionId: "00000000-0000-7000-8000-000000000004",
+      taskId: "00000000-0000-7000-8000-000000000003",
+      sandboxProvider: "e2b",
+      sandboxId: "sandbox-filtered",
+      sandboxState: "running",
+      runState: "calling_model",
+      sessionLeafId: null,
+    };
+    const repository = {
+      loadRun: vi.fn(async () => run),
+      continuity: vi.fn(),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(),
+      persistOutput: vi.fn(),
+      persist: vi.fn(async () => ({ id: "snapshot-filtered", objectKey: "filtered.json", contentHash: "hash", sequence: 1 })),
+      recordSandbox: vi.fn(),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(async () => undefined),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+
+    await manager.snapshot({
+      tenantId: run.tenantId,
+      runId: run.runId,
+      reason: "interval",
+    });
+
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(expect.objectContaining({ path: "/workspace/notes.md" }));
+  });
+
+  it("exposes an image read from a connector-created sandbox input path", async () => {
+    const image = Buffer.from("connector-image");
+    const provider = {
+      kind: "e2b",
+      files: {
+        read: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          content: image.toString("base64"),
+          size_bytes: image.byteLength,
+        })),
+        write: vi.fn(),
+        list: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(),
+      latest: vi.fn(),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-connector-image";
+    current.sandboxProvider = "e2b";
+    current.steps = [{
+      ...toolStep("read_file", { path: "/workspace/inputs/connector-download/brent.png" }),
+      state: "completed",
+      output: {
+        path: "/workspace/inputs/connector-download/brent.png",
+        binary: true,
+        mediaType: "image/png",
+        visionPath: "/workspace/inputs/connector-download/brent.png",
+      },
+    }];
+
+    await expect(manager.modelContent(current)).resolves.toEqual([{
+      type: "image_url",
+      image_url: { url: `data:image/png;base64,${image.toString("base64")}` },
+    }]);
+    expect(provider.files.read).toHaveBeenCalledWith({
+      sandbox_id: "sandbox-connector-image",
+      path: "/workspace/inputs/connector-download/brent.png",
+      encoding: "base64",
+    });
+  });
+
   it("does not let an older terminal cleanup pause a sandbox claimed by a follow-up run", async () => {
     const provider = {
       kind: "e2b",
