@@ -128,11 +128,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       : [];
     if (artifact) {
       const stagedArtifact = staged.find((item) => item.fileId === artifact.fileId);
-      text = [
-        `Imported ${artifact.name} into the Berry Library.`,
-        stagedArtifact ? `Sandbox path: ${stagedArtifact.path}` : "The file is stored as a Berry artifact.",
-        stagedArtifact ? documentProcessingHint(stagedArtifact.name, stagedArtifact.mediaType) : "",
-      ].filter(Boolean).join("\n");
+      text = connectorArtifactText(artifact, stagedArtifact);
     }
     const parts = sanitizeMcpJournalValue(result.content);
     return {
@@ -350,17 +346,64 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function connectorArtifact(value: unknown): { fileId: string; name: string; mediaType: string } | null {
+type ConnectorArtifact = {
+  fileId: string;
+  name: string;
+  mediaType: string;
+  library: boolean | null;
+};
+
+type StagedConnectorArtifact = {
+  name: string;
+  mediaType: string;
+  path: string;
+};
+
+function connectorArtifact(value: unknown): ConnectorArtifact | null {
   const details = record(value);
   const structured = record(details?.structuredContent);
   const artifact = record(structured?.artifact);
   const fileId = stringValue(artifact?.fileId);
   const name = stringValue(artifact?.name);
   const mediaType = stringValue(artifact?.mediaType);
-  return fileId && name && mediaType ? { fileId, name, mediaType } : null;
+  const library = typeof artifact?.library === "boolean" ? artifact.library : null;
+  return fileId && name && mediaType ? { fileId, name, mediaType, library } : null;
 }
 
-function documentProcessingHint(name: string, mediaType: string): string {
+export function connectorArtifactText(
+  artifact: ConnectorArtifact,
+  staged: StagedConnectorArtifact | undefined,
+): string {
+  const disposition = artifact.library === true
+    ? `Saved ${artifact.name} to the Berry Library.`
+    : artifact.library === false
+      ? `Downloaded ${artifact.name} for temporary use in this task.`
+      : `Imported ${artifact.name} into Berry.`;
+  const storage = staged
+    ? `Sandbox path: ${staged.path}`
+    : artifact.library === false
+      ? "The file is stored as a task-scoped Berry artifact."
+      : "The file is stored as a Berry artifact.";
+  const persistence = artifact.library === false
+    ? "It was not added to the Berry Library or project knowledge."
+    : "";
+  return [
+    disposition,
+    storage,
+    persistence,
+    staged ? documentProcessingHint(staged.name, staged.mediaType, artifact.library !== false) : "",
+  ].filter(Boolean).join("\n");
+}
+
+function documentProcessingHint(name: string, mediaType: string, indexed: boolean): string {
+  if (!indexed) {
+    const lower = name.toLowerCase();
+    if (lower.endsWith(".pdf") || mediaType === "application/pdf") return "Use read_file on the sandbox path to extract the PDF for this task.";
+    if (/\.(xlsx?|xlsm|csv)$/.test(lower) || /spreadsheet|excel|csv/.test(mediaType)) return "Use the sandbox path with the spreadsheet tools for this task.";
+    if (/\.docx?$/.test(lower) || /wordprocessingml|msword/.test(mediaType)) return "Use the sandbox path with the document tools for this task.";
+    if (/\.pptx?$/.test(lower) || /presentationml|powerpoint/.test(mediaType)) return "Use the sandbox path with the presentation tools for this task.";
+    return "Use the sandbox path for this task.";
+  }
   const lower = name.toLowerCase();
   if (lower.endsWith(".pdf") || mediaType === "application/pdf") return "The PDF skill is active for structured reading; searchable extraction is queued through Tika.";
   if (/\.(xlsx?|xlsm|csv)$/.test(lower) || /spreadsheet|excel|csv/.test(mediaType)) return "The XLSX skill is active for structured spreadsheet analysis; searchable extraction is queued through Tika.";

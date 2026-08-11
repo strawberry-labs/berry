@@ -154,7 +154,7 @@ export class CloudRuntimeConfigService {
     };
   }
 
-  async catalog(tenantId: string): Promise<{ providerId: string; name: string; defaultModel: string; models: RemoteModel[]; skills: Array<{ id: string; name: string; description: string; enabled: true }>; mcpServers: Array<{ id: string; name: string; url: string; auth: "none" | "bearer"; enabled: boolean }> } | null> {
+  async catalog(tenantId: string): Promise<{ providerId: string; name: string; defaultModel: string; models: RemoteModel[]; skills: Array<{ id: string; name: string; description: string; content: string; enabled: true }>; mcpServers: Array<{ id: string; name: string; url: string; auth: "none" | "bearer"; enabled: boolean }> } | null> {
     let provider = this.config.provider;
     if (this.organizationProviders) {
       try {
@@ -174,7 +174,13 @@ export class CloudRuntimeConfigService {
       name: provider.name,
       defaultModel: provider.defaultModel,
       models: provider.models ?? [],
-      skills: this.config.extraSkills.map((skill) => ({ id: safeSegment(skill.name), name: skill.name, description: skill.description, enabled: true })),
+      skills: this.config.extraSkills.map((skill) => ({
+        id: safeSegment(skill.name),
+        name: skill.name,
+        description: skill.description,
+        content: skill.content,
+        enabled: true,
+      })),
       mcpServers: this.config.mcpServers.flatMap((server) => server.url ? [{ id: server.id, name: server.name, url: server.url, auth: server.credential ? "bearer" as const : "none" as const, enabled: server.enabled }] : []),
     };
   }

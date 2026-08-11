@@ -138,6 +138,7 @@ export class ConnectorsController {
           sourceRevision: artifact.sourceRevision,
           sourceMimeType: artifact.sourceMimeType,
           exportMimeType: artifact.exportMimeType,
+          saveToLibrary: artifact.saveToLibrary,
           name: artifact.name,
           contentType: artifact.contentType,
           declaredSize: artifact.declaredSize,

@@ -26,6 +26,7 @@ const SkillConfigSchema = z.object({
   id: z.string(),
   name: z.string(),
   description: z.string(),
+  content: z.string().optional(),
   enabled: z.boolean().default(true),
 });
 

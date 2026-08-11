@@ -322,8 +322,8 @@ function createRuntimeSessionHost(env: NodeJS.ProcessEnv, contractProvider: Cont
     cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
     ttlSeconds: sandboxTtlSeconds(env),
     resources: {
-      cpuCount: numberEnv(env.BERRY_SANDBOX_CPU_COUNT, 2),
-      memoryMiB: numberEnv(env.BERRY_SANDBOX_MEMORY_MIB, 2048),
+      cpuCount: numberEnv(env.BERRY_SANDBOX_CPU_COUNT, 1),
+      memoryMiB: numberEnv(env.BERRY_SANDBOX_MEMORY_MIB, 1024),
       diskMiB: numberEnv(env.BERRY_SANDBOX_DISK_MIB, 10_240),
     },
   });

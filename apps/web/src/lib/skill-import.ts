@@ -10,6 +10,24 @@ export type BrowserSkillImport = {
   packageFiles: string[];
 };
 
+export type BrowserSkillExport = {
+  blob: Blob;
+  fileName: string;
+};
+
+export async function createBrowserSkillExport(name: string, content: string): Promise<BrowserSkillExport> {
+  validateContent(content);
+  const archive = new JSZip();
+  archive.file("SKILL.md", content);
+  const blob = await archive.generateAsync({
+    type: "blob",
+    mimeType: "application/zip",
+    compression: "DEFLATE",
+    compressionOptions: { level: 6 },
+  });
+  return { blob, fileName: `${safeSkillFileStem(name)}.skill` };
+}
+
 export async function readBrowserSkillImport(file: File): Promise<BrowserSkillImport> {
   if (file.size > MAX_ARCHIVE_BYTES) throw new Error("Skill files are limited to 5 MB");
   if (!/\.(skill|zip)$/i.test(file.name)) {
@@ -47,4 +65,13 @@ function validateArchivePath(path: string): void {
 function validateContent(content: string): void {
   if (!content.trim()) throw new Error("SKILL.md is empty");
   if (new TextEncoder().encode(content).byteLength > MAX_SKILL_BYTES) throw new Error("SKILL.md is limited to 256 KB");
+}
+
+function safeSkillFileStem(name: string): string {
+  return name
+    .trim()
+    .replace(/\.skill$/i, "")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 120) || "skill";
 }

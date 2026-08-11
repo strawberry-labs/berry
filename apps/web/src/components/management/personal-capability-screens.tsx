@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Check,
   Code2,
+  Download,
   EllipsisVertical,
   Eye,
   FlaskConical,
@@ -41,7 +42,7 @@ import type {
   PersonalMcpServer,
   PersonalSkill,
 } from "@berry/shared";
-import { readBrowserSkillImport } from "@/lib/skill-import";
+import { createBrowserSkillExport, readBrowserSkillImport } from "@/lib/skill-import";
 import {
   AsyncState,
   Button,
@@ -431,7 +432,7 @@ function SkillDetailsDialog({
 }) {
   const [view, setView] = React.useState<SkillViewMode>("rendered");
   const [descriptionExpanded, setDescriptionExpanded] = React.useState(false);
-  const [busy, setBusy] = React.useState<"toggle" | "uninstall" | null>(null);
+  const [busy, setBusy] = React.useState<"toggle" | "download" | "uninstall" | null>(null);
   const [actionError, setActionError] = React.useState("");
   const provider = skill.provenance === "organization"
     ? "your organization"
@@ -462,6 +463,31 @@ function SkillDetailsDialog({
       await onUninstall();
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "Could not uninstall this skill");
+      setBusy(null);
+    }
+  }
+
+  async function download() {
+    if (!skill.content) return;
+    setActionError("");
+    setBusy("download");
+    try {
+      const exported = await createBrowserSkillExport(skill.name, skill.content);
+      const url = URL.createObjectURL(exported.blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = exported.fileName;
+        anchor.hidden = true;
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      }
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Could not download this skill");
+    } finally {
       setBusy(null);
     }
   }
@@ -528,6 +554,14 @@ function SkillDetailsDialog({
                     <DropdownMenuItem onSelect={onTryInChat}>
                       <MessageCircle aria-hidden />
                       Try in chat
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={!skill.content || busy !== null}
+                      title={skill.content ? "Download a portable skill package" : "This deployment has not loaded the skill definition"}
+                      onSelect={() => void download()}
+                    >
+                      <Download aria-hidden />
+                      {busy === "download" ? "Downloading…" : "Download .skill"}
                     </DropdownMenuItem>
                     {onUninstall ? (
                       <>
@@ -644,6 +678,7 @@ function buildSkillRows(
     id: string;
     name: string;
     description: string;
+    content?: string | undefined;
     enabled: boolean;
   }>,
 ): SkillCatalogRow[] {
@@ -693,7 +728,7 @@ function buildSkillRows(
         capabilityId: item.id,
         name: item.name.replace(/^\$/, ""),
         description: item.description,
-        content: null,
+        content: item.content ?? null,
         enabled: item.enabled,
         locked: true,
         provenance: "self-host-bootstrap",

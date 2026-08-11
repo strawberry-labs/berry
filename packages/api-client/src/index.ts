@@ -330,7 +330,13 @@ export const ManagedModelCatalogSchema = z.object({
     id: z.string(),
     name: z.string().optional(),
   }).passthrough()),
-  skills: z.array(z.object({ id: z.string(), name: z.string(), description: z.string(), enabled: z.boolean() })).default([]),
+  skills: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    description: z.string(),
+    content: z.string().optional(),
+    enabled: z.boolean(),
+  })).default([]),
   mcpServers: z.array(z.object({ id: z.string(), name: z.string(), url: z.string().url(), auth: z.enum(["none", "bearer", "oauth"]), enabled: z.boolean() })).default([]),
   capabilities: z.object({
     imageGeneration: z.object({

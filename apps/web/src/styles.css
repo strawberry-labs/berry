@@ -1163,8 +1163,6 @@ textarea:not([data-slot="textarea"]):focus-visible,
 
 .berry-deployment-logo {
   object-fit: contain;
-  outline: 1px solid var(--berry-image-outline);
-  outline-offset: -1px;
 }
 
 .auth-card .auth-sso-domain {

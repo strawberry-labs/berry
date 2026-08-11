@@ -26,9 +26,10 @@ describe("formatSkillsForSystemPrompt", () => {
 		expect(prompt).toContain("# AESG artifact workspace");
 		expect(prompt).toContain('activate "AESG branding" and the matching skill');
 		expect(prompt).toContain('activate "AESG branding" and "CV Creator"');
-		expect(prompt).toContain("`/workspace/inputs/<file-id>/<filename>`");
+		expect(prompt).toContain("`<workspace-root>/inputs/<file-id>/<filename>`");
 		expect(prompt).toContain("`/managed-skills/<skill-id>` (read-only)");
-		expect(prompt).toContain("Final deliverables only: `/workspace/outputs`");
+		expect(prompt).toContain("Final deliverables only: `<workspace-root>/outputs`");
+		expect(prompt).toContain("Any `/workspace` path in a skill is a placeholder");
 	});
 
 	it("omits AESG routing when a required skill is unavailable to the model", () => {

@@ -72,6 +72,54 @@ describe("durable turn runner", () => {
     expect(duplicate.noOp).toBe(true);
   });
 
+  it("retries one empty model response instead of marking the turn complete", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return modelCalls === 1
+          ? { text: "", inputTokens: 3, outputTokens: 0, toolCalls: [] }
+          : { text: "Completed after retry.", inputTokens: 4, outputTokens: 3, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-empty-response" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(repository.current.state).toBe("calling_model");
+    expect(repository.current.steps.find((step) => step.state === "pending" && step.type === "model.call")?.input)
+      .toMatchObject({ recoveryReason: "empty_response" });
+    expect(repository.events.some((event) => event.kind === "turn.end")).toBe(false);
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "finalizing" });
+    expect(modelCalls).toBe(2);
+    expect(repository.current.entries.some((entry) => JSON.stringify(entry.payload).includes("Completed after retry.")))
+      .toBe(true);
+  });
+
+  it("fails visibly when the empty-response recovery is also empty", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({ text: "", inputTokens: 3, outputTokens: 0, toolCalls: [] }),
+    }, noTools(), { owner: "worker-repeated-empty-response" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(repository.current.error).toContain("empty response twice");
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "turn.end",
+      status: "failed",
+    }));
+  });
+
   it("reclaims an expired lease from the persisted pending model step", async () => {
     const pending = modelStep("pending", 1);
     const state = snapshot("calling_model", [admittedStep(), pending]);
@@ -350,7 +398,7 @@ describe("durable turn runner", () => {
 
   it("does not compact generated image bytes as if their base64 were prompt text", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
-    current.runtimeRequest.contextWindowTokens = 20_000;
+    current.runtimeRequest.contextWindowTokens = 40_000;
     const repository = new FakeTurnRepository(current);
     let compactions = 0;
     let modelCalls = 0;
@@ -983,6 +1031,7 @@ describe("durable turn runner", () => {
     const client = {
       stream: async function* (options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
         request = options;
+        const wrappedArguments = JSON.stringify({ raw: JSON.stringify({ query: "AI news" }) });
         yield {
           id: "completion-1",
           model: "kimi-2.6",
@@ -998,7 +1047,7 @@ describe("durable turn runner", () => {
           toolCalls: [{
             index: 0,
             id: "call_1",
-            function: { name: "mcp__BerryCrawl__search", arguments: "{\"query\":" },
+            function: { name: "mcp__BerryCrawl__search", arguments: wrappedArguments.slice(0, 12) },
           }],
           finishReason: null,
           raw: {},
@@ -1007,7 +1056,7 @@ describe("durable turn runner", () => {
           id: "completion-1",
           model: "kimi-2.6",
           delta: "",
-          toolCalls: [{ index: 0, function: { arguments: "\"AI news\"}" } }],
+          toolCalls: [{ index: 0, function: { arguments: wrappedArguments.slice(12) } }],
           finishReason: "tool_calls",
           usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
           raw: {},
@@ -1108,6 +1157,12 @@ describe("durable turn runner", () => {
     );
     expect(request?.messages[0]?.content).toContain(
       "call ask_user_question so the frontend renders the interactive question UI",
+    );
+    expect(request?.messages[0]?.content).toContain(
+      "Path rule: use /home/user/workspace exactly",
+    );
+    expect(request?.messages[0]?.content).toContain(
+      "Never JSON-stringify the entire argument object inside raw",
     );
     const userContent = request?.messages.find((message) => message.role === "user")?.content;
     expect(Array.isArray(userContent)).toBe(true);

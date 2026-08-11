@@ -249,10 +249,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
-    const sandbox = await this.ensureSandbox(snapshot);
-    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const args = objectValue(step.input.arguments);
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (typeof args.raw === "string") {
+      throw new Error(
+        `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper. For large text, write a small first chunk and continue with append_file in separate tool turns.`,
+      );
+    }
+    const sandbox = await this.ensureSandbox(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (toolName === "read_file") {
       const path = safeReadablePath(stringValue(args.path) ?? "", workspaceRoot);
       const mediaType = binaryMediaType(path);
@@ -324,6 +329,39 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return {
         output: { path: result.path, sizeBytes: result.size_bytes, mtime: result.mtime },
         summary: `Wrote ${result.path}`,
+        sandbox,
+      };
+    }
+    if (toolName === "append_file") {
+      const path = safeWorkspacePath(stringValue(args.path) ?? "", workspaceRoot);
+      const content = stringValue(args.content, true) ?? "";
+      const expectedSizeBytes = numberValue(args.expected_size_bytes);
+      if (expectedSizeBytes === null || !Number.isInteger(expectedSizeBytes) || expectedSizeBytes < 0) {
+        throw new Error("append_file requires a non-negative integer expected_size_bytes from the previous write result");
+      }
+      const existing = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
+      const appendedBytes = Buffer.byteLength(content, "utf8");
+      if (existing.size_bytes === expectedSizeBytes + appendedBytes && existing.content.endsWith(content)) {
+        return {
+          output: { path: existing.path, sizeBytes: existing.size_bytes, appendedBytes, alreadyApplied: true },
+          summary: `Append was already applied to ${existing.path}`,
+          sandbox,
+        };
+      }
+      if (existing.size_bytes !== expectedSizeBytes) {
+        throw new Error(
+          `append_file expected ${expectedSizeBytes} bytes at ${path}, but found ${existing.size_bytes}; read the file before retrying`,
+        );
+      }
+      const result = await this.provider.files.write({
+        sandbox_id: sandbox.id,
+        path,
+        content: existing.content + content,
+        encoding: "utf8",
+      });
+      return {
+        output: { path: result.path, sizeBytes: result.size_bytes, appendedBytes, mtime: result.mtime },
+        summary: `Appended ${appendedBytes} bytes to ${result.path}`,
         sandbox,
       };
     }

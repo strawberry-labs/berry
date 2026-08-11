@@ -164,8 +164,8 @@ sandbox:
   requestTimeoutMs: 60000
   ttlSeconds: 300
   keepMemoryOnPause: false
-  cpuCount: 2
-  memoryMiB: 2048
+  cpuCount: 1
+  memoryMiB: 1024
   diskMiB: 10240
   estimatedHourlyCostMicros: 0
   minimumExecCostMicros: 0

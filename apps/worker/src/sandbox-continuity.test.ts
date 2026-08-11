@@ -474,6 +474,13 @@ describe("SandboxContinuityManager", () => {
     }))).resolves.toMatchObject({
       output: { path: "/workspace/result.txt", sizeBytes: 4 },
     });
+    await expect(manager.execute(snapshot(), toolStep("append_file", {
+      path: "/workspace/file.txt",
+      content: " more",
+      expected_size_bytes: 13,
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace/file.txt", sizeBytes: 18, appendedBytes: 5 },
+    });
     await expect(manager.execute(snapshot(), toolStep("edit_file", {
       path: "/workspace/file.txt",
       old_string: "file",
@@ -521,6 +528,18 @@ describe("SandboxContinuityManager", () => {
       path: "/workspace/file.txt",
       content: "updated contents",
     }));
+  });
+
+  it("rejects malformed raw tool wrappers with an actionable error", async () => {
+    const read = vi.fn();
+    const write = vi.fn();
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep("run_command", {
+      raw: "{\"command\":\"printf done\"",
+    }))).rejects.toThrow("arguments were incomplete or invalid JSON");
+    expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
   });
 
   it("reads managed skill references without making the managed tree writable", async () => {

@@ -32,6 +32,7 @@ export type DriveArtifactImport = {
   sourceRevision: string;
   sourceMimeType: string;
   exportMimeType: string | null;
+  saveToLibrary: boolean;
   name: string;
   contentType: string;
   declaredSize: number | null;
@@ -89,7 +90,11 @@ const workspaceTools: ToolDefinition[] = [
     (token, input) => searchDriveFiles(token, { ...input, query: "trashed = false", orderBy: "modifiedTime desc" })),
   tool("drive_get_file_metadata", "Get safe metadata and current capabilities for one Drive file.", object({ fileId: string("Drive file ID.") }, ["fileId"]), "read", driveReadScopes,
     async (token, input) => driveFilePreflight(token, requiredString(input.fileId, "fileId"), "read")),
-  tool("drive_read_file", "Import an eligible Drive file into Berry. The file is streamed into private object storage, added to the Library, and staged in the task sandbox without placing file bytes in model context.", object({ fileId: string("Drive file ID."), exportMimeType: string("Optional export MIME type for Google-native files.") }, ["fileId"]), "read", driveReadScopes, readDriveFile),
+  tool("drive_read_file", "Download an eligible Drive file for use in the current task. By default it is staged temporarily in the task sandbox and is not added to the Berry Library or searchable knowledge. Set saveToLibrary=true only when the user explicitly asks to keep it or clearly intends to reuse it in future tasks, project reference material, or recurring work. Do not save it merely because it is needed for the current answer. File bytes are never placed directly in model context.", object({
+    fileId: string("Drive file ID."),
+    exportMimeType: string("Optional export MIME type for Google-native files."),
+    saveToLibrary: boolean("Save the file to the Berry Library and queue searchable extraction. Defaults to false. Use true only for clear durable user intent, never only because the current task needs the file."),
+  }, ["fileId"]), "read", driveReadScopes, readDriveFile),
   tool("drive_list_children", "List eligible files directly inside a Drive folder.", object({ folderId: string("Folder ID."), pageSize: integer("Maximum results.", 1, 100), pageToken: string("Continuation token.") }, ["folderId"]), "read", driveReadScopes,
     (token, input) => searchDriveFiles(token, { query: `'${escapeDriveQuery(requiredString(input.folderId, "folderId"))}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken })),
   tool("drive_list_permissions", "List existing Drive permissions without changing sharing.", object({ fileId: string("Drive file ID."), pageSize: integer("Maximum permissions.", 1, 100), pageToken: string("Continuation token.") }, ["fileId"]), "read", driveReadScopes, async (token, input) => {
@@ -313,6 +318,7 @@ async function readDriveFile(token: string, input: Record<string, unknown>, cont
     sourceRevision,
     sourceMimeType: mimeType,
     exportMimeType: googleMime ? exportMimeType : null,
+    saveToLibrary: optionalBoolean(input.saveToLibrary) ?? false,
     name: driveArtifactName(requiredString(metadata.name, "name"), contentType, googleMime),
     contentType,
     declaredSize,

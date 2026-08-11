@@ -59,6 +59,27 @@ describe("cloud runtime configuration", () => {
     });
   });
 
+  it("includes deployment skill definitions in the downloadable catalog", async () => {
+    const service = new CloudRuntimeConfigService({
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: "kimi-2.6",
+      BERRY_CLOUD_SKILLS_JSON: JSON.stringify([{
+        name: "research",
+        description: "Research a topic with cited sources.",
+        content: "---\nname: research\ndescription: Research a topic with cited sources.\n---\nUse BerryCrawl.",
+      }]),
+    });
+
+    await expect(service.catalog(SELF_HOST_TENANT_ID)).resolves.toMatchObject({
+      skills: [{
+        id: "research",
+        name: "research",
+        content: expect.stringContaining("Use BerryCrawl."),
+        enabled: true,
+      }],
+    });
+  });
+
   it("allows buffered transport as an explicit emergency override", () => {
     const config = createCloudRuntimeConfigFromEnv({
       BERRY_API_MODEL_MODE: "live",

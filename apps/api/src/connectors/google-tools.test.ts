@@ -36,6 +36,22 @@ describe("Google connector tool policy", () => {
     expect(fullWithoutScope.some((tool) => tool.name === "gmail_send_message")).toBe(false);
   });
 
+  it("makes Drive downloads temporary unless the model explicitly saves them", () => {
+    const readFile = googleToolCatalog(
+      "google-workspace",
+      "read",
+      ["https://www.googleapis.com/auth/drive.readonly"],
+    ).find((tool) => tool.name === "drive_read_file");
+    const properties = readFile?.inputSchema.properties as Record<string, Record<string, unknown>>;
+
+    expect(readFile?.description).toContain("By default it is staged temporarily");
+    expect(properties.saveToLibrary).toMatchObject({
+      type: "boolean",
+      description: expect.stringContaining("Defaults to false"),
+    });
+    expect(readFile?.inputSchema.required).toEqual(["fileId"]);
+  });
+
   it("requires approval for native writes in every task mode except reviewable Gmail drafts", () => {
     const gmail = googleToolsRequiringApproval("gmail", "full", [GMAIL_MODIFY]);
     expect(gmail).toContain("gmail_send_message");
@@ -119,6 +135,7 @@ describe("Google connector tool policy", () => {
     expect(driveArtifactImporter).toHaveBeenCalledWith(expect.objectContaining({
       sourceFileId: "file-1",
       sourceRevision: "file-1",
+      saveToLibrary: false,
       body: expect.any(ReadableStream),
     }));
   });
@@ -180,7 +197,7 @@ describe("Google connector tool policy", () => {
       "read",
       "drive_read_file",
       "access-token",
-      { fileId: "sheet-1" },
+      { fileId: "sheet-1", saveToLibrary: true },
       "person@aesg.com",
       ["https://www.googleapis.com/auth/drive.readonly"],
       { driveArtifactImporter },
@@ -190,6 +207,7 @@ describe("Google connector tool policy", () => {
     expect(driveArtifactImporter).toHaveBeenCalledWith(expect.objectContaining({
       name: "Forecast.v2.xlsx",
       exportMimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      saveToLibrary: true,
     }));
   });
 

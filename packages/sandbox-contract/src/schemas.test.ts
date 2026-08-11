@@ -22,7 +22,7 @@ describe("sandbox contract schemas", () => {
       network_policy: { egress: "off", allowedDomains: [] },
       writable_roots: ["/workspace"],
       mounts: [],
-      resources: { cpuCount: 1, memoryMiB: 2048, storageMiB: 10_240 },
+      resources: { cpuCount: 1, memoryMiB: 1024, storageMiB: 10_240 },
     });
   });
 

@@ -74,6 +74,7 @@ type FileRow = {
   index_status?: "pending" | "extracting" | "chunking" | "embedding" | "indexed" | "failed" | "deleted" | null;
   vector_ready?: boolean | null;
   failure_reason?: string | null;
+  in_library?: boolean;
 };
 
 const FILE_PHYSICAL_COLUMNS = `
@@ -714,6 +715,7 @@ export class FilePlatformService {
     sourceRevision: string;
     sourceMimeType: string;
     exportMimeType: string | null;
+    saveToLibrary: boolean;
     name: string;
     contentType: string;
     declaredSize: number | null;
@@ -741,14 +743,29 @@ export class FilePlatformService {
       const file = await connectorImportFile(executor, tenantId, fileId, userId);
       if (!file) return null;
       assertConnectorIdentity(file, input);
-      await reviveLibraryEntry(executor, tenantId, userId, fileId);
+      const promoted = input.saveToLibrary && file.in_library !== true;
+      if (input.saveToLibrary) await reviveLibraryEntry(executor, tenantId, userId, fileId);
       await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
-      await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
-      return file;
+      if (input.saveToLibrary) {
+        await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+      }
+      return promoteConnectorKnowledgeIfNeeded(executor, {
+        file,
+        promoted,
+        projectKnowledgeEnabled: this.#durableConfig.projectKnowledgeEnabled,
+        maxIndexableBytes: config.maxIndexableBytes,
+        tenantId,
+        userId,
+        workspaceId: task.workspace_id,
+        taskId: input.taskId,
+        revision: input.sourceRevision,
+        title: name,
+        mediaType: input.contentType,
+      });
     });
     if (existing) {
       await input.body.cancel().catch(() => undefined);
-      return connectorArtifactDto(existing, input, true);
+      return connectorArtifactDto(existing, input, true, input.saveToLibrary || existing.in_library === true);
     }
 
     const maximumBytes = Math.min(100 * 1024 * 1024, config.maxUploadBytes);
@@ -770,13 +787,31 @@ export class FilePlatformService {
         const raced = await connectorImportFile(executor, tenantId, fileId, userId);
         if (raced) {
           assertConnectorIdentity(raced, input);
-          await reviveLibraryEntry(executor, tenantId, userId, fileId);
+          const promoted = input.saveToLibrary && raced.in_library !== true;
+          if (input.saveToLibrary) await reviveLibraryEntry(executor, tenantId, userId, fileId);
           await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
-          await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
-          return { file: raced, reused: true };
+          if (input.saveToLibrary) {
+            await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+          }
+          const referenced = await promoteConnectorKnowledgeIfNeeded(executor, {
+            file: raced,
+            promoted,
+            projectKnowledgeEnabled: this.#durableConfig.projectKnowledgeEnabled,
+            maxIndexableBytes: config.maxIndexableBytes,
+            tenantId,
+            userId,
+            workspaceId: task.workspace_id,
+            taskId: input.taskId,
+            revision: input.sourceRevision,
+            title: name,
+            mediaType: input.contentType,
+          });
+          return { file: referenced, reused: true, library: input.saveToLibrary || raced.in_library === true };
         }
         const blobId = randomUUID();
-        const shouldIndex = this.#durableConfig.projectKnowledgeEnabled && stored.size <= config.maxIndexableBytes;
+        const shouldIndex = input.saveToLibrary
+          && this.#durableConfig.projectKnowledgeEnabled
+          && stored.size <= config.maxIndexableBytes;
         const metadata = connectorImportMetadata(input);
         await executor.execute(`
           INSERT INTO file_blobs (
@@ -796,9 +831,11 @@ export class FilePlatformService {
           RETURNING *
         `, [fileId, tenantId, userId, blobId, name, input.contentType || "application/octet-stream", stored.size, stored.sha256, config.bucket, objectKey, stored.etag, stored.versionId, shouldIndex ? "processing" : "available", JSON.stringify(metadata)]);
         if (!created) throw new Error("Unable to register the Drive artifact");
-        await reviveLibraryEntry(executor, tenantId, userId, fileId);
+        if (input.saveToLibrary) await reviveLibraryEntry(executor, tenantId, userId, fileId);
         await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
-        await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+        if (input.saveToLibrary) {
+          await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });
+        }
         await enqueueBlobVerification(executor, tenantId, blobId);
         if (shouldIndex) {
           await enqueueConnectorKnowledgeExtraction(executor, {
@@ -814,7 +851,7 @@ export class FilePlatformService {
             objectKey,
           });
         }
-        return { file: created, reused: false };
+        return { file: created, reused: false, library: input.saveToLibrary };
       });
       registered = !file.reused;
       if (file.reused) {
@@ -824,7 +861,7 @@ export class FilePlatformService {
           ...(stored.versionId ? { VersionId: stored.versionId } : {}),
         })).catch(() => undefined);
       }
-      return connectorArtifactDto(file.file, input, file.reused);
+      return connectorArtifactDto(file.file, input, file.reused, file.library);
     } catch (cause) {
       if (!registered) {
         await config.client.send(new DeleteObjectCommand({
@@ -1189,6 +1226,7 @@ function connectorArtifactDto(
   row: FileRow,
   input: ConnectorImportIdentity,
   reused: boolean,
+  library: boolean,
 ): Record<string, unknown> {
   return {
     artifact: {
@@ -1203,7 +1241,7 @@ function connectorArtifactDto(
       sourceRevision: input.sourceRevision,
       exportMimeType: input.exportMimeType,
       reused,
-      library: true,
+      library,
     },
   };
 }
@@ -1215,7 +1253,13 @@ async function connectorImportFile(
   userId: string,
 ): Promise<FileRow | null> {
   const [row] = await executor.query<FileRow>(`
-    SELECT f.*, ${FILE_PHYSICAL_COLUMNS}
+    SELECT f.*, ${FILE_PHYSICAL_COLUMNS},
+      EXISTS (
+        SELECT 1
+        FROM file_library_entries library
+        WHERE library.tenant_id=f.tenant_id AND library.file_id=f.id
+          AND library.user_id=$3::uuid AND library.deleted_at IS NULL
+      ) AS in_library
     FROM files f
     LEFT JOIN file_blobs blob ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
     WHERE f.tenant_id=$1::uuid AND f.id=$2::uuid AND f.owner_user_id=$3::uuid
@@ -1223,7 +1267,47 @@ async function connectorImportFile(
       AND f.status IN ('processing','available')
     FOR UPDATE OF f
   `, [tenantId, fileId, userId]);
-  return row ?? null;
+  return row ? resolvePhysicalFile(row) : null;
+}
+
+async function promoteConnectorKnowledgeIfNeeded(executor: SqlExecutor, input: {
+  file: FileRow;
+  promoted: boolean;
+  projectKnowledgeEnabled: boolean;
+  maxIndexableBytes: number;
+  tenantId: string;
+  userId: string;
+  workspaceId: string;
+  taskId: string;
+  revision: string;
+  title: string;
+  mediaType: string;
+}): Promise<FileRow> {
+  if (!input.promoted) return input.file;
+  const libraryFile = { ...input.file, in_library: true };
+  if (!input.projectKnowledgeEnabled
+    || Number(input.file.size_bytes) > input.maxIndexableBytes
+    || !input.file.sha256) {
+    return libraryFile;
+  }
+  await executor.execute(`
+    UPDATE files
+    SET status='processing', updated_at=now()
+    WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='available'
+  `, [input.tenantId, input.file.id]);
+  await enqueueConnectorKnowledgeExtraction(executor, {
+    tenantId: input.tenantId,
+    userId: input.userId,
+    workspaceId: input.workspaceId,
+    taskId: input.taskId,
+    fileId: input.file.id,
+    revision: input.revision,
+    contentHash: input.file.sha256,
+    title: input.title,
+    mediaType: input.mediaType,
+    objectKey: input.file.object_key,
+  });
+  return { ...libraryFile, status: "processing" };
 }
 
 async function lockConnectorImport(executor: SqlExecutor, fileId: string): Promise<void> {
@@ -1300,7 +1384,7 @@ async function enqueueConnectorKnowledgeExtraction(executor: SqlExecutor, input:
     ) VALUES (
       $1::uuid, $2::uuid, $3::uuid, 'file', $4::uuid::text, $5, $6, $7,
       'task_only', 'pending', 'pending', 'tika-v1', 'recursive-v1',
-      jsonb_build_object('fileId',$4::uuid,'mediaType',$8,'objectKey',$9,'taskId',$10::uuid,'source','google-drive')
+      jsonb_build_object('fileId',$4::uuid,'mediaType',$8::text,'objectKey',$9::text,'taskId',$10::uuid,'source','google-drive')
     )
     ON CONFLICT (tenant_id, workspace_id, source_type, source_id, source_revision)
     DO UPDATE SET tombstoned_at=NULL, failure_reason=NULL, extraction_status='pending',
@@ -1311,7 +1395,8 @@ async function enqueueConnectorKnowledgeExtraction(executor: SqlExecutor, input:
   await executor.execute(`
     INSERT INTO runtime_outbox (tenant_id, event_type, aggregate_id, dedupe_key, payload)
     VALUES ($1::uuid, 'knowledge.extract', $2, $3, $4::jsonb)
-    ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+    ON CONFLICT (tenant_id, dedupe_key) DO UPDATE SET
+      completed_at = NULL, available_at = now(), last_error = NULL, updated_at = now()
   `, [input.tenantId, source.id, `knowledge.extract:${source.id}:${input.revision}`, JSON.stringify({ tenantId: input.tenantId, sourceId: source.id, revision: input.revision })]);
 }
 

@@ -10,7 +10,7 @@ export type SandboxProviderKind = z.infer<typeof SandboxProviderKindSchema>;
 
 export const SandboxResourceLimitsSchema = z.object({
   cpuCount: z.number().positive().max(128).default(1),
-  memoryMiB: z.number().int().positive().max(1_048_576).default(2048),
+  memoryMiB: z.number().int().positive().max(1_048_576).default(1024),
   storageMiB: z.number().int().positive().max(10_485_760).default(10_240),
   gpuModel: z.string().trim().min(1).optional(),
   gpuCount: z.number().int().positive().optional(),

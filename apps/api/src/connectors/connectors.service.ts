@@ -1030,7 +1030,7 @@ function googleToolText(result: unknown): string {
           size: item.size,
           status: item.status,
           reused: item.reused,
-          library: true,
+          library: item.library === true,
         },
       });
     }

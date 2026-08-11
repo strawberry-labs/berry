@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { durableMcpToolPolicy, sanitizeMcpJournalValue } from "./mcp-tools.js";
+import { connectorArtifactText, durableMcpToolPolicy, sanitizeMcpJournalValue } from "./mcp-tools.js";
 
 describe("durable MCP journal serialization", () => {
   it("redacts binary content from both parts and raw result details", () => {
@@ -78,5 +78,30 @@ describe("durable MCP approval policy", () => {
     );
 
     expect(policy).toMatchObject({ requiresApproval: false });
+  });
+});
+
+describe("connector artifact staging", () => {
+  it("labels sandbox-first Drive downloads as temporary", () => {
+    const text = connectorArtifactText(
+      { fileId: "file-1", name: "brief.pdf", mediaType: "application/pdf", library: false },
+      { name: "brief.pdf", mediaType: "application/pdf", path: "/workspace/inputs/file-1/brief.pdf" },
+    );
+
+    expect(text).toContain("Downloaded brief.pdf for temporary use in this task.");
+    expect(text).toContain("Sandbox path: /workspace/inputs/file-1/brief.pdf");
+    expect(text).toContain("not added to the Berry Library or project knowledge");
+    expect(text).toContain("Use read_file on the sandbox path");
+    expect(text).not.toContain("Searchable extraction is queued");
+  });
+
+  it("labels intentionally persisted Drive downloads as Library files", () => {
+    const text = connectorArtifactText(
+      { fileId: "file-1", name: "brief.pdf", mediaType: "application/pdf", library: true },
+      { name: "brief.pdf", mediaType: "application/pdf", path: "/workspace/inputs/file-1/brief.pdf" },
+    );
+
+    expect(text).toContain("Saved brief.pdf to the Berry Library.");
+    expect(text).toContain("searchable extraction is queued through Tika");
   });
 });
