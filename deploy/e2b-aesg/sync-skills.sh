@@ -16,10 +16,43 @@ compose() {
   docker compose --env-file "$env_file" -f "$repo_dir/deploy/compose.yaml" "$@"
 }
 
+database_url=""
+if ! compose ps --services --status running 2>/dev/null | grep -qx postgres; then
+  database_url="$(awk -F= '/^(DATABASE_URL|BERRY_DATABASE_URL|BERRY_POSTGRES_URL)=/ { sub(/^[^=]*=/, ""); print; exit }' "$env_file")"
+  case "$database_url" in
+    \"*\") database_url="${database_url#\"}"; database_url="${database_url%\"}" ;;
+    \'*\') database_url="${database_url#\'}"; database_url="${database_url%\'}" ;;
+  esac
+  if [ -z "$database_url" ]; then
+    echo "Production database URL is not configured" >&2
+    exit 1
+  fi
+  command -v psql >/dev/null 2>&1 || { echo "psql is required for managed database sync" >&2; exit 1; }
+  command -v pg_dump >/dev/null 2>&1 || { echo "pg_dump is required for managed database backup" >&2; exit 1; }
+fi
+
+database_psql() {
+  if [ -n "$database_url" ]; then
+    psql "$database_url" "$@"
+  else
+    compose exec -T postgres psql -U berry -d berry "$@"
+  fi
+}
+
+database_dump() {
+  if [ -n "$database_url" ]; then
+    pg_dump "$database_url" "$@"
+  else
+    compose exec -T postgres pg_dump -U berry -d berry "$@"
+  fi
+}
+
 mkdir -p "$backup_dir"
 backup_file="$backup_dir/organization-capabilities-$(date -u +%Y%m%dT%H%M%SZ).sql"
-compose exec -T postgres pg_dump -U berry -d berry \
+umask 077
+database_dump \
   --data-only --table=organization_capabilities > "$backup_file"
+chmod 0600 "$backup_file"
 
 sync_skill() {
   capability_id="$1"
@@ -32,7 +65,7 @@ sync_skill() {
   fi
   content_hash="$(sha256sum "$skill_file" | awk '{print $1}')"
   content_b64="$(base64 -w 0 "$skill_file")"
-  compose exec -T postgres psql -v ON_ERROR_STOP=1 -U berry -d berry \
+  database_psql -v ON_ERROR_STOP=1 \
     -v tenant_id="$tenant_id" \
     -v capability_id="$capability_id" \
     -v display_name="$display_name" \
@@ -89,13 +122,13 @@ sync_skill "xlsx" "AESG Excel workbooks" "Branded multi-sheet AESG workbooks wit
 sync_skill "pptx" "AESG PowerPoint presentations" "AESG General Template presentations using approved masters, semantic layouts, and imagery"
 sync_skill "skill-creator" "Skill Creator" "Create or update Berry skills and install them directly into each member's personal Skills library"
 
-compose exec -T postgres psql -v ON_ERROR_STOP=1 -U berry -d berry -v tenant_id="$tenant_id" <<'SQL'
+database_psql -v ON_ERROR_STOP=1 -v tenant_id="$tenant_id" <<'SQL'
 UPDATE organization_capability_settings
 SET allow_personal_skills = true, updated_at = now()
 WHERE tenant_id = :'tenant_id'::uuid;
 SQL
 
-compose exec -T postgres psql -U berry -d berry -Atc \
+database_psql -Atc \
   "SELECT capability_id || '|' || name || '|' || assignment || '|' || content_hash FROM organization_capabilities WHERE tenant_id='$tenant_id'::uuid AND kind='skill' ORDER BY capability_id;"
 
 echo "Organization skills synced. Backup: $backup_file"
