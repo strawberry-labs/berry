@@ -89,6 +89,12 @@ sync_skill "xlsx" "AESG Excel workbooks" "Branded multi-sheet AESG workbooks wit
 sync_skill "pptx" "AESG PowerPoint presentations" "AESG General Template presentations using approved masters, semantic layouts, and imagery"
 sync_skill "skill-creator" "Skill Creator" "Create or update Berry skills and install them directly into each member's personal Skills library"
 
+compose exec -T postgres psql -v ON_ERROR_STOP=1 -U berry -d berry -v tenant_id="$tenant_id" <<'SQL'
+UPDATE organization_capability_settings
+SET allow_personal_skills = true, updated_at = now()
+WHERE tenant_id = :'tenant_id'::uuid;
+SQL
+
 compose exec -T postgres psql -U berry -d berry -Atc \
   "SELECT capability_id || '|' || name || '|' || assignment || '|' || content_hash FROM organization_capabilities WHERE tenant_id='$tenant_id'::uuid AND kind='skill' ORDER BY capability_id;"
 
