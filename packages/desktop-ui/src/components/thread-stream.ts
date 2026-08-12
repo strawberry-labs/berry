@@ -1,5 +1,5 @@
 import type { AgentStreamEvent, ApprovalKind, ImageAspectRatio, MessageDraft, QuestionOption, SessionNoteKind } from "@berry/shared";
-import type { ActivityTool } from "@berry/desktop-ui/components/thread-activity";
+import type { ActivityTool, ToolStatus } from "@berry/desktop-ui/components/thread-activity";
 
 /* ------------------------------------------------------------------------ */
 /* Pure live-stream state: the reducer that folds AgentStreamEvents into the */
@@ -12,7 +12,7 @@ export interface ToolEntry {
   toolCallId: string;
   name: string;
   title?: string | undefined;
-  status: "running" | "completed" | "failed" | "denied";
+  status: ToolStatus;
   summary?: string | undefined;
   output?: string | undefined;
   args?: Record<string, unknown> | null | undefined;
@@ -50,6 +50,42 @@ export interface TextEntry {
 }
 
 export type TimelineEntry = ToolEntry | NoteEntry | ThoughtEntry | TextEntry;
+
+export type TerminalToolStatus = Exclude<ToolStatus, "running">;
+
+export function toolTerminalStatus(
+  status: "completed" | "complete" | "failed" | "cancelled",
+): TerminalToolStatus {
+  if (status === "cancelled") return "cancelled";
+  return status === "failed" ? "failed" : "completed";
+}
+
+export function settleRunningActivityTool(
+  tool: ActivityTool,
+  status: TerminalToolStatus,
+): ActivityTool {
+  const children = tool.children?.map((child) => settleRunningActivityTool(child, status));
+  const childrenUnchanged = !children || children.every((child, index) => child === tool.children?.[index]);
+  if (tool.status !== "running" && childrenUnchanged) {
+    return tool;
+  }
+  return {
+    ...tool,
+    status: tool.status === "running" ? status : tool.status,
+    ...(children ? { children } : {}),
+  };
+}
+
+export function settleRunningActivityTools(
+  tools: readonly ActivityTool[],
+  status: TerminalToolStatus,
+): ActivityTool[] {
+  return tools.map((tool) => settleRunningActivityTool(tool, status));
+}
+
+function settleRunningTimelineTool(tool: ToolEntry, status: TerminalToolStatus): ToolEntry {
+  return settleRunningActivityTool(tool, status) as ToolEntry;
+}
 
 export const MAX_RENDERED_LIVE_TIMELINE_ENTRIES = 160;
 export const MAX_RETAINED_LIVE_TIMELINE_ENTRIES = 320;
@@ -404,9 +440,10 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
       // Failed and cancelled compactions do not emit a completed note. Clear
       // the transient marker when the turn terminates so replay cannot leave a
       // permanent "Context auto-compacting" spinner behind.
-      const timeline = state.timeline.filter(
-        (entry) => entry.kind !== "note" || entry.note !== "compacting",
-      );
+      const terminalStatus = toolTerminalStatus(event.status);
+      const timeline = state.timeline
+        .filter((entry) => entry.kind !== "note" || entry.note !== "compacting")
+        .map((entry) => entry.kind === "tool" ? settleRunningTimelineTool(entry, terminalStatus) : entry);
       return {
         ...state,
         ...boundedTimeline(state, timeline),

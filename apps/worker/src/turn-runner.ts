@@ -19,6 +19,7 @@ import {
 import {
   AgentStreamEventSchema,
   DURABLE_BASE_BUILT_IN_TOOLS,
+  DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
   DurableTurnRuntimeRequestSchema,
   openDurableSecret,
   latestAssistantStreamDraft,
@@ -188,7 +189,7 @@ export interface DurableTurnMutation {
     toolCallId: string;
     name: string;
     input: JsonValue;
-    status: "completed" | "failed" | "denied";
+    status: "completed" | "failed" | "denied" | "cancelled";
     output?: JsonValue;
     summary?: string;
     durationMs?: number;
@@ -198,7 +199,7 @@ export interface DurableTurnMutation {
     toolCallId: string;
     name: string;
     input: JsonValue;
-    status: "completed" | "failed" | "denied";
+    status: "completed" | "failed" | "denied" | "cancelled";
     output?: JsonValue;
     summary?: string;
     durationMs?: number;
@@ -1454,13 +1455,32 @@ export class DurableTurnRunner {
   }
 
   private async cancel(snapshot: DurableTurnSnapshot): Promise<void> {
+    const unfinishedSteps = snapshot.steps.filter(isUnfinishedStep);
+    const unfinishedTools = unfinishedSteps.filter(isToolStep);
+    const summary = "Interrupted by the user.";
     await this.repository.commit(snapshot, {
       expectedState: snapshot.state,
       nextState: "cancelled",
-      steps: snapshot.steps
-        .filter((step) => step.state === "pending" || step.state === "running" || step.state === "waiting")
-        .map((step) => ({ ...step, state: "cancelled" as const })),
-      events: [{ kind: "turn.end", turnId: snapshot.id, status: "cancelled" }],
+      steps: unfinishedSteps.map((step) => ({ ...step, state: "cancelled" as const })),
+      events: [
+        ...unfinishedTools.map((step) => ({
+          kind: "tool.end" as const,
+          toolCallId: toolCallIdForStep(step),
+          // Keep the streaming vocabulary compatible with already-open web
+          // clients. The following turn.end carries the cancelled state.
+          status: "failed" as const,
+          summary,
+        })),
+        { kind: "turn.end", turnId: snapshot.id, status: "cancelled" },
+      ],
+      toolResultMessages: unfinishedTools.map((step) => ({
+        id: randomUUID(),
+        toolCallId: toolCallIdForStep(step),
+        name: toolNameForStep(step),
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "cancelled" as const,
+        summary,
+      })),
       terminalAssistant: { status: "cancelled" },
       nextAction: null,
       waitingReason: null,
@@ -1480,45 +1500,40 @@ export class DurableTurnRunner {
   }
 
   private async fail(snapshot: DurableTurnSnapshot, message: string): Promise<void> {
-    const activeStep = snapshot.state === "calling_model"
-      ? latestStep(snapshot.steps, "model.call")
-      : snapshot.state === "executing_tool"
-        ? snapshot.steps.find((step) => step.type.startsWith("tool.") && step.state !== "completed")
-        : undefined;
+    const unfinishedSteps = snapshot.steps.filter(isUnfinishedStep);
+    const unfinishedTools = unfinishedSteps.filter(isToolStep);
+    const error = message.slice(0, 4_000);
+    const summary = message.slice(0, 2_000);
     await this.repository.commit(snapshot, {
       expectedState: snapshot.state,
       nextState: "failed",
-      ...(activeStep ? {
-        steps: [{
-          ...activeStep,
-          state: "failed",
-          error: message.slice(0, 4_000),
-        }],
-      } : {}),
+      steps: unfinishedSteps.map((step) => ({
+        ...step,
+        state: "failed",
+        error,
+      })),
       events: [
-        ...(activeStep?.type.startsWith("tool.") ? [{
+        ...unfinishedTools.map((step) => ({
           kind: "tool.end" as const,
-          toolCallId: stringValue(activeStep.input.toolCallId) ?? activeStep.id,
+          toolCallId: toolCallIdForStep(step),
           status: "failed" as const,
-          summary: message.slice(0, 2_000),
-        }] : []),
-        { kind: "error", message: message.slice(0, 4_000) },
+          summary,
+        })),
+        { kind: "error", message: error },
         { kind: "turn.end", turnId: snapshot.id, status: "failed" },
       ],
-      terminalAssistant: { status: "failed", error: message.slice(0, 4_000) },
-      ...(activeStep?.type.startsWith("tool.") ? {
-        toolResultMessage: {
-          id: randomUUID(),
-          toolCallId: stringValue(activeStep.input.toolCallId) ?? activeStep.id,
-          name: stringValue(activeStep.input.toolName) ?? activeStep.type.slice(5),
-          input: (activeStep.input.arguments ?? {}) as JsonValue,
-          status: "failed" as const,
-          summary: message.slice(0, 2_000),
-        },
-      } : {}),
+      terminalAssistant: { status: "failed", error },
+      toolResultMessages: unfinishedTools.map((step) => ({
+        id: randomUUID(),
+        toolCallId: toolCallIdForStep(step),
+        name: toolNameForStep(step),
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "failed" as const,
+        summary,
+      })),
       nextAction: null,
       waitingReason: null,
-      error: message.slice(0, 4_000),
+      error,
       taskStatus: "failed",
       ...(snapshot.sandboxId ? {
         outbox: [{
@@ -3198,9 +3213,25 @@ function hasAmbiguousNonIdempotentTool(snapshot: DurableTurnSnapshot): boolean {
   return snapshot.state === "executing_tool"
     && snapshot.steps.some((step) =>
       step.type.startsWith("tool.")
-      && step.state !== "completed"
+      && step.state === "running"
       && step.retryClass === "non_idempotent_manual"
     );
+}
+
+function isUnfinishedStep(step: DurableTurnStep): boolean {
+  return step.state === "pending" || step.state === "running" || step.state === "waiting";
+}
+
+function isToolStep(step: DurableTurnStep): boolean {
+  return step.type.startsWith("tool.");
+}
+
+function toolCallIdForStep(step: DurableTurnStep): string {
+  return stringValue(step.input.toolCallId) ?? step.id;
+}
+
+function toolNameForStep(step: DurableTurnStep): string {
+  return stringValue(step.input.toolName) ?? step.type.slice(5);
 }
 
 function isRunnableToolStep(step: DurableTurnStep): boolean {
@@ -3369,7 +3400,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "The runtime environment below gives the exact workspace root for this turn. Use that exact root. If a skill or example says /workspace, treat it as a placeholder for the runtime root; never assume /workspace exists.",
   "Sandbox persistence is selective. Inputs are already durable and the workspace inputs directory must not be copied. Put disposable clones, package caches, extracted intermediates, and build trees under system /tmp, outside the runtime workspace. Keep only user-authored working files in the workspace and final deliverables in its outputs directory.",
   "run_command uses Bash. Check for an installed command before downloading or compiling a replacement, and keep large dependency trees in system /tmp.",
-  "Keep each tool argument manageable. When file content could exceed roughly 12,000 characters, write a first chunk and append one manageable chunk per later tool turn with append_file and the preceding sizeBytes. Do not retry the same truncated payload.",
+  `Treat every file-tool call as stateless. Keep each content argument at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters and repeat the exact non-empty absolute path on every read_file, list_files, write_file, append_file, and edit_file call; a prior path is never carried forward. Every append_file call must include all three fields: path, one bounded content chunk, and expected_size_bytes copied exactly from the preceding write_file or append_file sizeBytes result. Do not retry the same truncated payload.`,
   "When creating a personal skill, build a complete package directory containing SKILL.md plus any reusable scripts, references, assets, or templates, then call save_personal_skill once with the directory path. Copy reusable task attachments into stable package paths; never hardcode task-scoped /inputs/<file-id> paths. Instructions-only skills may use content directly.",
   "Read a tool error before retrying and correct its path, schema, or strategy. Do not repeat an identical failed call more than once.",
   "For ordinary requests about current web information, make one or two targeted search calls, open or scrape only the most relevant primary page when more detail is necessary, and answer briefly with source links. Do not activate deep-research for routine questions. Activate it only when the user explicitly asks for deep, extensive, comprehensive, or exhaustive research or invokes $deep-research. Never claim browsing is unavailable when a relevant tool is declared.",
@@ -3408,6 +3439,24 @@ export function durableVisionToolSelectionPrompt(toolNames: readonly string[]): 
   return toolNames.includes("inspect_images") ? DURABLE_VISION_TOOL_SELECTION_PROMPT : "";
 }
 
+export const DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT = [
+  "DeepSeek V4 Flash file-tool compatibility guard:",
+  `keep write_file and append_file content at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters,`,
+  "and treat every file call as stateless by including the exact non-empty absolute path again.",
+  'For append_file, always send all three fields, for example: {"path":"/home/user/workspace/output/report.html","content":"next chunk","expected_size_bytes":8421}.',
+  "Replace 8421 with the exact sizeBytes from the preceding write_file or append_file result; a prior path or size is never carried forward implicitly.",
+].join(" ");
+
+export function durableProviderCompatibilityPrompt(
+  model: string | null | undefined,
+  toolNames: readonly string[],
+): string {
+  if (!model || !/deepseek.*v4[-_.]?flash/i.test(model)) return "";
+  return toolNames.some((name) => ["read_file", "list_files", "write_file", "append_file", "edit_file"].includes(name))
+    ? DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT
+    : "";
+}
+
 function modelMessages(
   snapshot: DurableTurnSnapshot,
   additionalUserContent: readonly ChatContentPart[] = [],
@@ -3431,6 +3480,10 @@ function modelMessages(
       : "",
     durableImageToolSelectionPrompt(runtime?.builtInTools ?? []),
     durableVisionToolSelectionPrompt(runtime?.builtInTools ?? []),
+    durableProviderCompatibilityPrompt(
+      runtime?.model ?? runtime?.provider.defaultModel,
+      runtime?.builtInTools ?? [],
+    ),
     snapshot.runtimeRequest.continueInterruptedTurn === true
       ? "This is an explicit continuation request. Continue the interrupted assistant response from the persisted partial output without repeating completed content."
       : "",
@@ -3789,7 +3842,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
         type: "object",
         additionalProperties: false,
         required: ["path"],
-        properties: { path: { type: "string", description: "Absolute path under the runtime workspace root or /managed-skills" } },
+        properties: { path: { type: "string", minLength: 1, description: "Required on every call: the absolute path under the runtime workspace root or /managed-skills" } },
       },
     },
   },
@@ -3803,7 +3856,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
         additionalProperties: false,
         required: ["path"],
         properties: {
-          path: { type: "string", description: "Absolute path under the runtime workspace root or /managed-skills" },
+          path: { type: "string", minLength: 1, description: "Required on every call: the absolute path under the runtime workspace root or /managed-skills" },
           recursive: { type: "boolean" },
         },
       },
@@ -3813,14 +3866,14 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "write_file",
-      description: "Create or replace a UTF-8 file under the exact runtime workspace root shown in the system prompt. For large content, write only the first manageable chunk, then use append_file in later tool turns.",
+      description: `Create or replace a UTF-8 file under the exact runtime workspace root shown in the system prompt. Always include path. Keep content at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters; for larger files, write the first chunk and use append_file in later tool turns.`,
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path", "content"],
         properties: {
-          path: { type: "string", description: "Absolute path under the runtime workspace root" },
-          content: { type: "string", description: "Complete content, or the first chunk when append_file will continue it" },
+          path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute path under the runtime workspace root" },
+          content: { type: "string", maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS, description: "Complete content, or the first bounded chunk when append_file will continue it" },
         },
       },
     },
@@ -3829,14 +3882,14 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "append_file",
-      description: "Append one manageable UTF-8 chunk to an existing workspace file. Use separate tool turns for large files so a single tool argument is not truncated. Pass the exact sizeBytes returned by the previous write_file or append_file call.",
+      description: `Append one UTF-8 chunk of at most ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters to an existing workspace file. Treat every call as stateless and send all three required fields: the exact non-empty path, one bounded content chunk, and expected_size_bytes copied from the previous write_file or append_file sizeBytes result.`,
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path", "content", "expected_size_bytes"],
         properties: {
-          path: { type: "string", description: "Absolute path under the runtime workspace root" },
-          content: { type: "string", description: "The next UTF-8 text chunk to append" },
+          path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute path under the runtime workspace root" },
+          content: { type: "string", minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS, description: "The next bounded UTF-8 text chunk to append" },
           expected_size_bytes: { type: "integer", minimum: 0, description: "Exact sizeBytes from the preceding write or append result" },
         },
       },
@@ -3852,7 +3905,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
         additionalProperties: false,
         required: ["path", "old_string", "new_string"],
         properties: {
-          path: { type: "string" },
+          path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute workspace path" },
           old_string: { type: "string" },
           new_string: { type: "string" },
           replace_all: { type: "boolean" },

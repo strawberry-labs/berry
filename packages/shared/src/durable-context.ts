@@ -529,6 +529,12 @@ export const DurableBuiltInToolNameSchema = z.enum([
 ]);
 export type DurableBuiltInToolName = z.infer<typeof DurableBuiltInToolNameSchema>;
 
+/**
+ * Keeps JSON tool calls comfortably below the argument sizes where several
+ * OpenAI-compatible providers start dropping sibling fields such as `path`.
+ */
+export const DURABLE_FILE_TOOL_MAX_CONTENT_CHARS = 6_000;
+
 export const DURABLE_BASE_BUILT_IN_TOOLS: readonly DurableBuiltInToolName[] = [
   "ask_user_question",
   "compose_message",

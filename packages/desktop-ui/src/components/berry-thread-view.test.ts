@@ -3,6 +3,7 @@ import type { Message } from "@berry/shared";
 import {
   collectMessageDraftParts,
   isContinuableAssistantTurn,
+  latestTerminalMessageStatus,
   latestArtifactToolCallIds,
   partitionAssistantParts,
 } from "./berry-thread-view";
@@ -50,6 +51,80 @@ describe("failed assistant turn recovery", () => {
       assistant("failed", "assistant_failure"),
       assistant("complete", "assistant_recovered"),
     ])).toBe(false);
+  });
+});
+
+describe("terminal tool projection", () => {
+  it("does not settle a streaming continuation from an older terminal message", () => {
+    expect(latestTerminalMessageStatus([
+      assistant("complete", "assistant_previous"),
+      assistant("streaming", "assistant_active"),
+    ])).toBeUndefined();
+    expect(latestTerminalMessageStatus([
+      assistant("streaming", "assistant_previous"),
+      assistant("failed", "assistant_terminal"),
+    ])).toBe("failed");
+  });
+
+  it.each([
+    ["failed", "failed"],
+    ["cancelled", "cancelled"],
+    ["complete", "completed"],
+  ] as const)("settles unmatched historical tool calls for a %s turn", (messageStatus, toolStatus) => {
+    const call = assistant("complete", `assistant_${messageStatus}_call`);
+    call.parts = [{
+      ...call.parts[0]!,
+      kind: "tool-call",
+      content: {
+        toolCallId: `tool_${messageStatus}`,
+        name: "task",
+        status: "running",
+        arguments: { description: "Inspect files" },
+        children: [{
+          toolCallId: `child_${messageStatus}`,
+          name: "read_file",
+          status: "running",
+          args: { path: "/workspace/input.txt" },
+        }],
+      },
+    }];
+
+    const projected = partitionAssistantParts(call.parts, new Map(), undefined, messageStatus);
+    expect(projected.segments).toEqual([
+      expect.objectContaining({
+        kind: "tools",
+        tools: [expect.objectContaining({
+          toolCallId: `tool_${messageStatus}`,
+          status: toolStatus,
+          children: [expect.objectContaining({
+            toolCallId: `child_${messageStatus}`,
+            status: toolStatus,
+          })],
+        })],
+      }),
+    ]);
+  });
+
+  it("keeps an explicit tool result status instead of overriding it from the turn", () => {
+    const call = assistant("complete", "assistant_explicit_failure");
+    call.parts = [{
+      ...call.parts[0]!,
+      kind: "tool-result",
+      content: {
+        toolCallId: "tool_explicit_failure",
+        name: "append_file",
+        status: "failed",
+        summary: "append_file requires a non-empty path",
+      },
+    }];
+
+    const projected = partitionAssistantParts(call.parts, new Map(), undefined, "cancelled");
+    expect(projected.segments).toEqual([
+      expect.objectContaining({
+        kind: "tools",
+        tools: [expect.objectContaining({ status: "failed" })],
+      }),
+    ]);
   });
 });
 

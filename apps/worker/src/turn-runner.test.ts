@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DURABLE_BASE_BUILT_IN_TOOLS, latestAssistantStreamDraft, type AgentStreamEvent, type TurnRunState } from "@berry/shared";
+import {
+  DURABLE_BASE_BUILT_IN_TOOLS,
+  DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
+  latestAssistantStreamDraft,
+  type AgentStreamEvent,
+  type TurnRunState,
+} from "@berry/shared";
 import {
   OpenAIChatCompletionsClient,
   RouterClientError,
@@ -10,6 +16,7 @@ import {
 import {
   DurableTurnRunner,
   DurableTurnRetryableError,
+  DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT,
   DURABLE_IMAGE_TOOL_SELECTION_PROMPT,
   DURABLE_TOOL_DEFINITIONS,
   RouterDurableTurnModel,
@@ -17,6 +24,7 @@ import {
   SqlDurableTurnRepository,
   createDurableTurnModel,
   durableImageToolSelectionPrompt,
+  durableProviderCompatibilityPrompt,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -45,6 +53,33 @@ describe("durable turn runner", () => {
     expect(DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "create_image")?.function.description)
       .toContain("already published");
     expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
+  });
+
+  it("advertises bounded, explicit file arguments and a DeepSeek compatibility guard", () => {
+    const write = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "write_file");
+    const append = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "append_file");
+
+    expect(write?.function.parameters).toMatchObject({
+      required: ["path", "content"],
+      properties: {
+        path: { minLength: 1 },
+        content: { maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+      },
+    });
+    expect(append?.function.parameters).toMatchObject({
+      required: ["path", "content", "expected_size_bytes"],
+      properties: {
+        path: { minLength: 1 },
+        content: { minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+      },
+    });
+    expect(durableProviderCompatibilityPrompt(
+      "canopywave/deepseek/deepseek-v4-flash",
+      DURABLE_BASE_BUILT_IN_TOOLS,
+    )).toBe(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT);
+    expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain("always send all three fields");
+    expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain('"expected_size_bytes":8421');
+    expect(durableProviderCompatibilityPrompt("kimi-2.6", DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
   });
 
   it("starts in live mode without a global router for snapshot-admitted providers", () => {
@@ -635,6 +670,34 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("settles every unfinished tool projection when cancellation is observed", async () => {
+    const first = { ...toolStep("pending", "idempotent", false), sequence: 1 };
+    const second = { ...toolStep("waiting", "idempotent", false), sequence: 2 };
+    const current = snapshot("executing_tool", [admittedStep(), first, second]);
+    current.cancelledAt = new Date().toISOString();
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, unusedModel(), noTools());
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "cancelled" });
+
+    expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")))
+      .toEqual([
+        expect.objectContaining({ id: first.id, state: "cancelled" }),
+        expect.objectContaining({ id: second.id, state: "cancelled" }),
+      ]);
+    const terminalMutation = repository.mutations.at(-1)!;
+    expect(terminalMutation.toolResultMessages).toEqual([
+      expect.objectContaining({ toolCallId: first.input.toolCallId, status: "cancelled" }),
+      expect.objectContaining({ toolCallId: second.input.toolCallId, status: "cancelled" }),
+    ]);
+    expect(terminalMutation.events).toEqual([
+      expect.objectContaining({ kind: "tool.end", toolCallId: first.input.toolCallId, status: "failed" }),
+      expect.objectContaining({ kind: "tool.end", toolCallId: second.input.toolCallId, status: "failed" }),
+      expect.objectContaining({ kind: "turn.end", status: "cancelled" }),
+    ]);
+  });
+
   it("releases the lease while waiting for approval and resumes after a durable wakeup", async () => {
     const tool = toolStep("pending", "idempotent", true);
     const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
@@ -979,8 +1042,20 @@ describe("durable turn runner", () => {
       error: "Arguments must include content; raw is not supported",
     };
     const pending = { ...toolStep("pending", "idempotent", false), sequence: 3 };
+    const laterPendingToolCallId = randomUUID();
+    const laterPending = {
+      ...toolStep("pending", "idempotent", false),
+      sequence: 4,
+      input: {
+        toolCallId: laterPendingToolCallId,
+        toolName: "append_file",
+        arguments: { path: "/workspace/result.txt", content: "next", expected_size_bytes: 4 },
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    };
     let executions = 0;
-    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second, pending]));
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second, pending, laterPending]));
     const runner = new DurableTurnRunner(repository, unusedModel(), {
       execute: async () => {
         executions += 1;
@@ -992,6 +1067,17 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
     expect(executions).toBe(0);
     expect(repository.current.error).toContain("failed twice with the same argument shape");
+    expect(repository.current.steps.find((step) => step.id === pending.id)?.state).toBe("failed");
+    expect(repository.current.steps.find((step) => step.id === laterPending.id)?.state).toBe("failed");
+    const terminalMutation = repository.mutations.at(-1)!;
+    expect(terminalMutation.toolResultMessages?.map((result) => result.toolCallId)).toEqual([
+      pending.input.toolCallId,
+      laterPendingToolCallId,
+    ]);
+    expect(terminalMutation.events?.filter((event) => event.kind === "tool.end")).toEqual([
+      expect.objectContaining({ toolCallId: pending.input.toolCallId, status: "failed" }),
+      expect.objectContaining({ toolCallId: laterPendingToolCallId, status: "failed" }),
+    ]);
   });
 
   it("stops a turn that exceeds the total model iteration limit", async () => {
@@ -1643,6 +1729,36 @@ describe("durable turn runner", () => {
         minimumTokens: 1_024,
       }),
     });
+    repository.current.runtimeRequest = {
+      capabilityVersion: 1,
+      input: "Do the task",
+      providerId: "router",
+      provider: {
+        id: "router",
+        name: "Berry Router",
+        kind: "berry-router",
+        baseUrl: "https://router.example.test/v1",
+        defaultModel: "canopywave/deepseek/deepseek-v4-flash",
+        apiType: "openai-chat-completions",
+        endpointPath: "/chat/completions",
+        authType: "none",
+        models: [],
+      },
+      model: "canopywave/deepseek/deepseek-v4-flash",
+      conversationKind: "chat",
+      workspacePath: "/workspace",
+      workspaceId: repository.current.workspaceId,
+      permissionMode: "ask",
+      reasoning: "off",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      modelAcceptsImages: false,
+      modelPricing: {},
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS],
+      mcpServers: [],
+      extraSkills: [],
+      attachments: [],
+    };
     await model.call(repository.current, modelStep("pending", 3), {
       messageId: randomUUID(),
       tools: [],
@@ -1658,6 +1774,8 @@ describe("durable turn runner", () => {
         reasoningContent: "I need the file contents before answering.",
         toolCalls: [{ id: toolCallId }],
       });
+    expect(replayedRequest?.messages.find((message) => message.role === "system")?.content)
+      .toContain(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT);
   });
 
   it("casts persisted tool statuses to the PostgreSQL enum", async () => {

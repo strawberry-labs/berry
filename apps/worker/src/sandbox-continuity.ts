@@ -16,7 +16,11 @@ import {
   type SandboxProvider,
 } from "@berry/sandbox-contract";
 import type { ChatContentPart, ImageGenerationResult } from "@berry/router-client";
-import { DEFAULT_SANDBOX_INPUT_MAX_BYTES, type JsonValue } from "@berry/shared";
+import {
+  DEFAULT_SANDBOX_INPUT_MAX_BYTES,
+  DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
+  type JsonValue,
+} from "@berry/shared";
 import { parsePatch, type PatchHunk } from "@berry/local-agent";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
@@ -333,10 +337,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper. For large text, write a small first chunk and continue with append_file in separate tool turns.`,
       );
     }
+    validateFileToolArguments(toolName, args);
     const sandbox = await this.ensureSandbox(snapshot);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (toolName === "read_file") {
-      const path = safeReadablePath(stringValue(args.path) ?? "", workspaceRoot);
+      const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const mediaType = binaryMediaType(path);
       if (mediaType === "application/pdf") {
         const content = await extractPdfText(this.provider, sandbox.id, path, step, workspaceRoot);
@@ -374,7 +379,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "list_files") {
-      const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
+      const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const result = await this.provider.files.list({
         sandbox_id: sandbox.id,
         path,
@@ -395,8 +400,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "write_file") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "", workspaceRoot);
-      const content = stringValue(args.content, true) ?? "";
+      const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
+      const content = requiredToolString(args, "content", toolName, true);
       const result = await this.provider.files.write({
         sandbox_id: sandbox.id,
         path,
@@ -410,8 +415,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "append_file") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "", workspaceRoot);
-      const content = stringValue(args.content, true) ?? "";
+      const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
+      const content = requiredToolString(args, "content", toolName);
       const expectedSizeBytes = numberValue(args.expected_size_bytes);
       if (expectedSizeBytes === null || !Number.isInteger(expectedSizeBytes) || expectedSizeBytes < 0) {
         throw new Error("append_file requires a non-negative integer expected_size_bytes from the previous write result");
@@ -443,10 +448,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       };
     }
     if (toolName === "edit_file") {
-      const path = safeWorkspacePath(stringValue(args.path) ?? "", workspaceRoot);
-      const oldString = stringValue(args.old_string, true);
-      const newString = stringValue(args.new_string, true) ?? "";
-      if (oldString === null || oldString.length === 0) throw new Error("edit_file requires a non-empty old_string");
+      const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
+      const oldString = requiredToolString(args, "old_string", toolName);
+      const newString = requiredToolString(args, "new_string", toolName, true);
       const existing = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
       const occurrences = existing.content.split(oldString).length - 1;
       if (occurrences === 0) throw new Error(`old_string was not found in ${path}`);
@@ -1844,6 +1848,67 @@ function safeWorkspaceRoot(value: string): string {
     throw new Error("Sandbox workspace root must be an absolute path without traversal segments");
   }
   return `/${parts.join("/")}`;
+}
+
+function validateFileToolArguments(toolName: string, args: Record<string, unknown>): void {
+  if (toolName === "read_file" || toolName === "list_files") {
+    requiredToolPath(args, toolName);
+    return;
+  }
+  if (toolName === "write_file") {
+    requiredToolPath(args, toolName);
+    boundedFileToolContent(requiredToolString(args, "content", toolName, true), toolName);
+    return;
+  }
+  if (toolName === "append_file") {
+    requiredToolPath(args, toolName);
+    boundedFileToolContent(requiredToolString(args, "content", toolName), toolName);
+    const expectedSizeBytes = numberValue(args.expected_size_bytes);
+    if (expectedSizeBytes === null || !Number.isInteger(expectedSizeBytes) || expectedSizeBytes < 0) {
+      throw new Error("append_file requires a non-negative integer expected_size_bytes from the previous write result");
+    }
+    return;
+  }
+  if (toolName === "edit_file") {
+    requiredToolPath(args, toolName);
+    requiredToolString(args, "old_string", toolName);
+    requiredToolString(args, "new_string", toolName, true);
+  }
+}
+
+function requiredToolPath(args: Record<string, unknown>, toolName: string): string {
+  const path = stringValue(args.path);
+  if (!path) {
+    throw new Error(
+      `${toolName} requires a non-empty path. Retry once with the declared schema fields and repeat the exact path on every file-tool call.`,
+    );
+  }
+  return path;
+}
+
+function requiredToolString(
+  args: Record<string, unknown>,
+  field: string,
+  toolName: string,
+  allowEmpty = false,
+): string {
+  const value = stringValue(args[field], allowEmpty);
+  if (value === null) {
+    throw new Error(`${toolName} requires ${allowEmpty ? "a string" : "a non-empty string"} ${field}`);
+  }
+  return value;
+}
+
+function boundedFileToolContent(content: string, toolName: string): void {
+  if (content.length <= DURABLE_FILE_TOOL_MAX_CONTENT_CHARS) return;
+  if (toolName === "write_file") {
+    throw new Error(
+      `write_file content is ${content.length} characters; retry write_file with the first ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters or fewer, then use its returned sizeBytes as expected_size_bytes for later append_file chunks while repeating the exact path.`,
+    );
+  }
+  throw new Error(
+    `${toolName} content is ${content.length} characters; retry append_file with one chunk at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters while repeating the exact path and the unchanged preceding sizeBytes.`,
+  );
 }
 
 function safeWorkspacePath(value: string, workspaceRoot = "/workspace"): string {

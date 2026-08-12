@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SandboxProvider } from "@berry/sandbox-contract";
+import { DURABLE_FILE_TOOL_MAX_CONTENT_CHARS } from "@berry/shared";
 import {
   S3SandboxSnapshotObjectStore,
   SandboxContinuityManager,
@@ -683,6 +684,66 @@ describe("SandboxContinuityManager", () => {
     }))).rejects.toThrow("arguments were incomplete or invalid JSON");
     expect(read).not.toHaveBeenCalled();
     expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["read_file", {}],
+    ["list_files", { path: "   " }],
+    ["write_file", { content: "x".repeat(5_500) }],
+    ["append_file", { content: "x".repeat(5_500), expected_size_bytes: 0 }],
+    ["edit_file", { old_string: "before", new_string: "after" }],
+  ])("rejects %s before a missing path can resolve to the workspace directory", async (toolName, args) => {
+    const read = vi.fn();
+    const write = vi.fn();
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep(toolName, args)))
+      .rejects.toThrow(`${toolName} requires a non-empty path`);
+    expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["write_file", "retry write_file with the first"],
+    ["append_file", "retry append_file with one chunk"],
+  ])("bounds %s content so providers can preserve sibling arguments", async (toolName, recoveryInstruction) => {
+    const read = vi.fn();
+    const write = vi.fn();
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+    const args = {
+      path: "/workspace/result.txt",
+      content: "x".repeat(DURABLE_FILE_TOOL_MAX_CONTENT_CHARS + 1),
+      ...(toolName === "append_file" ? { expected_size_bytes: 0 } : {}),
+    };
+
+    await expect(manager.execute(snapshot(), toolStep(toolName, args)))
+      .rejects.toThrow(recoveryInstruction);
+    expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("requires edit_file new_string while still permitting an intentional empty replacement", async () => {
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: "remove me",
+      size_bytes: 9,
+    }));
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep("edit_file", {
+      path: "/workspace/result.txt",
+      old_string: "remove me",
+    }))).rejects.toThrow("edit_file requires a string new_string");
+    await expect(manager.execute(snapshot(), toolStep("edit_file", {
+      path: "/workspace/result.txt",
+      old_string: "remove me",
+      new_string: "",
+    }))).resolves.toMatchObject({ output: { replacements: 1, sizeBytes: 0 } });
   });
 
   it("reads managed skill references without making the managed tree writable", async () => {

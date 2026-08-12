@@ -384,7 +384,7 @@ export function reconcileMessageDraftState(
 export function messageDraftFromToolResult(content: unknown): MessageDraft | null {
   if (!content || typeof content !== "object" || Array.isArray(content)) return null;
   const record = content as Record<string, unknown>;
-  if (record.name !== "compose_message" || record.status === "failed" || record.status === "denied") return null;
+  if (record.name !== "compose_message" || record.status === "failed" || record.status === "denied" || record.status === "cancelled") return null;
   const output = record.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) return null;
   const outputRecord = output as Record<string, unknown>;

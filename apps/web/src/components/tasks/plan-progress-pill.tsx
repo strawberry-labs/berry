@@ -15,7 +15,7 @@ export interface PlanProgress {
   status: PlanItemStatus;
 }
 
-type ToolStatus = ToolEntry["status"] | "pending" | "waiting-for-approval" | "cancelled";
+type ToolStatus = ToolEntry["status"] | "pending" | "waiting-for-approval";
 
 interface TodoToolSnapshot {
   args?: Record<string, unknown> | null | undefined;
@@ -38,7 +38,7 @@ function todoItemsFromArgs(args: Record<string, unknown> | null | undefined, too
         : "pending";
     // A todo write that fails while declaring an active step should surface as
     // a failed step instead of looking as though work is still progressing.
-    const status = (toolStatus === "failed" || toolStatus === "denied") && explicitStatus === "in_progress"
+    const status = (toolStatus === "failed" || toolStatus === "denied" || toolStatus === "cancelled") && explicitStatus === "in_progress"
       ? "failed"
       : explicitStatus;
     return [{ content: entry.content.trim(), status }];

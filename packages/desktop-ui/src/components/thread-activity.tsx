@@ -32,7 +32,7 @@ import {
 import { AnimatedCollapse } from "@berry/desktop-ui/components/animated-collapse";
 import { cn } from "@berry/desktop-ui/lib/utils";
 
-export type ToolStatus = "running" | "completed" | "failed" | "denied";
+export type ToolStatus = "running" | "completed" | "failed" | "denied" | "cancelled";
 
 export interface ActivityTool {
   toolCallId: string;
@@ -586,6 +586,7 @@ function ToolLayout({
 function failureLabel(status: ToolStatus): string | undefined {
   if (status === "failed") return "Failed";
   if (status === "denied") return "Denied";
+  if (status === "cancelled") return "Cancelled";
   return undefined;
 }
 
@@ -1216,7 +1217,9 @@ function ExploreGroup({ tools, active, latest = false }: { tools: ActivityTool[]
   // Exploration probes files that may not exist, so individual failed reads are
   // routine; only flag the group when nothing in it succeeded.
   const allProblem =
-    tools.length > 0 && tools.every((tool) => tool.status === "failed" || tool.status === "denied");
+    tools.length > 0 && tools.every((tool) =>
+      tool.status === "failed" || tool.status === "denied" || tool.status === "cancelled"
+    );
   const groupId = `${tools[0]?.toolCallId ?? "explore"}:explore`;
   // Berry utt: while running, the collapsed summary is the newest child action
   // (rolling); the trailing group of a live turn keeps its action up between
@@ -1434,7 +1437,7 @@ function SubagentActivity({ tool, active = false }: { tool: ActivityTool; active
       summaryContentKey={liveAction?.key ?? `agent:${tool.toolCallId}:${description}`}
       summarySequence={liveSequence}
       metaText={metaTextOf(tool)}
-      statusLabel={tool.status === "failed" ? "Failed" : tool.status === "denied" ? "Denied" : undefined}
+      statusLabel={failureLabel(tool.status)}
     >
       <div className="ml-2 flex flex-col gap-3 border-l border-border pl-3.5">
         {prompt ? <SubagentBox label="Prompt">{prompt}</SubagentBox> : null}

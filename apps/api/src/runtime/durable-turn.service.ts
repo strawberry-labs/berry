@@ -2088,7 +2088,7 @@ VALUES ($1::uuid,$2::uuid,'tool-result',$3::jsonb,0)
           toolCallId: tool.id,
           name: tool.tool_name,
           arguments: tool.input,
-          status: "failed",
+          status: "cancelled",
           summary: "Interrupted by the user.",
         }),
       ],

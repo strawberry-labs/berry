@@ -39,6 +39,8 @@ import {
 import {
   classifyTurnSegments,
   groupLiveTimeline,
+  settleRunningActivityTools,
+  toolTerminalStatus,
   windowLiveTimeline,
   type ApprovalPrompt,
   type MessageSegment,
@@ -549,10 +551,12 @@ function BerryAssistantTurnGroup({
     .join("\n");
 
   const visibleArtifactToolCallIds = latestArtifactToolCallIds(messages);
+  const terminalStatus = latestTerminalMessageStatus(messages);
   const { segments, totalMs } = partitionAssistantParts(
     allParts,
     writingBlockParts,
     visibleArtifactToolCallIds,
+    terminalStatus,
   );
   // Merge tool runs that were split across adjacent assistant messages.
   const merged: typeof segments = [];
@@ -928,6 +932,13 @@ export function BerryActivityStackBlock({ children }: { children: React.ReactNod
   return <div className="berry-activity-stack flex max-w-[1360px] flex-col gap-2">{children}</div>;
 }
 
+export function latestTerminalMessageStatus(
+  messages: readonly Message[],
+): Exclude<Message["status"], "streaming"> | undefined {
+  const status = messages.at(-1)?.status;
+  return status && status !== "streaming" ? status : undefined;
+}
+
 /**
  * Splits a settled agent turn into an ordered stream of reasoning, tool runs,
  * and prose — walking parts in document order like Berry. Consecutive tools
@@ -939,6 +950,7 @@ export function partitionAssistantParts(
   parts: MessagePart[],
   writingBlockParts: Map<string, MessageDraftPartResolution> = new Map(),
   visibleArtifactToolCallIds?: ReadonlySet<string>,
+  terminalStatus?: Message["status"],
 ): {
   segments: MessageSegment[];
   totalMs: number;
@@ -1067,7 +1079,13 @@ export function partitionAssistantParts(
     }
   }
 
-  const tools = [...toolMap.values()];
+  if (terminalStatus && terminalStatus !== "streaming") {
+    const status = toolTerminalStatus(terminalStatus);
+    for (const segment of segments) {
+      if (segment.kind === "tools") segment.tools = settleRunningActivityTools(segment.tools, status);
+    }
+  }
+  const tools = segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []);
   const totalMs = tools.reduce((sum, tool) => sum + (tool.durationMs ?? 0), 0);
   return { segments, totalMs, hadTools: tools.length > 0 };
 }
@@ -1306,7 +1324,7 @@ export function isImageMessagePart(part: MessagePart): boolean {
 }
 
 function toolStatusFromMeta(value: unknown): ToolEntry["status"] {
-  if (value === "running" || value === "failed" || value === "denied" || value === "completed") return value;
+  if (value === "running" || value === "failed" || value === "denied" || value === "completed" || value === "cancelled") return value;
   return "completed";
 }
 

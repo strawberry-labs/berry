@@ -82,6 +82,51 @@ describe("live timeline rendering window", () => {
     expect(state.turnActive).toBe(false);
     expect(state.endStatus).toBe("failed");
   });
+
+  it.each([
+    ["failed", "failed"],
+    ["cancelled", "cancelled"],
+    ["completed", "completed"],
+  ] as const)("settles every top-level and nested tool when a turn ends %s", (turnStatus, toolStatus) => {
+    let state = reduceStream(IDLE, { kind: "turn.start", turnId: "turn_tools" });
+    state = reduceStream(state, {
+      kind: "tool.start",
+      toolCallId: "parent",
+      name: "task",
+      args: { description: "Inspect files" },
+    });
+    state = reduceStream(state, {
+      kind: "tool.start",
+      toolCallId: "child",
+      parentToolCallId: "parent",
+      name: "read_file",
+      args: { path: "/workspace/input.txt" },
+    });
+    state = reduceStream(state, {
+      kind: "tool.start",
+      toolCallId: "image",
+      name: "create_image",
+      args: { prompt: "A berry" },
+    });
+
+    state = reduceStream(state, {
+      kind: "turn.end",
+      status: turnStatus,
+      turnId: "turn_tools",
+    });
+
+    expect(state.timeline).toEqual([
+      expect.objectContaining({
+        kind: "tool",
+        toolCallId: "parent",
+        status: toolStatus,
+        children: [expect.objectContaining({ toolCallId: "child", status: toolStatus })],
+      }),
+      expect.objectContaining({ kind: "tool", toolCallId: "image", status: toolStatus }),
+    ]);
+    expect(state.timeline.some((entry) => entry.kind === "tool" && entry.status === "running")).toBe(false);
+  });
+
 });
 
 describe("image generation stream state", () => {
