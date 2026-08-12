@@ -31,6 +31,7 @@ import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { MemoryService } from "../memory/memory.service.ts";
 import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { DURABLE_TURN_RUNNER_ENABLED, DurableTurnService } from "../runtime/durable-turn.service.ts";
+import { TurnCancellationPublisher } from "../runtime/turn-cancellation-publisher.ts";
 import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
 import { ConnectorsController, OrganizationConnectorsController } from "../connectors/connectors.controller.ts";
 import { SetupModule } from "../setup/setup.module.ts";
@@ -108,6 +109,7 @@ export class AgentApiModule {
         options.personalCapabilities ? { provide: PERSONAL_CAPABILITIES, useValue: options.personalCapabilities.useValue } : { provide: PERSONAL_CAPABILITIES, useClass: PersonalCapabilitiesService },
         options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) },
         { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
+        TurnCancellationPublisher,
         ...(durableContextEnabled
           ? [DurableTurnService]
           : [

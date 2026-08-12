@@ -89,6 +89,9 @@ key. Model IDs and embedding dimensions are independently configurable under
 ## Reliability behavior
 
 - API writes and recall use a typed HTTP adapter with bounded timeouts.
+- Mem0's pgvector adapter is wrapped with a bounded `pg.Pool`; concurrent
+  searches do not share one executing `pg.Client`, and idle socket errors are
+  handled without terminating the Mem0 process.
 - Read-only requests retry once for transient network, rate-limit, and 5xx
   failures. Mutations are not blindly retried.
 - Background extraction carries the durable outbox identity into Mem0.
@@ -106,6 +109,19 @@ key. Model IDs and embedding dimensions are independently configurable under
 - Secrets and credential-looking source lines are removed before implicit
   extraction. Retrieved memory remains untrusted grounding, never executable
   instructions.
+
+Before a production rollout, run the real adapter recovery test against a
+disposable pgvector database. It issues 50 simultaneous searches, terminates
+one active Mem0 PostgreSQL backend, and verifies that later searches recover:
+
+```sh
+BERRY_MEM0_TEST_DATABASE_URL=postgres://... \
+  pnpm --filter @berry/mem0 exec vitest run src/pgvector-pool.integration.test.ts
+```
+
+The database role used by this test must be allowed to create the `vector`
+extension and call `pg_terminate_backend` for its own sessions. The test uses a
+unique collection and removes it afterward. Never point it at production.
 
 ## Data and backups
 

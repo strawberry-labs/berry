@@ -26,6 +26,7 @@ import type {
   DurableTurnSnapshot,
   DurableTurnStep,
   DurableTurnToolExecutor,
+  DurableSkillPackageFile,
   TurnToolResult,
 } from "./turn-runner.js";
 
@@ -260,6 +261,68 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       mediaType: file.mediaType,
       path: durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot),
     }));
+  }
+
+  async readSkillPackage(snapshot: DurableTurnSnapshot, requestedPath: string): Promise<readonly DurableSkillPackageFile[]> {
+    const sandbox = await this.ensureSandbox(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const normalized = safeWorkspacePath(requestedPath, workspaceRoot);
+    const root = normalized.toLowerCase().endsWith("/skill.md")
+      ? normalized.slice(0, -"/SKILL.md".length)
+      : normalized;
+    const listing = await this.provider.files.list({ sandbox_id: sandbox.id, path: root, recursive: true });
+    const entries = listing.entries.filter((entry) => entry.type !== "directory");
+    if (entries.some((entry) => entry.type === "symlink")) throw new Error("Skill packages cannot contain symbolic links");
+    if (entries.length === 0 || entries.length > 501) throw new Error("Skill package must contain SKILL.md and at most 500 resource files");
+    const files: DurableSkillPackageFile[] = [];
+    let totalBytes = 0;
+    for (const entry of entries.sort((left, right) => left.path.localeCompare(right.path))) {
+      const relativePath = relativeSkillPackagePath(root, entry.path);
+      totalBytes += entry.size_bytes;
+      if (totalBytes > 5 * 1024 * 1024) throw new Error("Skill packages are limited to 5 MB extracted");
+      const source = await this.provider.files.read({ sandbox_id: sandbox.id, path: entry.path, encoding: "base64" });
+      files.push({ path: relativePath, contentBase64: source.content, mode: relativePath.startsWith("scripts/") ? 0o755 : 0o644 });
+    }
+    if (!files.some((file) => file.path === "SKILL.md")) throw new Error("Skill package directory must contain SKILL.md at its root");
+    return files;
+  }
+
+  async stageSkillPackage(snapshot: DurableTurnSnapshot, packageId: string, files: readonly DurableSkillPackageFile[]): Promise<{ filePath: string; resources: string[] }> {
+    const sandbox = await this.ensureSandbox(snapshot);
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const safeId = packageId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 160) || "skill";
+    if (files.length === 0 || files.length > 501) throw new Error("Skill package must contain SKILL.md and at most 500 resource files");
+    const seen = new Set<string>();
+    const normalizedFiles = files.map((file) => {
+      const path = safeRelativeSkillPackagePath(file.path);
+      if (seen.has(path)) throw new Error(`Skill package contains duplicate path: ${path}`);
+      seen.add(path);
+      return { ...file, path, bytes: Buffer.from(file.contentBase64, "base64") };
+    });
+    if (!seen.has("SKILL.md")) throw new Error("Skill package is missing SKILL.md");
+    const packageRevision = createHash("sha256");
+    for (const file of [...normalizedFiles].sort((left, right) => left.path.localeCompare(right.path))) {
+      packageRevision.update(file.path).update("\0").update(file.bytes).update("\0");
+    }
+    const totalBytes = normalizedFiles.reduce((total, file) => total + file.bytes.byteLength, 0);
+    if (totalBytes > 5 * 1024 * 1024) throw new Error("Skill packages are limited to 5 MB extracted");
+    // Reused sandboxes can retain prior files. A content-addressed directory makes
+    // package revisions immutable, so resources removed by an update cannot leak
+    // into a later activation of the same skill.
+    const root = `${workspaceRoot}/.berry/runtime-skills/${safeId}-${packageRevision.digest("hex").slice(0, 16)}`;
+    for (const file of normalizedFiles) {
+      await this.provider.files.write({
+        sandbox_id: sandbox.id,
+        path: `${root}/${file.path}`,
+        content: file.contentBase64,
+        encoding: "base64",
+        mode: file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644),
+      });
+    }
+    return {
+      filePath: `${root}/SKILL.md`,
+      resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
+    };
   }
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
@@ -1786,6 +1849,21 @@ function safeWorkspaceRoot(value: string): string {
 function safeWorkspacePath(value: string, workspaceRoot = "/workspace"): string {
   const root = safeWorkspaceRoot(workspaceRoot);
   return safeSandboxPath(value, root, [root], `Sandbox writes must remain under ${root}`);
+}
+
+function safeRelativeSkillPackagePath(value: string): string {
+  const normalized = value.trim().replaceAll("\\", "/");
+  const parts = normalized.split("/");
+  if (!normalized || normalized.length > 512 || normalized.startsWith("/") || /^[a-z]:\//i.test(normalized) || parts.some((part) => !part || part === "." || part === "..") || normalized.includes("\0")) {
+    throw new Error(`Unsafe skill package path: ${value}`);
+  }
+  return normalized;
+}
+
+function relativeSkillPackagePath(root: string, path: string): string {
+  const prefix = `${root.replace(/\/+$/, "")}/`;
+  if (!path.startsWith(prefix)) throw new Error("Skill package file escaped its root directory");
+  return safeRelativeSkillPackagePath(path.slice(prefix.length));
 }
 
 function safeReadablePath(value: string, workspaceRoot = "/workspace"): string {

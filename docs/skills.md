@@ -22,6 +22,9 @@ If the selected scope already contains the same name, Berry requires an explicit
 
 Berry also discovers older `.berry/skills` locations and `~/.codex/skills` for compatibility. New skills and `.skill` imports use `.agents/skills`.
 
+For cloud upgrades from the older single-file storage model, follow the
+[skill package migration and recovery runbook](./skill-package-migration-runbook.md).
+
 ## Trust and scripts
 
 A `.skill` file is untrusted content. Importing one never runs scripts, hooks, installers, package managers, or dependency commands. Installing a skill does not grant it extra filesystem, shell, or network access. If its instructions later ask Berry to run a bundled script, the command goes through the same permission policy as any other tool call.

@@ -200,6 +200,41 @@ describe("BerryApiClient", () => {
     expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/cancel", expect.objectContaining({ method: "POST" }));
   });
 
+  it("cancels the exact pending submission operation", async () => {
+    const operationId = "e6e39930-cc25-47ca-a42d-2bd38f0ff573";
+    const fetchImpl = vi.fn(async () => json({ ok: true }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.cancelTurn("session_1", { operationId })).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/cancel", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ operationId }),
+    }));
+  });
+
+  it("passes browser cancellation through to a pending turn submission", async () => {
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.signal).toBe(controller.signal);
+      return json({ turnId: "turn_1", sessionId: "session_1" });
+    });
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await client.startTurn("session_1", {
+      input: "Run",
+      workspacePath: "/workspace",
+    }, { signal: controller.signal });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/sessions/session_1/turns",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ input: "Run", workspacePath: "/workspace" }),
+        signal: controller.signal,
+      }),
+    );
+  });
+
   it("continues an interrupted turn without serializing user input", async () => {
     const fetchImpl = vi.fn(async () => json({ turnId: "turn_2", sessionId: "session_1" }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });

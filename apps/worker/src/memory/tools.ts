@@ -112,6 +112,16 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     return this.base.stageAssociatedInputFiles?.(snapshot, fileIds) ?? [];
   }
 
+  readSkillPackage(snapshot: DurableTurnSnapshot, path: string) {
+    if (!this.base.readSkillPackage) throw new Error("Skill package workspace access is unavailable");
+    return this.base.readSkillPackage(snapshot, path);
+  }
+
+  stageSkillPackage(snapshot: DurableTurnSnapshot, packageId: string, files: Parameters<NonNullable<DurableTurnToolExecutor["stageSkillPackage"]>>[2]) {
+    if (!this.base.stageSkillPackage) throw new Error("Skill package workspace access is unavailable");
+    return this.base.stageSkillPackage(snapshot, packageId, files);
+  }
+
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     return this.base.finalize?.(snapshot) ?? [];
   }

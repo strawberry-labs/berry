@@ -13,6 +13,7 @@ export * from "./agent-skill-content.ts";
  * app-server clients. Phase 2 freezes this into an additive-only contract.
  */
 export const PROTOCOL_VERSION = 1;
+export const TURN_CANCELLATION_CHANNEL = "berry:turn-cancel:v1";
 
 export function protocolMajor(version: number): number {
   return Math.trunc(version);
@@ -2699,9 +2700,23 @@ export const PersonalSkillSchema = z.object({
   content: z.string().min(1).max(262_144), enabled: z.boolean(), trusted: z.boolean(),
   source: z.enum(["text", "upload", "git"]), sourceUrl: z.string().url().nullable(),
   version: z.string().max(64).nullable(), hash: z.string().regex(/^[a-f0-9]{64}$/), diagnostics: z.array(z.string()).default([]),
+  resources: z.array(z.string()).default([]), packageBytes: z.number().int().nonnegative().default(0),
   createdAt: ISODateSchema, updatedAt: ISODateSchema,
 });
 export type PersonalSkill = z.infer<typeof PersonalSkillSchema>;
+
+export const SkillPackageFileSchema = z.object({
+  path: z.string().trim().min(1).max(512),
+  contentBase64: z.string(),
+  mode: z.number().int().min(0).max(0o777).optional(),
+}).strict();
+export type SkillPackageFile = z.infer<typeof SkillPackageFileSchema>;
+
+export const PersonalSkillPackageSchema = z.object({
+  content: z.string().min(1).max(262_144),
+  resourceFiles: z.array(SkillPackageFileSchema).max(500).default([]),
+}).strict();
+export type PersonalSkillPackage = z.infer<typeof PersonalSkillPackageSchema>;
 
 export const PersonalSkillReviewSchema = z.object({
   name: z.string(), description: z.string(), source: z.enum(["text", "upload", "git"]),
@@ -2798,6 +2813,7 @@ export const OrgCapabilitySchema = z.object({
   id: z.string().min(1), tenantId: z.string().uuid(), kind: z.enum(["skill", "mcp"]), capabilityId: z.string().min(1),
   name: z.string().min(1), description: z.string().default(""), assignment: OrgCapabilityAssignmentSchema,
   allowUserDisable: z.boolean(), contentHash: z.string().regex(/^[a-f0-9]{64}$/).nullable(), config: JsonValueSchema.default({}),
+  resources: z.array(z.string()).default([]), packageBytes: z.number().int().nonnegative().default(0),
   createdAt: ISODateSchema, updatedAt: ISODateSchema,
 });
 export type OrgCapability = z.infer<typeof OrgCapabilitySchema>;

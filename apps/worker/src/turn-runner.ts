@@ -11,6 +11,8 @@ import {
   conversationProfilePrompt,
   createBerryModel,
   createProviderStreamFn,
+  providerErrorFromAssistantMessage,
+  routerRequestIdFromAssistantMessage,
   type BerryModelProviderInfo,
   type BerryStreamFn,
 } from "@berry/local-agent";
@@ -59,6 +61,11 @@ import {
 } from "./compaction.js";
 import { durableAttachmentPrompt } from "./durable-attachments.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import {
+  DurableTurnCancellationError,
+  type ActiveTurnCancellationRegistry,
+} from "./turn-cancellation.js";
+import { workerRuntimeMetrics } from "./runtime-metrics.js";
 
 const TERMINAL_STATES = new Set<TurnRunState>([
   "completed",
@@ -248,7 +255,16 @@ export interface DurableTurnRepository {
   reserveNextModelCall?(snapshot: DurableTurnSnapshot, estimatedCostMicros: string): Promise<{ allowed: boolean; reason: string | null }>;
   appendEvents(snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void>;
   commit(snapshot: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void>;
-  release(snapshot: DurableTurnSnapshot, error?: string): Promise<void>;
+  release(
+    snapshot: DurableTurnSnapshot,
+    error?: string,
+    retryDiagnostics?: DurableTurnRetryDiagnostics,
+  ): Promise<void>;
+}
+
+export interface DurableTurnRetryDiagnostics {
+  stepId: string;
+  providerDiagnostics: Record<string, JsonValue>;
 }
 
 export interface TurnModelToolIntent {
@@ -268,6 +284,7 @@ export interface TurnModelResult {
   reasoning?: string;
   finishReason?: string | null;
   providerResponseId?: string;
+  routerRequestId?: string;
   inputTokens: number;
   outputTokens: number;
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
@@ -306,6 +323,12 @@ export interface TurnToolResult {
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
 }
 
+export interface DurableSkillPackageFile {
+  path: string;
+  contentBase64: string;
+  mode?: number;
+}
+
 export interface DurableTurnToolExecutor {
   definitions?(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]>;
   modelContent?(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]>;
@@ -317,6 +340,11 @@ export interface DurableTurnToolExecutor {
     mediaType: string;
     path: string;
   }[]>;
+  readSkillPackage?(snapshot: DurableTurnSnapshot, path: string): Promise<readonly DurableSkillPackageFile[]>;
+  stageSkillPackage?(snapshot: DurableTurnSnapshot, packageId: string, files: readonly DurableSkillPackageFile[]): Promise<{
+    filePath: string;
+    resources: string[];
+  }>;
   finalize?(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]>;
 }
 
@@ -382,6 +410,7 @@ export class DurableTurnRunner {
       modelMaxDurationMs?: number;
       abortCleanupTimeoutMs?: number;
       compactor?: SessionCompactionRunner;
+      cancellations?: ActiveTurnCancellationRegistry;
     } = {},
   ) {}
 
@@ -425,11 +454,14 @@ export class DurableTurnRunner {
       await this.repository.release(snapshot);
       return { runId: snapshot.id, state: snapshot.state, noOp: true };
     } catch (error) {
+      if (error instanceof DurableTurnCancellationError) {
+        return { runId: snapshot.id, state: "cancelled" };
+      }
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof DurableTurnRetryableError
         || error instanceof CompactionRetryableError
         || (error instanceof RouterClientError && isRetryableStatus(error.status))) {
-        await this.repository.release(snapshot, message);
+        await this.repository.release(snapshot, message, retryableProviderDiagnostics(snapshot));
         throw error instanceof DurableTurnRetryableError
           ? error
           : new DurableTurnRetryableError(message, error);
@@ -626,37 +658,52 @@ export class DurableTurnRunner {
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
     const repetitionGuard = new ExactOutputRepetitionGuard();
-    const result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress, abort }) => {
-      const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
-      try {
-        return await this.model.call(modelSnapshot, step, {
-          messageId,
-          tools: definitions,
-          additionalUserContent,
-          signal,
-          reportProgress,
-          emitDelta: async (delta, channel) => {
-            reportProgress();
-            try {
-              repetitionGuard.observe(delta, channel);
-            } catch (error) {
-              abort(error);
-              throw error;
-            }
-            await writer.write(delta, channel);
-          },
-          policyForTool: (name) => this.tools.policy?.(snapshot, name, permissionMode)
-            ?? durableToolPolicy(name, permissionMode),
-        });
-      } finally {
-        await writer.flush();
-      }
-    }, {
-      label: "Model request",
-      abortable: true,
-      idleTimeoutMs: this.options.modelIdleTimeoutMs ?? 240_000,
-      maxDurationMs: this.options.modelMaxDurationMs ?? 900_000,
-    });
+    let result: TurnModelResult;
+    try {
+      result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress, abort }) => {
+        const permissionMode = stringValue(snapshot.runtimeRequest.permissionMode) ?? "ask";
+        try {
+          return await this.model.call(modelSnapshot, step, {
+            messageId,
+            tools: definitions,
+            additionalUserContent,
+            signal,
+            reportProgress,
+            emitDelta: async (delta, channel) => {
+              reportProgress();
+              try {
+                repetitionGuard.observe(delta, channel);
+              } catch (error) {
+                abort(error);
+                throw error;
+              }
+              await writer.write(delta, channel);
+            },
+            policyForTool: (name) => this.tools.policy?.(snapshot, name, permissionMode)
+              ?? durableToolPolicy(name, permissionMode),
+          });
+        } finally {
+          await writer.flush();
+        }
+      }, {
+        label: "Model request",
+        abortable: true,
+        idleTimeoutMs: this.options.modelIdleTimeoutMs ?? 240_000,
+        maxDurationMs: this.options.modelMaxDurationMs ?? 900_000,
+      });
+    } catch (error) {
+      const diagnostics = providerFailureDiagnostics(snapshot, error, modelStartedAt);
+      workerRuntimeMetrics.providerRequest(diagnostics);
+      const activeModelStep = latestStep(snapshot.steps, "model.call") ?? step;
+      activeModelStep.output = {
+        ...(record(activeModelStep.output) ?? {}),
+        providerDiagnostics: diagnostics,
+      };
+      console.warn(JSON.stringify({ event: "berry.turn.provider_failure", runId: snapshot.id, ...diagnostics }));
+      throw error;
+    }
+    const providerDiagnostics = successfulProviderDiagnostics(snapshot, result, modelStartedAt);
+    workerRuntimeMetrics.providerRequest(providerDiagnostics);
     const freshCancelled = !(await this.repository.heartbeat(
       snapshot.tenantId,
       snapshot.id,
@@ -672,9 +719,12 @@ export class DurableTurnRunner {
       );
     }
 
+    const responseUsageEvents: AgentStreamEvent[] = result.usage
+      ? [AgentStreamEventSchema.parse(result.usage)]
+      : [];
     const responseEndEvents: AgentStreamEvent[] = [
       { kind: "message.end", messageId },
-      ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
+      ...responseUsageEvents,
     ];
     const normalizedFinishReason = result.finishReason?.toLowerCase() ?? null;
     if (normalizedFinishReason === "length" || normalizedFinishReason === "max_tokens") {
@@ -685,11 +735,18 @@ export class DurableTurnRunner {
         toolCallIds: result.toolCalls.map((call) => call.id),
         finishReason: result.finishReason ?? "length",
         ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+        outputTokens: result.outputTokens,
+        requestedMaxOutputTokens: effectiveMaxTokens,
         reasoningCharacters: result.reasoning?.length ?? 0,
+        providerDiagnostics,
       };
-      await this.repository.appendEvents(snapshot, responseEndEvents);
+      // Leave the assistant stream open so the terminal projection persists
+      // the reasoning/text already received alongside the provider error. A
+      // message.end here made insertTerminalAssistantProjection treat the
+      // draft as settled and replace it with an error-only message.
+      await this.repository.appendEvents(snapshot, responseUsageEvents);
       throw new DurableTurnTerminalError(
-        `The provider stopped because the ${effectiveMaxTokens}-token output limit was reached before the model completed its response. Berry preserved the provider finish reason instead of reporting this as an empty response. Retry with a model that advertises a larger output limit.`,
+        providerLengthStopMessage(result, effectiveMaxTokens),
       );
     }
     if (normalizedFinishReason === "content_filter") {
@@ -700,6 +757,7 @@ export class DurableTurnRunner {
         toolCallIds: result.toolCalls.map((call) => call.id),
         finishReason: result.finishReason ?? "content_filter",
         ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+        providerDiagnostics,
       };
       await this.repository.appendEvents(snapshot, responseEndEvents);
       throw new DurableTurnTerminalError(
@@ -717,6 +775,7 @@ export class DurableTurnRunner {
         emptyResponse: true,
         finishReason: result.finishReason ?? null,
         ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+        providerDiagnostics,
         reasoningCharacters: result.reasoning?.length ?? 0,
       };
       if (record(step.input)?.recoveryReason === "empty_response") {
@@ -826,6 +885,7 @@ export class DurableTurnRunner {
             toolCallIds: result.toolCalls.map((call) => call.id),
             finishReason: result.finishReason ?? null,
             ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+            providerDiagnostics,
           },
           sessionEntryId: messageId,
         },
@@ -1161,8 +1221,13 @@ export class DurableTurnRunner {
           throw new Error(visionBudget.reason ?? "Vision inspection was blocked by the spend limit");
         }
       }
-      result = builtInPresentationToolResult(snapshot, toolName, step.input.arguments)
-        ?? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
+      const storedSkill = toolName === "activate_skill"
+        ? durableSkills(snapshot).find((skill) => skill.name === stringValue(record(step.input.arguments)?.name))
+        : undefined;
+      result = storedSkill && (/^\/(personal|organization)-skills\//.test(storedSkill.filePath))
+        ? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step))
+        : builtInPresentationToolResult(snapshot, toolName, step.input.arguments)
+          ?? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
     } catch (error) {
       if (error instanceof DurableTurnRetryableError || error instanceof DurableTurnTerminalError) {
         throw error;
@@ -1392,7 +1457,7 @@ export class DurableTurnRunner {
       expectedState: snapshot.state,
       nextState: "cancelled",
       steps: snapshot.steps
-        .filter((step) => step.state === "pending" || step.state === "waiting")
+        .filter((step) => step.state === "pending" || step.state === "running" || step.state === "waiting")
         .map((step) => ({ ...step, state: "cancelled" as const })),
       events: [{ kind: "turn.end", turnId: snapshot.id, status: "cancelled" }],
       terminalAssistant: { status: "cancelled" },
@@ -1551,6 +1616,8 @@ export class DurableTurnRunner {
     const leaseSeconds = this.options.leaseSeconds ?? 90;
     const heartbeatMs = this.options.heartbeatMs ?? Math.max(5_000, Math.floor(leaseSeconds * 1_000 / 3));
     const controller = new AbortController();
+    const unregisterCancellation = this.options.cancellations?.register(snapshot.id, controller)
+      ?? (() => undefined);
     let timer: NodeJS.Timeout | null = null;
     let idleTimer: NodeJS.Timeout | null = null;
     let durationTimer: NodeJS.Timeout | null = null;
@@ -1655,6 +1722,7 @@ export class DurableTurnRunner {
       return result;
     } finally {
       stopped = true;
+      unregisterCancellation();
       if (timer) clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
       if (durationTimer) clearTimeout(durationTimer);
@@ -2158,7 +2226,39 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
     else await run(this.executor);
   }
 
-  async release(snapshot: DurableTurnSnapshot, error?: string): Promise<void> {
+  async release(
+    snapshot: DurableTurnSnapshot,
+    error?: string,
+    retryDiagnostics?: DurableTurnRetryDiagnostics,
+  ): Promise<void> {
+    if (retryDiagnostics) {
+      await this.executor.execute(
+        `
+WITH released AS (
+  UPDATE turn_runs
+  SET lease_owner=NULL,lease_expires_at=NULL,
+      error=COALESCE($4,error),updated_at=now()
+  WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
+  RETURNING id
+)
+UPDATE turn_steps
+SET output=(CASE WHEN jsonb_typeof(output)='object' THEN output ELSE '{}'::jsonb END)
+      || jsonb_build_object('providerDiagnostics',$5::jsonb),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$6::uuid
+  AND EXISTS (SELECT 1 FROM released)
+        `.trim(),
+        [
+          snapshot.tenantId,
+          snapshot.id,
+          snapshot.leaseOwner,
+          error?.slice(0, 4_000) ?? null,
+          JSON.stringify(retryDiagnostics.providerDiagnostics),
+          retryDiagnostics.stepId,
+        ],
+      );
+      return;
+    }
     await this.executor.execute(
       `
 UPDATE turn_runs
@@ -2231,6 +2331,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     let servedModel = model;
     let finishReason: string | null = null;
     let providerResponseId: string | undefined;
+    let routerRequestId: string | undefined;
     const selectedReasoningEffort = reasoningEffort(snapshot.runtimeRequest.reasoning);
     const kimiSectionStart = "<|tool_calls_section_begin|>";
     const emitVisibleText = async (value: string) => {
@@ -2272,6 +2373,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       context.reportProgress?.();
       servedModel = chunk.model || servedModel;
       if (chunk.id) providerResponseId = chunk.id;
+      if (chunk.requestId) routerRequestId = chunk.requestId;
       if (chunk.finishReason) finishReason = chunk.finishReason;
       await acceptTextDelta(chunk.delta);
       if (chunk.reasoningDelta) {
@@ -2361,6 +2463,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       ...(rawReasoning ? { reasoning: rawReasoning } : {}),
       finishReason,
       ...(providerResponseId ? { providerResponseId } : {}),
+      ...(routerRequestId ? { routerRequestId } : {}),
       inputTokens: finalUsage?.inputTokens ?? 0,
       outputTokens: finalUsage?.outputTokens ?? 0,
       ...(usage ? { usage } : {}),
@@ -2478,6 +2581,8 @@ async function callProviderStream(
   }
   const assistant = await stream.result();
   if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
+    const providerError = providerErrorFromAssistantMessage(assistant);
+    if (providerError) throw providerError;
     throw new Error(assistant.errorMessage ?? `Provider stopped with ${assistant.stopReason}`);
   }
   const text = assistant.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
@@ -2518,10 +2623,13 @@ async function callProviderStream(
     servedModel: assistant.model,
     servedProvider: assistant.provider,
   }) as Extract<AgentStreamEvent, { kind: "usage" }>;
+  const routerRequestId = routerRequestIdFromAssistantMessage(assistant);
   return {
     text,
     ...(reasoning ? { reasoning } : {}),
     finishReason: assistant.stopReason,
+    ...(assistant.responseId ? { providerResponseId: assistant.responseId } : {}),
+    ...(routerRequestId ? { routerRequestId } : {}),
     inputTokens: assistant.usage.input,
     outputTokens: assistant.usage.output,
     usage,
@@ -2685,6 +2793,113 @@ function reasoningEffort(value: unknown): "minimal" | "low" | "medium" | "high" 
   return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh"
     ? value
     : undefined;
+}
+
+function providerLengthStopMessage(result: TurnModelResult, requestedMaxOutputTokens: number): string {
+  const reportedOutputTokens = Number.isFinite(result.outputTokens) && result.outputTokens > 0
+    ? Math.floor(result.outputTokens)
+    : null;
+  const reasoningCharacters = result.reasoning?.length ?? 0;
+  const observations = [
+    reportedOutputTokens === null
+      ? "no provider-reported output-token usage"
+      : `${formatCount(reportedOutputTokens)} provider-reported output tokens`,
+    reasoningCharacters > 0 ? `${formatCount(reasoningCharacters)} streamed reasoning characters` : null,
+    result.text.length > 0 ? `${formatCount(result.text.length)} streamed answer characters` : null,
+  ].filter((value): value is string => value !== null);
+  const diagnosis = reportedOutputTokens !== null
+    ? reportedOutputTokens < requestedMaxOutputTokens
+      ? "The reported output is below Berry's requested limit, which indicates a lower provider-side generation cap or incorrect model metadata."
+      : "The provider-reported output reached Berry's requested limit."
+    : "Check the provider's actual generation cap and model metadata.";
+  const responseReference = result.providerResponseId
+    ? ` Provider response ID: ${result.providerResponseId}.`
+    : "";
+  return `The provider ended the response with finish reason "length" before the model completed. Berry requested up to ${formatCount(requestedMaxOutputTokens)} output tokens. Observed: ${observations.join(" and ")}. ${diagnosis}${responseReference}`;
+}
+
+function successfulProviderDiagnostics(
+  snapshot: DurableTurnSnapshot,
+  result: TurnModelResult,
+  startedAt: number,
+): Record<string, JsonValue> {
+  return {
+    outcome: "success",
+    model: stringValue(result.usage?.servedModel)
+      ?? stringValue(snapshot.runtimeRequest.model)
+      ?? "unknown",
+    status: 200,
+    routerRequestId: result.routerRequestId ?? null,
+    providerResponseId: result.providerResponseId ?? null,
+    latencyMs: Math.max(0, Date.now() - startedAt),
+    errorCode: null,
+  };
+}
+
+function providerFailureDiagnostics(
+  snapshot: DurableTurnSnapshot,
+  error: unknown,
+  startedAt: number,
+): Record<string, JsonValue> {
+  const details = providerErrorDetails(error);
+  return {
+    outcome: error instanceof DurableTurnCancellationError ? "cancelled" : "failure",
+    model: stringValue(snapshot.runtimeRequest.model) ?? "unknown",
+    status: details.status,
+    routerRequestId: details.requestId,
+    providerResponseId: null,
+    latencyMs: Math.max(0, Date.now() - startedAt),
+    errorCode: details.code,
+  };
+}
+
+function providerErrorDetails(error: unknown): {
+  status: number | null;
+  code: string | null;
+  requestId: string | null;
+} {
+  const seen = new Set<unknown>();
+  let candidate: unknown = error;
+  let status: number | null = null;
+  let code: string | null = null;
+  let requestId: string | null = null;
+  for (let depth = 0; candidate && depth < 8 && !seen.has(candidate); depth += 1) {
+    seen.add(candidate);
+    if (candidate instanceof RouterClientError) {
+      if (status === null && candidate.status !== undefined) status = candidate.status;
+      if (code === null && candidate.code) code = candidate.code;
+      if (requestId === null && candidate.requestId) requestId = candidate.requestId;
+    } else if (typeof candidate === "object") {
+      const item = candidate as Record<string, unknown>;
+      if (status === null) {
+        const value = item.status ?? item.statusCode;
+        if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) status = value;
+      }
+      if (code === null && typeof item.code === "string") code = item.code.trim().slice(0, 128);
+      const request = item.requestId ?? item.request_id;
+      if (requestId === null && typeof request === "string") requestId = request.trim().slice(0, 240);
+    }
+    candidate = typeof candidate === "object" && candidate !== null
+      ? (candidate as { cause?: unknown }).cause
+      : null;
+  }
+  return { status, code, requestId };
+}
+
+function retryableProviderDiagnostics(
+  snapshot: DurableTurnSnapshot,
+): DurableTurnRetryDiagnostics | undefined {
+  const step = latestStep(snapshot.steps, "model.call");
+  const diagnostics = record(record(step?.output)?.providerDiagnostics);
+  if (!step || !diagnostics) return undefined;
+  return {
+    stepId: step.id,
+    providerDiagnostics: diagnostics as Record<string, JsonValue>,
+  };
+}
+
+function formatCount(value: number): string {
+  return Math.max(0, Math.floor(value)).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
 function modelIteration(steps: readonly DurableTurnStep[]): number {
@@ -3154,9 +3369,9 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "Sandbox persistence is selective. Inputs are already durable and the workspace inputs directory must not be copied. Put disposable clones, package caches, extracted intermediates, and build trees under system /tmp, outside the runtime workspace. Keep only user-authored working files in the workspace and final deliverables in its outputs directory.",
   "run_command uses Bash. Check for an installed command before downloading or compiling a replacement, and keep large dependency trees in system /tmp.",
   "Keep each tool argument manageable. When file content could exceed roughly 12,000 characters, write a first chunk and append one manageable chunk per later tool turn with append_file and the preceding sizeBytes. Do not retry the same truncated payload.",
-  "For a large personal skill, write its complete SKILL.md in manageable chunks inside the runtime workspace, then call save_personal_skill once with path. Do not place a large skill document directly inside a tool argument.",
+  "When creating a personal skill, build a complete package directory containing SKILL.md plus any reusable scripts, references, assets, or templates, then call save_personal_skill once with the directory path. Copy reusable task attachments into stable package paths; never hardcode task-scoped /inputs/<file-id> paths. Instructions-only skills may use content directly.",
   "Read a tool error before retrying and correct its path, schema, or strategy. Do not repeat an identical failed call more than once.",
-  "For requests about current web information, call an available MCP research or search tool before answering. Never claim browsing is unavailable when a relevant tool is declared.",
+  "For ordinary requests about current web information, make one or two targeted search calls, open or scrape only the most relevant primary page when more detail is necessary, and answer briefly with source links. Do not activate deep-research for routine questions. Activate it only when the user explicitly asks for deep, extensive, comprehensive, or exhaustive research or invokes $deep-research. Never claim browsing is unavailable when a relevant tool is declared.",
   "When the user explicitly asks you to remember or forget a durable personal fact or preference, call remember_memory or forget_memory when that tool is declared. Confirm the change only after the tool succeeds.",
   "When the user explicitly asks you to ask questions, collect requirements, or clarify choices, call ask_user_question so the frontend renders the interactive question UI. Do not print the questionnaire as ordinary prose.",
   "When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call compose_message so it renders as an editable writing block. Use one variant unless genuinely different strategies are useful, reuse the same draft id for revisions, and do not repeat the draft body in prose after the tool succeeds.",
@@ -3431,13 +3646,13 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "save_personal_skill",
-      description: "Create or update a validated Berry skill in the current signed-in user's personal Skills library. For content over roughly 12,000 characters, first write SKILL.md in manageable workspace chunks and pass path. Use only when the user asks to create, install, or update a skill.",
+      description: "Create or update a validated Berry skill package in the current signed-in user's personal Skills library. Pass content only for instructions-only skills. Otherwise build a directory containing SKILL.md plus scripts, references, assets, or templates and pass that directory as path. Use only when the user asks to create, install, or update a skill.",
       parameters: {
         type: "object",
         additionalProperties: false,
         properties: {
           content: { type: "string", minLength: 1, maxLength: 262_144 },
-          path: { type: "string", description: "Workspace path to a completed SKILL.md; use this for large skills" },
+          path: { type: "string", description: "Workspace path to the completed skill package directory (or a legacy SKILL.md path)." },
         },
         oneOf: [
           { required: ["content"] },

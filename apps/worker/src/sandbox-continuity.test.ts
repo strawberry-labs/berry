@@ -1592,6 +1592,33 @@ describe("SandboxContinuityManager", () => {
     expect(statements[0]).toContain("sandbox_claimed_by_newer_run");
     expect(statements.at(-1)).toContain("pg_advisory_xact_lock");
   });
+
+  it("stages updated skill packages in isolated content-addressed directories", async () => {
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.from(input.content, "base64").byteLength,
+      mtime: null,
+    }));
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read: vi.fn(),
+      write,
+    });
+    const skill = (content: string, resource?: string) => [
+      { path: "SKILL.md", contentBase64: Buffer.from(content).toString("base64"), mode: 0o644 },
+      ...(resource ? [{ path: resource, contentBase64: Buffer.from("resource").toString("base64"), mode: 0o644 }] : []),
+    ];
+
+    const first = await manager.stageSkillPackage(snapshot(), "memo", skill("version one", "assets/old.docx"));
+    const second = await manager.stageSkillPackage(snapshot(), "memo", skill("version two"));
+
+    expect(first.filePath).not.toBe(second.filePath);
+    expect(first.resources).toHaveLength(1);
+    expect(second.resources).toEqual([]);
+    expect(first.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
+    expect(second.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
+    expect(write).toHaveBeenCalledTimes(3);
+  });
 });
 
 function snapshot(): DurableTurnSnapshot {

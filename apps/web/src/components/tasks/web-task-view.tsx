@@ -20,7 +20,7 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -35,6 +35,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
   onRegenerateGeneratedImage?: ((image: GeneratedImageView, aspectRatio: "1:1" | "3:4" | "4:3" | "9:16" | "16:9") => void | Promise<void>) | undefined;
   editTurn?: ((message: Message, text: string) => Promise<void>) | undefined;
   recoveryRequired?: boolean;
+  activeStatus?: string | undefined;
   cancelTurn: () => Promise<void>;
   onViewTaskFiles?: (() => void) | undefined;
   scrollRequest?: number;
@@ -171,6 +172,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
         showTodos={false}
         showQuestions={false}
         showPendingTurnActivity
+        activeStatus={activeStatus}
         showReasoning={showReasoning}
         {...(recoveryRequired ? { latestTurnError: "Something interrupted this response." } : {})}
         adapter={adapter}

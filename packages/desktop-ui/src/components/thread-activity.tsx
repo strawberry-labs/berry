@@ -1511,6 +1511,7 @@ export function TurnActivity({
   turnKey,
   active,
   elapsedMs,
+  activeLabel,
   liveAction = null,
   summary,
   children,
@@ -1518,6 +1519,8 @@ export function TurnActivity({
   turnKey: string;
   active: boolean;
   elapsedMs?: number | undefined;
+  /** Current durable phase. Elapsed time remains explicitly turn-wide. */
+  activeLabel?: string | undefined;
   /** Latest tool action, rolled in under the header while active + collapsed. */
   liveAction?: { key: string; node: React.ReactNode } | null;
   /** Compact mode's lossless roll-up; expanding still renders every tool row. */
@@ -1525,7 +1528,14 @@ export function TurnActivity({
   children?: React.ReactNode;
 }) {
   const time = elapsedMs !== undefined && (!active || elapsedMs >= 1000) ? ` for ${formatDuration(elapsedMs)}` : "";
-  const label = active ? `Working${time || "..."}` : `Worked${time}${summary ? ` — ${summary}` : ""}`;
+  const totalElapsed = elapsedMs !== undefined && elapsedMs >= 1000
+    ? ` · ${formatDuration(elapsedMs)} total`
+    : "";
+  const label = active
+    ? activeLabel
+      ? `${activeLabel}${totalElapsed}`
+      : `Working${time || "..."}`
+    : `Worked${time}${summary ? ` — ${summary}` : ""}`;
   const hasChildren = React.Children.toArray(children).some(Boolean);
   const [, rerender] = React.useReducer((count: number) => count + 1, 0);
   // Derived: open for the whole live run, collapsed once settled — unless the
@@ -1679,8 +1689,8 @@ export function ThoughtRow({
           <ChevronRight
             className={cn(
               "size-4 shrink-0 text-muted-foreground will-change-transform",
-              "transition-[transform,opacity] duration-[var(--duration-quick)] ease-[var(--ease-in-out)]",
-              effectiveOpen ? "rotate-90 opacity-100" : "rotate-0 opacity-0 group-hover/thought:opacity-100",
+              "transition-transform duration-[var(--duration-quick)] ease-[var(--ease-in-out)]",
+              effectiveOpen ? "rotate-90" : "rotate-0",
             )}
           />
         ) : null}

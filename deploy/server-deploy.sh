@@ -75,23 +75,34 @@ changed_files="$(git diff --name-only "$deployed_ref" "$target_ref")"
 git reset --hard "$target_ref"
 
 storage_mode="$(sed -n 's/^BERRY_OBJECT_STORAGE_MODE=//p' "$env_file" | tail -n 1)"
+background_worker_replicas="$(sed -n 's/^BERRY_BACKGROUND_WORKER_REPLICAS=//p' "$env_file" | tail -n 1)"
+foreground_worker_replicas="$(sed -n 's/^BERRY_FOREGROUND_WORKER_REPLICAS=//p' "$env_file" | tail -n 1)"
+background_worker_replicas="${background_worker_replicas:-1}"
+foreground_worker_replicas="${foreground_worker_replicas:-5}"
+case "$background_worker_replicas:$foreground_worker_replicas" in
+  *[!0-9:]*|0:*|*:0)
+    echo "Worker replica counts must be positive integers in $env_file." >&2
+    exit 1
+    ;;
+esac
+worker_scale_args="--scale worker=$background_worker_replicas --scale worker-foreground=$foreground_worker_replicas"
 if [ "$storage_mode" = "aws" ]; then
   export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/native/*.caddy'
-  berry_runtime_services="caddy embeddings mem0 tika redis api worker web"
+  berry_runtime_services="caddy embeddings mem0 tika redis api worker worker-foreground alertmanager prometheus web"
   berry_initialize_minio=false
   compose() {
     docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml "$@"
   }
 elif [ "$storage_mode" = "r2" ]; then
   export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/native/*.caddy'
-  berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis api worker web"
+  berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis api worker worker-foreground alertmanager prometheus web"
   berry_initialize_minio=false
   compose() {
     docker compose --env-file "$env_file" -f deploy/compose.yaml "$@"
   }
 else
   export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/minio/*.caddy'
-  berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis minio api worker web"
+  berry_runtime_services="caddy postgres mem0-postgres embeddings mem0 tika redis minio api worker worker-foreground alertmanager prometheus web"
   berry_initialize_minio=true
   compose() {
     docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml "$@"
@@ -113,6 +124,9 @@ if [ -n "$berry_image_services" ]; then
   echo "Building affected services:$berry_image_services"
   DOCKER_BUILDKIT=1 compose build $berry_image_services
 fi
+if [ "$berry_prometheus_changed" = true ]; then
+  compose pull alertmanager prometheus
+fi
 
 if [ "$berry_run_migrations" = true ]; then
   echo "Running database migrations..."
@@ -123,20 +137,47 @@ if [ "$berry_configure_roles" = true ]; then
   compose run --rm --no-deps postgres-roles
 fi
 
+worker_scale_reconciled=false
+berry_non_monitoring_restart_services=""
+for service in $berry_restart_services; do
+  case "$service" in
+    alertmanager|prometheus) ;;
+    *) berry_non_monitoring_restart_services="$berry_non_monitoring_restart_services $service" ;;
+  esac
+done
 if [ "$berry_compose_changed" = true ]; then
   # Wait only for long-running services. Compose reports a successful one-shot
   # container such as minio-init as an error under `up --wait`, and following
   # API dependencies here would also run migrations and role setup twice.
-  compose up -d --no-deps --no-build --pull never --remove-orphans --wait --wait-timeout 120 $berry_runtime_services
+  compose up -d --no-deps --no-build --pull never --remove-orphans --wait --wait-timeout 120 $worker_scale_args $berry_runtime_services
+  worker_scale_reconciled=true
   if [ "$berry_initialize_minio" = true ]; then
     compose run --rm --no-deps minio-init
   fi
-elif [ -n "$berry_restart_services" ]; then
+elif [ -n "$berry_non_monitoring_restart_services" ]; then
   echo "Restarting affected services:$berry_restart_services"
-  compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 $berry_restart_services
+  case " $berry_non_monitoring_restart_services " in
+    *" worker "*|*" worker-foreground "*)
+      compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 $worker_scale_args $berry_non_monitoring_restart_services
+      worker_scale_reconciled=true
+      ;;
+    *)
+      compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 $berry_non_monitoring_restart_services
+      ;;
+  esac
 fi
 if [ "$berry_caddy_changed" = true ] && [ "$berry_compose_changed" = false ]; then
   compose up -d --no-build --pull never --force-recreate --no-deps --wait --wait-timeout 120 caddy
+fi
+if [ "$berry_prometheus_changed" = true ] && [ "$berry_compose_changed" = false ]; then
+  compose up -d --no-build --pull never --force-recreate --no-deps --wait --wait-timeout 120 alertmanager prometheus
+fi
+if [ "$worker_scale_reconciled" = false ]; then
+  # Reassert capacity on every revision without recreating healthy workers.
+  # This repairs manual scale drift and prevents an unrelated deployment from
+  # silently leaving the foreground pool below its configured replica count.
+  compose up -d --no-build --pull never --no-deps --wait --wait-timeout 120 \
+    $worker_scale_args worker worker-foreground
 fi
 
 domain="$(sed -n 's/^BERRY_DOMAIN=//p' "$env_file" | tail -n 1)"

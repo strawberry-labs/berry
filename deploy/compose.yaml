@@ -116,11 +116,14 @@ services:
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       BERRY_MEM0_PORT: 8010
       BERRY_MEM0_DATABASE_URL: postgres://${BERRY_MEM0_POSTGRES_USER:-mem0}:${BERRY_MEM0_POSTGRES_PASSWORD:-berry-dev-mem0-postgres-password}@mem0-postgres:5432/${BERRY_MEM0_POSTGRES_DB:-mem0}
+      BERRY_MEM0_DATABASE_POOL_MAX: ${BERRY_MEM0_DATABASE_POOL_MAX:-10}
+      BERRY_MEM0_DATABASE_CONNECTION_TIMEOUT_MS: ${BERRY_MEM0_DATABASE_CONNECTION_TIMEOUT_MS:-5000}
+      BERRY_MEM0_DATABASE_IDLE_TIMEOUT_MS: ${BERRY_MEM0_DATABASE_IDLE_TIMEOUT_MS:-30000}
       BERRY_MEM0_API_KEY: ${BERRY_MEM0_API_KEY:-berry-dev-mem0-api-key-change-me}
       BERRY_MEM0_COLLECTION: ${BERRY_MEM0_COLLECTION:-berry_personal_memories}
       BERRY_MEM0_LLM_BASE_URL: ${BERRY_MEM0_LLM_BASE_URL:-${BERRY_ROUTER_INFERENCE_BASE_URL:-}}
       BERRY_MEM0_LLM_API_KEY: ${BERRY_MEM0_LLM_API_KEY:-${BERRY_ROUTER_API_KEY:-}}
-      BERRY_MEM0_LLM_MODEL: ${BERRY_MEM0_LLM_MODEL:-${BERRY_MEMORY_MODEL:-${BERRY_ROUTER_DEFAULT_MODEL:-kimi-2.6}}}
+      BERRY_MEM0_LLM_MODEL: ${BERRY_MEM0_LLM_MODEL:-${BERRY_MEMORY_MODEL:-canopywave/moonshotai/kimi-k2.6}}
       BERRY_MEM0_EMBEDDING_BASE_URL: ${BERRY_MEM0_EMBEDDING_BASE_URL:-${BERRY_EMBEDDING_BASE_URL:-http://embeddings:80/v1}}
       BERRY_MEM0_EMBEDDING_API_KEY: ${BERRY_MEM0_EMBEDDING_API_KEY:-${BERRY_EMBEDDING_API_KEY:-berry-local-embeddings}}
       BERRY_MEM0_EMBEDDING_MODEL: ${BERRY_MEM0_EMBEDDING_MODEL:-${BERRY_EMBEDDING_MODEL:-sentence-transformers/all-mpnet-base-v2}}
@@ -321,6 +324,7 @@ services:
       BERRY_FILE_PRESIGN_SECONDS: ${BERRY_FILE_PRESIGN_SECONDS:-900}
       BERRY_MEMORY_ENABLED: ${BERRY_MEMORY_ENABLED:-true}
       BERRY_IMPLICIT_MEMORY_ENABLED: ${BERRY_IMPLICIT_MEMORY_ENABLED:-true}
+      BERRY_MEMORY_MODEL: ${BERRY_MEMORY_MODEL:-canopywave/moonshotai/kimi-k2.6}
       BERRY_PERSONAL_MEMORY_PROVIDER: ${BERRY_PERSONAL_MEMORY_PROVIDER:-mem0}
       BERRY_MEM0_BASE_URL: ${BERRY_MEM0_BASE_URL:-http://mem0:8010}
       BERRY_MEM0_API_KEY: ${BERRY_MEM0_API_KEY:-berry-dev-mem0-api-key-change-me}
@@ -359,6 +363,8 @@ services:
       dockerfile: Dockerfile
       target: worker
     restart: unless-stopped
+    deploy:
+      replicas: ${BERRY_BACKGROUND_WORKER_REPLICAS:-1}
     command: ["node", "apps/worker/dist/main.js"]
     depends_on:
       api:
@@ -373,10 +379,18 @@ services:
       NODE_ENV: production
       BERRY_DATABASE_URL: postgres://berry_worker:${BERRY_WORKER_DATABASE_PASSWORD:-berry-worker-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
       BERRY_REDIS_URL: redis://redis:6379
+      BERRY_WORKER_ROLE: background
       BERRY_WORKER_CONCURRENCY: ${BERRY_WORKER_CONCURRENCY:-4}
+      BERRY_BACKGROUND_WORKER_CONCURRENCY: ${BERRY_BACKGROUND_WORKER_CONCURRENCY:-4}
+      BERRY_LEGACY_WORKER_CONCURRENCY: ${BERRY_LEGACY_WORKER_CONCURRENCY:-1}
+      BERRY_LEGACY_QUEUE_DRAIN: ${BERRY_LEGACY_QUEUE_DRAIN:-true}
+      BERRY_BACKGROUND_WORKER_DB_POOL_MAX: ${BERRY_BACKGROUND_WORKER_DB_POOL_MAX:-4}
       BERRY_WORKER_READINESS_PORT: 3010
+      BERRY_WORKER_READINESS_HOST: 0.0.0.0
       BERRY_MEMORY_ENABLED: ${BERRY_MEMORY_ENABLED:-true}
       BERRY_IMPLICIT_MEMORY_ENABLED: ${BERRY_IMPLICIT_MEMORY_ENABLED:-true}
+      BERRY_MEMORY_MODEL: ${BERRY_MEMORY_MODEL:-canopywave/moonshotai/kimi-k2.6}
+      BERRY_COMPACTION_MODEL: ${BERRY_COMPACTION_MODEL:-canopywave/moonshotai/kimi-k2.6}
       BERRY_PERSONAL_MEMORY_PROVIDER: ${BERRY_PERSONAL_MEMORY_PROVIDER:-mem0}
       BERRY_MEM0_BASE_URL: ${BERRY_MEM0_BASE_URL:-http://mem0:8010}
       BERRY_MEM0_API_KEY: ${BERRY_MEM0_API_KEY:-berry-dev-mem0-api-key-change-me}
@@ -447,6 +461,64 @@ services:
       retries: 12
       start_period: 20s
 
+  worker-foreground:
+    extends:
+      service: worker
+    deploy:
+      replicas: ${BERRY_FOREGROUND_WORKER_REPLICAS:-5}
+    environment:
+      BERRY_WORKER_ROLE: foreground
+      BERRY_WORKER_CONCURRENCY: ${BERRY_FOREGROUND_WORKER_CONCURRENCY:-20}
+      BERRY_FOREGROUND_WORKER_CONCURRENCY: ${BERRY_FOREGROUND_WORKER_CONCURRENCY:-20}
+      BERRY_FOREGROUND_WORKER_DB_POOL_MAX: ${BERRY_FOREGROUND_WORKER_DB_POOL_MAX:-5}
+      BERRY_LEGACY_QUEUE_DRAIN: "false"
+
+  alertmanager:
+    image: ${BERRY_ALERTMANAGER_IMAGE:-prom/alertmanager:v0.33.1@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d}
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/alertmanager/alertmanager-entrypoint.sh"]
+    environment:
+      BERRY_ALERT_SNS_TOPIC_ARN: ${BERRY_ALERT_SNS_TOPIC_ARN:-}
+      BERRY_ALERT_SNS_REGION: ${BERRY_ALERT_SNS_REGION:-${AWS_REGION:-eu-west-1}}
+      BERRY_ALERTMANAGER_RETENTION: ${BERRY_ALERTMANAGER_RETENTION:-120h}
+    volumes:
+      - ./prometheus/alertmanager-entrypoint.sh:/etc/alertmanager/alertmanager-entrypoint.sh:ro
+      - ./prometheus/alertmanager.fallback.yml:/etc/alertmanager/alertmanager.fallback.yml:ro
+      - ./prometheus/alertmanager.sns.yml:/etc/alertmanager/alertmanager.sns.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:${BERRY_ALERTMANAGER_PORT:-9093}:9093"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9093/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  prometheus:
+    image: ${BERRY_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.5@sha256:332c2f43e7e389d74d3893b55bb02fbbd684208e681eeb604641d5d769c0fe2a}
+    restart: unless-stopped
+    depends_on:
+      alertmanager:
+        condition: service_healthy
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${BERRY_PROMETHEUS_RETENTION:-15d}"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${BERRY_PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
   web:
     image: ${BERRY_WEB_IMAGE:-berry-web:local}
     build:
@@ -489,3 +561,5 @@ volumes:
   api_data:
   caddy_data:
   caddy_config:
+  alertmanager_data:
+  prometheus_data:

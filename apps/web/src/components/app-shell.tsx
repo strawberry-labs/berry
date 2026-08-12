@@ -121,13 +121,13 @@ export function reduceDurableTurnState(
     error: null,
   };
   if (event.kind === "turn.start") {
-    return { ...base, active: true, turnId, runState: "queued", nextAction: "Waiting for a worker slot", error: null };
+    return { ...base, active: true, turnId, runState: "queued", nextAction: "Waiting for worker", error: null };
   }
   if (event.kind === "message.start" || event.kind === "message.delta" || event.kind === "message.end") {
-    return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Generating a response" };
+    return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Calling model" };
   }
   if (event.kind === "tool.start" || event.kind === "tool.update" || event.kind === "tool.end") {
-    return { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Running the current tool" };
+    return { ...base, active: true, runState: "executing_tool", waitingReason: null, nextAction: "Running tool" };
   }
   if (event.kind === "approval.request") {
     return { ...base, active: true, runState: "waiting", waitingReason: "approval", nextAction: "Review the pending action to continue" };
@@ -154,6 +154,16 @@ export function reduceDurableTurnState(
     };
   }
   return base;
+}
+
+export function durableTurnPhase(state: TurnState | undefined): string | undefined {
+  if (!state?.active) return undefined;
+  if (state.nextAction === "Submitting the turn") return "Submitting";
+  if (state.nextAction === "Preparing context" || state.runState === "assembling_context") return "Preparing context";
+  if (state.runState === "queued") return "Waiting for worker";
+  if (state.runState === "calling_model") return "Calling model";
+  if (state.runState === "executing_tool") return "Running tool";
+  return state.nextAction ?? undefined;
 }
 
 export type { ShellData } from "@/lib/shell-data";
@@ -244,6 +254,69 @@ export function isInterruptedTurnAvailable(
 
 export function shouldShowComposerProjectSwitcher(messages: readonly unknown[]): boolean {
   return messages.length === 0;
+}
+
+type ModelSelection = { providerId: string; model: string };
+type ModelSelectionSource = "organization" | "session" | "user";
+
+export function preferredNewChatModel(
+  browserModel: ModelSelection | null,
+  organizationModel: ModelSelection | null,
+  availableModels: readonly { id: string }[],
+): (ModelSelection & { source: "organization" | "user" }) | null {
+  if (
+    browserModel
+    && (
+      !organizationModel
+      || browserModel.providerId !== organizationModel.providerId
+      || availableModels.length === 0
+      || availableModels.some((item) => item.id === browserModel.model)
+    )
+  ) {
+    return { ...browserModel, source: "user" };
+  }
+  return organizationModel ? { ...organizationModel, source: "organization" } : null;
+}
+
+export async function hydratedExistingChatModel(
+  loadedSessionModel: Promise<ModelSelection | null>,
+  explicitSessionModel: () => ModelSelection | null,
+): Promise<(ModelSelection & { source: "session" | "user" }) | null> {
+  const loaded = await loadedSessionModel;
+  const explicit = explicitSessionModel();
+  if (explicit) return { ...explicit, source: "user" };
+  return loaded ? { ...loaded, source: "session" } : null;
+}
+
+export function existingChatTurnModelOverride(
+  explicitSessionModel: ModelSelection | null,
+): { provider?: { id: string }; model?: string } {
+  return explicitSessionModel
+    ? { provider: { id: explicitSessionModel.providerId }, model: explicitSessionModel.model }
+    : {};
+}
+
+export function newChatModelOverride(
+  source: ModelSelectionSource,
+  providerId: string,
+  model: string,
+): { modelProviderId?: string; model?: string } {
+  return source === "user" ? { modelProviderId: providerId, model } : {};
+}
+
+type PendingTurnSubmission = {
+  operationId: string;
+  controller: AbortController;
+  cancelRequested: boolean;
+};
+
+export function prepareTurnCancellation(
+  pending: PendingTurnSubmission | undefined,
+): { operationId?: string } {
+  if (!pending) return {};
+  pending.cancelRequested = true;
+  pending.controller.abort();
+  return { operationId: pending.operationId };
 }
 
 export function AppShell({ initial, user, onSignedOut }: {
@@ -353,14 +426,45 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [providerId, setProviderId] = React.useState(defaultProvider?.id ?? "router");
   const [modelOptions, setModelOptions] = React.useState(defaultProvider?.models ?? []);
   const [model, setModel] = React.useState(defaultProvider?.defaultModel ?? "");
+  const providerIdRef = React.useRef(providerId);
+  const modelRef = React.useRef(model);
+  const organizationModelRef = React.useRef<{ providerId: string; model: string } | null>(null);
+  const browserModelRef = React.useRef<{ providerId: string; model: string } | null>(null);
+  const sessionModelsRef = React.useRef(new Map<string, ModelSelection>());
+  const explicitSessionModelsRef = React.useRef(new Map<string, ModelSelection>());
+  const modelSelectionSourceRef = React.useRef<ModelSelectionSource>("organization");
+  const applyModelSelection = React.useCallback((nextProviderId: string, nextModel: string, source: ModelSelectionSource) => {
+    providerIdRef.current = nextProviderId;
+    modelRef.current = nextModel;
+    modelSelectionSourceRef.current = source;
+    setProviderId(nextProviderId);
+    setModel(nextModel);
+  }, []);
   React.useEffect(() => {
     const storedReasoning = window.localStorage.getItem("berry.web.reasoning");
-    const storedModel = window.localStorage.getItem("berry.web.model");
+    const storedModel = window.localStorage.getItem("berry.web.model")?.trim();
+    const storedProviderId = window.localStorage.getItem("berry.web.modelProviderId")?.trim()
+      || defaultProvider?.id
+      || "router";
     if (storedReasoning === "off" || storedReasoning === "low" || storedReasoning === "medium" || storedReasoning === "high" || storedReasoning === "xhigh") setReasoning(storedReasoning);
-    if (storedModel) setModel(storedModel);
-  }, []);
+    if (storedModel) {
+      browserModelRef.current = { providerId: storedProviderId, model: storedModel };
+      applyModelSelection(storedProviderId, storedModel, "user");
+    }
+  }, [applyModelSelection, defaultProvider?.id]);
   const updateReasoning = React.useCallback((next: ReasoningLevel) => { setReasoning(next); window.localStorage.setItem("berry.web.reasoning", next); }, []);
-  const updateModel = React.useCallback((next: string) => { setModel(next); window.localStorage.setItem("berry.web.model", next); }, []);
+  const updateModel = React.useCallback((next: string) => {
+    const browserSelection = { providerId: providerIdRef.current, model: next };
+    browserModelRef.current = browserSelection;
+    const sessionId = activeTask?.activeSessionId;
+    if (sessionId) {
+      sessionModelsRef.current.set(sessionId, browserSelection);
+      explicitSessionModelsRef.current.set(sessionId, browserSelection);
+    }
+    window.localStorage.setItem("berry.web.modelProviderId", browserSelection.providerId);
+    window.localStorage.setItem("berry.web.model", browserSelection.model);
+    applyModelSelection(providerIdRef.current, next, "user");
+  }, [activeTask?.activeSessionId, applyModelSelection]);
   const [editingTitle, setEditingTitle] = React.useState(false);
   const titleInputRef = React.useRef<HTMLInputElement>(null);
   const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
@@ -418,6 +522,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // paths cannot start two turns for the same prompt.
   const followUpSendInFlightRef = React.useRef(new Set<string>());
   const activeSessionsRef = React.useRef(new Set<string>());
+  const pendingSubmissionsRef = React.useRef(new Map<string, PendingTurnSubmission>());
   const pendingRequestMessageIdsBySessionRef = React.useRef(new Map<string, Set<string>>());
   const activeSessionId = activeTask?.activeSessionId ?? null;
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
@@ -678,9 +783,22 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (catalogResult.status === "fulfilled" && catalogResult.value) {
           const catalog = catalogResult.value;
           setImageGenerationCapability(catalog.capabilities.imageGeneration);
-          setProviderId(catalog.providerId);
           setModelOptions(catalog.models.map((item) => ({ id: item.id, name: item.name ?? item.id, capabilities: resolveModelCapabilities(item) })));
-          setModel((current) => catalog.models.some((item) => item.id === current) ? current : catalog.defaultModel);
+          organizationModelRef.current = { providerId: catalog.providerId, model: catalog.defaultModel };
+          if (modelSelectionSourceRef.current === "organization") {
+            applyModelSelection(catalog.providerId, catalog.defaultModel, "organization");
+          } else if (modelSelectionSourceRef.current === "user") {
+            const browserModel = browserModelRef.current;
+            const browserModelRetiredFromCurrentProvider = browserModel
+              && browserModel.providerId === catalog.providerId
+              && !catalog.models.some((item) => item.id === browserModel.model);
+            if (browserModelRetiredFromCurrentProvider) {
+              browserModelRef.current = null;
+              window.localStorage.removeItem("berry.web.modelProviderId");
+              window.localStorage.removeItem("berry.web.model");
+              applyModelSelection(catalog.providerId, catalog.defaultModel, "organization");
+            }
+          }
           setConfig((current) => WebConfigSchema.parse({
             ...current,
             providers: [{
@@ -717,7 +835,44 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (errors.length > 0) setResourceError("tasks", errors.join(". "));
       });
     return () => { cancelled = true; };
-  }, [client, tasksLoaded]);
+  }, [applyModelSelection, client, tasksLoaded]);
+
+  React.useEffect(() => {
+    const sessionId = activeTask?.activeSessionId;
+    if (!client || !sessionId) return;
+    let cancelled = false;
+    const cachedSessionModel = sessionModelsRef.current.get(sessionId) ?? null;
+    const loadedSessionModel = cachedSessionModel
+      ? Promise.resolve(cachedSessionModel)
+      : client.getSession(sessionId).then((session) => {
+          const loaded = session.modelProviderId && session.model
+            ? { providerId: session.modelProviderId, model: session.model }
+            : null;
+          if (loaded) sessionModelsRef.current.set(sessionId, loaded);
+          return loaded;
+        });
+    void hydratedExistingChatModel(
+      loadedSessionModel,
+      () => explicitSessionModelsRef.current.get(sessionId) ?? null,
+    )
+      .then((selection) => {
+        if (cancelled || !selection) return;
+        sessionModelsRef.current.set(sessionId, selection);
+        applyModelSelection(selection.providerId, selection.model, selection.source);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [activeTask?.activeSessionId, applyModelSelection, client]);
+
+  React.useEffect(() => {
+    if (shellLocation.kind === "task") return;
+    const preferredModel = preferredNewChatModel(browserModelRef.current, organizationModelRef.current, modelOptions);
+    if (preferredModel) {
+      applyModelSelection(preferredModel.providerId, preferredModel.model, preferredModel.source);
+    } else {
+      modelSelectionSourceRef.current = "organization";
+    }
+  }, [applyModelSelection, modelOptions, shellLocation.kind]);
 
   React.useEffect(() => {
     if (shellLocation.kind !== "task") {
@@ -756,14 +911,23 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     const title = options?.title?.trim().slice(0, 80) || "New cloud task";
     if (client) {
       try {
+        const preferredModel = preferredNewChatModel(browserModelRef.current, organizationModelRef.current, modelOptions);
         const created = await client.createTask({
           workspaceId: activeWorkspaceId,
           conversationKind: "chat",
           title,
           permissionMode,
-          modelProviderId: providerId,
-          model,
+          ...(preferredModel
+            ? newChatModelOverride(preferredModel.source, preferredModel.providerId, preferredModel.model)
+            : {}),
         });
+        if (created.session.modelProviderId && created.session.model) {
+          sessionModelsRef.current.set(created.session.id, {
+            providerId: created.session.modelProviderId,
+            model: created.session.model,
+          });
+          applyModelSelection(created.session.modelProviderId, created.session.model, "session");
+        }
         setTasks((current) => [created.task, ...current]);
         navigateToTask(created.task.id);
         return created.task;
@@ -799,7 +963,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     setTasks((current) => [task, ...current]);
     navigateToTask(id);
     return task;
-  }, [activeWorkspaceId, client, model, navigateToTask, providerId, tasks.length]);
+  }, [activeWorkspaceId, applyModelSelection, client, modelOptions, navigateToTask, permissionMode, tasks.length]);
 
   // Turns belong to sessions, not to the currently rendered task. Keep every
   // active SSE reader at shell scope so navigation only changes which stream
@@ -1024,6 +1188,18 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   ) => {
     if (!client || !task.activeSessionId) return;
     const sessionId = task.activeSessionId;
+    const operationId = params.continueInterruptedTurn === true
+      ? globalThis.crypto.randomUUID()
+      : params.requestMessageId ?? globalThis.crypto.randomUUID();
+    const submission = {
+      operationId,
+      controller: new AbortController(),
+      cancelRequested: false,
+    };
+    pendingSubmissionsRef.current.set(sessionId, submission);
+    const turnModelOverride = existingChatTurnModelOverride(
+      explicitSessionModelsRef.current.get(sessionId) ?? null,
+    );
     const taskWorkspacePath = workspaces.find((workspace) => workspace.id === task.workspaceId)?.path ?? initial.config.workspacePath;
     setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
     setStartingSessions((current) => new Set(current).add(sessionId));
@@ -1042,14 +1218,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       error: null,
     });
     const request = {
-      operationId: params.continueInterruptedTurn === true
-        ? globalThis.crypto.randomUUID()
-        : params.requestMessageId ?? globalThis.crypto.randomUUID(),
+      operationId,
       workspacePath: taskWorkspacePath,
       workspaceId: task.workspaceId,
       permissionMode,
-      provider: { id: providerId },
-      model,
+      ...turnModelOverride,
       reasoning,
       ...(params.continueInterruptedTurn
         ? { continueInterruptedTurn: true as const }
@@ -1069,8 +1242,21 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       // belongs inside this try/finally so an initial SSE failure cannot leave
       // a phantom active turn in browser state.
       await attachSessionStream(sessionId);
+      if (submission.cancelRequested) return;
+      applyDurableState(sessionId, {
+        active: true,
+        turnId: pendingTurnId,
+        bufferedEvents: [],
+        replayOnly: false,
+        owner: null,
+        runState: "assembling_context",
+        waitingReason: null,
+        nextAction: "Preparing context",
+        error: null,
+      });
       submissionAttempted = true;
-      const started = await client.startTurn(sessionId, request);
+      const started = await client.startTurn(sessionId, request, { signal: submission.controller.signal });
+      if (submission.cancelRequested) return;
       // A stale terminal event can close the pre-admission EventSource while
       // POST /turns is in flight. Reassert ownership after the server accepts
       // this run and reopen the stream from the cursor that event supplied.
@@ -1084,11 +1270,16 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         owner: null,
         runState: "queued",
         waitingReason: null,
-        nextAction: "Waiting for a worker slot",
+        nextAction: "Waiting for worker",
         error: null,
       });
       void attachSessionStream(sessionId).catch(() => undefined);
     } catch (cause) {
+      if (submission.cancelRequested) {
+        activeSessionsRef.current.delete(sessionId);
+        stopSessionConnection(sessionId);
+        return;
+      }
       if (submissionAttempted) {
         const activeConflict = await activeTurnStateAfterConflict(client, sessionId, cause).catch(() => null);
         if (activeConflict) {
@@ -1121,6 +1312,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       if (submissionAttempted && shouldConfirmTurnAdmission(cause)) {
         try {
           const recovered = await retryTurnAdmission(client, sessionId, request);
+          if (submission.cancelRequested) return;
           if (recovered.state) {
             applyDurableState(sessionId, recovered.state);
           } else {
@@ -1147,6 +1339,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           }
           return;
         } catch {
+          if (submission.cancelRequested) return;
           // Fall through to the original start error when acceptance cannot
           // be confirmed.
         }
@@ -1165,21 +1358,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       await refreshSessionMessages(sessionId).catch(() => undefined);
       throw error;
     } finally {
+      if (pendingSubmissionsRef.current.get(sessionId) === submission) {
+        pendingSubmissionsRef.current.delete(sessionId);
+      }
       setStartingSessions((current) => {
         const next = new Set(current);
         next.delete(sessionId);
         return next;
       });
     }
-  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, model, permissionMode, providerId, reasoning, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionFollowUps, updateSessionStream, workspaces]);
+  }, [applyDurableState, attachSessionStream, clearPendingRequestMessage, client, initial.config.workspacePath, permissionMode, reasoning, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateDurableStateFromEvent, updateSessionFollowUps, updateSessionStream, workspaces]);
 
   const cancelTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
     if (!sessionId) return;
+    const pending = pendingSubmissionsRef.current.get(sessionId);
+    const cancellation = prepareTurnCancellation(pending);
     try {
       if (client) {
-        const result = await client.cancelTurn(sessionId);
-        if (!result.ok) throw new Error("The active turn could not be cancelled.");
+        await client.cancelTurn(sessionId, cancellation);
       }
       stopSessionConnection(sessionId);
       // cancelTurn commits its terminal event before returning. The next turn
@@ -1532,8 +1729,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
 
     requestThreadBottom(sessionId);
-    const cancelled = await client.cancelTurn(sessionId);
-    if (!cancelled.ok) throw new Error("The active turn could not be interrupted.");
+    const pending = pendingSubmissionsRef.current.get(sessionId);
+    await client.cancelTurn(sessionId, prepareTurnCancellation(pending));
 
     // The cancelled turn must no longer own the live tail before rendering the
     // next user prompt. listMessages waits for server-side projection writes.
@@ -2180,6 +2377,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onRegenerateGeneratedImage={regenerateGeneratedImage}
               editTurn={activeTask.activeSessionId ? editTurn : undefined}
               recoveryRequired={durableState?.runState === "recovery_required"}
+              activeStatus={durableTurnPhase(durableState)}
               cancelTurn={cancelTurn}
               onViewTaskFiles={() => setTaskFilesOpen(true)}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}

@@ -36,6 +36,7 @@ import {
   DURABLE_CONTEXT_TABLES,
   DURABLE_TURN_BINDINGS_MIGRATION,
   DURABLE_TURN_QUESTIONS_MIGRATION,
+  DEEP_RESEARCH_SKILL_MIGRATION,
   ENTERPRISE_IDENTITY_MIGRATION,
   ENTERPRISE_IDENTITY_TABLES,
   ENTERPRISE_IDENTITY_TENANT_SCOPED_TABLES,
@@ -69,6 +70,8 @@ import {
   SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION,
   KNOWLEDGE_VECTOR_HNSW_MIGRATION,
   SESSION_COMPACTION_LEASES_MIGRATION,
+  SKILL_PACKAGE_FILES_MIGRATION,
+  TURN_ADMISSION_INTENTS_MIGRATION,
   PERSONAL_CAPABILITIES_MIGRATION,
   ORG_CAPABILITIES_MIGRATION,
   TWO_PROFILE_MODEL_GOVERNANCE_MIGRATION,
@@ -180,7 +183,34 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]);
+  });
+
+  it("stores personal and organization skill package files with tenant isolation", () => {
+    expect(SKILL_PACKAGE_FILES_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS personal_skill_files");
+    expect(SKILL_PACKAGE_FILES_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS organization_skill_files");
+    expect(SKILL_PACKAGE_FILES_MIGRATION).toContain("content bytea NOT NULL");
+    expect(SKILL_PACKAGE_FILES_MIGRATION).toContain("personal_skill_files_tenant_isolation");
+    expect(SKILL_PACKAGE_FILES_MIGRATION).toContain("organization_skill_files_tenant_isolation");
+    expect(cloudMigrations.find((migration) => migration.id === 50)).toMatchObject({ id: 50, name: "skill_package_files_v1" });
+    expect(cloudMigrations.find((migration) => migration.id === 51)).toMatchObject({ id: 51, name: "turn_admission_intents_v1" });
+    expect(TURN_ADMISSION_INTENTS_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS turn_admission_intents");
+    expect(TURN_ADMISSION_INTENTS_MIGRATION).toContain("FORCE ROW LEVEL SECURITY");
+  });
+
+  it("renames the legacy organization research skill without deleting its package", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 52)).toMatchObject({
+      id: 52,
+      name: "deep_research_skill_v1",
+    });
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("capability_id = 'research'");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("capability_id = 'deep-research'");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("name: deep-research");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("[^\\n\\r]*\\r?$");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("INSERT INTO capability_user_overrides");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("FROM organization_skill_files");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).toContain("SET assignment = 'blocked'");
+    expect(DEEP_RESEARCH_SKILL_MIGRATION).not.toMatch(/DELETE FROM organization_(?:capabilities|skill_files)/);
   });
 
   it("adds inherited organization, department, and member base allowances", () => {

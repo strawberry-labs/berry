@@ -114,4 +114,34 @@ describe("DurablePersonalSkillToolExecutor", () => {
       expect.arrayContaining([content]),
     );
   });
+
+  it("persists scripts and assets from a workspace skill package", async () => {
+    const content = "---\nname: packaged-skill\ndescription: Uses a retained template and script\n---\n\nRun scripts/build.py with assets/template.docx.";
+    const execute = vi.fn(async () => undefined);
+    const base: DurableTurnToolExecutor = {
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+      readSkillPackage: vi.fn(async () => [
+        { path: "SKILL.md", contentBase64: Buffer.from(content).toString("base64"), mode: 0o644 },
+        { path: "scripts/build.py", contentBase64: Buffer.from("print('ok')\n").toString("base64"), mode: 0o755 },
+        { path: "assets/template.docx", contentBase64: Buffer.from("docx-bytes").toString("base64"), mode: 0o644 },
+      ]),
+    };
+    const tools = new DurablePersonalSkillToolExecutor(base, { execute, query: vi.fn(async () => []) });
+
+    await expect(tools.execute({ tenantId: "tenant", userId: "user" } as never, {
+      id: "step_package",
+      type: "tool.save_personal_skill",
+      input: { toolName: "save_personal_skill", arguments: { path: "/workspace/skills/packaged-skill" } },
+    } as never)).resolves.toMatchObject({
+      output: { skill: { name: "packaged-skill", resources: ["scripts/build.py", "assets/template.docx"] } },
+    });
+    expect(execute).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO personal_skill_files"),
+      expect.arrayContaining(["scripts/build.py", 0o755]),
+    );
+    expect(execute).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO personal_skill_files"),
+      expect.arrayContaining(["assets/template.docx", 0o644]),
+    );
+  });
 });

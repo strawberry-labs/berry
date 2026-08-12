@@ -18,11 +18,11 @@ const job: CompactionJobPayload = {
 };
 
 describe("durable session compactor", () => {
-  it("uses the governed router provider id for compaction by default", () => {
+  it("uses the tool-capable compaction model instead of inheriting the chat default", () => {
     const generator = createCheckpointGenerator({
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_API_KEY: "test-key",
-      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/moonshotai/kimi-k2.6",
+      BERRY_ROUTER_DEFAULT_MODEL: "canopywave/deepseek/deepseek-v4-flash",
       BERRY_ROUTER_PROVIDER_ID: "router",
     });
 
@@ -39,9 +39,13 @@ describe("durable session compactor", () => {
       BERRY_ROUTER_DEFAULT_MODEL: "chat-model",
       BERRY_ROUTER_PROVIDER_ID: "router",
       BERRY_COMPACTION_PROVIDER: "dedicated-compactor",
+      BERRY_COMPACTION_MODEL: "dedicated-compaction-model",
     });
 
-    expect(generator?.provider).toBe("dedicated-compactor");
+    expect(generator).toMatchObject({
+      provider: "dedicated-compactor",
+      model: "dedicated-compaction-model",
+    });
   });
 
   it("checks governance against the compaction provider and model actually selected", async () => {

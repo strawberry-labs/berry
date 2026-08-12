@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { BadRequestException, Body, Controller, Get, Inject, Module, NotFoundException, Param, Post, Query, Res, type DynamicModule } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Get, Header, Inject, Module, NotFoundException, Param, Post, Query, Res, type DynamicModule } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import type { NestExpressApplication } from "@nestjs/platform-express";
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -63,6 +63,7 @@ import { ConnectorsService } from "./connectors/connectors.service.ts";
 import { SetupService } from "./setup/setup.service.ts";
 import { s3ClientOptions, s3PresignClientOptions } from "./storage/s3-client-options.ts";
 import { ArtifactListQuerySchema } from "./storage/artifact-pagination.ts";
+import { apiRuntimeMetrics } from "./runtime/runtime-metrics.ts";
 
 @Controller()
 @PublicAuth()
@@ -78,6 +79,12 @@ export class HealthController {
   async ready() {
     await this.database.ping();
     return { ok: true, service: "berry-api", ready: true };
+  }
+
+  @Get("/metrics")
+  @Header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+  metrics(): string {
+    return apiRuntimeMetrics.render();
   }
 }
 

@@ -19,7 +19,15 @@ describe("Agent Skills imports", () => {
     ].join("\n");
 
     expect(parseAgentSkillMarkdown(content)).toMatchObject({ name: "release-notes", version: "1.2.0", compatibility: "Requires git" });
-    const result = await new PersonalCapabilitiesService().previewSkill({ content, source: "upload", packageFiles: ["SKILL.md", "scripts/check.sh", "references/style.md"] });
+    const result = await new PersonalCapabilitiesService().previewSkill({
+      content,
+      source: "upload",
+      packageFiles: ["SKILL.md", "scripts/check.sh", "references/style.md"],
+      resourceFiles: [
+        { path: "scripts/check.sh", contentBase64: Buffer.from("#!/bin/sh\n").toString("base64"), mode: 0o755 },
+        { path: "references/style.md", contentBase64: Buffer.from("Concise.").toString("base64") },
+      ],
+    });
     expect(result.review).toMatchObject({ name: "release-notes", version: "1.2.0", hasScripts: true, resources: ["references/style.md", "scripts/check.sh"] });
     expect(result.review.warnings).toContain("This skill package includes executable scripts. Inspect them before use.");
   });

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { BullMqBerryQueueClient, createBerryQueue } from "./bullmq.js";
+import { createBerryQueueRouter } from "./bullmq.js";
 import {
   ContextBackfillJobPayloadSchema,
   RetentionCleanupJobPayloadSchema,
@@ -54,7 +54,7 @@ export async function runMaintenanceCli(argv: string[], env: NodeJS.ProcessEnv =
   const batchSize = numberArg(args.batch, 100);
   const requestedByUserId = args["requested-by"] ? UuidSchema.parse(args["requested-by"]) : undefined;
   const redisUrl = env.BERRY_REDIS_URL ?? env.REDIS_URL;
-  const queue = new BullMqBerryQueueClient(createBerryQueue(redisUrl ? { redisUrl } : {}));
+  const queue = createBerryQueueRouter(redisUrl ? { redisUrl } : {});
   try {
     if (command === "backfill" || command === "verify_file_blobs") {
       const payload = ContextBackfillJobPayloadSchema.parse({

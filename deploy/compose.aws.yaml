@@ -31,3 +31,7 @@ services:
   worker:
     environment:
       BERRY_DATABASE_URL: ${BERRY_WORKER_DATABASE_URL:?BERRY_WORKER_DATABASE_URL must use the RDS berry_worker role}
+
+  worker-foreground:
+    environment:
+      BERRY_DATABASE_URL: ${BERRY_WORKER_DATABASE_URL:?BERRY_WORKER_DATABASE_URL must use the RDS berry_worker role}

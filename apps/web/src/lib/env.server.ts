@@ -568,7 +568,7 @@ const DEFAULT_CONFIG: WebConfig = {
   ],
   skills: [
     { id: "review", name: "review", description: "Read-only review pass for code and product docs", enabled: true },
-    { id: "research", name: "research", description: "Collect sources and produce a cited brief", enabled: true },
+    { id: "deep-research", name: "deep-research", description: "Conduct extensive multi-source research when explicitly requested", enabled: true },
   ],
 };
 

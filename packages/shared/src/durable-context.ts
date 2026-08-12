@@ -201,6 +201,8 @@ export const GroundingContextSchema = z.object({
       "knowledge_disabled",
       "memory_disabled",
       "personal_memory_unavailable",
+      "context_timeout",
+      "context_unavailable",
     ]).default("none"),
   }),
 });

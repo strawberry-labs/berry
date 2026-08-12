@@ -1,4 +1,5 @@
 import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
+import { BERRY_ROUTER_METADATA_KEY, RouterClientError } from "@berry/router-client";
 import { describe, expect, it } from "vitest";
 import {
   AnthropicMessagesAdapter,
@@ -9,6 +10,8 @@ import {
   createProviderStreamFn,
   FallbackChatCompletionClient,
   OpenAIResponsesAdapter,
+  providerErrorFromAssistantMessage,
+  routerRequestIdFromAssistantMessage,
 } from "./model.ts";
 import { joinStableAndDynamicPrompt } from "./prompt-cache.ts";
 
@@ -218,12 +221,61 @@ describe("OpenAIResponsesAdapter", () => {
 
   it("surfaces response.failed as an error event with redacted text", async () => {
     const adapter = new OpenAIResponsesAdapter({
-      client: fakeClient([{ type: "response.failed", response: { error: { message: "denied for Bearer sk-secret-123" } } }]),
+      client: fakeClient([{
+        type: "response.failed",
+        response: { error: { message: "denied for Bearer sk-secret-123", type: "invalid_request_error" } },
+        [BERRY_ROUTER_METADATA_KEY]: { requestId: "responses-request-failed" },
+      }]),
     });
     const events = await collect(adapter.stream(createBerryModel(responsesProvider), { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, undefined));
     const last = events.at(-1);
     if (last?.type !== "error") throw new Error("expected error event");
     expect(last.error.errorMessage).not.toContain("sk-secret-123");
+    expect(providerErrorFromAssistantMessage(last.error)).toMatchObject({
+      name: "RouterClientError",
+      status: 400,
+      code: "invalid_request_error",
+      requestId: "responses-request-failed",
+    });
+  });
+
+  it("preserves the original Responses transport error and successful identifiers", async () => {
+    const failure = new RouterClientError("temporarily unavailable", 503, "sensitive", {
+      code: "upstream_unavailable",
+      requestId: "responses-request-503",
+    });
+    const failing = new OpenAIResponsesAdapter({
+      client: {
+        async *streamEvents(): AsyncGenerator<Record<string, unknown>> {
+          throw failure;
+        },
+      },
+    });
+    const failedEvents = await collect(failing.stream(
+      createBerryModel(responsesProvider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      undefined,
+    ));
+    const failed = failedEvents.at(-1);
+    if (failed?.type !== "error") throw new Error("expected error event");
+    expect(providerErrorFromAssistantMessage(failed.error)).toBe(failure);
+
+    const successful = new OpenAIResponsesAdapter({
+      client: fakeClient([{
+        type: "response.completed",
+        response: { id: "resp-success", model: "gpt-served" },
+        [BERRY_ROUTER_METADATA_KEY]: { requestId: "responses-request-success" },
+      }]),
+    });
+    const successEvents = await collect(successful.stream(
+      createBerryModel(responsesProvider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      undefined,
+    ));
+    const success = successEvents.at(-1);
+    if (success?.type !== "done") throw new Error("expected done event");
+    expect(success.message).toMatchObject({ responseId: "resp-success", responseModel: "gpt-served" });
+    expect(routerRequestIdFromAssistantMessage(success.message)).toBe("responses-request-success");
   });
 });
 
@@ -312,6 +364,50 @@ describe("Ollama adapter", () => {
 });
 
 describe("AnthropicMessagesAdapter", () => {
+  it("preserves the original Anthropic transport error and successful identifiers", async () => {
+    const failure = new RouterClientError("rate limited", 429, "sensitive", {
+      code: "rate_limit_error",
+      requestId: "anthropic-request-429",
+    });
+    const failing = new AnthropicMessagesAdapter({
+      client: {
+        async *streamEvents(): AsyncGenerator<Record<string, unknown>> {
+          throw failure;
+        },
+      },
+    });
+    const failedEvents = await collect(failing.stream(
+      createBerryModel(anthropicProvider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      undefined,
+    ));
+    const failed = failedEvents.at(-1);
+    if (failed?.type !== "error") throw new Error("expected error event");
+    expect(providerErrorFromAssistantMessage(failed.error)).toBe(failure);
+
+    const successful = new AnthropicMessagesAdapter({
+      client: fakeClient([{
+        type: "message_start",
+        message: { id: "msg-success", model: "claude-served", usage: { input_tokens: 1 } },
+        [BERRY_ROUTER_METADATA_KEY]: { requestId: "anthropic-request-success" },
+      }, {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 1 },
+        [BERRY_ROUTER_METADATA_KEY]: { requestId: "anthropic-request-success" },
+      }]),
+    });
+    const successEvents = await collect(successful.stream(
+      createBerryModel(anthropicProvider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      undefined,
+    ));
+    const success = successEvents.at(-1);
+    if (success?.type !== "done") throw new Error("expected done event");
+    expect(success.message).toMatchObject({ responseId: "msg-success", responseModel: "claude-served" });
+    expect(routerRequestIdFromAssistantMessage(success.message)).toBe("anthropic-request-success");
+  });
+
   it("marks stable Anthropic blocks cacheable but leaves dynamic grounding unmarked", async () => {
     const capture: { body?: Record<string, unknown> } = {};
     const provider = {

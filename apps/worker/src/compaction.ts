@@ -521,7 +521,11 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
 export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGenerator | null {
   const baseUrl = env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim();
   const apiKey = env.BERRY_ROUTER_API_KEY?.trim();
-  const model = env.BERRY_COMPACTION_MODEL?.trim() || env.BERRY_ROUTER_DEFAULT_MODEL?.trim();
+  // Checkpoint generation forces a structured tool call. Keep it isolated from
+  // the chat default, which an administrator may change to a model that cannot
+  // satisfy that contract during a provider incident.
+  const model = env.BERRY_COMPACTION_MODEL?.trim()
+    || "canopywave/moonshotai/kimi-k2.6";
   if (!baseUrl || !apiKey || !model) return null;
   const provider = env.BERRY_COMPACTION_PROVIDER?.trim()
     || env.BERRY_ROUTER_PROVIDER_ID?.trim()

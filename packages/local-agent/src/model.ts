@@ -223,6 +223,7 @@ export class BufferedChatCompletionClient implements ChatCompletionStreamClient 
       finishReason: result.finishReason,
       ...(result.usage ? { usage: result.usage } : {}),
       ...(result.attribution ? { attribution: result.attribution } : {}),
+      ...(result.requestId ? { requestId: result.requestId } : {}),
       raw: result.raw,
     };
   }
@@ -307,9 +308,13 @@ export type BerryPromptCacheMetadata = PromptCacheRequest & {
   cacheCreationTokens5m: number;
 };
 
+const BERRY_PROVIDER_ERROR = Symbol("berry.providerError");
+
 export type BerryAssistantMessage = AssistantMessage & {
   berryRouterAttribution?: RouterAttribution;
   berryPromptCache?: BerryPromptCacheMetadata;
+  berryRouterRequestId?: string;
+  [BERRY_PROVIDER_ERROR]?: unknown;
 };
 
 function applyRouterAttribution(message: AssistantMessage, attribution: RouterAttribution | undefined): void {
@@ -318,6 +323,31 @@ function applyRouterAttribution(message: AssistantMessage, attribution: RouterAt
 
 function applyPromptCache(message: AssistantMessage, promptCache: BerryPromptCacheMetadata): void {
   (message as BerryAssistantMessage).berryPromptCache = promptCache;
+}
+
+function applyRouterStreamMetadata(
+  message: AssistantMessage,
+  metadata: BerryRouterStreamMetadata | undefined,
+): void {
+  applyRouterAttribution(message, metadata?.attribution);
+  if (metadata?.requestId) (message as BerryAssistantMessage).berryRouterRequestId = metadata.requestId;
+}
+
+function applyProviderError(message: AssistantMessage, error: unknown): void {
+  Object.defineProperty(message, BERRY_PROVIDER_ERROR, {
+    value: error,
+    configurable: true,
+  });
+}
+
+/** Returns the original in-process provider error without serializing its body. */
+export function providerErrorFromAssistantMessage(message: AssistantMessage): unknown {
+  return (message as BerryAssistantMessage)[BERRY_PROVIDER_ERROR];
+}
+
+/** Returns the sanitized request identifier carried by a streaming transport. */
+export function routerRequestIdFromAssistantMessage(message: AssistantMessage): string | undefined {
+  return (message as BerryAssistantMessage).berryRouterRequestId;
 }
 
 function observeCacheRead(promptCache: BerryPromptCacheMetadata, cacheReadTokens: number): void {
@@ -331,6 +361,59 @@ function redactSecrets(text: string): string {
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
     .replace(/x-api-key["':\s]+[\w-]+/gi, "x-api-key [redacted]")
     .replace(/([?&](?:key|apiKey|api_key|token|secret)=)[^&\s"']+/gi, "$1[redacted]");
+}
+
+function providerStreamEventError(event: Record<string, unknown>, fallback: string): RouterClientError {
+  const response = recordValue(event.response);
+  const detail = recordValue(response?.error) ?? recordValue(event.error) ?? event;
+  const code = diagnosticValue(detail.code) ?? diagnosticValue(detail.type);
+  const explicitStatus = validHttpStatus(detail.status)
+    ?? validHttpStatus(detail.status_code)
+    ?? validHttpStatus(response?.status)
+    ?? validHttpStatus(event.status);
+  const metadata = event[BERRY_ROUTER_METADATA_KEY] as BerryRouterStreamMetadata | undefined;
+  return new RouterClientError(
+    stringValue(detail.message) ?? fallback,
+    explicitStatus ?? providerStatusFromCode(code),
+    undefined,
+    {
+      ...(code ? { code } : {}),
+      ...(metadata?.requestId ? { requestId: metadata.requestId } : {}),
+    },
+  );
+}
+
+function providerStatusFromCode(code: string | undefined): number | undefined {
+  const normalized = code?.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "invalid_request_error") return 400;
+  if (normalized === "authentication_error") return 401;
+  if (normalized === "permission_error") return 403;
+  if (normalized === "not_found_error") return 404;
+  if (normalized === "request_too_large") return 413;
+  if (normalized === "rate_limit_error") return 429;
+  if (normalized === "api_error" || normalized === "server_error") return 500;
+  if (normalized === "overloaded_error") return 529;
+  return undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function diagnosticValue(value: unknown): string | undefined {
+  return typeof value === "string" || typeof value === "number" ? String(value) : undefined;
+}
+
+function validHttpStatus(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined;
 }
 
 function flattenContentToText(content: string | Array<TextContent | ImageContent>): string {
@@ -646,6 +729,7 @@ export class BerryModelAdapter {
       const aborted = options?.signal?.aborted === true;
       message.stopReason = aborted ? "aborted" : "error";
       message.errorMessage = redactSecrets(error instanceof Error ? error.message : String(error));
+      applyProviderError(message, error);
       stream.push({ type: "error", reason: message.stopReason, error: message });
     }
   }
@@ -815,7 +899,12 @@ export class OpenAIResponsesAdapter {
       for await (const event of this.#client.streamEvents(body, options?.signal, providerHeaderMetadata(options?.metadata))) {
         if (options?.signal?.aborted) throw new Error("aborted");
         const routerMetadata = event[BERRY_ROUTER_METADATA_KEY] as BerryRouterStreamMetadata | undefined;
-        applyRouterAttribution(message, routerMetadata?.attribution);
+        applyRouterStreamMetadata(message, routerMetadata);
+        const response = recordValue(event.response);
+        const responseId = stringValue(response?.id);
+        if (responseId) message.responseId = responseId;
+        const responseModel = stringValue(response?.model);
+        if (responseModel) message.responseModel = responseModel;
         if (routerMetadata?.usage) {
           const cacheRead = routerMetadata.usage.cacheReadTokens ?? 0;
           const cacheWrite = routerMetadata.usage.cacheWriteTokens ?? 0;
@@ -927,8 +1016,7 @@ export class OpenAIResponsesAdapter {
           continue;
         }
         if (type === "response.failed" || type === "error") {
-          const errorInfo = (event.response as { error?: { message?: string } } | undefined)?.error ?? (event as { message?: string });
-          throw new Error(typeof errorInfo?.message === "string" ? errorInfo.message : "Provider stream failed");
+          throw providerStreamEventError(event, "Provider stream failed");
         }
         // Other event types (response.created, deltas we don't render, pings)
         // are intentionally ignored.
@@ -958,6 +1046,7 @@ export class OpenAIResponsesAdapter {
       const aborted = options?.signal?.aborted === true;
       message.stopReason = aborted ? "aborted" : "error";
       message.errorMessage = redactSecrets(error instanceof Error ? error.message : String(error));
+      applyProviderError(message, error);
       stream.push({ type: "error", reason: message.stopReason, error: message });
     }
   }
@@ -1146,9 +1235,13 @@ export class AnthropicMessagesAdapter {
 
       for await (const event of this.#client.streamEvents(body, options?.signal, providerHeaderMetadata(options?.metadata))) {
         if (options?.signal?.aborted) throw new Error("aborted");
+        const routerMetadata = event[BERRY_ROUTER_METADATA_KEY] as BerryRouterStreamMetadata | undefined;
+        applyRouterStreamMetadata(message, routerMetadata);
         const type = typeof event.type === "string" ? event.type : "";
         if (type === "message_start") {
-          const usage = (event.message as {
+          const response = event.message as {
+            id?: string;
+            model?: string;
             usage?: {
               input_tokens?: number;
               cache_read_input_tokens?: number;
@@ -1158,7 +1251,10 @@ export class AnthropicMessagesAdapter {
                 ephemeral_5m_input_tokens?: number;
               };
             };
-          } | undefined)?.usage;
+          } | undefined;
+          if (response?.id) message.responseId = response.id;
+          if (response?.model) message.responseModel = response.model;
+          const usage = response?.usage;
           if (usage) {
             message.usage.input = usage.input_tokens ?? 0;
             message.usage.cacheRead = usage.cache_read_input_tokens ?? 0;
@@ -1244,8 +1340,7 @@ export class AnthropicMessagesAdapter {
           continue;
         }
         if (type === "error") {
-          const errorInfo = event.error as { message?: string } | undefined;
-          throw new Error(typeof errorInfo?.message === "string" ? errorInfo.message : "Provider stream failed");
+          throw providerStreamEventError(event, "Provider stream failed");
         }
         // message_stop, ping, and unknown event types need no handling.
       }
@@ -1258,6 +1353,7 @@ export class AnthropicMessagesAdapter {
       const aborted = options?.signal?.aborted === true;
       message.stopReason = aborted ? "aborted" : "error";
       message.errorMessage = redactSecrets(error instanceof Error ? error.message : String(error));
+      applyProviderError(message, error);
       stream.push({ type: "error", reason: message.stopReason, error: message });
     }
   }
@@ -1300,6 +1396,7 @@ export function createBerryModels(streamFn: StreamFn, models: Array<Model<Api>>)
             errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
             timestamp: Date.now(),
           };
+          applyProviderError(failure, error);
           stream.push({ type: "error", reason: "error", error: failure });
         }
       })();

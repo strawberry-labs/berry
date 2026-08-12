@@ -10,8 +10,9 @@ personal Skills library with `save_personal_skill`.
 
 ## Berry skill contract
 
-A Berry skill is a `SKILL.md` document with YAML frontmatter followed by
-Markdown instructions. The frontmatter must contain exactly these core fields:
+A Berry skill is a directory package with a required `SKILL.md` entry point and
+optional `scripts/`, `references/`, `assets/`, and other supporting files. The
+frontmatter must contain exactly these core fields:
 
 ```yaml
 ---
@@ -34,6 +35,13 @@ Follow these rules:
   a skill.
 - Do not include Claude-specific commands, paths, terminology, hooks, agents,
   or evaluation tools.
+- Keep reusable source files in the package. Never flatten scripts, templates,
+  examples, brand assets, or reference documents into `SKILL.md` merely to fit
+  the save tool.
+- Never hardcode a task-scoped attachment path such as
+  `/workspace/inputs/<file-id>/template.docx`. Copy retained inputs into the
+  skill package under a stable relative path such as
+  `assets/templates/template.docx` and reference that relative path.
 
 ## Workflow
 
@@ -53,6 +61,11 @@ more information. Ask only for choices that materially change the resulting
 skill. If the user's request is already specific enough, proceed without an
 extra confirmation round.
 
+Inventory all supplied inputs once, choose the package layout, then build and
+validate it in one consolidated pass. Avoid alternating repeated one-file
+inspection commands with model calls, and do not re-check unchanged files after
+each write. Ask one consolidated blocking question at most.
+
 ### 2. Choose a precise name and trigger description
 
 Prefer a short capability name such as `meeting-brief`, `proposal-review`, or
@@ -71,7 +84,23 @@ description: >-
 
 Avoid vague descriptions such as "Helps with documents" or "Useful workflow."
 
-### 3. Write the smallest useful instruction set
+### 3. Build the smallest useful package
+
+Create `/workspace/tmp/skills/<skill-name>/SKILL.md` and add supporting files
+only when they make the workflow more reliable:
+
+- put executable, reusable code under `scripts/`;
+- put detailed guidance and schemas under `references/`;
+- put templates, examples, images, and other retained inputs under `assets/`;
+- keep file references relative to the skill directory;
+- preserve binary files byte-for-byte;
+- make scripts executable and keep generated outputs outside the package.
+
+Move substantial inline code out of `SKILL.md` into a script. If an attachment
+is meant to be reused on future tasks, copy it into the package now. If it is
+only an example and should not be retained, say so explicitly in the skill.
+
+Then organize `SKILL.md` around the work the agent must perform:
 
 Organize the body around the work the agent must perform:
 
@@ -131,18 +160,24 @@ Before saving, verify:
 - referenced tools and skills exist in Berry or are described conditionally;
 - referenced sandbox paths use `/workspace` or `/managed-skills` correctly;
 - no secrets or private session data appear in the content;
+- every relative file reference resolves inside the completed package;
+- reusable task attachments have been copied into stable `assets/` paths;
+- substantial reusable code lives in `scripts/` instead of a long inline block;
 - the workflow includes a concrete completion or validation condition;
 - the document is concise enough to load only useful context.
 
 ### 4. Save the skill
 
-Call `save_personal_skill` with the complete `SKILL.md` content. Do not merely
-write the file into the sandbox and claim it was installed.
+Call `save_personal_skill` with `path` set to the completed skill package
+directory. For a genuinely instructions-only skill, `content` remains
+supported. Do not point `path` at a task attachment, and do not merely write the
+package into the sandbox and claim it was installed.
 
 The save tool:
 
 - binds the skill to the current signed-in user;
-- validates the `SKILL.md` contract;
+- validates the `SKILL.md` contract and safe package paths;
+- stores scripts, references, assets, templates, and other package resources;
 - creates the skill or updates the user's existing skill with the same name;
 - enables it immediately;
 - makes it available to new turns and the user's Skills settings.
@@ -158,7 +193,7 @@ When the user asks to improve a skill:
 1. Preserve its intended name unless renaming is explicit.
 2. Keep useful domain rules and remove obsolete or duplicated instructions.
 3. Strengthen the activation description if the skill is hard to discover.
-4. Update the complete document through `save_personal_skill`; same-name saves
+4. Update the complete package through `save_personal_skill`; same-name saves
    replace the current user's prior version.
 5. Summarize the material behavior changes.
 
@@ -194,4 +229,5 @@ names, figures, and commitments from the source. Flag contradictions. Finish
 with a short validation note listing any missing source details.
 ```
 
-Save that complete content with `save_personal_skill`.
+For this instructions-only example, save the content directly. For a package
+with any supporting file, write the directory and save it by path.

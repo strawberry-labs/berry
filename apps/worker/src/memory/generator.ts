@@ -2,6 +2,8 @@ import { MemoryOperationSchema, type JsonValue, type MemoryOperation, type Memor
 import { OpenAIChatCompletionsClient } from "@berry/router-client";
 import { z } from "zod";
 import type { MemoryExtractJobPayload } from "../jobs.js";
+import { classifyProviderFailure } from "../provider-retry.js";
+import { workerRuntimeMetrics, type WorkerRuntimeMetrics } from "../runtime-metrics.js";
 
 export const ExtractedMemoryOperationSchema = MemoryOperationSchema.extend({
   scope: z.enum(["personal", "project"]),
@@ -18,10 +20,14 @@ export interface MemoryOperationGenerator {
   ): Promise<readonly ExtractedMemoryOperation[]>;
 }
 
+export const DEFAULT_MEMORY_MODEL = "canopywave/moonshotai/kimi-k2.6";
+
 export class RouterMemoryOperationGenerator implements MemoryOperationGenerator {
   constructor(
     private readonly client: OpenAIChatCompletionsClient,
     private readonly model: string,
+    private readonly metrics: Pick<WorkerRuntimeMetrics, "providerRequest"> = workerRuntimeMetrics,
+    private readonly now: () => number = Date.now,
   ) {}
 
   async generate(
@@ -72,31 +78,55 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
   }
 
   private async complete(messages: Array<{ role: "system" | "user"; content: string }>) {
-    const result = await this.client.complete({
-      model: this.model,
-      messages,
-      temperature: 0,
-      maxTokens: 2_000,
-      tools: [{
-        type: "function",
-        function: {
-          name: "memory_operations",
-          description: "Return validated durable memory candidates.",
-          parameters: MEMORY_OPERATIONS_JSON_SCHEMA,
-        },
-      }],
-      toolChoice: { type: "function", function: { name: "memory_operations" } },
-    });
-    const call = result.toolCalls?.find((candidate) => candidate.function.name === "memory_operations");
-    return call?.function.arguments ?? result.content;
+    const startedAt = this.now();
+    try {
+      const result = await this.client.complete({
+        model: this.model,
+        messages,
+        temperature: 0,
+        maxTokens: 2_000,
+        tools: [{
+          type: "function",
+          function: {
+            name: "memory_operations",
+            description: "Return validated durable memory candidates.",
+            parameters: MEMORY_OPERATIONS_JSON_SCHEMA,
+          },
+        }],
+        toolChoice: { type: "function", function: { name: "memory_operations" } },
+      });
+      this.metrics.providerRequest({
+        model: result.model || this.model,
+        outcome: "success",
+        status: 200,
+        latencyMs: Math.max(0, this.now() - startedAt),
+      });
+      const call = result.toolCalls?.find((candidate) => candidate.function.name === "memory_operations");
+      return call?.function.arguments ?? result.content;
+    } catch (error) {
+      const failure = classifyProviderFailure(error);
+      const diagnostics = {
+        event: "berry.memory.provider_failure",
+        jobName: "memory.extract",
+        model: this.model,
+        outcome: "failure",
+        status: failure.status ?? null,
+        code: failure.code ?? null,
+        requestId: failure.requestId ?? null,
+        latencyMs: Math.max(0, this.now() - startedAt),
+      };
+      this.metrics.providerRequest(diagnostics);
+      console.warn(JSON.stringify(diagnostics));
+      throw error;
+    }
   }
 }
 
 export function createMemoryOperationGenerator(env: NodeJS.ProcessEnv): MemoryOperationGenerator | null {
   const baseUrl = env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim();
   const apiKey = env.BERRY_ROUTER_API_KEY?.trim();
-  const model = env.BERRY_MEMORY_MODEL?.trim() || env.BERRY_ROUTER_DEFAULT_MODEL?.trim();
-  if (!baseUrl || !apiKey || !model) return null;
+  const model = env.BERRY_MEMORY_MODEL?.trim() || DEFAULT_MEMORY_MODEL;
+  if (!baseUrl || !apiKey) return null;
   const client = new OpenAIChatCompletionsClient({
     provider: {
       baseUrl,

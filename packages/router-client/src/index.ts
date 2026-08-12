@@ -48,6 +48,8 @@ export interface ChatCompletionUsage {
 export interface ChatCompletionResult {
   id: string;
   model: string;
+  /** Sanitized provider/router request identifier from response headers. */
+  requestId?: string;
   content: string;
   reasoning?: string;
   toolCalls?: ChatToolCall[];
@@ -66,6 +68,8 @@ export interface ChatToolCallDelta {
 export interface ChatCompletionChunk {
   id: string;
   model: string;
+  /** Sanitized provider/router request identifier from response headers. */
+  requestId?: string;
   delta: string;
   reasoningDelta?: string;
   toolCalls?: ChatToolCallDelta[];
@@ -78,8 +82,10 @@ export interface ChatCompletionChunk {
 export const BERRY_ROUTER_METADATA_KEY = "_berryRouter";
 
 export interface BerryRouterStreamMetadata {
-  attribution: RouterAttribution;
+  attribution?: RouterAttribution;
   usage?: ChatCompletionUsage;
+  /** Sanitized provider/router request identifier from response headers. */
+  requestId?: string;
 }
 
 export interface ResponsesCompactionResult {
@@ -174,14 +180,27 @@ export interface ImageGenerationResult {
   data: ImageGenerationData[];
 }
 
+export interface RouterClientErrorDetails {
+  /** Sanitized provider/router error code, suitable for retry classification and metrics. */
+  code?: string;
+  /** Sanitized provider/router request identifier, suitable for support correlation. */
+  requestId?: string;
+}
+
 export class RouterClientError extends Error {
+  readonly code: string | undefined;
+  readonly requestId: string | undefined;
+
   constructor(
     message: string,
     readonly status?: number,
     readonly body?: string,
+    details: RouterClientErrorDetails = {},
   ) {
     super(redactSecrets(message));
     this.name = "RouterClientError";
+    this.code = safeDiagnosticValue(details.code, 128);
+    this.requestId = safeDiagnosticValue(details.requestId, 240);
   }
 }
 
@@ -220,6 +239,50 @@ function requestUrl(provider: ProviderTransportInfo, path: string): URL {
   return new URL(path.replace(/^\//, ""), ensureSlash(provider.baseUrl));
 }
 
+async function routerClientErrorFromResponse(message: string, response: Response): Promise<RouterClientError> {
+  const body = await response.text();
+  return new RouterClientError(message, response.status, body, providerErrorDetails(response, body));
+}
+
+function providerErrorDetails(response: Response, value?: unknown): RouterClientErrorDetails {
+  let payload = value;
+  if (typeof value === "string" && value.trim().startsWith("{")) {
+    try {
+      payload = JSON.parse(value) as unknown;
+    } catch {
+      payload = undefined;
+    }
+  }
+  const record = isRecord(payload) ? payload : undefined;
+  const providerError = isRecord(record?.error) ? record.error : undefined;
+  const code = diagnosticField(providerError, "code")
+    ?? diagnosticField(providerError, "type")
+    ?? diagnosticField(record, "code");
+  const requestId = diagnosticField(record, "request_id")
+    ?? diagnosticField(record, "requestId")
+    ?? diagnosticField(providerError, "request_id")
+    ?? requestIdHeader(response.headers);
+  return {
+    ...(code ? { code } : {}),
+    ...(requestId ? { requestId } : {}),
+  };
+}
+
+function requestIdHeader(headers: Headers): string | undefined {
+  for (const name of ["x-request-id", "x-berry-request-id", "x-router-request-id", "request-id"]) {
+    const value = headers.get(name)?.trim();
+    const requestId = value ? safeDiagnosticValue(value, 240) : undefined;
+    if (requestId) return requestId;
+  }
+  return undefined;
+}
+
+function diagnosticField(value: unknown, key: string): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const field = value[key];
+  return typeof field === "string" || typeof field === "number" ? String(field) : undefined;
+}
+
 /**
  * Fetches and normalizes a provider's model list. Works for OpenAI-style
  * `GET /models` (`data[]` of `{id, owned_by}`) and Anthropic's
@@ -236,11 +299,7 @@ export async function listProviderModels(options: RouterClientOptions): Promise<
     headers: buildHeaders(provider, options.apiKey, { ...(options.appName ? { appName: options.appName } : {}) }),
   });
   if (!response.ok) {
-    throw new RouterClientError(
-      `Provider returned ${response.status} when listing models`,
-      response.status,
-      await response.text(),
-    );
+    throw await routerClientErrorFromResponse(`Provider returned ${response.status} when listing models`, response);
   }
   const payload = (await response.json()) as { data?: ProviderModelEntry[] } | ProviderModelEntry[] | null;
   const entries = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
@@ -288,7 +347,7 @@ export class BerryRouterAccountClient {
       ...(signal ? { signal } : {}),
     });
     if (!response.ok) {
-      throw new RouterClientError(`Berry Router account request failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Berry Router account request failed with ${response.status}`, response);
     }
     return normalizeRouterAccount(await response.json());
   }
@@ -308,11 +367,18 @@ export class BerryRouterAccountClient {
       ...(signal ? { signal } : {}),
     });
     if (!response.ok) {
-      throw new RouterClientError(`Berry Router OAuth exchange failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Berry Router OAuth exchange failed with ${response.status}`, response);
     }
     const payload = await response.json() as Record<string, unknown>;
     const accessToken = stringField(payload, "access_token");
-    if (!accessToken) throw new RouterClientError("Berry Router OAuth response did not include access_token", response.status, JSON.stringify(payload));
+    if (!accessToken) {
+      throw new RouterClientError(
+        "Berry Router OAuth response did not include access_token",
+        response.status,
+        JSON.stringify(payload),
+        providerErrorDetails(response, payload),
+      );
+    }
     const expiresIn = numberField(payload, "expires_in");
     return {
       accessToken,
@@ -366,7 +432,7 @@ export class OpenAIImageGenerationClient {
         const { stream: _stream, partialImages: _partialImages, onPartial: _onPartial, ...fallback } = options;
         return this.generate(fallback);
       }
-      throw new RouterClientError(`Image provider request failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Image provider request failed with ${response.status}`, response);
     }
     if (options.stream && response.headers.get("content-type")?.includes("text/event-stream")) {
       let finalImage: string | undefined;
@@ -387,20 +453,35 @@ export class OpenAIImageGenerationClient {
         }
       }
       if (!finalImage) {
-        throw new RouterClientError("Image provider stream ended without a completed image", response.status);
+        throw new RouterClientError(
+          "Image provider stream ended without a completed image",
+          response.status,
+          undefined,
+          providerErrorDetails(response),
+        );
       }
       return { model, data: [{ b64_json: finalImage }] };
     }
     const payload = await response.json() as unknown;
     if (!isRecord(payload) || !Array.isArray(payload.data)) {
-      throw new RouterClientError("Image provider returned an invalid response", response.status, JSON.stringify(payload));
+      throw new RouterClientError(
+        "Image provider returned an invalid response",
+        response.status,
+        JSON.stringify(payload),
+        providerErrorDetails(response, payload),
+      );
     }
     const data = payload.data.filter((entry): entry is ImageGenerationData => {
       if (!isRecord(entry)) return false;
       return typeof entry.url === "string" || typeof entry.b64_json === "string";
     });
     if (data.length === 0) {
-      throw new RouterClientError("Image provider returned no image data", response.status, JSON.stringify(payload));
+      throw new RouterClientError(
+        "Image provider returned no image data",
+        response.status,
+        JSON.stringify(payload),
+        providerErrorDetails(response, payload),
+      );
     }
     return {
       ...(typeof payload.model === "string" ? { model: payload.model } : {}),
@@ -494,7 +575,14 @@ export class OpenAIChatCompletionsClient {
     const response = await this.#post({ ...options, stream: false });
     const payload = (await response.json()) as OpenAICompletionResponse;
     const choice = payload.choices[0];
-    if (!choice) throw new RouterClientError("Provider returned no choices", response.status, JSON.stringify(payload));
+    if (!choice) {
+      throw new RouterClientError(
+        "Provider returned no choices",
+        response.status,
+        JSON.stringify(payload),
+        providerErrorDetails(response, payload),
+      );
+    }
     const model = payload.model ?? options.model ?? this.#provider.defaultModel;
     const rawContent = choice.message?.content ?? "";
     const taggedContent = usesThinkTaggedReasoning(model)
@@ -502,9 +590,11 @@ export class OpenAIChatCompletionsClient {
       : { text: rawContent, reasoning: "" };
     const nativeToolCalls = normalizeToolCalls(choice.message?.tool_calls);
     const kimiToolCalls = nativeToolCalls ? undefined : parseKimiToolCalls(taggedContent.text);
+    const requestId = requestIdHeader(response.headers);
     const result: ChatCompletionResult = {
       id: payload.id,
       model,
+      ...(requestId ? { requestId } : {}),
       content: kimiToolCalls?.content ?? taggedContent.text,
       finishReason: kimiToolCalls ? "tool_calls" : choice.finish_reason ?? null,
       raw: payload as unknown as JsonValue,
@@ -526,6 +616,7 @@ export class OpenAIChatCompletionsClient {
   async *stream(options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
     const response = await this.#post({ ...options, stream: true });
     const requestedModel = options.model ?? this.#provider.defaultModel;
+    const requestId = requestIdHeader(response.headers);
     const headerUsage = normalizeUsageHeaders(response.headers);
     const taggedContentParser = usesThinkTaggedReasoning(requestedModel) ? new ThinkTaggedContentParser() : undefined;
     let lastChunk: ChatCompletionChunk | undefined;
@@ -535,11 +626,21 @@ export class OpenAIChatCompletionsClient {
         const rawPayload = JSON.parse(event) as unknown;
         throwForOpenAIStreamError(rawPayload, response, this.#provider.name);
         if (!isRecord(rawPayload)) {
-          throw new RouterClientError("Provider returned a non-object streaming event", undefined, event);
+          throw new RouterClientError(
+            "Provider returned a non-object streaming event",
+            undefined,
+            event,
+            { code: "invalid_stream_event", ...providerErrorDetails(response) },
+          );
         }
         const payload = rawPayload as unknown as OpenAIStreamResponse;
         if (!Array.isArray(payload.choices)) {
-          throw new RouterClientError("Provider returned a streaming event without choices", undefined, event);
+          throw new RouterClientError(
+            "Provider returned a streaming event without choices",
+            undefined,
+            event,
+            { code: "invalid_stream_event", ...providerErrorDetails(response) },
+          );
         }
         const choice = payload.choices[0];
         if (!choice && !payload.usage) continue;
@@ -551,6 +652,7 @@ export class OpenAIChatCompletionsClient {
         const chunk: ChatCompletionChunk = {
           id: payload.id,
           model: payload.model ?? options.model ?? this.#provider.defaultModel,
+          ...(requestId ? { requestId } : {}),
           delta: taggedContent.text,
           finishReason: choice?.finish_reason ?? null,
           raw: payload as unknown as JsonValue,
@@ -575,6 +677,7 @@ export class OpenAIChatCompletionsClient {
         yield {
           id: lastChunk.id,
           model: lastChunk.model,
+          ...(lastChunk.requestId ? { requestId: lastChunk.requestId } : {}),
           delta: trailingContent.text,
           ...(trailingContent.reasoning.length > 0 ? { reasoningDelta: trailingContent.reasoning } : {}),
           finishReason: null,
@@ -583,12 +686,17 @@ export class OpenAIChatCompletionsClient {
       }
     } catch (error) {
       if (error instanceof RouterClientError || options.signal?.aborted) throw error;
-      const requestId = response.headers.get("x-request-id")?.trim();
       const cause = redactSecrets(error instanceof Error ? error.message : String(error));
       throw new RouterClientError(
         `${this.#provider.name} stream failed before completion${requestId ? ` (request ${requestId})` : ""}: ${cause}`,
         undefined,
         cause,
+        {
+          code: error instanceof Error && "code" in error && typeof error.code === "string"
+            ? error.code
+            : "stream_interrupted",
+          ...(requestId ? { requestId } : {}),
+        },
       );
     }
   }
@@ -634,7 +742,7 @@ export class OpenAIChatCompletionsClient {
     if (options.signal) init.signal = options.signal;
     const response = await this.#fetch(url, init);
     if (!response.ok) {
-      throw new RouterClientError(`Provider request failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Provider request failed with ${response.status}`, response);
     }
     return response;
   }
@@ -676,8 +784,9 @@ export class OllamaNativeChatClient {
       ...(options.signal ? { signal: options.signal } : {}),
     });
     if (!response.ok) {
-      throw new RouterClientError(`Ollama native chat failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Ollama native chat failed with ${response.status}`, response);
     }
+    const requestId = requestIdHeader(response.headers);
     let sequence = 0;
     for await (const value of parseNdjson(response)) {
       const payload = value as OllamaChatChunk;
@@ -698,6 +807,7 @@ export class OllamaNativeChatClient {
       yield {
         id: `ollama_${sequence++}`,
         model: payload.model ?? options.model ?? this.#provider.defaultModel,
+        ...(requestId ? { requestId } : {}),
         delta: payload.message?.content ?? "",
         ...(payload.message?.thinking ? { reasoningDelta: payload.message.thinking } : {}),
         ...(toolCalls?.length ? { toolCalls } : {}),
@@ -751,18 +861,20 @@ export class OpenAIResponsesClient {
     if (signal) init.signal = signal;
     const response = await this.#fetch(url, init);
     if (!response.ok) {
-      throw new RouterClientError(`Provider request failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Provider request failed with ${response.status}`, response);
     }
     const requestedModel = typeof body.model === "string" ? body.model : this.#provider.defaultModel;
+    const requestId = requestIdHeader(response.headers);
     const headerUsage = normalizeUsageHeaders(response.headers);
     for await (const event of parseSse(response)) {
       if (event === "[DONE]") break;
       const payload = JSON.parse(event) as Record<string, unknown>;
       const attribution = routerAttribution(this.#provider, requestedModel, response.headers, payload);
-      if (attribution) {
+      if (attribution || headerUsage || requestId) {
         payload[BERRY_ROUTER_METADATA_KEY] = {
-          attribution,
+          ...(attribution ? { attribution } : {}),
           ...(headerUsage ? { usage: headerUsage } : {}),
+          ...(requestId ? { requestId } : {}),
         } satisfies BerryRouterStreamMetadata;
       }
       yield payload;
@@ -779,11 +891,16 @@ export class OpenAIResponsesClient {
     if (signal) init.signal = signal;
     const response = await this.#fetch(url, init);
     if (!response.ok) {
-      throw new RouterClientError(`Provider compact request failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Provider compact request failed with ${response.status}`, response);
     }
     const payload = (await response.json()) as Record<string, unknown>;
     if (!Array.isArray(payload.output) || !payload.output.every(isRecord)) {
-      throw new RouterClientError("Provider compact response did not include an output item array", response.status, JSON.stringify(payload));
+      throw new RouterClientError(
+        "Provider compact response did not include an output item array",
+        response.status,
+        JSON.stringify(payload),
+        providerErrorDetails(response, payload),
+      );
     }
     const result: ResponsesCompactionResult = {
       output: payload.output,
@@ -835,11 +952,21 @@ export class AnthropicMessagesClient {
     if (signal) init.signal = signal;
     const response = await this.#fetch(url, init);
     if (!response.ok) {
-      throw new RouterClientError(`Provider request failed with ${response.status}`, response.status, await response.text());
+      throw await routerClientErrorFromResponse(`Provider request failed with ${response.status}`, response);
     }
+    const requestedModel = typeof body.model === "string" ? body.model : this.#provider.defaultModel;
+    const requestId = requestIdHeader(response.headers);
     for await (const event of parseSse(response)) {
       if (event === "[DONE]") break;
-      yield JSON.parse(event) as Record<string, unknown>;
+      const payload = JSON.parse(event) as Record<string, unknown>;
+      const attribution = routerAttribution(this.#provider, requestedModel, response.headers, payload);
+      if (attribution || requestId) {
+        payload[BERRY_ROUTER_METADATA_KEY] = {
+          ...(attribution ? { attribution } : {}),
+          ...(requestId ? { requestId } : {}),
+        } satisfies BerryRouterStreamMetadata;
+      }
+      yield payload;
     }
   }
 
@@ -966,11 +1093,13 @@ function parseSseDataBlock(block: string): string | undefined {
 function throwForOpenAIStreamError(payload: unknown, response: Response, providerName: string): void {
   if (!isRecord(payload) || !isRecord(payload.error)) return;
   const message = stringField(payload.error, "message") ?? "The provider stream failed";
-  const requestId = stringField(payload, "request_id") ?? response.headers.get("x-request-id")?.trim();
+  const details = providerErrorDetails(response, payload);
+  const requestId = details.requestId;
   throw new RouterClientError(
     `${providerName} stream failed${requestId ? ` (request ${requestId})` : ""}: ${message}`,
     numberField(payload.error, "status") ?? 502,
     JSON.stringify(payload),
+    details,
   );
 }
 
@@ -995,6 +1124,11 @@ export function redactSecrets(text: string): string {
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
     .replace(/x-api-key["':\s]+[\w-]+/gi, "x-api-key [redacted]")
     .replace(/([?&](?:key|apiKey|api_key|token|secret)=)[^&\s"']+/gi, "$1[redacted]");
+}
+
+function safeDiagnosticValue(value: string | undefined, maximum: number): string | undefined {
+  const normalized = value?.trim().replace(/[^a-zA-Z0-9._:/-]/g, "_").slice(0, maximum);
+  return normalized || undefined;
 }
 
 function usesOpenRouterReasoningShape(provider: ProviderTransportInfo): boolean {

@@ -1,5 +1,5 @@
 import "reflect-metadata";
-import { UnauthorizedException, type INestApplication } from "@nestjs/common";
+import { ConflictException, UnauthorizedException, type INestApplication } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import type { AgentStreamEvent } from "@berry/shared";
@@ -18,7 +18,8 @@ import { InMemoryUsageRepository, USAGE_REPOSITORY, type UsageRepository } from 
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissionReplay } from "../runtime/durable-turn.service.ts";
-import { normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
+import { durableAdmissionPreparationTimeoutMs, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -27,6 +28,7 @@ describe("AgentApiController", () => {
     await app?.close();
     app = null;
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it("normalizes prompt-only model output without altering the rewritten content", () => {
@@ -145,6 +147,160 @@ describe("AgentApiController", () => {
     }));
   });
 
+  it("caps optional durable admission preparation below the two-second SLA", () => {
+    expect(durableAdmissionPreparationTimeoutMs({})).toBe(1_500);
+    expect(durableAdmissionPreparationTimeoutMs({
+      BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "5000",
+    })).toBe(1_500);
+    expect(durableAdmissionPreparationTimeoutMs({
+      BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS: "25",
+    })).toBe(25);
+  });
+
+  it("admits with degraded context when context and checkpoint preparation hang", async () => {
+    vi.stubEnv("BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS", "50");
+    const never = new Promise<never>(() => undefined);
+    const contextAssembly = {
+      assemble: vi.fn(() => never),
+      portableCheckpoint: vi.fn(() => never),
+    };
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({
+      runId: "turn_bounded_preparation",
+      sessionId: input.sessionId,
+    }));
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    app = await createApp(fakeSessionHost(), {
+      contextAssembly,
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: chatRuntimeConfig(),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Bounded admission" })
+      .expect(201);
+
+    const startedAt = Date.now();
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        input: "Run despite unavailable optional context",
+        workspacePath: "/workspace",
+      })
+      .expect(201)
+      .expect({ turnId: "turn_bounded_preparation", sessionId: created.body.session.id });
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(contextAssembly.assemble).toHaveBeenCalledOnce();
+    expect(contextAssembly.portableCheckpoint).toHaveBeenCalledOnce();
+    expect(admit).toHaveBeenCalledWith(expect.objectContaining({
+      groundingContext: expect.objectContaining({
+        retrieval: expect.objectContaining({ degradedReason: "context_timeout" }),
+      }),
+      runtimeRequest: expect.objectContaining({
+        providerId: "router",
+        model: "chat-model",
+      }),
+    }));
+    expect(admit.mock.calls[0]?.[0].runtimeRequest).not.toHaveProperty("portableCheckpoint");
+  });
+
+  it("does not enqueue a provider call when pending admission is cancelled during preparation", async () => {
+    vi.stubEnv("BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS", "100");
+    const never = new Promise<never>(() => undefined);
+    const contextAssembly = {
+      assemble: vi.fn(() => never),
+      portableCheckpoint: vi.fn(() => never),
+    };
+    let admissionStarted!: () => void;
+    const beganAdmission = new Promise<void>((resolve) => { admissionStarted = resolve; });
+    let cancelled = false;
+    let enqueuedProviderCalls = 0;
+    const admit = vi.fn(async (input: DurableTurnAdmission) => {
+      if (cancelled) {
+        throw new ConflictException({
+          code: "turn_admission_cancelled",
+          message: "This turn submission was cancelled before durable admission completed.",
+        });
+      }
+      enqueuedProviderCalls += 1;
+      return { runId: "turn_should_not_exist", sessionId: input.sessionId };
+    });
+    const cancel = vi.fn(async () => {
+      cancelled = true;
+      return true;
+    });
+    const operationId = "00000000-0000-7000-8000-000000000091";
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    app = await createApp(fakeSessionHost(), {
+      contextAssembly,
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: chatRuntimeConfig(),
+      durableTurns: {
+        enabled: true,
+        replayAdmission: async () => null,
+        beginAdmission: async () => {
+          admissionStarted();
+          return null;
+        },
+        admit,
+        cancel,
+      },
+    });
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Cancelled admission" })
+      .expect(201);
+
+    const startRequest = request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        operationId,
+        input: "Do not run after cancellation",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+        model: "chat-model",
+      })
+      .then((response) => response);
+    await beganAdmission;
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/cancel`)
+      .set(authHeader())
+      .send({ operationId })
+      .expect(201)
+      .expect({ ok: true });
+    const response = await startRequest;
+
+    expect(response.status).toBe(409);
+    expect(cancel).toHaveBeenCalledWith(
+      SELF_HOST_TENANT_ID,
+      created.body.session.id,
+      `model_${operationId}`,
+    );
+    expect(admit).toHaveBeenCalledOnce();
+    expect(enqueuedProviderCalls).toBe(0);
+  });
+
   it("serves task, session, and message CRUD over HTTP", async () => {
     app = await createApp(fakeSessionHost());
     const created = await request(app.getHttpServer())
@@ -175,6 +331,70 @@ describe("AgentApiController", () => {
       expect(body.deletedAt).toBeNull();
       expect(body.title).toBe("Renamed");
     });
+  });
+
+  it("snapshots the current organization default on each new chat", async () => {
+    const runtimeConfig = new CloudRuntimeConfigService({
+      ...chatRuntimeEnv(),
+      BERRY_ROUTER_DEFAULT_MODEL: "primary-model",
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([
+        { id: "primary-model", name: "Primary Model" },
+        { id: "backup-model", name: "Backup Model" },
+      ]),
+    });
+    const modelGovernance = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    const runtime = await runtimeConfig.resolve(SELF_HOST_TENANT_ID, {});
+    await modelGovernance.synchronizeRuntimeCatalog(SELF_HOST_TENANT_ID, runtime.provider);
+    await modelGovernance.upsertDefault({
+      tenantId: SELF_HOST_TENANT_ID,
+      mode: "chat",
+      providerId: "router",
+      model: "backup-model",
+      enforce: false,
+    });
+    app = await createApp(fakeSessionHost(), { modelGovernance, runtimeConfig });
+
+    await request(app.getHttpServer())
+      .get("/v1/models/catalog")
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body.defaultModel).toBe("backup-model"));
+
+    const beforeSwitch = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Before outage switch" })
+      .expect(201);
+    expect(beforeSwitch.body.session).toMatchObject({
+      modelProviderId: "router",
+      model: "backup-model",
+    });
+
+    await modelGovernance.upsertDefault({
+      tenantId: SELF_HOST_TENANT_ID,
+      mode: "chat",
+      providerId: "router",
+      model: "primary-model",
+      enforce: false,
+    });
+    const afterSwitch = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "After outage switch" })
+      .expect(201);
+    expect(afterSwitch.body.session).toMatchObject({
+      modelProviderId: "router",
+      model: "primary-model",
+    });
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${beforeSwitch.body.session.id}`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({
+        modelProviderId: "router",
+        model: "backup-model",
+      }));
   });
 
   it("reports context usage with the current draft in fallback runtime mode", async () => {
@@ -1401,7 +1621,27 @@ describe("AgentApiController", () => {
   });
 });
 
-async function createApp(sessionHost: SessionHost, options: { budget?: BudgetService | undefined; modelGovernance?: ModelGovernanceService | undefined; taskStore?: CloudTaskStore | undefined; runtimeConfig?: CloudRuntimeConfigService | undefined; usageRepository?: UsageRepository | undefined; membershipActive?: boolean | undefined; durableTurns?: { enabled: boolean; replayAdmission: (input: DurableTurnAdmissionReplay) => Promise<{ runId: string; sessionId: string } | null>; admit: (input: DurableTurnAdmission) => Promise<{ runId: string; sessionId: string }> } | undefined } = {}): Promise<INestApplication> {
+type CreateAppOptions = {
+  budget?: BudgetService | undefined;
+  contextAssembly?: Pick<ContextAssemblyService, "assemble" | "portableCheckpoint"> | undefined;
+  modelGovernance?: ModelGovernanceService | undefined;
+  taskStore?: CloudTaskStore | undefined;
+  runtimeConfig?: CloudRuntimeConfigService | undefined;
+  usageRepository?: UsageRepository | undefined;
+  membershipActive?: boolean | undefined;
+  durableTurns?: {
+    enabled: boolean;
+    replayAdmission: (input: DurableTurnAdmissionReplay) => Promise<{ runId: string; sessionId: string } | null>;
+    beginAdmission?: DurableTurnService["beginAdmission"];
+    admit: (input: DurableTurnAdmission) => Promise<{ runId: string; sessionId: string }>;
+    cancel?: DurableTurnService["cancel"];
+  } | undefined;
+};
+
+async function createApp(
+  sessionHost: SessionHost,
+  options: CreateAppOptions = {},
+): Promise<INestApplication> {
   let builder = Test.createTestingModule({
     imports: [
       CloudDatabaseModule.register({
@@ -1426,7 +1666,13 @@ async function createApp(sessionHost: SessionHost, options: { budget?: BudgetSer
     .overrideProvider(CloudRuntimeConfigService)
     .useValue(options.runtimeConfig ?? new CloudRuntimeConfigService());
   if (options.durableTurns) {
-    builder = builder.overrideProvider(DurableTurnService).useValue(options.durableTurns);
+    builder = builder.overrideProvider(DurableTurnService).useValue({
+      ...options.durableTurns,
+      beginAdmission: options.durableTurns.beginAdmission ?? (async () => null),
+    });
+  }
+  if (options.contextAssembly) {
+    builder = builder.overrideProvider(ContextAssemblyService).useValue(options.contextAssembly);
   }
   const moduleRef = await builder.compile();
   const nestApp = moduleRef.createNestApplication();

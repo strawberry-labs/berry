@@ -71,8 +71,9 @@ export interface CloudTaskStore {
   updateTask(taskId: string, input: UpdateTaskInput, ownerUserId?: string | null): Promise<Task>;
   deleteTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
   restoreTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
-  createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session>;
+  createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined; modelProviderId?: string | null | undefined; model?: string | null | undefined }): Promise<Session>;
   getSession(sessionId: string): Promise<Session>;
+  updateSessionModel(sessionId: string, providerId: string, model: string): Promise<Session>;
   appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message>;
   listMessages(sessionId: string): Promise<Message[]>;
   /**
@@ -204,6 +205,8 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     const session = await this.createSession({
       taskId: task.id,
       permissionMode: "full-access",
+      modelProviderId: input.modelProviderId ?? null,
+      model: input.model ?? null,
     });
     const updatedTask = { ...task, activeSessionId: session.id, updatedAt: nowIso() };
     this.#tasks.set(task.id, TaskSchema.parse(updatedTask));
@@ -267,7 +270,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     this.#tasks.set(taskId, next);
     return next;
   }
-  async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session> {
+  async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined; modelProviderId?: string | null | undefined; model?: string | null | undefined }): Promise<Session> {
     const task = await this.getTask(input.taskId);
     const now = nowIso();
     const session = SessionSchema.parse({
@@ -275,8 +278,8 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       taskId: task.id,
       parentSessionId: input.parentSessionId ?? null,
       status: "active",
-      modelProviderId: null,
-      model: null,
+      modelProviderId: input.modelProviderId ?? null,
+      model: input.model ?? null,
       permissionMode: PermissionModeSchema.parse("full-access"),
       createdAt: now,
       updatedAt: now,
@@ -291,6 +294,18 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     const session = this.#sessions.get(sessionId);
     if (!session) throw new NotFoundException(`Session not found: ${sessionId}`);
     return session;
+  }
+
+  async updateSessionModel(sessionId: string, providerId: string, model: string): Promise<Session> {
+    const current = await this.getSession(sessionId);
+    const next = SessionSchema.parse({
+      ...current,
+      modelProviderId: providerId,
+      model,
+      updatedAt: nowIso(),
+    });
+    this.#sessions.set(sessionId, next);
+    return next;
   }
 
   async appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message> {
@@ -557,7 +572,7 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
     });
   }
 
-  async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined }): Promise<Session> {
+  async createSession(input: { taskId: string; parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined; modelProviderId?: string | null | undefined; model?: string | null | undefined }): Promise<Session> {
     return this.database.withTenant(this.tenantId, async (executor) => {
       const session = await this.createSessionInTenant(executor, input);
       await executor.execute(
@@ -570,6 +585,20 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS
 
   async getSession(sessionId: string): Promise<Session> {
     return this.database.withTenant(this.tenantId, (executor) => this.getSessionInTenant(executor, sessionId));
+  }
+
+  async updateSessionModel(sessionId: string, providerId: string, model: string): Promise<Session> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      const rows = await executor.query<SessionRow>(
+        `UPDATE sessions
+         SET model_provider_id=$3,model=$4,updated_at=now()
+         WHERE tenant_id=$1::uuid AND id=$2::uuid
+         RETURNING id,task_id,parent_session_id,status,model_provider_id,model,permission_mode,created_at,updated_at`,
+        [this.tenantId, sessionId, providerId, model],
+      );
+      if (!rows[0]) throw new NotFoundException(`Session not found: ${sessionId}`);
+      return sessionFromRow(rows[0]);
+    });
   }
 
   async appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message> {

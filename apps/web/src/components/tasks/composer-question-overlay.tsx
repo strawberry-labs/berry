@@ -4,7 +4,22 @@ import type { QuestionPrompt } from "@berry/desktop-ui/components/thread-stream"
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { Input } from "@berry/desktop-ui/components/ui/input";
 import { ArrowLeft02, ArrowRight02, Check, X } from "@berry/desktop-ui/lib/icons";
-import { Paperclip } from "lucide-react";
+import { ArrowUp, Paperclip } from "lucide-react";
+
+export const COMPOSER_SEND_BUTTON_CLASS = "berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45";
+export const COMPOSER_SEND_ARROW_SIZE = 18;
+
+export function questionFileDropPolicy(
+  dataTransferTypes: readonly string[],
+  interactionLocked: boolean,
+  uploadAvailable: boolean,
+): { suppressBrowserDefault: boolean; acceptFiles: boolean } {
+  const hasFiles = dataTransferTypes.includes("Files");
+  return {
+    suppressBrowserDefault: hasFiles,
+    acceptFiles: hasFiles && uploadAvailable && !interactionLocked,
+  };
+}
 
 export interface ComposerQuestionAnswer {
   question: string;
@@ -12,6 +27,21 @@ export interface ComposerQuestionAnswer {
   selectedOptions: string[];
   attachments: Array<AttachmentInput & { fileId: string }>;
   skipped: boolean;
+}
+
+export function strictQuestionAnswerAttachment(file: {
+  id: string;
+  name: string;
+  mediaType: string;
+  size: number;
+}): AttachmentInput & { fileId: string } {
+  return {
+    fileId: file.id,
+    name: file.name,
+    mediaType: file.mediaType,
+    size: file.size,
+    sourceKind: "object-storage",
+  };
 }
 
 type Draft = ComposerQuestionAnswer & {
@@ -117,9 +147,11 @@ export function ComposerQuestionOverlay({
   const [activeOption, setActiveOption] = React.useState(0);
   const [pending, setPending] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
+  const [draggingFiles, setDraggingFiles] = React.useState(false);
   const [error, setError] = React.useState("");
   const customInputRef = React.useRef<HTMLInputElement>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const dragDepthRef = React.useRef(0);
   const prompt = items[current]!;
   const draft = drafts[current];
   const isCustom = draft?.mode === "custom";
@@ -132,6 +164,8 @@ export function ComposerQuestionOverlay({
     setActiveOption(0);
     setPending(false);
     setUploading(false);
+    setDraggingFiles(false);
+    dragDepthRef.current = 0;
     setError("");
   }, [question.questionId]);
 
@@ -214,7 +248,7 @@ export function ComposerQuestionOverlay({
     advance({ question: prompt.question, answer: "Skipped", selectedOptions: [], attachments: [], skipped: true, mode: "skipped" });
   }, [advance, interactionLocked, prompt.question]);
 
-  const uploadFiles = React.useCallback(async (files: FileList | null) => {
+  const uploadFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
     if (!files?.length || !onUploadFiles || interactionLocked) return;
     selectCustom();
     setUploading(true);
@@ -326,7 +360,37 @@ export function ComposerQuestionOverlay({
             </button>
           );
         })}
-        <div className={`berry-composer-question-option berry-composer-question-custom${isCustom ? " is-selected" : ""}${activeOption === optionCount ? " is-active" : ""}`}>
+        <div
+          className={`berry-composer-question-option berry-composer-question-custom${isCustom ? " is-selected" : ""}${activeOption === optionCount ? " is-active" : ""}${draggingFiles ? " is-dragging-files" : ""}`}
+          onDragEnter={(event) => {
+            const policy = questionFileDropPolicy(event.dataTransfer.types, interactionLocked, Boolean(onUploadFiles));
+            if (!policy.suppressBrowserDefault) return;
+            event.preventDefault();
+            if (!policy.acceptFiles) return;
+            dragDepthRef.current += 1;
+            setDraggingFiles(true);
+            selectCustom();
+          }}
+          onDragOver={(event) => {
+            const policy = questionFileDropPolicy(event.dataTransfer.types, interactionLocked, Boolean(onUploadFiles));
+            if (!policy.suppressBrowserDefault) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = policy.acceptFiles ? "copy" : "none";
+          }}
+          onDragLeave={() => {
+            dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+            if (dragDepthRef.current === 0) setDraggingFiles(false);
+          }}
+          onDrop={(event) => {
+            const policy = questionFileDropPolicy(event.dataTransfer.types, interactionLocked, Boolean(onUploadFiles));
+            if (!policy.suppressBrowserDefault) return;
+            event.preventDefault();
+            dragDepthRef.current = 0;
+            setDraggingFiles(false);
+            if (!policy.acceptFiles) return;
+            void uploadFiles(Array.from(event.dataTransfer.files));
+          }}
+        >
           <button type="button" className="berry-composer-question-custom-select" disabled={interactionLocked} aria-label="Enter your own answer" onMouseEnter={() => setActiveOption(optionCount)} onClick={selectCustom}>
             <span className="berry-composer-question-number">{optionCount + 1}</span>
           </button>
@@ -377,7 +441,20 @@ export function ComposerQuestionOverlay({
               ) : null}
             </div>
           ) : <button type="button" className="berry-composer-question-custom-label" disabled={interactionLocked} onClick={selectCustom}>Or enter your own choice</button>}
-          {isCustom && (draft?.answer.trim() || draft?.attachments.length) ? <Button type="button" variant="secondary" size="sm" className="berry-composer-question-custom-next" disabled={pending || uploading} onClick={() => advance({ ...draft, answer: draft.answer.trim() })}>{current === items.length - 1 ? "Send" : "Next"}</Button> : null}
+          {isCustom && (draft?.answer.trim() || draft?.attachments.length) ? (
+            <Button
+              type="button"
+              variant="secondary"
+              size="icon-lg"
+              className={COMPOSER_SEND_BUTTON_CLASS}
+              disabled={pending || uploading}
+              aria-label={current === items.length - 1 ? "Send answer" : "Send answer and continue"}
+              title={current === items.length - 1 ? "Send answer" : "Next question"}
+              onClick={() => advance({ ...draft, answer: draft.answer.trim() })}
+            >
+              <ArrowUp size={COMPOSER_SEND_ARROW_SIZE} aria-hidden />
+            </Button>
+          ) : null}
         </div>
       </div>
 

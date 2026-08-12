@@ -5,7 +5,8 @@ import { z } from "zod";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { PERSONAL_CAPABILITIES, PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
 
-const SkillInputSchema = z.object({ name: z.string().trim().max(64).optional(), description: z.string().trim().max(1024).optional(), content: z.string().max(262_144).optional(), source: z.enum(["text", "upload", "git"]).default("text"), sourceUrl: z.string().url().nullable().optional(), version: z.string().max(64).nullable().optional(), packageFiles: z.array(z.string().min(1).max(512)).max(500).optional(), enabled: z.boolean().optional() }).strict();
+const SkillPackageFileSchema = z.object({ path: z.string().trim().min(1).max(512), contentBase64: z.string().max(7_000_000), mode: z.number().int().min(0).max(0o777).optional() }).strict();
+const SkillInputSchema = z.object({ name: z.string().trim().max(64).optional(), description: z.string().trim().max(1024).optional(), content: z.string().max(262_144).optional(), source: z.enum(["text", "upload", "git"]).default("text"), sourceUrl: z.string().url().nullable().optional(), version: z.string().max(64).nullable().optional(), packageFiles: z.array(z.string().min(1).max(512)).max(500).optional(), resourceFiles: z.array(SkillPackageFileSchema).max(500).optional(), enabled: z.boolean().optional() }).strict();
 const SkillToggleSchema = z.object({ enabled: z.boolean() }).strict();
 const ToggleSchema = z.object({ enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict().refine((input) => input.enabled !== undefined || input.trusted !== undefined);
 const McpInputSchema = z.object({ name: z.string().trim().min(1).max(100), url: z.string().url(), transport: z.enum(["http-sse", "streamable-http"]), auth: z.enum(["none", "bearer", "oauth"]), credential: z.string().min(1).max(16_384).optional(), enabled: z.boolean().optional(), trusted: z.boolean().optional() }).strict();
@@ -19,6 +20,7 @@ export class PersonalCapabilitiesController {
   @Get("/personalization") personalization(@Req() request: AuthenticatedRequest) { return this.capabilities.personalization(tenant(), user(request)); }
   @Patch("/personalization") updatePersonalization(@Req() request: AuthenticatedRequest, @Body() body: unknown) { return this.capabilities.updatePersonalization(tenant(), user(request), parse(PersonalizationInputSchema, body)); }
   @Get("/skills") listSkills(@Req() request: AuthenticatedRequest) { return this.capabilities.listSkills(tenant(), user(request)); }
+  @Get("/skills/:id/package") skillPackage(@Req() request: AuthenticatedRequest, @Param("id") id: string) { return this.capabilities.skillPackage(tenant(), user(request), id); }
   @Post("/skills/review") async reviewSkill(@Body() body: unknown) { return (await this.capabilities.previewSkill(parse(SkillInputSchema, body))).review; }
   @Post("/skills") saveSkill(@Req() request: AuthenticatedRequest, @Body() body: unknown) { return this.capabilities.saveSkill(tenant(), user(request), parse(SkillInputSchema, body)); }
   @Patch("/skills/:id") updateSkill(@Req() request: AuthenticatedRequest, @Param("id") id: string, @Body() body: unknown) { return this.capabilities.updateSkill(tenant(), user(request), id, parse(SkillToggleSchema, body)); }

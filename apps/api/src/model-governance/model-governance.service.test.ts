@@ -167,6 +167,103 @@ describe("model governance scoped access", () => {
       model: "deepseek-v4-flash",
     })).rejects.toThrow("must declare vision support");
   });
+
+  it("stores chat defaults as overridable while preserving code enforcement", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+
+    await expect(service.upsertDefault({
+      tenantId,
+      mode: "chat",
+      providerId: "router",
+      model: "organization-default",
+      enforce: true,
+    })).resolves.toMatchObject({ mode: "chat", enforce: false });
+    await expect(service.upsertDefault({
+      tenantId,
+      mode: "code",
+      providerId: "router",
+      model: "organization-code-default",
+      enforce: true,
+    })).resolves.toMatchObject({ mode: "code", enforce: true });
+  });
+
+  it("ignores legacy chat-default enforcement without weakening policies or code defaults", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId,
+      providerId: "router",
+      model: "organization-default",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    await repository.upsertPolicy({
+      tenantId,
+      providerId: "failover",
+      model: "browser-choice",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    // Seed through the repository to reproduce a row written before chat
+    // defaults became explicitly overridable.
+    await repository.upsertDefault({
+      tenantId,
+      mode: "chat",
+      providerId: "router",
+      model: "organization-default",
+      enforce: true,
+    });
+    await repository.upsertDefault({
+      tenantId,
+      mode: "code",
+      providerId: "router",
+      model: "organization-default",
+      enforce: true,
+    });
+    const service = new ModelGovernanceService(repository);
+
+    await expect(service.resolve({
+      tenantId,
+      mode: "chat",
+      providerId: "failover",
+      model: "browser-choice",
+    })).resolves.toMatchObject({
+      allowed: true,
+      enforced: false,
+      providerId: "failover",
+      model: "browser-choice",
+    });
+    await expect(service.resolve({
+      tenantId,
+      mode: "code",
+      providerId: "failover",
+      model: "browser-choice",
+    })).resolves.toMatchObject({
+      allowed: false,
+      enforced: true,
+      reason: "mode_default_enforced",
+    });
+
+    await repository.upsertPolicy({
+      tenantId,
+      providerId: "failover",
+      model: "browser-choice",
+      status: "blocked",
+      enforce: true,
+      modeAllow: ["chat", "code"],
+    });
+    await expect(service.resolve({
+      tenantId,
+      mode: "chat",
+      providerId: "failover",
+      model: "browser-choice",
+    })).resolves.toMatchObject({
+      allowed: false,
+      enforced: true,
+      reason: "model_blocked",
+    });
+  });
 });
 
 async function modelService() {

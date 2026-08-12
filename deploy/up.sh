@@ -82,6 +82,16 @@ fi
 
 storage_mode="$(env_value BERRY_OBJECT_STORAGE_MODE)"
 storage_mode="${storage_mode:-minio}"
+background_worker_replicas="$(env_value BERRY_BACKGROUND_WORKER_REPLICAS)"
+foreground_worker_replicas="$(env_value BERRY_FOREGROUND_WORKER_REPLICAS)"
+background_worker_replicas="${background_worker_replicas:-1}"
+foreground_worker_replicas="${foreground_worker_replicas:-5}"
+case "$background_worker_replicas:$foreground_worker_replicas" in
+  *[!0-9:]*|0:*|*:0)
+    echo "BERRY_BACKGROUND_WORKER_REPLICAS and BERRY_FOREGROUND_WORKER_REPLICAS must be positive integers." >&2
+    exit 1
+    ;;
+esac
 domain="$(env_value BERRY_DOMAIN)"
 if [ -z "$domain" ]; then
   echo "BERRY_DOMAIN is required." >&2
@@ -158,9 +168,11 @@ if [ "$storage_mode" = "aws" ]; then
   done
   export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/native/*.caddy'
   docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml config --quiet
-  docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml pull embeddings tika redis caddy
+  docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml pull embeddings tika redis alertmanager prometheus caddy
   docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml build mem0 api worker web
-  docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml up -d --remove-orphans
+  docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml up -d --remove-orphans \
+    --scale "worker=$background_worker_replicas" \
+    --scale "worker-foreground=$foreground_worker_replicas"
   docker compose --env-file "$env_file" -f deploy/compose.yaml -f deploy/compose.aws.yaml ps
 elif [ "$storage_mode" = "r2" ]; then
   for name in BERRY_ARTIFACT_S3_ENDPOINT BERRY_ARTIFACT_S3_BUCKET BERRY_ARTIFACT_S3_ACCESS_KEY_ID BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY BERRY_AUDIT_S3_ENDPOINT BERRY_AUDIT_S3_BUCKET BERRY_AUDIT_S3_ACCESS_KEY_ID BERRY_AUDIT_S3_SECRET_ACCESS_KEY; do
@@ -172,9 +184,11 @@ elif [ "$storage_mode" = "r2" ]; then
   done
   export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/native/*.caddy'
   docker compose --env-file "$env_file" -f deploy/compose.yaml config --quiet
-  docker compose --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres embeddings tika redis caddy
+  docker compose --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres embeddings tika redis alertmanager prometheus caddy
   docker compose --env-file "$env_file" -f deploy/compose.yaml build mem0 api worker web
-  docker compose --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans
+  docker compose --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans \
+    --scale "worker=$background_worker_replicas" \
+    --scale "worker-foreground=$foreground_worker_replicas"
   docker compose --env-file "$env_file" -f deploy/compose.yaml ps
 elif [ "$storage_mode" = "minio" ]; then
   minio_password="$(env_value MINIO_ROOT_PASSWORD)"
@@ -184,9 +198,11 @@ elif [ "$storage_mode" = "minio" ]; then
   fi
   export BERRY_STORAGE_PROXY_IMPORT='/etc/caddy/storage/minio/*.caddy'
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml config --quiet
-  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres embeddings tika redis minio minio-init caddy
+  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml pull postgres mem0-postgres embeddings tika redis minio minio-init alertmanager prometheus caddy
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml build mem0 api worker web
-  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans
+  docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml up -d --remove-orphans \
+    --scale "worker=$background_worker_replicas" \
+    --scale "worker-foreground=$foreground_worker_replicas"
   docker compose --profile minio --env-file "$env_file" -f deploy/compose.yaml ps
 else
   echo "BERRY_OBJECT_STORAGE_MODE must be aws, r2, or minio." >&2

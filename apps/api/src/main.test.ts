@@ -61,6 +61,7 @@ describe("API health probes", () => {
     expect(Reflect.getMetadata(BERRY_AUTH_PUBLIC, HealthController)).toBe(true);
     expect(controller.health()).toMatchObject({ ok: true, service: "berry-api" });
     await expect(controller.ready()).resolves.toEqual({ ok: true, service: "berry-api", ready: true });
+    expect(controller.metrics()).toContain("berry_api_turn_admissions_total");
     expect(ping).toHaveBeenCalledOnce();
   });
 

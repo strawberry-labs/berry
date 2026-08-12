@@ -1,6 +1,14 @@
 import { z } from "zod";
 
-export const WORKER_QUEUE_NAME = "berry-cloud";
+/**
+ * The original shared queue remains available only as a deployment drain path.
+ * New jobs are routed to one of the two isolated queues below.
+ */
+export const LEGACY_WORKER_QUEUE_NAME = "berry-cloud";
+export const FOREGROUND_WORKER_QUEUE_NAME = "berry-cloud-turns";
+export const BACKGROUND_WORKER_QUEUE_NAME = "berry-cloud-background";
+/** @deprecated Use a role-specific queue name for new producers. */
+export const WORKER_QUEUE_NAME = LEGACY_WORKER_QUEUE_NAME;
 
 export const TitleGenJobPayloadSchema = z.object({
   tenantId: z.string().uuid(),
@@ -172,6 +180,12 @@ export interface BerryWorkerJobMap {
 }
 
 export type BerryWorkerJobPayload = BerryWorkerJobMap[BerryWorkerJobName];
+
+export type BerryWorkerQueueKind = "foreground" | "background";
+
+export function workerQueueKind(name: BerryWorkerJobName): BerryWorkerQueueKind {
+  return name === "turn.execute" || name === "turn.resume" ? "foreground" : "background";
+}
 
 export function parseWorkerJob(name: string, data: unknown): BerryWorkerJobPayload {
   const jobName = BerryWorkerJobNameSchema.parse(name);

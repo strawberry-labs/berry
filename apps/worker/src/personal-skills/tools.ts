@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { parseAgentSkillMarkdown } from "@berry/shared";
+import { formatSkillInvocation } from "@berry/harness";
+import { DurableTurnRuntimeRequestSchema, parseAgentSkillMarkdown } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
 import { z } from "zod";
 import type { SqlExecutor } from "../sql-repositories.js";
@@ -8,6 +9,7 @@ import type {
   DurableTurnSnapshot,
   DurableTurnStep,
   DurableTurnToolExecutor,
+  DurableSkillPackageFile,
   TurnToolResult,
 } from "../turn-runner.js";
 
@@ -55,30 +57,67 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName === "activate_skill") return this.activateSkill(snapshot, step);
     if (toolName !== "save_personal_skill") return this.base.execute(snapshot, step);
 
     const parsedInput = SavePersonalSkillInputSchema.safeParse(step.input.arguments ?? {});
     if (!parsedInput.success) {
       throw new Error(
-        "save_personal_skill requires exactly one field: content for a small skill, or path to a completed workspace SKILL.md for a large skill. Never send raw.",
+        "save_personal_skill requires exactly one field: content for an instructions-only skill, or path to a completed skill package directory containing SKILL.md. Never send raw.",
       );
     }
     const input = parsedInput.data;
-    const content = "content" in input
-      ? input.content
-      : await this.readSkillContent(snapshot, step, input.path);
+    let packageFiles = "content" in input
+      ? [{ path: "SKILL.md", contentBase64: Buffer.from(input.content, "utf8").toString("base64"), mode: 0o644 }]
+      : await this.readWorkspaceSkillPackage(snapshot, step, input.path);
+    const skillFile = packageFiles.find((file) => file.path === "SKILL.md");
+    if (!skillFile) throw new Error("Skill package is missing SKILL.md at its root");
+    const content = Buffer.from(skillFile.contentBase64, "base64").toString("utf8");
     const metadata = parseAgentSkillMarkdown(content);
-    const hash = createHash("sha256").update(content).digest("hex");
     const deterministicId = `skill_${createHash("sha256")
       .update(`${snapshot.tenantId}\0${snapshot.userId}\0${metadata.name}`)
       .digest("hex")
       .slice(0, 40)}`;
-    const existing = await this.executor.query<{ id: string }>(
+    const existing = await this.inTenant(snapshot.tenantId, (executor) => executor.query<{ id: string }>(
       "SELECT id FROM personal_skills WHERE tenant_id=$1::uuid AND user_id=$2 AND name=$3 ORDER BY updated_at DESC LIMIT 1",
       [snapshot.tenantId, snapshot.userId, metadata.name],
-    );
+    ));
     const id = existing[0]?.id ?? deterministicId;
-    await this.executor.execute(
+    if ("content" in input && existing[0]) {
+      const resources = await this.inTenant(snapshot.tenantId, (executor) => executor.query<{ path: string; content: Buffer; mode: number }>(
+        "SELECT path,content,mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path",
+        [id],
+      ));
+      packageFiles = [packageFiles[0]!, ...resources.map((row) => ({ path: row.path, contentBase64: Buffer.from(row.content).toString("base64"), mode: row.mode }))];
+    }
+    const hash = hashSkillPackage(packageFiles);
+    await this.inTenant(snapshot.tenantId, async (executor) => executor.transaction
+      ? executor.transaction((transaction) => this.persistSkillPackage(transaction, snapshot, id, metadata, content, hash, packageFiles))
+      : this.persistSkillPackage(executor, snapshot, id, metadata, content, hash, packageFiles));
+    return {
+      output: {
+        skill: {
+          id,
+          name: metadata.name,
+          description: metadata.description,
+          enabled: true,
+          resources: packageFiles.filter((file) => file.path !== "SKILL.md").map((file) => file.path),
+        },
+      },
+      summary: `Saved $${metadata.name} to the current user's Skills library with ${packageFiles.length - 1} resource file${packageFiles.length === 2 ? "" : "s"}`,
+    };
+  }
+
+  private async persistSkillPackage(
+    executor: SqlExecutor,
+    snapshot: DurableTurnSnapshot,
+    id: string,
+    metadata: ReturnType<typeof parseAgentSkillMarkdown>,
+    content: string,
+    hash: string,
+    packageFiles: readonly DurableSkillPackageFile[],
+  ): Promise<void> {
+    await executor.execute(
       `
 INSERT INTO personal_skills (
   id,tenant_id,user_id,name,description,content,enabled,trusted,source,source_url,version,hash,diagnostics,created_at,updated_at
@@ -99,43 +138,77 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       `.trim(),
       [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, content, metadata.version, hash],
     );
-    return {
-      output: {
-        skill: {
-          id,
-          name: metadata.name,
-          description: metadata.description,
-          enabled: true,
-        },
-      },
-      summary: `Saved $${metadata.name} to the current user's Skills library`,
-    };
+    await executor.execute("DELETE FROM personal_skill_files WHERE skill_id=$1", [id]);
+    for (const file of packageFiles.filter((candidate) => candidate.path !== "SKILL.md")) {
+      const bytes = Buffer.from(file.contentBase64, "base64");
+      await executor.execute(
+        "INSERT INTO personal_skill_files (tenant_id,skill_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7)",
+        [snapshot.tenantId,id,file.path,bytes,bytes.byteLength,createHash("sha256").update(bytes).digest("hex"),file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644)],
+      );
+    }
   }
 
-  private async readSkillContent(
-    snapshot: DurableTurnSnapshot,
-    step: DurableTurnStep,
-    path: string,
-  ): Promise<string> {
+  private async readWorkspaceSkillPackage(snapshot: DurableTurnSnapshot, step: DurableTurnStep, path: string): Promise<readonly DurableSkillPackageFile[]> {
+    const files = this.base.readSkillPackage
+      ? await this.base.readSkillPackage(snapshot, path)
+      : await this.readLegacySkillFile(snapshot, step, path);
+    const skill = files.find((file) => file.path === "SKILL.md");
+    if (!skill || Buffer.from(skill.contentBase64, "base64").byteLength > 262_144) throw new Error("SKILL.md is missing or exceeds the 256 KiB limit");
+    return files;
+  }
+
+  private async readLegacySkillFile(snapshot: DurableTurnSnapshot, step: DurableTurnStep, path: string): Promise<readonly DurableSkillPackageFile[]> {
     const result = await this.base.execute(snapshot, {
       ...step,
       type: "tool.read_file",
-      input: {
-        ...step.input,
-        toolName: "read_file",
-        arguments: { path },
-      },
+      input: { ...step.input, toolName: "read_file", arguments: { path } },
     });
-    const output = result.output && typeof result.output === "object" && !Array.isArray(result.output)
-      ? result.output
-      : null;
+    const output = result.output && typeof result.output === "object" && !Array.isArray(result.output) ? result.output : null;
     const content = typeof output?.content === "string" ? output.content : null;
-    if (!content) throw new Error("The skill path did not resolve to a readable text file");
-    if (Buffer.byteLength(content, "utf8") > 262_144) {
-      throw new Error("SKILL.md exceeds the 256 KiB personal skill limit");
-    }
-    return content;
+    if (!content) throw new Error("The skill path did not resolve to a readable SKILL.md file");
+    return [{ path: "SKILL.md", contentBase64: Buffer.from(content, "utf8").toString("base64"), mode: 0o644 }];
   }
+
+  private async activateSkill(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+    const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
+    const requestedName = stringValue((step.input.arguments as Record<string, unknown> | undefined)?.name);
+    const skill = runtime.extraSkills.find((candidate) => candidate.name === requestedName);
+    if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}`);
+    const alreadyActive = snapshot.steps.some((candidate) => candidate.id !== step.id && candidate.state === "completed" && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill" && stringValue((candidate.input.arguments as Record<string, unknown> | undefined)?.name) === skill.name);
+    if (alreadyActive) return { output: { skill: skill.name, alreadyActive: true, content: `<skill_already_active name=${JSON.stringify(skill.name)} />` }, summary: `${skill.name} is already active` };
+
+    const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
+    const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
+    const rows = await this.inTenant(snapshot.tenantId, (executor) => personalId
+      ? executor.query<{ path: string; content: Buffer; mode: number }>("SELECT path,content,mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path", [personalId])
+      : executor.query<{ path: string; content: Buffer; mode: number }>("SELECT path,content,mode FROM organization_skill_files WHERE organization_capability_id=$1 ORDER BY path", [organizationId]));
+    const files: DurableSkillPackageFile[] = [
+      { path: "SKILL.md", contentBase64: Buffer.from(skill.content, "utf8").toString("base64"), mode: 0o644 },
+      ...rows.map((row) => ({ path: row.path, contentBase64: Buffer.from(row.content).toString("base64"), mode: row.mode })),
+    ];
+    if (!this.base.stageSkillPackage) throw new Error("Skill package workspace access is unavailable");
+    const staged = await this.base.stageSkillPackage(snapshot, personalId ?? organizationId ?? skill.name, files);
+    const activeSkill = { ...skill, filePath: staged.filePath, resources: staged.resources };
+    return {
+      output: { skill: skill.name, alreadyActive: false, location: staged.filePath, content: formatSkillInvocation(activeSkill) },
+      summary: `Activated ${skill.name} with ${staged.resources.length} resource file${staged.resources.length === 1 ? "" : "s"}`,
+    };
+  }
+
+  private async inTenant<T>(tenantId: string, operation: (executor: SqlExecutor) => Promise<T>): Promise<T> {
+    if (!this.executor.runWithTenant) return operation(this.executor);
+    return this.executor.runWithTenant(tenantId, () => operation(this.executor));
+  }
+}
+
+function hashSkillPackage(files: readonly DurableSkillPackageFile[]): string {
+  const skill = files.find((file) => file.path === "SKILL.md");
+  if (!skill) throw new Error("Skill package is missing SKILL.md");
+  const hash = createHash("sha256").update("SKILL.md\0").update(Buffer.from(skill.contentBase64, "base64"));
+  for (const file of files.filter((candidate) => candidate.path !== "SKILL.md").sort((left, right) => left.path.localeCompare(right.path))) {
+    hash.update("\0").update(file.path).update("\0").update(Buffer.from(file.contentBase64, "base64"));
+  }
+  return hash.digest("hex");
 }
 
 function stringValue(value: unknown): string | null {

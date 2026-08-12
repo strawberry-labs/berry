@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
-import { DURABLE_BASE_BUILT_IN_TOOLS, type AgentStreamEvent, type TurnRunState } from "@berry/shared";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DURABLE_BASE_BUILT_IN_TOOLS, latestAssistantStreamDraft, type AgentStreamEvent, type TurnRunState } from "@berry/shared";
 import {
   OpenAIChatCompletionsClient,
+  RouterClientError,
   type ChatCompletionChunk,
   type ChatCompletionOptions,
 } from "@berry/router-client";
@@ -19,14 +20,20 @@ import {
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
+  type DurableTurnRetryDiagnostics,
   type DurableTurnSnapshot,
   type DurableTurnStep,
   type DurableTurnToolExecutor,
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
 const runId = "00000000-0000-7000-8000-000000000002";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("durable turn runner", () => {
   it("guides ordinary image-edit turns toward the admitted image tool", () => {
@@ -44,6 +51,101 @@ describe("durable turn runner", () => {
     expect(createDurableTurnModel({ BERRY_API_MODEL_MODE: "live" }))
       .toBeInstanceOf(SnapshotProviderDurableTurnModel);
   });
+
+  it.each([
+    ["openai-responses", "resp-success"],
+    ["anthropic-messages", "msg-success"],
+  ] as const)("returns successful request identifiers from %s", async (apiType, responseId) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      apiType === "openai-responses"
+        ? [
+            'data: {"type":"response.output_text.delta","delta":"ok"}',
+            `data: {"type":"response.completed","response":{"id":"${responseId}","model":"served-model","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`,
+            "data: [DONE]",
+            "",
+          ].join("\n\n")
+        : [
+            `data: {"type":"message_start","message":{"id":"${responseId}","model":"served-model","usage":{"input_tokens":2}}}`,
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+            'data: {"type":"content_block_stop","index":0}',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}',
+            'data: {"type":"message_stop"}',
+            "",
+          ].join("\n\n"),
+      {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "x-router-request-id": `${apiType} request@42`,
+        },
+      },
+    )) as typeof fetch);
+    const current = providerSnapshot(apiType);
+    const deltas: string[] = [];
+    const result = await new SnapshotProviderDurableTurnModel({}, null).call(
+      current,
+      modelStep("pending", 1),
+      {
+        messageId: randomUUID(),
+        tools: [],
+        additionalUserContent: [],
+        emitDelta: async (delta) => { deltas.push(delta); },
+        policyForTool: () => ({
+          retryClass: "read_only",
+          requiresApproval: false,
+          approvalKind: "mcp",
+        }),
+      },
+    );
+
+    expect(result).toMatchObject({
+      text: "ok",
+      providerResponseId: responseId,
+      routerRequestId: `${apiType}_request_42`,
+      inputTokens: 2,
+      outputTokens: 1,
+    });
+    expect(deltas.join("")).toBe("ok");
+  });
+
+  it.each(["openai-responses", "anthropic-messages"] as const)(
+    "rethrows structured transient errors from %s",
+    async (apiType) => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(
+        JSON.stringify({ error: { message: "temporarily unavailable", code: "upstream_unavailable" } }),
+        {
+          status: 503,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": `${apiType} request@503`,
+          },
+        },
+      )) as typeof fetch);
+      const current = providerSnapshot(apiType);
+
+      await expect(new SnapshotProviderDurableTurnModel({}, null).call(
+        current,
+        modelStep("pending", 1),
+        {
+          messageId: randomUUID(),
+          tools: [],
+          additionalUserContent: [],
+          emitDelta: async () => undefined,
+          policyForTool: () => ({
+            retryClass: "read_only",
+            requiresApproval: false,
+            approvalKind: "mcp",
+          }),
+        },
+      )).rejects.toMatchObject({
+        name: "RouterClientError",
+        status: 503,
+        code: "upstream_unavailable",
+        requestId: `${apiType}_request_503`,
+      });
+    },
+  );
 
   it("does not duplicate a completed step when the queue delivery repeats", async () => {
     const repository = new FakeTurnRepository(snapshot("queued", [admittedStep()]));
@@ -130,15 +232,22 @@ describe("durable turn runner", () => {
     const repository = new FakeTurnRepository(current);
     let modelCalls = 0;
     const runner = new DurableTurnRunner(repository, {
-      call: async () => {
+      call: async (_snapshot, _step, context) => {
         modelCalls += 1;
+        await context.emitDelta("unfinished reasoning", "reasoning");
         return {
           text: "",
           reasoning: "unfinished reasoning",
           finishReason: "length",
           providerResponseId: "completion-cut-off",
           inputTokens: 50,
-          outputTokens: 384_000,
+          outputTokens: 32_598,
+          usage: {
+            kind: "usage",
+            inputTokens: 50,
+            outputTokens: 32_598,
+            totalTokens: 32_648,
+          },
           toolCalls: [],
         };
       },
@@ -147,13 +256,57 @@ describe("durable turn runner", () => {
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
       .resolves.toMatchObject({ state: "failed" });
     expect(modelCalls).toBe(1);
-    expect(repository.current.error).toContain("384000-token output limit");
+    expect(repository.current.error).toContain("32,598 provider-reported output tokens");
+    expect(repository.current.error).toContain("Berry requested up to 384,000 output tokens");
+    expect(repository.current.error).toContain("lower provider-side generation cap or incorrect model metadata");
+    expect(repository.current.error).toContain("Provider response ID: completion-cut-off");
     expect(repository.current.steps.filter((step) => step.type === "model.call")).toHaveLength(1);
     expect(repository.current.steps.at(-1)?.output).toMatchObject({
       finishReason: "length",
       providerResponseId: "completion-cut-off",
+      outputTokens: 32_598,
+      requestedMaxOutputTokens: 384_000,
       reasoningCharacters: 20,
     });
+    expect(repository.events.some((event) => event.kind === "message.end")).toBe(false);
+    expect(latestAssistantStreamDraft(repository.events)).toMatchObject({
+      reasoning: "unfinished reasoning",
+      text: "",
+      open: true,
+    });
+  });
+
+  it("hands sanitized provider diagnostics to the atomic retry release", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.model = "provider/model";
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        throw new RouterClientError(
+          "Provider request failed with 503",
+          503,
+          "sensitive upstream response body",
+          { code: "upstream_unavailable", requestId: "router_request_503" },
+        );
+      },
+    }, noTools(), { owner: "worker-provider-retry" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toBeInstanceOf(DurableTurnRetryableError);
+
+    expect(repository.releasedRetryDiagnostics).toEqual({
+      stepId: current.steps.find((step) => step.type === "model.call")!.id,
+      providerDiagnostics: {
+        outcome: "failure",
+        model: "provider/model",
+        status: 503,
+        routerRequestId: "router_request_503",
+        providerResponseId: null,
+        latencyMs: expect.any(Number),
+        errorCode: "upstream_unavailable",
+      },
+    });
+    expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("sensitive upstream response body");
   });
 
   it("stops a sustained exact reasoning loop before it can consume the full model allowance", async () => {
@@ -176,6 +329,28 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
     expect(repository.current.error).toContain("exact repeating reasoning loop");
     expect(providerAborted).toBe(true);
+  });
+
+  it("aborts an active provider request immediately when cancellation is published", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let providerStarted!: () => void;
+    const started = new Promise<void>((resolve) => { providerStarted = resolve; });
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => new Promise<never>((_resolve, reject) => {
+        providerStarted();
+        context.signal?.addEventListener("abort", () => reject(context.signal?.reason), { once: true });
+      }),
+    }, noTools(), { owner: "worker-immediate-cancel", cancellations });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await started;
+    expect(cancellations.cancel(runId)).toBe(1);
+
+    await expect(execution).resolves.toMatchObject({ state: "cancelled" });
   });
 
   it("caps the model output allowance to the remaining context capacity", async () => {
@@ -1194,6 +1369,7 @@ describe("durable turn runner", () => {
         yield {
           id: "completion-1",
           model: "kimi-2.6",
+          requestId: "router-request-success",
           delta: "Searching",
           reasoningDelta: "Need current sources.",
           finishReason: null,
@@ -1342,6 +1518,7 @@ describe("durable turn runner", () => {
       reasoning: "Need current sources.",
       finishReason: "tool_calls",
       providerResponseId: "completion-1",
+      routerRequestId: "router-request-success",
       inputTokens: 10,
       outputTokens: 4,
       usage: { costRawMicros: "18" },
@@ -1352,6 +1529,37 @@ describe("durable turn runner", () => {
         requiresApproval: false,
       }],
     });
+  });
+
+  it("persists a successful router request id in model-step diagnostics", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [
+      admittedStep(),
+      modelStep("pending", 1),
+    ]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({
+        text: "Done.",
+        providerResponseId: "completion-success",
+        routerRequestId: "router-request-success",
+        inputTokens: 2,
+        outputTokens: 1,
+        toolCalls: [],
+      }),
+    }, noTools(), { owner: "worker-success-diagnostics" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "finalizing" });
+
+    expect(repository.current.steps.find((step) => step.type === "model.call")?.output)
+      .toMatchObject({
+        providerDiagnostics: {
+          outcome: "success",
+          status: 200,
+          routerRequestId: "router-request-success",
+          providerResponseId: "completion-success",
+          errorCode: null,
+        },
+      });
   });
 
   it("persists and replays interleaved reasoning with assistant tool calls", async () => {
@@ -1647,6 +1855,47 @@ describe("durable turn runner", () => {
         reason: "The budget reservation for this turn is no longer active.",
       });
   });
+
+  it("persists retry diagnostics in the same statement that releases the lease", async () => {
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      async execute(sql, params = []) {
+        statements.push({ sql, params });
+      },
+      async query<T>() { return [] as T[]; },
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("running", 1)]);
+    current.leaseOwner = "worker-provider-retry";
+    const modelCall = current.steps.find((step) => step.type === "model.call")!;
+    const diagnostics = {
+      outcome: "failure",
+      model: "provider/model",
+      status: 503,
+      routerRequestId: "router_request_503",
+      providerResponseId: null,
+      latencyMs: 42,
+      errorCode: "upstream_unavailable",
+    };
+
+    await new SqlDurableTurnRepository(executor).release(
+      current,
+      "Provider request failed with 503",
+      { stepId: modelCall.id, providerDiagnostics: diagnostics },
+    );
+
+    expect(statements).toHaveLength(1);
+    expect(statements[0]!.sql).toContain("WITH released AS");
+    expect(statements[0]!.sql).toContain("jsonb_build_object('providerDiagnostics',$5::jsonb)");
+    expect(statements[0]!.sql).toContain("EXISTS (SELECT 1 FROM released)");
+    expect(statements[0]!.params).toEqual([
+      tenantId,
+      runId,
+      "worker-provider-retry",
+      "Provider request failed with 503",
+      JSON.stringify(diagnostics),
+      modelCall.id,
+    ]);
+  });
 });
 
 class FakeTurnRepository implements DurableTurnRepository {
@@ -1655,6 +1904,7 @@ class FakeTurnRepository implements DurableTurnRepository {
   mutations: DurableTurnMutation[] = [];
   budgetDecision = { allowed: true, reason: null as string | null };
   lastBudgetEstimate = "0";
+  releasedRetryDiagnostics: DurableTurnRetryDiagnostics | undefined;
 
   constructor(public current: MutableSnapshot) {}
 
@@ -1726,7 +1976,12 @@ class FakeTurnRepository implements DurableTurnRepository {
     this.current.leaseOwner = mutation.keepLease ? snapshotValue.leaseOwner : "";
   }
 
-  async release(): Promise<void> {
+  async release(
+    _snapshot: DurableTurnSnapshot,
+    _error?: string,
+    retryDiagnostics?: DurableTurnRetryDiagnostics,
+  ): Promise<void> {
+    this.releasedRetryDiagnostics = retryDiagnostics;
     this.current.leaseOwner = "";
   }
 }
@@ -1781,6 +2036,41 @@ function snapshot(state: TurnRunState, steps: DurableTurnStep[]): MutableSnapsho
     approvals: [],
     error: null,
   };
+}
+
+function providerSnapshot(apiType: "openai-responses" | "anthropic-messages"): MutableSnapshot {
+  const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+  current.runtimeRequest = {
+    capabilityVersion: 1,
+    input: "Say ok",
+    providerId: `provider-${apiType}`,
+    provider: {
+      id: `provider-${apiType}`,
+      name: apiType,
+      kind: "test",
+      baseUrl: "https://provider.example.test/v1",
+      defaultModel: "test-model",
+      apiType,
+      endpointPath: apiType === "openai-responses" ? "/responses" : "/messages",
+      authType: "none",
+      models: [],
+    },
+    model: "test-model",
+    conversationKind: "chat",
+    workspacePath: "/workspace",
+    workspaceId: current.workspaceId,
+    permissionMode: "ask",
+    reasoning: "off",
+    maxTokens: 1_000,
+    contextWindowTokens: 16_000,
+    modelAcceptsImages: false,
+    modelPricing: {},
+    builtInTools: [],
+    mcpServers: [],
+    extraSkills: [],
+    attachments: [],
+  };
+  return current;
 }
 
 function admittedStep(): DurableTurnStep {

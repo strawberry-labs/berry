@@ -62,6 +62,34 @@ describe("BerryModelAdapter", () => {
     expect(events.some((event) => event.type === "toolcall_end" && event.toolCall.name === "lookup")).toBe(true);
   });
 
+  it("preserves a sanitized request id when adapting a buffered completion", async () => {
+    const buffered = new BufferedChatCompletionClient({
+      async complete() {
+        return {
+          id: "buffered_request_id",
+          model: "test-model",
+          requestId: "router-request-buffered",
+          content: "done",
+          finishReason: "stop",
+          raw: {},
+        };
+      },
+      async *stream() {
+        throw new Error("the SSE lane must not be used");
+      },
+    });
+    const chunks = [];
+
+    for await (const chunk of buffered.stream({ messages: [] })) chunks.push(chunk);
+
+    expect(chunks).toEqual([
+      expect.objectContaining({
+        id: "buffered_request_id",
+        requestId: "router-request-buffered",
+      }),
+    ]);
+  });
+
   it("falls back to a buffered completion when streaming fails before its first content chunk", async () => {
     let completed = 0;
     const compatible = {

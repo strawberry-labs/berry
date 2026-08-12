@@ -1,0 +1,17 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: berry-aws-sns
+  group_by: [alertname, severity, deployment]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: berry-aws-sns
+    sns_configs:
+      - topic_arn: __BERRY_ALERT_SNS_TOPIC_ARN__
+        send_resolved: true
+        sigv4:
+          region: __BERRY_ALERT_SNS_REGION__

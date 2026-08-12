@@ -10,20 +10,26 @@ import {
   type PersonalizationProfile,
   type PersonalMcpServer,
   type PersonalSkill,
+  type PersonalSkillPackage,
   type PersonalSkillReview,
+  type SkillPackageFile,
 } from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 
 export const PERSONAL_CAPABILITIES = Symbol("PERSONAL_CAPABILITIES");
 const MAX_SKILL_BYTES = 262_144;
+const MAX_PACKAGE_BYTES = 5 * 1024 * 1024;
+const MAX_PACKAGE_FILES = 500;
+type SkillFileMetadata = { path: string; sizeBytes: number };
 
-export type PersonalSkillInput = { name?: string | undefined; description?: string | undefined; content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; version?: string | null | undefined; packageFiles?: string[] | undefined; enabled?: boolean | undefined };
+export type PersonalSkillInput = { name?: string | undefined; description?: string | undefined; content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; version?: string | null | undefined; packageFiles?: string[] | undefined; resourceFiles?: SkillPackageFile[] | undefined; enabled?: boolean | undefined };
 type McpInput = { name: string; url: string; transport: "http-sse" | "streamable-http"; auth: "none" | "bearer" | "oauth"; credential?: string | undefined; enabled?: boolean | undefined; trusted?: boolean | undefined };
 type ToggleInput = { enabled?: boolean | undefined; trusted?: boolean | undefined };
 
 export class PersonalCapabilitiesService {
   readonly #skills = new Map<string, PersonalSkill>();
+  readonly #skillFiles = new Map<string, SkillPackageFile[]>();
   readonly #mcp = new Map<string, PersonalMcpServer>();
   readonly #secrets = new Map<string, string>();
   readonly #secretEnvelopes = new Map<string, DurableSecretEnvelope>();
@@ -70,28 +76,50 @@ export class PersonalCapabilitiesService {
     return [...this.#skills.values()].filter((item) => owns(item, tenantId, userId));
   }
 
-  async previewSkill(input: PersonalSkillInput): Promise<{ review: PersonalSkillReview; content: string }> {
+  async previewSkill(input: PersonalSkillInput): Promise<{ review: PersonalSkillReview; content: string; resourceFiles: SkillPackageFile[] }> {
     const source = input.source ?? "text";
     const content = source === "git" ? await fetchApprovedSkill(input.sourceUrl) : input.content ?? "";
     validateSkillContent(content);
     const metadata = parseAgentSkillMarkdown(content);
     if (input.name?.trim() && input.name.trim() !== metadata.name) throw new BadRequestException(`Skill name must match SKILL.md frontmatter (${metadata.name})`);
     if (input.description?.trim() && input.description.trim() !== metadata.description) throw new BadRequestException("Skill description must match SKILL.md frontmatter");
-    const packageFiles = [...new Set(input.packageFiles ?? [])].sort();
+    const resourceFiles = normalizeSkillPackageFiles(input.resourceFiles ?? []);
+    const packageFiles = [...new Set(input.packageFiles ?? ["SKILL.md", ...resourceFiles.map((file) => file.path)])].sort();
+    const missingResources = packageFiles.filter((path) => path !== "SKILL.md" && !resourceFiles.some((file) => file.path === path));
+    if (missingResources.length > 0) {
+      throw new BadRequestException(`Skill package file content is missing for: ${missingResources.slice(0, 5).join(", ")}`);
+    }
+    const packageBytes = Buffer.byteLength(content) + resourceFiles.reduce((total, file) => total + Buffer.from(file.contentBase64, "base64").byteLength, 0);
+    if (packageBytes > MAX_PACKAGE_BYTES) throw new BadRequestException("Skill packages are limited to 5 MB extracted");
     const warnings = [/ignore (all|previous) instructions/i, /curl\s+.*\|\s*(sh|bash)/i].filter((pattern) => pattern.test(content)).map(() => "Skill contains instructions that should be inspected before use.");
     if (packageFiles.some((path) => path.startsWith("scripts/"))) warnings.push("This skill package includes executable scripts. Inspect them before use.");
-    return { content, review: { ...metadata, source, hash: sha256(content), bytes: Buffer.byteLength(content), warnings, resources: packageFiles.filter((path) => path !== "SKILL.md"), hasScripts: packageFiles.some((path) => path.startsWith("scripts/")) } };
+    return { content, resourceFiles, review: { ...metadata, source, hash: hashSkillPackage(content, resourceFiles), bytes: packageBytes, warnings, resources: resourceFiles.map((file) => file.path), hasScripts: resourceFiles.some((file) => file.path.startsWith("scripts/")) } };
   }
 
   async saveSkill(tenantId: string, userId: string, input: PersonalSkillInput & { id?: string }): Promise<PersonalSkill> {
     await this.#load(tenantId, userId);
-    const preview = await this.previewSkill(input);
+    let preview = await this.previewSkill(input);
     const existing = input.id
       ? this.#skill(input.id, tenantId, userId)
       : [...this.#skills.values()].find((item) => owns(item, tenantId, userId) && item.name === preview.review.name) ?? null;
+    if (existing && input.resourceFiles === undefined && input.packageFiles === undefined) {
+      const currentPackage = await this.skillPackage(tenantId, userId, existing.id);
+      preview = await this.previewSkill({
+        ...input,
+        resourceFiles: currentPackage.resourceFiles,
+        packageFiles: ["SKILL.md", ...currentPackage.resourceFiles.map((file) => file.path)],
+      });
+    }
     const now = new Date().toISOString();
-    const skill: PersonalSkill = { id: existing?.id ?? `skill_${randomUUID()}`, tenantId, userId, name: preview.review.name, description: preview.review.description, content: preview.content, enabled: input.enabled ?? existing?.enabled ?? true, trusted: true, source: preview.review.source, sourceUrl: input.sourceUrl ?? null, version: input.version ?? preview.review.version, hash: preview.review.hash, diagnostics: preview.review.warnings, createdAt: existing?.createdAt ?? now, updatedAt: now };
-    this.#skills.set(skill.id, skill); await this.#persistSkill(skill); return skill;
+    const skill: PersonalSkill = { id: existing?.id ?? `skill_${randomUUID()}`, tenantId, userId, name: preview.review.name, description: preview.review.description, content: preview.content, enabled: input.enabled ?? existing?.enabled ?? true, trusted: true, source: preview.review.source, sourceUrl: input.sourceUrl ?? null, version: input.version ?? preview.review.version, hash: preview.review.hash, diagnostics: preview.review.warnings, resources: preview.review.resources, packageBytes: preview.review.bytes, createdAt: existing?.createdAt ?? now, updatedAt: now };
+    this.#skills.set(skill.id, skill); this.#skillFiles.set(skill.id, preview.resourceFiles); await this.#persistSkill(skill, preview.resourceFiles); return skill;
+  }
+
+  async skillPackage(tenantId: string, userId: string, id: string): Promise<PersonalSkillPackage> {
+    await this.#load(tenantId, userId);
+    const skill = this.#skill(id, tenantId, userId);
+    if (this.database) await this.#refreshSkillFiles(tenantId, id);
+    return { content: skill.content, resourceFiles: this.#skillFiles.get(id) ?? [] };
   }
 
   async updateSkill(tenantId: string, userId: string, id: string, input: ToggleInput): Promise<PersonalSkill> {
@@ -151,7 +179,7 @@ export class PersonalCapabilitiesService {
   pollOAuth(tenantId: string, userId: string, state: string) { const flow = this.#oauth.get(state); if (!flow || flow.expiresAt < Date.now() || flow.tenantId !== tenantId || flow.userId !== userId) throw new BadRequestException("OAuth state is invalid or expired"); return { status: flow.complete ? "complete" as const : "pending" as const, serverId: flow.complete ? flow.serverId : null }; }
 
   async runtime(tenantId: string, userId: string): Promise<{ skills: AgentSkill[]; mcpServers: McpServerSpec[] }> {
-    const skills = (await this.listSkills(tenantId, userId)).filter((item) => item.enabled).map((item) => ({ name: item.name, description: item.description, content: item.content, filePath: `/personal-skills/${item.id}/SKILL.md`, scope: "registered" as const, disableModelInvocation: false, resources: [] }));
+    const skills = (await this.listSkills(tenantId, userId)).filter((item) => item.enabled).map((item) => ({ name: item.name, description: item.description, content: item.content, filePath: `/personal-skills/${item.id}/SKILL.md`, scope: "registered" as const, disableModelInvocation: false, resources: item.resources.map((path) => `/personal-skills/${item.id}/${path}`) }));
     const enabledMcp = (await this.listMcp(tenantId, userId)).filter((item) => item.enabled && item.trusted);
     for (const item of enabledMcp) {
       if (item.auth !== "none" && item.credentialRef && !this.#secrets.has(item.credentialRef)) {
@@ -169,12 +197,14 @@ export class PersonalCapabilitiesService {
 
   async #load(tenantId: string, userId: string) {
     const key = `${tenantId}:${userId}`; if (!this.database || this.#loaded.has(key)) return; this.#loaded.add(key);
-    const [skills, servers, profiles] = await Promise.all([
+    const [skills, skillFiles, servers, profiles] = await Promise.all([
       this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personal_skills WHERE user_id = $1", [userId])),
+      this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT f.skill_id, f.path, f.size_bytes FROM personal_skill_files f JOIN personal_skills s ON s.id=f.skill_id WHERE s.user_id = $1 ORDER BY f.skill_id, f.path", [userId])),
       this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personal_mcp_servers WHERE user_id = $1", [userId])),
       this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personalization_profiles WHERE user_id = $1 LIMIT 1", [userId])),
     ]);
-    for (const row of skills) { const item = skillRow(row); this.#skills.set(item.id, item); }
+    const groupedFiles = groupSkillFileRows(skillFiles, "skill_id");
+    for (const row of skills) { const item = skillRow(row, groupedFiles.get(str(row, "id")) ?? []); this.#skills.set(item.id, item); }
     for (const row of servers) {
       const envelope = durableEnvelope(row.credential_envelope);
       const item = mcpRow(row, Boolean(envelope));
@@ -189,19 +219,36 @@ export class PersonalCapabilitiesService {
   }
   async #refreshSkills(tenantId: string, userId: string) {
     if (!this.database) return;
-    const rows = await this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>(
-      "SELECT * FROM personal_skills WHERE user_id = $1",
-      [userId],
-    ));
+    const [rows, fileRows] = await Promise.all([
+      this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT * FROM personal_skills WHERE user_id = $1", [userId])),
+      this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT f.skill_id, f.path, f.size_bytes FROM personal_skill_files f JOIN personal_skills s ON s.id=f.skill_id WHERE s.user_id = $1 ORDER BY f.skill_id, f.path", [userId])),
+    ]);
+    const groupedFiles = groupSkillFileRows(fileRows, "skill_id");
     for (const [id, item] of this.#skills) {
       if (owns(item, tenantId, userId)) this.#skills.delete(id);
     }
     for (const row of rows) {
-      const item = skillRow(row);
+      const item = skillRow(row, groupedFiles.get(str(row, "id")) ?? []);
       this.#skills.set(item.id, item);
     }
   }
-  async #persistSkill(skill: PersonalSkill) { if (!this.database) return; await this.database.withTenant(skill.tenantId, (db) => db.execute(`INSERT INTO personal_skills (id, tenant_id, user_id, name, description, content, enabled, trusted, source, source_url, version, hash, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,content=EXCLUDED.content,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,source=EXCLUDED.source,source_url=EXCLUDED.source_url,version=EXCLUDED.version,hash=EXCLUDED.hash,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [skill.id,skill.tenantId,skill.userId,skill.name,skill.description,skill.content,skill.enabled,skill.trusted,skill.source,skill.sourceUrl,skill.version,skill.hash,JSON.stringify(skill.diagnostics),skill.createdAt,skill.updatedAt])); }
+  async #refreshSkillFiles(tenantId: string, skillId: string) {
+    if (!this.database) return;
+    const rows = await this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT skill_id, path, content, mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path", [skillId]));
+    this.#skillFiles.set(skillId, rows.map(skillPackageFileRow));
+  }
+  async #persistSkill(skill: PersonalSkill, files?: readonly SkillPackageFile[]) {
+    if (!this.database) return;
+    await this.database.withTenant(skill.tenantId, async (db) => {
+      await db.execute(`INSERT INTO personal_skills (id, tenant_id, user_id, name, description, content, enabled, trusted, source, source_url, version, hash, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,content=EXCLUDED.content,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,source=EXCLUDED.source,source_url=EXCLUDED.source_url,version=EXCLUDED.version,hash=EXCLUDED.hash,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [skill.id,skill.tenantId,skill.userId,skill.name,skill.description,skill.content,skill.enabled,skill.trusted,skill.source,skill.sourceUrl,skill.version,skill.hash,JSON.stringify(skill.diagnostics),skill.createdAt,skill.updatedAt]);
+      if (!files) return;
+      await db.execute("DELETE FROM personal_skill_files WHERE skill_id=$1", [skill.id]);
+      for (const file of files) {
+        const content = Buffer.from(file.contentBase64, "base64");
+        await db.execute("INSERT INTO personal_skill_files (tenant_id,skill_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7)", [skill.tenantId, skill.id, file.path, content, content.byteLength, sha256(content), file.mode ?? defaultSkillFileMode(file.path)]);
+      }
+    });
+  }
   async #persistMcp(server: PersonalMcpServer) { if (!this.database) return; const envelope = server.credentialRef ? this.#secretEnvelopes.get(server.credentialRef) : undefined; await this.database.withTenant(server.tenantId, (db) => db.execute(`INSERT INTO personal_mcp_servers (id, tenant_id, user_id, name, url, transport, auth, credential_ref, credential_envelope, enabled, trusted, health, tool_count, last_checked_at, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14::timestamptz,$15::jsonb,$16::timestamptz,$17::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,transport=EXCLUDED.transport,auth=EXCLUDED.auth,credential_ref=EXCLUDED.credential_ref,credential_envelope=EXCLUDED.credential_envelope,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,health=EXCLUDED.health,tool_count=EXCLUDED.tool_count,last_checked_at=EXCLUDED.last_checked_at,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [server.id,server.tenantId,server.userId,server.name,server.url,server.transport,server.auth,server.credentialRef,envelope ? JSON.stringify(envelope) : null,server.enabled,server.trusted,server.health,server.toolCount,server.lastCheckedAt,JSON.stringify(server.diagnostics),server.createdAt,server.updatedAt])); }
 
   #durableSecretKey(): string {
@@ -216,7 +263,14 @@ export class PersonalCapabilitiesService {
 }
 
 function owns(item: { tenantId: string; userId: string }, tenantId: string, userId: string) { return item.tenantId === tenantId && item.userId === userId; }
-function sha256(content: string) { return createHash("sha256").update(content).digest("hex"); }
+function sha256(content: string | Buffer) { return createHash("sha256").update(content).digest("hex"); }
+function hashSkillPackage(content: string, files: readonly SkillPackageFile[]) {
+  const hash = createHash("sha256").update("SKILL.md\0").update(content);
+  for (const file of [...files].sort((left, right) => left.path.localeCompare(right.path))) {
+    hash.update("\0").update(file.path).update("\0").update(Buffer.from(file.contentBase64, "base64"));
+  }
+  return hash.digest("hex");
+}
 function validateSkillContent(content: string) { const bytes = Buffer.byteLength(content); if (!content.trim()) throw new BadRequestException("Skill content is required"); if (bytes > MAX_SKILL_BYTES) throw new BadRequestException("Skill packages are limited to 256 KB"); }
 function safeRemoteUrl(raw: string) { const url = new URL(raw); if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))) throw new BadRequestException("Remote MCP must use HTTPS"); return url.toString(); }
 async function fetchApprovedSkill(raw: string | null | undefined) { if (!raw) throw new BadRequestException("Git source URL is required"); let url = new URL(raw); if (!["github.com", "raw.githubusercontent.com"].includes(url.hostname) || url.protocol !== "https:") throw new BadRequestException("Git skill sources must be hosted on approved GitHub domains"); if (url.hostname === "github.com") { const parts = url.pathname.split("/").filter(Boolean); if (parts[2] !== "blob" || parts.length < 5) throw new BadRequestException("GitHub skill URL must point to a SKILL.md file"); url = new URL(`https://raw.githubusercontent.com/${parts[0]}/${parts[1]}/${parts[3]}/${parts.slice(4).join("/")}`); } const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new BadRequestException(`Skill source returned HTTP ${response.status}`); const content = await response.text(); validateSkillContent(content); return content; }
@@ -226,6 +280,40 @@ function nullable(row: Record<string, unknown>, key: string) { const result = va
 function bool(row: Record<string, unknown>, key: string) { return Boolean(value(row, key)); }
 function date(row: Record<string, unknown>, key: string) { const result = value(row, key); return result instanceof Date ? result.toISOString() : new Date(String(result)).toISOString(); }
 function jsonStrings(row: Record<string, unknown>, key: string) { const result = value(row, key); return Array.isArray(result) ? result.map(String) : typeof result === "string" ? JSON.parse(result) as string[] : []; }
-function skillRow(row: Record<string, unknown>): PersonalSkill { return { id:str(row,"id"),tenantId:str(row,"tenant_id"),userId:str(row,"user_id"),name:str(row,"name"),description:str(row,"description"),content:str(row,"content"),enabled:bool(row,"enabled"),trusted:bool(row,"trusted"),source:str(row,"source") as PersonalSkill["source"],sourceUrl:nullable(row,"source_url"),version:nullable(row,"version"),hash:str(row,"hash"),diagnostics:jsonStrings(row,"diagnostics"),createdAt:date(row,"created_at"),updatedAt:date(row,"updated_at")}; }
+function skillRow(row: Record<string, unknown>, files: readonly SkillFileMetadata[]): PersonalSkill { return { id:str(row,"id"),tenantId:str(row,"tenant_id"),userId:str(row,"user_id"),name:str(row,"name"),description:str(row,"description"),content:str(row,"content"),enabled:bool(row,"enabled"),trusted:bool(row,"trusted"),source:str(row,"source") as PersonalSkill["source"],sourceUrl:nullable(row,"source_url"),version:nullable(row,"version"),hash:str(row,"hash"),diagnostics:jsonStrings(row,"diagnostics"),resources:files.map((file)=>file.path),packageBytes:Buffer.byteLength(str(row,"content"))+files.reduce((total,file)=>total+file.sizeBytes,0),createdAt:date(row,"created_at"),updatedAt:date(row,"updated_at")}; }
+
+function normalizeSkillPackageFiles(files: readonly SkillPackageFile[]): SkillPackageFile[] {
+  if (files.length > MAX_PACKAGE_FILES) throw new BadRequestException(`Skill packages may contain at most ${MAX_PACKAGE_FILES} resource files`);
+  const seen = new Set<string>();
+  return files.map((file) => {
+    const path = safeSkillPackagePath(file.path);
+    if (path.toLowerCase() === "skill.md") throw new BadRequestException("SKILL.md must be supplied in the content field");
+    if (seen.has(path)) throw new BadRequestException(`Skill package contains duplicate path: ${path}`);
+    seen.add(path);
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(file.contentBase64) || file.contentBase64.length % 4 !== 0) throw new BadRequestException(`Skill package file is not valid base64: ${path}`);
+    return { path, contentBase64: file.contentBase64, ...(file.mode !== undefined ? { mode: file.mode } : {}) };
+  }).sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function safeSkillPackagePath(value: string): string {
+  const path = value.trim().replaceAll("\\", "/");
+  const parts = path.split("/");
+  if (!path || path.startsWith("/") || /^[a-z]:\//i.test(path) || parts.some((part) => !part || part === "." || part === "..") || path.includes("\0")) {
+    throw new BadRequestException(`Unsafe skill package path: ${value}`);
+  }
+  return path;
+}
+
+function defaultSkillFileMode(path: string): number { return path.startsWith("scripts/") ? 0o755 : 0o644; }
+function skillPackageFileRow(row: Record<string, unknown>): SkillPackageFile {
+  const raw = value(row, "content");
+  const content = Buffer.isBuffer(raw) ? raw : Buffer.from(raw instanceof Uint8Array ? raw : String(raw ?? ""));
+  return { path: str(row, "path"), contentBase64: content.toString("base64"), mode: Number(value(row, "mode") ?? defaultSkillFileMode(str(row, "path"))) };
+}
+function groupSkillFileRows(rows: readonly Record<string, unknown>[], key: string): Map<string, SkillFileMetadata[]> {
+  const grouped = new Map<string, SkillFileMetadata[]>();
+  for (const row of rows) { const id = str(row, key); grouped.set(id, [...(grouped.get(id) ?? []), { path: str(row, "path"), sizeBytes: Number(value(row, "size_bytes") ?? 0) }]); }
+  return grouped;
+}
 function mcpRow(row: Record<string, unknown>, credentialConfigured: boolean): PersonalMcpServer { return { id:str(row,"id"),tenantId:str(row,"tenant_id"),userId:str(row,"user_id"),name:str(row,"name"),url:str(row,"url"),transport:str(row,"transport") as PersonalMcpServer["transport"],auth:str(row,"auth") as PersonalMcpServer["auth"],credentialRef:nullable(row,"credential_ref"),credentialConfigured,enabled:bool(row,"enabled"),trusted:bool(row,"trusted"),health:str(row,"health") as PersonalMcpServer["health"],toolCount:Number(value(row,"tool_count") ?? 0),lastCheckedAt:nullable(row,"last_checked_at"),diagnostics:jsonStrings(row,"diagnostics"),createdAt:date(row,"created_at"),updatedAt:date(row,"updated_at")}; }
 function durableEnvelope(value: unknown): DurableSecretEnvelope | null { try { const parsed = DurableSecretEnvelopeSchema.safeParse(typeof value === "string" ? JSON.parse(value) : value); return parsed.success ? parsed.data : null; } catch { return null; } }

@@ -13,6 +13,7 @@ import {
   OpenRouterCompatibleClient,
   parseKimiToolCalls,
   parseSse,
+  RouterClientError,
   type ChatCompletionChunk,
   listProviderModels,
   redactSecrets,
@@ -296,6 +297,29 @@ describe("router client", () => {
     });
   });
 
+  it("captures a sanitized request id on successful buffered completions", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.writeHead(200, {
+        "Content-Type": "application/json",
+        "x-berry-request-id": "brq buffered@42",
+      });
+      response.end(JSON.stringify({
+        id: "chatcmpl_request_id",
+        model: "test-model",
+        choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+      }));
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "test-model", kind: "berry-router", name: "Berry Router" },
+      apiKey: "key",
+    });
+
+    await expect(client.complete({ messages: [{ role: "user", content: "hi" }] })).resolves.toMatchObject({
+      requestId: "brq_buffered_42",
+      content: "ok",
+    });
+  });
+
   it("serializes declared OpenAI cache fields without inventing them", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const baseUrl = await withServer((request, response) => {
@@ -349,6 +373,30 @@ describe("router client", () => {
     expect(chunks.join("")).toBe("hello");
   });
 
+  it("captures a sanitized request id on every successful streaming chunk", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "x-router-request-id": "brq stream@42",
+      });
+      response.write('data: {"id":"1","model":"m","choices":[{"delta":{"content":"hel"}}]}\n\n');
+      response.write('data: {"id":"1","model":"m","choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}\n\n');
+      response.end("data: [DONE]\n\n");
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "m", kind: "berry-router", name: "Berry Router" },
+      apiKey: "key",
+    });
+    const chunks: ChatCompletionChunk[] = [];
+
+    for await (const chunk of client.stream({ messages: [{ role: "user", content: "hi" }] })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toHaveLength(2);
+    expect(chunks.every((chunk) => chunk.requestId === "brq_stream_42")).toBe(true);
+  });
+
   it("surfaces structured streaming errors with the Berry Router request id", async () => {
     const baseUrl = await withServer((_request, response) => {
       response.writeHead(200, {
@@ -377,10 +425,46 @@ describe("router client", () => {
     await expect(consume()).rejects.toMatchObject({
       name: "RouterClientError",
       status: 502,
+      code: "provider_stream_error",
+      requestId: "brq_stream_failure",
       message: "Berry Router stream failed (request brq_stream_failure): The canopywave stream ended before completion",
     });
     expect(chunks).toHaveLength(1);
     expect(chunks[0]?.toolCalls?.[0]).toMatchObject({ id: "call_partial", function: { name: "list_dir" } });
+  });
+
+  it("surfaces sanitized provider code and request id on HTTP failures", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.writeHead(400, {
+        "Content-Type": "application/json",
+        "x-request-id": "brq_memory_400",
+      });
+      response.end(JSON.stringify({
+        error: {
+          message: "tool_choice is unsupported",
+          type: "invalid_request_error",
+          code: "unsupported tool choice",
+        },
+      }));
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "m", kind: "berry-router", name: "Berry Router" },
+      apiKey: "key",
+    });
+
+    await expect(client.complete({ messages: [{ role: "user", content: "remember this" }] })).rejects.toMatchObject({
+      name: "RouterClientError",
+      status: 400,
+      code: "unsupported_tool_choice",
+      requestId: "brq_memory_400",
+    });
+  });
+
+  it("keeps the RouterClientError constructor backward compatible", () => {
+    const legacy = new RouterClientError("legacy", 503, "unavailable");
+    expect(legacy).toMatchObject({ status: 503, body: "unavailable" });
+    expect(legacy.code).toBeUndefined();
+    expect(legacy.requestId).toBeUndefined();
   });
 
   it("sends tools and serialized tool messages in the request body", async () => {
@@ -558,6 +642,7 @@ describe("router client", () => {
       request.on("end", () => {
         body = JSON.parse(raw) as Record<string, unknown>;
         response.setHeader("Content-Type", "application/x-ndjson");
+        response.setHeader("x-request-id", "ollama request@7");
         response.write('{"model":"qwen3:8b","message":{"thinking":"plan","content":""},"done":false}\n');
         response.write('{"model":"qwen3:8b","message":{"content":"","tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"berry"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":9,"eval_count":4}\n');
         response.end();
@@ -575,6 +660,7 @@ describe("router client", () => {
     })) chunks.push(chunk);
     expect(authorization).toBe("Bearer ollama-key");
     expect(body).toMatchObject({ model: "qwen3:8b", stream: true, think: "high" });
+    expect(chunks.every((chunk) => chunk.requestId === "ollama_request_7")).toBe(true);
     expect(chunks[0]?.reasoningDelta).toBe("plan");
     expect(chunks[1]?.toolCalls?.[0]).toMatchObject({ function: { name: "grep", arguments: '{"pattern":"berry"}' } });
     expect(chunks[1]?.usage).toEqual({ inputTokens: 9, outputTokens: 4, totalTokens: 13 });
@@ -774,7 +860,10 @@ describe("router client", () => {
       });
       request.on("end", () => {
         requestBody = JSON.parse(raw) as Record<string, unknown>;
-        response.setHeader("Content-Type", "text/event-stream");
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "x-router-request-id": "responses request@42",
+        });
         response.write('data: {"type":"response.output_text.delta","delta":"hi"}\n\n');
         response.write('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n');
         response.end();
@@ -791,6 +880,9 @@ describe("router client", () => {
     expect(idempotencyHeader).toBe("durable-step-1");
     expect(requestBody).toMatchObject({ model: "gpt-test", stream: true });
     expect(events.map((event) => event.type)).toEqual(["response.output_text.delta", "response.completed"]);
+    expect(events.every((event) => (
+      event[BERRY_ROUTER_METADATA_KEY] as { requestId?: string } | undefined
+    )?.requestId === "responses_request_42")).toBe(true);
   });
 
   it("posts Responses compaction to the matching /responses/compact path", async () => {
@@ -844,7 +936,10 @@ describe("router client", () => {
       versionHeader = request.headers["anthropic-version"] as string | undefined;
       authHeader = request.headers["authorization"] ?? null;
       idempotencyHeader = request.headers["idempotency-key"] as string | undefined;
-      response.setHeader("Content-Type", "text/event-stream");
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "request-id": "anthropic request@42",
+      });
       response.write('data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3}}}\n\n');
       response.write('data: {"type":"ping"}\n\n');
       response.write('data: {"type":"message_stop"}\n\n');
@@ -861,6 +956,9 @@ describe("router client", () => {
     expect(authHeader).toBeNull();
     expect(idempotencyHeader).toBe("durable-step-2");
     expect(events.map((event) => event.type)).toEqual(["message_start", "ping", "message_stop"]);
+    expect(events.every((event) => (
+      event[BERRY_ROUTER_METADATA_KEY] as { requestId?: string } | undefined
+    )?.requestId === "anthropic_request_42")).toBe(true);
   });
 
   it("lists Anthropic models using display_name as the model name", async () => {

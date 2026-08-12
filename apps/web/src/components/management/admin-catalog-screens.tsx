@@ -658,6 +658,10 @@ function ProvidersScreen({
 }
 
 /* ------------------------------------------------------------------ models */
+export function modelDefaultEnforcement(mode: "chat" | "code", policyEnforced: boolean): boolean {
+  return mode === "chat" ? false : policyEnforced;
+}
+
 function ModelsScreen({
   client,
   config,
@@ -700,6 +704,8 @@ function ModelsScreen({
   const [active, setActive] = React.useState<number | null>(null);
   const [draft, setDraft] = React.useState<any>(null);
   const [message, setMessage] = React.useState("");
+  const [newChatDefaultKey, setNewChatDefaultKey] = React.useState("");
+  const [savingNewChatDefault, setSavingNewChatDefault] = React.useState(false);
   const [adding, setAdding] = React.useState(false);
   const [addingRule, setAddingRule] = React.useState(false);
   const [ruleScope, setRuleScope] = React.useState<"org" | "department" | "user">("department");
@@ -736,6 +742,19 @@ function ModelsScreen({
   }, [active, r.data]);
   const defaultFor = (mode: string) =>
     (defaults ?? []).find((d) => d.mode === mode);
+  const currentNewChatDefault = defaultFor("chat");
+  const currentNewChatDefaultKey = currentNewChatDefault
+    ? `${currentNewChatDefault.providerId}:${currentNewChatDefault.model}`
+    : "";
+  const newChatModelOptions = (models ?? [])
+    .filter((item) => item.status === "allowed" && (item.modeAllow ?? []).includes("chat"))
+    .map((item) => ({
+      value: `${item.providerId}:${item.model}`,
+      label: `${item.displayName || item.model} · ${item.providerId}`,
+    }));
+  React.useEffect(() => {
+    setNewChatDefaultKey(currentNewChatDefaultKey);
+  }, [currentNewChatDefaultKey]);
   const isDefault = (m: any, mode: string) => {
     const d = defaultFor(mode);
     return d && d.model === m.model && d.providerId === m.providerId;
@@ -788,10 +807,11 @@ function ModelsScreen({
   };
   const makeDefault = async (mode: "chat" | "code") => {
     if (!draft) return;
+    const enforce = modelDefaultEnforcement(mode, Boolean(draft.enforce));
     await client?.upsertOrgModelDefault(tenantId, mode, {
       providerId: draft.providerId,
       model: draft.model,
-      enforce: draft.enforce,
+      enforce,
     });
     const next = [
       ...(defaults ?? []).filter((d) => d.mode !== mode),
@@ -800,12 +820,46 @@ function ModelsScreen({
         mode,
         providerId: draft.providerId,
         model: draft.model,
-        enforce: draft.enforce,
+        enforce,
         updatedAt: new Date().toISOString(),
       },
     ];
     r.setData([models, next, auxiliaryDefaults, registeredProviders, accessRules, members, departments]);
     setMessage(`Set as the ${mode} default and recorded in the audit log.`);
+  };
+  const saveNewChatDefault = async () => {
+    const selected = (models ?? []).find(
+      (item) => `${item.providerId}:${item.model}` === newChatDefaultKey,
+    );
+    if (!selected) return;
+    setSavingNewChatDefault(true);
+    try {
+      const saved = await client?.upsertOrgModelDefault(tenantId, "chat", {
+        providerId: selected.providerId,
+        model: selected.model,
+        enforce: false,
+      });
+      const nextDefault = saved ?? {
+        tenantId,
+        mode: "chat",
+        providerId: selected.providerId,
+        model: selected.model,
+        enforce: false,
+        updatedAt: new Date().toISOString(),
+      };
+      r.setData([
+        models,
+        [...(defaults ?? []).filter((item) => item.mode !== "chat"), nextDefault],
+        auxiliaryDefaults,
+        registeredProviders,
+        accessRules,
+        members,
+        departments,
+      ]);
+      setMessage("New chats will now start with this model. Existing chats were not changed.");
+    } finally {
+      setSavingNewChatDefault(false);
+    }
   };
   const makeVisionDefault = async () => {
     if (!draft || draft.capabilities?.vision !== true) return;
@@ -886,11 +940,36 @@ function ModelsScreen({
   return (
     <ManagementPage
       title="Models"
-      description="Add provider models, record token pricing and context limits, control availability, and choose Chat, Code, and vision defaults."
+      description="Choose the model new chats start with, manage provider models, and control availability, pricing, and context limits."
       eyebrow="AI & tools"
       actions={canWrite ? <><Button variant="secondary" onClick={() => setAddingRule(true)}><ShieldCheck />Access rule</Button><Button onClick={() => setAdding(true)}><Plus />Add model</Button></> : null}
     >
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
+        <Section
+          title="Default model for new chats"
+          description="Use this to route new conversations to a healthy model during an outage. The choice is snapshotted when a chat is created, so existing chats keep their current model."
+        >
+          <div className="grid items-end gap-3 rounded-lg border border-border bg-muted/20 p-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              Organization default
+              <FormSelect
+                value={newChatDefaultKey}
+                onChange={setNewChatDefaultKey}
+                options={newChatModelOptions}
+                placeholder="Choose a model"
+                disabled={!canWrite || savingNewChatDefault || newChatModelOptions.length === 0}
+                ariaLabel="Default model for new chats"
+              />
+            </label>
+            <Button
+              onClick={() => void saveNewChatDefault()}
+              disabled={!canWrite || savingNewChatDefault || !newChatDefaultKey || newChatDefaultKey === currentNewChatDefaultKey}
+            >
+              <Save aria-hidden />
+              {savingNewChatDefault ? "Saving…" : "Save default"}
+            </Button>
+          </div>
+        </Section>
         <section
           className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
           aria-label="Model defaults"
@@ -1127,7 +1206,7 @@ function ModelsScreen({
                       onClick={() => makeDefault("chat")}
                       disabled={isDefault(draft, "chat")}
                     >
-                      Set as Chat default
+                      Set as new-chat default
                     </Button>
                     <Button
                       variant="secondary"
@@ -1252,6 +1331,7 @@ function SkillsMcpScreen({
   const [skillDraft, setSkillDraft] = React.useState({
     content: "",
     packageFiles: [] as string[],
+    resourceFiles: [] as Array<{ path: string; contentBase64: string; mode?: number | undefined }>,
     fileName: "",
     assignment: "default-on" as OrgCapabilityAssignment,
     allowUserDisable: true,
@@ -1325,6 +1405,7 @@ function SkillsMcpScreen({
           content: skillDraft.content,
           source: skillDraft.fileName ? "upload" : "text",
           packageFiles: skillDraft.packageFiles,
+          resourceFiles: skillDraft.resourceFiles,
         }),
       );
     } catch (cause) {
@@ -1343,6 +1424,7 @@ function SkillsMcpScreen({
         ...current,
         content: imported.content,
         packageFiles: imported.packageFiles,
+        resourceFiles: imported.resourceFiles,
         fileName: imported.fileName,
       }));
       setSkillSource("upload");
@@ -1369,6 +1451,7 @@ function SkillsMcpScreen({
           : skillDraft.allowUserDisable,
       contentHash: review.hash,
       config: { content: skillDraft.content },
+      resourceFiles: skillDraft.resourceFiles,
     });
     r.setData([
       saved,
@@ -1384,6 +1467,7 @@ function SkillsMcpScreen({
     setSkillDraft({
       content: "",
       packageFiles: [],
+      resourceFiles: [],
       fileName: "",
       assignment: "default-on",
       allowUserDisable: true,
@@ -1536,7 +1620,7 @@ function SkillsMcpScreen({
                   required
                   value={skillDraft.content}
                   placeholder="---\nname: example\ndescription: ...\n---"
-                  onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [] })}
+                  onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [], resourceFiles: [] })}
                 />
               </label>
             )}

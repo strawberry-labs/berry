@@ -322,6 +322,38 @@ describe("MemoryService", () => {
     expect(fetched.id).toBe(project.item!.id);
     expect(personalGetCalls).toBe(0);
   });
+
+  it("passes the caller abort signal to personal-memory search and fails open", async () => {
+    const repository = new FakeMemoryRepository();
+    let observedSignal: AbortSignal | undefined;
+    const personalMemory = {
+      async search(input: Parameters<PersonalMemoryProvider["search"]>[0]) {
+        observedSignal = input.signal;
+        return new Promise<MemoryItem[]>((_resolve, reject) => {
+          const abort = () => reject(new PersonalMemoryHttpError("cancelled", null, false));
+          if (input.signal?.aborted) abort();
+          else input.signal?.addEventListener("abort", abort, { once: true });
+        });
+      },
+    } as unknown as PersonalMemoryProvider;
+    const service = memoryService(repository, personalMemory);
+    const controller = new AbortController();
+    const pending = service.recall({
+      tenantId: tenantA,
+      userId: userA,
+      workspaceId: workspaceA,
+      query: "response preferences",
+      signal: controller.signal,
+    });
+
+    controller.abort(new Error("context deadline"));
+
+    await expect(pending).resolves.toMatchObject({
+      personal: [],
+      personalDegraded: true,
+    });
+    expect(observedSignal).toBe(controller.signal);
+  });
 });
 
 function memoryService(

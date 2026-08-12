@@ -119,6 +119,8 @@ export interface BerryThreadViewProps {
   showQuestions?: boolean;
   /** Show the elapsed turn clock before the provider emits its first work item. */
   showPendingTurnActivity?: boolean;
+  /** Durable lifecycle phase shown while the turn is active. */
+  activeStatus?: string | undefined;
   /** Host-owned fallback for an interrupted latest turn not yet projected as a message part. */
   latestTurnError?: string;
   /** Native desktop keeps the rail 16px from its window edge; web uses 12px. */
@@ -144,6 +146,7 @@ export function BerryThreadView({
   showTodos = true,
   showQuestions = true,
   showPendingTurnActivity = false,
+  activeStatus,
   latestTurnError,
   navigatorInset = 12,
   adapter = {},
@@ -338,6 +341,7 @@ export function BerryThreadView({
                         <TurnActivity
                           turnKey={liveTurnKey}
                           active={stream.turnActive}
+                          activeLabel={activeStatus}
                           elapsedMs={stream.turnStartedAt ? now - stream.turnStartedAt : undefined}
                           liveAction={
                             stream.turnActive
@@ -355,6 +359,7 @@ export function BerryThreadView({
                         <TurnActivity
                           turnKey={liveTurnKey}
                           active
+                          activeLabel={activeStatus}
                           elapsedMs={stream.turnStartedAt ? now - stream.turnStartedAt : undefined}
                         />
                       ) : (

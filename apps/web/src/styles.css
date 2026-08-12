@@ -2577,6 +2577,12 @@ input.berry-command-search-input:focus-visible {
   padding-left: 10px;
 }
 
+.berry-composer-question-custom.is-dragging-files {
+  border-color: var(--berry-focus);
+  background: var(--berry-selected);
+  box-shadow: inset 0 0 0 1px var(--berry-focus);
+}
+
 .berry-composer-question-custom-select,
 .berry-composer-question-custom-label {
   min-width: 0;
@@ -2613,14 +2619,12 @@ input.berry-command-search-input:focus-visible {
   box-shadow: none;
 }
 
-.berry-composer-question-custom-next,
 .berry-composer-question-continue {
   border-radius: 999px;
   background: var(--berry-text);
   color: var(--berry-main-bg);
 }
 
-.berry-composer-question-custom-next:hover,
 .berry-composer-question-continue:hover {
   background: var(--berry-text-secondary);
   color: var(--berry-main-bg);

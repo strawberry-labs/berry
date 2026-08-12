@@ -1,0 +1,79 @@
+rule_files:
+  - ../rules/berry-runtime.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: missing worker targets and metrics still page
+    interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BerryForegroundMetricsTargetsMissing
+        exp_alerts:
+          - exp_labels:
+              job: berry-worker-foreground
+              severity: critical
+            exp_annotations:
+              summary: "No Berry foreground worker metrics targets were discovered"
+      - eval_time: 3m
+        alertname: BerryBackgroundMetricsTargetMissing
+        exp_alerts:
+          - exp_labels:
+              job: berry-worker-background
+              severity: critical
+            exp_annotations:
+              summary: "No Berry background worker metrics target was discovered"
+      - eval_time: 3m
+        alertname: BerryForegroundReplicaCountBelowTarget
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Fewer than five Berry foreground workers are being scraped"
+      - eval_time: 3m
+        alertname: BerryForegroundCapacityBelowTarget
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Berry foreground capacity is below 100 turn slots"
+
+  - name: healthy worker targets and capacity suppress outage alerts
+    interval: 1m
+    input_series:
+      - series: 'up{job="berry-worker-foreground",instance="worker-1"}'
+        values: '1x5'
+      - series: 'up{job="berry-worker-foreground",instance="worker-2"}'
+        values: '1x5'
+      - series: 'up{job="berry-worker-foreground",instance="worker-3"}'
+        values: '1x5'
+      - series: 'up{job="berry-worker-foreground",instance="worker-4"}'
+        values: '1x5'
+      - series: 'up{job="berry-worker-foreground",instance="worker-5"}'
+        values: '1x5'
+      - series: 'up{job="berry-worker-background",instance="worker-background"}'
+        values: '1x5'
+      - series: 'berry_worker_process_capacity_slots{role="foreground",instance="worker-1"}'
+        values: '20x5'
+      - series: 'berry_worker_process_capacity_slots{role="foreground",instance="worker-2"}'
+        values: '20x5'
+      - series: 'berry_worker_process_capacity_slots{role="foreground",instance="worker-3"}'
+        values: '20x5'
+      - series: 'berry_worker_process_capacity_slots{role="foreground",instance="worker-4"}'
+        values: '20x5'
+      - series: 'berry_worker_process_capacity_slots{role="foreground",instance="worker-5"}'
+        values: '20x5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BerryForegroundMetricsTargetsMissing
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BerryBackgroundMetricsTargetMissing
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BerryForegroundReplicaCountBelowTarget
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BerryForegroundCapacityBelowTarget
+        exp_alerts: []

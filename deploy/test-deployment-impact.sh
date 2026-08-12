@@ -64,8 +64,18 @@ berry_impact_reset
 berry_impact_add_file "packages/personal-memory/src/index.ts"
 assert_contains "$berry_image_services" api "personal-memory image services"
 assert_contains "$berry_image_services" worker "personal-memory image services"
+assert_not_contains "$berry_image_services" worker-foreground "personal-memory image services"
+assert_contains "$berry_restart_services" worker "personal-memory restart services"
+assert_contains "$berry_restart_services" worker-foreground "personal-memory restart services"
 assert_contains "$berry_image_services" mem0 "personal-memory image services"
 assert_not_contains "$berry_image_services" web "personal-memory image services"
+
+berry_impact_reset
+berry_impact_add_file "apps/worker/src/main.ts"
+assert_contains "$berry_image_services" worker "worker image services"
+assert_not_contains "$berry_image_services" worker-foreground "worker image services"
+assert_contains "$berry_restart_services" worker "worker restart services"
+assert_contains "$berry_restart_services" worker-foreground "worker restart services"
 
 berry_impact_reset
 berry_impact_add_file "packages/shared/src/index.ts"
@@ -82,6 +92,8 @@ for service in api worker mem0 web; do
   assert_contains "$berry_image_services" "$service" "Compose image services"
   assert_contains "$berry_restart_services" "$service" "Compose restart services"
 done
+assert_not_contains "$berry_image_services" worker-foreground "Compose image services"
+assert_contains "$berry_restart_services" worker-foreground "Compose restart services"
 
 berry_impact_reset
 berry_impact_add_file "deploy/compose.aws.yaml"
@@ -92,6 +104,8 @@ for service in api worker mem0 web; do
   assert_contains "$berry_image_services" "$service" "AWS Compose image services"
   assert_contains "$berry_restart_services" "$service" "AWS Compose restart services"
 done
+assert_not_contains "$berry_image_services" worker-foreground "AWS Compose image services"
+assert_contains "$berry_restart_services" worker-foreground "AWS Compose restart services"
 
 berry_impact_reset
 berry_impact_add_file "deploy/.env.production.example"
@@ -117,6 +131,13 @@ test -z "$berry_image_services"
 berry_impact_reset
 berry_impact_add_file "deploy/Caddyfile.native"
 test "$berry_caddy_changed" = true
+test -z "$berry_image_services"
+
+berry_impact_reset
+berry_impact_add_file "deploy/prometheus/rules/berry-runtime.yml"
+test "$berry_prometheus_changed" = true
+assert_contains "$berry_restart_services" alertmanager "Alertmanager restart services"
+assert_contains "$berry_restart_services" prometheus "Prometheus restart services"
 test -z "$berry_image_services"
 
 berry_impact_reset

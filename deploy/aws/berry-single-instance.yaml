@@ -333,6 +333,11 @@ Resources:
                   - secretsmanager:DescribeSecret
                   - secretsmanager:GetSecretValue
                 Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Sid: PublishOperationalAlerts
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
       Tags:
         - Key: berry:environment
           Value: !Ref EnvironmentName

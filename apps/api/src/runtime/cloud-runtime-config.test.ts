@@ -25,8 +25,8 @@ describe("cloud runtime configuration", () => {
       }]),
       BERRYCRAWL_API_KEY: "crawl-secret",
       BERRY_CLOUD_SKILLS_JSON: JSON.stringify([{
-        name: "research",
-        description: "Research a topic with cited sources.",
+        name: "deep-research",
+        description: "Conduct deep research when explicitly requested.",
         content: "Use BerryCrawl and cite every factual claim.",
       }]),
       BERRY_CLOUD_NETWORK_ALLOWED_DOMAINS: "crawl.example.test,registry.npmjs.org",
@@ -45,7 +45,7 @@ describe("cloud runtime configuration", () => {
       credentialKey: "env:BERRYCRAWL_API_KEY",
       trusted: true,
     });
-    expect(config.extraSkills[0]).toMatchObject({ name: "research", scope: "registered" });
+    expect(config.extraSkills[0]).toMatchObject({ name: "deep-research", scope: "registered" });
     expect(config.networkPolicy).toEqual({ egress: "on", allowedDomains: ["crawl.example.test", "registry.npmjs.org"] });
     expect(config.provider?.completionTransport).toBe("stream");
     expect(config.provider?.completionFallback).toBe("buffered");
@@ -64,16 +64,16 @@ describe("cloud runtime configuration", () => {
       BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
       BERRY_ROUTER_DEFAULT_MODEL: "kimi-2.6",
       BERRY_CLOUD_SKILLS_JSON: JSON.stringify([{
-        name: "research",
-        description: "Research a topic with cited sources.",
-        content: "---\nname: research\ndescription: Research a topic with cited sources.\n---\nUse BerryCrawl.",
+        name: "deep-research",
+        description: "Conduct deep research when explicitly requested.",
+        content: "---\nname: deep-research\ndescription: Conduct deep research when explicitly requested.\n---\nUse BerryCrawl.",
       }]),
     });
 
     await expect(service.catalog(SELF_HOST_TENANT_ID)).resolves.toMatchObject({
       skills: [{
-        id: "research",
-        name: "research",
+        id: "deep-research",
+        name: "deep-research",
         content: expect.stringContaining("Use BerryCrawl."),
         enabled: true,
       }],

@@ -1,7 +1,7 @@
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { createPersonalMemoryProviderFromEnv } from "@berry/personal-memory";
-import { BullMqBerryQueueClient, createBerryQueue, createBerryWorker } from "./bullmq.ts";
+import { createBerryQueueRouter, createBerryWorker } from "./bullmq.ts";
 import { durableContextConfigFromEnv } from "@berry/shared";
 import { PgSqlExecutor } from "./pg-executor.ts";
 import { SqlManagementJobRepository, SqlTaskTitleRepository, SqlUsageRollupRepository } from "./sql-repositories.ts";
@@ -33,21 +33,34 @@ import { SqlMaintenanceRunner } from "./maintenance.ts";
 import { createDurableTurnToolsFromEnv } from "./mcp-tools.ts";
 import { S3FileObjectDeleter, SqlFileDeletionReceiptStore } from "./file-deletion.ts";
 import { SqlFileBlobProcessor } from "./file-blobs.ts";
-import { closeServer, startWorkerReadinessServer } from "./readiness.ts";
+import {
+  closeServer,
+  startWorkerReadinessServer,
+  WorkerProcessActivityTracker,
+} from "./readiness.ts";
 import { DurableVisionToolExecutor, SqlVisionObservationCache } from "./vision-tools.ts";
 import { DurablePersonalSkillToolExecutor } from "./personal-skills/tools.ts";
+import {
+  ActiveTurnCancellationRegistry,
+  TurnCancellationSubscriber,
+} from "./turn-cancellation.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const processConfig = workerProcessConfigFromEnv(env);
   const durableConfig = durableContextConfigFromEnv(env);
   const databaseUrl = env.BERRY_DATABASE_URL ?? env.DATABASE_URL;
   if (!databaseUrl) throw new Error("BERRY_DATABASE_URL or DATABASE_URL is required");
-  const executor = PgSqlExecutor.fromConnectionString(databaseUrl);
+  const executor = PgSqlExecutor.fromConnectionString(databaseUrl, { max: processConfig.databasePoolMax });
   const redisUrl = env.BERRY_REDIS_URL ?? env.REDIS_URL;
-  const workerOptions = redisUrl
-    ? { redisUrl, concurrency: Number(env.BERRY_WORKER_CONCURRENCY ?? 4) }
-    : { concurrency: Number(env.BERRY_WORKER_CONCURRENCY ?? 4) };
-  const queueOptions = redisUrl ? { redisUrl } : {};
-  const queue = new BullMqBerryQueueClient(createBerryQueue(queueOptions));
+  const resolvedRedisUrl = redisUrl ?? "redis://127.0.0.1:6379";
+  const turnCancellations = new ActiveTurnCancellationRegistry();
+  const cancellationSubscriber = new TurnCancellationSubscriber(resolvedRedisUrl, turnCancellations);
+  const queue = createBerryQueueRouter({
+    ...(redisUrl ? { redisUrl } : {}),
+    ...(env.BERRY_FOREGROUND_QUEUE_NAME?.trim() ? { foregroundQueueName: env.BERRY_FOREGROUND_QUEUE_NAME.trim() } : {}),
+    ...(env.BERRY_BACKGROUND_QUEUE_NAME?.trim() ? { backgroundQueueName: env.BERRY_BACKGROUND_QUEUE_NAME.trim() } : {}),
+    ...(env.BERRY_LEGACY_QUEUE_NAME?.trim() ? { legacyQueueName: env.BERRY_LEGACY_QUEUE_NAME.trim() } : {}),
+  });
   const sandboxContinuity = new SandboxContinuityManager(
     createWorkerSandboxProvider(env),
     new SqlSandboxSnapshotRepository(executor),
@@ -115,7 +128,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const durableTools = createDurableTurnToolsFromEnv(env, personalSkillTools);
   const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
   const fileBlobs = SqlFileBlobProcessor.fromEnv(env, executor);
-  const worker = createBerryWorker({
+  const dependencies: Parameters<typeof createBerryWorker>[0] = {
     titles: new SqlTaskTitleRepository(executor),
     usage: new SqlUsageRollupRepository(executor),
     management: new SqlManagementJobRepository(executor),
@@ -159,6 +172,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
           300_000,
         ),
         compactor,
+        cancellations: turnCancellations,
       },
     ),
     snapshotter: sandboxContinuity,
@@ -169,35 +183,115 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     tenantContext: {
       run: (tenantId, callback) => executor.runWithTenant(tenantId, callback),
     },
-  }, workerOptions);
-  const outbox = new RuntimeOutboxDispatcher(executor, queue, {
-    ...(env.BERRY_TENANT_ID ? { tenantId: env.BERRY_TENANT_ID } : {}),
-    workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
-    pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 100,
-  });
+  };
+  const workers: ReturnType<typeof createBerryWorker>[] = [];
+  const workerActivity = new WorkerProcessActivityTracker(processConfig.role);
+  const addWorker = (worker: ReturnType<typeof createBerryWorker>): void => {
+    workers.push(worker);
+    workerActivity.observe(worker);
+  };
+  const commonWorkerOptions = redisUrl ? { redisUrl } : {};
+  if (processConfig.role === "foreground" || processConfig.role === "all") {
+    addWorker(createBerryWorker(dependencies, {
+      ...commonWorkerOptions,
+      queueKind: "foreground",
+      concurrency: processConfig.foregroundConcurrency,
+      ...(env.BERRY_FOREGROUND_QUEUE_NAME?.trim() ? { queueName: env.BERRY_FOREGROUND_QUEUE_NAME.trim() } : {}),
+    }));
+  }
+  if (processConfig.role === "background" || processConfig.role === "all") {
+    addWorker(createBerryWorker(dependencies, {
+      ...commonWorkerOptions,
+      queueKind: "background",
+      concurrency: processConfig.backgroundConcurrency,
+      ...(env.BERRY_BACKGROUND_QUEUE_NAME?.trim() ? { queueName: env.BERRY_BACKGROUND_QUEUE_NAME.trim() } : {}),
+    }));
+    if (processConfig.drainLegacyQueue) {
+      addWorker(createBerryWorker(dependencies, {
+        ...commonWorkerOptions,
+        queueKind: "legacy",
+        concurrency: processConfig.legacyConcurrency,
+        ...(env.BERRY_LEGACY_QUEUE_NAME?.trim() ? { queueName: env.BERRY_LEGACY_QUEUE_NAME.trim() } : {}),
+      }));
+    }
+  }
+  const outbox = processConfig.role === "foreground"
+    ? null
+    : new RuntimeOutboxDispatcher(executor, queue, {
+        ...(env.BERRY_TENANT_ID ? { tenantId: env.BERRY_TENANT_ID } : {}),
+        workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
+        pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 100,
+      });
   await Promise.all([
     executor.query("SELECT 1"),
     queue.waitUntilReady(),
-    worker.waitUntilReady(),
+    cancellationSubscriber.start(),
+    ...workers.map((worker) => worker.waitUntilReady()),
   ]);
-  outbox.start();
+  outbox?.start();
   const readinessPort = positiveInteger(env.BERRY_WORKER_READINESS_PORT) ?? 3010;
+  const workersAreRunning = (): boolean => workers.length > 0 && workers.every((worker) => worker.isRunning());
   const readinessServer = await startWorkerReadinessServer({
     pingDatabase: () => executor.query("SELECT 1"),
     pingQueue: () => queue.ping(),
-    isWorkerRunning: () => worker.isRunning(),
-  }, readinessPort);
+    isWorkerRunning: workersAreRunning,
+    collectMetrics: async () => ({
+      queues: await queue.operationalMetrics(),
+      process: workerActivity.snapshot(workersAreRunning()),
+    }),
+  }, readinessPort, env.BERRY_WORKER_READINESS_HOST?.trim() || "127.0.0.1");
 
   const shutdown = async () => {
     await closeServer(readinessServer);
-    await outbox.stop();
+    await outbox?.stop();
+    await Promise.all(workers.map((worker) => worker.close()));
+    await cancellationSubscriber.close();
     await queue.close();
-    await worker.close();
     await durableTools.close();
     await executor.close();
   };
   process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
   process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
+}
+
+export type BerryWorkerProcessRole = "foreground" | "background" | "all";
+
+export type BerryWorkerProcessConfig = {
+  role: BerryWorkerProcessRole;
+  foregroundConcurrency: number;
+  backgroundConcurrency: number;
+  legacyConcurrency: number;
+  drainLegacyQueue: boolean;
+  databasePoolMax: number;
+};
+
+export function workerProcessConfigFromEnv(env: NodeJS.ProcessEnv): BerryWorkerProcessConfig {
+  const rawRole = env.BERRY_WORKER_ROLE?.trim() || "all";
+  if (rawRole !== "foreground" && rawRole !== "background" && rawRole !== "all") {
+    throw new Error("BERRY_WORKER_ROLE must be foreground, background, or all");
+  }
+  const role: BerryWorkerProcessRole = rawRole;
+  const sharedConcurrency = positiveInteger(env.BERRY_WORKER_CONCURRENCY);
+  const foregroundConcurrency = positiveInteger(env.BERRY_FOREGROUND_WORKER_CONCURRENCY)
+    ?? sharedConcurrency
+    ?? (role === "foreground" ? 20 : 4);
+  const backgroundConcurrency = positiveInteger(env.BERRY_BACKGROUND_WORKER_CONCURRENCY)
+    ?? sharedConcurrency
+    ?? 4;
+  const legacyConcurrency = positiveInteger(env.BERRY_LEGACY_WORKER_CONCURRENCY) ?? 1;
+  const rolePoolMax = role === "foreground"
+    ? positiveInteger(env.BERRY_FOREGROUND_WORKER_DB_POOL_MAX)
+    : role === "background"
+      ? positiveInteger(env.BERRY_BACKGROUND_WORKER_DB_POOL_MAX)
+      : undefined;
+  return {
+    role,
+    foregroundConcurrency,
+    backgroundConcurrency,
+    legacyConcurrency,
+    drainLegacyQueue: env.BERRY_LEGACY_QUEUE_DRAIN?.trim().toLowerCase() !== "false",
+    databasePoolMax: positiveInteger(env.BERRY_WORKER_DB_POOL_MAX) ?? rolePoolMax ?? 10,
+  };
 }
 
 function knowledgeObjectStore(env: NodeJS.ProcessEnv): KnowledgeObjectStore {

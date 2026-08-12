@@ -861,6 +861,24 @@ export const turnRuns = pgTable("turn_runs", {
       AND COALESCE(${table.sandboxState},'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')`),
 ]);
 
+export const turnAdmissionIntents = pgTable("turn_admission_intents", {
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  requestId: text("request_id").notNull(),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  operationFingerprint: text("operation_fingerprint"),
+  state: text("state").notNull().default("preparing"),
+  runId: uuid("run_id").references(() => turnRuns.id, { onDelete: "set null" }),
+  preparationMs: integer("preparation_ms"),
+  admittedAt: timestamp("admitted_at", { withTimezone: true }),
+  cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  primaryKey({ columns: [table.tenantId, table.requestId] }),
+  index("turn_admission_intents_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("turn_admission_intents_state_idx").on(table.tenantId, table.state, table.updatedAt),
+]);
+
 export const turnSteps = pgTable("turn_steps", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
@@ -1538,6 +1556,7 @@ export const cloudSchema = {
   sessionEntries,
   sessionCheckpoints,
   sessionCompactionLeases,
+  turnAdmissionIntents,
   turnRuns,
   turnSteps,
   turnEvents,
@@ -1596,6 +1615,7 @@ export const CLOUD_SCHEMA_TABLES = [
   "session_entries",
   "session_checkpoints",
   "session_compaction_leases",
+  "turn_admission_intents",
   "turn_runs",
   "turn_steps",
   "turn_events",
@@ -1641,6 +1661,7 @@ export const TENANT_SCOPED_TABLES = [
   "file_uploads",
   "file_derivatives",
   ...DURABLE_CONTEXT_TABLES,
+  "turn_admission_intents",
   "session_compaction_leases",
   "maintenance_runs",
   "tool_calls",
@@ -2834,6 +2855,184 @@ ALTER TABLE organization_capability_settings ENABLE ROW LEVEL SECURITY; ALTER TA
 CREATE POLICY organization_capabilities_tenant_isolation ON organization_capabilities USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
 CREATE POLICY capability_user_overrides_tenant_isolation ON capability_user_overrides USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
 CREATE POLICY organization_capability_settings_tenant_isolation ON organization_capability_settings USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
+export const SKILL_PACKAGE_FILES_MIGRATION = `
+CREATE UNIQUE INDEX IF NOT EXISTS personal_skills_tenant_id_id_unique ON personal_skills (tenant_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS organization_capabilities_tenant_id_id_unique ON organization_capabilities (tenant_id, id);
+CREATE TABLE IF NOT EXISTS personal_skill_files (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  skill_id text NOT NULL,
+  path text NOT NULL,
+  content bytea NOT NULL,
+  size_bytes integer NOT NULL CHECK (size_bytes >= 0),
+  sha256 text NOT NULL CHECK (sha256 ~ '^[a-f0-9]{64}$'),
+  mode integer NOT NULL DEFAULT 420 CHECK (mode >= 0 AND mode <= 511),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (skill_id, path),
+  FOREIGN KEY (tenant_id, skill_id) REFERENCES personal_skills(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS personal_skill_files_owner_idx ON personal_skill_files (tenant_id, skill_id);
+ALTER TABLE personal_skill_files ENABLE ROW LEVEL SECURITY;
+ALTER TABLE personal_skill_files FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS personal_skill_files_tenant_isolation ON personal_skill_files;
+CREATE POLICY personal_skill_files_tenant_isolation ON personal_skill_files
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+
+CREATE TABLE IF NOT EXISTS organization_skill_files (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  organization_capability_id text NOT NULL,
+  path text NOT NULL,
+  content bytea NOT NULL,
+  size_bytes integer NOT NULL CHECK (size_bytes >= 0),
+  sha256 text NOT NULL CHECK (sha256 ~ '^[a-f0-9]{64}$'),
+  mode integer NOT NULL DEFAULT 420 CHECK (mode >= 0 AND mode <= 511),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_capability_id, path),
+  FOREIGN KEY (tenant_id, organization_capability_id) REFERENCES organization_capabilities(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS organization_skill_files_owner_idx ON organization_skill_files (tenant_id, organization_capability_id);
+ALTER TABLE organization_skill_files ENABLE ROW LEVEL SECURITY;
+ALTER TABLE organization_skill_files FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS organization_skill_files_tenant_isolation ON organization_skill_files;
+CREATE POLICY organization_skill_files_tenant_isolation ON organization_skill_files
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
+export const TURN_ADMISSION_INTENTS_MIGRATION = `
+CREATE TABLE IF NOT EXISTS turn_admission_intents (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  request_id text NOT NULL,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  operation_fingerprint text,
+  state text NOT NULL DEFAULT 'preparing'
+    CHECK (state IN ('preparing','admitted','cancelled')),
+  run_id uuid REFERENCES turn_runs(id) ON DELETE SET NULL,
+  preparation_ms integer CHECK (preparation_ms IS NULL OR preparation_ms >= 0),
+  admitted_at timestamptz,
+  cancelled_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS turn_admission_intents_session_idx
+  ON turn_admission_intents (tenant_id, session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS turn_admission_intents_state_idx
+  ON turn_admission_intents (tenant_id, state, updated_at);
+ALTER TABLE turn_admission_intents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE turn_admission_intents FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS turn_admission_intents_tenant_isolation ON turn_admission_intents;
+CREATE POLICY turn_admission_intents_tenant_isolation ON turn_admission_intents
+  USING (tenant_id = berry_current_tenant_id())
+  WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
+export const DEEP_RESEARCH_SKILL_MIGRATION = `
+DO $berry_deep_research$
+DECLARE
+  target_tenant record;
+  legacy_skill record;
+  package_file record;
+  migrated_content text;
+  package_payload bytea;
+  migrated_hash text;
+BEGIN
+  FOR target_tenant IN SELECT id FROM tenants ORDER BY id LOOP
+    PERFORM berry_set_tenant_id(target_tenant.id);
+    SELECT * INTO legacy_skill
+    FROM organization_capabilities
+    WHERE tenant_id = target_tenant.id
+      AND kind = 'skill'
+      AND capability_id = 'research';
+
+    IF FOUND THEN
+      IF EXISTS (
+        SELECT 1 FROM organization_capabilities
+        WHERE tenant_id = target_tenant.id
+          AND kind = 'skill'
+          AND capability_id = 'deep-research'
+      ) THEN
+        -- Preserve both packages when an administrator already created the replacement,
+        -- but ensure the legacy broad trigger can no longer be invoked.
+        UPDATE organization_capabilities
+        SET assignment = 'blocked', allow_user_disable = false, updated_at = now()
+        WHERE id = legacy_skill.id;
+      ELSE
+        migrated_content := legacy_skill.config->>'content';
+        migrated_hash := NULL;
+        IF migrated_content IS NOT NULL THEN
+          migrated_content := regexp_replace(
+            migrated_content,
+            '^[ \\t]*name:[^\\n\\r]*\\r?$',
+            'name: deep-research',
+            'im'
+          );
+          migrated_content := regexp_replace(
+            migrated_content,
+            '^[ \\t]*description:[^\\n\\r]*\\r?$',
+            'description: Conduct deep, extensive, multi-source research only when explicitly requested.',
+            'im'
+          );
+          package_payload := convert_to('SKILL.md', 'UTF8')
+            || decode('00', 'hex')
+            || convert_to(migrated_content, 'UTF8');
+          FOR package_file IN
+            SELECT path, content
+            FROM organization_skill_files
+            WHERE organization_capability_id = legacy_skill.id
+            ORDER BY path COLLATE "C"
+          LOOP
+            package_payload := package_payload
+              || decode('00', 'hex')
+              || convert_to(package_file.path, 'UTF8')
+              || decode('00', 'hex')
+              || package_file.content;
+          END LOOP;
+          migrated_hash := encode(digest(package_payload, 'sha256'), 'hex');
+        END IF;
+
+        INSERT INTO capability_user_overrides (
+          tenant_id, user_id, kind, capability_id, enabled, updated_at
+        )
+        SELECT tenant_id, user_id, kind, 'deep-research', enabled, updated_at
+        FROM capability_user_overrides
+        WHERE tenant_id = target_tenant.id
+          AND kind = 'skill'
+          AND capability_id = 'research'
+        ON CONFLICT (tenant_id, user_id, kind, capability_id) DO UPDATE
+        SET enabled = CASE
+              WHEN EXCLUDED.updated_at >= capability_user_overrides.updated_at
+                THEN EXCLUDED.enabled
+              ELSE capability_user_overrides.enabled
+            END,
+            updated_at = GREATEST(EXCLUDED.updated_at, capability_user_overrides.updated_at);
+
+        DELETE FROM capability_user_overrides
+        WHERE tenant_id = target_tenant.id
+          AND kind = 'skill'
+          AND capability_id = 'research';
+
+        UPDATE organization_capabilities
+        SET capability_id = 'deep-research',
+            name = 'deep-research',
+            description = 'Conduct deep, extensive, multi-source research only when explicitly requested.',
+            config = CASE
+              WHEN migrated_content IS NULL THEN config
+              ELSE jsonb_set(config, '{content}', to_jsonb(migrated_content), false)
+            END,
+            content_hash = migrated_hash,
+            updated_at = now()
+        WHERE id = legacy_skill.id;
+      END IF;
+    END IF;
+  END LOOP;
+  PERFORM set_config('berry.tenant_id', '', true);
+END;
+$berry_deep_research$;
 `.trim();
 
 export const TWO_PROFILE_MODEL_GOVERNANCE_MIGRATION = `
@@ -4572,4 +4771,7 @@ export const cloudMigrations = [
   { id: 47, name: "platform_role_rls_v1", sql: PLATFORM_ROLE_RLS_MIGRATION },
   { id: 48, name: "connector_artifacts_and_full_access_v1", sql: CONNECTOR_ARTIFACTS_AND_FULL_ACCESS_MIGRATION },
   { id: 49, name: "vision_model_routing_v1", sql: VISION_MODEL_ROUTING_MIGRATION },
+  { id: 50, name: "skill_package_files_v1", sql: SKILL_PACKAGE_FILES_MIGRATION },
+  { id: 51, name: "turn_admission_intents_v1", sql: TURN_ADMISSION_INTENTS_MIGRATION },
+  { id: 52, name: "deep_research_skill_v1", sql: DEEP_RESEARCH_SKILL_MIGRATION },
 ] as const;

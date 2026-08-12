@@ -6,6 +6,8 @@ import {
 } from "@berry/personal-memory";
 import { z } from "zod";
 import type { Memory as Mem0Memory, MemoryItem as Mem0MemoryItem } from "mem0ai/oss";
+import { Mem0RuntimeMetrics } from "./metrics.js";
+import { installMem0PgVectorPool } from "./pgvector-pool.js";
 
 const IdentitySchema = z.object({
   tenantId: z.string().uuid(),
@@ -36,50 +38,74 @@ const UpdateSchema = IdentitySchema.extend({
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   env.MEM0_TELEMETRY ??= "false";
   const config = configFromEnv(env);
-  const { Memory } = await import("mem0ai/oss");
-  const memory = new Memory({
-    version: "v1.1",
-    embedder: {
-      provider: "openai",
-      config: {
-        apiKey: config.embeddingApiKey,
-        baseURL: config.embeddingBaseUrl,
-        model: config.embeddingModel,
-        embeddingDims: config.embeddingDimensions,
-      },
+  const runtimeMetrics = new Mem0RuntimeMetrics();
+  const pgVectorPool = await installMem0PgVectorPool({
+    max: config.databasePoolMax,
+    connectionTimeoutMillis: config.databaseConnectionTimeoutMs,
+    idleTimeoutMillis: config.databaseIdleTimeoutMs,
+    onIdleError: ({ code, message }) => {
+      runtimeMetrics.postgresPoolFailed(code);
+      console.error(`Berry Mem0: ${message}; the pool discarded the connection`);
     },
-    vectorStore: {
-      provider: "pgvector",
-      config: {
-        connectionString: config.databaseUrl,
-        collectionName: config.collectionName,
-        embeddingModelDims: config.embeddingDimensions,
-        dimension: config.embeddingDimensions,
-        hnsw: true,
-      },
-    },
-    llm: {
-      provider: "openai",
-      config: {
-        apiKey: config.llmApiKey,
-        baseURL: config.llmBaseUrl,
-        model: config.llmModel,
-        temperature: 0,
-        maxTokens: 2_000,
-      },
-    },
-    disableHistory: true,
-    customInstructions: config.customInstructions,
   });
+  let memory: Mem0Memory;
+  try {
+    const { Memory } = await import("mem0ai/oss");
+    memory = new Memory({
+      version: "v1.1",
+      embedder: {
+        provider: "openai",
+        config: {
+          apiKey: config.embeddingApiKey,
+          baseURL: config.embeddingBaseUrl,
+          model: config.embeddingModel,
+          embeddingDims: config.embeddingDimensions,
+        },
+      },
+      vectorStore: {
+        provider: "pgvector",
+        config: {
+          connectionString: config.databaseUrl,
+          collectionName: config.collectionName,
+          embeddingModelDims: config.embeddingDimensions,
+          dimension: config.embeddingDimensions,
+          hnsw: true,
+        },
+      },
+      llm: {
+        provider: "openai",
+        config: {
+          apiKey: config.llmApiKey,
+          baseURL: config.llmBaseUrl,
+          model: config.llmModel,
+          temperature: 0,
+          maxTokens: 2_000,
+        },
+      },
+      disableHistory: true,
+      customInstructions: config.customInstructions,
+    });
 
-  await memory.getAll({
-    filters: { user_id: "berry:healthcheck" },
-    topK: 1,
-  });
+    await memory.getAll({
+      filters: { user_id: "berry:healthcheck" },
+      topK: 1,
+    });
+  } catch (error) {
+    await pgVectorPool.close();
+    throw error;
+  }
 
   const server = createServer((request, response) => {
-    void route(memory, config.apiKey, request, response).catch((error) => {
+    if (request.method === "GET" && request.url?.split("?", 1)[0] === "/metrics") {
+      sendMetrics(response, runtimeMetrics.render());
+      return;
+    }
+    const startedAt = runtimeMetrics.requestStarted();
+    void route(memory, config.apiKey, request, response).then(() => {
+      runtimeMetrics.requestSucceeded(startedAt);
+    }).catch((error) => {
       const status = error instanceof HttpError ? error.status : error instanceof z.ZodError ? 400 : 500;
+      runtimeMetrics.requestFailed(error, status, startedAt);
       if (status >= 500) {
         console.error(`Berry Mem0 request failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -94,13 +120,22 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       });
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(config.port, config.host, resolve);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(config.port, config.host, resolve);
+    });
+  } catch (error) {
+    await pgVectorPool.close();
+    throw error;
+  }
   console.log(`Berry self-hosted Mem0 listening on ${config.host}:${config.port}`);
 
-  const shutdown = () => server.close(() => process.exit(0));
+  const shutdown = () => server.close(() => {
+    void pgVectorPool.close()
+      .catch(() => console.error("Berry Mem0: PostgreSQL pool did not close cleanly"))
+      .finally(() => process.exit(0));
+  });
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
@@ -320,6 +355,15 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.end(JSON.stringify(body));
 }
 
+function sendMetrics(response: ServerResponse, body: string): void {
+  response.writeHead(200, {
+    "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  });
+  response.end(body);
+}
+
 function identityFrom(input: z.infer<typeof IdentitySchema>): PersonalMemoryIdentity {
   return { tenantId: input.tenantId, userId: input.userId };
 }
@@ -350,6 +394,17 @@ function configFromEnv(env: NodeJS.ProcessEnv) {
     host: env.BERRY_MEM0_HOST?.trim() || "0.0.0.0",
     port: boundedInteger(env.BERRY_MEM0_PORT ?? null, 8010, 65_535),
     collectionName: env.BERRY_MEM0_COLLECTION?.trim() || "berry_personal_memories",
+    databasePoolMax: boundedInteger(env.BERRY_MEM0_DATABASE_POOL_MAX ?? null, 10, 100),
+    databaseConnectionTimeoutMs: boundedInteger(
+      env.BERRY_MEM0_DATABASE_CONNECTION_TIMEOUT_MS ?? null,
+      5_000,
+      60_000,
+    ),
+    databaseIdleTimeoutMs: boundedInteger(
+      env.BERRY_MEM0_DATABASE_IDLE_TIMEOUT_MS ?? null,
+      30_000,
+      600_000,
+    ),
     llmBaseUrl: env.BERRY_MEM0_LLM_BASE_URL?.trim()
       || env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim()
       || "https://api.openai.com/v1",

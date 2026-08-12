@@ -2,6 +2,7 @@ import { BerryApiError } from "@berry/api-client";
 import { describe, expect, it, vi } from "vitest";
 import {
   loadPersonalSkillResource,
+  loadSkillPackageForDownload,
   isManagedSkillDuplicate,
   skillControlHint,
   skillMarkdownBody,
@@ -31,6 +32,25 @@ describe("personal capability screens", () => {
     };
 
     await expect(loadPersonalSkillResource(client, "tenant_1")).rejects.toMatchObject({ status: 503 });
+  });
+
+  it("downloads organization skills from their retained package", async () => {
+    const resourceFiles = [{ path: "assets/template.docx", contentBase64: "ZG9jeA==" }];
+    const client = {
+      personalSkillPackage: vi.fn(),
+      organizationSkillPackage: vi.fn(async () => ({
+        content: "---\nname: memo\ndescription: Memo\n---\nUse the template.",
+        resourceFiles,
+      })),
+    };
+
+    await expect(loadSkillPackageForDownload(client as never, "tenant_1", {
+      capabilityId: "memo",
+      content: "cached markdown",
+      provenance: "organization",
+    })).resolves.toMatchObject({ resourceFiles });
+    expect(client.organizationSkillPackage).toHaveBeenCalledWith("tenant_1", "memo");
+    expect(client.personalSkillPackage).not.toHaveBeenCalled();
   });
 
   it("explains managed and offline skill controls", () => {

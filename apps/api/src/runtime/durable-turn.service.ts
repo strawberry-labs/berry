@@ -1,4 +1,4 @@
-import { ConflictException, Inject, Injectable } from "@nestjs/common";
+import { ConflictException, Inject, Injectable, Optional } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
 import {
   AgentStreamEventSchema,
@@ -14,6 +14,8 @@ import {
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.js";
 import { associateInputFilesInTransaction } from "../files/file-platform.service.js";
 import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.js";
+import { TurnCancellationPublisher } from "./turn-cancellation-publisher.js";
+import { apiRuntimeMetrics, type TurnCancellationMetricResult } from "./runtime-metrics.js";
 
 export const DURABLE_TURN_RUNNER_ENABLED = Symbol("DURABLE_TURN_RUNNER_ENABLED");
 
@@ -47,6 +49,13 @@ export interface DurableTurnAdmissionReplay {
   operationFingerprint: string;
 }
 
+export interface DurableTurnAdmissionIntent {
+  tenantId: string;
+  sessionId: string;
+  requestId: string;
+  operationFingerprint: string;
+}
+
 export interface DurableEventEnvelope {
   id: string;
   runId: string;
@@ -69,11 +78,20 @@ type AdmissionReplayRow = {
   runtime_request: unknown;
 };
 
+type AdmissionIntentRow = {
+  session_id: string;
+  operation_fingerprint: string | null;
+  state: "preparing" | "admitted" | "cancelled";
+  run_id: string | null;
+};
+
 @Injectable()
 export class DurableTurnService {
   constructor(
     @Inject(CloudDatabaseService) private readonly database: CloudDatabaseService,
     @Inject(DURABLE_TURN_RUNNER_ENABLED) readonly enabled: boolean,
+    @Optional() @Inject(TurnCancellationPublisher)
+    private readonly cancellationPublisher?: TurnCancellationPublisher,
   ) {}
 
   async replayAdmission(input: DurableTurnAdmissionReplay): Promise<{ runId: string; sessionId: string } | null> {
@@ -84,9 +102,50 @@ export class DurableTurnService {
     });
   }
 
+  async beginAdmission(input: DurableTurnAdmissionIntent): Promise<{ runId: string; sessionId: string } | null> {
+    if (!this.enabled) return null;
+    return this.database.withTenant(input.tenantId, async (executor) => {
+      await executor.execute(
+        `
+INSERT INTO turn_admission_intents (
+  tenant_id,request_id,session_id,operation_fingerprint,state
+) VALUES ($1::uuid,$2,$3::uuid,$4,'preparing')
+ON CONFLICT (tenant_id,request_id) DO NOTHING
+        `.trim(),
+        [input.tenantId, input.requestId, input.sessionId, input.operationFingerprint],
+      );
+      const intent = await lockAdmissionIntent(executor, input.tenantId, input.requestId);
+      if (!intent) throw new Error("Unable to persist the durable turn admission intent");
+      validateAdmissionIntent(intent, input);
+      if (!intent.operation_fingerprint) {
+        await executor.execute(
+          `
+UPDATE turn_admission_intents
+SET operation_fingerprint=$3,updated_at=now()
+WHERE tenant_id=$1::uuid AND request_id=$2 AND operation_fingerprint IS NULL
+          `.trim(),
+          [input.tenantId, input.requestId, input.operationFingerprint],
+        );
+      }
+      if (intent.state === "cancelled") throw cancelledAdmissionConflict();
+      if (intent.state === "admitted" && intent.run_id) {
+        return { runId: intent.run_id, sessionId: input.sessionId };
+      }
+      return null;
+    });
+  }
+
   async admit(input: DurableTurnAdmission): Promise<{ runId: string; sessionId: string }> {
     if (!this.enabled) throw new Error("Durable turn runner is disabled");
     return this.database.withTenant(input.tenantId, async (executor) => {
+      const admissionIntent = await lockAdmissionIntent(executor, input.tenantId, input.requestId);
+      if (admissionIntent) {
+        validateAdmissionIntent(admissionIntent, input);
+        if (admissionIntent.state === "cancelled") throw cancelledAdmissionConflict();
+        if (admissionIntent.state === "admitted" && admissionIntent.run_id) {
+          return { runId: admissionIntent.run_id, sessionId: input.sessionId };
+        }
+      }
       const owned = await executor.query<{ session_id: string }>(
         `
 SELECT s.id AS session_id
@@ -237,6 +296,18 @@ WHERE tenant_id=$1::uuid AND id=$4::uuid
         `.trim(),
         [input.tenantId, runId, requestMessageId, input.sessionId],
       );
+      if (admissionIntent) {
+        await executor.execute(
+          `
+UPDATE turn_admission_intents
+SET state='admitted',run_id=$3::uuid,admitted_at=now(),
+    preparation_ms=GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-created_at))*1000)::integer),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND request_id=$2 AND state='preparing'
+          `.trim(),
+          [input.tenantId, input.requestId, runId],
+        );
+      }
       return { runId, sessionId: input.sessionId };
     });
   }
@@ -629,10 +700,41 @@ LIMIT $3
     });
   }
 
-  async cancel(tenantId: string, sessionId: string): Promise<boolean> {
-    if (!this.enabled) return false;
-    return this.database.withTenant(tenantId, async (executor) => {
-      const run = async (transaction: SqlExecutor): Promise<boolean> => {
+  async cancel(tenantId: string, sessionId: string, requestId?: string): Promise<boolean> {
+    if (!this.enabled) {
+      apiRuntimeMetrics.turnCancellation("no_active_run");
+      return true;
+    }
+    const cancellation = await this.database.withTenant(tenantId, async (executor) => {
+      const run = async (transaction: SqlExecutor): Promise<{
+        runId: string | null;
+        result: TurnCancellationMetricResult;
+      }> => {
+        if (requestId) {
+          await transaction.execute(
+            `
+INSERT INTO turn_admission_intents (
+  tenant_id,request_id,session_id,state,cancelled_at
+) VALUES ($1::uuid,$2,$3::uuid,'cancelled',now())
+ON CONFLICT (tenant_id,request_id) DO UPDATE
+SET state=CASE
+      WHEN turn_admission_intents.state='admitted' THEN 'admitted'
+      ELSE 'cancelled'
+    END,
+    cancelled_at=COALESCE(turn_admission_intents.cancelled_at,now()),
+    preparation_ms=COALESCE(
+      turn_admission_intents.preparation_ms,
+      GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-turn_admission_intents.created_at))*1000)::integer)
+    ),
+    updated_at=now()
+            `.trim(),
+            [tenantId, requestId, sessionId],
+          );
+          const intent = await lockAdmissionIntent(transaction, tenantId, requestId);
+          if (intent && intent.session_id !== sessionId) {
+            throw new ConflictException("This operation key belongs to another session");
+          }
+        }
         const rows = await transaction.query<{
           id: string;
           task_id: string;
@@ -643,21 +745,28 @@ LIMIT $3
 SELECT id,task_id,session_id,request_message_id
 FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+  AND ($3::text IS NULL OR request_id=$3)
   AND state NOT IN ('completed','failed','cancelled','recovery_required')
 ORDER BY created_at DESC
 LIMIT 1
 FOR UPDATE
           `.trim(),
-          [tenantId, sessionId],
+          [tenantId, sessionId, requestId ?? null],
         );
         const active = rows[0];
-        if (!active) return false;
+        if (!active) return {
+          runId: null,
+          result: requestId ? "pending_or_terminal" : "no_active_run",
+        };
         await cancelActiveDurableRun(transaction, tenantId, active);
-        return true;
+        return { runId: active.id, result: "active_run" };
       };
       // CloudDatabaseService.withTenant already owns the transaction boundary.
       return run(executor);
     });
+    apiRuntimeMetrics.turnCancellation(cancellation.result);
+    if (cancellation.runId) await this.cancellationPublisher?.publish(tenantId, cancellation.runId);
+    return true;
   }
 
   async deleteTask(tenantId: string, userId: string, taskId: string): Promise<boolean> {
@@ -2656,6 +2765,42 @@ function safeBigInt(value: unknown): bigint {
   } catch {
     return 0n;
   }
+}
+
+async function lockAdmissionIntent(
+  executor: SqlExecutor,
+  tenantId: string,
+  requestId: string,
+): Promise<AdmissionIntentRow | null> {
+  const rows = await executor.query<AdmissionIntentRow>(
+    `
+SELECT session_id,operation_fingerprint,state,run_id
+FROM turn_admission_intents
+WHERE tenant_id=$1::uuid AND request_id=$2
+FOR UPDATE
+    `.trim(),
+    [tenantId, requestId],
+  );
+  return rows[0] ?? null;
+}
+
+function validateAdmissionIntent(
+  intent: AdmissionIntentRow,
+  input: { sessionId: string; operationFingerprint: string },
+): void {
+  if (intent.session_id !== input.sessionId) {
+    throw new ConflictException("This operation key belongs to another session");
+  }
+  if (intent.operation_fingerprint && intent.operation_fingerprint !== input.operationFingerprint) {
+    throw new ConflictException("This operation key was already used with a different turn request");
+  }
+}
+
+function cancelledAdmissionConflict(): ConflictException {
+  return new ConflictException({
+    code: "turn_submission_cancelled",
+    message: "This turn submission was cancelled before admission.",
+  });
 }
 
 async function appendDurableEvents(

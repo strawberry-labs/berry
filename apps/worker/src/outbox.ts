@@ -8,6 +8,7 @@ import {
 } from "./jobs.js";
 import type { BerryQueueClient } from "./bullmq.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { workerRuntimeMetrics } from "./runtime-metrics.js";
 
 type OutboxRow = {
   id: string;
@@ -15,6 +16,8 @@ type OutboxRow = {
   event_type: string;
   payload: unknown;
   attempts: number;
+  created_at?: Date | string;
+  available_at?: Date | string;
 };
 
 export class RuntimeOutboxDispatcher {
@@ -136,7 +139,7 @@ export class RuntimeOutboxDispatcher {
         FROM due
         WHERE outbox.id = due.id
         RETURNING outbox.id, outbox.tenant_id, outbox.event_type,
-                  outbox.payload, outbox.attempts
+                  outbox.payload, outbox.attempts, outbox.created_at, outbox.available_at
       `, [tenantId, this.options.workerId, remaining]));
         rows.push(...claimed);
       }
@@ -174,6 +177,7 @@ export class RuntimeOutboxDispatcher {
               priority: outboxJobPriority(name),
             },
           );
+          logOutboxDispatch(row, name);
           if (requiresDeliveryReceipt(name)) await this.deferForDeliveryReceipt(row);
           else await this.complete(row);
           dispatched += 1;
@@ -281,6 +285,23 @@ export class RuntimeOutboxDispatcher {
       console.error("[runtime-outbox] Dispatch cycle failed; the next poll will retry.", error);
     });
   }
+}
+
+function logOutboxDispatch(row: OutboxRow, name: BerryWorkerJobName): void {
+  const createdAt = row.created_at instanceof Date
+    ? row.created_at.getTime()
+    : typeof row.created_at === "string"
+      ? Date.parse(row.created_at)
+      : Number.NaN;
+  const latencyMs = Number.isFinite(createdAt) ? Math.max(0, Date.now() - createdAt) : null;
+  workerRuntimeMetrics.outboxDispatch(name, latencyMs);
+  console.info(JSON.stringify({
+    event: "berry.outbox.dispatch",
+    outboxId: row.id,
+    jobName: name,
+    attempt: row.attempts,
+    latencyMs,
+  }));
 }
 
 export function outboxJobId(name: BerryWorkerJobName, outboxId: string, attempt = 1): string {

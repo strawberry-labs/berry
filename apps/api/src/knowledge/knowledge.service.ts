@@ -127,6 +127,7 @@ export class KnowledgeService {
     constraints?: string[];
     openItems?: string[];
     tokenBudget?: number;
+    signal?: AbortSignal;
   }): Promise<GroundingContext> {
     const query = buildRetrievalQuery(input);
     const queryHash = sha256(query);
@@ -138,7 +139,10 @@ export class KnowledgeService {
     let degradedReason: GroundingContext["retrieval"]["degradedReason"] = "none";
     if (this.embeddings) {
       try {
-        queryVector = (await this.embeddings.embed([query]))[0] ?? null;
+        queryVector = (await this.embeddings.embed(
+          [query],
+          input.signal ? { signal: input.signal } : {},
+        ))[0] ?? null;
       } catch {
         degradedReason = "embeddings_unavailable";
       }

@@ -16,7 +16,7 @@ import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle, type PromptMentionConfig } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
 import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
-import { ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, type ComposerQuestionAnswer } from "./composer-question-overlay";
+import { COMPOSER_SEND_ARROW_SIZE, COMPOSER_SEND_BUTTON_CLASS, ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, strictQuestionAnswerAttachment, type ComposerQuestionAnswer } from "./composer-question-overlay";
 import { QueuedMessageList } from "./queued-message-list";
 import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
 import { resolveComposerSubmitIntent } from "@/lib/composer-submit-intent";
@@ -672,15 +672,7 @@ export function Composer({
       taskId: activeTask.id,
       sessionId: activeTask.activeSessionId!,
     }));
-    return stored.map((file) => ({
-      id: file.id,
-      fileId: file.id,
-      name: file.name,
-      mediaType: file.mediaType,
-      size: file.size,
-      sourceKind: "object-storage",
-      previewUrl: file.previewUrl,
-    }));
+    return stored.map(strictQuestionAnswerAttachment);
   }, [activeTask, client]);
 
   const handlePaste = React.useCallback((event: ClipboardEvent) => {
@@ -968,12 +960,12 @@ export function Composer({
               disabled={primaryActionDisabled}
               onClick={() => void (primaryAction === "continue" ? continueInterruptedTurn() : submit())}
               aria-label={editingFollowUp ? "Save queued message" : primaryAction === "continue" ? "Continue response" : "Send"}
-              className="berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45"
+              className={COMPOSER_SEND_BUTTON_CLASS}
             >
               {primaryAction === "continue" ? (
                 <Play size={15} fill="currentColor" className="translate-x-px" aria-hidden />
               ) : (
-                <ArrowUp size={18} aria-hidden />
+                <ArrowUp size={COMPOSER_SEND_ARROW_SIZE} aria-hidden />
               )}
             </Button>
           )}

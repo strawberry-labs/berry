@@ -61,6 +61,7 @@ import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { MemoryService } from "../memory/memory.service.ts";
 import { DurableTurnService } from "../runtime/durable-turn.service.ts";
+import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
 import {
   ENTERPRISE_IDENTITY_REPOSITORY,
   type EnterpriseIdentityRepository,
@@ -89,6 +90,7 @@ const PROMPT_IMPROVEMENT_TIMEOUT_MS = 30_000;
 const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
 const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 16_384;
+const DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS = 1_500;
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -185,7 +187,7 @@ const StartTurnRequestSchema = z.object({
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1).optional(),
   permissionMode: PermissionModeSchema.optional(),
-  provider: z.any(),
+  provider: z.any().optional(),
   model: z.string().optional(),
   apiKey: z.string().optional(),
   reasoning: ReasoningLevelSchema.optional(),
@@ -222,6 +224,10 @@ const StartTurnRequestSchema = z.object({
   }
 });
 
+const CancelTurnRequestSchema = z.object({
+  operationId: z.string().uuid().optional(),
+}).strict();
+
 function canonicalTurnOperation(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalTurnOperation).join(",")}]`;
   if (value && typeof value === "object") {
@@ -235,9 +241,112 @@ function canonicalTurnOperation(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+function providerIdFromRequest(provider: unknown): string | undefined {
+  if (!provider || typeof provider !== "object" || Array.isArray(provider)) return undefined;
+  const id = (provider as Record<string, unknown>).id;
+  return typeof id === "string" && id.trim() ? id.trim() : undefined;
+}
+
 export function turnAdmissionFingerprint(request: z.infer<typeof StartTurnRequestSchema>): string {
   const { operationId: _operationId, ...operation } = request;
   return createHash("sha256").update(canonicalTurnOperation(operation)).digest("hex");
+}
+
+type ObservedAdmissionPreparation<T> = Promise<
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown }
+>;
+
+function observeAdmissionPreparation<T>(work: Promise<T>): ObservedAdmissionPreparation<T> {
+  return work.then(
+    (value) => ({ status: "fulfilled" as const, value }),
+    (reason: unknown) => ({ status: "rejected" as const, reason }),
+  );
+}
+
+async function resolveAdmissionPreparation<T>(work: ObservedAdmissionPreparation<T>): Promise<T> {
+  const result = await work;
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
+}
+
+async function resolveOptionalAdmissionPreparation<T>(
+  work: ObservedAdmissionPreparation<T>,
+  fallback: T,
+  deadlineAt: number,
+  label: string,
+): Promise<T> {
+  const remainingMs = Math.max(0, deadlineAt - Date.now());
+  if (remainingMs === 0) {
+    logAdmissionPreparationDegraded(label, "timeout");
+    return fallback;
+  }
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    work,
+    new Promise<{ status: "timeout" }>((resolve) => {
+      timeout = setTimeout(() => resolve({ status: "timeout" }), remainingMs);
+      timeout.unref?.();
+    }),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  if (result.status === "timeout") {
+    logAdmissionPreparationDegraded(label, "timeout");
+    return fallback;
+  }
+  if (result.status === "rejected") {
+    logAdmissionPreparationDegraded(label, "unavailable");
+    return fallback;
+  }
+  return result.value;
+}
+
+export function durableAdmissionPreparationTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env.BERRY_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS;
+  const configured = Number(raw);
+  if (!Number.isSafeInteger(configured) || configured < 1) {
+    return DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS;
+  }
+  // Admission is user-visible and cancellable. Configuration may tighten the
+  // budget for tests or an incident, but it cannot weaken the two-second SLA.
+  return Math.min(configured, DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS);
+}
+
+function logAdmissionPreparationDegraded(
+  label: string,
+  outcome: "timeout" | "unavailable",
+): void {
+  console.info(JSON.stringify({
+    event: "berry.turn.admission_preparation",
+    outcome,
+    dependency: label.slice(0, 128),
+  }));
+}
+
+function logTurnAdmission(
+  outcome: "admitted" | "replayed" | "failed",
+  runId: string | null,
+  durationMs: number,
+  error?: unknown,
+): void {
+  const status = error instanceof HttpException ? error.getStatus() : null;
+  const response = error instanceof HttpException ? error.getResponse() : null;
+  const code = response && typeof response === "object" && "code" in response
+    && typeof response.code === "string"
+    ? response.code.slice(0, 128)
+    : null;
+  apiRuntimeMetrics.turnAdmission(outcome, durationMs, status);
+  console.info(JSON.stringify({
+    event: "berry.turn.admission",
+    outcome,
+    runId,
+    durationMs: Math.max(0, Math.floor(durationMs)),
+    status,
+    code,
+  }));
 }
 
 const SteerTurnRequestSchema = z.object({
@@ -434,15 +543,36 @@ export class AgentApiController {
   async modelCatalog(@Req() httpRequest: AuthenticatedRequest) {
     const tenantId = tenantIdFromRequest(httpRequest);
     const userId = httpRequest.auth?.user.id ?? null;
-    const [catalog, effective, connectorRuntime, departmentId] = await Promise.all([
+    const [initialCatalog, effective, connectorRuntime, departmentId] = await Promise.all([
       this.runtimeConfig.catalog(tenantId),
       this.organizationCapabilities.effective(tenantId, userId ?? ""),
       userId ? this.connectors.runtime(tenantId, userId) : Promise.resolve([]),
       this.#primaryDepartmentId(tenantId, userId),
     ]);
-    if (!catalog) return null;
-    const runtime = await this.runtimeConfig.resolve(tenantId, {});
+    if (!initialCatalog) return null;
+    let catalog = initialCatalog;
+    let runtime = await this.runtimeConfig.resolve(tenantId, {});
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
+    const organizationDefault = await this.modelGovernance.resolve({
+      tenantId,
+      mode: "chat",
+      userId,
+      departmentId,
+    });
+    if (organizationDefault.allowed && organizationDefault.providerId !== catalog.providerId) {
+      runtime = await this.runtimeConfig.resolve(tenantId, {
+        provider: { id: organizationDefault.providerId },
+        model: organizationDefault.model,
+      });
+      await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
+      catalog = {
+        ...catalog,
+        providerId: runtime.provider.id,
+        name: runtime.provider.name,
+        defaultModel: organizationDefault.model,
+        models: runtime.provider.models ?? [],
+      };
+    }
     const modelDecisions = await Promise.all(catalog.models.map((model) => this.modelGovernance.resolve({
       tenantId,
       mode: "chat",
@@ -452,8 +582,12 @@ export class AgentApiController {
       departmentId,
     })));
     const visibleModels = catalog.models.filter((_, index) => modelDecisions[index]?.allowed === true);
-    const visibleDefault = visibleModels.some((model) => model.id === catalog.defaultModel)
-      ? catalog.defaultModel
+    const preferredDefault = organizationDefault.allowed
+      && organizationDefault.providerId === catalog.providerId
+      ? organizationDefault.model
+      : catalog.defaultModel;
+    const visibleDefault = visibleModels.some((model) => model.id === preferredDefault)
+      ? preferredDefault
       : visibleModels[0]?.id ?? catalog.defaultModel;
     const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, "chat");
     return {
@@ -768,10 +902,63 @@ export class AgentApiController {
 
   @Post("/tasks")
   async createTask(@Req() httpRequest: AuthenticatedRequest, @Body() body: unknown) {
+    const request = parseBody(CreateTaskRequestSchema, body);
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const userId = httpRequest.auth?.user.id ?? null;
+    const mode = request.conversationKind;
+    const explicitModel = request.model ?? null;
+    const requestedProviderId = explicitModel ? request.modelProviderId ?? null : null;
+    const catalog = await this.runtimeConfig.catalog(tenantId);
+    if (!catalog) {
+      return this.store.createTask({
+        ...request,
+        permissionMode: "full-access",
+        ownerUserId: userId,
+      });
+    }
+    const runtime = await this.runtimeConfig.resolve(tenantId, {
+      ...(requestedProviderId ? { provider: { id: requestedProviderId } } : {}),
+      ...(explicitModel ? { model: explicitModel } : {}),
+    });
+    await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, runtime.provider);
+    const departmentId = await this.#primaryDepartmentId(tenantId, userId);
+    let modelDecision = await this.modelGovernance.resolve({
+      tenantId,
+      mode,
+      providerId: explicitModel ? requestedProviderId ?? runtime.provider.id : null,
+      model: explicitModel,
+      userId,
+      departmentId,
+    });
+    if (!explicitModel && modelDecision.reason === "no_model_selected") {
+      modelDecision = await this.modelGovernance.resolve({
+        tenantId,
+        mode,
+        providerId: runtime.provider.id,
+        model: runtime.provider.defaultModel,
+        userId,
+        departmentId,
+      });
+    }
+    if (!modelDecision.allowed) {
+      throw new ForbiddenException({
+        code: "model_governance_blocked",
+        message: modelGovernanceMessage(modelDecision.reason),
+        decision: modelDecision,
+      });
+    }
+    if (runtime.provider.id !== modelDecision.providerId) {
+      await this.runtimeConfig.resolve(tenantId, {
+        provider: { id: modelDecision.providerId },
+        model: modelDecision.model,
+      });
+    }
     return this.store.createTask({
-      ...parseBody(CreateTaskRequestSchema, body),
+      ...request,
       permissionMode: "full-access",
-      ownerUserId: httpRequest.auth?.user.id ?? null,
+      modelProviderId: modelDecision.providerId,
+      model: modelDecision.model,
+      ownerUserId: userId,
     });
   }
 
@@ -993,6 +1180,11 @@ export class AgentApiController {
     });
   }
 
+  @Get("/sessions/:sessionId")
+  async getSession(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    return (await this.ownedSession(httpRequest, sessionId)).session;
+  }
+
   @Get("/sessions/:sessionId/messages")
   async listMessages(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
     await this.ownedSession(httpRequest, sessionId);
@@ -1058,6 +1250,8 @@ export class AgentApiController {
 
   @Post("/sessions/:sessionId/turns")
   async startTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
+    const admissionStartedAt = Date.now();
+    const optionalPreparationDeadlineAt = admissionStartedAt + durableAdmissionPreparationTimeoutMs();
     const request = parseBody(StartTurnRequestSchema, body);
     const { session, task } = await this.ownedSession(httpRequest, sessionId);
     const tenantId = tenantIdFromRequest(httpRequest);
@@ -1074,26 +1268,71 @@ export class AgentApiController {
         requestId,
         operationFingerprint,
       });
-      if (replayed) return { turnId: replayed.runId, sessionId };
+      if (replayed) {
+        logTurnAdmission("replayed", replayed.runId, Date.now() - admissionStartedAt);
+        return { turnId: replayed.runId, sessionId };
+      }
+      const preparing = await this.durableTurns.beginAdmission({
+        tenantId,
+        sessionId,
+        requestId,
+        operationFingerprint,
+      });
+      if (preparing) {
+        logTurnAdmission("replayed", preparing.runId, Date.now() - admissionStartedAt);
+        return { turnId: preparing.runId, sessionId };
+      }
     }
     if (request.continueInterruptedTurn) {
       await this.assertContinuableTurn(sessionId);
     }
-    const baseRuntime = await this.runtimeConfig.resolve(tenantId, request);
-    const [effectiveRuntime, connectorRuntime, departmentId] = await Promise.all([
+    const requestProviderId = providerIdFromRequest(request.provider);
+    const selectedModel = request.model ?? session.model ?? undefined;
+    const selectedProviderId = request.model
+      ? requestProviderId ?? session.modelProviderId ?? undefined
+      : session.modelProviderId ?? requestProviderId;
+    const selectedProvider = selectedProviderId && selectedProviderId !== requestProviderId
+      ? { id: selectedProviderId }
+      : request.provider;
+    const baseRuntimeWork = this.runtimeConfig.resolve(tenantId, {
+      ...request,
+      ...(selectedProvider ? { provider: selectedProvider } : {}),
+      ...(selectedModel ? { model: selectedModel } : {}),
+    });
+    const effectiveRuntimeWork = observeAdmissionPreparation(
       this.organizationCapabilities.effective(tenantId, userId),
+    );
+    const connectorRuntimeWork = observeAdmissionPreparation(
       this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId }),
-      this.#primaryDepartmentId(tenantId, userId),
+    );
+    const departmentIdWork = this.#primaryDepartmentId(tenantId, userId);
+    let baseRuntime = await baseRuntimeWork;
+    const [effectiveRuntime, connectorRuntime, departmentId] = await Promise.all([
+      this.durableTurns.enabled
+        ? resolveOptionalAdmissionPreparation(
+            effectiveRuntimeWork,
+            { rows: [], skills: [], mcpServers: [] },
+            optionalPreparationDeadlineAt,
+            "organization_capabilities",
+          )
+        : resolveAdmissionPreparation(effectiveRuntimeWork),
+      this.durableTurns.enabled
+        ? resolveOptionalAdmissionPreparation(
+            connectorRuntimeWork,
+            [],
+            optionalPreparationDeadlineAt,
+            "connector_runtime",
+          )
+        : resolveAdmissionPreparation(connectorRuntimeWork),
+      departmentIdWork,
     ]);
-    const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers, ...connectorRuntime], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
-    await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, resolvedRuntime.provider);
-    const providerId = resolvedRuntime.provider.id;
+    await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
     const mode = conversationKindFromTask(task);
     const modelDecision = await this.modelGovernance.resolve({
       tenantId,
       mode,
-      providerId,
-      model: request.model ?? null,
+      providerId: selectedProviderId ?? null,
+      model: selectedModel ?? null,
       userId,
       departmentId,
     });
@@ -1104,7 +1343,19 @@ export class AgentApiController {
         decision: modelDecision,
       });
     }
-    const governedModelId = request.model ?? modelDecision.model;
+    if (baseRuntime.provider.id !== modelDecision.providerId) {
+      baseRuntime = await this.runtimeConfig.resolve(tenantId, {
+        provider: { id: modelDecision.providerId },
+        model: modelDecision.model,
+      });
+      await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
+    }
+    const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers, ...connectorRuntime], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
+    const providerId = modelDecision.providerId;
+    const governedModelId = modelDecision.model;
+    if (session.modelProviderId !== modelDecision.providerId || session.model !== governedModelId) {
+      await this.store.updateSessionModel(sessionId, modelDecision.providerId, governedModelId);
+    }
     const governedModel = resolvedRuntime.provider.models?.find((candidate) => candidate.id === governedModelId);
     const governedCapabilities = resolveModelCapabilities(governedModel);
     const advertisedMaxOutputTokens = governedCapabilities.context?.maxOutputTokens;
@@ -1115,17 +1366,41 @@ export class AgentApiController {
       : modelMaxOutputTokens;
     const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, mode);
     if (request.intent === "image_generation") this.#assertImageGenerationAvailable(imageAccess);
-    const [groundingContext, portableCheckpoint] = await Promise.all([
-      this.contextAssembly.assemble({
-        tenantId,
-        userId: httpRequest.auth!.user.id,
-        workspaceId: request.workspaceId ?? task.workspaceId,
-        taskId: task.id,
-        sessionId,
-        request: request.input ?? task.title,
-        taskTitle: task.title,
-      }),
+    const contextInput = {
+      tenantId,
+      userId: httpRequest.auth!.user.id,
+      workspaceId: request.workspaceId ?? task.workspaceId,
+      taskId: task.id,
+      sessionId,
+      request: request.input ?? task.title,
+      taskTitle: task.title,
+    };
+    const groundingContextWork = observeAdmissionPreparation(this.contextAssembly.assemble(
+      contextInput,
+      this.durableTurns.enabled
+        ? { timeoutMs: Math.max(1, optionalPreparationDeadlineAt - Date.now()) }
+        : {},
+    ));
+    const portableCheckpointWork = observeAdmissionPreparation(
       this.contextAssembly.portableCheckpoint(tenantId, sessionId),
+    );
+    const [groundingContext, portableCheckpoint] = await Promise.all([
+      this.durableTurns.enabled
+        ? resolveOptionalAdmissionPreparation(
+            groundingContextWork,
+            unavailableAdmissionGroundingContext(contextInput),
+            optionalPreparationDeadlineAt,
+            "grounding_context",
+          )
+        : resolveAdmissionPreparation(groundingContextWork),
+      this.durableTurns.enabled
+        ? resolveOptionalAdmissionPreparation(
+            portableCheckpointWork,
+            undefined,
+            optionalPreparationDeadlineAt,
+            "portable_checkpoint",
+          )
+        : resolveAdmissionPreparation(portableCheckpointWork),
     ]);
     let runtimeImageAttachments: RuntimeImageReference[] = [];
     const governedRequest = {
@@ -1292,18 +1567,31 @@ export class AgentApiController {
       try {
         const imageInfo = imageAccess.image;
         const imageDecision = imageAccess.decision;
+        const providerWork = durableProviderTransport(
+          governedRequest.provider,
+          resolvedRuntime.apiKey,
+          resolvedRuntime.credentialRef,
+        );
+        const mcpServersWork = observeAdmissionPreparation(Promise.all(governedRequest.mcpServers
+          .filter((server) => server.enabled && server.trusted)
+          .map((server) => durableMcpServer(server))));
+        const visionWork = observeAdmissionPreparation(governedCapabilities.vision === true
+          ? Promise.resolve(null)
+          : this.#resolveVisionAdapter(tenantId, userId, departmentId, mode));
         const [provider, mcpServers, vision] = await Promise.all([
-          durableProviderTransport(
-            governedRequest.provider,
-            resolvedRuntime.apiKey,
-            resolvedRuntime.credentialRef,
+          providerWork,
+          resolveOptionalAdmissionPreparation(
+            mcpServersWork,
+            [],
+            optionalPreparationDeadlineAt,
+            "mcp_runtime",
           ),
-          Promise.all(governedRequest.mcpServers
-            .filter((server) => server.enabled && server.trusted)
-            .map((server) => durableMcpServer(server))),
-          governedCapabilities.vision === true
-            ? Promise.resolve(null)
-            : this.#resolveVisionAdapter(tenantId, userId, departmentId, mode),
+          resolveOptionalAdmissionPreparation(
+            visionWork,
+            null,
+            optionalPreparationDeadlineAt,
+            "vision_runtime",
+          ),
         ]);
         const builtInTools = [
           ...DURABLE_BASE_BUILT_IN_TOOLS,
@@ -1376,8 +1664,10 @@ export class AgentApiController {
           runtimeRequest: { ...runtimeRequest, budgetReservationRequired },
           groundingContext: groundingContext as unknown as JsonValue,
         });
+        logTurnAdmission("admitted", admitted.runId, Date.now() - admissionStartedAt);
         return { turnId: admitted.runId, sessionId };
       } catch (error) {
+        logTurnAdmission("failed", null, Date.now() - admissionStartedAt, error);
         await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
         throw error;
       }
@@ -1769,10 +2059,21 @@ export class AgentApiController {
   }
 
   @Post("/sessions/:sessionId/cancel")
-  async cancelTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+  async cancelTurn(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
     await this.ownedSession(httpRequest, sessionId);
+    const request = parseBody(CancelTurnRequestSchema, body ?? {});
     if (this.durableTurns.enabled) {
-      return { ok: await this.durableTurns.cancel(tenantIdFromRequest(httpRequest), sessionId) };
+      return {
+        ok: await this.durableTurns.cancel(
+          tenantIdFromRequest(httpRequest),
+          sessionId,
+          request.operationId ? `model_${request.operationId}` : undefined,
+        ),
+      };
     }
     const turn = this.sessionHost.turnState(sessionId);
     const ok = await this.sessionHost.cancel(sessionId);
@@ -2226,6 +2527,27 @@ function modelGovernanceMessage(reason: string): string {
   if (reason === "blocked_by_department_rule") return "The requested model is blocked for your department.";
   if (reason === "blocked_by_user_rule") return "The requested model is blocked for your account.";
   return "The requested model is not allowed by organization policy.";
+}
+
+function unavailableAdmissionGroundingContext(input: {
+  request: string;
+  taskTitle?: string | undefined;
+}): JsonValue {
+  const query = [input.request, input.taskTitle]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join("\n");
+  return {
+    personalMemory: [],
+    projectFacts: [],
+    citations: [],
+    retrieval: {
+      snapshotId: null,
+      queryHash: createHash("sha256").update(query).digest("hex"),
+      tokenBudget: 0,
+      tokensSelected: 0,
+      degradedReason: "context_timeout",
+    },
+  };
 }
 
 function contextThresholdState(percentUsed: number | null): "unknown" | "normal" | "warning" | "critical" {

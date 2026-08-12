@@ -66,6 +66,7 @@ export interface PersonalMemoryProvider {
   search(input: PersonalMemoryIdentity & {
     query: string;
     limit: number;
+    signal?: AbortSignal;
   }): Promise<MemoryItem[]>;
   update(input: PersonalMemoryIdentity & {
     memoryId: string;
@@ -213,7 +214,7 @@ export class SelfHostedMem0PersonalMemoryProvider implements PersonalMemoryProvi
     return response ? memoryItemFromRecord(response, identity) : null;
   }
 
-  async search(input: PersonalMemoryIdentity & { query: string; limit: number }): Promise<MemoryItem[]> {
+  async search(input: PersonalMemoryIdentity & { query: string; limit: number; signal?: AbortSignal }): Promise<MemoryItem[]> {
     const response = await this.request<Mem0ListResponse>("v1/search", {
       method: "POST",
       body: JSON.stringify({
@@ -222,6 +223,7 @@ export class SelfHostedMem0PersonalMemoryProvider implements PersonalMemoryProvi
         query: input.query,
         limit: input.limit,
       }),
+      ...(input.signal ? { signal: input.signal } : {}),
     }, true);
     return response.results.map((record) => memoryItemFromRecord(record, input));
   }
@@ -310,6 +312,11 @@ export class SelfHostedMem0PersonalMemoryProvider implements PersonalMemoryProvi
     let lastError: unknown;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
+        if (init.signal?.aborted) throw personalMemoryAbortError(init.signal);
+        const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
+        const signal = init.signal
+          ? AbortSignal.any([init.signal, timeoutSignal])
+          : timeoutSignal;
         const response = await this.#fetch(new URL(path, this.#baseUrl), {
           ...init,
           headers: {
@@ -318,7 +325,7 @@ export class SelfHostedMem0PersonalMemoryProvider implements PersonalMemoryProvi
             ...(init.body ? { "Content-Type": "application/json" } : {}),
             ...init.headers,
           },
-          signal: AbortSignal.timeout(this.#timeoutMs),
+          signal,
         });
         if (response.status === 404 && notFoundIsNull) return null as T;
         if (!response.ok) {
@@ -335,6 +342,7 @@ export class SelfHostedMem0PersonalMemoryProvider implements PersonalMemoryProvi
         }
         return await response.json() as T;
       } catch (error) {
+        if (init.signal?.aborted) throw personalMemoryAbortError(init.signal);
         lastError = error;
         const retryable = !(error instanceof PersonalMemoryHttpError) || error.retryable;
         if (!retryable || attempt + 1 >= attempts) {
@@ -349,6 +357,15 @@ export class SelfHostedMem0PersonalMemoryProvider implements PersonalMemoryProvi
     }
     throw lastError;
   }
+}
+
+function personalMemoryAbortError(signal: AbortSignal): PersonalMemoryHttpError {
+  const reason = signal.reason instanceof Error ? signal.reason.message : "request cancelled";
+  return new PersonalMemoryHttpError(
+    `Self-hosted Mem0 request cancelled: ${reason}`,
+    null,
+    false,
+  );
 }
 
 export function createPersonalMemoryProviderFromEnv(

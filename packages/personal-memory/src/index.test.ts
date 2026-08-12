@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  PersonalMemoryHttpError,
   SelfHostedMem0PersonalMemoryProvider,
   createPersonalMemoryProviderFromEnv,
   personalMemoryScopeId,
@@ -102,6 +103,35 @@ describe("self-hosted personal memory adapter", () => {
     expect(result.replayed).toBe(true);
     expect(result.items).toHaveLength(1);
     expect(personalMemoryScopeId({ tenantId, userId })).toBe(`berry:${tenantId}:${userId}`);
+  });
+
+  it("aborts an in-flight search without retrying it", async () => {
+    let attempts = 0;
+    const provider = providerWith(async (_input, init) => {
+      attempts += 1;
+      const signal = init?.signal;
+      if (!signal) throw new Error("Expected a request abort signal");
+      return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    });
+    const controller = new AbortController();
+    const pending = provider.search({
+      tenantId,
+      userId,
+      query: "response preferences",
+      limit: 10,
+      signal: controller.signal,
+    });
+
+    controller.abort(new Error("turn cancelled"));
+
+    const error = await pending.catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(PersonalMemoryHttpError);
+    expect(error).toMatchObject({ retryable: false, status: null });
+    expect(attempts).toBe(1);
   });
 });
 

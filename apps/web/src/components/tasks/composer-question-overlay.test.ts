@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeQuestionDraft, questionAnswerTranscript, questionInteractionLocked, questionToolAnswer, stableQuestionAnswerMessageId, updateCustomAnswerDraft } from "./composer-question-overlay.tsx";
+import { COMPOSER_SEND_ARROW_SIZE, COMPOSER_SEND_BUTTON_CLASS, normalizeQuestionDraft, questionAnswerTranscript, questionFileDropPolicy, questionInteractionLocked, questionToolAnswer, stableQuestionAnswerMessageId, strictQuestionAnswerAttachment, updateCustomAnswerDraft } from "./composer-question-overlay.tsx";
 
 describe("question answer summaries", () => {
   const answers = [
@@ -70,5 +70,31 @@ describe("question answer summaries", () => {
     expect(questionInteractionLocked(false, true)).toBe(true);
     expect(questionInteractionLocked(true, false)).toBe(true);
     expect(questionInteractionLocked(false, false)).toBe(false);
+  });
+
+  it("suppresses the browser file-drop default while question input is locked", () => {
+    expect(questionFileDropPolicy(["Files"], true, true)).toEqual({
+      suppressBrowserDefault: true,
+      acceptFiles: false,
+    });
+    expect(questionFileDropPolicy(["text/plain"], false, true)).toEqual({
+      suppressBrowserDefault: false,
+      acceptFiles: false,
+    });
+  });
+
+  it("shares the composer's exact send-arrow treatment", () => {
+    expect(COMPOSER_SEND_BUTTON_CLASS).toBe("berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45");
+    expect(COMPOSER_SEND_ARROW_SIZE).toBe(18);
+  });
+
+  it("sends only fields accepted by the strict question-answer API schema", () => {
+    expect(strictQuestionAnswerAttachment({ id: "file-1", name: "brief.docx", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 42 })).toEqual({
+      fileId: "file-1",
+      name: "brief.docx",
+      mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      size: 42,
+      sourceKind: "object-storage",
+    });
   });
 });

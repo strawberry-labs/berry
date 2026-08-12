@@ -109,6 +109,16 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     return this.base.stageAssociatedInputFiles?.(snapshot, fileIds) ?? Promise.resolve([]);
   }
 
+  readSkillPackage(snapshot: DurableTurnSnapshot, path: string) {
+    if (!this.base.readSkillPackage) throw new Error("Skill package workspace access is unavailable");
+    return this.base.readSkillPackage(snapshot, path);
+  }
+
+  stageSkillPackage(snapshot: DurableTurnSnapshot, packageId: string, files: Parameters<NonNullable<DurableTurnToolExecutor["stageSkillPackage"]>>[2]) {
+    if (!this.base.stageSkillPackage) throw new Error("Skill package workspace access is unavailable");
+    return this.base.stageSkillPackage(snapshot, packageId, files);
+  }
+
   policy(
     snapshot: DurableTurnSnapshot,
     toolName: string,

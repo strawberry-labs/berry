@@ -8,6 +8,7 @@ berry_impact_reset() {
   berry_configure_roles=false
   berry_compose_changed=false
   berry_caddy_changed=false
+  berry_prometheus_changed=false
 }
 
 berry_add_image_service() {
@@ -29,11 +30,19 @@ berry_mark_service() {
   berry_add_restart_service "$1"
 }
 
+berry_mark_worker_pools() {
+  # Both process roles use the same image, but every worker code change must
+  # recreate both services without building the image twice.
+  berry_add_image_service worker
+  berry_add_restart_service worker
+  berry_add_restart_service worker-foreground
+}
+
 berry_impact_add_file() {
   case "$1" in
     package.json|pnpm-lock.yaml|pnpm-workspace.yaml|turbo.json|tsconfig.base.json|Dockerfile|.dockerignore)
       berry_mark_service api
-      berry_mark_service worker
+      berry_mark_worker_pools
       berry_mark_service mem0
       berry_mark_service web
       ;;
@@ -63,33 +72,41 @@ berry_impact_add_file() {
       ;;
     packages/desktop-db/*|packages/local-agent/*|packages/execpolicy/*|packages/harness/*|packages/router-client/*|packages/sandbox-contract/*)
       berry_mark_service api
-      berry_mark_service worker
+      berry_mark_worker_pools
       ;;
     apps/worker/*)
-      berry_mark_service worker
+      berry_mark_worker_pools
       ;;
     apps/mem0/*)
       berry_mark_service mem0
       ;;
     packages/personal-memory/*)
       berry_mark_service api
-      berry_mark_service worker
+      berry_mark_worker_pools
       berry_mark_service mem0
       ;;
     packages/shared/*)
       berry_mark_service api
-      berry_mark_service worker
+      berry_mark_worker_pools
       berry_mark_service mem0
       berry_mark_service web
       ;;
     deploy/compose.yaml|deploy/compose.aws.yaml)
       berry_mark_service api
-      berry_mark_service worker
+      berry_mark_worker_pools
       berry_mark_service mem0
       berry_mark_service web
+      berry_add_restart_service alertmanager
+      berry_add_restart_service prometheus
       berry_run_migrations=true
       berry_configure_roles=true
       berry_compose_changed=true
+      berry_prometheus_changed=true
+      ;;
+    deploy/prometheus/*|deploy/production-runtime-alerts.yaml)
+      berry_add_restart_service alertmanager
+      berry_add_restart_service prometheus
+      berry_prometheus_changed=true
       ;;
     deploy/Caddyfile|deploy/Caddyfile.storage|deploy/Caddyfile.native)
       berry_caddy_changed=true
@@ -103,7 +120,7 @@ berry_impact_add_file() {
       # service impact is classified, rebuild every production application so
       # a deploy can never record a commit while serving stale code.
       berry_mark_service api
-      berry_mark_service worker
+      berry_mark_worker_pools
       berry_mark_service mem0
       berry_mark_service web
       ;;

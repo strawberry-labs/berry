@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, initialCloudContent, isInterruptedTurnAvailable, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, durableTurnPhase, existingChatTurnModelOverride, hydratedExistingChatModel, initialCloudContent, isInterruptedTurnAvailable, newChatModelOverride, preferredNewChatModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
@@ -34,6 +34,90 @@ describe("cloud shell bootstrap", () => {
   it("does not load organization administration data for ordinary members", () => {
     expect(shouldRefreshAdministration(["org:read", "departments:read", "sso:read"])).toBe(false);
     expect(shouldRefreshAdministration(["org:read", "org:admin"])).toBe(true);
+  });
+
+  it("prefers a valid browser model for new chats and otherwise uses the organization default", () => {
+    const organization = { providerId: "router", model: "default-model" };
+    expect(preferredNewChatModel(
+      { providerId: "router", model: "browser-model" },
+      organization,
+      [{ id: "default-model" }, { id: "browser-model" }],
+    )).toEqual({ providerId: "router", model: "browser-model", source: "user" });
+    expect(preferredNewChatModel(
+      { providerId: "router", model: "retired-model" },
+      organization,
+      [{ id: "default-model" }],
+    )).toEqual({ ...organization, source: "organization" });
+    expect(preferredNewChatModel(
+      { providerId: "retired-provider", model: "default-model" },
+      organization,
+      [{ id: "default-model" }],
+    )).toEqual({ providerId: "retired-provider", model: "default-model", source: "user" });
+    expect(preferredNewChatModel(
+      { providerId: "router", model: "browser-model" },
+      organization,
+      [],
+    )).toEqual({ providerId: "router", model: "browser-model", source: "user" });
+  });
+
+  it("never leaks a cached new-chat model into an existing chat while its session snapshot loads", async () => {
+    let finishLoading!: (selection: { providerId: string; model: string }) => void;
+    const delayedSessionModel = new Promise<{ providerId: string; model: string }>((resolve) => {
+      finishLoading = resolve;
+    });
+
+    expect(existingChatTurnModelOverride(null)).toEqual({});
+    const hydrated = hydratedExistingChatModel(delayedSessionModel, () => null);
+    finishLoading({ providerId: "session-provider", model: "session-model" });
+    await expect(hydrated).resolves.toEqual({
+      providerId: "session-provider",
+      model: "session-model",
+      source: "session",
+    });
+    expect(existingChatTurnModelOverride(null)).toEqual({});
+  });
+
+  it("keeps an explicit in-session model change when delayed hydration completes", async () => {
+    let explicit: { providerId: string; model: string } | null = null;
+    let finishLoading!: (selection: { providerId: string; model: string }) => void;
+    const delayedSessionModel = new Promise<{ providerId: string; model: string }>((resolve) => {
+      finishLoading = resolve;
+    });
+    const hydrated = hydratedExistingChatModel(delayedSessionModel, () => explicit);
+    explicit = { providerId: "failover-provider", model: "selected-model" };
+    finishLoading({ providerId: "original-provider", model: "original-model" });
+
+    await expect(hydrated).resolves.toEqual({
+      ...explicit,
+      source: "user",
+    });
+    expect(existingChatTurnModelOverride(explicit)).toEqual({
+      provider: { id: "failover-provider" },
+      model: "selected-model",
+    });
+  });
+
+  it("sends only a browser override when creating a chat", () => {
+    expect(newChatModelOverride("user", "router", "browser-model")).toEqual({
+      modelProviderId: "router",
+      model: "browser-model",
+    });
+    expect(newChatModelOverride("organization", "router", "default-model")).toEqual({});
+    expect(newChatModelOverride("session", "router", "previous-task-model")).toEqual({});
+  });
+
+  it("aborts and scopes interruption cancellation to a pending admission", () => {
+    const controller = new AbortController();
+    const pending = {
+      operationId: "00000000-0000-7000-8000-000000000001",
+      controller,
+      cancelRequested: false,
+    };
+
+    expect(prepareTurnCancellation(pending)).toEqual({ operationId: pending.operationId });
+    expect(pending.cancelRequested).toBe(true);
+    expect(controller.signal.aborted).toBe(true);
+    expect(prepareTurnCancellation(undefined)).toEqual({});
   });
 
   it("checks durable state after network and retryable gateway failures", () => {
@@ -188,6 +272,22 @@ describe("cloud shell bootstrap", () => {
       waitingReason: null,
       nextAction: null,
     });
+  });
+
+  it("labels each durable phase without treating total elapsed time as assignment latency", () => {
+    const active = (runState: "queued" | "assembling_context" | "calling_model" | "executing_tool", nextAction: string | null = null) => ({
+      active: true,
+      turnId: "turn_1",
+      bufferedEvents: [],
+      replayOnly: false,
+      runState,
+      nextAction,
+    });
+    expect(durableTurnPhase(active("queued", "Submitting the turn"))).toBe("Submitting");
+    expect(durableTurnPhase(active("assembling_context"))).toBe("Preparing context");
+    expect(durableTurnPhase(active("queued"))).toBe("Waiting for worker");
+    expect(durableTurnPhase(active("calling_model"))).toBe("Calling model");
+    expect(durableTurnPhase(active("executing_tool"))).toBe("Running tool");
   });
 
   it("hydrates the elapsed timer from the durable run start", () => {

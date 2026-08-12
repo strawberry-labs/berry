@@ -1,0 +1,43 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    deployment: berry-compose
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - scheme: http
+      static_configs:
+        - targets: [alertmanager:9093]
+
+scrape_configs:
+  - job_name: berry-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: [api:3000]
+
+  - job_name: berry-mem0
+    metrics_path: /metrics
+    static_configs:
+      - targets: [mem0:8010]
+
+  # Compose publishes an A record for each scaled container. DNS discovery is
+  # required here: a static service target would observe only one replica.
+  - job_name: berry-worker-foreground
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: [worker-foreground]
+        type: A
+        port: 3010
+        refresh_interval: 15s
+
+  - job_name: berry-worker-background
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: [worker]
+        type: A
+        port: 3010
+        refresh_interval: 15s

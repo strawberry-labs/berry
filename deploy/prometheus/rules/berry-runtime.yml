@@ -1,0 +1,192 @@
+groups:
+  - name: berry.targets
+    rules:
+      - alert: BerryMetricsTargetDown
+        expr: up{job=~"berry-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Berry metrics target is down"
+          description: "Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }}."
+      - alert: BerryForegroundMetricsTargetsMissing
+        expr: absent(up{job="berry-worker-foreground"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Berry foreground worker metrics targets were discovered"
+      - alert: BerryBackgroundMetricsTargetMissing
+        expr: absent(up{job="berry-worker-background"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Berry background worker metrics target was discovered"
+      - alert: BerryForegroundReplicaCountBelowTarget
+        expr: (count(up{job="berry-worker-foreground"} == 1) or vector(0)) < 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fewer than five Berry foreground workers are being scraped"
+
+  - name: berry.admission
+    rules:
+      - alert: BerryTurnAdmissionP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(berry_api_turn_admission_duration_seconds_bucket{outcome=~"admitted|replayed"}[5m]))) > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Berry durable turn admission p95 exceeds one second"
+      - alert: BerryTurnAdmissionFailures
+        expr: sum(rate(berry_api_turn_admissions_total{outcome="failed"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Berry turn admission failures exceed three per minute"
+      - alert: BerryCancellationSignalFailure
+        expr: sum(rate(berry_api_turn_cancellation_signals_total{result=~"failed|unconfigured"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Immediate provider cancellation signaling is unavailable"
+      - alert: BerryCancellationNoActiveRunRateHigh
+        expr: sum(rate(berry_api_turn_cancellations_total{result="no_active_run"}[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cancellation terminal/no-active races exceed 30 per minute"
+
+  - name: berry.worker-capacity
+    rules:
+      - alert: BerryForegroundCapacityBelowTarget
+        expr: (sum(berry_worker_process_capacity_slots{role="foreground"}) or vector(0)) < 100
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Berry foreground capacity is below 100 turn slots"
+      - alert: BerryForegroundWorkerNotRunning
+        expr: min_over_time(berry_worker_process_running{role="foreground"}[2m]) < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A Berry foreground worker process is not running"
+      - alert: BerryForegroundQueueOldestTurnHigh
+        expr: max(berry_worker_queue_oldest_waiting_seconds{queue="foreground"}) > 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The oldest foreground turn has waited longer than two seconds"
+      - alert: BerryForegroundQueueBacklog
+        expr: max(berry_worker_queue_jobs{queue="foreground",state="waiting"}) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 100 foreground turns are waiting"
+      - alert: BerryForegroundCapacitySaturated
+        expr: sum(berry_worker_process_active_jobs{role="foreground"}) / clamp_min(sum(berry_worker_process_capacity_slots{role="foreground"}), 1) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Berry foreground capacity has remained above 90 percent"
+      - alert: BerryBackgroundFailedJobsHigh
+        expr: max(berry_worker_queue_jobs{queue="background",state="failed"}) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Berry background failed-job set exceeds 100"
+      - alert: BerryLegacyQueueDrainStalled
+        expr: max(berry_worker_queue_oldest_waiting_seconds{queue="legacy"}) > 900 and max(berry_worker_queue_jobs{queue="legacy",state="waiting"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The legacy berry-cloud queue has not drained"
+          description: "At least one legacy job has waited longer than 15 minutes; keep the drain worker enabled and follow the legacy queue runbook."
+      - alert: BerryOutboxDispatchP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(berry_worker_outbox_dispatch_duration_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Berry runtime outbox dispatch p95 exceeds one second"
+
+  - name: berry.provider
+    rules:
+      - alert: BerryProviderErrorRatioHigh
+        expr: sum by (model) (rate(berry_worker_provider_requests_total{outcome="failure"}[10m])) / clamp_min(sum by (model) (rate(berry_worker_provider_requests_total[10m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider errors exceed 10 percent for {{ $labels.model }}"
+      - alert: BerryProviderLatencyP95High
+        expr: histogram_quantile(0.95, sum by (model, le) (rate(berry_worker_provider_request_duration_seconds_bucket{outcome="success"}[10m]))) > 120
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider latency p95 exceeds two minutes for {{ $labels.model }}"
+      - alert: BerryProviderBadRequest
+        expr: sum by (model) (increase(berry_worker_provider_requests_total{outcome="failure",status="400"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider returned HTTP 400 for {{ $labels.model }}"
+
+  - name: berry.mem0
+    rules:
+      - alert: BerryPersonalMemoryCallerTimeoutRateHigh
+        expr: sum(rate(berry_api_personal_memory_recalls_total{outcome="timeout"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Berry callers observe more than three personal-memory timeouts per minute"
+      - alert: BerryPersonalMemoryCallerUnavailableRateHigh
+        expr: sum(rate(berry_api_personal_memory_recalls_total{outcome="unavailable"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Berry callers observe personal memory as unavailable more than three times per minute"
+      - alert: BerryMem0TimeoutRateHigh
+        expr: sum(rate(berry_mem0_request_timeouts_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mem0 is timing out more than three times per minute"
+      - alert: BerryMem0ErrorRatioHigh
+        expr: sum(rate(berry_mem0_request_errors_total[5m])) / clamp_min(sum(rate(berry_mem0_requests_total[5m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 10 percent of Mem0 requests are failing"
+      - alert: BerryMem0PostgresPoolError
+        expr: sum(increase(berry_mem0_postgres_pool_errors_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Mem0 PostgreSQL pool discarded an errored connection"
+      - alert: BerryMem0Restarted
+        expr: time() - berry_mem0_process_start_time_seconds < 900
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Berry Mem0 process restarted in the last 15 minutes"

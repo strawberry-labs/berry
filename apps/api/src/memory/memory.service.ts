@@ -15,6 +15,7 @@ import {
 } from "@berry/shared";
 import { createHash } from "node:crypto";
 import { CloudDatabaseService } from "../db/cloud-database.service.js";
+import { apiRuntimeMetrics } from "../runtime/runtime-metrics.js";
 import {
   SqlMemoryRepository,
   type MemoryIdentity,
@@ -319,6 +320,7 @@ export class MemoryService {
     query: string;
     personalTokenBudget?: number;
     projectTokenBudget?: number;
+    signal?: AbortSignal;
   }): Promise<MemoryRecall> {
     if (!this.#config.memoryEnabled) {
       return { personal: [], project: [], personalTokens: 0, projectTokens: 0, personalDegraded: false };
@@ -341,6 +343,7 @@ export class MemoryService {
             userId: input.userId,
             query: input.query,
             limit: 40,
+            ...(input.signal ? { signal: input.signal } : {}),
           }))
         : Promise.resolve({ items: [], degraded: false }),
     ]);
@@ -456,9 +459,16 @@ export class MemoryService {
   private async recallPersonal(
     operation: () => Promise<MemoryItem[]>,
   ): Promise<{ items: MemoryItem[]; degraded: boolean }> {
+    const startedAt = Date.now();
     try {
-      return { items: await operation(), degraded: false };
+      const items = await operation();
+      apiRuntimeMetrics.personalMemoryRecall("success", Date.now() - startedAt);
+      return { items, degraded: false };
     } catch (error) {
+      apiRuntimeMetrics.personalMemoryRecall(
+        isPersonalMemoryTimeout(error) ? "timeout" : "unavailable",
+        Date.now() - startedAt,
+      );
       if (error instanceof PersonalMemoryHttpError) {
         return { items: [], degraded: true };
       }
@@ -474,6 +484,12 @@ export class MemoryService {
       throw error;
     }
   }
+}
+
+function isPersonalMemoryTimeout(error: unknown): boolean {
+  if (error instanceof PersonalMemoryHttpError && error.status === 408) return true;
+  if (!(error instanceof Error)) return false;
+  return /(?:timed?\s*out|timeout|deadline)/i.test(`${error.name} ${error.message}`);
 }
 
 export function createSqlMemoryRepository(database: CloudDatabaseService): SqlMemoryRepository {

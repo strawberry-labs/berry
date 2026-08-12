@@ -13,6 +13,107 @@ const workspaceId = "00000000-0000-7000-8000-000000000008";
 const operationFingerprint = "a".repeat(64);
 
 describe("DurableTurnService", () => {
+  it("rejects admission after the matching pending submission was cancelled", async () => {
+    const executions: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { executions.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_admission_intents")) {
+          return [{
+            session_id: sessionId,
+            operation_fingerprint: operationFingerprint,
+            state: "cancelled",
+            run_id: null,
+          }] as T[];
+        }
+        throw new Error(`Admission continued after cancellation: ${sql}`);
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "model_cancelled_before_admission",
+      operationFingerprint,
+      budgetReservationRequired: false,
+      input: "Do not run this",
+      runtimeRequest: {},
+      groundingContext: {},
+    })).rejects.toMatchObject({ status: 409 });
+
+    expect(executions).not.toContainEqual(expect.stringContaining("INSERT INTO turn_runs"));
+    expect(executions).not.toContainEqual(expect.stringContaining("runtime_outbox"));
+  });
+
+  it("records and idempotently accepts cancellation before a run exists", async () => {
+    const executions: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { executions.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_admission_intents")) {
+          return [{
+            session_id: sessionId,
+            operation_fingerprint: null,
+            state: "cancelled",
+            run_id: null,
+          }] as T[];
+        }
+        if (sql.includes("FROM turn_runs")) return [] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.cancel(tenantId, sessionId, "model_pending_operation")).resolves.toBe(true);
+
+    expect(executions).toContainEqual(expect.stringContaining("INSERT INTO turn_admission_intents"));
+    expect(executions).not.toContainEqual(expect.stringContaining("UPDATE turn_runs"));
+  });
+
+  it("does not let a delayed operation-scoped cancel stop a newer run in the same session", async () => {
+    const requestIdA = "model_operation_a";
+    const newerRunId = "00000000-0000-7000-8000-000000000009";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    let activeSelector: { sql: string; params: readonly unknown[] } | undefined;
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string, params = []) => {
+        if (sql.includes("FROM turn_admission_intents")) {
+          return [{
+            session_id: sessionId,
+            operation_fingerprint: operationFingerprint,
+            state: "admitted",
+            run_id: runId,
+          }] as T[];
+        }
+        if (sql.includes("SELECT id,task_id,session_id,request_message_id")) {
+          activeSelector = { sql, params };
+          // Simulate operation B being active. Before the request_id predicate
+          // existed this row was selected and the delayed cancel for A stopped B.
+          return sql.includes("($3::text IS NULL OR request_id=$3)")
+            ? [] as T[]
+            : [{ id: newerRunId, task_id: taskId, session_id: sessionId, request_message_id: userId }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.cancel(tenantId, sessionId, requestIdA)).resolves.toBe(true);
+
+    expect(activeSelector?.sql).toContain("($3::text IS NULL OR request_id=$3)");
+    expect(activeSelector?.params).toEqual([tenantId, sessionId, requestIdA]);
+    expect(executions.some(({ sql }) => sql.includes("UPDATE turn_runs") && sql.includes("state='cancelled'")))
+      .toBe(false);
+  });
+
   it("returns the original run for a retried admission without writing another run", async () => {
     const executions: string[] = [];
     const executor: SqlExecutor = {

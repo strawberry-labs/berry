@@ -84,6 +84,7 @@ const emptyDraft = {
   sourceUrl: "",
   source: "upload" as "text" | "upload" | "git",
   packageFiles: [] as string[],
+  resourceFiles: [] as Array<{ path: string; contentBase64: string; mode?: number | undefined }>,
   fileName: "",
 };
 
@@ -99,6 +100,19 @@ export async function loadPersonalSkillResource(
     }),
   ]);
   return { personal, effective };
+}
+
+export async function loadSkillPackageForDownload(
+  client: Pick<BerryApiClient, "personalSkillPackage" | "organizationSkillPackage"> | null,
+  tenantId: string,
+  skill: Pick<SkillCatalogRow, "capabilityId" | "content" | "personal" | "provenance">,
+) {
+  if (!skill.content) throw new Error("This skill has no downloadable content");
+  if (client && skill.personal) return client.personalSkillPackage(skill.personal.id);
+  if (client && skill.provenance === "organization") {
+    return client.organizationSkillPackage(tenantId, skill.capabilityId);
+  }
+  return { content: skill.content, resourceFiles: [] };
 }
 
 export function PersonalSkillsScreen({
@@ -143,6 +157,7 @@ export function PersonalSkillsScreen({
         source: draft.source,
         sourceUrl: draft.sourceUrl || null,
         packageFiles: draft.packageFiles,
+        resourceFiles: draft.resourceFiles,
         enabled: true,
       });
       setCreating(false);
@@ -188,6 +203,7 @@ export function PersonalSkillsScreen({
       setDraft({
         content: imported.content,
         packageFiles: imported.packageFiles,
+        resourceFiles: imported.resourceFiles,
         fileName: imported.fileName,
         source: "upload",
         sourceUrl: "",
@@ -394,6 +410,8 @@ export function PersonalSkillsScreen({
         <SkillDetailsDialog
           key={selected.key}
           skill={selected}
+          client={client}
+          tenantId={tenantId}
           hasClient={Boolean(client)}
           onClose={() => setSelected(null)}
           onToggle={(enabled) => toggle(selected, enabled)}
@@ -417,6 +435,8 @@ export function skillMarkdownBody(content: string): string {
 
 function SkillDetailsDialog({
   skill,
+  client,
+  tenantId,
   hasClient,
   onClose,
   onToggle,
@@ -424,6 +444,8 @@ function SkillDetailsDialog({
   onUninstall,
 }: {
   skill: SkillCatalogRow;
+  client: BerryApiClient | null;
+  tenantId: string;
   hasClient: boolean;
   onClose: () => void;
   onToggle: (enabled: boolean) => Promise<void>;
@@ -472,7 +494,8 @@ function SkillDetailsDialog({
     setActionError("");
     setBusy("download");
     try {
-      const exported = await createBrowserSkillExport(skill.name, skill.content);
+      const skillPackage = await loadSkillPackageForDownload(client, tenantId, skill);
+      const exported = await createBrowserSkillExport(skill.name, skillPackage.content, skillPackage.resourceFiles);
       const url = URL.createObjectURL(exported.blob);
       try {
         const anchor = document.createElement("a");

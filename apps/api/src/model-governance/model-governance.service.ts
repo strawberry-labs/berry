@@ -145,7 +145,7 @@ export class ModelGovernanceService {
       : runtimeModels[0]!.id;
     for (const modelDefault of defaults) {
       if (modelDefault.providerId !== provider.id || modelDefault.model !== "berry/auto") continue;
-      await this.repository.upsertDefault({
+      await this.upsertDefault({
         tenantId,
         mode: modelDefault.mode,
         providerId: provider.id,
@@ -200,7 +200,12 @@ export class ModelGovernanceService {
   }
 
   async upsertDefault(input: UpsertModelDefaultInput): Promise<OrgModelDefault> {
-    return this.repository.upsertDefault(input);
+    return this.repository.upsertDefault({
+      ...input,
+      // Chat defaults seed new conversations. They are deliberately not a
+      // policy ceiling: users may retain a browser failover choice.
+      enforce: input.mode === "chat" ? false : input.enforce,
+    });
   }
 
   async listAuxiliaryDefaults(tenantId: string): Promise<OrgAuxiliaryModelDefault[]> {
@@ -266,7 +271,8 @@ export class ModelGovernanceService {
     const model = requestedModel ?? modeDefault?.model ?? "";
     const policy = policies.find((entry) => entry.providerId === providerId && entry.model === model) ?? null;
     const enforcedAllowList = policies.some((entry) => entry.enforce);
-    const enforcedDefaultMismatch = modeDefault?.enforce === true
+    const enforcedDefaultMismatch = input.mode !== "chat"
+      && modeDefault?.enforce === true
       && requestedProviderId !== null
       && requestedModel !== null
       && (requestedProviderId !== modeDefault.providerId || requestedModel !== modeDefault.model);
@@ -312,7 +318,9 @@ export class ModelGovernanceService {
       providerId,
       model,
       true,
-      policy?.enforce === true || modeDefault?.enforce === true || accessRule !== null,
+      policy?.enforce === true
+        || (input.mode !== "chat" && modeDefault?.enforce === true)
+        || accessRule !== null,
       accessRule ? `allowed_by_${accessRule.scopeType}_rule` : policy ? "allowed_by_policy" : "allowed_no_enforced_policy",
       policy,
       modeDefault,

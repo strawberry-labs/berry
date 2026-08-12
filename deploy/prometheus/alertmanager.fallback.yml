@@ -1,0 +1,15 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: notifications-not-configured
+  group_by: [alertname, severity, deployment]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+# This receiver keeps Alertmanager healthy and its UI useful before the
+# deployment-specific SNS ARN is installed. Production is not considered
+# notification-ready until BERRY_ALERT_SNS_TOPIC_ARN is set.
+receivers:
+  - name: notifications-not-configured

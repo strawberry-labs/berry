@@ -63,4 +63,58 @@ describe("OrganizationCapabilitiesService", () => {
     expect(updated.description).toBe(created.description);
     expect((await service.effective(tenantId, "user_1")).skills[0]?.content).toContain("Write concise notes");
   });
+
+  it("keeps uploaded organization resources in a materializable package", async () => {
+    const service = new OrganizationCapabilitiesService(new PersonalCapabilitiesService());
+    const tenantId = SELF_HOST_TENANT_ID;
+    const content = "---\nname: branded-memo\ndescription: Create a memo from the retained template\n---\nUse assets/templates/memo.docx.";
+    const resourceFiles = [{ path: "assets/templates/memo.docx", contentBase64: Buffer.from("docx-bytes").toString("base64") }];
+    const saved = await service.upsert(tenantId, {
+      kind: "skill",
+      capabilityId: "branded-memo",
+      name: "Branded memo",
+      assignment: "default-on",
+      config: { content },
+      resourceFiles,
+    });
+
+    expect(saved).toMatchObject({ resources: ["assets/templates/memo.docx"], packageBytes: expect.any(Number) });
+    await expect(service.skillPackage(tenantId, saved.id)).resolves.toEqual({ content, resourceFiles });
+    await expect(service.skillPackage(tenantId, saved.capabilityId)).resolves.toEqual({ content, resourceFiles });
+    await expect(service.effective(tenantId, "user_1")).resolves.toMatchObject({
+      skills: [{
+        filePath: `/organization-skills/${saved.id}/SKILL.md`,
+        resources: [`/organization-skills/${saved.id}/assets/templates/memo.docx`],
+      }],
+    });
+  });
+
+  it("preserves organization resources when a content update omits resourceFiles", async () => {
+    const service = new OrganizationCapabilitiesService(new PersonalCapabilitiesService());
+    const tenantId = SELF_HOST_TENANT_ID;
+    const resourceFiles = [{ path: "scripts/render.js", contentBase64: Buffer.from("render()").toString("base64"), mode: 0o755 }];
+    await service.upsert(tenantId, {
+      kind: "skill",
+      capabilityId: "memo-renderer",
+      name: "Memo renderer",
+      assignment: "default-on",
+      config: { content: "---\nname: memo-renderer\ndescription: Render memos\n---\nRun scripts/render.js." },
+      resourceFiles,
+    });
+
+    const updatedContent = "---\nname: memo-renderer\ndescription: Render concise memos\n---\nRun scripts/render.js with the new format.";
+    const updated = await service.upsert(tenantId, {
+      kind: "skill",
+      capabilityId: "memo-renderer",
+      name: "Memo renderer",
+      assignment: "required",
+      config: { content: updatedContent },
+    });
+
+    await expect(service.skillPackage(tenantId, updated.id)).resolves.toEqual({
+      content: updatedContent,
+      resourceFiles,
+    });
+    expect(updated.resources).toEqual(["scripts/render.js"]);
+  });
 });

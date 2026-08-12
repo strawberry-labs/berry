@@ -167,7 +167,14 @@ assertContains("deploy/.env.production.example", productionEnv, ["BERRY_DOMAIN=a
 assertContains("deploy/PRODUCTION.md", productionRunbook, ["ai.example.com", "pause/reconnect", "deploy/backup.sh", "bak-sandbox-ttl-300", "require IMDSv2", "metadata response hop limit to `2`", "EC2 role can access artifact S3"]);
 assertContains("deploy/up.sh", deploymentLauncher, ["BERRY_CONNECTOR_ENCRYPTION_KEY", "openssl base64 -d -A", 'connector_encryption_key_bytes" != "32"']);
 assertContains("deploy/server-deploy.sh", serverDeploy, ["max_sandbox_ttl_seconds=300", "Deployment automation will not replace the production environment file"]);
-assertContains("deploy/server-deploy.sh", serverDeploy, ["deployment-impact.sh", "compose build $berry_image_services", "berry_runtime_services=", "compose run --rm --no-deps minio-init", "--wait-timeout 120 $berry_runtime_services"]);
+assertContains("deploy/server-deploy.sh", serverDeploy, [
+  "deployment-impact.sh",
+  "compose build $berry_image_services",
+  "berry_runtime_services=",
+  "compose run --rm --no-deps minio-init",
+  'worker_scale_args="--scale worker=$background_worker_replicas --scale worker-foreground=$foreground_worker_replicas"',
+  "--wait-timeout 120 $worker_scale_args $berry_runtime_services",
+]);
 assertContains("deploy/deployment-impact.sh", deploymentImpact, ["packages/db/*", "berry_run_migrations=true", "deploy/compose.yaml"]);
 
 console.log("[compose] self-host deployment config OK");
