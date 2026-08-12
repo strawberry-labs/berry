@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { parseAgentSkillMarkdown } from "@berry/shared";
-import type { ChatContentPart } from "@berry/router-client";
+import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
 import { z } from "zod";
 import type { SqlExecutor } from "../sql-repositories.js";
 import type {
@@ -21,6 +21,10 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     private readonly base: DurableTurnToolExecutor,
     private readonly executor: SqlExecutor,
   ) {}
+
+  async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
+    return this.base.definitions?.(snapshot) ?? [];
+  }
 
   async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
     return this.base.modelContent?.(snapshot) ?? [];

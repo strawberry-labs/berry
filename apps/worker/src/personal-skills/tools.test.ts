@@ -3,6 +3,32 @@ import type { DurableTurnSnapshot, DurableTurnToolExecutor } from "../turn-runne
 import { DurablePersonalSkillToolExecutor } from "./tools.js";
 
 describe("DurablePersonalSkillToolExecutor", () => {
+  it("preserves inherited dynamic tool definitions", async () => {
+    const snapshot = {
+      tenantId: "00000000-0000-7000-8000-000000000001",
+      userId: "user_1",
+    } as DurableTurnSnapshot;
+    const definitions = [{
+      type: "function" as const,
+      function: {
+        name: "remember_memory",
+        description: "Remember a durable preference",
+        parameters: { type: "object" },
+      },
+    }];
+    const base: DurableTurnToolExecutor = {
+      definitions: vi.fn(async () => definitions),
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    };
+    const tools = new DurablePersonalSkillToolExecutor(base, {
+      execute: vi.fn(async () => undefined),
+      query: vi.fn(async () => []),
+    });
+
+    await expect(tools.definitions(snapshot)).resolves.toEqual(definitions);
+    expect(base.definitions).toHaveBeenCalledWith(snapshot);
+  });
+
   it("upserts an enabled skill for the durable turn's tenant and user without approval", async () => {
     const execute = vi.fn(async () => undefined);
     const query = vi.fn(async () => []);
