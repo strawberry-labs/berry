@@ -19,6 +19,8 @@ import { FilePlatformService } from "../files/file-platform.service.ts";
 import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissionReplay } from "../runtime/durable-turn.service.ts";
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
+import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
+import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
 import { durableAdmissionPreparationTimeoutMs, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
@@ -213,6 +215,56 @@ describe("AgentApiController", () => {
       }),
     }));
     expect(admit.mock.calls[0]?.[0].runtimeRequest).not.toHaveProperty("portableCheckpoint");
+  });
+
+  it("observes concurrent admission failures immediately and records the failed attempt", async () => {
+    const runtimeConfig = chatRuntimeConfig();
+    const resolveRuntime = runtimeConfig.resolve.bind(runtimeConfig);
+    vi.spyOn(runtimeConfig, "resolve").mockImplementation(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return resolveRuntime(...args);
+    });
+    const identityFailure = new Error("identity unavailable");
+    const identityRepository = new InMemoryEnterpriseIdentityRepository();
+    const getMembership = identityRepository.getMembership.bind(identityRepository);
+    let failMembershipLookup = false;
+    vi.spyOn(identityRepository, "getMembership").mockImplementation(async (...args) => {
+      if (failMembershipLookup) throw identityFailure;
+      return getMembership(...args);
+    });
+    const before = admissionMetricCount("failed", "unknown");
+    app = await createApp(fakeSessionHost(), {
+      identityRepository,
+      runtimeConfig,
+      durableTurns: {
+        enabled: true,
+        replayAdmission: async () => null,
+        admit: async (input) => ({ runId: "turn_not_admitted", sessionId: input.sessionId }),
+      },
+    });
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Failed admission" })
+      .expect(201);
+    failMembershipLookup = true;
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+
+    try {
+      const startRequest = request(app.getHttpServer())
+        .post(`/v1/sessions/${created.body.session.id}/turns`)
+        .set(authHeader())
+        .send({ input: "Fail during preparation", workspacePath: "/workspace" })
+        .then((response) => response);
+      await nextTick();
+      expect(unhandled).not.toHaveBeenCalled();
+      expect((await startRequest).status).toBe(500);
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+
+    expect(admissionMetricCount("failed", "unknown")).toBe(before + 1);
   });
 
   it("does not enqueue a provider call when pending admission is cancelled during preparation", async () => {
@@ -1628,6 +1680,7 @@ type CreateAppOptions = {
   taskStore?: CloudTaskStore | undefined;
   runtimeConfig?: CloudRuntimeConfigService | undefined;
   usageRepository?: UsageRepository | undefined;
+  identityRepository?: EnterpriseIdentityRepository | undefined;
   membershipActive?: boolean | undefined;
   durableTurns?: {
     enabled: boolean;
@@ -1654,6 +1707,7 @@ async function createApp(
       AgentApiModule.register({
       sessionHost: { useValue: sessionHost },
       auth: { useValue: fakeAuthRuntime(options.membershipActive ?? true) },
+      ...(options.identityRepository ? { identity: { repository: { useValue: options.identityRepository } } } : {}),
       ...(options.taskStore ? { taskStore: { useValue: options.taskStore } } : {}),
       ...(options.budget ? { budget: { service: { useValue: options.budget } } } : {}),
       ...(options.usageRepository ? { usage: { repository: { useValue: options.usageRepository } } } : {}),
@@ -1753,6 +1807,12 @@ function chatRuntimeEnv(): NodeJS.ProcessEnv {
 
 function nextTick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+function admissionMetricCount(outcome: string, status: string): number {
+  const prefix = `berry_api_turn_admissions_total{outcome="${outcome}",status="${status}"} `;
+  const line = apiRuntimeMetrics.render().split("\n").find((candidate) => candidate.startsWith(prefix));
+  return line ? Number(line.slice(prefix.length)) : 0;
 }
 
 function authHeader(token = "berry-test-session") {

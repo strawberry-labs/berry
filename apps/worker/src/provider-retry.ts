@@ -38,6 +38,13 @@ const CONNECTION_CODES = new Set([
   "UND_ERR_SOCKET",
 ]);
 
+export function isRetryableProviderStatus(status: number | undefined): boolean {
+  if (status === undefined) return true;
+  if (status === 408 || status === 429) return true;
+  if (status >= 500) return true;
+  return status < 400;
+}
+
 /**
  * Classify provider failures before handing them back to a durable queue.
  * Unknown failures remain retryable to preserve the existing recovery policy;
@@ -63,7 +70,7 @@ export function classifyProviderFailure(error: unknown): ProviderRetryClassifica
   if (status !== undefined && status >= 500) {
     return { retryable: true, category: "server", status, code, requestId };
   }
-  if (status !== undefined && status >= 400 && status < 500) {
+  if (status !== undefined && !isRetryableProviderStatus(status)) {
     return { retryable: false, category: "permanent_client", status, code, requestId };
   }
   if (isTimeout) return { retryable: true, category: "timeout", status, code, requestId };

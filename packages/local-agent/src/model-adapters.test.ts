@@ -239,6 +239,35 @@ describe("OpenAIResponsesAdapter", () => {
     });
   });
 
+  it("infers a permanent status from the error type when a specific code is also present", async () => {
+    const adapter = new OpenAIResponsesAdapter({
+      client: fakeClient([{
+        type: "response.failed",
+        response: {
+          error: {
+            message: "the prompt was rejected",
+            code: "invalid_prompt",
+            type: "invalid_request_error",
+          },
+        },
+        [BERRY_ROUTER_METADATA_KEY]: { requestId: "responses-invalid-prompt" },
+      }]),
+    });
+    const events = await collect(adapter.stream(
+      createBerryModel(responsesProvider),
+      { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      undefined,
+    ));
+    const last = events.at(-1);
+    if (last?.type !== "error") throw new Error("expected error event");
+    expect(providerErrorFromAssistantMessage(last.error)).toMatchObject({
+      name: "RouterClientError",
+      status: 400,
+      code: "invalid_prompt",
+      requestId: "responses-invalid-prompt",
+    });
+  });
+
   it("preserves the original Responses transport error and successful identifiers", async () => {
     const failure = new RouterClientError("temporarily unavailable", 503, "sensitive", {
       code: "upstream_unavailable",

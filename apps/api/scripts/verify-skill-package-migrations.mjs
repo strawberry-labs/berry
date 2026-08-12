@@ -175,13 +175,19 @@ async function seedPackageFilesAndBackfillFixture(pool) {
 
 async function verifyBackfill(pool) {
   const client = await pool.connect();
+  const skillContent = skillMarkdown(
+    "memo",
+    "Create a memo from the retained template",
+    `Open ${legacyInputPath}.`,
+  );
   const skill = {
     kind: "personal",
     id: personalBackfillId,
     tenant_id: ids.tenantA,
     user_id: ids.userA,
     name: "memo",
-    content: skillMarkdown("memo", "Create a memo from the retained template", `Open ${legacyInputPath}.`),
+    content: skillContent,
+    snapshot_hash: packageHash(skillContent, []),
   };
   let objectReads = 0;
   const s3 = {

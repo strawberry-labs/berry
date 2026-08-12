@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { RouterClientError } from "@berry/router-client";
 import type { SessionCheckpointV2 } from "@berry/shared";
 import {
+  CompactionRetryableError,
+  CompactionTerminalError,
   DurableSessionCompactor,
   SqlSessionCompactionRepository,
   createCheckpointGenerator,
@@ -16,6 +19,42 @@ const job: CompactionJobPayload = {
   sessionId: "00000000-0000-7000-8000-000000000003",
   reason: "token-threshold",
 };
+
+function compactionState(): CompactionSessionState {
+  return {
+    tenantId: job.tenantId,
+    taskId: job.taskId,
+    sessionId: job.sessionId,
+    sourceLeafId: "entry-2",
+    modelProviderId: null,
+    model: null,
+    modelAllowed: true,
+    entries: [
+      {
+        entryId: "entry-1",
+        parentEntryId: null,
+        entryType: "message",
+        sequence: 1,
+        payload: { role: "user", content: "Implement durable compaction." },
+        isLeafMarker: false,
+        createdAt: "2026-07-28T12:00:00.000Z",
+      },
+      {
+        entryId: "entry-2",
+        parentEntryId: "entry-1",
+        entryType: "message",
+        sequence: 2,
+        payload: { role: "assistant", content: "Working on it." },
+        isLeafMarker: true,
+        createdAt: "2026-07-28T12:01:00.000Z",
+      },
+    ],
+    previousRolling: null,
+    priorSegments: [],
+    latestSegmentCoveredEnd: null,
+    latestSegmentSourceLeafId: null,
+  };
+}
 
 describe("durable session compactor", () => {
   it("uses the tool-capable compaction model instead of inheriting the chat default", () => {
@@ -75,42 +114,41 @@ describe("durable session compactor", () => {
     ]);
   });
 
+  it.each([
+    [408, CompactionRetryableError],
+    [409, CompactionTerminalError],
+  ] as const)("classifies provider HTTP %i as %s", async (status, expectedError) => {
+    const releasedErrors: Array<string | undefined> = [];
+    const repository: SessionCompactionRepository = {
+      claim: async () => true,
+      load: async () => compactionState(),
+      persist: async () => {
+        throw new Error("persist should not be called");
+      },
+      release: async (_input, _leaseOwner, error) => {
+        releasedErrors.push(error);
+      },
+    };
+    const generator: CheckpointGenerator = {
+      provider: "test",
+      model: "checkpoint-test",
+      generate: async () => {
+        throw new RouterClientError(`provider status ${status}`, status);
+      },
+    };
+    const compactor = new DurableSessionCompactor(repository, generator, {
+      leaseOwner: "test-worker",
+      keepRecentTokens: 1,
+    });
+
+    await expect(compactor.compactSession(job)).rejects.toBeInstanceOf(expectedError);
+    expect(releasedErrors).toEqual([`provider status ${status}`]);
+  });
+
   it("persists one immutable segment and no-ops when the same leaf is delivered again", async () => {
     let persistCalls = 0;
     let generatorCalls = 0;
-    const state: CompactionSessionState = {
-      tenantId: job.tenantId,
-      taskId: job.taskId,
-      sessionId: job.sessionId,
-      sourceLeafId: "entry-2",
-      modelProviderId: null,
-      model: null,
-      modelAllowed: true,
-      entries: [
-        {
-          entryId: "entry-1",
-          parentEntryId: null,
-          entryType: "message",
-          sequence: 1,
-          payload: { role: "user", content: "Implement durable compaction." },
-          isLeafMarker: false,
-          createdAt: "2026-07-28T12:00:00.000Z",
-        },
-        {
-          entryId: "entry-2",
-          parentEntryId: "entry-1",
-          entryType: "message",
-          sequence: 2,
-          payload: { role: "assistant", content: "Working on it." },
-          isLeafMarker: true,
-          createdAt: "2026-07-28T12:01:00.000Z",
-        },
-      ],
-      previousRolling: null,
-      priorSegments: [],
-      latestSegmentCoveredEnd: null,
-      latestSegmentSourceLeafId: null,
-    };
+    const state = compactionState();
     const repository: SessionCompactionRepository = {
       claim: async () => true,
       load: async () => state,

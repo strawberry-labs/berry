@@ -10,6 +10,7 @@ import {
   safeLegacyInputFileName,
   uniqueRecoveredPackagePath,
 } from "./skill-package-backfill.js";
+import { s3ClientOptions } from "./storage/s3-client-options.js";
 
 const MAX_PACKAGE_BYTES = 5 * 1024 * 1024;
 
@@ -20,6 +21,7 @@ export type LegacySkill = {
   user_id: string | null;
   name: string;
   content: string;
+  snapshot_hash: string | null;
 };
 
 type StoredFile = {
@@ -35,12 +37,21 @@ type StoredFile = {
 
 type PackageFile = { path: string; content: Buffer; mode: number };
 
+export function backfillS3ClientOptions(env: NodeJS.ProcessEnv = process.env) {
+  return s3ClientOptions({
+    endpoint: env.BERRY_ARTIFACT_S3_ENDPOINT,
+    region: env.BERRY_ARTIFACT_S3_REGION ?? env.AWS_REGION,
+    accessKeyId: env.BERRY_ARTIFACT_S3_ACCESS_KEY_ID,
+    secretAccessKey: env.BERRY_ARTIFACT_S3_SECRET_ACCESS_KEY,
+  });
+}
+
 export async function main(): Promise<void> {
   const databaseUrl = process.env.BERRY_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("BERRY_DATABASE_URL or DATABASE_URL is required");
   const apply = process.argv.includes("--apply");
   const pool = new Pool({ connectionString: databaseUrl });
-  const s3 = new S3Client({ region: process.env.BERRY_ARTIFACT_S3_REGION || process.env.AWS_REGION || "us-east-1" });
+  const s3 = new S3Client(backfillS3ClientOptions());
   const totals = {
     scanned: 0,
     candidates: 0,
@@ -58,10 +69,10 @@ export async function main(): Promise<void> {
         await client.query("BEGIN");
         await client.query("SELECT berry_set_tenant_id($1::uuid)", [tenant.id]);
         const result = await client.query<LegacySkill>(`
-          SELECT 'personal'::text AS kind,id,tenant_id::text,user_id,name,content
+          SELECT 'personal'::text AS kind,id,tenant_id::text,user_id,name,content,hash AS snapshot_hash
           FROM personal_skills
           UNION ALL
-          SELECT 'organization'::text AS kind,id,tenant_id::text,NULL::text AS user_id,name,config->>'content' AS content
+          SELECT 'organization'::text AS kind,id,tenant_id::text,NULL::text AS user_id,name,config->>'content' AS content,content_hash AS snapshot_hash
           FROM organization_capabilities
           WHERE kind='skill' AND config->>'content' IS NOT NULL
           ORDER BY kind,name
@@ -178,10 +189,18 @@ export async function recoverSkill(client: PoolClient, s3: Pick<S3Client, "send"
   }
   const hash = hashPackage(content, packageFiles);
   if (skill.kind === "personal") {
-    await client.query("UPDATE personal_skills SET content=$2,hash=$3,updated_at=now() WHERE id=$1", [skill.id, content, hash]);
+    const updated = await client.query(
+      "UPDATE personal_skills SET content=$2,hash=$3,updated_at=now() WHERE id=$1 AND content=$4 AND hash IS NOT DISTINCT FROM $5::text",
+      [skill.id, content, hash, skill.content, skill.snapshot_hash],
+    );
+    assertSkillSnapshotUnchanged(updated.rowCount, skill);
     for (const file of additions) await insertPersonalFile(client, skill, file);
   } else {
-    await client.query("UPDATE organization_capabilities SET config=jsonb_set(jsonb_set(config,'{content}',to_jsonb($2::text),true),'{packageStorageVersion}','1'::jsonb,true),content_hash=$3,updated_at=now() WHERE id=$1", [skill.id, content, hash]);
+    const updated = await client.query(
+      "UPDATE organization_capabilities SET config=jsonb_set(jsonb_set(config,'{content}',to_jsonb($2::text),true),'{packageStorageVersion}','1'::jsonb,true),content_hash=$3,updated_at=now() WHERE id=$1 AND config->>'content'=$4 AND content_hash IS NOT DISTINCT FROM $5::text",
+      [skill.id, content, hash, skill.content, skill.snapshot_hash],
+    );
+    assertSkillSnapshotUnchanged(updated.rowCount, skill);
     for (const file of additions) await insertOrganizationFile(client, skill, file);
   }
   console.log(JSON.stringify({ skill: skill.name, skillId: skill.id, status: "recovered", files: additions.map((file) => file.path) }));
@@ -196,11 +215,18 @@ export async function existingPackageFiles(client: PoolClient, skill: LegacySkil
 }
 
 async function insertPersonalFile(client: PoolClient, skill: LegacySkill, file: PackageFile): Promise<void> {
-  await client.query("INSERT INTO personal_skill_files (tenant_id,skill_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7) ON CONFLICT (skill_id,path) DO NOTHING", [skill.tenant_id,skill.id,file.path,file.content,file.content.byteLength,sha256(file.content),file.mode]);
+  const inserted = await client.query("INSERT INTO personal_skill_files (tenant_id,skill_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7) ON CONFLICT (skill_id,path) DO NOTHING", [skill.tenant_id,skill.id,file.path,file.content,file.content.byteLength,sha256(file.content),file.mode]);
+  assertSkillSnapshotUnchanged(inserted.rowCount, skill);
 }
 
 async function insertOrganizationFile(client: PoolClient, skill: LegacySkill, file: PackageFile): Promise<void> {
-  await client.query("INSERT INTO organization_skill_files (tenant_id,organization_capability_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7) ON CONFLICT (organization_capability_id,path) DO NOTHING", [skill.tenant_id,skill.id,file.path,file.content,file.content.byteLength,sha256(file.content),file.mode]);
+  const inserted = await client.query("INSERT INTO organization_skill_files (tenant_id,organization_capability_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7) ON CONFLICT (organization_capability_id,path) DO NOTHING", [skill.tenant_id,skill.id,file.path,file.content,file.content.byteLength,sha256(file.content),file.mode]);
+  assertSkillSnapshotUnchanged(inserted.rowCount, skill);
+}
+
+function assertSkillSnapshotUnchanged(rowCount: number | null, skill: LegacySkill): void {
+  if (rowCount === 1) return;
+  throw new Error(`Skill ${skill.name} (${skill.id}) changed during package recovery; rerun the backfill from a fresh audit`);
 }
 
 function hashPackage(content: string, files: readonly PackageFile[]): string {

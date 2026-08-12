@@ -309,6 +309,29 @@ describe("durable turn runner", () => {
     expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("sensitive upstream response body");
   });
 
+  it("terminally fails provider HTTP 409 instead of releasing it for a BullMQ retry", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        throw new RouterClientError("Provider rejected a conflicting request", 409, "sensitive body", {
+          code: "conflict",
+          requestId: "router_request_409",
+        });
+      },
+    }, noTools(), { owner: "worker-provider-conflict" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+
+    expect(repository.current.state).toBe("failed");
+    expect(repository.releasedRetryDiagnostics).toBeUndefined();
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "turn.end",
+      status: "failed",
+    }));
+  });
+
   it("stops a sustained exact reasoning loop before it can consume the full model allowance", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),

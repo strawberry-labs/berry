@@ -6,7 +6,7 @@ import { Input } from "@berry/desktop-ui/components/ui/input";
 import { ArrowLeft02, ArrowRight02, Check, X } from "@berry/desktop-ui/lib/icons";
 import { ArrowUp, Paperclip } from "lucide-react";
 
-export const COMPOSER_SEND_BUTTON_CLASS = "berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45";
+export const COMPOSER_SEND_BUTTON_CLASS = "berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] motion-safe:active:scale-[0.96] disabled:opacity-45 motion-reduce:transition-none";
 export const COMPOSER_SEND_ARROW_SIZE = 18;
 
 export function questionFileDropPolicy(
@@ -90,6 +90,27 @@ export function questionInteractionLocked(pending: boolean, uploading: boolean):
   return pending || uploading;
 }
 
+export const QUESTION_ANSWER_ATTACHMENT_LIMIT = 100;
+
+export async function uploadQuestionFilesWithinLimit<TFile, TAttachment>(
+  files: readonly TFile[],
+  existingAttachmentCount: number,
+  uploadFiles: (acceptedFiles: readonly TFile[]) => Promise<readonly TAttachment[]>,
+): Promise<{ attachments: TAttachment[]; rejectedCount: number }> {
+  const availableSlots = Math.max(
+    0,
+    QUESTION_ANSWER_ATTACHMENT_LIMIT - Math.max(0, existingAttachmentCount),
+  );
+  const acceptedFiles = files.slice(0, availableSlots);
+  const rejectedCount = files.length - acceptedFiles.length;
+  if (acceptedFiles.length === 0) return { attachments: [], rejectedCount };
+  const attachments = await uploadFiles(acceptedFiles);
+  return {
+    attachments: Array.from(attachments).slice(0, availableSlots),
+    rejectedCount,
+  };
+}
+
 function promptItems(question: QuestionPrompt) {
   return question.questions.length > 0
     ? question.questions
@@ -151,6 +172,7 @@ export function ComposerQuestionOverlay({
   const [error, setError] = React.useState("");
   const customInputRef = React.useRef<HTMLInputElement>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const uploadInProgressRef = React.useRef(false);
   const dragDepthRef = React.useRef(0);
   const prompt = items[current]!;
   const draft = drafts[current];
@@ -249,28 +271,40 @@ export function ComposerQuestionOverlay({
   }, [advance, interactionLocked, prompt.question]);
 
   const uploadFiles = React.useCallback(async (files: FileList | readonly File[] | null) => {
-    if (!files?.length || !onUploadFiles || interactionLocked) return;
+    if (!files?.length || !onUploadFiles || interactionLocked || uploadInProgressRef.current) return;
+    const existingAttachmentCount = draft?.mode === "custom" ? draft.attachments.length : 0;
+    uploadInProgressRef.current = true;
     selectCustom();
     setUploading(true);
     setError("");
     try {
-      const attachments = await onUploadFiles(Array.from(files));
+      const { attachments, rejectedCount } = await uploadQuestionFilesWithinLimit(
+        Array.from(files),
+        existingAttachmentCount,
+        onUploadFiles,
+      );
       setDrafts((currentDrafts) => {
         const currentDraft = currentDrafts[current]?.mode === "custom"
           ? currentDrafts[current]!
           : { question: prompt.question, answer: "", selectedOptions: [], attachments: [], skipped: false, mode: "custom" as const };
         return {
           ...currentDrafts,
-          [current]: { ...currentDraft, attachments: [...currentDraft.attachments, ...attachments].slice(0, 100) },
+          [current]: { ...currentDraft, attachments: [...currentDraft.attachments, ...attachments] },
         };
       });
+      if (rejectedCount > 0) {
+        setError(
+          `${rejectedCount} file${rejectedCount === 1 ? " was" : "s were"} not uploaded. Each answer can include up to ${QUESTION_ANSWER_ATTACHMENT_LIMIT} files.`,
+        );
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to upload these files.");
     } finally {
+      uploadInProgressRef.current = false;
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
-  }, [current, interactionLocked, onUploadFiles, prompt.question, selectCustom]);
+  }, [current, draft, interactionLocked, onUploadFiles, prompt.question, selectCustom]);
 
   const continueMulti = React.useCallback(() => {
     if (!draft || draft.selectedOptions.length === 0 || interactionLocked) return;

@@ -54,6 +54,7 @@ import {
   planDurablePromptCache,
   promptCacheCapabilityFromEnv,
 } from "./prompt-cache.js";
+import { isRetryableProviderStatus } from "./provider-retry.js";
 import {
   CompactionRetryableError,
   type CompactionJobResult,
@@ -460,7 +461,7 @@ export class DurableTurnRunner {
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof DurableTurnRetryableError
         || error instanceof CompactionRetryableError
-        || (error instanceof RouterClientError && isRetryableStatus(error.status))) {
+        || (error instanceof RouterClientError && isRetryableProviderStatus(error.status))) {
         await this.repository.release(snapshot, message, retryableProviderDiagnostics(snapshot));
         throw error instanceof DurableTurnRetryableError
           ? error
@@ -4866,10 +4867,6 @@ function numberValue(value: unknown): number | null {
 
 function dateString(value: Date | string | null): string | null {
   return value instanceof Date ? value.toISOString() : value;
-}
-
-function isRetryableStatus(status: number | undefined): boolean {
-  return status === undefined || status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
 interface BudgetReservationGuardRow {

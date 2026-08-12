@@ -15,6 +15,7 @@ import {
   RouterClientError,
 } from "@berry/router-client";
 import type { CompactionJobPayload } from "./jobs.js";
+import { isRetryableProviderStatus } from "./provider-retry.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 export const WORKER_CHECKPOINT_REBASE_INTERVAL = 5;
@@ -206,7 +207,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         error instanceof Error ? error.message.slice(0, 4_000) : String(error).slice(0, 4_000),
       );
       if (error instanceof CompactionTerminalError || error instanceof CompactionRetryableError) throw error;
-      if (error instanceof RouterClientError && isRetryableStatus(error.status)) {
+      if (error instanceof RouterClientError && isRetryableProviderStatus(error.status)) {
         throw new CompactionRetryableError(error.message, error);
       }
       throw new CompactionTerminalError(
@@ -858,10 +859,6 @@ function retryClass(value: unknown): SessionCheckpointV2["toolCalls"][number]["r
     || value === "non_idempotent_manual"
     ? value
     : "non_idempotent_manual";
-}
-
-function isRetryableStatus(status: number | undefined): boolean {
-  return status === undefined || status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
 function mapEntry(row: EntryRow): CompactionEntryRecord {

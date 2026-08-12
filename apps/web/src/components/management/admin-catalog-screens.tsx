@@ -662,6 +662,21 @@ export function modelDefaultEnforcement(mode: "chat" | "code", policyEnforced: b
   return mode === "chat" ? false : policyEnforced;
 }
 
+export async function saveNewChatDefaultSafely<T>(
+  save: () => T | Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  try {
+    return { ok: true, value: await save() };
+  } catch (cause) {
+    return {
+      ok: false,
+      error: cause instanceof Error && cause.message.trim().length > 0
+        ? cause.message
+        : "Could not save the default model. Try again.",
+    };
+  }
+}
+
 function ModelsScreen({
   client,
   config,
@@ -706,6 +721,7 @@ function ModelsScreen({
   const [message, setMessage] = React.useState("");
   const [newChatDefaultKey, setNewChatDefaultKey] = React.useState("");
   const [savingNewChatDefault, setSavingNewChatDefault] = React.useState(false);
+  const [newChatDefaultError, setNewChatDefaultError] = React.useState("");
   const [adding, setAdding] = React.useState(false);
   const [addingRule, setAddingRule] = React.useState(false);
   const [ruleScope, setRuleScope] = React.useState<"org" | "department" | "user">("department");
@@ -833,12 +849,21 @@ function ModelsScreen({
     );
     if (!selected) return;
     setSavingNewChatDefault(true);
+    setMessage("");
+    setNewChatDefaultError("");
     try {
-      const saved = await client?.upsertOrgModelDefault(tenantId, "chat", {
-        providerId: selected.providerId,
-        model: selected.model,
-        enforce: false,
-      });
+      const result = await saveNewChatDefaultSafely(() =>
+        client?.upsertOrgModelDefault(tenantId, "chat", {
+          providerId: selected.providerId,
+          model: selected.model,
+          enforce: false,
+        }),
+      );
+      if (!result.ok) {
+        setNewChatDefaultError(result.error);
+        return;
+      }
+      const saved = result.value;
       const nextDefault = saved ?? {
         tenantId,
         mode: "chat",
@@ -954,7 +979,10 @@ function ModelsScreen({
               Organization default
               <FormSelect
                 value={newChatDefaultKey}
-                onChange={setNewChatDefaultKey}
+                onChange={(value) => {
+                  setNewChatDefaultKey(value);
+                  setNewChatDefaultError("");
+                }}
                 options={newChatModelOptions}
                 placeholder="Choose a model"
                 disabled={!canWrite || savingNewChatDefault || newChatModelOptions.length === 0}
@@ -969,6 +997,11 @@ function ModelsScreen({
               {savingNewChatDefault ? "Saving…" : "Save default"}
             </Button>
           </div>
+          {newChatDefaultError ? (
+            <p className="text-xs text-[var(--berry-danger)]" role="alert">
+              {newChatDefaultError}
+            </p>
+          ) : null}
         </Section>
         <section
           className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"

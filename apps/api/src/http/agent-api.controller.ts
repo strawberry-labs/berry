@@ -1251,6 +1251,22 @@ export class AgentApiController {
   @Post("/sessions/:sessionId/turns")
   async startTurn(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
     const admissionStartedAt = Date.now();
+    try {
+      return await this.startTurnRequest(httpRequest, sessionId, body, admissionStartedAt);
+    } catch (error) {
+      if (this.durableTurns.enabled) {
+        logTurnAdmission("failed", null, Date.now() - admissionStartedAt, error);
+      }
+      throw error;
+    }
+  }
+
+  private async startTurnRequest(
+    httpRequest: AuthenticatedRequest,
+    sessionId: string,
+    body: unknown,
+    admissionStartedAt: number,
+  ) {
     const optionalPreparationDeadlineAt = admissionStartedAt + durableAdmissionPreparationTimeoutMs();
     const request = parseBody(StartTurnRequestSchema, body);
     const { session, task } = await this.ownedSession(httpRequest, sessionId);
@@ -1305,7 +1321,9 @@ export class AgentApiController {
     const connectorRuntimeWork = observeAdmissionPreparation(
       this.connectors.runtime(tenantId, userId, { taskId: task.id, sessionId }),
     );
-    const departmentIdWork = this.#primaryDepartmentId(tenantId, userId);
+    const departmentIdWork = observeAdmissionPreparation(
+      this.#primaryDepartmentId(tenantId, userId),
+    );
     let baseRuntime = await baseRuntimeWork;
     const [effectiveRuntime, connectorRuntime, departmentId] = await Promise.all([
       this.durableTurns.enabled
@@ -1324,7 +1342,7 @@ export class AgentApiController {
             "connector_runtime",
           )
         : resolveAdmissionPreparation(connectorRuntimeWork),
-      departmentIdWork,
+      resolveAdmissionPreparation(departmentIdWork),
     ]);
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
     const mode = conversationKindFromTask(task);
@@ -1667,7 +1685,6 @@ export class AgentApiController {
         logTurnAdmission("admitted", admitted.runId, Date.now() - admissionStartedAt);
         return { turnId: admitted.runId, sessionId };
       } catch (error) {
-        logTurnAdmission("failed", null, Date.now() - admissionStartedAt, error);
         await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
         throw error;
       }

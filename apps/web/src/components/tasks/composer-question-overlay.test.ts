@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { COMPOSER_SEND_ARROW_SIZE, COMPOSER_SEND_BUTTON_CLASS, normalizeQuestionDraft, questionAnswerTranscript, questionFileDropPolicy, questionInteractionLocked, questionToolAnswer, stableQuestionAnswerMessageId, strictQuestionAnswerAttachment, updateCustomAnswerDraft } from "./composer-question-overlay.tsx";
+import { describe, expect, it, vi } from "vitest";
+import { COMPOSER_SEND_ARROW_SIZE, COMPOSER_SEND_BUTTON_CLASS, normalizeQuestionDraft, questionAnswerTranscript, questionFileDropPolicy, questionInteractionLocked, questionToolAnswer, stableQuestionAnswerMessageId, strictQuestionAnswerAttachment, updateCustomAnswerDraft, uploadQuestionFilesWithinLimit } from "./composer-question-overlay.tsx";
 
 describe("question answer summaries", () => {
   const answers = [
@@ -84,7 +84,7 @@ describe("question answer summaries", () => {
   });
 
   it("shares the composer's exact send-arrow treatment", () => {
-    expect(COMPOSER_SEND_BUTTON_CLASS).toBe("berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] active:scale-[0.96] disabled:opacity-45");
+    expect(COMPOSER_SEND_BUTTON_CLASS).toBe("berry-composer-send size-8 rounded-full transition-[background-color,color,box-shadow,opacity,transform] motion-safe:active:scale-[0.96] disabled:opacity-45 motion-reduce:transition-none");
     expect(COMPOSER_SEND_ARROW_SIZE).toBe(18);
   });
 
@@ -96,5 +96,24 @@ describe("question answer summaries", () => {
       size: 42,
       sourceKind: "object-storage",
     });
+  });
+
+  it("enforces the cumulative attachment limit before starting uploads", async () => {
+    const files = [{ name: "accepted.pdf" }, { name: "rejected.pdf" }];
+    const uploader = vi.fn(async (acceptedFiles: readonly { name: string }[]) =>
+      acceptedFiles.map((file) => ({ fileId: file.name })),
+    );
+
+    await expect(uploadQuestionFilesWithinLimit(files, 99, uploader)).resolves.toEqual({
+      attachments: [{ fileId: "accepted.pdf" }],
+      rejectedCount: 1,
+    });
+    expect(uploader).toHaveBeenCalledWith([files[0]]);
+
+    await expect(uploadQuestionFilesWithinLimit(files, 100, uploader)).resolves.toEqual({
+      attachments: [],
+      rejectedCount: 2,
+    });
+    expect(uploader).toHaveBeenCalledTimes(1);
   });
 });

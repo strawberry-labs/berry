@@ -51,12 +51,54 @@ and idempotency, then drops the temporary database.
 - Confirm the source objects are still available in the configured artifact
   bucket. The backfill reads objects but never changes or deletes them.
 
+On a provisioned production host, use the API container from the deployed
+revision. The host does not require Node.js or pnpm. From the Berry checkout,
+define this storage-aware helper once in the current shell:
+
+```sh
+cd "${BERRY_DEPLOY_REPO_DIR:-/opt/berry}"
+berry_env_file="$PWD/deploy/.env.production"
+test -f "$berry_env_file"
+berry_storage_mode="$(sed -n 's/^BERRY_OBJECT_STORAGE_MODE=//p' "$berry_env_file" | tail -n 1)"
+
+case "$berry_storage_mode" in
+  aws)
+    berry_compose() {
+      docker compose --env-file "$berry_env_file" \
+        -f deploy/compose.yaml -f deploy/compose.aws.yaml "$@"
+    }
+    ;;
+  r2)
+    berry_compose() {
+      docker compose --env-file "$berry_env_file" \
+        -f deploy/compose.yaml "$@"
+    }
+    ;;
+  minio)
+    berry_compose() {
+      docker compose --profile minio --env-file "$berry_env_file" \
+        -f deploy/compose.yaml "$@"
+    }
+    ;;
+  *)
+    echo "Unsupported BERRY_OBJECT_STORAGE_MODE: $berry_storage_mode" >&2
+    berry_compose() { return 1; }
+    ;;
+esac
+
+berry_compose config --quiet
+```
+
+The helper passes `deploy/.env.production` to Compose without sourcing or
+printing it. Keep the audit and apply commands in separate operator steps.
+
 ## Step 1: audit only
 
 Run the compiled API command without `--apply` in the deployment environment:
 
 ```sh
-pnpm --filter @berry/api backfill:skill-packages
+berry_compose run --rm --no-deps -T api \
+  node apps/api/dist/backfill-skill-packages.js
 ```
 
 Audit mode opens tenant-scoped transactions and rolls them back. It does not
@@ -86,7 +128,8 @@ migrated.
 Using the same reviewed revision and credentials, run:
 
 ```sh
-pnpm --filter @berry/api backfill:skill-packages -- --apply
+berry_compose run --rm --no-deps -T api \
+  node apps/api/dist/backfill-skill-packages.js --apply
 ```
 
 Apply mode downloads each accepted source object, verifies its stored byte

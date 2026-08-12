@@ -366,7 +366,9 @@ function redactSecrets(text: string): string {
 function providerStreamEventError(event: Record<string, unknown>, fallback: string): RouterClientError {
   const response = recordValue(event.response);
   const detail = recordValue(response?.error) ?? recordValue(event.error) ?? event;
-  const code = diagnosticValue(detail.code) ?? diagnosticValue(detail.type);
+  const code = diagnosticValue(detail.code);
+  const type = diagnosticValue(detail.type);
+  const diagnosticCode = code ?? type;
   const explicitStatus = validHttpStatus(detail.status)
     ?? validHttpStatus(detail.status_code)
     ?? validHttpStatus(response?.status)
@@ -374,10 +376,10 @@ function providerStreamEventError(event: Record<string, unknown>, fallback: stri
   const metadata = event[BERRY_ROUTER_METADATA_KEY] as BerryRouterStreamMetadata | undefined;
   return new RouterClientError(
     stringValue(detail.message) ?? fallback,
-    explicitStatus ?? providerStatusFromCode(code),
+    explicitStatus ?? providerStatusFromCode(code) ?? providerStatusFromCode(type),
     undefined,
     {
-      ...(code ? { code } : {}),
+      ...(diagnosticCode ? { code: diagnosticCode } : {}),
       ...(metadata?.requestId ? { requestId: metadata.requestId } : {}),
     },
   );
