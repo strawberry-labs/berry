@@ -23,12 +23,13 @@ if (process.env.AESG_FONTS_CONFIRMED !== "1") {
     "Production build blocked: verify the Verdana licence and set AESG_FONTS_CONFIRMED=1",
   );
 }
-for (const filename of [
+const fontFilenames = [
   "Verdana.ttf",
   "Verdana-Bold.ttf",
   "Verdana-Italic.ttf",
   "Verdana-BoldItalic.ttf",
-]) {
+] as const;
+for (const filename of fontFilenames) {
   const fontPath = path.join(
     repositoryRoot,
     `deploy/e2b-aesg/fonts/Verdana/${filename}`,
@@ -44,11 +45,14 @@ fs.cpSync(
   path.join(repositoryRoot, "deploy/e2b-aesg/requirements.lock"),
   path.join(buildRoot, "requirements.lock"),
 );
-fs.cpSync(
-  path.join(repositoryRoot, "deploy/e2b-aesg/fonts"),
-  path.join(buildRoot, "fonts"),
-  { recursive: true },
-);
+const buildFontRoot = path.join(buildRoot, "fonts/Verdana");
+fs.mkdirSync(buildFontRoot, { recursive: true });
+for (const filename of fontFilenames) {
+  fs.copyFileSync(
+    path.join(repositoryRoot, `deploy/e2b-aesg/fonts/Verdana/${filename}`),
+    path.join(buildFontRoot, filename),
+  );
+}
 
 const contextFiles: Array<{ path: string; bytes: number }> = [];
 const visit = (directory: string) => {
@@ -72,6 +76,14 @@ visit(buildRoot);
 const topLevel = fs.readdirSync(buildRoot).sort();
 if (JSON.stringify(topLevel) !== JSON.stringify(["fonts", "requirements.lock"])) {
   throw new Error(`Unexpected build-context roots: ${topLevel.join(", ")}`);
+}
+const expectedContextFiles = [
+  ...fontFilenames.map((filename) => `fonts/Verdana/${filename}`),
+  "requirements.lock",
+].sort();
+const actualContextFiles = contextFiles.map((file) => file.path).sort();
+if (JSON.stringify(actualContextFiles) !== JSON.stringify(expectedContextFiles)) {
+  throw new Error(`Unexpected build-context files: ${actualContextFiles.join(", ")}`);
 }
 const contextBytes = contextFiles.reduce((total, file) => total + file.bytes, 0);
 if (process.env.AESG_PREPARE_ONLY === "1") {
