@@ -133,6 +133,58 @@ describe("E2BSandboxProvider", () => {
     ]));
   });
 
+  it("refreshes the sliding idle timeout on activity and disables the command timeout", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const sandbox = await provider.create({
+      request_id: "keepalive",
+      tenant_id: TENANT_ID,
+      image: "base",
+      ttl_seconds: 300,
+    });
+    await provider.resume({ sandbox_id: sandbox.sandbox_id, reason: "active task reused the sandbox" });
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([300_000]);
+
+    await collectSandboxExecEvents(provider.exec({
+      sandbox_id: sandbox.sandbox_id,
+      request_id: "keepalive-exec",
+      command: ["echo", "active"],
+      timeout_ms: 0,
+    }));
+
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([300_000, 300_000, 300_000]);
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.lastCommandHandle?.timeoutMs).toBe(0);
+  });
+
+  it("keeps refreshing the sandbox while a long command is running", async () => {
+    const client = new FakeE2BClient();
+    client.blockCommands = true;
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const sandbox = await provider.create({
+      request_id: "keepalive-long",
+      tenant_id: TENANT_ID,
+      image: "base",
+      ttl_seconds: 1,
+    });
+    const abort = new AbortController();
+    const eventsPromise = collectSandboxExecEvents(provider.exec({
+      sandbox_id: sandbox.sandbox_id,
+      request_id: "keepalive-long-exec",
+      command: ["sleep", "60"],
+      timeout_ms: 0,
+    }, { signal: abort.signal }));
+
+    const activeSandbox = client.sandboxes.get(sandbox.sandbox_id)?.sandbox;
+    for (let attempt = 0; attempt < 30 && (activeSandbox?.timeoutUpdates.length ?? 0) < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    abort.abort();
+    await eventsPromise;
+
+    expect(activeSandbox?.timeoutUpdates.length).toBeGreaterThanOrEqual(3);
+    expect(activeSandbox?.timeoutUpdates.at(-1)).toBe(1_000);
+  });
+
   it("streams large command input through stdin instead of argv", async () => {
     const client = new FakeE2BClient();
     const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
@@ -258,6 +310,7 @@ class FakeE2BClient implements E2BSandboxClient {
 
 class FakeSandbox implements E2BSandboxLike {
   readonly filesByPath = new Map<string, { content: Uint8Array; modifiedTime: Date }>();
+  readonly timeoutUpdates: number[] = [];
   onPause: (() => void) | undefined;
   lastCommandHandle: FakeCommandHandle | undefined;
   readonly files: E2BSandboxLike["files"];
@@ -298,6 +351,10 @@ class FakeSandbox implements E2BSandboxLike {
     return `${port}-${this.sandboxId}.e2b.test`;
   }
 
+  async setTimeout(timeoutMs: number): Promise<void> {
+    this.timeoutUpdates.push(timeoutMs);
+  }
+
   async pause(): Promise<boolean> {
     this.onPause?.();
     return true;
@@ -322,6 +379,10 @@ class FakeCommandHandle implements E2BCommandHandleLike {
     private readonly options: Parameters<E2BSandboxLike["commands"]["run"]>[1],
     private readonly blocked: () => boolean,
   ) {}
+
+  get timeoutMs(): number | undefined {
+    return this.options?.timeoutMs;
+  }
 
   async wait(): Promise<E2BCommandResultLike> {
     if (this.blocked() && !this.#killed) await new Promise<void>((resolve) => { this.#resolveKilled = resolve; });

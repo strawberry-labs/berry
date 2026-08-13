@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SandboxProvider } from "@berry/sandbox-contract";
@@ -6,6 +7,10 @@ import {
   S3SandboxSnapshotObjectStore,
   SandboxContinuityManager,
   SqlSandboxSnapshotRepository,
+  PI_BASH_WRAPPER_SCRIPT,
+  PI_GREP_FILTER_SCRIPT,
+  PI_READ_STREAM_SCRIPT,
+  piReadContent,
   type SandboxSnapshotObjectStore,
   type SandboxSnapshotRepository,
 } from "./sandbox-continuity.js";
@@ -430,7 +435,7 @@ describe("SandboxContinuityManager", () => {
     current.sandboxId = "sandbox-connector-image";
     current.sandboxProvider = "e2b";
     current.steps = [{
-      ...toolStep("read_file", { path: "/workspace/inputs/connector-download/brent.png" }),
+      ...toolStep("read", { path: "/workspace/inputs/connector-download/brent.png" }),
       state: "completed",
       output: {
         path: "/workspace/inputs/connector-download/brent.png",
@@ -548,6 +553,42 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("executes every sandbox-backed durable tool contract", async () => {
+    const files = {
+      read: vi.fn(async (input: { path: string }) => ({
+        path: input.path,
+        content: "file contents",
+        size_bytes: 13,
+      })),
+      write: vi.fn(async (input: { path: string; content: string }) => ({
+        path: input.path,
+        size_bytes: Buffer.byteLength(input.content),
+        mtime: null,
+      })),
+      list: vi.fn(async (input: { path: string }) => ({
+        path: input.path,
+        entries: [{
+          path: `${input.path}/file.txt`,
+          type: "file",
+          size_bytes: 13,
+          mtime: null,
+        }],
+      })),
+    };
+    const rawExec = async function* (input: { command: string[] }) {
+      const isGrep = input.command[0] === "bash"
+        && input.command[1] === "-c"
+        && input.command[2]?.includes("--json");
+      if (isGrep) {
+        yield { kind: "stdout", data: "file.txt:1:needle" };
+        yield {
+          kind: "stderr",
+          data: "__BERRY_PI_GREP_META__{\"matchCount\":1,\"limitReached\":false,\"byteLimitReached\":false,\"linesTruncated\":false}\n",
+        };
+      } else {
+        yield { kind: "stdout", data: "command output" };
+      }
+      yield { kind: "exit", exit_code: 0, signal: null };
+    };
     const provider = {
       kind: "e2b",
       create: vi.fn(async () => ({
@@ -555,31 +596,8 @@ describe("SandboxContinuityManager", () => {
         provider: "e2b",
         status: "running",
       })),
-      exec: async function* () {
-        yield { kind: "stdout", data: "command output" };
-        yield { kind: "exit", exit_code: 0, signal: null };
-      },
-      files: {
-        read: vi.fn(async (input: { path: string }) => ({
-          path: input.path,
-          content: "file contents",
-          size_bytes: 13,
-        })),
-        write: vi.fn(async (input: { path: string; content: string }) => ({
-          path: input.path,
-          size_bytes: Buffer.byteLength(input.content),
-          mtime: null,
-        })),
-        list: vi.fn(async (input: { path: string }) => ({
-          path: input.path,
-          entries: [{
-            path: `${input.path}/file.txt`,
-            type: "file",
-            size_bytes: 13,
-            mtime: null,
-          }],
-        })),
-      },
+      exec: piReadAwareExec(files, rawExec),
+      files,
     } as unknown as SandboxProvider;
     const repository = {
       loadRun: vi.fn(),
@@ -600,76 +618,51 @@ describe("SandboxContinuityManager", () => {
       image: "berry-sandbox",
     });
 
-    await expect(manager.execute(snapshot(), toolStep("read_file", {
+    await expect(manager.execute(snapshot(), toolStep("read", {
       path: "/workspace/file.txt",
     }))).resolves.toMatchObject({
       output: { path: "/workspace/file.txt", content: "file contents" },
     });
-    await expect(manager.execute(snapshot(), toolStep("list_files", {
-      path: "/workspace",
-      recursive: true,
-    }))).resolves.toMatchObject({
-      output: { path: "/workspace", entries: [expect.objectContaining({ type: "file" })] },
-    });
-    await expect(manager.execute(snapshot(), toolStep("write_file", {
-      path: "/workspace/result.txt",
+    await expect(manager.execute(snapshot(), toolStep("write", {
+      path: "/workspace/pi-result.txt",
       content: "done",
     }))).resolves.toMatchObject({
-      output: { path: "/workspace/result.txt", sizeBytes: 4 },
+      output: { path: "/workspace/pi-result.txt", sizeBytes: 4 },
     });
-    await expect(manager.execute(snapshot(), toolStep("append_file", {
+    await expect(manager.execute(snapshot(), toolStep("edit", {
       path: "/workspace/file.txt",
-      content: " more",
-      expected_size_bytes: 13,
+      edits: [
+        { oldText: "file", newText: "updated" },
+        { oldText: "contents", newText: "body" },
+      ],
     }))).resolves.toMatchObject({
-      output: { path: "/workspace/file.txt", sizeBytes: 18, appendedBytes: 5 },
+      output: { path: "/workspace/file.txt", replacements: 2 },
     });
-    await expect(manager.execute(snapshot(), toolStep("edit_file", {
-      path: "/workspace/file.txt",
-      old_string: "file",
-      new_string: "updated",
-    }))).resolves.toMatchObject({
-      output: { path: "/workspace/file.txt", replacements: 1 },
-    });
-    await expect(manager.execute(snapshot(), toolStep("apply_patch", {
-      patch: [
-        "*** Begin Patch",
-        "*** Update File: file.txt",
-        "@@",
-        "-file contents",
-        "+patched contents",
-        "*** End Patch",
-      ].join("\n"),
-    }))).resolves.toMatchObject({
-      output: expect.objectContaining({ updated: ["file.txt"] }),
-    });
-    await expect(manager.execute(snapshot(), toolStep("glob", {
+    await expect(manager.execute(snapshot(), toolStep("find", {
       path: "/workspace",
       pattern: "**/*.ts",
     }))).resolves.toMatchObject({
-      output: { path: "/workspace", pattern: "**/*.ts", files: ["command output"] },
+      output: { path: "/workspace", pattern: "**/*.ts", content: "command output" },
+    });
+    await expect(manager.execute(snapshot(), toolStep("ls", {
+      path: "/workspace",
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace", content: "file.txt" },
     });
     await expect(manager.execute(snapshot(), toolStep("grep", {
       path: "/workspace",
       pattern: "needle",
     }))).resolves.toMatchObject({
-      output: { path: "/workspace", pattern: "needle", matches: "command output" },
+      output: { path: "/workspace", pattern: "needle", matches: "file.txt:1:needle", matchCount: 1 },
     });
-    for (const toolName of ["git_status", "git_diff", "git_log", "git_checkpoint"]) {
-      await expect(manager.execute(snapshot(), toolStep(toolName, {
-        ...(toolName === "git_checkpoint" ? { message: "Checkpoint" } : {}),
-      }))).resolves.toMatchObject({
-        output: { command: toolName, output: "command output" },
-      });
-    }
-    await expect(manager.execute(snapshot(), toolStep("run_command", {
+    await expect(manager.execute(snapshot(), toolStep("bash", {
       command: "printf done",
     }))).resolves.toMatchObject({
       output: { command: "printf done", exitCode: 0, output: "command output" },
     });
-    expect(provider.files.write).toHaveBeenCalledWith(expect.objectContaining({
+    expect(files.write).toHaveBeenCalledWith(expect.objectContaining({
       path: "/workspace/file.txt",
-      content: "updated contents",
+      content: "updated body",
     }));
   });
 
@@ -678,19 +671,99 @@ describe("SandboxContinuityManager", () => {
     const write = vi.fn();
     const manager = managerWithProvider({ read, write, list: vi.fn() });
 
-    await expect(manager.execute(snapshot(), toolStep("run_command", {
+    await expect(manager.execute(snapshot(), toolStep("bash", {
       raw: "{\"command\":\"printf done\"",
     }))).rejects.toThrow("arguments were incomplete or invalid JSON");
     expect(read).not.toHaveBeenCalled();
     expect(write).not.toHaveBeenCalled();
   });
 
+  it("repairs recognized provider argument damage only after direct validation fails", async () => {
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: "\uFEFFfirst\r\nsecond\r\n",
+      size_bytes: 17,
+    }));
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      raw: JSON.stringify({
+        file_path: "/workspace/[notes.md](http://notes.md)",
+        offset: "1",
+        limit: null,
+      }),
+    }))).resolves.toMatchObject({
+      output: {
+        path: "/workspace/notes.md",
+        content: "first\nsecond",
+        inputRepairs: expect.arrayContaining([
+          "parsed the raw JSON wrapper after direct validation failed",
+          "renamed file_path to path",
+          "converted numeric string offset",
+          "removed null optional field limit",
+          "unwrapped a markdown-autolinked path",
+        ]),
+      },
+    });
+    expect(read).toHaveBeenCalledWith(expect.objectContaining({ path: "/workspace/notes.md" }));
+
+    const jsonLikeContent = '{"raw":"this is file content, not tool arguments"}';
+    await manager.execute(snapshot(), toolStep("write", {
+      path: "/workspace/result.json",
+      content: jsonLikeContent,
+    }));
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({ content: jsonLikeContent }));
+  });
+
+  it("repairs stringified single-edit arrays without weakening the advertised schema", async () => {
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: "before",
+      size_bytes: 6,
+    }));
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep("edit", {
+      path: "/workspace/result.txt",
+      edits: JSON.stringify({ oldText: "before", newText: "after" }),
+    }))).resolves.toMatchObject({
+      output: {
+        replacements: 1,
+        inputRepairs: ["parsed stringified edits JSON", "wrapped one edit object as an edits array"],
+      },
+    });
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({ content: "after" }));
+  });
+
+  it("rejects fractional and partially numeric limits instead of flooring them", async () => {
+    const read = vi.fn();
+    const manager = managerWithProvider({ read, write: vi.fn(), list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/result.txt",
+      offset: 1.5,
+    }))).rejects.toThrow("read offset must be an integer");
+    await expect(manager.execute(snapshot(), toolStep("grep", {
+      pattern: "needle",
+      limit: "2abc",
+    }))).rejects.toThrow("grep limit must be an integer");
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it.each([
-    ["read_file", {}],
-    ["list_files", { path: "   " }],
-    ["write_file", { content: "contents" }],
-    ["append_file", { content: "contents", expected_size_bytes: 0 }],
-    ["edit_file", { old_string: "before", new_string: "after" }],
+    ["read", {}],
+    ["write", { content: "contents" }],
+    ["edit", { edits: [{ oldText: "before", newText: "after" }] }],
   ])("rejects %s before a missing path can resolve to the workspace directory", async (toolName, args) => {
     const read = vi.fn();
     const write = vi.fn();
@@ -711,7 +784,7 @@ describe("SandboxContinuityManager", () => {
     }));
     const manager = managerWithProvider({ read: vi.fn(), write, list: vi.fn() });
 
-    await expect(manager.execute(snapshot(), toolStep("write_file", {
+    await expect(manager.execute(snapshot(), toolStep("write", {
       path: "/workspace/result.json",
       content,
     }))).resolves.toMatchObject({
@@ -737,17 +810,313 @@ describe("SandboxContinuityManager", () => {
     }));
     const manager = managerWithProvider({ read, write, list: vi.fn() });
 
-    await expect(manager.execute(snapshot(), toolStep("edit_file", {
+    await expect(manager.execute(snapshot(), toolStep("edit", {
       path: "/workspace/result.txt",
-      old_string: "before",
-      new_string: replacement,
+      edits: [{ oldText: "before", newText: replacement }],
     }))).resolves.toMatchObject({
       output: { path: "/workspace/result.txt", sizeBytes: 8_911, replacements: 1 },
     });
     expect(write).toHaveBeenCalledWith(expect.objectContaining({ content: replacement }));
   });
 
-  it("requires edit_file new_string while still permitting an intentional empty replacement", async () => {
+  it("applies Pi edit entries against the original file and rejects overlaps", async () => {
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: "alpha middle omega",
+      size_bytes: 18,
+    }));
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+
+    await expect(manager.execute(snapshot(), toolStep("edit", {
+      path: "/workspace/result.txt",
+      edits: [
+        { oldText: "alpha", newText: "first" },
+        { oldText: "omega", newText: "last" },
+      ],
+    }))).resolves.toMatchObject({ output: { replacements: 2 } });
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({ content: "first middle last" }));
+
+    await expect(manager.execute(snapshot(), toolStep("edit", {
+      path: "/workspace/result.txt",
+      edits: [
+        { oldText: "alpha middle", newText: "first" },
+        { oldText: "middle omega", newText: "last" },
+      ],
+    }))).rejects.toThrow("overlap");
+  });
+
+  it("honors Pi read offsets and reports the next offset", async () => {
+    const content = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
+    const manager = managerWithProvider({
+      read: vi.fn(async (input: { path: string }) => ({
+        path: input.path,
+        content,
+        size_bytes: Buffer.byteLength(content),
+      })),
+      write: vi.fn(),
+      list: vi.fn(),
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/result.txt",
+      offset: 3,
+      limit: 2,
+    }))).resolves.toMatchObject({
+      output: { content: "line 3\nline 4\n\n[6 more lines in file. Use offset=5 to continue.]" },
+    });
+  });
+
+  it("returns explicit empty and EOF states and clamps pathological lines", async () => {
+    const contents: Record<string, string> = {
+      "/workspace/empty.txt": "",
+      "/workspace/short.txt": "one\ntwo",
+      "/workspace/long.txt": "x".repeat(2_100),
+    };
+    const manager = managerWithProvider({
+      read: vi.fn(async (input: { path: string }) => ({
+        path: input.path,
+        content: contents[input.path] ?? "",
+        size_bytes: Buffer.byteLength(contents[input.path] ?? ""),
+      })),
+      write: vi.fn(),
+      list: vi.fn(),
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/empty.txt",
+    }))).resolves.toMatchObject({
+      output: { content: "[File is empty.]", empty: true, totalLines: 0 },
+    });
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/short.txt",
+      offset: 9,
+    }))).resolves.toMatchObject({
+      output: {
+        content: "[Offset 9 is beyond end of file (2 lines total). Retry with offset=2 or smaller.]",
+        eof: true,
+      },
+    });
+    const longLine = await manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/long.txt",
+    }));
+    expect(longLine.output).toMatchObject({ truncated: true, linesTruncated: true });
+    const firstLine = (longLine.output as { content: string }).content.split("\n")[0]!;
+    expect(Array.from(firstLine)).toHaveLength(2_000);
+  });
+
+  it("reduces a multi-megabyte line inside the sandbox read helper", () => {
+    const result = spawnSync(process.execPath, [
+      "-e",
+      PI_READ_STREAM_SCRIPT,
+      "/dev/stdin",
+      "1",
+      "0",
+      "2000",
+      String(50 * 1024),
+      "2000",
+    ], {
+      input: "x".repeat(2 * 1024 * 1024),
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout) as { content: string; details: Record<string, unknown> };
+    expect(output.details).toMatchObject({ truncated: true, linesTruncated: true });
+    expect(Array.from(output.content.split("\n")[0]!)).toHaveLength(2_000);
+    expect(Buffer.byteLength(result.stdout)).toBeLessThan(10 * 1024);
+  });
+
+  it("parses a grep JSON record larger than one megabyte before bounding its rendered line", () => {
+    const event = JSON.stringify({
+      type: "match",
+      data: {
+        path: { text: "/workspace/large.txt" },
+        lines: { text: `needle${"x".repeat(1_100_000)}\n` },
+        line_number: 7,
+      },
+    });
+    const result = spawnSync(process.execPath, [
+      "-e",
+      PI_GREP_FILTER_SCRIPT,
+      "/workspace",
+      "100",
+      String(50 * 1024),
+      "500",
+    ], {
+      input: `${event}\n`,
+      encoding: "utf8",
+      maxBuffer: 2 * 1024 * 1024,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("large.txt:7:needle");
+    expect(result.stdout).toContain("... [truncated]");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThan(1024);
+    expect(result.stderr).toContain("\"matchCount\":1");
+    expect(result.stderr).toContain("\"linesTruncated\":true");
+  });
+
+  it("keeps only the tail of large bash output while tee saves the full output inside the sandbox", async () => {
+    const fullOutput = Array.from({ length: 2_100 }, (_, index) => `line ${index + 1}`).join("\n");
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
+    const exec = vi.fn(async function* (input: { command: string[] }) {
+      expect(input.command[2]).toContain("tee --");
+      yield { kind: "stdout", data: fullOutput };
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+    const manager = managerWithProvider(
+      { read: vi.fn(), write, list: vi.fn() },
+      exec,
+    );
+
+    await expect(manager.execute(snapshot(), toolStep("bash", {
+      command: "generate-output",
+    }))).resolves.toMatchObject({
+      output: {
+        output: expect.stringContaining("[Showing lines 101-2100 of 2100."),
+        fullOutputPath: expect.stringMatching(/^\/workspace\/\.berry-tool-output\/bash-/),
+        truncated: true,
+      },
+    });
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("preserves command and tee exit statuses in the bash wrapper", () => {
+    const success = spawnSync("bash", [
+      "-c",
+      PI_BASH_WRAPPER_SCRIPT,
+      "berry-bash",
+      "printf success",
+      "/dev/null",
+    ], { encoding: "utf8" });
+    expect(success.status, success.stderr).toBe(0);
+    expect(success.stdout).toBe("success");
+
+    const failure = spawnSync("bash", [
+      "-c",
+      PI_BASH_WRAPPER_SCRIPT,
+      "berry-bash",
+      "printf failure; exit 7",
+      "/dev/null",
+    ], { encoding: "utf8" });
+    expect(failure.status, failure.stderr).toBe(7);
+    expect(failure.stdout).toBe("failure");
+  });
+
+  it("preserves line boundaries when the rolling bash tail spans chunks", async () => {
+    const firstChunk = `${Array.from({ length: 2_001 }, (_, index) => `line ${index + 1}`).join("\n")}\n`;
+    const manager = managerWithProvider(
+      { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      async function* () {
+        yield { kind: "stdout", data: firstChunk };
+        yield { kind: "stdout", data: "line 2002\n" };
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
+    );
+
+    const result = await manager.execute(snapshot(), toolStep("bash", { command: "generate-chunked-output" }));
+    const output = (result.output as { output: string }).output;
+    expect(output).toContain("line 2001\nline 2002\n");
+    expect(output).not.toContain("line 2001line 2002");
+    expect(output).toContain("[Showing lines 3-2002 of 2002.");
+  });
+
+  it("bounds a single oversized bash chunk while preserving its tail", async () => {
+    const fullOutput = `START-${"x".repeat(2 * 1024 * 1024)}-END`;
+    const manager = managerWithProvider(
+      { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      async function* () {
+        yield { kind: "stdout", data: fullOutput };
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
+    );
+
+    const result = await manager.execute(snapshot(), toolStep("bash", { command: "generate-one-line" }));
+    const output = result.output as { output: string; truncated: boolean };
+    expect(output.truncated).toBe(true);
+    expect(output.output).not.toContain("START-");
+    expect(output.output).toContain("-END");
+    expect(Buffer.byteLength(output.output)).toBeLessThan(55 * 1024);
+  });
+
+  it("counts grep matches rather than context output lines", async () => {
+    const read = vi.fn();
+    const manager = managerWithProvider({
+      read,
+      write: vi.fn(),
+      list: vi.fn(),
+    }, async function* (input: { command: string[]; timeout_ms: number }) {
+      expect(input.command[0]).toBe("bash");
+      expect(input.command[2]).toContain("--json");
+      expect(input.timeout_ms).toBe(0);
+      yield { kind: "stdout", data: "source.ts-1-one\nsource.ts:2:needle first\nsource.ts-3-three\nsource.ts:4:needle second\nsource.ts-5-five" };
+      yield {
+        kind: "stderr",
+        data: "__BERRY_PI_GREP_META__{\"matchCount\":2,\"limitReached\":true,\"byteLimitReached\":false,\"linesTruncated\":false}\n",
+      };
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("grep", {
+      path: "/workspace",
+      pattern: "needle",
+      context: 1,
+      limit: 2,
+    }))).resolves.toMatchObject({
+      output: {
+        matchCount: 2,
+        matches: expect.stringContaining("source.ts:4:needle second"),
+        truncated: true,
+      },
+    });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("treats ripgrep's no-match status as a successful empty find", async () => {
+    const exec = vi.fn(async function* (input: { command: string[] }) {
+      expect(input.command[0]).toBe("sh");
+      expect(input.command[2]).toContain('[ "$status" -eq 0 ] || [ "$status" -eq 1 ]');
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+    const manager = managerWithProvider(
+      { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      exec,
+    );
+
+    await expect(manager.execute(snapshot(), toolStep("find", {
+      path: "/workspace",
+      pattern: "**/__definitely_missing__.*",
+    }))).resolves.toMatchObject({
+      output: { content: "No files found matching pattern" },
+    });
+  });
+
+  it("gives bash no command timeout unless the caller requests one", async () => {
+    const exec = vi.fn(async function* (_input: { timeout_ms: number }) {
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+    const manager = managerWithProvider(
+      { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      exec,
+    );
+
+    await manager.execute(snapshot(), toolStep("bash", { command: "printf default" }));
+    await manager.execute(snapshot(), toolStep("bash", { command: "printf explicit", timeout: 12.5 }));
+    expect(exec.mock.calls[0]?.[0]).toMatchObject({ timeout_ms: 0 });
+    expect(exec.mock.calls[1]?.[0]).toMatchObject({ timeout_ms: 12_500 });
+  });
+
+  it("requires edit newText while permitting an intentional empty replacement", async () => {
     const read = vi.fn(async (input: { path: string }) => ({
       path: input.path,
       content: "remove me",
@@ -760,14 +1129,13 @@ describe("SandboxContinuityManager", () => {
     }));
     const manager = managerWithProvider({ read, write, list: vi.fn() });
 
-    await expect(manager.execute(snapshot(), toolStep("edit_file", {
+    await expect(manager.execute(snapshot(), toolStep("edit", {
       path: "/workspace/result.txt",
-      old_string: "remove me",
-    }))).rejects.toThrow("edit_file requires a string new_string");
-    await expect(manager.execute(snapshot(), toolStep("edit_file", {
+      edits: [{ oldText: "remove me" }],
+    }))).rejects.toThrow("edit requires a string edits[0].newText");
+    await expect(manager.execute(snapshot(), toolStep("edit", {
       path: "/workspace/result.txt",
-      old_string: "remove me",
-      new_string: "",
+      edits: [{ oldText: "remove me", newText: "" }],
     }))).resolves.toMatchObject({ output: { replacements: 1, sizeBytes: 0 } });
   });
 
@@ -786,7 +1154,7 @@ describe("SandboxContinuityManager", () => {
       })),
     });
 
-    await expect(manager.execute(snapshot(), toolStep("read_file", {
+    await expect(manager.execute(snapshot(), toolStep("read", {
       path: "/managed-skills/aesg-branding/references/brand-system.md",
     }))).resolves.toMatchObject({
       output: {
@@ -794,12 +1162,12 @@ describe("SandboxContinuityManager", () => {
         content: "# Brand system",
       },
     });
-    await expect(manager.execute(snapshot(), toolStep("list_files", {
+    await expect(manager.execute(snapshot(), toolStep("ls", {
       path: "/managed-skills/aesg-branding/references",
     }))).resolves.toMatchObject({
       output: { path: "/managed-skills/aesg-branding/references" },
     });
-    await expect(manager.execute(snapshot(), toolStep("write_file", {
+    await expect(manager.execute(snapshot(), toolStep("write", {
       path: "/managed-skills/aesg-branding/references/brand-system.md",
       content: "changed",
     }))).rejects.toThrow("Sandbox writes must remain under /workspace");
@@ -822,7 +1190,7 @@ describe("SandboxContinuityManager", () => {
       yield { kind: "exit", exit_code: 0, signal: null };
     });
 
-    await expect(manager.execute(snapshot(), toolStep("read_file", {
+    await expect(manager.execute(snapshot(), toolStep("read", {
       path: "/workspace/inputs/file-id/reference.pdf",
     }))).resolves.toMatchObject({
       output: {
@@ -835,6 +1203,29 @@ describe("SandboxContinuityManager", () => {
     expect(read).not.toHaveBeenCalled();
   });
 
+  it("applies Pi read pagination to extracted PDF text", async () => {
+    const manager = managerWithProvider({
+      read: vi.fn(),
+      write: vi.fn(),
+      list: vi.fn(),
+    }, async function* () {
+      yield { kind: "stdout", data: Array.from({ length: 10 }, (_, index) => `page line ${index + 1}`).join("\n") };
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/reference.pdf",
+      offset: 3,
+      limit: 2,
+    }))).resolves.toMatchObject({
+      output: {
+        content: "page line 3\npage line 4\n\n[6 more lines in file. Use offset=5 to continue.]",
+        mediaType: "application/pdf",
+        extractedText: true,
+      },
+    });
+  });
+
   it("returns binary metadata instead of sending image bytes through the UTF-8 reader", async () => {
     const read = vi.fn();
     const manager = managerWithProvider({
@@ -843,7 +1234,7 @@ describe("SandboxContinuityManager", () => {
       list: vi.fn(),
     });
 
-    await expect(manager.execute(snapshot(), toolStep("read_file", {
+    await expect(manager.execute(snapshot(), toolStep("read", {
       path: "/workspace/tmp/rendered/page-1.png",
     }))).resolves.toMatchObject({
       output: {
@@ -917,7 +1308,7 @@ describe("SandboxContinuityManager", () => {
     current.sandboxId = "sandbox-existing";
     current.sandboxProvider = "e2b";
     current.steps = [{
-      ...toolStep("read_file", { path: "/workspace/outputs/chart.png" }),
+      ...toolStep("read", { path: "/workspace/outputs/chart.png" }),
       state: "completed",
       output: {
         path: "/workspace/outputs/chart.png",
@@ -1343,9 +1734,8 @@ describe("SandboxContinuityManager", () => {
       cwd: "/home/user/workspace",
     });
 
-    const result = await manager.execute(snapshot(), toolStep("list_files", {
+    const result = await manager.execute(snapshot(), toolStep("ls", {
       path: "/home/user/workspace",
-      recursive: true,
     }));
 
     expect(objects.streamSource).toHaveBeenCalledWith(
@@ -1361,9 +1751,7 @@ describe("SandboxContinuityManager", () => {
     const stagedBytes = Buffer.concat(staged.get(path)!.map((chunk) => Buffer.from(chunk)));
     expect(stagedBytes).toHaveLength((256 * 1024) + 2);
     expect(stagedBytes.subarray(-2)).toEqual(Buffer.from([2, 3]));
-    expect(result.output).toMatchObject({
-      entries: [expect.objectContaining({ path })],
-    });
+    expect(result.output).toMatchObject({ content: "candidate.pdf" });
   });
 
   it("preserves sandbox stderr when attachment directory preparation fails", async () => {
@@ -1402,7 +1790,7 @@ describe("SandboxContinuityManager", () => {
       cwd: "/home/user/workspace",
     });
 
-    await expect(manager.execute(snapshot(), toolStep("list_files", {
+    await expect(manager.execute(snapshot(), toolStep("ls", {
       path: "/home/user/workspace",
     }))).rejects.toThrow(
       "Unable to prepare the sandbox directory for Pasted text.txt: mkdir: cannot create directory: Permission denied",
@@ -1447,7 +1835,7 @@ describe("SandboxContinuityManager", () => {
       image: "berry-sandbox",
     });
 
-    await manager.execute(snapshot(), listFilesStep());
+    await manager.execute(snapshot(), lsStep());
 
     expect(provider.create).not.toHaveBeenCalled();
     expect(provider.resume).toHaveBeenCalledWith({
@@ -1794,13 +2182,13 @@ function snapshot(): DurableTurnSnapshot {
   } as DurableTurnSnapshot;
 }
 
-function listFilesStep(): DurableTurnStep {
+function lsStep(): DurableTurnStep {
   return {
     id: "00000000-0000-7000-8000-000000000005",
     sequence: 1,
-    type: "tool.list_files",
+    type: "tool.ls",
     state: "pending",
-    input: { toolName: "list_files", arguments: { path: "/workspace", recursive: true } },
+    input: { toolName: "ls", arguments: { path: "/workspace" } },
     output: null,
     retryClass: "read_only",
     idempotencyKey: null,
@@ -1832,6 +2220,7 @@ function managerWithProvider(
   exec: unknown = async function* () {
     yield { kind: "exit", exit_code: 0, signal: null };
   },
+  options: { ttlSeconds?: number; cwd?: string } = {},
 ): SandboxContinuityManager {
   const provider = {
     kind: "e2b",
@@ -1840,7 +2229,7 @@ function managerWithProvider(
       provider: "e2b",
       status: "running",
     })),
-    exec,
+    exec: piReadAwareExec(files, exec),
     files,
   } as unknown as SandboxProvider;
   const repository = {
@@ -1854,5 +2243,41 @@ function managerWithProvider(
   } satisfies SandboxSnapshotRepository;
   return new SandboxContinuityManager(provider, repository, null, {
     image: "berry-sandbox",
+    ...options,
   });
+}
+
+function piReadAwareExec(files: unknown, fallback: unknown): unknown {
+  return async function* (input: { command: string[]; sandbox_id: string }) {
+    if (input.command[0] === "node" && input.command[1] === "-e" && input.command[2] === PI_READ_STREAM_SCRIPT) {
+      const reader = (files as {
+        read: (readInput: { sandbox_id: string; path: string; encoding: string }) => Promise<{
+          content: string;
+          size_bytes: number;
+        }>;
+      }).read;
+      const path = input.command[3]!;
+      const offset = Number(input.command[4]);
+      const limit = Number(input.command[5]);
+      const source = await reader({ sandbox_id: input.sandbox_id, path, encoding: "utf8" });
+      const formatted = piReadContent(source.content, {
+        offset,
+        ...(limit > 0 ? { limit } : {}),
+      });
+      yield {
+        kind: "stdout",
+        data: JSON.stringify({
+          content: formatted.content,
+          details: formatted.details,
+          sizeBytes: source.size_bytes,
+        }),
+      };
+      yield { kind: "exit", exit_code: 0, signal: null };
+      return;
+    }
+
+    for await (const event of (fallback as (execInput: typeof input) => AsyncIterable<unknown>)(input)) {
+      yield event;
+    }
+  };
 }

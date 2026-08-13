@@ -66,7 +66,9 @@ export const SandboxExecInputSchema = z.object({
   cwd: PathSchema.optional(),
   env: EnvSchema.default({}),
   stdin: z.string().optional(),
-  timeout_ms: z.number().int().positive().max(3_600_000).default(120_000),
+  // Zero disables the command-level timeout. Providers may still enforce their
+  // own continuous-runtime limit, and callers that need a deadline can pass one.
+  timeout_ms: z.number().int().nonnegative().max(2_147_483_647).default(120_000),
   metadata: JsonValueSchema.default({}),
 }).passthrough().refine((input) => Boolean(input.command) !== Boolean(input.code), {
   message: "Provide exactly one of command or code",

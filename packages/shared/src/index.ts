@@ -2324,6 +2324,8 @@ export function latestAssistantStreamDraft(
 export const TurnStateSchema = z.object({
   active: z.boolean(),
   turnId: z.string().nullable(),
+  /** The active run continues the latest interrupted assistant turn in place. */
+  continuation: z.boolean().optional(),
   bufferedEvents: z.array(AgentStreamEventSchema),
   /** Durable SSE cursor for the final buffered event, if one exists. */
   lastEventId: z.string().nullable().optional(),

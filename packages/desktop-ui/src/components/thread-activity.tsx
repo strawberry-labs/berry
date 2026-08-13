@@ -59,17 +59,13 @@ export type ToolFamily = "file-read" | "file-write" | "shell" | "search" | "expl
 
 const EXACT_FAMILY: Record<string, ToolFamily> = {
   read: "file-read",
-  read_file: "file-read",
   write: "file-write",
-  write_file: "file-write",
   edit: "file-write",
-  edit_file: "file-write",
-  apply_patch: "file-write",
   bash: "shell",
   todo_write: "other",
-  glob: "search",
   grep: "search",
-  list_files: "search",
+  find: "search",
+  ls: "search",
   webfetch: "search",
   websearch: "search",
   web_search: "search",
@@ -80,13 +76,12 @@ export function familyFromTool(name: string): ToolFamily {
   const key = name.trim().toLowerCase();
   const exact = EXACT_FAMILY[key];
   if (exact) return exact;
-  // Berry's legacy regex chain (Ga), applied to dot/dash-normalized names so
-  // Berry names like "file.read" classify the same way as "read_file".
+  // Normalize dot- and dash-separated names before classifying provider tools.
   const n = key.replace(/[.-]/g, "_");
-  if (/^(?:read|view|open|cat|head|tail|read_file)(?:_|$)/.test(n) || /^file_read/.test(n)) return "file-read";
-  if (/(?:^|_)(?:edit|patch|replace|multi_edit|multiedit|write|create|save|apply_patch)(?:_|$)/.test(n)) return "file-write";
+  if (/^(?:read|view|open|cat|head|tail)(?:_|$)/.test(n)) return "file-read";
+  if (/(?:^|_)(?:edit|patch|replace|multi_edit|multiedit|write|create|save)(?:_|$)/.test(n)) return "file-write";
   if (/^(?:execute|run|exec|bash|shell|command|terminal)(?:_|$)/.test(n)) return "shell";
-  if (/^(?:search|grep|find|fetch|web_search|web_fetch|webfetch|query|lookup|glob|list|ls|dir|tree)(?:_|$)/.test(n)) return "search";
+  if (/^(?:search|grep|find|fetch|web_search|web_fetch|webfetch|query|lookup|list|ls|dir|tree)(?:_|$)/.test(n)) return "search";
   if (/^(?:explore|inspect)(?:_|$)/.test(n)) return "explore";
   return "other";
 }
@@ -191,7 +186,7 @@ export function isExploreEligible(tool: ActivityTool): boolean {
 type ExploreBucket = "search" | "list" | "file";
 
 function bucketFor(tool: ActivityTool): ExploreBucket {
-  // Normalize separators so names like "list_files" match \blist\b.
+  // Normalize separators before deriving the compact activity bucket.
   const label = `${tool.name} ${tool.title ?? ""}`.toLowerCase().replace(/[._-]/g, " ");
   const cmd = (commandOf(tool) ?? "").toLowerCase();
   if (/(\bgrep\b|\bsearch\b|\bfetch\b|\bweb.?search\b|\bweb.?fetch\b)/.test(label) || /(^|\s)(rg|grep|ripgrep|git\s+grep)(\s|$)/.test(cmd)) {

@@ -63,7 +63,7 @@ function planned(overrides: Partial<Parameters<typeof planDurablePromptCache>[0]
     model: "model-a",
     route: "/chat/completions",
     stableSystemPrompt: "stable system",
-    tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }],
+    tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
     capability,
     ...overrides,
   });

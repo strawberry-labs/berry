@@ -3,7 +3,7 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, durableTurnPhase, existingChatTurnModelOverride, hydratedExistingChatModel, initialCloudContent, isInterruptedTurnAvailable, mergeTaskSnapshots, newChatModelOverride, preferredNewChatModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingChatTurnModelOverride, hydratedExistingChatModel, initialCloudContent, isInterruptedTurnAvailable, mergeTaskSnapshots, newChatModelOverride, preferredNewChatModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
@@ -278,7 +278,7 @@ describe("cloud shell bootstrap", () => {
 
   it("clears durable activity for manually terminated turns", () => {
     const active = reduceDurableTurnState(undefined, { kind: "turn.start", turnId: "turn_1" });
-    expect(active).toMatchObject({ active: true, runState: "queued" });
+    expect(active).toMatchObject({ active: true, continuation: false, runState: "queued" });
 
     const cancelled = reduceDurableTurnState(
       active ?? undefined,
@@ -319,6 +319,34 @@ describe("cloud shell bootstrap", () => {
     });
 
     expect(stream.turnStartedAt).toBe(Date.parse(startedAt));
+    expect(stream.continuation).toBe(false);
+  });
+
+  it("hydrates an active continuation without hiding its settled assistant history", () => {
+    const state = reduceDurableTurnState(undefined, {
+      kind: "turn.start",
+      turnId: "turn_continued",
+      continuation: true,
+    });
+    expect(state).toMatchObject({ active: true, continuation: true });
+
+    const stream = replayDurableStreamState({
+      active: true,
+      turnId: "turn_continued",
+      continuation: true,
+      bufferedEvents: [{
+        kind: "message.start",
+        messageId: "message_continued",
+        role: "assistant",
+      }],
+      replayOnly: false,
+    });
+    expect(stream).toMatchObject({
+      turnActive: true,
+      turnId: "turn_continued",
+      continuation: true,
+      messageId: "message_continued",
+    });
   });
 
   it("offers composer continuation for failed, cancelled, and recoverable turns", () => {
@@ -331,5 +359,25 @@ describe("cloud shell bootstrap", () => {
     const staleFailure = [{ role: "assistant", status: "failed" }] as unknown as ShellData["messages"];
     expect(isInterruptedTurnAvailable("completed", "completed", staleFailure)).toBe(false);
     expect(isInterruptedTurnAvailable(null, undefined, staleFailure)).toBe(true);
+  });
+
+  it("refreshes interrupted messages before a continuation resets the live timeline", async () => {
+    const operations: string[] = [];
+    let finishRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { finishRefresh = resolve; });
+
+    const continuation = continueAfterMessageRefresh(
+      async () => {
+        operations.push("refresh-started");
+        await refreshGate;
+        operations.push("refresh-finished");
+      },
+      async () => { operations.push("continue"); },
+    );
+
+    expect(operations).toEqual(["refresh-started"]);
+    finishRefresh();
+    await continuation;
+    expect(operations).toEqual(["refresh-started", "refresh-finished", "continue"]);
   });
 });

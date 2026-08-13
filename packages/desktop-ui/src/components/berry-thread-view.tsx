@@ -130,6 +130,14 @@ export interface BerryThreadViewProps {
   adapter?: BerryThreadAdapter;
 }
 
+export function shouldReplaceLatestSettledAssistantWithLiveTurn(input: {
+  liveVisible: boolean;
+  latestTurnHasUser: boolean;
+  continuation: boolean;
+}): boolean {
+  return input.liveVisible && input.latestTurnHasUser && !input.continuation;
+}
+
 /**
  * The full Berry conversation presentation: settled turn groups (user bubbles
  * + "Worked for Xs" assistant turns) and the live streaming turn, inside the
@@ -193,7 +201,11 @@ export function BerryThreadView({
       || !latestTurnHasSettledAssistant
     );
   const renderedTurnGroups =
-    liveVisible && latestTurn?.user
+    shouldReplaceLatestSettledAssistantWithLiveTurn({
+      liveVisible,
+      latestTurnHasUser: Boolean(latestTurn?.user),
+      continuation: stream.continuation,
+    })
       ? turnGroups.map((group, index) => (index === turnGroups.length - 1 ? { ...group, assistants: [] } : group))
       : turnGroups;
   // Turn accordion state is keyed by session + turn ordinal: stable across the
@@ -731,9 +743,9 @@ export function isContinuableAssistantTurn(messages: Message[]): boolean {
 
 function summarizeActivity(segments: MessageSegment[]): string | undefined {
   const tools = segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []);
-  const reads = tools.filter((tool) => /^(?:read|read_file|file\.read)$/.test(tool.name)).length;
+  const reads = tools.filter((tool) => tool.name === "read").length;
   const writes = tools.flatMap((tool) => {
-    if (!/^(?:write|write_file|edit|edit_file|apply_patch|file\.write)$/.test(tool.name)) return [];
+    if (!/^(?:write|edit)$/.test(tool.name)) return [];
     const args = tool.args ?? {};
     const path = [args.path, args.file_path, args.filePath, args.file].find((value) => typeof value === "string");
     return typeof path === "string" ? [path.replace(/^.*[\\/]/, "")] : [];

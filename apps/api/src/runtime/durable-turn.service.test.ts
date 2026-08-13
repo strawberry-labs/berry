@@ -697,6 +697,7 @@ describe("DurableTurnService", () => {
             next_action: "Model request in progress",
             error: null,
             created_at: "2026-08-05T13:42:15.000Z",
+            continuation: true,
           }] as T[];
         }
         if (sql.includes("MAX(sequence) FILTER")) {
@@ -726,6 +727,7 @@ describe("DurableTurnService", () => {
 
     expect(state.lastEventId).toBe(`${runId}:12`);
     expect(state.startedAt).toBe("2026-08-05T13:42:15.000Z");
+    expect(state.continuation).toBe(true);
     expect(state.bufferedEvents).toEqual([
       { kind: "message.start", messageId: questionId, role: "assistant" },
       { kind: "message.delta", messageId: questionId, delta: "Hello", channel: "text" },
@@ -792,6 +794,46 @@ describe("DurableTurnService", () => {
     expect(executions.every(({ sql }) => !/;\s*\S/.test(sql))).toBe(true);
     expect(executions.some(({ sql }) => sql.startsWith("UPDATE tasks SET status='running'"))).toBe(true);
     expect(executions.some(({ sql }) => sql.startsWith("UPDATE sessions"))).toBe(true);
+  });
+
+  it("marks a continued run and its first stream event as a continuation", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
+        if (sql.includes("SELECT request_message_id") && sql.includes("state IN ('failed','cancelled')")) {
+          return [{ request_message_id: userId }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "request_continuation",
+      operationFingerprint,
+      budgetReservationRequired: false,
+      continueInterruptedTurn: true,
+      input: "",
+      runtimeRequest: {},
+      groundingContext: {},
+    });
+
+    const runInsert = executions.find(({ sql }) => sql.startsWith("INSERT INTO turn_runs"));
+    expect(JSON.parse(String(runInsert?.params[8]))).toMatchObject({ continueInterruptedTurn: true });
+    const startEvent = executions.find(({ sql }) => sql.includes("'turn.start'"));
+    expect(JSON.parse(String(startEvent?.params[3]))).toEqual({
+      kind: "turn.start",
+      turnId: expect.any(String),
+      continuation: true,
+    });
   });
 
   it("uses the same project-file access rules during durable attachment admission", async () => {

@@ -57,7 +57,7 @@ describe("AgentStreamEventSchema", () => {
       { kind: "message.start", messageId: "msg_1", role: "assistant" },
       { kind: "message.delta", messageId: "msg_1", delta: "Hello", channel: "text" },
       { kind: "message.end", messageId: "msg_1" },
-      { kind: "tool.start", toolCallId: "tc_1", name: "read_file", title: "Reading file" },
+      { kind: "tool.start", toolCallId: "tc_1", name: "read", title: "Reading file" },
       { kind: "tool.update", toolCallId: "tc_1", detail: "50%" },
       { kind: "tool.end", toolCallId: "tc_1", status: "completed", durationMs: 42, summary: "Read 12 lines" },
       {

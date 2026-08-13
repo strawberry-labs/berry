@@ -83,6 +83,37 @@ describe("live timeline rendering window", () => {
     expect(state.endStatus).toBe("failed");
   });
 
+  it("starts a clean live projection when continuing a persisted interrupted turn", () => {
+    let state = reduceStream(IDLE, { kind: "turn.start", turnId: "turn_interrupted" });
+    state = reduceStream(state, {
+      kind: "tool.start",
+      toolCallId: "old-tool",
+      name: "read",
+      args: { path: "/workspace/old.txt" },
+    });
+    state = reduceStream(state, {
+      kind: "turn.end",
+      turnId: "turn_interrupted",
+      status: "cancelled",
+    });
+
+    state = reduceStream(state, {
+      kind: "turn.start",
+      turnId: "turn_continued",
+      continuation: true,
+    });
+
+    expect(state).toMatchObject({
+      turnActive: true,
+      turnId: "turn_continued",
+      continuation: true,
+      timeline: [],
+      text: "",
+      reasoning: "",
+      endStatus: null,
+    });
+  });
+
   it.each([
     ["failed", "failed"],
     ["cancelled", "cancelled"],
@@ -99,7 +130,7 @@ describe("live timeline rendering window", () => {
       kind: "tool.start",
       toolCallId: "child",
       parentToolCallId: "parent",
-      name: "read_file",
+      name: "read",
       args: { path: "/workspace/input.txt" },
     });
     state = reduceStream(state, {

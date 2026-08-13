@@ -398,7 +398,7 @@ export function connectorArtifactText(
 function documentProcessingHint(name: string, mediaType: string, indexed: boolean): string {
   if (!indexed) {
     const lower = name.toLowerCase();
-    if (lower.endsWith(".pdf") || mediaType === "application/pdf") return "Use read_file on the sandbox path to extract the PDF for this task.";
+    if (lower.endsWith(".pdf") || mediaType === "application/pdf") return "Use read on the sandbox path to extract the PDF for this task.";
     if (/\.(xlsx?|xlsm|csv)$/.test(lower) || /spreadsheet|excel|csv/.test(mediaType)) return "Use the sandbox path with the spreadsheet tools for this task.";
     if (/\.docx?$/.test(lower) || /wordprocessingml|msword/.test(mediaType)) return "Use the sandbox path with the document tools for this task.";
     if (/\.pptx?$/.test(lower) || /presentationml|powerpoint/.test(mediaType)) return "Use the sandbox path with the presentation tools for this task.";

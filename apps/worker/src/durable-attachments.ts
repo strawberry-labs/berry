@@ -25,9 +25,9 @@ export function durableAttachmentPrompt(attachment: DurableAttachmentReference, 
     `Attached file: ${attachment.name}${details ? ` (${details})` : ""}`,
     `Sandbox path: ${durableAttachmentPath(attachment, workspaceRoot)}`,
     mediaType === "application/pdf" || lowerName.endsWith(".pdf")
-      ? "Use read_file on this PDF path; read_file extracts its text safely instead of decoding the PDF bytes as UTF-8."
+      ? "Use read on this PDF path; read extracts its text safely instead of decoding the PDF bytes as UTF-8."
       : mediaType.startsWith("image/")
-        ? "This is a binary image. read_file returns safe metadata; use an image-capable skill/tool when visual inspection is required."
+        ? "This is a binary image. read returns safe metadata; use an image-capable skill/tool when visual inspection is required."
         : "",
   ].filter(Boolean).join("\n");
 }

@@ -173,8 +173,8 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
   private async readLegacySkillFile(snapshot: DurableTurnSnapshot, step: DurableTurnStep, path: string): Promise<readonly DurableSkillPackageFile[]> {
     const result = await this.base.execute(snapshot, {
       ...step,
-      type: "tool.read_file",
-      input: { ...step.input, toolName: "read_file", arguments: { path } },
+      type: "tool.read",
+      input: { ...step.input, toolName: "read", arguments: { path } },
     });
     const output = result.output && typeof result.output === "object" && !Array.isArray(result.output) ? result.output : null;
     const content = typeof output?.content === "string" ? output.content : null;

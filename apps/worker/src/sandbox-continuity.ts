@@ -21,7 +21,6 @@ import {
   ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
   type JsonValue,
 } from "@berry/shared";
-import { parsePatch, type PatchHunk } from "@berry/local-agent";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
@@ -38,6 +37,12 @@ const MAX_SNAPSHOT_ARCHIVE_BYTES = 384 * 1024 * 1024;
 const MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_MODEL_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_MODEL_IMAGES = 5;
+const PI_TOOL_MAX_LINES = 2_000;
+const PI_TOOL_MAX_BYTES = 50 * 1024;
+const PI_READ_MAX_LINE_LENGTH = 2_000;
+const PI_GREP_MAX_LINE_LENGTH = 500;
+const PI_GREP_META_PREFIX = "__BERRY_PI_GREP_META__";
+export const PI_BASH_WRAPPER_SCRIPT = 'mkdir -p -- "$(dirname "$2")" || exit; set -o pipefail; bash -lc "$1" 2>&1 | tee -- "$2"; pipeline_status=("${PIPESTATUS[@]}"); [ "${pipeline_status[0]}" -ne 0 ] && exit "${pipeline_status[0]}"; exit "${pipeline_status[1]}"';
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
 const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
@@ -45,6 +50,208 @@ const MAX_SNAPSHOT_FILES = 5_000;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
+
+/**
+ * Runs inside the sandbox so hostile files are reduced before they cross the
+ * provider boundary. Keep this dependency-free: every Berry sandbox includes
+ * Node, but optional packages are not guaranteed.
+ */
+export const PI_READ_STREAM_SCRIPT = String.raw`
+const fs = require("node:fs");
+const { StringDecoder } = require("node:string_decoder");
+const filePath = process.argv[1];
+const offset = Number(process.argv[2] || 1);
+const requestedLimit = Number(process.argv[3] || 0);
+const maxLines = Number(process.argv[4]);
+const maxBytes = Number(process.argv[5]);
+const maxLineCharacters = Number(process.argv[6]);
+const suffix = "\u2026 [truncated; use bash for full line]";
+const suffixLength = Array.from(suffix).length;
+let lineNumber = 1;
+let totalLines = 0;
+let sawContent = false;
+let endedWithLineBreak = false;
+let skipLf = false;
+let atStart = true;
+let prefix = [];
+let prefixCharacters = 0;
+let lineClamped = false;
+let outputBytes = 0;
+let truncatedBy = null;
+let linesTruncated = false;
+const output = [];
+const selected = () => lineNumber >= offset && (requestedLimit === 0 || lineNumber < offset + requestedLimit);
+const resetLine = () => {
+  prefix = [];
+  prefixCharacters = 0;
+  lineClamped = false;
+};
+const finishLine = () => {
+  totalLines = lineNumber;
+  if (selected() && !truncatedBy) {
+    let rendered = prefix.join("");
+    if (lineClamped) {
+      rendered = Array.from(rendered).slice(0, maxLineCharacters - suffixLength).join("") + suffix;
+      linesTruncated = true;
+    }
+    const lineBytes = Buffer.byteLength(rendered, "utf8") + (output.length > 0 ? 1 : 0);
+    if (output.length >= maxLines) truncatedBy = "lines";
+    else if (outputBytes + lineBytes > maxBytes) truncatedBy = "bytes";
+    else {
+      output.push(rendered);
+      outputBytes += lineBytes;
+    }
+  }
+  lineNumber += 1;
+  resetLine();
+  endedWithLineBreak = true;
+};
+const appendCharacter = (character) => {
+  endedWithLineBreak = false;
+  if (atStart) {
+    atStart = false;
+    if (character === "\uFEFF") return;
+  }
+  sawContent = true;
+  if (!selected() || truncatedBy) return;
+  if (prefixCharacters < maxLineCharacters) {
+    prefix.push(character);
+    prefixCharacters += 1;
+  } else {
+    lineClamped = true;
+  }
+};
+const consume = (text) => {
+  for (const character of text) {
+    if (skipLf) {
+      skipLf = false;
+      if (character === "\n") continue;
+    }
+    if (character === "\r") {
+      atStart = false;
+      sawContent = true;
+      finishLine();
+      skipLf = true;
+    } else if (character === "\n") {
+      atStart = false;
+      sawContent = true;
+      finishLine();
+    } else {
+      appendCharacter(character);
+    }
+  }
+};
+(async () => {
+  const decoder = new StringDecoder("utf8");
+  for await (const chunk of fs.createReadStream(filePath)) consume(decoder.write(chunk));
+  consume(decoder.end());
+  if (sawContent && !endedWithLineBreak) finishLine();
+  const sizeBytes = fs.statSync(filePath).size;
+  const details = {};
+  let content;
+  if (totalLines === 0) {
+    content = "[File is empty.]";
+    details.empty = true;
+    details.totalLines = 0;
+  } else if (offset > totalLines) {
+    content = "[Offset " + offset + " is beyond end of file (" + totalLines + " lines total). Retry with offset=" + Math.max(1, totalLines) + " or smaller.]";
+    details.eof = true;
+    details.totalLines = totalLines;
+  } else {
+    const notices = [];
+    if (truncatedBy) {
+      const endDisplay = offset + output.length - 1;
+      notices.push("Showing lines " + offset + "-" + endDisplay + " of " + totalLines + (truncatedBy === "bytes" ? " (50.0KB limit)" : "") + ". Use offset=" + (endDisplay + 1) + " to continue.");
+      details.truncated = true;
+      details.truncatedBy = truncatedBy;
+      details.totalLines = totalLines;
+      details.outputLines = output.length;
+    } else if (requestedLimit > 0 && offset - 1 + requestedLimit < totalLines) {
+      const endLine = offset - 1 + requestedLimit;
+      notices.push((totalLines - endLine) + " more lines in file. Use offset=" + (endLine + 1) + " to continue.");
+    }
+    if (linesTruncated) {
+      notices.push("Some lines were truncated to " + maxLineCharacters + " characters. Use bash for targeted full-line inspection.");
+      details.truncated = true;
+      details.linesTruncated = true;
+    }
+    content = output.join("\n") + (notices.length > 0 ? "\n\n[" + notices.join(" ") + "]" : "");
+  }
+  process.stdout.write(JSON.stringify({ content, details, sizeBytes }));
+})().catch((error) => {
+  process.stderr.write(error && error.stack ? error.stack : String(error));
+  process.exitCode = 1;
+});
+`;
+
+/** Convert ripgrep JSON to bounded Pi-style lines before it reaches the worker. */
+export const PI_GREP_FILTER_SCRIPT = String.raw`
+const readline = require("node:readline");
+const root = String(process.argv[1] || "").replace(/\/+$/, "");
+const limit = Number(process.argv[2]);
+const maxBytes = Number(process.argv[3]);
+const maxLineCharacters = Number(process.argv[4]);
+const metaPrefix = "__BERRY_PI_GREP_META__";
+let matchCount = 0;
+let outputBytes = 0;
+let wroteLine = false;
+let limitReached = false;
+let byteLimitReached = false;
+let linesTruncated = false;
+let finished = false;
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const finish = () => {
+  if (finished) return;
+  finished = true;
+  process.stderr.write(metaPrefix + JSON.stringify({ matchCount, limitReached, byteLimitReached, linesTruncated }) + "\n");
+};
+const stop = () => {
+  finish();
+  input.close();
+  process.stdin.destroy();
+};
+const displayPath = (value) => {
+  const path = String(value || "").replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!path.startsWith("/")) return path;
+  if (path === root) return path.split("/").pop() || path;
+  return path.startsWith(root + "/") ? path.slice(root.length + 1) : path;
+};
+input.on("line", (line) => {
+  let event;
+  try { event = JSON.parse(line); } catch { return; }
+  if (event.type !== "match" && event.type !== "context") return;
+  if (event.type === "match" && matchCount >= limit) {
+    limitReached = true;
+    stop();
+    return;
+  }
+  const data = event.data || {};
+  const path = data.path && data.path.text;
+  const lineNumber = data.line_number;
+  const text = data.lines && data.lines.text;
+  if (typeof path !== "string" || !Number.isSafeInteger(lineNumber) || typeof text !== "string") return;
+  if (event.type === "match") matchCount += 1;
+  const separator = event.type === "match" ? ":" : "-";
+  let rendered = displayPath(path) + separator + lineNumber + separator + text.replace(/[\r\n]+$/, "");
+  const characters = Array.from(rendered);
+  if (characters.length > maxLineCharacters) {
+    rendered = characters.slice(0, maxLineCharacters).join("") + "... [truncated]";
+    linesTruncated = true;
+  }
+  const lineBytes = Buffer.byteLength(rendered, "utf8") + (wroteLine ? 1 : 0);
+  if (outputBytes + lineBytes > maxBytes) {
+    byteLimitReached = true;
+    stop();
+    return;
+  }
+  if (wroteLine) process.stdout.write("\n");
+  process.stdout.write(rendered);
+  wroteLine = true;
+  outputBytes += lineBytes;
+});
+input.on("close", finish);
+process.on("beforeExit", finish);
+`;
 
 interface SnapshotArchive {
   version: 1;
@@ -358,27 +565,29 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
-    const args = objectValue(step.input.arguments);
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (typeof args.raw === "string") {
-      throw new Error(
-        `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper.`,
-      );
-    }
-    validateFileToolArguments(toolName, args);
+    const prepared = prepareCoreToolArguments(toolName, step.input.arguments);
+    const args = prepared.args;
+    validateCoreToolArguments(toolName, args);
+    const inputRepairDetails = prepared.repairs.length > 0
+      ? { inputRepairs: prepared.repairs }
+      : {};
     const sandbox = await this.ensureSandbox(snapshot);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    if (toolName === "read_file") {
+    if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const mediaType = binaryMediaType(path);
       if (mediaType === "application/pdf") {
         const content = await extractPdfText(this.provider, sandbox.id, path, step, workspaceRoot);
+        const formatted = piReadContent(content, args);
         return {
           output: {
             path,
-            content,
+            content: formatted.content,
             mediaType,
             extractedText: true,
+            ...formatted.details,
+            ...inputRepairDetails,
           },
           summary: `Extracted text from ${path}`,
           sandbox,
@@ -393,41 +602,54 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             ...(mediaType.startsWith("image/") ? { visionPath: path } : {}),
             content: mediaType.startsWith("image/")
               ? `This ${mediaType} image will be attached to the next model request for visual inspection.`
-              : `This is a binary ${mediaType} file. It was not decoded as UTF-8. Use a document-capable skill/tool, or run_command with an appropriate inspection utility.`,
+              : `This is a binary ${mediaType} file. It was not decoded as UTF-8. Use a document-capable skill/tool, or bash with an appropriate inspection utility.`,
+            ...inputRepairDetails,
           },
           summary: `Identified ${path} as a binary ${mediaType} file`,
           sandbox,
         };
       }
-      const result = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
-      return {
-        output: { path: result.path, content: result.content, sizeBytes: result.size_bytes },
-        summary: `Read ${result.path}`,
-        sandbox,
-      };
-    }
-    if (toolName === "list_files") {
-      const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
-      const result = await this.provider.files.list({
-        sandbox_id: sandbox.id,
+      const result = await readSandboxText(
+        this.provider,
+        sandbox.id,
+        `${step.idempotencyKey ?? step.id}:pi-read`,
         path,
-        recursive: args.recursive === true,
-      });
+        args,
+        workspaceRoot,
+      );
       return {
-        output: {
-          path: result.path,
-          entries: result.entries.map((entry) => ({
-            path: entry.path,
-            type: entry.type,
-            sizeBytes: entry.size_bytes,
-            mtime: entry.mtime,
-          })),
-        },
-        summary: `Listed ${result.entries.length} entries under ${result.path}`,
+        output: { path, content: result.content, sizeBytes: result.sizeBytes, ...result.details, ...inputRepairDetails },
+        summary: `Read ${path}`,
         sandbox,
       };
     }
-    if (toolName === "write_file") {
+    if (toolName === "ls") {
+      const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
+      const limit = numberValue(args.limit) ?? 500;
+      const result = await this.provider.files.list({ sandbox_id: sandbox.id, path, recursive: false });
+      const entries = result.entries
+        .flatMap((entry) => {
+          if (entry.path.replace(/\/+$/, "") === path.replace(/\/+$/, "")) return [];
+          const name = entry.path.replace(/\/+$/, "").split("/").at(-1) ?? entry.path;
+          return [`${name}${entry.type === "directory" ? "/" : ""}`];
+        })
+        .sort((left, right) => left.toLowerCase().localeCompare(right.toLowerCase()));
+      const limited = entries.slice(0, limit);
+      const truncated = truncatePiHead(limited.join("\n"), Number.MAX_SAFE_INTEGER);
+      const notices = [
+        ...(entries.length > limit ? [`${limit} entries limit reached. Use limit=${limit * 2} for more`] : []),
+        ...(truncated.truncated ? ["50.0KB limit reached"] : []),
+      ];
+      const content = limited.length === 0
+        ? "(empty directory)"
+        : `${truncated.content}${notices.length > 0 ? `\n\n[${notices.join(". ")}]` : ""}`;
+      return {
+        output: { path: result.path, content, ...(notices.length > 0 ? { truncated: true } : {}), ...inputRepairDetails },
+        summary: `Listed ${limited.length} entries under ${result.path}`,
+        sandbox,
+      };
+    }
+    if (toolName === "write") {
       const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
       const content = requiredToolString(args, "content", toolName, true);
       const result = await this.provider.files.write({
@@ -437,105 +659,111 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         encoding: "utf8",
       });
       return {
-        output: { path: result.path, sizeBytes: result.size_bytes, mtime: result.mtime },
+        output: { path: result.path, sizeBytes: result.size_bytes, mtime: result.mtime, ...inputRepairDetails },
         summary: `Wrote ${result.path}`,
         sandbox,
       };
     }
-    // Legacy compatibility for append steps persisted before append_file was
-    // removed from the model-visible toolset.
-    if (toolName === "append_file") {
+    if (toolName === "edit") {
       const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
-      const content = requiredToolString(args, "content", toolName);
-      const expectedSizeBytes = numberValue(args.expected_size_bytes);
-      if (expectedSizeBytes === null || !Number.isInteger(expectedSizeBytes) || expectedSizeBytes < 0) {
-        throw new Error("append_file requires a non-negative integer expected_size_bytes from the previous write result");
-      }
+      const edits = piEditEntries(args).map((edit) => ({
+        oldText: edit.oldText.replace(/\r\n/g, "\n").replace(/\r/g, "\n"),
+        newText: edit.newText.replace(/\r\n/g, "\n").replace(/\r/g, "\n"),
+      }));
       const existing = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
-      const appendedBytes = Buffer.byteLength(content, "utf8");
-      if (existing.size_bytes === expectedSizeBytes + appendedBytes && existing.content.endsWith(content)) {
-        return {
-          output: { path: existing.path, sizeBytes: existing.size_bytes, appendedBytes, alreadyApplied: true },
-          summary: `Append was already applied to ${existing.path}`,
-          sandbox,
-        };
+      const bom = existing.content.startsWith("\uFEFF") ? "\uFEFF" : "";
+      const source = bom ? existing.content.slice(1) : existing.content;
+      const lineEnding = source.includes("\r\n") ? "\r\n" : source.includes("\r") ? "\r" : "\n";
+      const normalizedSource = source.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const replacements = edits.map((edit, index) => {
+        const start = normalizedSource.indexOf(edit.oldText);
+        if (start < 0) throw new Error(`edits[${index}].oldText was not found in ${path}`);
+        if (normalizedSource.indexOf(edit.oldText, start + 1) >= 0) {
+          throw new Error(`edits[${index}].oldText is not unique in ${path}; provide more context`);
+        }
+        return { ...edit, start, end: start + edit.oldText.length, index };
+      }).sort((left, right) => left.start - right.start);
+      for (let index = 1; index < replacements.length; index += 1) {
+        const previous = replacements[index - 1]!;
+        const current = replacements[index]!;
+        if (current.start < previous.end) {
+          throw new Error(`edits[${previous.index}] and edits[${current.index}] overlap in ${path}; merge them into one edit`);
+        }
       }
-      if (existing.size_bytes !== expectedSizeBytes) {
-        throw new Error(
-          `append_file expected ${expectedSizeBytes} bytes at ${path}, but found ${existing.size_bytes}; read the file before retrying`,
-        );
+      let content = normalizedSource;
+      for (const replacement of [...replacements].reverse()) {
+        content = `${content.slice(0, replacement.start)}${replacement.newText}${content.slice(replacement.end)}`;
       }
-      const result = await this.provider.files.write({
-        sandbox_id: sandbox.id,
-        path,
-        content: existing.content + content,
-        encoding: "utf8",
-      });
+      const finalContent = bom + (lineEnding === "\n" ? content : content.replace(/\n/g, lineEnding));
+      const written = await this.provider.files.write({ sandbox_id: sandbox.id, path, content: finalContent, encoding: "utf8" });
       return {
-        output: { path: result.path, sizeBytes: result.size_bytes, appendedBytes, mtime: result.mtime },
-        summary: `Appended ${appendedBytes} bytes to ${result.path}`,
-        sandbox,
-      };
-    }
-    if (toolName === "edit_file") {
-      const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
-      const oldString = requiredToolString(args, "old_string", toolName);
-      const newString = requiredToolString(args, "new_string", toolName, true);
-      const existing = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
-      const occurrences = existing.content.split(oldString).length - 1;
-      if (occurrences === 0) throw new Error(`old_string was not found in ${path}`);
-      if (occurrences > 1 && args.replace_all !== true) {
-        throw new Error(`old_string occurs ${occurrences} times in ${path}; set replace_all or provide more context`);
-      }
-      const content = args.replace_all === true
-        ? existing.content.split(oldString).join(newString)
-        : existing.content.replace(oldString, newString);
-      const written = await this.provider.files.write({ sandbox_id: sandbox.id, path, content, encoding: "utf8" });
-      return {
-        output: { path: written.path, replacements: args.replace_all === true ? occurrences : 1, sizeBytes: written.size_bytes },
+        output: { path: written.path, replacements: replacements.length, sizeBytes: written.size_bytes, ...inputRepairDetails },
         summary: `Edited ${written.path}`,
         sandbox,
       };
     }
-    if (toolName === "apply_patch") {
-      const patch = stringValue(args.patch, true);
-      if (!patch) throw new Error("apply_patch requires a patch");
-      const result = await applySandboxPatch(this.provider, sandbox.id, patch, step.id, workspaceRoot);
-      return { output: result, summary: "Applied workspace patch", sandbox };
-    }
-    if (toolName === "glob") {
-      const pattern = stringValue(args.pattern);
-      if (!pattern) throw new Error("glob requires a pattern");
+    if (toolName === "find") {
+      const pattern = stringValue(args.pattern, true);
+      if (pattern === null) throw new Error("find requires a pattern");
       const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
+      const limit = numberValue(args.limit) ?? 1_000;
       const result = await sandboxCommand(this.provider, sandbox.id, step.id, [
         "sh", "-c",
-        'root="$1"; pattern="$2"; if command -v rg >/dev/null 2>&1; then cd "$root" && rg --files -g "$pattern"; else find "$root" -type f -print; fi',
-        "berry-glob", path, pattern,
+        'root="$1"; pattern="$2"; if ! command -v rg >/dev/null 2>&1; then echo "ripgrep (rg) is required for find" >&2; exit 127; fi; cd "$root" || exit; rg --files --hidden -g "!.git/**" -g "!node_modules/**" -g "$pattern"; status=$?; [ "$status" -eq 0 ] || [ "$status" -eq 1 ]',
+        "berry-find", path, pattern,
       ], workspaceRoot);
-      const files = result.split("\n").filter(Boolean).slice(0, 10_000);
-      return { output: { path, pattern, files }, summary: `Matched ${files.length} files`, sandbox };
+      const allFiles = result.split("\n").filter(Boolean);
+      const files = allFiles.slice(0, limit);
+      const truncated = truncatePiHead(files.join("\n"), Number.MAX_SAFE_INTEGER);
+      const notices = [
+        ...(allFiles.length > limit ? [`${limit} results limit reached`] : []),
+        ...(truncated.truncated ? ["50.0KB limit reached"] : []),
+      ];
+      const content = files.length === 0
+        ? "No files found matching pattern"
+        : `${truncated.content}${notices.length > 0 ? `\n\n[${notices.join(". ")}]` : ""}`;
+      return {
+        output: { path, pattern, content, ...(notices.length > 0 ? { truncated: true } : {}), ...inputRepairDetails },
+        summary: `Matched ${files.length} files`,
+        sandbox,
+      };
     }
     if (toolName === "grep") {
       const pattern = stringValue(args.pattern, true);
-      if (!pattern) throw new Error("grep requires a pattern");
+      if (pattern === null) throw new Error("grep requires a pattern");
       const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
-      const result = await sandboxCommand(this.provider, sandbox.id, step.id, [
-        "sh", "-c",
-        'root="$1"; pattern="$2"; ignore="$3"; if command -v rg >/dev/null 2>&1; then [ "$ignore" = 1 ] && flag=-i || flag=; rg -n --column --color never $flag -- "$pattern" "$root" || [ $? -eq 1 ]; else grep -RIn -- "$pattern" "$root" || [ $? -eq 1 ]; fi',
-        "berry-grep", path, pattern, args.ignore_case === true ? "1" : "0",
+      const ignoreCase = args.ignoreCase === true;
+      const literal = args.literal === true;
+      const context = numberValue(args.context) ?? 0;
+      const limit = numberValue(args.limit) ?? 100;
+      const glob = stringValue(args.glob);
+      const result = await sandboxCommandOutput(this.provider, sandbox.id, step.id, [
+        "bash", "-c",
+        `root="$1"; pattern="$2"; ignore="$3"; literal="$4"; glob="$5"; context="$6"; limit="$7"; filter="$8"; if ! command -v rg >/dev/null 2>&1; then echo "ripgrep (rg) is required for grep" >&2; exit 127; fi; if ! command -v node >/dev/null 2>&1; then echo "node is required for bounded grep output" >&2; exit 127; fi; set -- --json --line-number --color never --hidden -g "!.git/**" -g "!node_modules/**" -C "$context"; [ "$ignore" = 1 ] && set -- "$@" -i; [ "$literal" = 1 ] && set -- "$@" -F; [ -n "$glob" ] && set -- "$@" -g "$glob"; set -o pipefail; rg "$@" -- "$pattern" "$root" | node -e "$filter" "$root" "$limit" "${PI_TOOL_MAX_BYTES}" "${PI_GREP_MAX_LINE_LENGTH}"; status=$?; [ "$status" -eq 0 ] || [ "$status" -eq 1 ] || [ "$status" -eq 141 ]`,
+        "berry-grep",
+        path,
+        pattern,
+        ignoreCase ? "1" : "0",
+        literal ? "1" : "0",
+        glob ?? "",
+        String(context),
+        String(limit),
+        PI_GREP_FILTER_SCRIPT,
       ], workspaceRoot);
-      return { output: { path, pattern, matches: result.slice(0, 1_000_000) }, summary: `Searched ${path}`, sandbox };
-    }
-    if (toolName === "git_status" || toolName === "git_diff" || toolName === "git_log" || toolName === "git_checkpoint") {
-      const command = toolName === "git_status"
-        ? ["git", "status", "--short", "--branch"]
-        : toolName === "git_diff"
-          ? ["git", "diff", "--", ...(stringValue(args.path) ? [safeWorkspacePath(stringValue(args.path)!, workspaceRoot)] : [])]
-          : toolName === "git_log"
-            ? ["git", "log", `-${Math.min(100, Math.max(1, numberValue(args.limit) ?? 10))}`, "--oneline", "--decorate"]
-            : ["sh", "-c", 'git add -A && git commit -m "$1"', "berry-checkpoint", stringValue(args.message) ?? "Berry checkpoint"];
-      const output = await sandboxCommand(this.provider, sandbox.id, step.id, command, workspaceRoot);
-      return { output: { command: toolName, output }, summary: `${toolName} completed`, sandbox };
+      const meta = parsePiGrepMetadata(result.stderr);
+      const notices = [
+        ...(meta.limitReached ? [`${limit} matches limit reached. Use limit=${limit * 2} for more, or refine pattern`] : []),
+        ...(meta.byteLimitReached ? ["50.0KB limit reached"] : []),
+        ...(meta.linesTruncated ? ["Some lines truncated to 500 chars. Use read tool to see full lines"] : []),
+      ];
+      const matches = meta.matchCount === 0
+        ? "No matches found"
+        : `${result.stdout}${notices.length > 0 ? `\n\n[${notices.join(". ")}]` : ""}`;
+      return {
+        output: { path, pattern, matches, matchCount: meta.matchCount, ...(notices.length > 0 ? { truncated: true } : {}), ...inputRepairDetails },
+        summary: `Matched ${meta.matchCount} lines under ${path}`,
+        sandbox,
+      };
     }
     if (toolName === "create_image") {
       const capability = objectValue(snapshot.runtimeRequest.imageGeneration);
@@ -668,27 +896,44 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sandbox,
       };
     }
-    if (toolName === "run_command") {
+    if (toolName === "bash") {
       const command = stringValue(args.command);
-      if (!command) throw new Error("run_command requires a command");
-      const output: string[] = [];
+      if (!command) throw new Error("bash requires a command");
+      const requestedTimeoutMs = numberValue(args.timeout) !== null
+        ? Math.min(2_147_483_647, Math.ceil(numberValue(args.timeout)! * 1_000))
+        : 0;
+      const fullOutputPath = `${workspaceRoot}/.berry-tool-output/bash-${createHash("sha256").update(step.id).digest("hex").slice(0, 16)}.log`;
+      const output = new PiTailCollector();
       let exitCode: number | null = null;
       for await (const event of this.provider.exec({
         sandbox_id: sandbox.id,
         request_id: step.idempotencyKey ?? step.id,
-        command: ["bash", "-lc", command],
+        command: [
+          "bash",
+          "-c",
+          PI_BASH_WRAPPER_SCRIPT,
+          "berry-bash",
+          command,
+          fullOutputPath,
+        ],
         cwd: workspaceRoot,
-        timeout_ms: numberValue(args.timeoutMs) ?? 120_000,
+        timeout_ms: requestedTimeoutMs,
       })) {
-        if (event.kind === "stdout") output.push(event.data);
-        else if (event.kind === "stderr") output.push(event.data);
+        if (event.kind === "stdout" || event.kind === "stderr") output.append(event.data);
         else if (event.kind === "exit") exitCode = event.exit_code;
         else if (event.kind === "error") throw new Error(event.message);
       }
-      const text = output.join("").slice(0, 1_000_000);
-      if (exitCode !== 0) throw new Error(`Command exited with ${exitCode ?? "unknown"}: ${text.slice(-4_000)}`);
+      const truncated = output.result();
+      let text = truncated.content || "(no output)";
+      if (truncated.truncated) {
+        const startLine = truncated.totalLines - truncated.outputLines + 1;
+        text += truncated.truncatedBy === "lines"
+          ? `\n\n[Showing lines ${startLine}-${truncated.totalLines} of ${truncated.totalLines}. Full output: ${fullOutputPath}]`
+          : `\n\n[Showing lines ${startLine}-${truncated.totalLines} of ${truncated.totalLines} (50.0KB limit). Full output: ${fullOutputPath}]`;
+      }
+      if (exitCode !== 0) throw new Error(`${text}\n\nCommand exited with code ${exitCode ?? "unknown"}`);
       return {
-        output: { command, exitCode, output: text },
+        output: { command, exitCode, output: text, ...(truncated.truncated ? { fullOutputPath, truncated: true } : {}), ...inputRepairDetails },
         summary: `Command completed with exit code ${exitCode ?? 0}`,
         sandbox,
       };
@@ -1148,7 +1393,7 @@ function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot
   const paths = snapshot.steps.flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (toolName !== "read_file" && toolName !== "create_image") return [];
+    if (toolName !== "read" && toolName !== "create_image") return [];
     const output = objectValue(step.output);
     const path = stringValue(output.visionPath);
     if (!path) return [];
@@ -1722,90 +1967,114 @@ async function sandboxCommand(
   command: string[],
   cwd: string,
 ): Promise<string> {
-  const output: string[] = [];
+  const result = await sandboxCommandOutput(provider, sandboxId, requestId, command, cwd);
+  return result.stdout;
+}
+
+async function sandboxCommandOutput(
+  provider: SandboxProvider,
+  sandboxId: string,
+  requestId: string,
+  command: string[],
+  cwd: string,
+): Promise<{ stdout: string; stderr: string }> {
+  let stdout = "";
+  let stderr = "";
   let exitCode: number | null = null;
   for await (const event of provider.exec({
     sandbox_id: sandboxId,
     request_id: requestId,
     command,
     cwd,
-    timeout_ms: 120_000,
+    timeout_ms: 0,
   })) {
-    if (event.kind === "stdout" || event.kind === "stderr") output.push(event.data);
+    if (event.kind === "stdout") stdout = appendBoundedHead(stdout, event.data, 1_000_000);
+    else if (event.kind === "stderr") stderr = appendBoundedTail(stderr, event.data, 100_000);
     else if (event.kind === "exit") exitCode = event.exit_code;
     else if (event.kind === "error") throw new Error(event.message);
   }
-  const text = output.join("").slice(0, 1_000_000);
-  if (exitCode !== 0) throw new Error(`Command exited with ${exitCode ?? "unknown"}: ${text.slice(-4_000)}`);
-  return text;
+  if (exitCode !== 0) {
+    const detail = (stderr || stdout).slice(-4_000);
+    throw new Error(`Command exited with ${exitCode ?? "unknown"}: ${detail}`);
+  }
+  return { stdout, stderr };
 }
 
-async function applySandboxPatch(
+function appendBoundedHead(current: string, chunk: string, maximum: number): string {
+  if (current.length >= maximum) return current;
+  return current + chunk.slice(0, maximum - current.length);
+}
+
+function appendBoundedTail(current: string, chunk: string, maximum: number): string {
+  if (chunk.length >= maximum) return chunk.slice(-maximum);
+  const combined = current + chunk;
+  return combined.length <= maximum ? combined : combined.slice(-maximum);
+}
+
+async function readSandboxText(
   provider: SandboxProvider,
   sandboxId: string,
-  patch: string,
   requestId: string,
-  workspaceRoot: string,
-): Promise<JsonValue> {
-  const operations = parsePatch(patch);
-  const result = { added: [] as string[], updated: [] as string[], deleted: [] as string[] };
-  for (const operation of operations) {
-    const target = safeWorkspacePath(operation.path, workspaceRoot);
-    if (operation.kind === "add") {
-      await provider.files.write({ sandbox_id: sandboxId, path: target, content: operation.content, encoding: "utf8" });
-      result.added.push(operation.path);
-      continue;
-    }
-    if (operation.kind === "delete") {
-      await sandboxCommand(provider, sandboxId, `${requestId}:delete`, ["rm", "--", target], workspaceRoot);
-      result.deleted.push(operation.path);
-      continue;
-    }
-    const existing = await provider.files.read({ sandbox_id: sandboxId, path: target, encoding: "utf8" });
-    const content = applyPatchHunks(operation.path, existing.content, operation.hunks);
-    const destination = operation.moveTo ? safeWorkspacePath(operation.moveTo, workspaceRoot) : target;
-    await provider.files.write({ sandbox_id: sandboxId, path: destination, content, encoding: "utf8" });
-    if (operation.moveTo) {
-      await sandboxCommand(provider, sandboxId, `${requestId}:move`, ["rm", "--", target], workspaceRoot);
-      result.updated.push(operation.moveTo);
-    } else {
-      result.updated.push(operation.path);
-    }
+  path: string,
+  args: Record<string, unknown>,
+  cwd: string,
+): Promise<{ content: string; details: Record<string, JsonValue>; sizeBytes: number }> {
+  const offset = numberValue(args.offset) ?? 1;
+  const limit = numberValue(args.limit) ?? 0;
+  const result = await sandboxCommandOutput(provider, sandboxId, requestId, [
+    "node",
+    "-e",
+    PI_READ_STREAM_SCRIPT,
+    path,
+    String(offset),
+    String(limit),
+    String(PI_TOOL_MAX_LINES),
+    String(PI_TOOL_MAX_BYTES),
+    String(PI_READ_MAX_LINE_LENGTH),
+  ], cwd);
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = objectValue(JSON.parse(result.stdout));
+  } catch {
+    throw new Error(`The bounded read helper returned invalid output for ${path}`);
   }
-  return result;
+  const content = stringValue(parsed.content, true);
+  const sizeBytes = numberValue(parsed.sizeBytes);
+  if (content === null || sizeBytes === null || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0) {
+    throw new Error(`The bounded read helper returned incomplete output for ${path}`);
+  }
+  return {
+    content,
+    details: objectValue(parsed.details) as Record<string, JsonValue>,
+    sizeBytes,
+  };
 }
 
-function applyPatchHunks(path: string, content: string, hunks: PatchHunk[]): string {
-  let lines = content.split("\n");
-  let searchFrom = 0;
-  for (const hunk of hunks) {
-    const anchor = hunk.removed.length > 0 ? hunk.removed : hunk.context;
-    if (anchor.length === 0) {
-      lines = [...lines, ...hunk.added];
-      continue;
-    }
-    const index = findLineSequence(lines, anchor, searchFrom);
-    if (index < 0) throw new Error(`Could not locate patch hunk in ${path}:\n${anchor.join("\n")}`);
-    if (hunk.removed.length > 0) {
-      lines.splice(index, hunk.removed.length, ...hunk.added);
-      searchFrom = index + hunk.added.length;
-    } else {
-      const insertAt = index + anchor.length;
-      lines.splice(insertAt, 0, ...hunk.added);
-      searchFrom = insertAt + hunk.added.length;
-    }
+function parsePiGrepMetadata(stderr: string): {
+  matchCount: number;
+  limitReached: boolean;
+  byteLimitReached: boolean;
+  linesTruncated: boolean;
+} {
+  const marker = stderr.lastIndexOf(PI_GREP_META_PREFIX);
+  if (marker < 0) throw new Error("The bounded grep formatter did not return result metadata");
+  const line = stderr.slice(marker + PI_GREP_META_PREFIX.length).split("\n", 1)[0] ?? "";
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = objectValue(JSON.parse(line));
+  } catch {
+    throw new Error("The bounded grep formatter returned invalid result metadata");
   }
-  return lines.join("\n");
-}
-
-function findLineSequence(haystack: string[], needle: string[], from: number): number {
-  outer: for (let index = from; index <= haystack.length - needle.length; index += 1) {
-    for (let offset = 0; offset < needle.length; offset += 1) {
-      if (haystack[index + offset] !== needle[offset]) continue outer;
-    }
-    return index;
+  const matchCount = numberValue(parsed.matchCount);
+  if (matchCount === null || !Number.isSafeInteger(matchCount) || matchCount < 0) {
+    throw new Error("The bounded grep formatter returned an invalid match count");
   }
-  return from > 0 ? findLineSequence(haystack, needle, 0) : -1;
+  return {
+    matchCount,
+    limitReached: parsed.limitReached === true,
+    byteLimitReached: parsed.byteLimitReached === true,
+    linesTruncated: parsed.linesTruncated === true,
+  };
 }
 
 async function downloadGeneratedImage(url: string | undefined): Promise<Buffer> {
@@ -1884,6 +2153,7 @@ function excludedSnapshotPath(path: string, root: string): boolean {
     ".next",
     ".cache",
     ".pnpm-store",
+    ".berry-tool-output",
     "__pycache__",
     ".venv",
     "target",
@@ -1902,29 +2172,429 @@ function safeWorkspaceRoot(value: string): string {
   return `/${parts.join("/")}`;
 }
 
-function validateFileToolArguments(toolName: string, args: Record<string, unknown>): void {
-  if (toolName === "read_file" || toolName === "list_files") {
-    requiredToolPath(args, toolName);
+interface PiTruncation {
+  content: string;
+  truncated: boolean;
+  truncatedBy: "lines" | "bytes" | null;
+  totalLines: number;
+  outputLines: number;
+}
+
+function countedLines(content: string): string[] {
+  if (!content) return [];
+  const lines = content.split("\n");
+  if (content.endsWith("\n")) lines.pop();
+  return lines;
+}
+
+function normalizeToolText(content: string): string {
+  return content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function truncatePiHead(content: string, maxLines = PI_TOOL_MAX_LINES): PiTruncation {
+  const lines = countedLines(content);
+  if (lines.length <= maxLines && Buffer.byteLength(content, "utf8") <= PI_TOOL_MAX_BYTES) {
+    return { content, truncated: false, truncatedBy: null, totalLines: lines.length, outputLines: lines.length };
+  }
+  const selected: string[] = [];
+  let bytes = 0;
+  let truncatedBy: "lines" | "bytes" = "lines";
+  for (const line of lines.slice(0, maxLines)) {
+    const lineBytes = Buffer.byteLength(line, "utf8") + (selected.length > 0 ? 1 : 0);
+    if (bytes + lineBytes > PI_TOOL_MAX_BYTES) {
+      truncatedBy = "bytes";
+      break;
+    }
+    selected.push(line);
+    bytes += lineBytes;
+  }
+  if (selected.length >= maxLines) truncatedBy = "lines";
+  return {
+    content: selected.join("\n"),
+    truncated: true,
+    truncatedBy,
+    totalLines: lines.length,
+    outputLines: selected.length,
+  };
+}
+
+class PiTailCollector {
+  #content = "";
+  #sawContent = false;
+  #endsWithNewline = false;
+  #totalNewlines = 0;
+  #trimmedBytes = false;
+  #trimmedLines = false;
+
+  append(chunk: string): void {
+    if (!chunk) return;
+    this.#sawContent = true;
+    this.#endsWithNewline = chunk.endsWith("\n");
+    for (let index = 0; index < chunk.length; index += 1) {
+      if (chunk.charCodeAt(index) === 10) this.#totalNewlines += 1;
+    }
+
+    let combined: string;
+    if (Buffer.byteLength(chunk, "utf8") > PI_TOOL_MAX_BYTES) {
+      combined = utf8Tail(chunk, PI_TOOL_MAX_BYTES);
+      this.#trimmedBytes = true;
+    } else {
+      combined = `${this.#content}${chunk}`;
+      if (Buffer.byteLength(combined, "utf8") > PI_TOOL_MAX_BYTES) {
+        combined = utf8Tail(combined, PI_TOOL_MAX_BYTES);
+        this.#trimmedBytes = true;
+      }
+    }
+
+    const endsWithNewline = combined.endsWith("\n");
+    const lines = countedLines(combined);
+    if (lines.length > PI_TOOL_MAX_LINES) {
+      combined = lines.slice(-PI_TOOL_MAX_LINES).join("\n");
+      if (endsWithNewline) combined += "\n";
+      this.#trimmedLines = true;
+    }
+    this.#content = combined;
+  }
+
+  result(): PiTruncation {
+    const outputLines = countedLines(this.#content).length;
+    const totalLines = this.#sawContent
+      ? this.#totalNewlines + (this.#endsWithNewline ? 0 : 1)
+      : 0;
+    const truncated = this.#trimmedBytes || this.#trimmedLines;
+    const truncatedBy = !truncated
+      ? null
+      : this.#trimmedLines && (!this.#trimmedBytes || outputLines >= PI_TOOL_MAX_LINES)
+        ? "lines"
+        : "bytes";
+    return {
+      content: this.#content,
+      truncated,
+      truncatedBy,
+      totalLines,
+      outputLines,
+    };
+  }
+}
+
+function utf8Tail(content: string, maxBytes: number): string {
+  let candidateStart = Math.max(0, content.length - maxBytes);
+  const candidateCode = content.charCodeAt(candidateStart);
+  if (candidateStart > 0 && candidateCode >= 0xdc00 && candidateCode <= 0xdfff) candidateStart -= 1;
+  const buffer = Buffer.from(content.slice(candidateStart), "utf8");
+  let start = Math.max(0, buffer.length - maxBytes);
+  while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start += 1;
+  return buffer.subarray(start).toString("utf8");
+}
+
+export function piReadContent(
+  source: string,
+  args: Record<string, unknown>,
+): { content: string; details: Record<string, JsonValue> } {
+  const normalized = normalizeToolText(source);
+  if (normalized.length === 0) {
+    return {
+      content: "[File is empty.]",
+      details: { empty: true, totalLines: 0 },
+    };
+  }
+  const allLines = countedLines(normalized);
+  const offset = numberValue(args.offset);
+  const limit = numberValue(args.limit);
+  const startLine = offset === null ? 0 : offset - 1;
+  if (startLine >= allLines.length) {
+    return {
+      content: `[Offset ${offset} is beyond end of file (${allLines.length} lines total). Retry with offset=${Math.max(1, allLines.length)} or smaller.]`,
+      details: { eof: true, totalLines: allLines.length },
+    };
+  }
+  const endLine = limit === null
+    ? allLines.length
+    : Math.min(allLines.length, startLine + limit);
+  let linesTruncated = false;
+  const selected = allLines.slice(startLine, endLine).map((line) => {
+    const clamped = clampReadLine(line);
+    linesTruncated ||= clamped.truncated;
+    return clamped.content;
+  }).join("\n");
+  const truncated = truncatePiHead(selected);
+  const startDisplay = startLine + 1;
+  const notices: string[] = [];
+  const details: Record<string, JsonValue> = {};
+  if (truncated.truncated) {
+    const endDisplay = startDisplay + truncated.outputLines - 1;
+    notices.push(`Showing lines ${startDisplay}-${endDisplay} of ${allLines.length}${truncated.truncatedBy === "bytes" ? " (50.0KB limit)" : ""}. Use offset=${endDisplay + 1} to continue.`);
+    Object.assign(details, {
+      truncated: true,
+      truncatedBy: truncated.truncatedBy,
+      totalLines: allLines.length,
+      outputLines: truncated.outputLines,
+    });
+  } else if (limit !== null && endLine < allLines.length) {
+    notices.push(`${allLines.length - endLine} more lines in file. Use offset=${endLine + 1} to continue.`);
+  }
+  if (linesTruncated) {
+    notices.push(`Some lines were truncated to ${PI_READ_MAX_LINE_LENGTH} characters. Use bash for targeted full-line inspection.`);
+    details.truncated = true;
+    details.linesTruncated = true;
+  }
+  return {
+    content: `${truncated.content}${notices.length > 0 ? `\n\n[${notices.join(" ")}]` : ""}`,
+    details,
+  };
+}
+
+function clampReadLine(line: string): { content: string; truncated: boolean } {
+  const characters = Array.from(line);
+  if (characters.length <= PI_READ_MAX_LINE_LENGTH) return { content: line, truncated: false };
+  const suffix = "… [truncated; use bash for full line]";
+  const suffixLength = Array.from(suffix).length;
+  return {
+    content: `${characters.slice(0, PI_READ_MAX_LINE_LENGTH - suffixLength).join("")}${suffix}`,
+    truncated: true,
+  };
+}
+
+function piEditEntries(args: Record<string, unknown>): Array<{ oldText: string; newText: string }> {
+  const edits = Array.isArray(args.edits) ? [...args.edits] : [];
+  if (edits.length === 0) throw new Error("edit requires one or more edits");
+  return edits.map((value, index) => {
+    const edit = objectValue(value);
+    const oldText = stringValue(edit.oldText);
+    const newText = stringValue(edit.newText, true);
+    if (!oldText) throw new Error(`edit requires a non-empty edits[${index}].oldText`);
+    if (newText === null) throw new Error(`edit requires a string edits[${index}].newText`);
+    return { oldText, newText };
+  });
+}
+
+const CORE_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+
+function prepareCoreToolArguments(
+  toolName: string,
+  input: unknown,
+): { args: Record<string, unknown>; repairs: string[] } {
+  const direct = objectValue(input);
+  if (!CORE_TOOL_NAMES.has(toolName) || coreToolArgumentsValid(toolName, direct)) {
+    return { args: direct, repairs: [] };
+  }
+
+  const repairs: string[] = [];
+  const rootField = toolName === "bash"
+    ? "command"
+    : toolName === "grep" || toolName === "find"
+      ? "pattern"
+      : "path";
+  let candidate: Record<string, unknown> = typeof input === "string"
+    ? { [rootField]: input }
+    : { ...direct };
+  if (typeof input === "string") repairs.push(`wrapped bare string as ${rootField}`);
+
+  if (typeof candidate.raw === "string") {
+    try {
+      const parsed = JSON.parse(candidate.raw);
+      const parsedArguments = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? objectValue(parsed)
+        : typeof parsed === "string"
+          ? { [rootField]: parsed }
+          : null;
+      if (parsedArguments) {
+        const explicit = Object.fromEntries(Object.entries(candidate).filter(([key]) => key !== "raw"));
+        candidate = { ...parsedArguments, ...explicit };
+        repairs.push("parsed the raw JSON wrapper after direct validation failed");
+      }
+    } catch {
+      // Leave malformed raw input intact so validation returns the actionable retry error.
+    }
+  }
+
+  moveCoreArgumentAlias(candidate, "path", [
+    "filePath", "file_path", "absolutePath", "absolute_path", "targetPath", "target_path", "targetFile", "target_file", "file", "filename",
+  ], repairs);
+  if (toolName === "bash") moveCoreArgumentAlias(candidate, "command", ["cmd", "shellCommand", "shell_command"], repairs);
+  if (toolName === "grep" || toolName === "find") {
+    moveCoreArgumentAlias(candidate, "pattern", ["query", "search", "searchPattern", "search_pattern"], repairs);
+  }
+  if (toolName === "grep") moveCoreArgumentAlias(candidate, "ignoreCase", ["ignore_case"], repairs);
+
+  if (toolName === "edit" && candidate.edits === undefined
+    && typeof candidate.oldText === "string" && typeof candidate.newText === "string") {
+    candidate.edits = [{ oldText: candidate.oldText, newText: candidate.newText }];
+    delete candidate.oldText;
+    delete candidate.newText;
+    repairs.push("wrapped oldText/newText as one edits entry");
+  }
+  if (toolName === "edit" && typeof candidate.edits === "string") {
+    try {
+      candidate.edits = JSON.parse(candidate.edits);
+      repairs.push("parsed stringified edits JSON");
+    } catch {
+      // Validation below explains that edits must be an array.
+    }
+  }
+  if (toolName === "edit" && candidate.edits && typeof candidate.edits === "object" && !Array.isArray(candidate.edits)) {
+    candidate.edits = [candidate.edits];
+    repairs.push("wrapped one edit object as an edits array");
+  }
+
+  for (const field of ["offset", "limit", "timeout", "context"]) {
+    if (typeof candidate[field] !== "string" || !candidate[field].trim()) continue;
+    const parsed = Number(candidate[field]);
+    if (!Number.isFinite(parsed)) continue;
+    candidate[field] = parsed;
+    repairs.push(`converted numeric string ${field}`);
+  }
+
+  const optionalFields = coreOptionalFields(toolName);
+  for (const field of optionalFields) {
+    if (candidate[field] !== null) continue;
+    delete candidate[field];
+    repairs.push(`removed null optional field ${field}`);
+  }
+  if (typeof candidate.path === "string") {
+    const repairedPath = repairDegenerateMarkdownPath(candidate.path);
+    if (repairedPath !== candidate.path) {
+      candidate.path = repairedPath;
+      repairs.push("unwrapped a markdown-autolinked path");
+    }
+  }
+  return { args: candidate, repairs: [...new Set(repairs)] };
+}
+
+function moveCoreArgumentAlias(
+  args: Record<string, unknown>,
+  target: string,
+  aliases: readonly string[],
+  repairs: string[],
+): void {
+  for (const alias of aliases) {
+    if (!(alias in args)) continue;
+    if (args[target] === undefined) {
+      args[target] = args[alias];
+      repairs.push(`renamed ${alias} to ${target}`);
+    } else {
+      repairs.push(`removed redundant alias ${alias}`);
+    }
+    delete args[alias];
+  }
+}
+
+function coreOptionalFields(toolName: string): readonly string[] {
+  if (toolName === "read") return ["offset", "limit"];
+  if (toolName === "bash") return ["timeout"];
+  if (toolName === "grep") return ["path", "glob", "ignoreCase", "literal", "context", "limit"];
+  if (toolName === "find") return ["path", "limit"];
+  if (toolName === "ls") return ["path", "limit"];
+  return [];
+}
+
+function repairDegenerateMarkdownPath(value: string): string {
+  return value.replace(/\[([^\]\r\n]+)\]\(https?:\/\/([^/)\s]+)\/?\)/gi, (whole, label: string, target: string) =>
+    label === target ? label : whole);
+}
+
+function coreToolArgumentsValid(toolName: string, args: Record<string, unknown>): boolean {
+  try {
+    validateCoreToolArguments(toolName, args);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateCoreToolArguments(toolName: string, args: Record<string, unknown>): void {
+  if (!CORE_TOOL_NAMES.has(toolName)) return;
+  if (typeof args.raw === "string") {
+    throw new Error(
+      `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper.`,
+    );
+  }
+  const allowed = toolName === "read" ? ["path", "offset", "limit"]
+    : toolName === "bash" ? ["command", "timeout"]
+      : toolName === "edit" ? ["path", "edits"]
+        : toolName === "write" ? ["path", "content"]
+          : toolName === "grep" ? ["pattern", "path", "glob", "ignoreCase", "literal", "context", "limit"]
+            : toolName === "find" ? ["pattern", "path", "limit"]
+              : ["path", "limit"];
+  const unexpected = Object.keys(args).find((field) => !allowed.includes(field));
+  if (unexpected) {
+    throw new Error(`${toolName} received unsupported field ${JSON.stringify(unexpected)}. Use only: ${allowed.join(", ")}`);
+  }
+
+  if (toolName === "read") {
+    validateCorePath(args, toolName, true);
+    validateOptionalInteger(args, "offset", 1, toolName);
+    validateOptionalInteger(args, "limit", 1, toolName);
     return;
   }
-  if (toolName === "write_file") {
-    requiredToolPath(args, toolName);
-    requiredToolString(args, "content", toolName, true);
-    return;
-  }
-  if (toolName === "append_file") {
-    requiredToolPath(args, toolName);
-    requiredToolString(args, "content", toolName);
-    const expectedSizeBytes = numberValue(args.expected_size_bytes);
-    if (expectedSizeBytes === null || !Number.isInteger(expectedSizeBytes) || expectedSizeBytes < 0) {
-      throw new Error("append_file requires a non-negative integer expected_size_bytes from the previous write result");
+  if (toolName === "bash") {
+    requiredToolString(args, "command", toolName);
+    if (args.timeout !== undefined && (numberValue(args.timeout) === null || numberValue(args.timeout)! <= 0)) {
+      throw new Error("bash timeout must be a finite number greater than zero");
     }
     return;
   }
-  if (toolName === "edit_file") {
-    requiredToolPath(args, toolName);
-    requiredToolString(args, "old_string", toolName);
-    requiredToolString(args, "new_string", toolName, true);
+  if (toolName === "edit") {
+    validateCorePath(args, toolName, true);
+    if (!Array.isArray(args.edits)) throw new Error("edit edits must be an array");
+    piEditEntries(args);
+    return;
+  }
+  if (toolName === "write") {
+    validateCorePath(args, toolName, true);
+    requiredToolString(args, "content", toolName, true);
+    return;
+  }
+  if (toolName === "grep") {
+    requiredToolString(args, "pattern", toolName, true);
+    validateCorePath(args, toolName, false);
+    validateOptionalString(args, "glob", toolName);
+    validateOptionalBoolean(args, "ignoreCase", toolName);
+    validateOptionalBoolean(args, "literal", toolName);
+    validateOptionalInteger(args, "context", 0, toolName);
+    validateOptionalInteger(args, "limit", 1, toolName);
+    return;
+  }
+  if (toolName === "find") {
+    requiredToolString(args, "pattern", toolName, true);
+    validateCorePath(args, toolName, false);
+    validateOptionalInteger(args, "limit", 1, toolName);
+    return;
+  }
+  validateCorePath(args, toolName, false);
+  validateOptionalInteger(args, "limit", 1, toolName);
+}
+
+function validateCorePath(args: Record<string, unknown>, toolName: string, required: boolean): void {
+  if (args.path === undefined && !required) return;
+  const path = requiredToolPath(args, toolName);
+  if (repairDegenerateMarkdownPath(path) !== path) {
+    throw new Error(`${toolName} path contains a markdown autolink and must be unwrapped`);
+  }
+}
+
+function validateOptionalString(args: Record<string, unknown>, field: string, toolName: string): void {
+  if (args[field] !== undefined && typeof args[field] !== "string") {
+    throw new Error(`${toolName} ${field} must be a string`);
+  }
+}
+
+function validateOptionalBoolean(args: Record<string, unknown>, field: string, toolName: string): void {
+  if (args[field] !== undefined && typeof args[field] !== "boolean") {
+    throw new Error(`${toolName} ${field} must be true or false`);
+  }
+}
+
+function validateOptionalInteger(
+  args: Record<string, unknown>,
+  field: string,
+  minimum: number,
+  toolName: string,
+): void {
+  if (args[field] === undefined) return;
+  const value = numberValue(args[field]);
+  if (value === null || !Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${toolName} ${field} must be an integer greater than or equal to ${minimum}`);
   }
 }
 

@@ -53,29 +53,29 @@ describe("durable turn runner", () => {
     expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
   });
 
-  it("advertises unrestricted writes and edits without append_file", () => {
-    const write = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "write_file");
-    const append = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "append_file");
-    const edit = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "edit_file");
+  it("advertises Pi's seven coding tools", () => {
+    const write = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "write");
+    const bash = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "bash");
+    const edit = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "edit");
 
     expect(write?.function.parameters).toMatchObject({
       required: ["path", "content"],
-      properties: {
-        path: { minLength: 1 },
-      },
+      properties: { path: { description: "Path to the file to write (relative or absolute)" } },
     });
     expect(write?.function.parameters).not.toHaveProperty("properties.content.maxLength");
-    expect(append).toBeUndefined();
-    expect(DURABLE_BASE_BUILT_IN_TOOLS).not.toContain("append_file");
+    expect(bash?.function.parameters).toMatchObject({
+      required: ["command"],
+      properties: { timeout: { description: "Timeout in seconds (optional, no default timeout)" } },
+    });
     expect(edit?.function.parameters).toMatchObject({
-      required: ["path", "old_string", "new_string"],
+      required: ["path", "edits"],
       properties: {
-        path: { minLength: 1 },
-        old_string: { minLength: 1 },
+        edits: {
+          items: { required: ["oldText", "newText"] },
+        },
       },
     });
-    expect(edit?.function.parameters).not.toHaveProperty("properties.old_string.maxLength");
-    expect(edit?.function.parameters).not.toHaveProperty("properties.new_string.maxLength");
+    expect(DURABLE_BASE_BUILT_IN_TOOLS.slice(0, 7)).toEqual(["read", "bash", "edit", "write", "grep", "find", "ls"]);
   });
 
   it("offers the same file-edit tools to DeepSeek V4 Flash", () => {
@@ -112,12 +112,11 @@ describe("durable turn runner", () => {
     };
 
     const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
-    expect(names).toContain("apply_patch");
-    expect(names).toContain("edit_file");
-    expect(names).not.toContain("append_file");
+    expect(names).toContain("edit");
+    expect(names).toContain("write");
 
     current.runtimeRequest = { ...current.runtimeRequest, model: "kimi-2.6" };
-    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("edit_file");
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("edit");
   });
 
   it("starts in live mode without a global router for snapshot-admitted providers", () => {
@@ -1068,32 +1067,54 @@ describe("durable turn runner", () => {
     });
   });
 
-  it("stops after two identical tool failures instead of starting a third loop", async () => {
-    const first = {
+  it("allows a fifth identical tool attempt after four matching failures", async () => {
+    const error = "Arguments must include content; raw is not supported";
+    const failures = Array.from({ length: 4 }, (_, index) => ({
       ...toolStep("failed", "idempotent", false),
-      sequence: 1,
-      error: "Arguments must include content; raw is not supported",
-    };
-    const second = {
+      sequence: index + 1,
+      error,
+    }));
+    const pending = { ...toolStep("pending", "idempotent", false), sequence: 5 };
+    let executions = 0;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...failures, pending]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        throw new Error(error);
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === pending.id)).toMatchObject({
+      state: "failed",
+      error,
+    });
+  });
+
+  it("stops after five identical tool failures instead of starting a sixth loop", async () => {
+    const error = "Arguments must include content; raw is not supported";
+    const failures = Array.from({ length: 5 }, (_, index) => ({
       ...toolStep("failed", "idempotent", false),
-      sequence: 2,
-      error: "Arguments must include content; raw is not supported",
-    };
-    const pending = { ...toolStep("pending", "idempotent", false), sequence: 3 };
+      sequence: index + 1,
+      error,
+    }));
+    const pending = { ...toolStep("pending", "idempotent", false), sequence: 6 };
     const laterPendingToolCallId = randomUUID();
     const laterPending = {
       ...toolStep("pending", "idempotent", false),
-      sequence: 4,
+      sequence: 7,
       input: {
         toolCallId: laterPendingToolCallId,
-        toolName: "write_file",
+        toolName: "write",
         arguments: { path: "/workspace/later.txt", content: "next" },
         requiresApproval: false,
         approvalKind: "file-edit",
       },
     };
     let executions = 0;
-    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second, pending, laterPending]));
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...failures, pending, laterPending]));
     const runner = new DurableTurnRunner(repository, unusedModel(), {
       execute: async () => {
         executions += 1;
@@ -1104,7 +1125,8 @@ describe("durable turn runner", () => {
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
       .resolves.toMatchObject({ state: "failed" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("failed twice with the same argument shape");
+    expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
+    expect(repository.current.error).toContain("before attempt 6");
     expect(repository.current.steps.find((step) => step.id === pending.id)?.state).toBe("failed");
     expect(repository.current.steps.find((step) => step.id === laterPending.id)?.state).toBe("failed");
     const terminalMutation = repository.mutations.at(-1)!;
@@ -1116,6 +1138,85 @@ describe("durable turn runner", () => {
       expect.objectContaining({ toolCallId: pending.input.toolCallId, status: "failed" }),
       expect.objectContaining({ toolCallId: laterPendingToolCallId, status: "failed" }),
     ]);
+  });
+
+  it("counts identical failures across unrelated tool calls", async () => {
+    const error = "write requires a non-empty path";
+    const writeArguments = { path: "", content: "result" };
+    const steps: DurableTurnStep[] = [admittedStep()];
+    for (let index = 0; index < 5; index += 1) {
+      steps.push({
+        ...toolStep("failed", "idempotent", false),
+        id: randomUUID(),
+        sequence: index * 2 + 1,
+        type: "tool.write",
+        input: {
+          toolCallId: randomUUID(),
+          toolName: "write",
+          arguments: writeArguments,
+          requiresApproval: false,
+          approvalKind: "file-edit",
+        },
+        error,
+      });
+      steps.push({
+        ...runCommandStep("completed", index * 2 + 2, `printf ${index}`),
+        id: randomUUID(),
+        output: { exitCode: 0 },
+      });
+    }
+    const pending = {
+      ...toolStep("pending", "idempotent", false),
+      id: randomUUID(),
+      sequence: 11,
+      type: "tool.write",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "write",
+        arguments: writeArguments,
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    };
+    steps.push(pending);
+    let executions = 0;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", steps));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: {}, summary: "unexpected" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(executions).toBe(0);
+    expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
+  });
+
+  it("does not count changed tool arguments as a repeated failure", async () => {
+    const error = "Command exited with 1: ModuleNotFoundError: No module named 'build_agreement'";
+    const previousCommand = "python3 -c 'import build_agreement'";
+    const changedCommand = "cd /workspace/scripts && python3 -c 'import build_agreement'";
+    const failures = Array.from({ length: 5 }, (_, index) => ({
+      ...runCommandStep("failed", index + 1, previousCommand),
+      error,
+    }));
+    const pending = runCommandStep("pending", 6, changedCommand);
+    let executions = 0;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), ...failures, pending]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: { exitCode: 0 }, summary: "Command completed" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === pending.id)?.state).toBe("completed");
+    expect(repository.current.error).toBeNull();
   });
 
   it("stops a turn that exceeds the total model iteration limit", async () => {
@@ -1148,16 +1249,16 @@ describe("durable turn runner", () => {
     let imagePolicy: unknown;
     let writePolicy: unknown;
     let editPolicy: unknown;
-    let patchPolicy: unknown;
+    let bashPolicy: unknown;
     let toolNames: string[] = [];
     const runner = new DurableTurnRunner(repository, {
       call: async (_snapshot, _step, context) => {
         toolNames = context.tools.map((tool) => tool.function.name);
         composePolicy = context.policyForTool("compose_message");
         imagePolicy = context.policyForTool("create_image");
-        writePolicy = context.policyForTool("write_file");
-        editPolicy = context.policyForTool("edit_file");
-        patchPolicy = context.policyForTool("apply_patch");
+        writePolicy = context.policyForTool("write");
+        editPolicy = context.policyForTool("edit");
+        bashPolicy = context.policyForTool("bash");
         return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
       },
     }, noTools(), { owner: "worker-compose-definition" });
@@ -1185,10 +1286,10 @@ describe("durable turn runner", () => {
       requiresApproval: true,
       approvalKind: "file-edit",
     });
-    expect(patchPolicy).toEqual({
+    expect(bashPolicy).toEqual({
       retryClass: "non_idempotent_manual",
       requiresApproval: true,
-      approvalKind: "file-edit",
+      approvalKind: "shell",
     });
   });
 
@@ -1238,8 +1339,8 @@ describe("durable turn runner", () => {
         inputTokens: 1,
         outputTokens: 1,
         toolCalls: [
-          { id: "duplicate-call", name: "read_file", input: { path: "a" }, retryClass: "read_only", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" },
-          { id: "duplicate-call", name: "read_file", input: { path: "b" }, retryClass: "read_only", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" },
+          { id: "duplicate-call", name: "read", input: { path: "a" }, retryClass: "read_only", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" },
+          { id: "duplicate-call", name: "read", input: { path: "b" }, retryClass: "read_only", idempotencyKey: null, requiresApproval: false, approvalKind: "file-edit" },
         ],
       }),
     }, {
@@ -1652,7 +1753,7 @@ describe("durable turn runner", () => {
       "Sandbox path: /home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
     expect(JSON.stringify(userContent)).toContain(
-      "read_file extracts its text",
+      "read extracts its text",
     );
     expect(userContent).toContainEqual({
       type: "image_url",
@@ -1724,7 +1825,7 @@ describe("durable turn runner", () => {
         outputTokens: 8,
         toolCalls: [{
           id: toolCallId,
-          name: "read_file",
+          name: "read",
           input: { path: "/workspace/input.txt" },
           retryClass: "read_only",
           idempotencyKey: null,
@@ -1845,12 +1946,12 @@ describe("durable turn runner", () => {
         text: "",
         inputTokens: 1,
         outputTokens: 1,
-        toolCalls: [{ id: randomUUID(), name: "read_file", input: { path: "/workspace/a.txt" } }],
+        toolCalls: [{ id: randomUUID(), name: "read", input: { path: "/workspace/a.txt" } }],
       },
       toolResultMessage: {
         id: randomUUID(),
         toolCallId: randomUUID(),
-        name: "read_file",
+        name: "read",
         input: { path: "/workspace/a.txt" },
         status: "completed",
         output: { content: "ok" },
@@ -2290,11 +2391,11 @@ function toolStep(
   return {
     id: randomUUID(),
     sequence: 1,
-    type: "tool.write_file",
+    type: "tool.write",
     state,
     input: {
       toolCallId: randomUUID(),
-      toolName: "write_file",
+      toolName: "write",
       arguments: { path: "/workspace/result.txt", content: "done" },
       requiresApproval,
       approvalKind: "file-edit",
@@ -2304,6 +2405,25 @@ function toolStep(
     idempotencyKey: retryClass === "idempotent_with_key" ? `${runId}:tool:1` : null,
     attempt: state === "running" ? 1 : 0,
     error: null,
+  };
+}
+
+function runCommandStep(
+  state: DurableTurnStep["state"],
+  sequence: number,
+  command: string,
+): DurableTurnStep {
+  return {
+    ...toolStep(state, "idempotent", false),
+    sequence,
+    type: "tool.bash",
+    input: {
+      toolCallId: randomUUID(),
+      toolName: "bash",
+      arguments: { command },
+      requiresApproval: false,
+      approvalKind: "shell",
+    },
   };
 }
 

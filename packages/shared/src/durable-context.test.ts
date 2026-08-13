@@ -14,6 +14,13 @@ import {
 const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 describe("durable capability contract", () => {
+  it("admits Pi's coding tools for new turns without exposing Berry's legacy aliases", () => {
+    expect(DURABLE_BASE_BUILT_IN_TOOLS).toEqual([
+      "read", "bash", "edit", "write", "grep", "find", "ls",
+      "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill",
+    ]);
+  });
+
   it("accepts only connector keys that decode to exactly 32 bytes", () => {
     expect(isConnectorEncryptionKeyValid(key)).toBe(true);
     expect(isConnectorEncryptionKeyValid("connector-encryption-key")).toBe(false);

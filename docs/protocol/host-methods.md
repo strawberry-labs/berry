@@ -883,6 +883,9 @@ Result:
             "null"
           ]
         },
+        "continuation": {
+          "type": "boolean"
+        },
         "bufferedEvents": {
           "type": "array",
           "items": {

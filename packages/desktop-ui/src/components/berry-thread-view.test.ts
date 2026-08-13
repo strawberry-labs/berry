@@ -6,6 +6,7 @@ import {
   latestTerminalMessageStatus,
   latestArtifactToolCallIds,
   partitionAssistantParts,
+  shouldReplaceLatestSettledAssistantWithLiveTurn,
 } from "./berry-thread-view";
 import { classifyTurnSegments } from "./thread-stream";
 
@@ -54,6 +55,24 @@ describe("failed assistant turn recovery", () => {
   });
 });
 
+describe("continued assistant turn projection", () => {
+  it("keeps the interrupted settled assistant visible beside resumed live work", () => {
+    expect(shouldReplaceLatestSettledAssistantWithLiveTurn({
+      liveVisible: true,
+      latestTurnHasUser: true,
+      continuation: true,
+    })).toBe(false);
+  });
+
+  it("still replaces a normal turn's optimistic settled projection", () => {
+    expect(shouldReplaceLatestSettledAssistantWithLiveTurn({
+      liveVisible: true,
+      latestTurnHasUser: true,
+      continuation: false,
+    })).toBe(true);
+  });
+});
+
 describe("terminal tool projection", () => {
   it("does not settle a streaming continuation from an older terminal message", () => {
     expect(latestTerminalMessageStatus([
@@ -82,7 +101,7 @@ describe("terminal tool projection", () => {
         arguments: { description: "Inspect files" },
         children: [{
           toolCallId: `child_${messageStatus}`,
-          name: "read_file",
+          name: "read",
           status: "running",
           args: { path: "/workspace/input.txt" },
         }],
@@ -112,9 +131,9 @@ describe("terminal tool projection", () => {
       kind: "tool-result",
       content: {
         toolCallId: "tool_explicit_failure",
-        name: "append_file",
+        name: "write",
         status: "failed",
-        summary: "append_file requires a non-empty path",
+        summary: "write requires a non-empty path",
       },
     }];
 

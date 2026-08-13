@@ -241,6 +241,7 @@ INSERT INTO turn_runs (
             requestId: input.requestId,
             admissionFingerprint: input.operationFingerprint,
             budgetReservationRequired: input.budgetReservationRequired,
+            continueInterruptedTurn: input.continueInterruptedTurn === true,
             input: input.input,
           }),
           JSON.stringify(input.groundingContext),
@@ -272,7 +273,16 @@ INSERT INTO turn_events (
   tenant_id,run_id,session_id,sequence,event_type,payload
 ) VALUES ($1::uuid,$2::uuid,$3::uuid,1,'turn.start',$4::jsonb)
         `.trim(),
-        [input.tenantId, runId, input.sessionId, JSON.stringify({ kind: "turn.start", turnId: runId })],
+        [
+          input.tenantId,
+          runId,
+          input.sessionId,
+          JSON.stringify({
+            kind: "turn.start",
+            turnId: runId,
+            ...(input.continueInterruptedTurn ? { continuation: true } : {}),
+          }),
+        ],
       );
       await executor.execute(
         `
@@ -345,9 +355,12 @@ WHERE tenant_id=$1::uuid AND request_id=$2 AND state='preparing'
         next_action: string | null;
         error: string | null;
         created_at: Date | string;
+        continuation: boolean;
       }>(
         `
-SELECT id,state,lease_owner,waiting_reason,next_action,error,created_at FROM turn_runs
+SELECT id,state,lease_owner,waiting_reason,next_action,error,created_at,
+       COALESCE(runtime_request->>'continueInterruptedTurn' = 'true',false) AS continuation
+FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
 ORDER BY created_at DESC
 LIMIT 1
@@ -405,6 +418,7 @@ LIMIT 256
       return TurnStateSchema.parse({
         active,
         turnId: run.id,
+        continuation: run.continuation,
         bufferedEvents,
         lastEventId: maximum === null ? null : `${run.id}:${maximum}`,
         startedAt: run.created_at instanceof Date

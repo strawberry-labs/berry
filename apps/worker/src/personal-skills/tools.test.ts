@@ -103,9 +103,9 @@ describe("DurablePersonalSkillToolExecutor", () => {
       output: { skill: { name: "imported-skill" } },
     });
     expect(read).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({
-      type: "tool.read_file",
+      type: "tool.read",
       input: expect.objectContaining({
-        toolName: "read_file",
+        toolName: "read",
         arguments: { path: "/workspace/skills/imported/SKILL.md" },
       }),
     }));

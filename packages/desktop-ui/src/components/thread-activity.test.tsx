@@ -36,9 +36,9 @@ describe("terminal tool labels", () => {
       startedAt: 0,
     });
     const tools: ActivityTool[] = [
-      running("run_command", { command: "printf done" }),
-      running("read_file", { path: "/workspace/input.txt" }),
-      running("append_file", { path: "/workspace/output.txt" }),
+      running("bash", { command: "printf done" }),
+      running("read", { path: "/workspace/input.txt" }),
+      running("write", { path: "/workspace/output.txt" }),
       running("grep", { pattern: "needle", path: "/workspace" }),
       running("skill", { name: "memo" }),
       running("ask_user_question", { question: "Continue?" }),

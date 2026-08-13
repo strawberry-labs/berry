@@ -92,6 +92,7 @@ export interface E2BSandboxLike {
     }): Promise<E2BCommandHandleLike | E2BCommandResultLike>;
   };
   getHost(port: number): string;
+  setTimeout(timeoutMs: number): Promise<void>;
   pause(options?: { keepMemory?: boolean | undefined }): Promise<boolean>;
 }
 
@@ -164,6 +165,7 @@ type SandboxRecord = {
 const DEFAULT_RESOURCES = SandboxResourceLimitsSchema.parse({});
 const DEFAULT_RECONNECT_TTL_SECONDS = 900;
 const ACTIVE_EXPIRY_SAFETY_MS = 2_000;
+const MAX_KEEPALIVE_INTERVAL_MS = 60_000;
 
 /** Direct, server-side E2B implementation of Berry's provider-neutral sandbox contract. */
 export class E2BSandboxProvider implements SandboxProvider {
@@ -315,6 +317,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     const onAbort = () => void handle.kill().catch(() => false);
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
+    const stopKeepAlive = record ? this.#keepAliveWhileRunning(record, handle, channel) : async () => undefined;
 
     void (async () => {
       let status: "completed" | "failed" | "cancelled" = "completed";
@@ -338,6 +341,19 @@ export class E2BSandboxProvider implements SandboxProvider {
           channel.push(SandboxExecEventSchema.parse({ kind: "error", message: errorMessage(error), code: "e2b_command_failed" }));
         }
       } finally {
+        await stopKeepAlive();
+        if (record) {
+          try {
+            await this.#refreshTimeout(record);
+          } catch (error) {
+            if (status === "completed") status = "failed";
+            channel.push(SandboxExecEventSchema.parse({
+              kind: "error",
+              message: `Unable to reset the sandbox idle timeout after the command finished: ${errorMessage(error)}`,
+              code: "e2b_idle_timeout_reset_failed",
+            }));
+          }
+        }
         options.signal?.removeEventListener("abort", onAbort);
         const usage = this.#usageEvent(parsed, record, startedAt, status);
         if (usage) channel.push(usage);
@@ -382,6 +398,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     const parsed = SandboxResumeInputSchema.parse(input);
     const current = this.#sandboxes.get(parsed.sandbox_id);
     if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) {
+      await this.#refreshTimeout(current);
       return current.handle;
     }
 
@@ -507,7 +524,10 @@ export class E2BSandboxProvider implements SandboxProvider {
 
   async #sandbox(sandboxId: string): Promise<E2BSandboxLike> {
     const current = this.#sandboxes.get(sandboxId);
-    if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) return current.sandbox;
+    if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) {
+      await this.#refreshTimeout(current);
+      return current.sandbox;
+    }
 
     const info = await this.#client.getInfo(sandboxId, this.#authOptions());
     if (info.state === "paused") throw new SandboxPausedError(sandboxId);
@@ -524,6 +544,47 @@ export class E2BSandboxProvider implements SandboxProvider {
       this.#remember(sandbox, handle, resources, ttlSeconds);
     }
     return sandbox;
+  }
+
+  async #refreshTimeout(record: SandboxRecord): Promise<void> {
+    const now = this.#now().getTime();
+    const ttlMs = record.ttlSeconds * 1_000;
+    await record.sandbox.setTimeout(ttlMs);
+    record.activeUntil = now + ttlMs;
+    record.handle = SandboxHandleSchema.parse({
+      ...record.handle,
+      expires_at: new Date(record.activeUntil).toISOString(),
+    });
+  }
+
+  #keepAliveWhileRunning(
+    record: SandboxRecord,
+    handle: E2BCommandHandleLike,
+    channel: EventChannel<SandboxExecEvent>,
+  ): () => Promise<void> {
+    const intervalMs = Math.max(1_000, Math.min(MAX_KEEPALIVE_INTERVAL_MS, record.ttlSeconds * 500));
+    let refreshPromise: Promise<void> | null = null;
+    let stopped = false;
+    const timer = setInterval(() => {
+      if (stopped || refreshPromise) return;
+      refreshPromise = this.#refreshTimeout(record).catch((error) => {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(timer);
+        channel.push(SandboxExecEventSchema.parse({
+          kind: "error",
+          message: `Unable to keep the sandbox active while the command was running: ${errorMessage(error)}`,
+          code: "e2b_keepalive_failed",
+        }));
+        void handle.kill().catch(() => false);
+      }).finally(() => { refreshPromise = null; });
+    }, intervalMs);
+    timer.unref?.();
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await refreshPromise;
+    };
   }
 
   #remember(sandbox: E2BSandboxLike, handle: SandboxHandle, resources: SandboxResourceLimits, ttlSeconds: number): void {

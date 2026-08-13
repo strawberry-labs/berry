@@ -125,8 +125,8 @@ describe("DurableVisionToolExecutor", () => {
 
   it("guides text-only models to one task-directed inspection without searching for attachments", () => {
     expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("call focused mode directly");
-    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("do not search for them with list_files, read_file, or shell tools");
-    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("call read_file once");
+    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("do not search for them with ls, find, read");
+    expect(DURABLE_VISION_TOOL_SELECTION_PROMPT).toContain("call read once");
   });
 
   it("uses the admitted per-call estimate when the vision provider omits usage", async () => {

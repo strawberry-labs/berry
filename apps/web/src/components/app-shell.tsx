@@ -95,7 +95,11 @@ export function replayDurableStreamState(state: TurnState): StreamState {
   const replayEvents = state.active
     && state.turnId
     && !state.bufferedEvents.some((event) => event.kind === "turn.start")
-    ? [{ kind: "turn.start" as const, turnId: state.turnId, continuation: true }, ...state.bufferedEvents]
+    ? [{
+        kind: "turn.start" as const,
+        turnId: state.turnId,
+        ...(state.continuation ? { continuation: true } : {}),
+      }, ...state.bufferedEvents]
     : state.bufferedEvents;
   return replayEvents.reduce(
     (streamState, event) => reduceStream(streamState, event),
@@ -121,7 +125,15 @@ export function reduceDurableTurnState(
     error: null,
   };
   if (event.kind === "turn.start") {
-    return { ...base, active: true, turnId, runState: "queued", nextAction: "Waiting for worker", error: null };
+    return {
+      ...base,
+      active: true,
+      turnId,
+      continuation: event.continuation === true,
+      runState: "queued",
+      nextAction: "Waiting for worker",
+      error: null,
+    };
   }
   if (event.kind === "message.start" || event.kind === "message.delta" || event.kind === "message.end") {
     return { ...base, active: true, runState: "calling_model", waitingReason: null, nextAction: "Calling model" };
@@ -264,6 +276,14 @@ export function isInterruptedTurnAvailable(
     || currentTerminalState === "cancelled"
     || currentTerminalState === "recovery_required"
     || (currentTerminalState !== "completed" && isContinuableAssistantTurn(messages));
+}
+
+export async function continueAfterMessageRefresh(
+  refreshMessages: () => Promise<void>,
+  startContinuation: () => Promise<void>,
+): Promise<void> {
+  await refreshMessages();
+  await startContinuation();
 }
 
 export function shouldShowComposerProjectSwitcher(messages: readonly unknown[]): boolean {
@@ -1294,10 +1314,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     setStartingSessions((current) => new Set(current).add(sessionId));
     activeSessionsRef.current.add(sessionId);
     const pendingTurnId = `pending_${Date.now()}`;
-    updateSessionStream(sessionId, { kind: "turn.start", turnId: pendingTurnId });
+    updateSessionStream(sessionId, {
+      kind: "turn.start",
+      turnId: pendingTurnId,
+      ...(params.continueInterruptedTurn ? { continuation: true } : {}),
+    });
     applyDurableState(sessionId, {
       active: true,
       turnId: pendingTurnId,
+      continuation: params.continueInterruptedTurn === true,
       bufferedEvents: [],
       replayOnly: false,
       owner: null,
@@ -1336,6 +1361,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       applyDurableState(sessionId, {
         active: true,
         turnId: pendingTurnId,
+        continuation: params.continueInterruptedTurn === true,
         bufferedEvents: [],
         replayOnly: false,
         owner: null,
@@ -1355,6 +1381,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       applyDurableState(sessionId, {
         active: true,
         turnId: started.turnId,
+        continuation: params.continueInterruptedTurn === true,
         bufferedEvents: [],
         replayOnly: false,
         owner: null,
@@ -1410,6 +1437,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             applyDurableState(sessionId, {
               active: true,
               turnId: recovered.started.turnId,
+              continuation: params.continueInterruptedTurn === true,
               bufferedEvents: [],
               replayOnly: false,
               owner: null,
@@ -1458,6 +1486,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         applyDurableState(sessionId, {
           active: true,
           turnId: pendingTurnId,
+          continuation: params.continueInterruptedTurn === true,
           bufferedEvents: [],
           replayOnly: false,
           owner: null,
@@ -1609,9 +1638,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   const continueTurn = React.useCallback(async () => {
     if (!activeTask?.activeSessionId) return;
-    requestThreadBottom(activeTask.activeSessionId);
-    await runTurn(activeTask, { continueInterruptedTurn: true });
-  }, [activeTask, requestThreadBottom, runTurn]);
+    const sessionId = activeTask.activeSessionId;
+    requestThreadBottom(sessionId);
+    await continueAfterMessageRefresh(
+      () => refreshSessionMessages(sessionId),
+      () => runTurn(activeTask, { continueInterruptedTurn: true }),
+    );
+  }, [activeTask, refreshSessionMessages, requestThreadBottom, runTurn]);
 
   const createProject = React.useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();

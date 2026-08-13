@@ -91,7 +91,7 @@ describe("connector artifact staging", () => {
     expect(text).toContain("Downloaded brief.pdf for temporary use in this task.");
     expect(text).toContain("Sandbox path: /workspace/inputs/file-1/brief.pdf");
     expect(text).toContain("not added to the Berry Library or project knowledge");
-    expect(text).toContain("Use read_file on the sandbox path");
+    expect(text).toContain("Use read on the sandbox path");
     expect(text).not.toContain("Searchable extraction is queued");
   });
 

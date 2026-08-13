@@ -39,6 +39,12 @@ describe("sandbox contract schemas", () => {
       code: "print('ok')",
       language: "python",
     })).toMatchObject({ code: "print('ok')", language: "python", timeout_ms: 120_000 });
+    expect(SandboxExecInputSchema.parse({
+      sandbox_id: "sandbox_1",
+      request_id: "req_no_timeout",
+      command: ["bash", "-lc", "long-running-job"],
+      timeout_ms: 0,
+    })).toMatchObject({ timeout_ms: 0 });
   });
 
   it("locks the normalized signed usage fields from spec 04 section 6", () => {

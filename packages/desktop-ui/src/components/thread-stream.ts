@@ -137,6 +137,8 @@ export interface QuestionPrompt {
 export interface StreamState {
   turnActive: boolean;
   turnId: string | null;
+  /** This live run continues the latest settled interrupted assistant turn. */
+  continuation: boolean;
   text: string;
   reasoning: string;
   messageId: string | null;
@@ -156,13 +158,12 @@ export interface StreamState {
   sawText: boolean;
   /** Terminal status from turn.end; null while running or unknown. */
   endStatus: "completed" | "failed" | "cancelled" | null;
-  /** Preserve the interrupted assistant text through the first resumed message.start. */
-  continuationPendingMessage: boolean;
 }
 
 export const IDLE: StreamState = {
   turnActive: false,
   turnId: null,
+  continuation: false,
   text: "",
   reasoning: "",
   messageId: null,
@@ -174,7 +175,6 @@ export const IDLE: StreamState = {
   turnStartedAt: null,
   sawText: false,
   endStatus: null,
-  continuationPendingMessage: false,
 };
 
 /** Apply the text collected during one browser frame in the same order on
@@ -266,17 +266,13 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
     case "turn.start":
       if (event.continuation) {
         return {
-          ...state,
+          ...IDLE,
           turnActive: true,
           turnId: event.turnId,
-          messageId: null,
-          approval: null,
-          question: null,
-          error: null,
-          endStatus: null,
-          continuationPendingMessage: true,
-          // Keep the original start time: visually and semantically this is
-          // still the same assistant turn, with a provider pause in the middle.
+          continuation: true,
+          // The interrupted portion is now durable message history. Start a
+          // clean live projection so it renders once, immediately above the
+          // newly arriving continuation events.
           turnStartedAt: state.turnStartedAt ?? Date.now(),
         };
       }
@@ -295,8 +291,7 @@ export function reduceStream(state: StreamState, event: AgentStreamEvent): Strea
       return {
         ...state,
         messageId: event.messageId,
-        text: state.continuationPendingMessage ? state.text : "",
-        continuationPendingMessage: false,
+        text: "",
       };
     case "message.delta":
       return event.channel === "reasoning"
