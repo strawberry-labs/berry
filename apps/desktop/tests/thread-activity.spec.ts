@@ -83,7 +83,7 @@ test("chat rows expose pin and archive actions on hover", async ({ page }) => {
   await archive.hover();
   await expect(chat).toHaveCSS("padding-right", "64px");
   await expect(chat.locator(".berry-sidebar-task-meta")).toHaveCSS("opacity", "0");
-  await expect(page.getByRole("button", { name: "New chat in berry-chat" })).toHaveCSS("opacity", "0");
+  await expect(page.getByRole("button", { name: "New task in berry-chat" })).toHaveCSS("opacity", "0");
   await expect(page.getByRole("button", { name: "Actions for berry-chat" })).toHaveCSS("opacity", "0");
 
   await page.getByRole("button", { name: "Pin Fonts utilized in recreation" }).click();
@@ -100,7 +100,7 @@ test("project rows expose new-chat and project management actions", async ({ pag
 
   const project = page.locator(".berry-sidebar-workspace-row", { hasText: "berry-chat" });
   await project.hover();
-  await expect(page.getByRole("button", { name: "New chat in berry-chat" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task in berry-chat" })).toBeVisible();
   await page.getByRole("button", { name: "Actions for berry-chat" }).click();
   await expect(page.getByRole("menuitem", { name: "Pin project" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Reveal in Finder" })).toBeVisible();
@@ -713,7 +713,7 @@ test.describe("turn activity accordion", () => {
     await page.goto("/");
     await page.getByRole("button", { name: /Fonts utilized in recreation/ }).click();
 
-    await page.getByRole("button", { name: "Fork conversation" }).first().click();
+    await page.getByRole("button", { name: "Fork task" }).first().click();
     await expect(page.getByText("First question")).toBeVisible();
     await expect(page.getByText("First answer")).toBeVisible();
     await expect(page.getByText("Second question")).toHaveCount(0);
@@ -767,7 +767,7 @@ test.describe("turn activity accordion", () => {
     await page.getByRole("button", { name: "More actions" }).click();
     await page.getByRole("menuitem", { name: "Task timeline" }).click();
     await page.getByRole("dialog", { name: "Task timeline" })
-      .getByRole("button", { name: "Restore conversation from Second question" })
+      .getByRole("button", { name: "Restore task from Second question" })
       .click();
     await page.keyboard.press("Escape");
 
@@ -783,7 +783,7 @@ test.describe("turn activity accordion", () => {
     await page.getByRole("button", { name: /Fonts utilized in recreation/ }).click();
 
     await page.getByRole("button", { name: "More actions" }).click();
-    await page.getByRole("menuitem", { name: "Compact conversation" }).click();
+    await page.getByRole("menuitem", { name: "Compact task" }).click();
 
     await expect(page.locator('[data-session-note="compacted"]')).toContainText("Compacted 420 tokens into a summary");
   });

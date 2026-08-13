@@ -18,7 +18,6 @@ import {
 import type { ChatContentPart, ImageGenerationResult } from "@berry/router-client";
 import {
   DEFAULT_SANDBOX_INPUT_MAX_BYTES,
-  DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
   ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
   type JsonValue,
 } from "@berry/shared";
@@ -363,7 +362,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (typeof args.raw === "string") {
       throw new Error(
-        `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper. For large text, write a small first chunk and continue with append_file in separate tool turns.`,
+        `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper.`,
       );
     }
     validateFileToolArguments(toolName, args);
@@ -443,6 +442,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sandbox,
       };
     }
+    // Legacy compatibility for append steps persisted before append_file was
+    // removed from the model-visible toolset.
     if (toolName === "append_file") {
       const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
       const content = requiredToolString(args, "content", toolName);
@@ -1908,12 +1909,12 @@ function validateFileToolArguments(toolName: string, args: Record<string, unknow
   }
   if (toolName === "write_file") {
     requiredToolPath(args, toolName);
-    boundedFileToolContent(requiredToolString(args, "content", toolName, true), toolName);
+    requiredToolString(args, "content", toolName, true);
     return;
   }
   if (toolName === "append_file") {
     requiredToolPath(args, toolName);
-    boundedFileToolContent(requiredToolString(args, "content", toolName), toolName);
+    requiredToolString(args, "content", toolName);
     const expectedSizeBytes = numberValue(args.expected_size_bytes);
     if (expectedSizeBytes === null || !Number.isInteger(expectedSizeBytes) || expectedSizeBytes < 0) {
       throw new Error("append_file requires a non-negative integer expected_size_bytes from the previous write result");
@@ -1922,8 +1923,8 @@ function validateFileToolArguments(toolName: string, args: Record<string, unknow
   }
   if (toolName === "edit_file") {
     requiredToolPath(args, toolName);
-    boundedEditFileContent(requiredToolString(args, "old_string", toolName), "old_string");
-    boundedEditFileContent(requiredToolString(args, "new_string", toolName, true), "new_string");
+    requiredToolString(args, "old_string", toolName);
+    requiredToolString(args, "new_string", toolName, true);
   }
 }
 
@@ -1948,25 +1949,6 @@ function requiredToolString(
     throw new Error(`${toolName} requires ${allowEmpty ? "a string" : "a non-empty string"} ${field}`);
   }
   return value;
-}
-
-function boundedFileToolContent(content: string, toolName: string): void {
-  if (content.length <= DURABLE_FILE_TOOL_MAX_CONTENT_CHARS) return;
-  if (toolName === "write_file") {
-    throw new Error(
-      `write_file content is ${content.length} characters; retry write_file with the first ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters or fewer, then use its returned sizeBytes as expected_size_bytes for later append_file chunks while repeating the exact path.`,
-    );
-  }
-  throw new Error(
-    `${toolName} content is ${content.length} characters; retry append_file with one chunk at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters while repeating the exact path and the unchanged preceding sizeBytes.`,
-  );
-}
-
-function boundedEditFileContent(content: string, field: "old_string" | "new_string"): void {
-  if (content.length <= DURABLE_FILE_TOOL_MAX_CONTENT_CHARS) return;
-  throw new Error(
-    `edit_file ${field} is ${content.length} characters; use apply_patch or several smaller exact replacements, and repeat the exact non-empty path on every edit_file call. Each old_string and new_string must be at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters.`,
-  );
 }
 
 function immediateSkillPackageBytes(file: DurableSkillPackageFile): Buffer | null {

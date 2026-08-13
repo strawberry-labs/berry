@@ -24,7 +24,7 @@ export function GlobalApprovals({ approvals, tasks, onOpenTask }: {
             return (
               <DropdownMenuItem key={approval.id} disabled={!approval.taskId} onClick={() => { if (approval.taskId) onOpenTask(approval.taskId); }}>
                 <ShieldCheck />
-                <span className="min-w-0 flex-1"><strong className="block truncate">{title}</strong><small className="block truncate text-muted-foreground">{task?.title ?? "Background conversation"} · {approval.status}</small></span>
+                <span className="min-w-0 flex-1"><strong className="block truncate">{title}</strong><small className="block truncate text-muted-foreground">{task?.title ?? "Background task"} · {approval.status}</small></span>
               </DropdownMenuItem>
             );
           })}

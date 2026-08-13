@@ -8,9 +8,9 @@ describe("TaskRouteState", () => {
       <TaskRouteState state="failed" onRetry={vi.fn()} onHome={vi.fn()} />,
     );
 
-    expect(html).toContain("Conversation unavailable");
+    expect(html).toContain("Task unavailable");
     expect(html).toContain("Retry");
-    expect(html).toContain("Back to chats");
+    expect(html).toContain("Back to tasks");
     expect(html).toContain("--berry-card-bg");
   });
 
@@ -22,7 +22,7 @@ describe("TaskRouteState", () => {
       <TaskRouteState state="forbidden" onRetry={vi.fn()} onHome={vi.fn()} />,
     );
 
-    expect(deleted).toContain("Restore conversation");
-    expect(forbidden).not.toContain("Restore conversation");
+    expect(deleted).toContain("Restore task");
+    expect(forbidden).not.toContain("Restore task");
   });
 });

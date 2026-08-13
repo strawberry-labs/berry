@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DURABLE_BASE_BUILT_IN_TOOLS,
-  DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
   latestAssistantStreamDraft,
   type AgentStreamEvent,
   type TurnRunState,
@@ -16,7 +15,6 @@ import {
 import {
   DurableTurnRunner,
   DurableTurnRetryableError,
-  DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT,
   DURABLE_IMAGE_TOOL_SELECTION_PROMPT,
   DURABLE_TOOL_DEFINITIONS,
   RouterDurableTurnModel,
@@ -24,7 +22,6 @@ import {
   SqlDurableTurnRepository,
   createDurableTurnModel,
   durableImageToolSelectionPrompt,
-  durableProviderCompatibilityPrompt,
   durableBuiltInToolDefinitions,
   type DurableTurnModel,
   type DurableTurnMutation,
@@ -56,7 +53,7 @@ describe("durable turn runner", () => {
     expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
   });
 
-  it("advertises bounded, explicit file arguments and a DeepSeek compatibility guard", () => {
+  it("advertises unrestricted writes and edits without append_file", () => {
     const write = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "write_file");
     const append = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "append_file");
     const edit = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "edit_file");
@@ -65,35 +62,23 @@ describe("durable turn runner", () => {
       required: ["path", "content"],
       properties: {
         path: { minLength: 1 },
-        content: { maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
       },
     });
-    expect(append?.function.parameters).toMatchObject({
-      required: ["path", "content", "expected_size_bytes"],
-      properties: {
-        path: { minLength: 1 },
-        content: { minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
-      },
-    });
+    expect(write?.function.parameters).not.toHaveProperty("properties.content.maxLength");
+    expect(append).toBeUndefined();
+    expect(DURABLE_BASE_BUILT_IN_TOOLS).not.toContain("append_file");
     expect(edit?.function.parameters).toMatchObject({
       required: ["path", "old_string", "new_string"],
       properties: {
         path: { minLength: 1 },
-        old_string: { minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
-        new_string: { maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+        old_string: { minLength: 1 },
       },
     });
-    expect(durableProviderCompatibilityPrompt(
-      "canopywave/deepseek/deepseek-v4-flash",
-      DURABLE_BASE_BUILT_IN_TOOLS,
-    )).toBe(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT);
-    expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain("always send all three fields");
-    expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain('"expected_size_bytes":8421');
-    expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain("edit_file is intentionally unavailable");
-    expect(durableProviderCompatibilityPrompt("kimi-2.6", DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
+    expect(edit?.function.parameters).not.toHaveProperty("properties.old_string.maxLength");
+    expect(edit?.function.parameters).not.toHaveProperty("properties.new_string.maxLength");
   });
 
-  it("uses apply_patch instead of edit_file for DeepSeek V4 Flash", () => {
+  it("offers the same file-edit tools to DeepSeek V4 Flash", () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest = {
       capabilityVersion: 1,
@@ -128,7 +113,8 @@ describe("durable turn runner", () => {
 
     const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
     expect(names).toContain("apply_patch");
-    expect(names).not.toContain("edit_file");
+    expect(names).toContain("edit_file");
+    expect(names).not.toContain("append_file");
 
     current.runtimeRequest = { ...current.runtimeRequest, model: "kimi-2.6" };
     expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("edit_file");
@@ -1100,8 +1086,8 @@ describe("durable turn runner", () => {
       sequence: 4,
       input: {
         toolCallId: laterPendingToolCallId,
-        toolName: "append_file",
-        arguments: { path: "/workspace/result.txt", content: "next", expected_size_bytes: 4 },
+        toolName: "write_file",
+        arguments: { path: "/workspace/later.txt", content: "next" },
         requiresApproval: false,
         approvalKind: "file-edit",
       },
@@ -1827,7 +1813,7 @@ describe("durable turn runner", () => {
         toolCalls: [{ id: toolCallId }],
       });
     expect(replayedRequest?.messages.find((message) => message.role === "system")?.content)
-      .toContain(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT);
+      .not.toContain("file-tool compatibility guard");
   });
 
   it("casts persisted tool statuses to the PostgreSQL enum", async () => {

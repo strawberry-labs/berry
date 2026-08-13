@@ -43,11 +43,11 @@ test("personal settings routes own their screens and preserve local preferences"
   await expect(page.getByLabel("Custom instructions")).toHaveValue("Keep answers concise and show verification results.");
 });
 
-test("archived chats are a final personal setting and stay out of the home composer", async ({ page }) => {
+test("archived tasks are a final personal setting and stay out of the home composer", async ({ page }) => {
   await page.goto("/settings/archived");
-  await expect(page.getByRole("heading", { name: "Archived chats", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Archived tasks", exact: true })).toBeVisible();
   const navigation = page.getByRole("navigation", { name: "Personal settings" });
-  await expect(navigation.getByRole("button", { name: "Archived chats" })).toBeVisible();
+  await expect(navigation.getByRole("button", { name: "Archived tasks" })).toBeVisible();
 });
 
 test("organization admin routes support direct navigation and validated analytics search", async ({ page }) => {

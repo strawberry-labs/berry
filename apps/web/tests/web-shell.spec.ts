@@ -154,7 +154,7 @@ test("search and command-K open one command palette", async ({ page }) => {
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   await page.getByRole("button", { name: "Search", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Search Berry" })).toBeVisible();
-  await page.getByPlaceholder("Search conversations and actions…").fill("Quick model question");
+  await page.getByPlaceholder("Search tasks and actions…").fill("Quick model question");
   await page.getByRole("option", { name: /Quick model question/ }).click();
   await expect(page).toHaveURL(/\/tasks\/task_chat$/);
   await expect(page.getByRole("heading", { name: "Quick model question" })).toBeVisible();
@@ -170,7 +170,7 @@ test("task deep links and invalid routes remain durable", async ({ page }) => {
   await expect(page).toHaveURL(/\/tasks\/task_cloud$/);
 
   await page.goto("/tasks/missing-task");
-  await expect(page.getByRole("heading", { name: "Conversation not found" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Task not found" })).toBeVisible();
   await expect(page.getByTestId("composer-input")).toHaveCount(0);
 });
 
@@ -344,7 +344,7 @@ test("turn presentation remains scoped to its session while navigating between t
 test("home route opens the centered new-chat composer without creating a thread", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
-  await expect(page.getByRole("button", { name: "New chat", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: /Good (morning|afternoon|evening)/ })).toBeVisible();
   await expect(page.getByTestId("composer-input")).toBeVisible();
   await expect(page.getByText(/Ask Berry anything/)).toBeVisible();
@@ -520,7 +520,7 @@ test("chat row actions stay visible while their upward menu is open", async ({ p
   await actions.click();
   await expect(page.getByRole("menuitem", { name: "Share" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
-  await expect(page.getByRole("menuitem", { name: "Pin chat" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Pin task" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Archive" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Delete" })).toBeVisible();
   await expect(actions).toBeVisible();
@@ -533,11 +533,11 @@ test("archived and deleted conversations can be restored", async ({ page }) => {
   await expect(page).toHaveURL("/");
   await expect(page.getByText(/Archived and deleted|Deleted \(1\)/)).toHaveCount(0);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Archived chats", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Archived chats" })).toBeVisible();
+  await page.getByRole("button", { name: "Archived tasks", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Archived tasks" })).toBeVisible();
   await expect(page.getByText("Cloud sandbox smoke")).toBeVisible();
   await page.getByRole("button", { name: "Unarchive" }).click();
-  await expect(page.getByText("No archived chats")).toBeVisible();
+  await expect(page.getByText("No archived tasks")).toBeVisible();
 
   await openTask(page);
   await page.getByRole("button", { name: "More actions" }).click();
@@ -545,7 +545,7 @@ test("archived and deleted conversations can be restored", async ({ page }) => {
   await expect(page).toHaveURL("/");
   await expect(page.getByText(/Archived and deleted|Deleted \(1\)/)).toHaveCount(0);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Archived chats", exact: true }).click();
+  await page.getByRole("button", { name: "Archived tasks", exact: true }).click();
   await page.getByLabel("Archive state").selectOption("deleted");
   await expect(page.getByText("Cloud sandbox smoke")).toBeVisible();
   await page.getByRole("button", { name: "Restore" }).click();
@@ -568,7 +568,7 @@ test("web composer keeps model and reasoning controls and opens the mobile sideb
   const sidebarTrigger = page.getByRole("button", { name: "Toggle Sidebar" });
   await sidebarTrigger.click();
   await expect(page.getByRole("dialog", { name: "Sidebar" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "New chat", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "Sidebar" })).toHaveCount(0);
   await expect(sidebarTrigger).toBeFocused();

@@ -1,7 +1,7 @@
 import * as React from "react";
 import { DollarSign, LogOut } from "lucide-react";
 import type { AllowanceBalance, OrgPermission, Task, Workspace } from "@berry/shared";
-import { BerryConversationSidebarContent } from "@berry/desktop-ui/components/berry-conversation-sidebar";
+import { BerryConversationSidebarContent, taskHasUnreadActivity, taskIsInProgress } from "@berry/desktop-ui/components/berry-conversation-sidebar";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@berry/desktop-ui/components/ui/avatar";
 import { Kbd } from "@berry/desktop-ui/components/ui/kbd";
@@ -40,6 +40,8 @@ const ProjectUploadDialog = React.lazy(() => import("../projects/project-upload-
 
 export type SettingsTab = "general" | "account" | "personalization" | "connectors" | "mcp" | "skills" | "usage" | "archived";
 
+export { taskHasUnreadActivity, taskIsInProgress };
+
 export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "general", label: "General" },
   { id: "account", label: "Account" },
@@ -48,7 +50,7 @@ export const WEB_SETTINGS_NAV: Array<{ id: SettingsTab; label: string }> = [
   { id: "skills", label: "Skills" },
   { id: "mcp", label: "MCP servers" },
   { id: "usage", label: "Usage" },
-  { id: "archived", label: "Archived chats" },
+  { id: "archived", label: "Archived tasks" },
 ];
 
 export function WebWindowChrome({ onHome, onSearch }: {
@@ -162,7 +164,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
         commands={(
           <>
             <SidebarMenu className="berry-sidebar-commands">
-              <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New chat</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem>
+              <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New task</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem>
             </SidebarMenu>
@@ -282,7 +284,7 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
           <DropdownMenuItem onSelect={() => setUploadOpen(true)}><Upload />Upload to project</DropdownMenuItem>
           <DropdownMenuItem onSelect={() => { setRenameValue(workspace.name); setRenameOpen(true); }}><Pencil />Rename project</DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem disabled={tasks.length === 0} onSelect={() => setArchiveOpen(true)}><Archive />Archive chats</DropdownMenuItem>
+          <DropdownMenuItem disabled={tasks.length === 0} onSelect={() => setArchiveOpen(true)}><Archive />Archive tasks</DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" onSelect={() => setRemoveOpen(true)}><Trash2 />Remove</DropdownMenuItem>
         </DropdownMenuContent>
@@ -299,11 +301,11 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
       </Dialog>
 
       <AlertDialog open={archiveOpen} onOpenChange={setArchiveOpen}>
-        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Archive chats in {workspace.name}?</AlertDialogTitle><AlertDialogDescription>This archives {tasks.length} chat{tasks.length === 1 ? "" : "s"}. Archived chats remain recoverable.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void onArchiveChats(workspace, tasks)}>Archive chats</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
+        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Archive tasks in {workspace.name}?</AlertDialogTitle><AlertDialogDescription>This archives {tasks.length} task{tasks.length === 1 ? "" : "s"}. Archived tasks remain recoverable.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void onArchiveChats(workspace, tasks)}>Archive tasks</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
       </AlertDialog>
 
       <AlertDialog open={removeOpen} onOpenChange={setRemoveOpen}>
-        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Remove {workspace.name}?</AlertDialogTitle><AlertDialogDescription>This removes the project and its chats from Berry. This cannot be undone.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void onRemove(workspace)}>Remove</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
+        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Remove {workspace.name}?</AlertDialogTitle><AlertDialogDescription>This removes the project and its tasks from Berry. This cannot be undone.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void onRemove(workspace)}>Remove</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
       </AlertDialog>
     </>
   );

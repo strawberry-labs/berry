@@ -86,7 +86,7 @@ function NewCommandDialog() {
           <DialogHeader>
             <DialogTitle>New command</DialogTitle>
             <DialogDescription>
-              Commands can be invoked with /command-name in chat.
+              Commands can be invoked with /command-name in a task.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-2">
@@ -217,7 +217,7 @@ export function CommandsSettings() {
     <div className="flex flex-col gap-6">
       <SettingsPageHeader
         title="Commands"
-        description="Manage Berry command files. Commands can be invoked with /command-name in chat."
+        description="Manage Berry command files. Commands can be invoked with /command-name in a task."
         actions={<NewCommandDialog />}
       />
 
@@ -256,7 +256,7 @@ export function CommandsSettings() {
                   </EmptyMedia>
                   <EmptyTitle className="text-sm">No user commands</EmptyTitle>
                   <EmptyDescription>
-                    Create a command to reuse a prompt with a quick /name in chat.
+                    Create a command to reuse a prompt with a quick /name in a task.
                   </EmptyDescription>
                 </EmptyHeader>
               </Empty>

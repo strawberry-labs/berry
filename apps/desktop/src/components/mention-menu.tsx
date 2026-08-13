@@ -176,7 +176,7 @@ export function useMentions({
       };
     }
     if (trigger === "$") return build("Skills", "skills", skillItems, skillsQuery.isLoading);
-    return build("Conversations", "sessions", taskItems, tasksQuery.isLoading);
+    return build("Tasks", "sessions", taskItems, tasksQuery.isLoading);
   }, [
     trigger,
     query,

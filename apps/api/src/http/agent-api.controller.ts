@@ -11,6 +11,7 @@ import {
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
   IMAGE_ASPECT_RATIO_DIMENSIONS,
+  ISODateSchema,
   JsonValueSchema,
   messageAttachmentContent,
   MessagePartKindSchema,
@@ -34,6 +35,7 @@ import {
   type JsonValue,
   type Message,
   type ModelGovernanceDecision,
+  type TaskStatus,
 } from "@berry/shared";
 import type {
   ApprovalDecisionKind,
@@ -60,7 +62,7 @@ import { FilePlatformService } from "../files/file-platform.service.ts";
 import { KnowledgeService } from "../knowledge/knowledge.service.ts";
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { MemoryService } from "../memory/memory.service.ts";
-import { DurableTurnService } from "../runtime/durable-turn.service.ts";
+import { DurableTurnService, type DurableTaskActivity } from "../runtime/durable-turn.service.ts";
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
 import {
   ENTERPRISE_IDENTITY_REPOSITORY,
@@ -91,6 +93,8 @@ const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
 const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 16_384;
 const DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS = 1_500;
+const DURABLE_TASK_WITHOUT_ADMISSION_STALE_MS = 15_000;
+const DURABLE_PREPARING_ADMISSION_STALE_MS = 120_000;
 
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
@@ -121,7 +125,13 @@ const UpdateTaskRequestSchema = z.object({
   pinned: z.boolean().optional(),
   archived: z.boolean().optional(),
   conversationKind: ConversationKindSchema.optional(),
-}).strict();
+  read: z.boolean().optional(),
+  readThrough: ISODateSchema.optional(),
+}).strict().superRefine((request, context) => {
+  if (request.readThrough && request.read !== true) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["readThrough"], message: "readThrough requires read=true" });
+  }
+});
 
 const CreateSessionRequestSchema = z.object({
   parentSessionId: z.string().nullable().optional(),
@@ -313,6 +323,40 @@ export function durableAdmissionPreparationTimeoutMs(
   // Admission is user-visible and cancellable. Configuration may tighten the
   // budget for tests or an incident, but it cannot weaken the two-second SLA.
   return Math.min(configured, DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS);
+}
+
+export function durableTaskReconciliationStatus(
+  activity: DurableTaskActivity | undefined,
+  taskUpdatedAt: string,
+  nowMs = Date.now(),
+): TaskStatus | null {
+  const terminalRunStatus = activity?.runState === "completed"
+    ? "completed"
+    : activity?.runState === "cancelled"
+      ? "cancelled"
+      : activity?.runState === "failed" || activity?.runState === "recovery_required"
+        ? "failed"
+        : null;
+  if (activity?.runState && !terminalRunStatus) return null;
+
+  const admissionIsNewerThanRun = activity?.admissionCreatedAt !== null
+    && activity?.admissionCreatedAt !== undefined
+    && (activity.runCreatedAt === null
+      || Date.parse(activity.admissionCreatedAt) > Date.parse(activity.runCreatedAt));
+  if (admissionIsNewerThanRun && activity?.admissionState === "preparing") {
+    const lastProgressAt = activity?.admissionUpdatedAt ?? activity?.admissionCreatedAt;
+    if (lastProgressAt && nowMs - Date.parse(lastProgressAt) <= DURABLE_PREPARING_ADMISSION_STALE_MS) {
+      return null;
+    }
+    return "failed";
+  }
+  if (admissionIsNewerThanRun && activity?.admissionState === "cancelled") return "cancelled";
+  if (terminalRunStatus) return terminalRunStatus;
+  if (!activity?.runId && activity?.admissionState === "cancelled") return "cancelled";
+  if (!activity?.runId && nowMs - Date.parse(taskUpdatedAt) > DURABLE_TASK_WITHOUT_ADMISSION_STALE_MS) {
+    return "failed";
+  }
+  return null;
 }
 
 function logAdmissionPreparationDegraded(
@@ -970,8 +1014,12 @@ export class AgentApiController {
     @Query("includeDeleted") includeDeleted?: string,
     @Query("limit") limit?: string,
     @Query("offset") offset?: string,
+    @Query("taskIds") taskIds?: string,
   ) {
     await Promise.all(this.#projectionWrites.values());
+    const requestedTaskIds = taskIds
+      ? z.array(z.string().trim().min(1).max(128)).max(100).parse(taskIds.split(",").filter(Boolean))
+      : undefined;
     const tasks = await this.store.listTasks({
       ...(workspaceId ? { workspaceId } : {}),
       ...(workspaceKind ? { workspaceKind: WorkspaceKindSchema.parse(workspaceKind) } : {}),
@@ -979,26 +1027,35 @@ export class AgentApiController {
       includeDeleted: includeDeleted === "true",
       ...(limit ? { limit: z.coerce.number().int().positive().max(500).parse(limit) } : {}),
       ...(offset ? { offset: z.coerce.number().int().nonnegative().parse(offset) } : {}),
+      ...(requestedTaskIds ? { taskIds: requestedTaskIds } : {}),
     });
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const activeSessionIds = tasks.flatMap((task) => (
+      (task.status === "queued" || task.status === "running" || task.status === "waiting-for-approval")
+        && task.activeSessionId
+        ? [task.activeSessionId]
+        : []
+    ));
+    const durableActivity = this.durableTurns.enabled
+      ? await this.durableTurns.taskActivity(tenantId, activeSessionIds)
+      : new Map<string, DurableTaskActivity>();
     return Promise.all(tasks.map(async (task) => {
-      if (task.status !== "running" || !task.activeSessionId) return task;
+      const taskClaimsActivity = task.status === "queued"
+        || task.status === "running"
+        || task.status === "waiting-for-approval";
+      if (!taskClaimsActivity || !task.activeSessionId) return task;
       if (this.durableTurns.enabled) {
-        const durableState = await this.durableTurns.state(
-          tenantIdFromRequest(httpRequest),
-          task.activeSessionId,
+        const reconciledStatus = durableTaskReconciliationStatus(
+          durableActivity.get(task.activeSessionId),
+          task.updatedAt,
         );
-        if (durableState.active) return task;
-        const durableTerminal = [...durableState.bufferedEvents].reverse()
-          .find((event) => event.kind === "turn.end");
-        if (durableTerminal?.kind === "turn.end") {
+        if (reconciledStatus && reconciledStatus !== task.status) {
           return this.store.updateTask(
             task.id,
-            { status: durableTerminal.status },
+            { status: reconciledStatus },
             httpRequest.auth?.user.id ?? null,
           );
         }
-        // A missing/expired API process is not evidence that a durable worker
-        // run is dead. Leave reconciliation to the persisted run lease/state.
         return task;
       }
       const state = this.sessionHost.turnState(task.activeSessionId);
@@ -1298,6 +1355,7 @@ export class AgentApiController {
         logTurnAdmission("replayed", preparing.runId, Date.now() - admissionStartedAt);
         return { turnId: preparing.runId, sessionId };
       }
+      await this.store.updateTask(task.id, { status: "running" }, userId);
     }
     if (request.continueInterruptedTurn) {
       await this.assertContinuableTurn(sessionId);

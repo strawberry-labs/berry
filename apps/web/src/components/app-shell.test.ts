@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
+import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, durableTurnPhase, existingChatTurnModelOverride, hydratedExistingChatModel, initialCloudContent, isInterruptedTurnAvailable, newChatModelOverride, preferredNewChatModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, durableTurnPhase, existingChatTurnModelOverride, hydratedExistingChatModel, initialCloudContent, isInterruptedTurnAvailable, mergeTaskSnapshots, newChatModelOverride, preferredNewChatModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
@@ -34,6 +35,23 @@ describe("cloud shell bootstrap", () => {
   it("does not load organization administration data for ordinary members", () => {
     expect(shouldRefreshAdministration(["org:read", "departments:read", "sso:read"])).toBe(false);
     expect(shouldRefreshAdministration(["org:read", "org:admin"])).toBe(true);
+  });
+
+  it("reconciles server task state without dropping a just-created local task", () => {
+    const localOnly = { id: "task_local", status: "running" } as Task;
+    const stale = { id: "task_server", status: "running" } as Task;
+    const settled = { id: "task_server", status: "completed", unreadAt: "2026-08-13T10:00:00.000Z" } as Task;
+
+    expect(mergeTaskSnapshots(
+      [localOnly, stale],
+      [settled],
+    )).toEqual([localOnly, settled]);
+  });
+
+  it("keeps ambiguous and active-conflict admission confirmations pending", () => {
+    expect(shouldKeepTurnPendingAfterFailedConfirmation(new TypeError("network unavailable"))).toBe(true);
+    expect(shouldKeepTurnPendingAfterFailedConfirmation(new BerryApiError("Still active", 409, null))).toBe(true);
+    expect(shouldKeepTurnPendingAfterFailedConfirmation(new BerryApiError("Invalid request", 400, null))).toBe(false);
   });
 
   it("prefers a valid browser model for new chats and otherwise uses the organization default", () => {
@@ -233,7 +251,7 @@ describe("cloud shell bootstrap", () => {
       label: group.label,
       items: group.items.map((item) => [item.id, item.label]),
     }))).toEqual([
-      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived chats"]] },
+      { label: "", items: [["general", "General"], ["account", "Account"], ["personalization", "Personalization"], ["connectors", "Connectors"], ["skills", "Skills"], ["mcp", "MCP servers"], ["usage", "Usage"], ["archived", "Archived tasks"]] },
     ]);
   });
 

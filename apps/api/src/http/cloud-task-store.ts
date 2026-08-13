@@ -47,6 +47,18 @@ export interface UpdateTaskInput {
   pinned?: boolean | undefined;
   archived?: boolean | undefined;
   conversationKind?: ConversationKind | undefined;
+  read?: boolean | undefined;
+  readThrough?: string | undefined;
+}
+
+export interface ListTasksFilter {
+  workspaceId?: string;
+  workspaceKind?: "project" | "general";
+  ownerUserId?: string | null;
+  includeDeleted?: boolean;
+  limit?: number;
+  offset?: number;
+  taskIds?: readonly string[];
 }
 
 export interface AppendMessageInput {
@@ -66,7 +78,7 @@ export interface CloudTaskStore {
   ensureGeneralWorkspace(ownerUserId: string): Promise<Workspace>;
   listWorkspaces(filter?: { ownerUserId?: string | null; includeGeneral?: boolean }): Promise<Workspace[]>;
   createTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }>;
-  listTasks(filter?: { workspaceId?: string; workspaceKind?: "project" | "general"; ownerUserId?: string | null; includeDeleted?: boolean; limit?: number; offset?: number }): Promise<Task[]>;
+  listTasks(filter?: ListTasksFilter): Promise<Task[]>;
   getTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
   updateTask(taskId: string, input: UpdateTaskInput, ownerUserId?: string | null): Promise<Task>;
   deleteTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
@@ -151,7 +163,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     const workspace = WorkspaceSchema.parse({
       id: randomUuid(),
       path: "/workspace/general",
-      name: "Chats",
+      name: "Tasks",
       workspaceKind: "general",
       ownerUserId,
       trustState: "trusted",
@@ -213,7 +225,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     return { task: this.#tasks.get(task.id)!, session };
   }
 
-  async listTasks(filter: { workspaceId?: string; workspaceKind?: "project" | "general"; ownerUserId?: string | null; includeDeleted?: boolean; limit?: number; offset?: number } = {}): Promise<Task[]> {
+  async listTasks(filter: ListTasksFilter = {}): Promise<Task[]> {
     const limit = Math.max(1, Math.min(500, filter.limit ?? 500));
     const offset = Math.max(0, filter.offset ?? 0);
     return [...this.#tasks.values()]
@@ -224,6 +236,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
         return workspace?.ownerUserId === undefined || workspace.ownerUserId === filter.ownerUserId;
       })
       .filter((task) => filter.ownerUserId === undefined || this.#taskOwners.get(task.id) === filter.ownerUserId)
+      .filter((task) => !filter.taskIds || filter.taskIds.includes(task.id))
       .filter((task) => filter.includeDeleted === true || task.deletedAt === null)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
       .slice(offset, offset + limit);
@@ -242,6 +255,18 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
 
   async updateTask(taskId: string, input: UpdateTaskInput, ownerUserId?: string | null): Promise<Task> {
     const current = await this.getTask(taskId, ownerUserId);
+    const readAt = nowIso();
+    const taskMetadataChanged = input.title !== undefined
+      || input.status !== undefined
+      || input.pinned !== undefined
+      || input.archived !== undefined
+      || input.conversationKind !== undefined;
+    const updatedAt = taskMetadataChanged ? readAt : current.updatedAt;
+    const becameUnread = input.status !== undefined
+      && input.status !== current.status
+      && (input.status === "completed" || input.status === "failed");
+    const canMarkRead = input.read === true
+      && (!input.readThrough || !current.unreadAt || Date.parse(current.unreadAt) <= Date.parse(input.readThrough));
     const next = TaskSchema.parse({
       ...current,
       ...(input.title !== undefined ? { title: input.title } : {}),
@@ -251,7 +276,10 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       ...(input.conversationKind !== undefined ? {
         conversationKind: ConversationKindSchema.parse(input.conversationKind),
       } : {}),
-      updatedAt: nowIso(),
+      ...(canMarkRead
+        ? { unreadAt: null, lastReadAt: readAt }
+        : becameUnread ? { unreadAt: readAt } : {}),
+      updatedAt,
     });
     this.#tasks.set(taskId, next);
     return next;
@@ -428,7 +456,7 @@ RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_a
       if (existing[0]) return workspaceFromRow(existing[0]);
       const rows = await executor.query<WorkspaceRow>(
         `INSERT INTO workspaces (tenant_id, owner_id, workspace_kind, name, slug, trust_state, settings, created_at, updated_at)
-         VALUES ($1::uuid, $2::uuid, 'general', 'Chats', $3, 'trusted', '{"cloud":true,"scratch":true}'::jsonb, now(), now())
+         VALUES ($1::uuid, $2::uuid, 'general', 'Tasks', $3, 'trusted', '{"cloud":true,"scratch":true}'::jsonb, now(), now())
          ON CONFLICT DO NOTHING
          RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_at`,
         [this.tenantId, ownerUserId, `general-${ownerUserId}`],
@@ -501,7 +529,7 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_k
     });
   }
 
-  async listTasks(filter: { workspaceId?: string; workspaceKind?: "project" | "general"; ownerUserId?: string | null; includeDeleted?: boolean; limit?: number; offset?: number } = {}): Promise<Task[]> {
+  async listTasks(filter: ListTasksFilter = {}): Promise<Task[]> {
     return this.database.withTenant(this.tenantId, async (executor) => {
       const workspaceId = filter.workspaceId ? normalizeWorkspaceId(filter.workspaceId) : null;
       const rows = await executor.query<TaskRow>(
@@ -517,10 +545,11 @@ WHERE t.tenant_id = $1::uuid
   AND ($4::workspace_kind IS NULL OR w.workspace_kind = $4::workspace_kind)
   AND w.owner_id = $5::uuid
   AND t.user_id = $5::uuid
+  AND ($8::text[] IS NULL OR t.id::text = ANY($8::text[]))
 ORDER BY t.updated_at DESC, t.id ASC
 LIMIT $6 OFFSET $7
         `.trim(),
-        [this.tenantId, workspaceId, filter.includeDeleted === true, filter.workspaceKind ?? null, filter.ownerUserId ?? null, Math.max(1, Math.min(500, filter.limit ?? 500)), Math.max(0, filter.offset ?? 0)],
+        [this.tenantId, workspaceId, filter.includeDeleted === true, filter.workspaceKind ?? null, filter.ownerUserId ?? null, Math.max(1, Math.min(500, filter.limit ?? 500)), Math.max(0, filter.offset ?? 0), filter.taskIds ? [...new Set(filter.taskIds)] : null],
       );
       return rows.map(taskFromRow);
     });
@@ -541,10 +570,22 @@ SET title = COALESCE($3, title),
     pinned = COALESCE($5, pinned),
     archived = COALESCE($6, archived),
     conversation_kind = COALESCE($7::conversation_kind, conversation_kind),
-    updated_at = $8
-WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($9::uuid IS NULL OR user_id IS NULL OR user_id = $9::uuid)
+    unread_at = CASE
+      WHEN $8::boolean AND ($9::timestamptz IS NULL OR unread_at IS NULL OR unread_at <= $9::timestamptz) THEN NULL
+      WHEN $4::task_status IN ('completed', 'failed') AND status IS DISTINCT FROM $4::task_status THEN $10
+      ELSE unread_at
+    END,
+    last_read_at = CASE
+      WHEN $8::boolean AND ($9::timestamptz IS NULL OR unread_at IS NULL OR unread_at <= $9::timestamptz) THEN $10
+      ELSE last_read_at
+    END,
+    updated_at = CASE
+      WHEN $3 IS NOT NULL OR $4 IS NOT NULL OR $5 IS NOT NULL OR $6 IS NOT NULL OR $7 IS NOT NULL THEN $10
+      ELSE updated_at
+    END
+WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($11::uuid IS NULL OR user_id IS NULL OR user_id = $11::uuid)
         `.trim(),
-        [this.tenantId, taskId, input.title, input.status, input.pinned, input.archived, input.conversationKind, nowIso(), ownerUserId ?? null],
+        [this.tenantId, taskId, input.title, input.status, input.pinned, input.archived, input.conversationKind, input.read === true, input.readThrough ?? null, nowIso(), ownerUserId ?? null],
       );
       return this.getTaskInTenant(executor, taskId, ownerUserId);
     });

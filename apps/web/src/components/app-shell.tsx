@@ -62,7 +62,7 @@ function generatedImageTitle(prompt: string): string {
     .slice(0, 80);
   return title ? title.charAt(0).toUpperCase() + title.slice(1) : "Generated image";
 }
-import { WebSidebar, WebWindowChrome, type SettingsTab } from "./shell/web-sidebar";
+import { WebSidebar, WebWindowChrome, taskHasUnreadActivity, taskIsInProgress, type SettingsTab } from "./shell/web-sidebar";
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
 import { WebHelpMenu } from "./shell/web-help-menu";
@@ -178,11 +178,25 @@ export function shouldRefreshAdministration(permissions: readonly OrgPermission[
   return permissions.includes("org:admin");
 }
 
+export function mergeTaskSnapshots(current: Task[], server: Task[]): Task[] {
+  const serverById = new Map(server.map((task) => [task.id, task]));
+  const currentIds = new Set(current.map((task) => task.id));
+  return [
+    ...current.map((task) => serverById.get(task.id) ?? task),
+    ...server.filter((task) => !currentIds.has(task.id)),
+  ];
+}
+
 export function shouldConfirmTurnAdmission(cause: unknown): boolean {
   return !(cause instanceof BerryApiError)
     || cause.status === 408
     || cause.status === 429
     || cause.status >= 500;
+}
+
+export function shouldKeepTurnPendingAfterFailedConfirmation(cause: unknown): boolean {
+  return shouldConfirmTurnAdmission(cause)
+    || (cause instanceof BerryApiError && cause.status === 409);
 }
 
 export async function activeTurnStateAfterConflict(
@@ -369,6 +383,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     setThreadScrollRequest((current) => ({ sessionId, id: (current?.id ?? 0) + 1 }));
   }, []);
   const [activeTaskId, setActiveTaskId] = React.useState(shellLocation.kind === "task" ? shellLocation.taskId : "");
+  const activeTaskIdRef = React.useRef(activeTaskId);
+  React.useEffect(() => { activeTaskIdRef.current = activeTaskId; }, [activeTaskId]);
   const fixtureWorkspace = React.useMemo<Workspace>(() => ({
     id: initial.config.workspaceId,
     path: initial.config.workspacePath,
@@ -386,7 +402,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     ...fixtureWorkspace,
     id: `${initial.config.workspaceId}:general`,
     path: `${initial.config.workspacePath.replace(/\/$/, "")}/.berry/general`,
-    name: "Chats",
+    name: "Tasks",
     workspaceKind: "general",
   }), [fixtureWorkspace, initial.config.workspaceId, initial.config.workspacePath]);
   const [workspaces, setWorkspaces] = React.useState<Workspace[]>([fixtureWorkspace, fixtureGeneralWorkspace]);
@@ -440,6 +456,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     setProviderId(nextProviderId);
     setModel(nextModel);
   }, []);
+  const inProgressTaskIds = tasks.filter(taskIsInProgress).map((task) => task.id);
+  const inProgressTaskIdsKey = [...inProgressTaskIds].sort().join(",");
+  const hasInProgressTasks = inProgressTaskIds.length > 0;
+
   React.useEffect(() => {
     const storedReasoning = window.localStorage.getItem("berry.web.reasoning");
     const storedModel = window.localStorage.getItem("berry.web.model")?.trim();
@@ -672,6 +692,16 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [activeTask]);
 
   React.useEffect(() => {
+    if (!client || !activeTask || !taskHasUnreadActivity(activeTask)) return;
+    const taskId = activeTask.id;
+    const readThrough = activeTask.unreadAt;
+    if (!readThrough) return;
+    void client.updateTask(taskId, { read: true, readThrough })
+      .then((updated) => setTasks((current) => current.map((task) => task.id === updated.id ? updated : task)))
+      .catch(() => undefined);
+  }, [activeTask, client]);
+
+  React.useEffect(() => {
     const sessionId = activeTask?.activeSessionId;
     if (!sessionId) return;
     setFollowUpsBySession((current) => {
@@ -768,6 +798,46 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       .finally(() => { if (!cancelled) setTasksLoaded(true); });
     return () => { cancelled = true; };
   }, [client, fixtureWorkspace]);
+
+  // A task can finish while its route is closed or while an EventSource is
+  // reconnecting. Poll only while a task claims to be active, then stop as
+  // soon as the durable task projection reaches a terminal state.
+  React.useEffect(() => {
+    if (!client || !tasksLoaded || !hasInProgressTasks) return;
+    let cancelled = false;
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing || cancelled) return;
+      refreshing = true;
+      try {
+        const taskIds = inProgressTaskIdsKey.split(",");
+        const chunks = Array.from(
+          { length: Math.ceil(taskIds.length / 50) },
+          (_, index) => taskIds.slice(index * 50, (index + 1) * 50),
+        );
+        const nextTasks = (await Promise.all(chunks.map((ids) =>
+          client.listTasks({ includeDeleted: true, taskIds: ids })))).flat();
+        if (!cancelled) setTasks((current) => mergeTaskSnapshots(current, nextTasks));
+      } catch {
+        // The next tick retries; live streams remain authoritative meanwhile.
+      } finally {
+        refreshing = false;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 8_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [client, hasInProgressTasks, inProgressTaskIdsKey, tasksLoaded]);
 
   React.useEffect(() => {
     if (!client || !tasksLoaded) return;
@@ -1089,8 +1159,27 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               taskTitle: streamedTask.title,
             });
           }
-          setTasks((current) => current.map((task) => task.activeSessionId === sessionId ? { ...task, status: event.status } : task));
+          const finishedAt = new Date().toISOString();
+          setTasks((current) => current.map((task) => {
+            if (task.activeSessionId !== sessionId) return task;
+            const unread = (event.status === "completed" || event.status === "failed")
+              && task.id !== activeTaskIdRef.current;
+            return {
+              ...task,
+              status: event.status,
+              ...(unread ? { unreadAt: finishedAt } : {}),
+            };
+          }));
+          if (streamedTask?.id === activeTaskIdRef.current) {
+            void client.getTask(streamedTask.id)
+              .then((latest) => latest.unreadAt
+                ? client.updateTask(latest.id, { read: true, readThrough: latest.unreadAt })
+                : latest)
+              .then((updated) => setTasks((current) => current.map((task) => task.id === updated.id ? updated : task)))
+              .catch(() => undefined);
+          }
           terminal = true;
+          pendingSubmissionsRef.current.delete(sessionId);
           activeSessionsRef.current.delete(sessionId);
           stopSessionConnection(sessionId);
           handleQueueTurnEndRef.current(sessionId, event.status);
@@ -1236,6 +1325,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         }),
     } satisfies StartTurnRequest;
     let submissionAttempted = false;
+    let retainPendingSubmission = false;
     try {
       // Listen before submitting so early deltas render live instead of being
       // delivered together from the server's replay buffer. Connection setup
@@ -1309,6 +1399,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           return;
         }
       }
+      let confirmationFailure: unknown = cause;
       if (submissionAttempted && shouldConfirmTurnAdmission(cause)) {
         try {
           const recovered = await retryTurnAdmission(client, sessionId, request);
@@ -1338,12 +1429,48 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             resetSessionStream(sessionId);
           }
           return;
-        } catch {
+        } catch (confirmationCause) {
           if (submission.cancelRequested) return;
-          // Fall through to the original start error when acceptance cannot
-          // be confirmed.
+          confirmationFailure = confirmationCause;
+          const confirmedConflict = await activeTurnStateAfterConflict(
+            client,
+            sessionId,
+            confirmationCause,
+          ).catch(() => null);
+          if (confirmedConflict) {
+            clearPendingRequestMessage(
+              sessionId,
+              params.continueInterruptedTurn === true ? undefined : params.requestMessageId,
+            );
+            await refreshSessionMessages(sessionId).catch(() => undefined);
+            applyDurableState(sessionId, confirmedConflict, true);
+            activeSessionsRef.current.add(sessionId);
+            setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
+            void attachSessionStream(sessionId).catch(() => undefined);
+            return;
+          }
         }
       }
+      if (submissionAttempted && shouldKeepTurnPendingAfterFailedConfirmation(confirmationFailure)) {
+        retainPendingSubmission = true;
+        activeSessionsRef.current.add(sessionId);
+        setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
+        applyDurableState(sessionId, {
+          active: true,
+          turnId: pendingTurnId,
+          bufferedEvents: [],
+          replayOnly: false,
+          owner: null,
+          runState: "assembling_context",
+          waitingReason: null,
+          nextAction: "Confirming submission",
+          error: null,
+        });
+        void attachSessionStream(sessionId).catch(() => undefined);
+        return;
+      }
+      // A definitive confirmation failure means the operation was not
+      // accepted, so the normal terminal error path below is safe.
       activeSessionsRef.current.delete(sessionId);
       stopSessionConnection(sessionId);
       clearPendingRequestMessage(
@@ -1355,10 +1482,24 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       const terminalEvent = { kind: "turn.end", turnId: `failed_${Date.now()}`, status: "failed" } as const;
       updateSessionStream(sessionId, terminalEvent);
       updateDurableStateFromEvent(sessionId, terminalEvent);
+      const failedAt = new Date().toISOString();
+      setTasks((current) => current.map((item) => item.id === task.id
+        ? {
+          ...item,
+          status: "failed",
+          ...(item.id !== activeTaskIdRef.current ? { unreadAt: failedAt } : {}),
+        }
+        : item));
+      await client.updateTask(task.id, {
+        status: "failed",
+        ...(task.id === activeTaskIdRef.current ? { read: true } : {}),
+      }).then((updated) => {
+        setTasks((current) => current.map((item) => item.id === updated.id ? updated : item));
+      }).catch(() => undefined);
       await refreshSessionMessages(sessionId).catch(() => undefined);
       throw error;
     } finally {
-      if (pendingSubmissionsRef.current.get(sessionId) === submission) {
+      if (!retainPendingSubmission && pendingSubmissionsRef.current.get(sessionId) === submission) {
         pendingSubmissionsRef.current.delete(sessionId);
       }
       setStartingSessions((current) => {
@@ -1387,6 +1528,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         lastEventCursorBySessionRef.current,
         durableEventSequencesBySessionRef.current,
       );
+      if (pending && pendingSubmissionsRef.current.get(sessionId) === pending) {
+        pendingSubmissionsRef.current.delete(sessionId);
+      }
       activeSessionsRef.current.delete(sessionId);
       const terminalEvent = {
         kind: "turn.end",
@@ -1534,7 +1678,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [client]);
 
   const renameTask = React.useCallback(async (task: Task) => {
-    const title = window.prompt("Rename chat", task.title)?.trim();
+    const title = window.prompt("Rename task", task.title)?.trim();
     if (!title || title === task.title) return;
     setTasks((current) => current.map((item) => item.id === task.id ? { ...item, title } : item));
     if (!client) return;
@@ -1550,9 +1694,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const shareTask = React.useCallback(async (task: Task) => {
     try {
       await navigator.clipboard.writeText(new URL(`/tasks/${task.id}`, window.location.origin).toString());
-      toast.success("Chat link copied");
+      toast.success("Task link copied");
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to copy the chat link");
+      toast.error(cause instanceof Error ? cause.message : "Unable to copy the task link");
     }
   }, []);
 
@@ -1568,7 +1712,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       if (shellLocation.kind === "task" && shellLocation.taskId === task.id) navigateHome();
     } catch (cause) {
       setTasks((current) => current.map((item) => item.id === previous.id ? previous : item));
-      toast.error(cause instanceof Error ? cause.message : "Unable to delete the conversation");
+      toast.error(cause instanceof Error ? cause.message : "Unable to delete the task");
     }
   }, [client, navigateHome, shellLocation]);
 
@@ -1581,7 +1725,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       if (archived && shellLocation.kind === "task" && shellLocation.taskId === task.id) navigateHome();
     } catch (cause) {
       setTasks((current) => current.map((item) => item.id === previous.id ? previous : item));
-      toast.error(cause instanceof Error ? cause.message : "Unable to update the conversation archive");
+      toast.error(cause instanceof Error ? cause.message : "Unable to update the task archive");
       throw cause;
     }
   }, [client, navigateHome, shellLocation]);
@@ -1614,9 +1758,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const archiveProjectChats = React.useCallback(async (workspace: Workspace, projectTasks: Task[]) => {
     try {
       await Promise.all(projectTasks.map((task) => archiveTask(task, true)));
-      toast.success(`Archived ${projectTasks.length} chat${projectTasks.length === 1 ? "" : "s"}`);
+      toast.success(`Archived ${projectTasks.length} task${projectTasks.length === 1 ? "" : "s"}`);
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "Unable to archive the project chats");
+      toast.error(cause instanceof Error ? cause.message : "Unable to archive the project tasks");
     }
   }, [archiveTask]);
 
@@ -1663,7 +1807,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       setTasks((current) => current.map((item) => item.id === updated.id ? updated : item));
     } catch (cause) {
       setTasks((current) => current.map((item) => item.id === previous.id ? previous : item));
-      toast.error(cause instanceof Error ? cause.message : "Unable to restore the conversation");
+      toast.error(cause instanceof Error ? cause.message : "Unable to restore the task");
     }
   }, [client]);
 
@@ -1726,7 +1870,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     intent?: TurnIntent,
   ): Promise<Message> => {
     const sessionId = task.activeSessionId;
-    if (!client || !sessionId) throw new Error("The active conversation is no longer available.");
+    if (!client || !sessionId) throw new Error("The active task is no longer available.");
 
     requestThreadBottom(sessionId);
     const pending = pendingSubmissionsRef.current.get(sessionId);
@@ -1783,7 +1927,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (!client) return;
     if (followUpSendInFlightRef.current.has(followUp.id)) return;
     const task = tasks.find((item) => item.id === followUp.taskId);
-    if (!task?.activeSessionId) throw new Error("This queued prompt no longer belongs to an active conversation.");
+    if (!task?.activeSessionId) throw new Error("This queued prompt no longer belongs to an active task.");
     const currentlyActive = activeSessionsRef.current.has(followUp.sessionId);
     let messageId = followUp.messageId ?? crypto.randomUUID();
     let deliveryMode = followUp.deliveryMode ?? (currentlyActive ? "steer" : "turn");
@@ -2099,7 +2243,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     const input = [
       `Edit the attached generated image${instruction ? `: ${instruction}` : "."}`,
       ...(regionInstructions.length > 0 ? ["Region comments:", ...regionInstructions] : []),
-      "Create a new image iteration and keep the original visible in the conversation.",
+      "Create a new image iteration and keep the original visible in the task.",
     ].join("\n");
     if (!client) {
       appendDemoGeneratedImageIteration(activeTask, image, input, image.aspectRatio, "edited");
@@ -2593,7 +2737,7 @@ function ProjectCreationDialog({
       <DialogContent container={container} className="w-[calc(100%-2rem)] gap-5 sm:max-w-[24rem]" aria-describedby="create-project-description">
         <DialogHeader className="gap-1.5">
           <DialogTitle>Create project</DialogTitle>
-          <DialogDescription id="create-project-description">Group related chats and files in one place.</DialogDescription>
+          <DialogDescription id="create-project-description">Group related tasks and files in one place.</DialogDescription>
         </DialogHeader>
         <form className="space-y-5" onSubmit={(event) => void onSubmit(event)}>
           <div className="space-y-2">

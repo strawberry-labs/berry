@@ -111,7 +111,7 @@ function NewSkillDialog({ workspaceId }: { workspaceId: string | null }) {
           <DialogHeader>
             <DialogTitle>New skill</DialogTitle>
             <DialogDescription>
-              Create a managed skill template {workspaceId ? "for the current project" : "for all projects"}. Enabled skills can be referenced in chat with $skill-name.
+              Create a managed skill template {workspaceId ? "for the current project" : "for all projects"}. Enabled skills can be referenced in a task with $skill-name.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-2">
@@ -591,7 +591,7 @@ export function SkillsSettings() {
     <div className="flex flex-col gap-6">
       <SettingsPageHeader
         title="Skills"
-        description="Manage workspace and personal skills. Enabled skills can be referenced in chat with $skill-name."
+        description="Manage workspace and personal skills. Enabled skills can be referenced in a task with $skill-name."
         actions={
           <>
             <Button

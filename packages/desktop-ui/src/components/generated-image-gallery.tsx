@@ -375,7 +375,7 @@ export function GeneratedImageLightbox({
         </header>
         <div className={styles.lightboxBody} data-testid="lightbox-body">
           {images.length > 1 ? (
-            <aside className={styles.lightboxRail} aria-label="Images in this conversation">
+            <aside className={styles.lightboxRail} aria-label="Images in this task">
               {images.map((image, index) => (
                 <button
                   type="button"

@@ -291,7 +291,7 @@ function ResourceAccessScreen({
   return (
     <ManagementPage
       title="Resource access"
-      description="Inspect and override sharing for workspaces, agents, prompts, skills, and conversations."
+      description="Inspect and override sharing for workspaces, agents, prompts, skills, and tasks."
       eyebrow="Access"
       actions={
         canWrite ? (
@@ -887,7 +887,7 @@ function ModelsScreen({
         members,
         departments,
       ]);
-      setMessage("New chats will now start with this model. Existing chats were not changed.");
+      setMessage("New tasks will now start with this model. Existing tasks were not changed.");
     } finally {
       setSavingNewChatDefault(false);
     }
@@ -971,14 +971,14 @@ function ModelsScreen({
   return (
     <ManagementPage
       title="Models"
-      description="Choose the model new chats start with, manage provider models, and control availability, pricing, and context limits."
+      description="Choose the model new tasks start with, manage provider models, and control availability, pricing, and context limits."
       eyebrow="AI & tools"
       actions={canWrite ? <><Button variant="secondary" onClick={() => setAddingRule(true)}><ShieldCheck />Access rule</Button><Button onClick={() => setAdding(true)}><Plus />Add model</Button></> : null}
     >
       <AsyncState loading={r.loading} error={r.error} onRetry={r.retry}>
         <Section
-          title="Default model for new chats"
-          description="Use this to route new conversations to a healthy model during an outage. The choice is snapshotted when a chat is created, so existing chats keep their current model."
+          title="Default model for new tasks"
+          description="Use this to route new tasks to a healthy model during an outage. The choice is snapshotted when a task is created, so existing tasks keep their current model."
         >
           <div className="grid items-end gap-3 rounded-lg border border-border bg-muted/20 p-3 sm:grid-cols-[minmax(0,1fr)_auto]">
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
@@ -992,7 +992,7 @@ function ModelsScreen({
                 options={newChatModelOptions}
                 placeholder="Choose a model"
                 disabled={!canWrite || savingNewChatDefault || newChatModelOptions.length === 0}
-                ariaLabel="Default model for new chats"
+                ariaLabel="Default model for new tasks"
               />
             </label>
             <Button
@@ -1017,7 +1017,7 @@ function ModelsScreen({
             const d = defaultFor(mode);
             return (
               <article key={mode} data-status={d ? "good" : "warning"}>
-                <span>Default for {mode === "chat" ? "Chat" : "Code"}</span>
+                <span>Default for {mode === "chat" ? "Task" : "Code"}</span>
                 <strong>{d ? d.model : "Not set"}</strong>
                 <small>
                   {d
@@ -1179,7 +1179,7 @@ function ModelsScreen({
                     key={mode}
                     className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"
                   >
-                    <span>{mode === "chat" ? "Chat" : "Code"}</span>
+                    <span>{mode === "chat" ? "Task" : "Code"}</span>
                     <ManagementSwitch
                       checked={(draft.modeAllow ?? []).includes(mode)}
                       onCheckedChange={(checked) => setMode(mode, checked)}

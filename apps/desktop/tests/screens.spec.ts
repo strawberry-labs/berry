@@ -359,7 +359,7 @@ test.describe("workbench", () => {
     await page.goto("/");
 
     await page.getByRole("button", { name: "Toggle Sidebar" }).click();
-    await expect(page.getByRole("button", { name: "New chat", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "New task", exact: true })).toBeVisible();
     await expectChromiumScreenshot(page, testInfo, "collapsed-sidebar-titlebar.png");
 
     await page.getByRole("button", { name: "Toggle Sidebar" }).click();

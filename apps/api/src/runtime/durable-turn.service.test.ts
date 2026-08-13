@@ -13,6 +13,46 @@ const workspaceId = "00000000-0000-7000-8000-000000000008";
 const operationFingerprint = "a".repeat(64);
 
 describe("DurableTurnService", () => {
+  it("loads task activity for multiple sessions with one database query", async () => {
+    const secondSessionId = "00000000-0000-7000-8000-000000000009";
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params = []) => {
+        queries.push({ sql, params });
+        return [
+          {
+            session_id: sessionId,
+            run_id: runId,
+            run_state: "completed",
+            run_created_at: "2026-08-13T09:00:00.000Z",
+            admission_state: "admitted",
+            admission_created_at: "2026-08-13T08:59:59.000Z",
+            admission_updated_at: "2026-08-13T09:00:00.000Z",
+          },
+          {
+            session_id: secondSessionId,
+            run_id: null,
+            run_state: null,
+            run_created_at: null,
+            admission_state: "preparing",
+            admission_created_at: "2026-08-13T09:01:00.000Z",
+            admission_updated_at: "2026-08-13T09:01:01.000Z",
+          },
+        ] as T[];
+      },
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    const activity = await service.taskActivity(tenantId, [sessionId, secondSessionId, sessionId]);
+
+    expect(queries).toHaveLength(1);
+    expect(queries[0]?.sql).toContain("LEFT JOIN LATERAL");
+    expect(queries[0]?.params).toEqual([tenantId, [sessionId, secondSessionId]]);
+    expect(activity.get(sessionId)).toMatchObject({ runId, runState: "completed" });
+    expect(activity.get(secondSessionId)).toMatchObject({ runId: null, admissionState: "preparing" });
+  });
+
   it("rejects admission after the matching pending submission was cancelled", async () => {
     const executions: string[] = [];
     const executor: SqlExecutor = {

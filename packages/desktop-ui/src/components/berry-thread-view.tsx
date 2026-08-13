@@ -690,7 +690,7 @@ function BerryAssistantTurnGroup({
             <Button
               variant="ghost"
               size="icon-sm"
-              aria-label="Fork conversation"
+              aria-label="Fork task"
               onClick={() => void adapter.onFork?.(boundaryMessageId)}
             >
               <GitFork />

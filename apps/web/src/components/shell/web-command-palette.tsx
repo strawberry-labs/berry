@@ -11,31 +11,34 @@ export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpe
   onSettings: () => void;
   onHelp: () => void;
 }) {
-  const workspaceNames = new Map(workspaces.map((workspace) => [workspace.id, workspace.name]));
+  const workspaceNames = new Map(workspaces.map((workspace) => [
+    workspace.id,
+    workspace.workspaceKind === "general" ? "Tasks" : workspace.name,
+  ]));
   const select = (action: () => void) => {
     onOpenChange(false);
     action();
   };
 
   return (
-    <CommandDialog open={open} onOpenChange={onOpenChange} title="Search Berry" description="Search conversations and actions">
+    <CommandDialog open={open} onOpenChange={onOpenChange} title="Search Berry" description="Search tasks and actions">
       <CommandInput
         autoFocus
-        placeholder="Search conversations and actions…"
-        aria-label="Search conversations and actions"
+        placeholder="Search tasks and actions…"
+        aria-label="Search tasks and actions"
         className="berry-command-search-input"
         wrapperClassName="berry-command-search-wrapper"
       />
       <CommandList>
-        <CommandEmpty>No conversations or actions found.</CommandEmpty>
+        <CommandEmpty>No tasks or actions found.</CommandEmpty>
         <CommandGroup heading="Actions">
           <CommandItem value="settings preferences" onSelect={() => select(onSettings)}><Settings /> Settings <CommandShortcut>⌘,</CommandShortcut></CommandItem>
           <CommandItem value="help docs support diagnostics" onSelect={() => select(onHelp)}><CircleHelp /> Help and diagnostics</CommandItem>
         </CommandGroup>
-        <CommandGroup heading="Conversations">
+        <CommandGroup heading="Tasks">
           {tasks.map((task) => {
             const Icon = task.conversationKind === "code" ? CodeXml : MessageSquare;
-            const provenance = workspaceNames.get(task.workspaceId) ?? "Chats";
+            const provenance = workspaceNames.get(task.workspaceId) ?? "Tasks";
             return (
               <CommandItem
                 key={task.id}
@@ -44,7 +47,7 @@ export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpe
               >
                 <Icon />
                 <span className="min-w-0 flex-1 truncate">{task.title}</span>
-                <span className="text-xs text-muted-foreground">{task.conversationKind === "code" ? "Code" : "Chat"} · {provenance} · {task.deletedAt ? "deleted" : task.archived ? "archived" : task.status}</span>
+                <span className="text-xs text-muted-foreground">{task.conversationKind === "code" ? "Code" : "Task"} · {provenance} · {task.deletedAt ? "deleted" : task.archived ? "archived" : task.status}</span>
               </CommandItem>
             );
           })}

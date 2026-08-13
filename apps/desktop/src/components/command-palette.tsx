@@ -163,10 +163,10 @@ export function CommandPalette() {
   const activeTask = view.kind === "task" ? tasks.find((task) => task.id === view.taskId) ?? null : null;
   const creationKind = activeTask?.conversationKind ?? selectedConversationKind;
   const suggested: PaletteAction[] = [
-    { id: "new-conversation", label: creationKind === "code" ? "New code chat" : "New chat", icon: Plus, shortcut: "⌘N", run: openHome },
+    { id: "new-conversation", label: creationKind === "code" ? "New code task" : "New task", icon: Plus, shortcut: "⌘N", run: openHome },
     {
       id: "new-worktree-task",
-      label: "New code chat in worktree",
+      label: "New code task in worktree",
       icon: GitFork,
       run: () => {
         openHome();
@@ -268,7 +268,7 @@ export function CommandPalette() {
           <CommandList className="max-h-[420px]">
             <CommandEmpty>No results found.</CommandEmpty>
             {showTasks && (
-              <CommandGroup heading="Recent conversations">
+              <CommandGroup heading="Recent tasks">
                 {recentTasks.map((task) => (
                   <CommandItem
                     key={task.id}

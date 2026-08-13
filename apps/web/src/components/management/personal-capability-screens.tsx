@@ -690,7 +690,7 @@ function SkillDetailsDialog({
                   <DropdownMenuContent align="end" className="w-48 border-[var(--berry-border)] bg-[var(--berry-card-bg)]">
                     <DropdownMenuItem onSelect={onTryInChat}>
                       <MessageCircle aria-hidden />
-                      Try in chat
+                      Try in a task
                     </DropdownMenuItem>
                     <DropdownMenuItem
                       disabled={!skill.content || busy !== null}

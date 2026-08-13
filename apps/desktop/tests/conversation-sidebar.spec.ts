@@ -34,9 +34,9 @@ test.describe("shared conversation sidebar", () => {
     });
 
     await page.goto("/");
-    await expect(page.getByRole("button", { name: "Show 101 more conversations" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Show 101 more tasks" })).toBeVisible();
     await expect(page.locator(".berry-sidebar-task-row")).toHaveCount(5);
-    const showMore = page.getByRole("button", { name: "Show 101 more conversations" });
+    const showMore = page.getByRole("button", { name: "Show 101 more tasks" });
     await showMore.focus();
     await page.keyboard.press("Enter");
     await expect(page.locator(".berry-sidebar-task-row").filter({ hasText: /^Chat / })).toHaveCount(106);
@@ -48,7 +48,7 @@ test.describe("shared conversation sidebar", () => {
     await expect(project).toHaveAttribute("aria-expanded", "false");
     await page.keyboard.press("Enter");
     await expect(project).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByRole("button", { name: "Show 101 more conversations" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Show 101 more tasks" })).toBeVisible();
 
     const code = page.getByRole("button", { name: "Code", exact: true });
     await code.focus();

@@ -151,13 +151,13 @@ describe("BerryApiClient", () => {
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
     await client.createTask({ workspaceKind: "general", conversationKind: "code", title: "General code" });
-    await client.listTasks({ workspaceKind: "general", limit: 6, offset: 0 });
+    await client.listTasks({ workspaceKind: "general", limit: 6, offset: 0, taskIds: ["task_1", "task_2", "task_1"] });
 
     expect(fetchImpl).toHaveBeenNthCalledWith(1, "https://api.berry.test/v1/tasks", expect.objectContaining({
       method: "POST",
       body: JSON.stringify({ workspaceKind: "general", conversationKind: "code", title: "General code" }),
     }));
-    expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks?workspaceKind=general&limit=6&offset=0", expect.objectContaining({ method: "GET" }));
+    expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks?workspaceKind=general&limit=6&offset=0&taskIds=task_1%2Ctask_2", expect.objectContaining({ method: "GET" }));
   });
 
   it("persists task title updates", async () => {
@@ -185,10 +185,10 @@ describe("BerryApiClient", () => {
     const fetchImpl = vi.fn(async () => json(task));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
-    await expect(client.updateTask("task_1", { title: "Persistent title" })).resolves.toMatchObject({ title: "Persistent title" });
+    await expect(client.updateTask("task_1", { title: "Persistent title", read: true, readThrough: "2026-07-10T00:00:00.000Z" })).resolves.toMatchObject({ title: "Persistent title" });
     expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/tasks/task_1", expect.objectContaining({
       method: "PATCH",
-      body: JSON.stringify({ title: "Persistent title" }),
+      body: JSON.stringify({ title: "Persistent title", read: true, readThrough: "2026-07-10T00:00:00.000Z" }),
     }));
   });
 

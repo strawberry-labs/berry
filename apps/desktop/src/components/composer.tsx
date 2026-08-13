@@ -475,7 +475,7 @@ export function Composer({
             onPasteEvent={handlePaste}
             placeholder={
               variant === "home"
-                ? "Ask Berry anything, @ for files or folders, / for commands, # for related conversations"
+                ? "Ask Berry anything, @ for files or folders, / for commands, # for related tasks"
                 : "Ask for follow-up changes"
             }
           />
@@ -1193,7 +1193,7 @@ export function useStartTurn() {
           workspaceId: activeWorkspace.id,
           workspaceKind: activeWorkspace.workspaceKind,
           conversationKind: selectedConversationKind,
-          title: submission.input.slice(0, 64) || (submission.attachments[0] ? `Attached: ${submission.attachments[0].name}` : selectedConversationKind === "code" ? "New code chat" : "New chat"),
+          title: submission.input.slice(0, 64) || (submission.attachments[0] ? `Attached: ${submission.attachments[0].name}` : selectedConversationKind === "code" ? "New code task" : "New task"),
           permissionMode: submission.permissionMode,
           modelProviderId: submission.providerId,
           model: submission.model,

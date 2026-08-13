@@ -461,12 +461,12 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
             </label>
             <label>
               <span>
-                <b>Learn from completed chats</b>
+                <b>Learn from completed tasks</b>
               </span>
               <ManagementSwitch
                 checked={data.settings.implicitMemoryEnabled}
                 disabled={disabled || busy === "settings"}
-                aria-label="Learn from completed chats"
+                aria-label="Learn from completed tasks"
                 onCheckedChange={(implicitMemoryEnabled) =>
                   void updateSetting({ implicitMemoryEnabled })
                 }
@@ -607,7 +607,7 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
 
         <Section
           title="Saved memory"
-          description="Explicit entries are user-authored. Inferred entries were consolidated from completed chats."
+          description="Explicit entries are user-authored. Inferred entries were consolidated from completed tasks."
           actions={
             <Input
               className="memory-search"
@@ -634,7 +634,7 @@ export function MemorySettingsScreen({ client, embedded = false }: ManagementScr
               <span>
                 {query
                   ? "Try a different search."
-                  : "Add a preference or let Berry learn after completed chats."}
+                  : "Add a preference or let Berry learn after completed tasks."}
               </span>
             </div>
           ) : (

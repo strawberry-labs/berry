@@ -146,6 +146,11 @@ export function taskIsInProgress(task: Pick<Task, "status">): boolean {
   return task.status === "queued" || task.status === "running" || task.status === "waiting-for-approval";
 }
 
+export function taskHasUnreadActivity(task: Pick<Task, "unreadAt" | "lastReadAt">): boolean {
+  if (!task.unreadAt) return false;
+  return !task.lastReadAt || task.unreadAt > task.lastReadAt;
+}
+
 export function BerryConversationSidebarContent(props: BerryConversationSidebarContentProps) {
   const [sectionState, dispatch] = React.useReducer(conversationSectionReducer, INITIAL_CONVERSATION_SECTION_STATE);
   const [optimisticKind, setOptimisticKind] = React.useState(props.selectedKind);
@@ -169,7 +174,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
     } catch (error) {
       setOptimisticKind(props.selectedKind);
       setFailedKind(kind);
-      setKindError(error instanceof Error ? error.message : "Unable to change conversation type");
+      setKindError(error instanceof Error ? error.message : "Unable to change task type");
     } finally {
       setPendingKind(null);
     }
@@ -198,7 +203,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
     <>
       <SidebarHeader className="berry-sidebar-header pt-[var(--berry-titlebar-height)]">
         {props.showKindControl !== false ? (
-          <div className="berry-conversation-kind-control grid grid-cols-2 rounded-lg bg-sidebar-accent/70 p-0.5" role="group" aria-label="Conversation type">
+          <div className="berry-conversation-kind-control grid grid-cols-2 rounded-lg bg-sidebar-accent/70 p-0.5" role="group" aria-label="Task type">
             <KindButton kind="chat" selected={optimisticKind === "chat"} pending={pendingKind === "chat"} disabled={pendingKind !== null} onSelect={selectKind} />
             <KindButton kind="code" selected={optimisticKind === "code"} pending={pendingKind === "code"} disabled={pendingKind !== null} onSelect={selectKind} />
           </div>
@@ -215,7 +220,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
         {pinned.length > 0 ? (
           <ConversationSection title="Pinned" open>
             <SidebarMenu className="berry-sidebar-task-list my-0 gap-0 pt-0.5 pb-2">
-              <ConversationRows tasks={pinned} emptyLabel="No pinned conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
+              <ConversationRows tasks={pinned} emptyLabel="No pinned tasks" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
             </SidebarMenu>
           </ConversationSection>
         ) : null}
@@ -283,8 +288,8 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
                     <SidebarMenuAction
                       type="button"
                       className="berry-sidebar-workspace-action berry-sidebar-workspace-new-chat-action md:opacity-0 peer-hover/menu-button:opacity-100 hover:opacity-100 focus-visible:opacity-100"
-                      aria-label={`New ${optimisticKind === "code" ? "code chat" : "chat"} in ${project.workspace.name}`}
-                      title={`New ${optimisticKind === "code" ? "code chat" : "chat"}`}
+                      aria-label={`New ${optimisticKind === "code" ? "code task" : "task"} in ${project.workspace.name}`}
+                      title={`New ${optimisticKind === "code" ? "code task" : "task"}`}
                       onClick={(event) => {
                         event.stopPropagation();
                         props.onNewProjectConversation?.(project.workspace);
@@ -298,7 +303,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
                     {project.error ? <SidebarStatus label={project.error} error indented /> : null}
                     {!project.loading && !project.error ? (
                       <SidebarMenu className="berry-sidebar-task-list my-0 gap-0 pt-0.5 pb-2">
-                        <ConversationRows tasks={visible} emptyLabel="No conversations" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} indented />
+                        <ConversationRows tasks={visible} emptyLabel="No tasks" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} indented />
                         {hiddenCount > 0 ? <ShowMoreRow count={hiddenCount} onClick={() => dispatch({ type: "show-project", projectId: id })} indented /> : null}
                       </SidebarMenu>
                     ) : null}
@@ -311,7 +316,7 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
         </SidebarGroup>
 
         <ConversationSection
-          title="Chats"
+          title="Tasks"
           open={!sectionState.chatsCollapsed}
           selected={props.chatsSelected === true}
           onToggle={() => {
@@ -319,13 +324,13 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
             props.onSelectChats?.();
           }}
         >
-          {props.chatsLoading ? <SidebarStatus label="Loading chats" loading /> : null}
+          {props.chatsLoading ? <SidebarStatus label="Loading tasks" loading /> : null}
           {props.chatsError ? <SidebarStatus label={props.chatsError} error /> : null}
           {!props.chatsLoading && !props.chatsError ? (() => {
             const { visible, hiddenCount } = visibleConversationSlice(chats, sectionState.chatsExpanded);
             return (
               <SidebarMenu className="berry-sidebar-task-list my-0 gap-0 pt-0.5 pb-2">
-                <ConversationRows tasks={visible} emptyLabel="No chats yet" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
+                <ConversationRows tasks={visible} emptyLabel="No tasks yet" activeTaskId={props.activeConversationId} onOpen={openConversation} formatAge={props.formatAge} onTogglePinned={props.onToggleConversationPinned} onArchive={props.onArchiveConversation} onDelete={props.onDeleteConversation} onRename={props.onRenameConversation} onShare={props.onShareConversation} />
                 {hiddenCount > 0 ? <ShowMoreRow count={hiddenCount} onClick={() => dispatch({ type: "show-chats" })} /> : null}
               </SidebarMenu>
             );
@@ -344,7 +349,7 @@ function KindButton({ kind, selected, pending, disabled, onSelect }: {
   onSelect: (kind: ConversationKind) => void;
 }) {
   const Icon = kind === "chat" ? MessageSquare : CodeXml;
-  const label = kind === "chat" ? "Chat" : "Code";
+  const label = kind === "chat" ? "Task" : "Code";
   return (
     <button
       type="button"
@@ -409,9 +414,15 @@ function ConversationRows({ tasks, emptyLabel, activeTaskId, onOpen, formatAge, 
               <CircularActivitySpinner
                 size={15}
                 label={`${task.title} is in progress`}
-                className="berry-sidebar-task-spinner pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 transition-opacity group-hover/task:opacity-0 group-focus-within/task:opacity-0"
+                className="berry-sidebar-task-spinner pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 transition-opacity motion-reduce:transition-none group-hover/task:opacity-0 group-focus-within/task:opacity-0"
                 durationMs={1_400}
                 phaseOffsetMs={task.id.length * 73}
+              />
+            ) : task.id !== activeTaskId && taskHasUnreadActivity(task) ? (
+              <span
+                role="status"
+                aria-label={`${task.title} has unread updates`}
+                className="berry-sidebar-task-unread pointer-events-none absolute right-2 top-1/2 size-2 -translate-y-1/2 rounded-full bg-[var(--berry-accent)] ring-2 ring-[var(--berry-sidebar-bg)] transition-opacity motion-reduce:transition-none group-hover/task:opacity-0 group-focus-within/task:opacity-0"
               />
             ) : null}
           </SidebarMenuItem>
@@ -435,7 +446,7 @@ function ConversationActions({ task, onTogglePinned, onArchive, onDelete, onRena
         type="button"
         className="berry-sidebar-task-action berry-sidebar-task-pin-action"
         aria-label={task.pinned ? `Unpin ${task.title}` : `Pin ${task.title}`}
-        title={task.pinned ? "Unpin chat" : "Pin chat"}
+        title={task.pinned ? "Unpin task" : "Pin task"}
         onClick={(event) => {
           event.stopPropagation();
           void onTogglePinned?.(task);
@@ -449,7 +460,7 @@ function ConversationActions({ task, onTogglePinned, onArchive, onDelete, onRena
             type="button"
             className="berry-sidebar-task-action berry-sidebar-task-menu-trigger"
             aria-label={`Actions for ${task.title}`}
-            title="Chat actions"
+            title="Task actions"
             onClick={(event) => event.stopPropagation()}
           >
             <Ellipsis />
@@ -462,7 +473,7 @@ function ConversationActions({ task, onTogglePinned, onArchive, onDelete, onRena
             <DropdownMenuSubTrigger><Folder />Move to project</DropdownMenuSubTrigger>
             <DropdownMenuSubContent className="berry-chat-actions-menu"><DropdownMenuItem disabled>No projects available</DropdownMenuItem></DropdownMenuSubContent>
           </DropdownMenuSub>
-          <DropdownMenuItem onSelect={() => void onTogglePinned?.(task)}>{task.pinned ? <PinOff /> : <Pin />}{task.pinned ? "Unpin chat" : "Pin chat"}</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void onTogglePinned?.(task)}>{task.pinned ? <PinOff /> : <Pin />}{task.pinned ? "Unpin task" : "Pin task"}</DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void onArchive?.(task)}><Archive />Archive</DropdownMenuItem>
           <DropdownMenuItem variant="destructive" onSelect={() => void onDelete?.(task)}><Trash2 />Delete</DropdownMenuItem>
         </DropdownMenuContent>
@@ -474,7 +485,7 @@ function ConversationActions({ task, onTogglePinned, onArchive, onDelete, onRena
 function ShowMoreRow({ count, onClick, indented = false }: { count: number; onClick: () => void; indented?: boolean }) {
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton type="button" className={cn("berry-sidebar-show-more text-sidebar-foreground/60", indented && "berry-sidebar-show-more-indented")} aria-label={`Show ${count} more conversations`} onClick={onClick}>
+      <SidebarMenuButton type="button" className={cn("berry-sidebar-show-more text-sidebar-foreground/60", indented && "berry-sidebar-show-more-indented")} aria-label={`Show ${count} more tasks`} onClick={onClick}>
         <span>Show {count} more</span>
       </SidebarMenuButton>
     </SidebarMenuItem>

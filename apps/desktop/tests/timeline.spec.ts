@@ -31,7 +31,7 @@ test("task timeline separates file and conversation restore scopes", async ({ pa
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Known good before dependency update")).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Restore files from Known good before dependency update" })).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "Restore conversation from Known good before dependency update" })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Restore task from Known good before dependency update" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Restore both from Known good before dependency update" })).toBeVisible();
   await expect(dialog.getByText("Second question")).toBeVisible();
   expect(Number.parseFloat(await dialog.getByRole("button", { name: "Checkpoint now" }).evaluate((element) => getComputedStyle(element).height))).toBeGreaterThanOrEqual(40);
@@ -42,7 +42,7 @@ test("task timeline separates file and conversation restore scopes", async ({ pa
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Restore both from Known good before dependency update" })).toBeVisible();
 
-  await dialog.getByRole("button", { name: "Restore conversation from Second question" }).click();
+  await dialog.getByRole("button", { name: "Restore task from Second question" }).click();
   await expect(dialog.getByText("Second question")).toHaveCount(0);
   await page.keyboard.press("Escape");
   const messages = page.getByLabel("Messages");

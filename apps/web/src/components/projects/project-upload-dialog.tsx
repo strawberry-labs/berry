@@ -106,7 +106,7 @@ export function ProjectUploadDialog({ open, workspace, onOpenChange, onUpload }:
       <DialogContent className="overflow-hidden p-0 sm:max-w-lg" showCloseButton={!uploading}>
         <DialogHeader className="px-5 pt-5">
           <DialogTitle>Upload to {workspace.name}</DialogTitle>
-          <DialogDescription>Files are saved in this project&apos;s Library and are available to every chat in the project.</DialogDescription>
+          <DialogDescription>Files are saved in this project&apos;s Library and are available to every task in the project.</DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 px-5">

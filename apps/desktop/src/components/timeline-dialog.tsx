@@ -78,7 +78,7 @@ export function TimelineDialog({
         ...(item.entryId ? { entryId: item.entryId } : {}),
       });
       await refresh();
-      toast.success(mode === "files" ? "Files restored" : mode === "conversation" ? "Conversation restored" : "Files and conversation restored");
+      toast.success(mode === "files" ? "Files restored" : mode === "conversation" ? "Task restored" : "Files and task restored");
     } finally {
       setPendingAction(null);
     }
@@ -94,7 +94,7 @@ export function TimelineDialog({
             </div>
             <div className="min-w-0">
               <DialogTitle>Task timeline</DialogTitle>
-              <DialogDescription className="sr-only">Git checkpoints and conversation entries for this task.</DialogDescription>
+              <DialogDescription className="sr-only">Git checkpoints and history entries for this task.</DialogDescription>
               <p className="mt-0.5 truncate text-xs text-muted-foreground">{items.length} entries</p>
             </div>
             <Button
@@ -114,7 +114,7 @@ export function TimelineDialog({
             {timelineQuery.isLoading ? (
               <p className="py-10 text-center text-sm text-muted-foreground">Loading timeline...</p>
             ) : items.length === 0 ? (
-              <p className="py-10 text-center text-sm text-muted-foreground">No checkpoints or conversation entries yet.</p>
+              <p className="py-10 text-center text-sm text-muted-foreground">No checkpoints or task history entries yet.</p>
             ) : (
               items.map((item) => (
                 <TimelineRow
@@ -166,7 +166,7 @@ function TimelineRow({
             <ScopeButton icon={<Files />} label="Files" item={item} mode="files" disabled={disabled} pendingAction={pendingAction} onRestore={onRestore} />
           ) : null}
           {item.entryId ? (
-            <ScopeButton icon={<MessageSquare />} label="Conversation" item={item} mode="conversation" disabled={disabled} pendingAction={pendingAction} onRestore={onRestore} />
+            <ScopeButton icon={<MessageSquare />} label="Task" item={item} mode="conversation" disabled={disabled} pendingAction={pendingAction} onRestore={onRestore} />
           ) : null}
           {checkpoint && item.entryId ? (
             <ScopeButton icon={<RefreshCw />} label="Both" item={item} mode="both" disabled={disabled} pendingAction={pendingAction} onRestore={onRestore} />

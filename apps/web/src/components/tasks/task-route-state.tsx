@@ -14,18 +14,18 @@ export function TaskRouteState({ state, onRetry, onHome, onRestore }: {
   if (state === "loading") {
     return (
       <section className="flex flex-1 items-center justify-center" aria-live="polite" aria-busy="true">
-        <CircularActivitySpinner size={28} label="Loading conversation" />
+        <CircularActivitySpinner size={28} label="Loading task" />
       </section>
     );
   }
 
   const copy = state === "deleted"
-      ? { title: "Conversation deleted", detail: "Restore it from deleted conversations before opening it here." }
+      ? { title: "Task deleted", detail: "Restore it from deleted tasks before opening it here." }
       : state === "forbidden"
-        ? { title: "Access denied", detail: "Your account does not have access to this conversation." }
+        ? { title: "Access denied", detail: "Your account does not have access to this task." }
         : state === "failed"
-          ? { title: "Conversation unavailable", detail: "Berry could not load this conversation. You can retry safely." }
-          : { title: "Conversation not found", detail: "It may have been removed, or this link may be incorrect." };
+          ? { title: "Task unavailable", detail: "Berry could not load this task. You can retry safely." }
+          : { title: "Task not found", detail: "It may have been removed, or this link may be incorrect." };
   const Icon = state === "forbidden" ? ShieldAlert : state === "failed" ? TriangleAlert : MessageSquareOff;
 
   return (
@@ -39,9 +39,9 @@ export function TaskRouteState({ state, onRetry, onHome, onRestore }: {
           <EmptyDescription className="text-[var(--berry-text-secondary)]">{copy.detail}</EmptyDescription>
         </EmptyHeader>
         <EmptyContent className="flex-row flex-wrap justify-center">
-          {state === "deleted" && onRestore ? <Button onClick={onRestore}>Restore conversation</Button> : null}
+          {state === "deleted" && onRestore ? <Button onClick={onRestore}>Restore task</Button> : null}
           {state === "failed" ? <Button onClick={onRetry}>Retry</Button> : null}
-          <Button variant="outline" onClick={onHome}>Back to chats</Button>
+          <Button variant="outline" onClick={onHome}>Back to tasks</Button>
         </EmptyContent>
       </Empty>
     </section>

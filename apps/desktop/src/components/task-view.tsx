@@ -290,7 +290,7 @@ export function TaskView({ taskId }: { taskId: string }) {
     if (reasoning) params.reasoning = reasoning;
     await host.call("session.compact", params);
     await queryClient.refetchQueries({ queryKey: ["session.messages", sessionId] });
-    toast.success("Conversation compacted");
+    toast.success("Task compacted");
   }, [activeProvider, queryClient, sessionId, sessionQuery.data]);
 
   const forkSession = React.useCallback(async () => {
@@ -309,7 +309,7 @@ export function TaskView({ taskId }: { taskId: string }) {
       await host.call("session.rewind", { sessionId, entryId: messageId });
       await queryClient.invalidateQueries({ queryKey: ["session.messages", sessionId] });
       await queryClient.invalidateQueries({ queryKey: ["task.list"] });
-      toast.success("Conversation rewound");
+      toast.success("Task rewound");
     },
     [queryClient, sessionId],
   );
@@ -769,7 +769,7 @@ export function TaskView({ taskId }: { taskId: string }) {
               <Copy /> Copy task ID
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => void forkSession()}>
-              <GitFork /> Fork conversation
+              <GitFork /> Fork task
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => setTimelineOpen(true)}>
               <RefreshCw /> Task timeline
@@ -780,7 +780,7 @@ export function TaskView({ taskId }: { taskId: string }) {
               </DropdownMenuItem>
             ) : null}
             <DropdownMenuItem onClick={() => void compactSession()}>
-              <Archive /> Compact conversation
+              <Archive /> Compact task
             </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -901,7 +901,7 @@ function ConversationArtifacts({ messages }: { messages: Message[] }) {
   const artifacts = recentArtifacts(messages);
   if (artifacts.length === 0) return null;
   return (
-    <section className="berry-conversation-artifacts mx-auto flex w-full max-w-3xl shrink-0 items-center gap-2 px-6 pt-3" aria-label="Conversation artifacts">
+    <section className="berry-conversation-artifacts mx-auto flex w-full max-w-3xl shrink-0 items-center gap-2 px-6 pt-3" aria-label="Task artifacts">
       <FolderOpen className="size-4 shrink-0 text-muted-foreground" />
       <div className="flex min-w-0 gap-1.5 overflow-hidden">
         {artifacts.map((artifact) => <span key={artifact} className="berry-artifact-label truncate" title={artifact}>{artifact}</span>)}

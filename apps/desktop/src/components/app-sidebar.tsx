@@ -66,9 +66,9 @@ export function AppSidebar({ className, ...props }: React.ComponentProps<typeof 
     try {
       await host.call("task.setPinned", { id: task.id, pinned: !task.pinned });
       await refreshTaskLists();
-      toast.success(task.pinned ? "Chat unpinned" : "Chat pinned");
+      toast.success(task.pinned ? "Task unpinned" : "Task pinned");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not update the chat");
+      toast.error(error instanceof Error ? error.message : "Could not update the task");
     }
   }, [refreshTaskLists]);
 
@@ -77,9 +77,9 @@ export function AppSidebar({ className, ...props }: React.ComponentProps<typeof 
       await host.call("task.setArchived", { id: task.id, archived: true });
       await refreshTaskLists();
       if (view.kind === "task" && view.taskId === task.id) openHome();
-      toast.success("Chat archived");
+      toast.success("Task archived");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not archive the chat");
+      toast.error(error instanceof Error ? error.message : "Could not archive the task");
     }
   }, [openHome, refreshTaskLists, view]);
 
@@ -169,7 +169,7 @@ export function AppSidebar({ className, ...props }: React.ComponentProps<typeof 
               <SidebarMenuItem>
                 <SidebarMenuButton onClick={() => { setSelectedConversationKind(displayedKind); openHome(); }} className="berry-sidebar-command berry-sidebar-command-primary font-medium">
                   <PencilEdit02Icon />
-                  <span>{displayedKind === "code" ? "New code chat" : "New chat"}</span>
+                  <span>{displayedKind === "code" ? "New code task" : "New task"}</span>
                   <Kbd className="ml-auto" aria-hidden>⌘N</Kbd>
                 </SidebarMenuButton>
               </SidebarMenuItem>

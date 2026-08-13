@@ -21,7 +21,7 @@ import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissio
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
-import { durableAdmissionPreparationTimeoutMs, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
@@ -46,6 +46,40 @@ describe("AgentApiController", () => {
       .toBe("$research\n\nFind and cite the latest AI news.");
     expect(preservePromptSkillTokens("Use $research to find and cite the latest AI news.", ["research"]))
       .toBe("Use $research to find and cite the latest AI news.");
+  });
+
+  it("keeps a task active while its durable admission intent is still preparing", () => {
+    const activity = {
+      sessionId: "session_pending",
+      runId: null,
+      runState: null,
+      runCreatedAt: null,
+      admissionState: "preparing" as const,
+      admissionCreatedAt: "2026-08-13T10:00:00.000Z",
+      admissionUpdatedAt: "2026-08-13T10:00:30.000Z",
+    };
+    expect(durableTaskReconciliationStatus(
+      activity,
+      "2026-08-13T10:00:00.000Z",
+      Date.parse("2026-08-13T10:01:00.000Z"),
+    )).toBeNull();
+    expect(durableTaskReconciliationStatus(
+      activity,
+      "2026-08-13T10:00:00.000Z",
+      Date.parse("2026-08-13T10:03:00.001Z"),
+    )).toBe("failed");
+  });
+
+  it("lets a newer cancelled admission supersede an older completed run", () => {
+    expect(durableTaskReconciliationStatus({
+      sessionId: "session_cancelled",
+      runId: "run_old",
+      runState: "completed",
+      runCreatedAt: "2026-08-13T09:00:00.000Z",
+      admissionState: "cancelled",
+      admissionCreatedAt: "2026-08-13T10:00:00.000Z",
+      admissionUpdatedAt: "2026-08-13T10:00:01.000Z",
+    }, "2026-08-13T10:00:00.000Z")).toBe("cancelled");
   });
 
   it("improves prompts with the fixed low-cost model and records measured usage", async () => {
@@ -368,6 +402,14 @@ describe("AgentApiController", () => {
     });
     await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ title: "Renamed", pinned: true, conversationKind: "code" }).expect(200).expect(({ body }) => {
       expect(body).toMatchObject({ title: "Renamed", pinned: true, conversationKind: "code" });
+    });
+    await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ status: "running" }).expect(200);
+    await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ status: "completed" }).expect(200).expect(({ body }) => {
+      expect(body.unreadAt).toEqual(expect.any(String));
+    });
+    await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ read: true }).expect(200).expect(({ body }) => {
+      expect(body.unreadAt).toBeNull();
+      expect(body.lastReadAt).toEqual(expect.any(String));
     });
     await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).send({
       role: "user",
@@ -1472,6 +1514,48 @@ describe("AgentApiController", () => {
       .expect(({ body }) => expect(body[0]).toMatchObject({ id: created.task.id, status: "failed" }));
   });
 
+  it("settles a durable recovery-required task even when its terminal event is missing", async () => {
+    const taskStore = new InMemoryCloudTaskStore();
+    const created = await taskStore.createTask({ workspaceId: "workspace_cloud", title: "Interrupted durable task", ownerUserId: "user_1" });
+    await taskStore.updateTask(created.task.id, { status: "running" });
+    app = await createApp(fakeSessionHost(), {
+      taskStore,
+      durableTurns: {
+        enabled: true,
+        replayAdmission: async () => null,
+        admit: async () => ({ runId: "turn_recovery", sessionId: created.session.id }),
+        state: async () => ({
+          active: false,
+          turnId: "turn_recovery",
+          bufferedEvents: [],
+          replayOnly: false,
+          runState: "recovery_required",
+          waitingReason: null,
+          nextAction: null,
+          error: "Worker exited during a non-idempotent tool",
+        }),
+        taskActivity: async (_tenantId, sessionIds) => new Map(sessionIds.map((id) => [id, {
+          sessionId: id,
+          runId: "turn_recovery",
+          runState: "recovery_required",
+          runCreatedAt: "2026-08-13T08:00:00.000Z",
+          admissionState: "admitted" as const,
+          admissionCreatedAt: "2026-08-13T08:00:00.000Z",
+          admissionUpdatedAt: "2026-08-13T08:00:00.000Z",
+        }])),
+      },
+    });
+
+    await request(app.getHttpServer())
+      .get("/v1/tasks?workspaceId=workspace_cloud")
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body[0]).toMatchObject({ id: created.task.id, status: "failed" });
+        expect(body[0].unreadAt).toEqual(expect.any(String));
+      });
+  });
+
   it("persists provider stream errors before the thread projection is reloaded", async () => {
     const startTurn = vi.fn((options: StartTurnOptions) => {
       options.onEvent({ kind: "turn.start", turnId: "turn_failed" });
@@ -1688,6 +1772,8 @@ type CreateAppOptions = {
     beginAdmission?: DurableTurnService["beginAdmission"];
     admit: (input: DurableTurnAdmission) => Promise<{ runId: string; sessionId: string }>;
     cancel?: DurableTurnService["cancel"];
+    state?: DurableTurnService["state"];
+    taskActivity?: DurableTurnService["taskActivity"];
   } | undefined;
 };
 
@@ -1723,6 +1809,8 @@ async function createApp(
     builder = builder.overrideProvider(DurableTurnService).useValue({
       ...options.durableTurns,
       beginAdmission: options.durableTurns.beginAdmission ?? (async () => null),
+      state: options.durableTurns.state ?? (async () => ({ active: false, turnId: null, bufferedEvents: [], replayOnly: false })),
+      taskActivity: options.durableTurns.taskActivity ?? (async () => new Map()),
     });
   }
   if (options.contextAssembly) {

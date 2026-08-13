@@ -4,6 +4,7 @@ import {
   INITIAL_CONVERSATION_SECTION_STATE,
   conversationSectionReducer,
   conversationsForKind,
+  taskHasUnreadActivity,
   taskIsInProgress,
   visibleConversationSlice,
 } from "./berry-conversation-sidebar";
@@ -89,5 +90,17 @@ describe("Berry conversation sidebar model", () => {
   it("shows activity only until a task reaches a terminal status", () => {
     expect(["queued", "running", "waiting-for-approval"].map((status) => taskIsInProgress(task(status, "chat", { status: status as Task["status"] })))).toEqual([true, true, true]);
     expect(["completed", "failed", "cancelled"].map((status) => taskIsInProgress(task(status, "chat", { status: status as Task["status"] })))).toEqual([false, false, false]);
+  });
+
+  it("shows unread activity only when completion is newer than the last read", () => {
+    expect(taskHasUnreadActivity(task("unread", "chat", {
+      unreadAt: "2026-07-20T02:00:00.000Z",
+      lastReadAt: "2026-07-20T01:00:00.000Z",
+    }))).toBe(true);
+    expect(taskHasUnreadActivity(task("read", "chat", {
+      unreadAt: "2026-07-20T01:00:00.000Z",
+      lastReadAt: "2026-07-20T02:00:00.000Z",
+    }))).toBe(false);
+    expect(taskHasUnreadActivity(task("never-unread", "chat"))).toBe(false);
   });
 });

@@ -179,7 +179,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
         </div>
       ) : null}
       {state === "error" ? <LibraryStatus title="The library could not be loaded" detail={error} action={<Button size="sm" onClick={() => void refresh()}>Try again</Button>} /> : null}
-      {state === "ready" && visibleItems.length === 0 ? <LibraryStatus title={search ? "No matching files" : tab === "all" ? "No files yet" : tab === "images" ? "No images yet" : "No documents yet"} detail={search ? "Try a different file name or clear the search." : "Upload a file in chat or ask Berry to create one. It will show up here."} /> : null}
+      {state === "ready" && visibleItems.length === 0 ? <LibraryStatus title={search ? "No matching files" : tab === "all" ? "No files yet" : tab === "images" ? "No images yet" : "No documents yet"} detail={search ? "Try a different file name or clear the search." : "Upload a file in a task or ask Berry to create one. It will show up here."} /> : null}
 
       {state === "ready" && visibleItems.length > 0 ? (
         <div className="berry-library-grid">

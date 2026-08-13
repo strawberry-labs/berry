@@ -628,7 +628,7 @@ function createDevelopmentHostClient(): HostClient {
         const workspace = {
           id: "dev_ws_general",
           path: "/tmp/berry-general",
-          name: "Chats",
+          name: "Tasks",
           workspaceKind: "general",
           ownerUserId: null,
           trustState: "trusted",
@@ -756,7 +756,7 @@ function createDevelopmentHostClient(): HostClient {
           let general = state.workspaces.find((workspace) => asRecord(workspace).workspaceKind === "general");
           if (!general) {
             const createdAt = new Date().toISOString();
-            general = { id: "dev_ws_general", path: "/tmp/berry-general", name: "Chats", workspaceKind: "general", ownerUserId: null, trustState: "trusted", lastOpenedAt: createdAt, indexedAt: null, createdAt, updatedAt: createdAt };
+            general = { id: "dev_ws_general", path: "/tmp/berry-general", name: "Tasks", workspaceKind: "general", ownerUserId: null, trustState: "trusted", lastOpenedAt: createdAt, indexedAt: null, createdAt, updatedAt: createdAt };
             state.workspaces.push(general);
           }
           workspaceId = recordId(general) ?? "dev_ws_general";
@@ -766,7 +766,7 @@ function createDevelopmentHostClient(): HostClient {
         const task = {
           id: `dev_task_${crypto.randomUUID()}`,
           workspaceId,
-          title: stringOr(input.title, "New chat"),
+          title: stringOr(input.title, "New task"),
           status: "running",
           activeSessionId: sessionId,
           conversationKind: input.conversationKind === "code" ? "code" : "chat",
@@ -775,7 +775,7 @@ function createDevelopmentHostClient(): HostClient {
           deletedAt: null,
           unreadAt: null,
           lastReadAt: null,
-          searchableText: stringOr(input.title, "New chat"),
+          searchableText: stringOr(input.title, "New task"),
           worktreePath: null,
           worktreeBranch: null,
           worktreeBaseRef: null,

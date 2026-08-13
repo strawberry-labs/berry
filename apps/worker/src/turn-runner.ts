@@ -19,7 +19,6 @@ import {
 import {
   AgentStreamEventSchema,
   DURABLE_BASE_BUILT_IN_TOOLS,
-  DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
   DurableTurnRuntimeRequestSchema,
   openDurableSecret,
   latestAssistantStreamDraft,
@@ -2221,7 +2220,14 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
       );
       if (mutation.taskStatus) {
         await executor.execute(
-          "UPDATE tasks SET status=$3,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+          `UPDATE tasks
+           SET status=$3,
+               unread_at=CASE
+                 WHEN $3::task_status IN ('completed','failed') AND status IS DISTINCT FROM $3::task_status THEN date_trunc('milliseconds',now())
+                 ELSE unread_at
+               END,
+               updated_at=now()
+           WHERE tenant_id=$1::uuid AND id=$2::uuid`,
           [snapshot.tenantId, snapshot.taskId, mutation.taskStatus],
         );
       }
@@ -3404,7 +3410,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "The runtime environment below gives the exact workspace root for this turn. Use that exact root. If a skill or example says /workspace, treat it as a placeholder for the runtime root; never assume /workspace exists.",
   "Sandbox persistence is selective. Inputs are already durable and the workspace inputs directory must not be copied. Put disposable clones, package caches, extracted intermediates, and build trees under system /tmp, outside the runtime workspace. Keep only user-authored working files in the workspace and final deliverables in its outputs directory.",
   "run_command uses Bash. Check for an installed command before downloading or compiling a replacement, and keep large dependency trees in system /tmp.",
-  `Treat every file-tool call as stateless. Keep each content argument at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters and repeat the exact non-empty absolute path on every read_file, list_files, write_file, append_file, and edit_file call; a prior path is never carried forward. Every append_file call must include all three fields: path, one bounded content chunk, and expected_size_bytes copied exactly from the preceding write_file or append_file sizeBytes result. Do not retry the same truncated payload.`,
+  "Treat every file-tool call as stateless and repeat the exact non-empty absolute path on every read_file, list_files, write_file, and edit_file call; a prior path is never carried forward. Use write_file for new files or complete rewrites and edit_file for precise replacements.",
   "When creating a personal skill, build a complete package directory containing SKILL.md plus any reusable scripts, references, assets, or templates, then call save_personal_skill once with the directory path. Copy reusable task attachments into stable package paths; never hardcode task-scoped /inputs/<file-id> paths. Instructions-only skills may use content directly.",
   "Read a tool error before retrying and correct its path, schema, or strategy. Do not repeat an identical failed call more than once.",
   "For ordinary requests about current web information, make one or two targeted search calls, open or scrape only the most relevant primary page when more detail is necessary, and answer briefly with source links. Do not activate deep-research for routine questions. Activate it only when the user explicitly asks for deep, extensive, comprehensive, or exhaustive research or invokes $deep-research. Never claim browsing is unavailable when a relevant tool is declared.",
@@ -3443,29 +3449,6 @@ export function durableVisionToolSelectionPrompt(toolNames: readonly string[]): 
   return toolNames.includes("inspect_images") ? DURABLE_VISION_TOOL_SELECTION_PROMPT : "";
 }
 
-export const DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT = [
-  "DeepSeek V4 Flash file-tool compatibility guard:",
-  `keep write_file and append_file content at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters,`,
-  "and treat every file call as stateless by including the exact non-empty absolute path again.",
-  "edit_file is intentionally unavailable for this model because large multi-field edit calls can lose their path. Use apply_patch for targeted edits, or make bounded write_file/append_file calls when replacing a complete file.",
-  'For append_file, always send all three fields, for example: {"path":"/home/user/workspace/output/report.html","content":"next chunk","expected_size_bytes":8421}.',
-  "Replace 8421 with the exact sizeBytes from the preceding write_file or append_file result; a prior path or size is never carried forward implicitly.",
-].join(" ");
-
-export function durableProviderCompatibilityPrompt(
-  model: string | null | undefined,
-  toolNames: readonly string[],
-): string {
-  if (!isDeepSeekV4FlashModel(model)) return "";
-  return toolNames.some((name) => ["read_file", "list_files", "write_file", "append_file", "edit_file"].includes(name))
-    ? DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT
-    : "";
-}
-
-function isDeepSeekV4FlashModel(model: string | null | undefined): boolean {
-  return typeof model === "string" && /deepseek.*v4[-_.]?flash/i.test(model);
-}
-
 function modelMessages(
   snapshot: DurableTurnSnapshot,
   additionalUserContent: readonly ChatContentPart[] = [],
@@ -3489,10 +3472,6 @@ function modelMessages(
       : "",
     durableImageToolSelectionPrompt(runtime?.builtInTools ?? []),
     durableVisionToolSelectionPrompt(runtime?.builtInTools ?? []),
-    durableProviderCompatibilityPrompt(
-      runtime?.model ?? runtime?.provider.defaultModel,
-      runtime?.builtInTools ?? [],
-    ),
     snapshot.runtimeRequest.continueInterruptedTurn === true
       ? "This is an explicit continuation request. Continue the interrupted assistant response from the persisted partial output without repeating completed content."
       : "",
@@ -3679,9 +3658,7 @@ export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): Ch
   const definitionsByName = new Map(
     DURABLE_TOOL_DEFINITIONS.map((definition) => [definition.function.name, definition]),
   );
-  const model = runtime?.model ?? runtime?.provider.defaultModel;
   const definitions = [...enabled].flatMap((name) => {
-    if (name === "edit_file" && isDeepSeekV4FlashModel(model)) return [];
     const definition = definitionsByName.get(name);
     return definition ? [definition] : [];
   });
@@ -3877,31 +3854,14 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "write_file",
-      description: `Create or replace a UTF-8 file under the exact runtime workspace root shown in the system prompt. Always include path. Keep content at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters; for larger files, write the first chunk and use append_file in later tool turns.`,
+      description: "Write content to a UTF-8 file under the exact runtime workspace root shown in the system prompt. Creates the file if it does not exist and overwrites it if it does. Automatically creates parent directories.",
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path", "content"],
         properties: {
           path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute path under the runtime workspace root" },
-          content: { type: "string", maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS, description: "Complete content, or the first bounded chunk when append_file will continue it" },
-        },
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "append_file",
-      description: `Append one UTF-8 chunk of at most ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters to an existing workspace file. Treat every call as stateless and send all three required fields: the exact non-empty path, one bounded content chunk, and expected_size_bytes copied from the previous write_file or append_file sizeBytes result.`,
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        required: ["path", "content", "expected_size_bytes"],
-        properties: {
-          path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute path under the runtime workspace root" },
-          content: { type: "string", minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS, description: "The next bounded UTF-8 text chunk to append" },
-          expected_size_bytes: { type: "integer", minimum: 0, description: "Exact sizeBytes from the preceding write or append result" },
+          content: { type: "string", description: "Complete file content" },
         },
       },
     },
@@ -3910,15 +3870,15 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "edit_file",
-      description: `Replace one bounded exact string in a UTF-8 workspace file. Always include the exact absolute path. old_string and new_string must each be at most ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters; use apply_patch or several small edits for a larger change.`,
+      description: "Replace one exact string in a UTF-8 workspace file. Always include the exact absolute path.",
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path", "old_string", "new_string"],
         properties: {
           path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute workspace path" },
-          old_string: { type: "string", minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
-          new_string: { type: "string", maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+          old_string: { type: "string", minLength: 1 },
+          new_string: { type: "string" },
           replace_all: { type: "boolean" },
         },
       },

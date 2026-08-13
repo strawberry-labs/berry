@@ -1,7 +1,7 @@
 /**
  * Composer autocomplete primitives for trigger-token insertion. Four trigger
  * characters each open a popover of live-filtering results:
- *   @ files/folders   / commands   $ skills   # conversations
+ *   @ files/folders   / commands   $ skills   # tasks
  */
 
 export type MentionTrigger = "@" | "/" | "$" | "#";
@@ -142,12 +142,12 @@ export const MENTION_HINTS: Record<MentionTrigger, string> = {
   "@": "Type to search files or folders",
   "/": "Type to search commands",
   $: "Type to search skills",
-  "#": "Type to search recent conversations",
+  "#": "Type to search recent tasks",
 };
 
 export const MENTION_EMPTY: Record<MentionTrigger, string> = {
   "@": "No matching files",
   "/": "No matching commands",
   $: "No matching skills",
-  "#": "No matching conversations",
+  "#": "No matching tasks",
 };

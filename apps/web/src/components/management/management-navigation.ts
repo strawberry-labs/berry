@@ -139,7 +139,7 @@ export const PERSONAL_NAV: NavGroup[] = [
     { id: "skills", label: "Skills", icon: Puzzle },
     { id: "mcp", label: "MCP servers", icon: Network },
     { id: "usage", label: "Usage", icon: LineChart },
-    { id: "archived", label: "Archived chats", icon: MessageSquareText },
+    { id: "archived", label: "Archived tasks", icon: MessageSquareText },
   ] },
 ];
 export const ADMIN_NAV: NavGroup[] = [

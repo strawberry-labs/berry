@@ -1856,7 +1856,7 @@ code, pre {
   padding-bottom: 1px;
 }
 
-/* New chat, Skills, and Library form one command group. Match the 24px
+/* New task, Skills, and Library form one command group. Match the 24px
    separation between content groups before Projects begins. */
 .berry-web-shell .berry-sidebar-header:has(.berry-sidebar-commands) {
   padding-bottom: 16px;

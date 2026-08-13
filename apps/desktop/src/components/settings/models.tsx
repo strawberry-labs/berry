@@ -56,7 +56,7 @@ const PROVIDERS_KEY = ["model-providers"] as const;
 const PRESETS_KEY = ["model-presets"] as const;
 const PROVIDER_HEALTH_INTERVAL_MS = 60_000;
 const MODE_DEFAULTS: Array<{ mode: ConversationKind; label: string }> = [
-  { mode: "chat", label: "Chat" },
+  { mode: "chat", label: "Task" },
   { mode: "code", label: "Code" },
 ];
 
@@ -1606,7 +1606,7 @@ export function ModelSettings() {
     <div className="flex flex-col gap-6">
       <SettingsPageHeader
         title="Model settings"
-        description="Manage model providers. Once configured, they can be selected during chat."
+        description="Manage model providers. Once configured, they can be selected during a task."
         actions={
           <Button
             size="icon-sm"

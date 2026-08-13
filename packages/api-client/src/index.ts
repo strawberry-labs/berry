@@ -287,6 +287,8 @@ export interface UpdateTaskRequest {
   pinned?: boolean | undefined;
   archived?: boolean | undefined;
   conversationKind?: "chat" | "code" | undefined;
+  read?: boolean | undefined;
+  readThrough?: string | undefined;
 }
 
 interface StartTurnRequestBase {
@@ -660,13 +662,14 @@ export class BerryApiClient {
     });
   }
 
-  async listTasks(filter: { workspaceId?: string | undefined; workspaceKind?: "project" | "general" | undefined; includeDeleted?: boolean | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Promise<Task[]> {
+  async listTasks(filter: { workspaceId?: string | undefined; workspaceKind?: "project" | "general" | undefined; includeDeleted?: boolean | undefined; limit?: number | undefined; offset?: number | undefined; taskIds?: readonly string[] | undefined } = {}): Promise<Task[]> {
     const params = new URLSearchParams();
     if (filter.workspaceId) params.set("workspaceId", filter.workspaceId);
     if (filter.workspaceKind) params.set("workspaceKind", filter.workspaceKind);
     if (filter.includeDeleted) params.set("includeDeleted", "true");
     if (filter.limit !== undefined) params.set("limit", String(filter.limit));
     if (filter.offset !== undefined) params.set("offset", String(filter.offset));
+    if (filter.taskIds) params.set("taskIds", [...new Set(filter.taskIds)].join(","));
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     return this.#request(`/v1/tasks${suffix}`, z.array(TaskSchema));
   }

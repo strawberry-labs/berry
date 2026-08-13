@@ -56,6 +56,16 @@ export interface DurableTurnAdmissionIntent {
   operationFingerprint: string;
 }
 
+export interface DurableTaskActivity {
+  sessionId: string;
+  runId: string | null;
+  runState: string | null;
+  runCreatedAt: string | null;
+  admissionState: "preparing" | "admitted" | "cancelled" | null;
+  admissionCreatedAt: string | null;
+  admissionUpdatedAt: string | null;
+}
+
 export interface DurableEventEnvelope {
   id: string;
   runId: string;
@@ -407,6 +417,59 @@ LIMIT 256
         nextAction: run.next_action,
         error: run.error,
       });
+    });
+  }
+
+  async taskActivity(tenantId: string, sessionIds: readonly string[]): Promise<Map<string, DurableTaskActivity>> {
+    if (!this.enabled || sessionIds.length === 0) return new Map();
+    return this.database.withTenant(tenantId, async (executor) => {
+      const rows = await executor.query<{
+        session_id: string;
+        run_id: string | null;
+        run_state: string | null;
+        run_created_at: Date | string | null;
+        admission_state: "preparing" | "admitted" | "cancelled" | null;
+        admission_created_at: Date | string | null;
+        admission_updated_at: Date | string | null;
+      }>(
+        `
+WITH requested AS (
+  SELECT DISTINCT unnest($2::uuid[]) AS session_id
+)
+SELECT requested.session_id,
+       latest_run.id AS run_id,
+       latest_run.state AS run_state,
+       latest_run.created_at AS run_created_at,
+       latest_intent.state AS admission_state,
+       latest_intent.created_at AS admission_created_at,
+       latest_intent.updated_at AS admission_updated_at
+FROM requested
+LEFT JOIN LATERAL (
+  SELECT id,state,created_at
+  FROM turn_runs
+  WHERE tenant_id=$1::uuid AND session_id=requested.session_id
+  ORDER BY created_at DESC
+  LIMIT 1
+) latest_run ON true
+LEFT JOIN LATERAL (
+  SELECT state,created_at,updated_at
+  FROM turn_admission_intents
+  WHERE tenant_id=$1::uuid AND session_id=requested.session_id
+  ORDER BY created_at DESC
+  LIMIT 1
+) latest_intent ON true
+        `.trim(),
+        [tenantId, [...new Set(sessionIds)]],
+      );
+      return new Map(rows.map((row) => [row.session_id, {
+        sessionId: row.session_id,
+        runId: row.run_id,
+        runState: row.run_state,
+        runCreatedAt: nullableIso(row.run_created_at),
+        admissionState: row.admission_state,
+        admissionCreatedAt: nullableIso(row.admission_created_at),
+        admissionUpdatedAt: nullableIso(row.admission_updated_at),
+      }]));
     });
   }
 
@@ -1781,6 +1844,11 @@ function nullableNumber(value: number | string | null | undefined): number | nul
   if (value === null || value === undefined) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function nullableIso(value: Date | string | null): string | null {
+  if (value === null) return null;
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
 async function continuableRequestMessageId(

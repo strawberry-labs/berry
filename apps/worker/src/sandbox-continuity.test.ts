@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SandboxProvider } from "@berry/sandbox-contract";
-import { DURABLE_FILE_TOOL_MAX_CONTENT_CHARS } from "@berry/shared";
 import {
   S3SandboxSnapshotObjectStore,
   SandboxContinuityManager,
@@ -689,8 +688,8 @@ describe("SandboxContinuityManager", () => {
   it.each([
     ["read_file", {}],
     ["list_files", { path: "   " }],
-    ["write_file", { content: "x".repeat(5_500) }],
-    ["append_file", { content: "x".repeat(5_500), expected_size_bytes: 0 }],
+    ["write_file", { content: "contents" }],
+    ["append_file", { content: "contents", expected_size_bytes: 0 }],
     ["edit_file", { old_string: "before", new_string: "after" }],
   ])("rejects %s before a missing path can resolve to the workspace directory", async (toolName, args) => {
     const read = vi.fn();
@@ -703,40 +702,49 @@ describe("SandboxContinuityManager", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["write_file", "retry write_file with the first"],
-    ["append_file", "retry append_file with one chunk"],
-  ])("bounds %s content so providers can preserve sibling arguments", async (toolName, recoveryInstruction) => {
-    const read = vi.fn();
-    const write = vi.fn();
-    const manager = managerWithProvider({ read, write, list: vi.fn() });
-    const args = {
-      path: "/workspace/result.txt",
-      content: "x".repeat(DURABLE_FILE_TOOL_MAX_CONTENT_CHARS + 1),
-      ...(toolName === "append_file" ? { expected_size_bytes: 0 } : {}),
-    };
+  it("writes complete large content in one call", async () => {
+    const content = "x".repeat(8_911);
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
+    const manager = managerWithProvider({ read: vi.fn(), write, list: vi.fn() });
 
-    await expect(manager.execute(snapshot(), toolStep(toolName, args)))
-      .rejects.toThrow(recoveryInstruction);
-    expect(read).not.toHaveBeenCalled();
-    expect(write).not.toHaveBeenCalled();
+    await expect(manager.execute(snapshot(), toolStep("write_file", {
+      path: "/workspace/result.json",
+      content,
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace/result.json", sizeBytes: 8_911 },
+    });
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      path: "/workspace/result.json",
+      content,
+    }));
   });
 
-  it.each(["old_string", "new_string"] as const)("bounds edit_file %s before touching the workspace", async (field) => {
-    const read = vi.fn();
-    const write = vi.fn();
+  it("accepts large exact replacements", async () => {
+    const replacement = "x".repeat(8_911);
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      content: "before",
+      size_bytes: 6,
+    }));
+    const write = vi.fn(async (input: { path: string; content: string }) => ({
+      path: input.path,
+      size_bytes: Buffer.byteLength(input.content),
+      mtime: null,
+    }));
     const manager = managerWithProvider({ read, write, list: vi.fn() });
-    const args = {
+
+    await expect(manager.execute(snapshot(), toolStep("edit_file", {
       path: "/workspace/result.txt",
       old_string: "before",
-      new_string: "after",
-      [field]: "x".repeat(DURABLE_FILE_TOOL_MAX_CONTENT_CHARS + 1),
-    };
-
-    await expect(manager.execute(snapshot(), toolStep("edit_file", args)))
-      .rejects.toThrow(`edit_file ${field}`);
-    expect(read).not.toHaveBeenCalled();
-    expect(write).not.toHaveBeenCalled();
+      new_string: replacement,
+    }))).resolves.toMatchObject({
+      output: { path: "/workspace/result.txt", sizeBytes: 8_911, replacements: 1 },
+    });
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({ content: replacement }));
   });
 
   it("requires edit_file new_string while still permitting an intentional empty replacement", async () => {

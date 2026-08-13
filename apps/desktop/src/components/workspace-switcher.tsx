@@ -256,11 +256,11 @@ export function WorkspaceRowActions({ workspace, tasks, trigger }: { workspace: 
       if (activeWorkspace?.id === workspace.id) openHome();
       toast.success(
         skipped > 0
-          ? `Archived ${archivable.length} chat${archivable.length === 1 ? "" : "s"}; skipped ${skipped} running`
-          : `Archived ${archivable.length} chat${archivable.length === 1 ? "" : "s"}`,
+          ? `Archived ${archivable.length} task${archivable.length === 1 ? "" : "s"}; skipped ${skipped} running`
+          : `Archived ${archivable.length} task${archivable.length === 1 ? "" : "s"}`,
       );
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not archive the project chats");
+      toast.error(error instanceof Error ? error.message : "Could not archive the project tasks");
     }
   };
 
@@ -306,7 +306,7 @@ export function WorkspaceRowActions({ workspace, tasks, trigger }: { workspace: 
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem disabled={tasks.length === 0} onSelect={() => setArchiveConfirmOpen(true)}>
-            <Archive /> Archive chats
+            <Archive /> Archive tasks
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" onSelect={() => setRemoveConfirmOpen(true)}>
@@ -340,14 +340,14 @@ export function WorkspaceRowActions({ workspace, tasks, trigger }: { workspace: 
       <AlertDialog open={archiveConfirmOpen} onOpenChange={setArchiveConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Archive chats in {workspace.name}?</AlertDialogTitle>
+            <AlertDialogTitle>Archive tasks in {workspace.name}?</AlertDialogTitle>
             <AlertDialogDescription>
-              This archives {tasks.length} chat{tasks.length === 1 ? "" : "s"}. Running chats are skipped. Archived chats remain recoverable.
+              This archives {tasks.length} task{tasks.length === 1 ? "" : "s"}. Running tasks are skipped. Archived tasks remain recoverable.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void archiveChats()}>Archive chats</AlertDialogAction>
+            <AlertDialogAction onClick={() => void archiveChats()}>Archive tasks</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
