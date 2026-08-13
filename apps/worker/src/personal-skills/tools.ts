@@ -18,6 +18,11 @@ const SavePersonalSkillInputSchema = z.union([
   z.object({ path: z.string().trim().min(1).max(4_096) }).strict(),
 ]);
 
+const ActivateStoredSkillInputSchema = z.object({
+  name: z.string().trim().min(1).max(128),
+  resources: z.array(z.string().trim().min(1).max(512)).max(50).optional(),
+}).strict();
+
 export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor {
   constructor(
     private readonly base: DurableTurnToolExecutor,
@@ -184,11 +189,21 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
 
   private async activateSkill(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
-    const requestedName = stringValue((step.input.arguments as Record<string, unknown> | undefined)?.name);
+    const parsedInput = ActivateStoredSkillInputSchema.safeParse(step.input.arguments ?? {});
+    if (!parsedInput.success) {
+      throw new Error("activate_skill requires a valid skill name and, when loading files, an optional resources array of exact relative paths");
+    }
+    const requestedName = parsedInput.data.name;
+    const requestedResources = [...new Set(parsedInput.data.resources ?? [])];
     const skill = runtime.extraSkills.find((candidate) => candidate.name === requestedName);
     if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}`);
-    const alreadyActive = snapshot.steps.some((candidate) => candidate.id !== step.id && candidate.state === "completed" && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill" && stringValue((candidate.input.arguments as Record<string, unknown> | undefined)?.name) === skill.name);
-    if (alreadyActive) return { output: { skill: skill.name, alreadyActive: true, content: `<skill_already_active name=${JSON.stringify(skill.name)} />` }, summary: `${skill.name} is already active` };
+    const alreadyActive = snapshot.steps.some((candidate) => candidate.id !== step.id
+      && candidate.state === "completed"
+      && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill"
+      && stringValue((candidate.input.arguments as Record<string, unknown> | undefined)?.name) === skill.name);
+    if (alreadyActive && requestedResources.length === 0) {
+      return { output: { skill: skill.name, alreadyActive: true, content: `<skill_already_active name=${JSON.stringify(skill.name)} />` }, summary: `${skill.name} is already active` };
+    }
 
     const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
@@ -198,6 +213,11 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const packageRecordId = personalId ?? organizationId!;
     const packageTable = personalId ? "personal_skill_files" : "organization_skill_files";
     const packageForeignKey = personalId ? "skill_id" : "organization_capability_id";
+    const availableResources = rows.map((row) => row.path);
+    const unknownResources = requestedResources.filter((path) => !availableResources.includes(path));
+    if (unknownResources.length > 0) {
+      throw new Error(`Unknown ${skill.name} resource${unknownResources.length === 1 ? "" : "s"}: ${unknownResources.join(", ")}`);
+    }
     const files: DurableSkillPackageFile[] = [
       { path: "SKILL.md", contentBytes: Buffer.from(skill.content, "utf8"), mode: 0o644 },
       ...rows.map((row) => ({
@@ -205,22 +225,47 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
         sizeBytes: Number(row.size_bytes),
         sha256: row.sha256,
         mode: row.mode,
-        loadContentBytes: async () => {
-          const loaded = await this.inTenant(snapshot.tenantId, (executor) => executor.query<{ content: Buffer }>(
-            `SELECT content FROM ${packageTable} WHERE ${packageForeignKey}=$1 AND path=$2 LIMIT 1`,
-            [packageRecordId, row.path],
-          ));
-          if (!loaded[0]) throw new Error(`Stored skill resource is missing: ${row.path}`);
-          return loaded[0].content;
-        },
       })),
     ];
     if (!this.base.stageSkillPackage) throw new Error("Skill package workspace access is unavailable");
-    const staged = await this.base.stageSkillPackage(snapshot, personalId ?? organizationId ?? skill.name, files);
-    const activeSkill = { ...skill, filePath: staged.filePath, resources: staged.resources };
+    const loadContentBytes = async (paths: readonly string[]): Promise<ReadonlyMap<string, Uint8Array>> => {
+      if (paths.length === 0) return new Map();
+      const loaded = await this.inTenant(snapshot.tenantId, (executor) => executor.query<{ path: string; content: Buffer }>(
+        `SELECT path,content FROM ${packageTable} WHERE ${packageForeignKey}=$1 AND path=ANY($2::text[])`,
+        [packageRecordId, [...paths]],
+      ));
+      const byPath = new Map<string, Uint8Array>(loaded.map((row) => [row.path, row.content]));
+      const missing = paths.filter((path) => !byPath.has(path));
+      if (missing.length > 0) throw new Error(`Stored skill resource is missing: ${missing.join(", ")}`);
+      return byPath;
+    };
+    const staged = await this.base.stageSkillPackage(
+      snapshot,
+      personalId ?? organizationId ?? skill.name,
+      files,
+      { resourcePaths: requestedResources, loadContentBytes },
+    );
+    const activeSkill = { ...skill, filePath: staged.filePath, resources: availableResources };
+    const skillDirectory = staged.filePath.slice(0, -"/SKILL.md".length);
+    const content = alreadyActive && requestedResources.length > 0
+      ? `<skill_resources_ready name=${JSON.stringify(skill.name)} directory=${JSON.stringify(skillDirectory)}>\n${requestedResources.map((path) => `  <file>${escapeXml(path)}</file>`).join("\n")}\n</skill_resources_ready>`
+      : formatSkillInvocation(activeSkill, requestedResources.length > 0
+          ? `The requested resource files are materialized under ${skillDirectory}. Use only the exact paths needed for this task.`
+          : "Resource files are deferred. Before using any listed file, call activate_skill again with this skill name and one resources array containing every exact relative path needed for the next operation. Do not load unrelated resources.");
+    const summary = requestedResources.length > 0
+      ? `Loaded ${requestedResources.length} ${skill.name} resource file${requestedResources.length === 1 ? "" : "s"}`
+      : `Activated ${skill.name}; ${availableResources.length} resource file${availableResources.length === 1 ? "" : "s"} available on demand`;
     return {
-      output: { skill: skill.name, alreadyActive: false, location: staged.filePath, content: formatSkillInvocation(activeSkill) },
-      summary: `Activated ${skill.name} with ${staged.resources.length} resource file${staged.resources.length === 1 ? "" : "s"}`,
+      output: {
+        skill: skill.name,
+        alreadyActive,
+        location: staged.filePath,
+        availableResources,
+        stagedResources: staged.stagedResources,
+        stagingSandboxId: staged.stagingSandboxId,
+        content,
+      },
+      summary,
     };
   }
 
@@ -253,4 +298,13 @@ function skillPackageBytes(file: DurableSkillPackageFile): Buffer {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }

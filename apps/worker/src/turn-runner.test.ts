@@ -15,6 +15,7 @@ import {
 import {
   DurableTurnRunner,
   DurableTurnRetryableError,
+  DurableToolExecutionError,
   DURABLE_IMAGE_TOOL_SELECTION_PROMPT,
   DURABLE_TOOL_DEFINITIONS,
   RouterDurableTurnModel,
@@ -1047,6 +1048,72 @@ describe("durable turn runner", () => {
     )).toBe(true);
     const failed = repository.mutations.find((mutation) => mutation.toolResultMessage);
     expect(failed?.toolResultMessage?.id).toBe(failed?.entries?.[0]?.entryId);
+  });
+
+  it("reserves for the vision retry and records provider usage when inspection still fails", async () => {
+    const tool = {
+      ...toolStep("pending", "idempotent_with_key", false),
+      type: "tool.inspect_images",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "inspect_images",
+        arguments: { mode: "overview" },
+        requiresApproval: false,
+        approvalKind: "file-edit" as const,
+      },
+    };
+    const current = snapshot("executing_tool", [admittedStep(), tool]);
+    current.runtimeRequest = {
+      capabilityVersion: 1,
+      requestId: "vision-request",
+      input: "Inspect this image",
+      providerId: "router",
+      provider: { id: "router", name: "Router", kind: "berry-router", baseUrl: "https://router.example/v1", defaultModel: "text-model" },
+      model: "text-model",
+      workspacePath: "/workspace",
+      workspaceId: current.workspaceId,
+      permissionMode: "full-access",
+      reasoning: "off",
+      maxTokens: 4_096,
+      contextWindowTokens: 100_000,
+      modelAcceptsImages: false,
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "inspect_images"],
+      vision: {
+        providerId: "router",
+        provider: { id: "router", name: "Router", kind: "berry-router", baseUrl: "https://router.example/v1", defaultModel: "vision-model" },
+        model: "vision-model",
+        maxTokens: 1_536,
+        modelPricing: { input: 0, output: 0 },
+        estimatedCostMicros: "3000",
+      },
+      attachments: [],
+    };
+    const repository = new FakeTurnRepository(current);
+    const usage = {
+      kind: "usage" as const,
+      inputTokens: 50,
+      outputTokens: 10,
+      totalTokens: 60,
+      costRawMicros: "25",
+      pricingSource: "measured" as const,
+      servedProvider: "router",
+      servedModel: "vision-model",
+    };
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => { throw new DurableToolExecutionError("Vision remained empty", usage); },
+    }, { owner: "worker-vision-failure" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({
+      state: "calling_model",
+    });
+
+    expect(repository.lastBudgetEstimate).toBe("6000");
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "usage",
+      inputTokens: 50,
+      outputTokens: 10,
+      costRawMicros: "25",
+    }));
   });
 
   it("feeds a known non-idempotent tool exception back to the model", async () => {

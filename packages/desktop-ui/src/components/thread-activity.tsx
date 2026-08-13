@@ -70,6 +70,7 @@ const EXACT_FAMILY: Record<string, ToolFamily> = {
   websearch: "search",
   web_search: "search",
   web_fetch: "search",
+  inspect_images: "other",
 };
 
 export function familyFromTool(name: string): ToolFamily {
@@ -1285,7 +1286,8 @@ function ToolEntranceWrapper({
 /**
  * Renders one consecutive run of tool calls the way Berry's message walker
  * does: consecutive explore-eligible calls collapse into one Explore group;
- * everything else renders as its own row. Rows/groups stack with gap-4.
+ * everything else renders as its own row. Keep the same compact gap as the
+ * surrounding Thought rows and nested Explore entries.
  */
 export function ToolFlow({
   tools,
@@ -1318,7 +1320,7 @@ export function ToolFlow({
   // A lone eligible call still gets the Explore treatment in Berry (it is an
   // aggregate of one); keep that behavior.
   return (
-    <div className="flex w-full flex-col gap-4">
+    <div className="flex w-full flex-col gap-2">
       {segments.map((segment, index) =>
         segment.kind === "explore" ? (
           <ExploreGroup

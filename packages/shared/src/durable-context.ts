@@ -7,6 +7,9 @@ const JsonObjectSchema = z.record(z.unknown());
 // Keep admission estimates and the worker's overview request on the same
 // bounded output ceiling. Focused inspections use a smaller worker-only cap.
 export const VISION_ADAPTER_MAX_OUTPUT_TOKENS = 1_536;
+// The adapter retries once when a provider returns reasoning without final
+// content. Admission must reserve enough budget for both provider calls.
+export const VISION_ADAPTER_MAX_ATTEMPTS = 2;
 
 export const MemoryScopeSchema = z.enum(["personal", "project"]);
 export type MemoryScope = z.infer<typeof MemoryScopeSchema>;

@@ -43,7 +43,13 @@ import {
   type SandboxResourceLimits,
   type SandboxResumeInput,
 } from "./schemas.js";
-import { SandboxPausedError, type SandboxFileApi, type SandboxFileWriteBytesInput, type SandboxProvider } from "./provider.js";
+import {
+  SandboxPausedError,
+  type SandboxFileApi,
+  type SandboxFileWriteBytesInput,
+  type SandboxFileWriteManyBytesInput,
+  type SandboxProvider,
+} from "./provider.js";
 
 type ParsedCreateInput = ReturnType<typeof SandboxCreateInputSchema.parse>;
 
@@ -77,6 +83,7 @@ export interface E2BSandboxLike {
   readonly files: {
     read(path: string, options: { format: "text" | "bytes" }): Promise<string | Uint8Array>;
     write(path: string, data: string | ArrayBuffer): Promise<E2BFileInfoLike>;
+    write(files: Array<{ path: string; data: string | ArrayBuffer }>): Promise<E2BFileInfoLike[]>;
     list(path: string, options?: { depth?: number | undefined }): Promise<E2BFileInfoLike[]>;
     getInfo(path: string): Promise<E2BFileInfoLike>;
   };
@@ -166,6 +173,7 @@ const DEFAULT_RESOURCES = SandboxResourceLimitsSchema.parse({});
 const DEFAULT_RECONNECT_TTL_SECONDS = 900;
 const ACTIVE_EXPIRY_SAFETY_MS = 2_000;
 const MAX_KEEPALIVE_INTERVAL_MS = 60_000;
+const MAX_CHMOD_COMMAND_BYTES = 32 * 1024;
 
 /** Direct, server-side E2B implementation of Berry's provider-neutral sandbox contract. */
 export class E2BSandboxProvider implements SandboxProvider {
@@ -188,6 +196,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     read: (input) => this.readFile(input),
     write: (input) => this.writeFile(input),
     writeBytes: (input) => this.writeFileBytes(input),
+    writeManyBytes: (input) => this.writeManyFileBytes(input),
     list: (input) => this.listFiles(input),
   };
 
@@ -283,7 +292,7 @@ export class E2BSandboxProvider implements SandboxProvider {
 
   async *exec(input: SandboxExecInput, options: { signal?: AbortSignal | undefined } = {}): AsyncIterable<SandboxExecEvent> {
     const parsed = SandboxExecInputSchema.parse(input);
-    const sandbox = await this.#sandbox(parsed.sandbox_id);
+    const sandbox = await this.#sandbox(parsed.sandbox_id, true);
     const record = this.#sandboxes.get(parsed.sandbox_id);
     const command = commandString(parsed.command, parsed.code, parsed.language);
     const startedAt = this.#now();
@@ -473,11 +482,10 @@ export class E2BSandboxProvider implements SandboxProvider {
     const parsed = SandboxFileWriteInputSchema.parse(input);
     const sandbox = await this.#sandbox(parsed.sandbox_id);
     const content = parsed.encoding === "base64" ? arrayBuffer(Buffer.from(parsed.content, "base64")) : parsed.content;
-    await sandbox.files.write(parsed.path, content);
+    const info = await sandbox.files.write(parsed.path, content);
     if (parsed.mode !== undefined) {
       await runForeground(sandbox, `chmod ${parsed.mode.toString(8)} -- ${shellQuote(parsed.path)}`);
     }
-    const info = await sandbox.files.getInfo(parsed.path);
     return SandboxFileWriteResultSchema.parse({
       path: parsed.path,
       size_bytes: info.size ?? (typeof content === "string" ? Buffer.byteLength(content) : content.byteLength),
@@ -495,15 +503,54 @@ export class E2BSandboxProvider implements SandboxProvider {
     const bytes = Buffer.isBuffer(input.content)
       ? input.content
       : Buffer.from(input.content.buffer, input.content.byteOffset, input.content.byteLength);
-    await sandbox.files.write(metadata.path, arrayBuffer(bytes));
+    const info = await sandbox.files.write(metadata.path, arrayBuffer(bytes));
     if (metadata.mode !== undefined) {
       await runForeground(sandbox, `chmod ${metadata.mode.toString(8)} -- ${shellQuote(metadata.path)}`);
     }
-    const info = await sandbox.files.getInfo(metadata.path);
     return SandboxFileWriteResultSchema.parse({
       path: metadata.path,
       size_bytes: info.size ?? bytes.byteLength,
       mtime: info.modifiedTime?.toISOString() ?? this.#now().toISOString(),
+    });
+  }
+
+  async writeManyFileBytes(input: SandboxFileWriteManyBytesInput): Promise<SandboxFileWriteResult[]> {
+    if (input.files.length === 0) return [];
+    const files = input.files.map((file) => {
+      const { content: _content, encoding: _encoding, ...metadata } = SandboxFileWriteInputSchema.parse({
+        sandbox_id: input.sandbox_id,
+        ...file,
+        content: "",
+        encoding: "base64",
+      });
+      const bytes = Buffer.isBuffer(file.content)
+        ? file.content
+        : Buffer.from(file.content.buffer, file.content.byteOffset, file.content.byteLength);
+      return { metadata, bytes };
+    });
+    const modeCommands = new Map<number, string[]>();
+    for (const { metadata } of files) {
+      if (metadata.mode === undefined) continue;
+      const paths = modeCommands.get(metadata.mode) ?? [];
+      paths.push(metadata.path);
+      modeCommands.set(metadata.mode, paths);
+    }
+    const chmodCommands = buildChmodCommands(modeCommands);
+    const sandbox = await this.#sandbox(input.sandbox_id);
+    const infos = await sandbox.files.write(files.map(({ metadata, bytes }) => ({
+      path: metadata.path,
+      data: arrayBuffer(bytes),
+    })));
+    for (const command of chmodCommands) {
+      await runForeground(sandbox, command);
+    }
+    return files.map(({ metadata, bytes }, index) => {
+      const info = infos[index];
+      return SandboxFileWriteResultSchema.parse({
+        path: metadata.path,
+        size_bytes: info?.size ?? bytes.byteLength,
+        mtime: info?.modifiedTime?.toISOString() ?? this.#now().toISOString(),
+      });
     });
   }
 
@@ -522,11 +569,18 @@ export class E2BSandboxProvider implements SandboxProvider {
     });
   }
 
-  async #sandbox(sandboxId: string): Promise<E2BSandboxLike> {
+  async #sandbox(sandboxId: string, refreshBeforeUse = false): Promise<E2BSandboxLike> {
     const current = this.#sandboxes.get(sandboxId);
-    if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) {
-      await this.#refreshTimeout(current);
-      return current.sandbox;
+    if (current) {
+      const remainingMs = current.activeUntil - this.#now().getTime();
+      const refreshThresholdMs = keepAliveIntervalMs(current.ttlSeconds) + ACTIVE_EXPIRY_SAFETY_MS;
+      if (!refreshBeforeUse && remainingMs > refreshThresholdMs) {
+        return current.sandbox;
+      }
+      if (remainingMs > ACTIVE_EXPIRY_SAFETY_MS) {
+        await this.#refreshTimeout(current);
+        return current.sandbox;
+      }
     }
 
     const info = await this.#client.getInfo(sandboxId, this.#authOptions());
@@ -562,7 +616,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     handle: E2BCommandHandleLike,
     channel: EventChannel<SandboxExecEvent>,
   ): () => Promise<void> {
-    const intervalMs = Math.max(1_000, Math.min(MAX_KEEPALIVE_INTERVAL_MS, record.ttlSeconds * 500));
+    const intervalMs = keepAliveIntervalMs(record.ttlSeconds);
     let refreshPromise: Promise<void> | null = null;
     let stopped = false;
     const timer = setInterval(() => {
@@ -758,6 +812,41 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function buildChmodCommands(modeCommands: ReadonlyMap<number, readonly string[]>): string[] {
+  const clauses: string[] = [];
+  for (const [mode, paths] of modeCommands) {
+    const prefix = `chmod ${mode.toString(8)} --`;
+    let clause = prefix;
+    for (const path of paths) {
+      const addition = ` ${shellQuote(path)}`;
+      if (Buffer.byteLength(`${prefix}${addition}`) > MAX_CHMOD_COMMAND_BYTES) {
+        throw new Error(`Sandbox file path is too long to apply mode ${mode.toString(8)}`);
+      }
+      if (Buffer.byteLength(`${clause}${addition}`) > MAX_CHMOD_COMMAND_BYTES) {
+        clauses.push(clause);
+        clause = `${prefix}${addition}`;
+      } else {
+        clause += addition;
+      }
+    }
+    if (clause !== prefix) clauses.push(clause);
+  }
+
+  const commands: string[] = [];
+  let command = "";
+  for (const clause of clauses) {
+    const addition = command.length === 0 ? clause : ` && ${clause}`;
+    if (command.length > 0 && Buffer.byteLength(`${command}${addition}`) > MAX_CHMOD_COMMAND_BYTES) {
+      commands.push(command);
+      command = clause;
+    } else {
+      command += addition;
+    }
+  }
+  if (command.length > 0) commands.push(command);
+  return commands;
+}
+
 async function runForeground(sandbox: E2BSandboxLike, command: string): Promise<E2BCommandResultLike> {
   const result = await sandbox.commands.run(command, { background: false });
   if (isCommandHandle(result)) return result.wait();
@@ -784,6 +873,10 @@ function errorMessage(error: unknown): string {
 function arrayBuffer(buffer: Buffer): ArrayBuffer {
   if (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength) return buffer.buffer as ArrayBuffer;
   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+}
+
+function keepAliveIntervalMs(ttlSeconds: number): number {
+  return Math.max(250, Math.min(MAX_KEEPALIVE_INTERVAL_MS, ttlSeconds * 500));
 }
 
 function positiveMetadataInteger(value: string | undefined): number | undefined {

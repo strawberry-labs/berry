@@ -456,6 +456,95 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+  it("loads inspect_images paths concurrently and preserves their explicit order", async () => {
+    let activeReads = 0;
+    let maxActiveReads = 0;
+    const read = vi.fn(async (input: { path: string }) => {
+      activeReads += 1;
+      maxActiveReads = Math.max(maxActiveReads, activeReads);
+      await Promise.resolve();
+      activeReads -= 1;
+      const bytes = Buffer.from(input.path.split("/").at(-1) ?? "");
+      return { path: input.path, content: bytes.toString("base64"), size_bytes: bytes.byteLength, mtime: null };
+    });
+    const provider = {
+      kind: "e2b",
+      files: { read, write: vi.fn(), list: vi.fn(async () => ({ path: "/workspace", entries: [] })) },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(),
+      latest: vi.fn(),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-ordered-images";
+    current.sandboxProvider = "e2b";
+    const paths = [
+      "/workspace/rendered/page-03.png",
+      "/workspace/rendered/page-01.png",
+      "/workspace/rendered/page-02.png",
+    ];
+    current.steps = [{ ...toolStep("inspect_images", { mode: "focused", paths }), state: "running" }];
+
+    const content = await manager.modelContent(current);
+
+    expect(content).toEqual(paths.map((path) => ({
+      type: "image_url",
+      image_url: { url: `data:image/png;base64,${Buffer.from(path.split("/").at(-1)!).toString("base64")}` },
+    })));
+    expect(maxActiveReads).toBe(3);
+    expect(read.mock.calls.map(([input]) => input.path)).toEqual(paths);
+  });
+
+  it("backfills image slots after oversized attachment candidates are skipped", async () => {
+    const inputFiles = Array.from({ length: 6 }, (_, index) => ({
+      fileId: `image-${index + 1}`,
+      name: `image-${index + 1}.png`,
+      mediaType: "image/png",
+      sizeBytes: index === 0 ? 20 * 1024 * 1024 + 1 : 1,
+      objectKey: `objects/image-${index + 1}.png`,
+    }));
+    const provider = {
+      kind: "e2b",
+      files: { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(),
+      latest: vi.fn(),
+      inputFiles: vi.fn(async () => inputFiles),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(),
+    } satisfies SandboxSnapshotRepository;
+    const getSource = vi.fn(async (key: string) => new Uint8Array([
+      Number(/image-(\d+)/.exec(key)?.[1] ?? 0),
+    ]));
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource,
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.steps = [];
+
+    const content = await manager.modelContent(current);
+
+    expect(content).toEqual([2, 3, 4, 5, 6].map((value) => ({
+      type: "image_url",
+      image_url: { url: `data:image/png;base64,${Buffer.from([value]).toString("base64")}` },
+    })));
+    expect(getSource).toHaveBeenCalledTimes(5);
+    expect(getSource).not.toHaveBeenCalledWith("objects/image-1.png", undefined);
+  });
+
   it("does not let an older terminal cleanup pause a sandbox claimed by a follow-up run", async () => {
     const provider = {
       kind: "e2b",
@@ -2093,7 +2182,17 @@ describe("SandboxContinuityManager", () => {
 
     const first = await manager.stageSkillPackage(snapshot(), "memo", skill("version one", "assets/old.docx"));
     const second = await manager.stageSkillPackage(snapshot(), "memo", skill("version two"));
-    const cached = await manager.stageSkillPackage(snapshot(), "memo", skill("version two"));
+    const cachedSnapshot = snapshot();
+    cachedSnapshot.steps = [{
+      ...toolStep("activate_skill", { name: "memo" }),
+      state: "completed",
+      output: {
+        location: second.filePath,
+        stagedResources: second.stagedResources,
+        stagingSandboxId: second.stagingSandboxId,
+      },
+    }];
+    const cached = await manager.stageSkillPackage(cachedSnapshot, "memo", skill("version two"));
 
     expect(first.filePath).not.toBe(second.filePath);
     expect(first.resources).toHaveLength(1);
@@ -2130,42 +2229,149 @@ describe("SandboxContinuityManager", () => {
     expect(writeBytes).toHaveBeenCalledTimes(2);
     expect(writeBytes.mock.calls[1]?.[0].content).toBe(large);
     expect(write).toHaveBeenCalledTimes(1);
-    expect(write.mock.calls[0]?.[0].path).toMatch(/\.berry-package-ready$/);
+    expect(write.mock.calls[0]?.[0].path).toMatch(/\.berry-staged-files\.json$/);
     expect(staged.filePath).toMatch(/^\/workspace\/runtime-skills\//);
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it("does not load database-backed resource bytes again when a package revision is already staged", async () => {
-    const markers = new Map<string, string>();
+  it("does not load database-backed resource bytes again on a follow-up run in the same sandbox", async () => {
+    const manifests = new Map<string, string>();
     const write = vi.fn(async (input: { path: string; content: string }) => {
-      markers.set(input.path, input.content);
+      manifests.set(input.path, input.content);
       return { path: input.path, size_bytes: Buffer.byteLength(input.content), mtime: null };
     });
     const writeBytes = vi.fn(async (input: { path: string; content: Uint8Array }) => ({ path: input.path, size_bytes: input.content.byteLength, mtime: null }));
     const content = Buffer.from("retained-template-bytes");
     const loadContentBytes = vi.fn(async () => content);
-    const manager = managerWithProvider({
+    const fileApi = {
       list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
       read: vi.fn(async (input: { path: string }) => {
-        const marker = markers.get(input.path);
-        if (!marker) throw new Error("not found");
-        return { path: input.path, content: marker, encoding: "utf8", size_bytes: Buffer.byteLength(marker), mtime: null };
+        const content = manifests.get(input.path);
+        if (content === undefined) throw new Error("not found");
+        return { path: input.path, content, encoding: "utf8", size_bytes: Buffer.byteLength(content), mtime: null };
       }),
       write,
       writeBytes,
-    });
+    };
+    const manager = managerWithProvider(fileApi);
     const files = [
       { path: "SKILL.md", contentBytes: Buffer.from("---\nname: cached\ndescription: Cached\n---\n") },
       { path: "assets/template.docx", sizeBytes: content.byteLength, sha256: createHash("sha256").update(content).digest("hex"), loadContentBytes },
     ];
 
     const first = await manager.stageSkillPackage(snapshot(), "cached", files);
-    const second = await manager.stageSkillPackage(snapshot(), "cached", files);
+    const second = await managerWithProvider(fileApi).stageSkillPackage(snapshot(), "cached", files);
 
     expect(second).toEqual(first);
     expect(loadContentBytes).toHaveBeenCalledTimes(1);
     expect(writeBytes).toHaveBeenCalledTimes(2);
     expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it("restages package files when durable activation state belongs to a replaced sandbox", async () => {
+    const writeManyBytes = vi.fn(async (input: { files: Array<{ path: string; content: Uint8Array }> }) => (
+      input.files.map((file) => ({ path: file.path, size_bytes: file.content.byteLength, mtime: null }))
+    ));
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read: vi.fn(),
+      write: vi.fn(),
+      writeManyBytes,
+    });
+    const files = [
+      { path: "SKILL.md", contentBytes: Buffer.from("---\nname: replaced\ndescription: Replaced\n---\n") },
+      { path: "scripts/run.py", contentBytes: Buffer.from("print('ok')\n"), mode: 0o755 },
+    ];
+    const first = await manager.stageSkillPackage(snapshot(), "replaced", files);
+    const recreatedSnapshot = snapshot();
+    recreatedSnapshot.steps = [{
+      ...toolStep("activate_skill", { name: "replaced" }),
+      state: "completed",
+      output: {
+        location: first.filePath,
+        stagedResources: first.stagedResources,
+        stagingSandboxId: "sandbox-before-replacement",
+      },
+    }];
+
+    await manager.stageSkillPackage(recreatedSnapshot, "replaced", files);
+
+    expect(writeManyBytes).toHaveBeenCalledTimes(2);
+    expect(writeManyBytes.mock.calls[1]?.[0].files).toHaveLength(2);
+  });
+
+  it("materializes only selected skill resources and batches each incremental upload", async () => {
+    const write = vi.fn();
+    const read = vi.fn(async () => { throw new Error("not found"); });
+    const writeManyBytes = vi.fn(async (input: { files: Array<{ path: string; content: Uint8Array }> }) => (
+      input.files.map((file) => ({ path: file.path, size_bytes: file.content.byteLength, mtime: null }))
+    ));
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read,
+      write,
+      writeManyBytes,
+    });
+    const script = Buffer.from("print('ok')\n");
+    const template = Buffer.from("template-bytes");
+    const files = [
+      { path: "SKILL.md", contentBytes: Buffer.from("---\nname: lazy\ndescription: Lazy\n---\n") },
+      { path: "scripts/build.py", sizeBytes: script.byteLength, sha256: createHash("sha256").update(script).digest("hex"), mode: 0o755 },
+      { path: "assets/template.docx", sizeBytes: template.byteLength, sha256: createHash("sha256").update(template).digest("hex") },
+    ];
+    const loadContentBytes = vi.fn(async (paths: readonly string[]) => new Map(paths.map((path) => [
+      path,
+      path === "scripts/build.py" ? script : template,
+    ])));
+
+    const activated = await manager.stageSkillPackage(snapshot(), "lazy", files, {
+      resourcePaths: [],
+      loadContentBytes,
+    });
+    const activatedSnapshot = snapshot();
+    activatedSnapshot.steps = [{
+      ...toolStep("activate_skill", { name: "lazy" }),
+      state: "completed",
+      output: {
+        location: activated.filePath,
+        stagedResources: activated.stagedResources,
+        stagingSandboxId: activated.stagingSandboxId,
+      },
+    }];
+    const first = await manager.stageSkillPackage(activatedSnapshot, "lazy", files, {
+      resourcePaths: ["scripts/build.py"],
+      loadContentBytes,
+    });
+    const nextSnapshot = snapshot();
+    nextSnapshot.steps = [{
+      ...toolStep("activate_skill", { name: "lazy", resources: ["scripts/build.py"] }),
+      state: "completed",
+      output: {
+        location: first.filePath,
+        stagedResources: first.stagedResources,
+        stagingSandboxId: first.stagingSandboxId,
+      },
+    }];
+    const second = await manager.stageSkillPackage(nextSnapshot, "lazy", files, {
+      resourcePaths: ["assets/template.docx"],
+      loadContentBytes,
+    });
+
+    expect(activated.stagedResources).toEqual([]);
+    expect(second.filePath).toBe(activated.filePath);
+    expect(first.resources).toHaveLength(2);
+    expect(first.stagedResources).toEqual([expect.stringMatching(/scripts\/build\.py$/)]);
+    expect(second.stagedResources).toEqual([
+      expect.stringMatching(/scripts\/build\.py$/),
+      expect.stringMatching(/assets\/template\.docx$/),
+    ]);
+    expect(loadContentBytes).toHaveBeenNthCalledWith(1, ["scripts/build.py"]);
+    expect(loadContentBytes).toHaveBeenNthCalledWith(2, ["assets/template.docx"]);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(writeManyBytes).toHaveBeenCalledTimes(3);
+    expect(writeManyBytes.mock.calls[0]?.[0].files).toHaveLength(1);
+    expect(writeManyBytes.mock.calls[1]?.[0].files).toHaveLength(1);
+    expect(writeManyBytes.mock.calls[2]?.[0].files).toHaveLength(1);
   });
 });
 

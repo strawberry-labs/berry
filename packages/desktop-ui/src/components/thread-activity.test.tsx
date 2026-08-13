@@ -60,3 +60,45 @@ describe("terminal tool labels", () => {
     expect(html).toContain("Failed");
   });
 });
+
+describe("tool flow spacing", () => {
+  it("keeps consecutive activate-skill rows on the compact activity rhythm", () => {
+    const activateSkill = (toolCallId: string, name: string): ActivityTool => ({
+      toolCallId,
+      name: "activate_skill",
+      status: "completed",
+      args: { name },
+      startedAt: 0,
+    });
+
+    const html = renderToStaticMarkup(
+      <ToolFlow tools={[
+        activateSkill("tool-skill-1", "pdf"),
+        activateSkill("tool-skill-2", "documents"),
+      ]} />,
+    );
+
+    expect(html).toContain('class="flex w-full flex-col gap-2"');
+    expect(html).not.toContain('class="flex w-full flex-col gap-4"');
+  });
+});
+
+describe("vision tool labels", () => {
+  it("renders inspect_images as its own action instead of an Explore search", () => {
+    const html = renderToStaticMarkup(
+      <ToolFlow tools={[{
+        toolCallId: "tool-vision",
+        name: "inspect_images",
+        status: "failed",
+        args: { paths: ["/workspace/rendered/page-01.png"] },
+        durationMs: 19_000,
+        startedAt: 0,
+      }]} />,
+    );
+
+    expect(html).toContain("Inspect Images");
+    expect(html).not.toContain("Explore");
+    expect(html).toContain("19.0s");
+    expect(html).toContain("Failed");
+  });
+});

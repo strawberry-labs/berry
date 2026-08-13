@@ -72,6 +72,18 @@ export class BudgetedSandboxProvider implements SandboxProvider {
           () => this.#provider.files.writeBytes!(input),
         ),
       } : {}),
+      ...(this.#provider.files.writeManyBytes ? {
+        writeManyBytes: (input) => this.#budgetFile(
+          "sandbox.file.write",
+          input.sandbox_id,
+          {
+            sandbox_id: input.sandbox_id,
+            fileCount: input.files.length,
+            sizeBytes: input.files.reduce((total, file) => total + file.content.byteLength, 0),
+          },
+          () => this.#provider.files.writeManyBytes!(input),
+        ),
+      } : {}),
       list: (input) => this.#budgetFile("sandbox.file.list", input.sandbox_id, input, () => this.#provider.files.list(input)),
     };
   }

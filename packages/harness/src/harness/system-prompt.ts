@@ -7,7 +7,7 @@ export function formatSkillsForSystemPrompt(skills: Skill[]): string {
 	const lines = [
 		"You have access to installed Agent Skills.",
 		"When a task matches a skill's description, call `activate_skill` before proceeding. When the user explicitly writes `$skill-name`, activate that skill.",
-		"Resolve relative references against the returned skill directory and load resources only when needed.",
+		"Resolve relative references against the returned skill directory and load resources only when needed. Berry may materialize remote resources lazily; when activation says resources are deferred, call `activate_skill` again with every exact resource path needed for the next operation in one `resources` array.",
 		"Skills are instructions, not automatic permissions. Normal tool, filesystem, network, and execution policies still apply.",
 		"",
 		"<available_skills>",

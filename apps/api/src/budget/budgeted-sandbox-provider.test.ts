@@ -57,6 +57,40 @@ describe("BudgetedSandboxProvider", () => {
     expect(events.map((event) => event.kind)).toEqual(["started", "usage", "exit"]);
     expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({ requestId: "sandbox_exec_exec_1", actualCostMicros: 7n }));
   });
+
+  it("budgets a multi-file upload as one provider operation without serializing file contents", async () => {
+    const budget = new BudgetService({
+      repository: new InMemoryBudgetRepository([limit("100")]),
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+    const reserve = vi.spyOn(budget, "reserve");
+    const underlying = fakeProvider();
+    const writeManyBytes = vi.fn(async (input: { files: readonly { path: string; content: Uint8Array }[] }) => (
+      input.files.map((file) => ({
+        path: file.path,
+        size_bytes: file.content.byteLength,
+        mtime: "2026-07-10T00:00:00.000Z",
+      }))
+    ));
+    underlying.files.writeManyBytes = writeManyBytes;
+    const provider = new BudgetedSandboxProvider({ provider: underlying, budgets: budget });
+    const sandbox = await provider.create(createInput());
+
+    await provider.files.writeManyBytes!({
+      sandbox_id: sandbox.sandbox_id,
+      files: [
+        { path: "/workspace/a.bin", content: Buffer.from("abc") },
+        { path: "/workspace/b.bin", content: Buffer.from("defg") },
+      ],
+    });
+
+    expect(writeManyBytes).toHaveBeenCalledTimes(1);
+    expect(reserve).toHaveBeenLastCalledWith(expect.objectContaining({
+      feature: "sandbox.file.write",
+      metadata: { sandbox_id: sandbox.sandbox_id, fileCount: 2, sizeBytes: 7 },
+    }));
+  });
 });
 
 function limit(hardLimitMicros: string) {

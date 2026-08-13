@@ -47,6 +47,52 @@ describe("E2BSandboxProvider", () => {
     });
   });
 
+  it("uploads multiple binary files in one E2B write without per-file probes or timeout refreshes", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const handle = await provider.create({ request_id: "batch-write", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+
+    const results = await provider.files.writeManyBytes!({
+      sandbox_id: handle.sandbox_id,
+      files: [
+        { path: "/workspace/SKILL.md", content: Buffer.from("instructions"), mode: 0o644 },
+        { path: "/workspace/scripts/build.py", content: Buffer.from("print('ok')\n"), mode: 0o755 },
+      ],
+    });
+
+    expect(results).toHaveLength(2);
+    expect(Buffer.from(sandbox.filesByPath.get("/workspace/SKILL.md")!.content).toString()).toBe("instructions");
+    expect(Buffer.from(sandbox.filesByPath.get("/workspace/scripts/build.py")!.content).toString()).toBe("print('ok')\n");
+    expect(sandbox.getInfoCount).toBe(0);
+    expect(sandbox.timeoutUpdates).toEqual([]);
+    expect(sandbox.foregroundCommands.filter((command) => command.startsWith("chmod "))).toEqual([
+      "chmod 644 -- '/workspace/SKILL.md' && chmod 755 -- '/workspace/scripts/build.py'",
+    ]);
+  });
+
+  it("bounds chmod command size when uploading a full skill package with long paths", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const handle = await provider.create({ request_id: "large-batch-write", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+    const files = Array.from({ length: 501 }, (_, index) => ({
+      path: `/workspace/runtime-skills/skill-${String(index).padStart(3, "0")}-${"a".repeat(180)}/assets/${"b".repeat(180)}-${index}.bin`,
+      content: Buffer.from([index % 256]),
+      mode: 0o644,
+    }));
+
+    const results = await provider.files.writeManyBytes!({ sandbox_id: handle.sandbox_id, files });
+
+    const chmodCommands = sandbox.foregroundCommands.filter((command) => command.startsWith("chmod "));
+    const chmodPaths = chmodCommands.flatMap((command) => [...command.matchAll(/'([^']+)'/g)]
+      .map((match) => match[1]));
+    expect(results).toHaveLength(files.length);
+    expect(chmodCommands.length).toBeGreaterThan(1);
+    expect(chmodCommands.every((command) => Buffer.byteLength(command) <= 32 * 1024)).toBe(true);
+    expect(chmodPaths).toEqual(files.map((file) => file.path));
+  });
+
   it("pauses on suspend and reuses the sandbox for the same tenant request", async () => {
     const client = new FakeE2BClient();
     const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
@@ -154,6 +200,28 @@ describe("E2BSandboxProvider", () => {
 
     expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([300_000, 300_000, 300_000]);
     expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.lastCommandHandle?.timeoutMs).toBe(0);
+  });
+
+  it("refreshes a nearly expired lease before starting a command", async () => {
+    const client = new FakeE2BClient();
+    let now = new Date("2026-07-16T00:00:00.000Z");
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, now: () => now });
+    const sandbox = await provider.create({
+      request_id: "keepalive-near-expiry",
+      tenant_id: TENANT_ID,
+      image: "base",
+      ttl_seconds: 120,
+    });
+    now = new Date(now.getTime() + 80_000);
+
+    await collectSandboxExecEvents(provider.exec({
+      sandbox_id: sandbox.sandbox_id,
+      request_id: "keepalive-near-expiry-exec",
+      command: ["echo", "active"],
+      timeout_ms: 0,
+    }));
+
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([120_000, 120_000]);
   });
 
   it("keeps refreshing the sandbox while a long command is running", async () => {
@@ -311,6 +379,8 @@ class FakeE2BClient implements E2BSandboxClient {
 class FakeSandbox implements E2BSandboxLike {
   readonly filesByPath = new Map<string, { content: Uint8Array; modifiedTime: Date }>();
   readonly timeoutUpdates: number[] = [];
+  readonly foregroundCommands: string[] = [];
+  getInfoCount = 0;
   onPause: (() => void) | undefined;
   lastCommandHandle: FakeCommandHandle | undefined;
   readonly files: E2BSandboxLike["files"];
@@ -322,16 +392,27 @@ class FakeSandbox implements E2BSandboxLike {
         const file = this.requireFile(path);
         return options.format === "bytes" ? file.content : Buffer.from(file.content).toString("utf8");
       },
-      write: async (path, data) => {
-        const content = typeof data === "string" ? Buffer.from(data) : new Uint8Array(data);
-        const modifiedTime = new Date("2026-07-16T00:00:01.000Z");
-        this.filesByPath.set(path, { content, modifiedTime });
-        return fileInfo(path, content.byteLength, modifiedTime);
-      },
+      write: (async (
+        pathOrFiles: string | Array<{ path: string; data: string | ArrayBuffer }>,
+        data?: string | ArrayBuffer,
+      ) => {
+        const writeOne = (path: string, value: string | ArrayBuffer) => {
+          const content = typeof value === "string" ? Buffer.from(value) : new Uint8Array(value);
+          const modifiedTime = new Date("2026-07-16T00:00:01.000Z");
+          this.filesByPath.set(path, { content, modifiedTime });
+          return fileInfo(path, content.byteLength, modifiedTime);
+        };
+        if (Array.isArray(pathOrFiles)) {
+          return pathOrFiles.map((file) => writeOne(file.path, file.data));
+        }
+        if (data === undefined) throw new Error("Missing file data");
+        return writeOne(pathOrFiles, data);
+      }) as E2BSandboxLike["files"]["write"],
       list: async (path) => [...this.filesByPath.entries()]
         .filter(([candidate]) => candidate.startsWith(`${path.replace(/\/$/, "")}/`))
         .map(([candidate, file]) => fileInfo(candidate, file.content.byteLength, file.modifiedTime)),
       getInfo: async (path) => {
+        this.getInfoCount += 1;
         const file = this.requireFile(path);
         return fileInfo(path, file.content.byteLength, file.modifiedTime);
       },
@@ -342,6 +423,7 @@ class FakeSandbox implements E2BSandboxLike {
           this.lastCommandHandle = new FakeCommandHandle(command, options, this.blockCommands);
           return this.lastCommandHandle;
         }
+        this.foregroundCommands.push(command);
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     };

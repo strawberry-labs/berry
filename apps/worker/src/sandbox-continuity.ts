@@ -30,6 +30,7 @@ import type {
   DurableTurnStep,
   DurableTurnToolExecutor,
   DurableSkillPackageFile,
+  DurableSkillPackageStageOptions,
   TurnToolResult,
 } from "./turn-runner.js";
 
@@ -48,6 +49,8 @@ const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
 const MAX_SNAPSHOT_FILES = 5_000;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
+const SKILL_STAGE_MANIFEST_NAME = ".berry-staged-files.json";
+const SKILL_STAGE_MANIFEST_VERSION = 1;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
 
@@ -396,12 +399,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn"))
       .filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
-    const requestedSandboxImages = requestedSandboxImagePaths(snapshot, workspaceRoot)
+    const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
+    const requestedSandboxImages = (explicitPaths ?? exposedSandboxImagePaths(snapshot, workspaceRoot))
       .filter((path) => {
         const attachmentId = sandboxAttachmentId(path, workspaceRoot);
         return !attachmentId || !attachedImageIds.has(attachmentId);
       });
-    if (requestedSandboxImages.length === 0 && attachedImages.length === 0) return [];
+    const selectedAttachments = explicitPaths
+      ? explicitPaths.flatMap((path) => {
+          const attachmentId = sandboxAttachmentId(path, workspaceRoot);
+          const file = attachmentId ? attachedImages.find((candidate) => candidate.fileId === attachmentId) : undefined;
+          return file ? [file] : [];
+        })
+      : attachedImages;
+    if (requestedSandboxImages.length === 0 && selectedAttachments.length === 0) return [];
 
     const parts: ChatContentPart[] = [];
     let totalBytes = 0;
@@ -424,33 +435,82 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return true;
     };
 
-    if (requestedSandboxImages.length > 0) {
+    const loadSandboxSources = async (paths: readonly string[]) => {
+      if (paths.length === 0) return [];
       const sandbox = await this.ensureSandbox(snapshot);
-      for (const path of requestedSandboxImages) {
-        if (parts.length >= MAX_MODEL_IMAGES) break;
+      return Promise.all(paths.slice(0, MAX_MODEL_IMAGES).map(async (path) => {
         const mediaType = binaryMediaType(path);
-        if (!mediaType?.startsWith("image/")) continue;
+        if (!mediaType?.startsWith("image/")) throw new Error(`inspect_images only accepts image paths: ${path}`);
         const source = await this.provider.files.read({
           sandbox_id: sandbox.id,
           path,
           encoding: "base64",
         });
-        append(mediaType, Buffer.from(source.content, "base64"));
-      }
-    }
-
-    if (attachedImages.length > 0) {
-      if (!this.objects) throw new Error("Input image object storage is not configured");
-      for (const file of attachedImages) {
-        if (parts.length >= MAX_MODEL_IMAGES) break;
-        if (file.sizeBytes > MAX_MODEL_IMAGE_BYTES) continue;
-        const bytes = await this.objects.getSource(file.objectKey, file.objectVersionId);
+        return { path, mediaType, bytes: Buffer.from(source.content, "base64") };
+      }));
+    };
+    const loadAttachmentSources = async (files: readonly SandboxInputFile[]) => {
+      if (files.length === 0) return [];
+      const objects = this.objects;
+      if (!objects) throw new Error("Input image object storage is not configured");
+      return Promise.all(files.map(async (file) => {
+        const bytes = await objects.getSource(file.objectKey, file.objectVersionId);
         if (bytes.byteLength !== file.sizeBytes) {
           throw new Error(`Input image ${file.name} is incomplete`);
         }
-        append(file.mediaType, bytes);
+        return {
+          path: durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot),
+          mediaType: file.mediaType,
+          bytes,
+        };
+      }));
+    };
+
+    if (explicitPaths) {
+      for (const file of selectedAttachments) {
+        if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
+          throw new Error(`Image exceeds the ${MAX_MODEL_IMAGE_BYTES} byte inspection limit: ${file.name}`);
+        }
       }
+      const [sandboxSources, attachmentSources] = await Promise.all([
+        loadSandboxSources(requestedSandboxImages),
+        loadAttachmentSources(selectedAttachments),
+      ]);
+      const loadedSources = [...sandboxSources, ...attachmentSources];
+      const sources = explicitPaths.flatMap((path) => {
+        const source = loadedSources.find((candidate) => candidate.path === path);
+        return source ? [source] : [];
+      });
+      if (sources.length !== explicitPaths.length) {
+        const loadedPaths = new Set(sources.map((source) => source.path));
+        const missing = explicitPaths.filter((path) => !loadedPaths.has(path));
+        throw new Error(`inspect_images could not load the exact requested image path${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`);
+      }
+      for (const source of sources) {
+        if (!append(source.mediaType, source.bytes)) {
+          throw new Error("The selected images exceed the per-image or 50 MB combined inspection limit");
+        }
+      }
+      return parts;
     }
+
+    const sandboxSources = await loadSandboxSources(requestedSandboxImages);
+    for (const source of sandboxSources) append(source.mediaType, source.bytes);
+
+    // Choose attachments only after sandbox images are validated. This keeps
+    // concurrent reads while allowing later valid files to backfill slots left
+    // by oversized or over-budget candidates.
+    const attachmentFiles: SandboxInputFile[] = [];
+    let plannedTotalBytes = totalBytes;
+    for (const file of selectedAttachments) {
+      if (attachmentFiles.length >= MAX_MODEL_IMAGES - parts.length) break;
+      if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) continue;
+      if (plannedTotalBytes + file.sizeBytes > MAX_MODEL_IMAGE_TOTAL_BYTES) continue;
+      attachmentFiles.push(file);
+      plannedTotalBytes += file.sizeBytes;
+    }
+    const attachmentSources = await loadAttachmentSources(attachmentFiles);
+    for (const source of attachmentSources) append(source.mediaType, source.bytes);
     return parts;
   }
 
@@ -494,8 +554,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       while (nextIndex < sortedEntries.length) {
         const index = nextIndex++;
         const entry = sortedEntries[index]!;
-      const relativePath = relativeSkillPackagePath(root, entry.path);
-      const source = await this.provider.files.read({ sandbox_id: sandbox.id, path: entry.path, encoding: "base64" });
+        const relativePath = relativeSkillPackagePath(root, entry.path);
+        const source = await this.provider.files.read({ sandbox_id: sandbox.id, path: entry.path, encoding: "base64" });
         files[index] = { path: relativePath, contentBase64: source.content, mode: relativePath.startsWith("scripts/") ? 0o755 : 0o644 };
       }
     }));
@@ -503,7 +563,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     return files;
   }
 
-  async stageSkillPackage(snapshot: DurableTurnSnapshot, packageId: string, files: readonly DurableSkillPackageFile[]): Promise<{ filePath: string; resources: string[] }> {
+  async stageSkillPackage(
+    snapshot: DurableTurnSnapshot,
+    packageId: string,
+    files: readonly DurableSkillPackageFile[],
+    options: DurableSkillPackageStageOptions = {},
+  ): Promise<{ filePath: string; resources: string[]; stagedResources: string[]; stagingSandboxId: string }> {
     const sandbox = await this.ensureSandbox(snapshot);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const safeId = packageId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 160) || "skill";
@@ -536,31 +601,81 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     // into a later activation of the same skill.
     const revision = packageRevision.digest("hex");
     const root = `${workspaceRoot}/runtime-skills/${safeId}-${revision.slice(0, 16)}`;
-    const readyPath = `${root}/.berry-package-ready`;
-    const ready = await this.provider.files.read({ sandbox_id: sandbox.id, path: readyPath, encoding: "utf8" }).catch(() => null);
-    if (ready?.content.trim() === revision) {
-      return {
-        filePath: `${root}/SKILL.md`,
-        resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
-      };
+    const manifestPath = `${root}/${SKILL_STAGE_MANIFEST_NAME}`;
+    const selectedResourcePaths = options.resourcePaths === undefined
+      ? normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => file.path)
+      : [...new Set(options.resourcePaths.map(safeRelativeSkillPackagePath))];
+    const unknownPaths = selectedResourcePaths.filter((path) => path === "SKILL.md" || !seen.has(path));
+    if (unknownPaths.length > 0) {
+      throw new Error(`Unknown skill package resource${unknownPaths.length === 1 ? "" : "s"}: ${unknownPaths.join(", ")}`);
     }
-    for (const file of normalizedFiles) {
-      const bytes = file.bytes ?? await loadSkillPackageBytes(file);
+    const targetPaths = new Set(["SKILL.md", ...selectedResourcePaths]);
+    const stagedPaths = durablyStagedSkillPackagePaths(snapshot, root, sandbox.id);
+    if (stagedPaths.size === 0) {
+      const persistedPaths = await readSkillStageManifest(
+        this.provider,
+        sandbox.id,
+        manifestPath,
+        revision,
+        seen,
+      );
+      for (const path of persistedPaths) stagedPaths.add(path);
+    }
+    const missingFiles = normalizedFiles.filter((file) => targetPaths.has(file.path) && !stagedPaths.has(file.path));
+    const lazyPaths = missingFiles.filter((file) => !file.bytes).map((file) => file.path);
+    const loaded = lazyPaths.length > 0 && options.loadContentBytes
+      ? await options.loadContentBytes(lazyPaths)
+      : new Map<string, Uint8Array>();
+    const prepared = await mapWithConcurrency(missingFiles, 4, async (file) => {
+      const loadedBytes = loaded.get(file.path);
+      const bytes = file.bytes ?? (loadedBytes
+        ? Buffer.from(loadedBytes.buffer, loadedBytes.byteOffset, loadedBytes.byteLength)
+        : await loadSkillPackageBytes(file));
       if (bytes.byteLength !== file.sizeBytes || createHash("sha256").update(bytes).digest("hex") !== file.sha256) {
         throw new Error(`Skill package file changed while it was being staged: ${file.path}`);
       }
-      const path = `${root}/${file.path}`;
-      const mode = file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644);
-      if (this.provider.files.writeBytes) {
-        await this.provider.files.writeBytes({ sandbox_id: sandbox.id, path, content: bytes, mode });
+      return {
+        path: `${root}/${file.path}`,
+        relativePath: file.path,
+        content: bytes,
+        mode: file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644),
+      };
+    });
+    if (prepared.length > 0) {
+      if (this.provider.files.writeManyBytes) {
+        await this.provider.files.writeManyBytes({
+          sandbox_id: sandbox.id,
+          files: prepared.map(({ path, content, mode }) => ({ path, content, mode })),
+        });
       } else {
-        await this.provider.files.write({ sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64", mode });
+        await mapWithConcurrency(prepared, 4, async ({ path, content, mode }) => {
+          if (this.provider.files.writeBytes) {
+            await this.provider.files.writeBytes({ sandbox_id: sandbox.id, path, content, mode });
+          } else {
+            await this.provider.files.write({ sandbox_id: sandbox.id, path, content: content.toString("base64"), encoding: "base64", mode });
+          }
+        });
       }
+      for (const file of prepared) stagedPaths.add(file.relativePath);
+      await this.provider.files.write({
+        sandbox_id: sandbox.id,
+        path: manifestPath,
+        content: JSON.stringify({
+          version: SKILL_STAGE_MANIFEST_VERSION,
+          sandboxId: sandbox.id,
+          revision,
+          stagedPaths: [...stagedPaths].sort(),
+        }),
+        encoding: "utf8",
+      });
     }
-    await this.provider.files.write({ sandbox_id: sandbox.id, path: readyPath, content: revision, encoding: "utf8", mode: 0o444 });
     return {
       filePath: `${root}/SKILL.md`,
       resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
+      stagedResources: normalizedFiles
+        .filter((file) => file.path !== "SKILL.md" && stagedPaths.has(file.path))
+        .map((file) => `${root}/${file.path}`),
+      stagingSandboxId: sandbox.id,
     };
   }
 
@@ -1389,7 +1504,21 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }
 }
 
-function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot = "/workspace"): string[] {
+function requestedInspectionImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot = "/workspace"): string[] | null {
+  const step = [...snapshot.steps].reverse().find((candidate) => {
+    const toolName = stringValue(candidate.input.toolName) ?? candidate.type.slice(5);
+    return candidate.state === "running" && toolName === "inspect_images";
+  });
+  const args = objectValue(step?.input.arguments);
+  if (!Array.isArray(args?.paths)) return null;
+  const paths = args.paths.flatMap((path) => typeof path === "string" && path.trim() ? [safeReadablePath(path, workspaceRoot)] : []);
+  if (paths.length === 0 || paths.length > MAX_MODEL_IMAGES) {
+    throw new Error(`inspect_images paths must contain between 1 and ${MAX_MODEL_IMAGES} image paths`);
+  }
+  return [...new Set(paths)];
+}
+
+function exposedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot = "/workspace"): string[] {
   const paths = snapshot.steps.flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
@@ -1399,7 +1528,7 @@ function requestedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot
     if (!path) return [];
     return binaryMediaType(path)?.startsWith("image/") ? [path] : [];
   });
-  return [...new Set(paths)].slice(-MAX_MODEL_IMAGES).reverse();
+  return [...new Set(paths)].slice(-MAX_MODEL_IMAGES);
 }
 
 function sandboxAttachmentId(path: string, workspaceRoot = "/workspace"): string | null {
@@ -2639,6 +2768,89 @@ async function loadSkillPackageBytes(file: DurableSkillPackageFile): Promise<Buf
   return Buffer.isBuffer(loaded)
     ? loaded
     : Buffer.from(loaded.buffer, loaded.byteOffset, loaded.byteLength);
+}
+
+function durablyStagedSkillPackagePaths(
+  snapshot: DurableTurnSnapshot,
+  root: string,
+  stagingSandboxId: string,
+): Set<string> {
+  const staged = new Set<string>();
+  const skillPath = `${root}/SKILL.md`;
+  for (const step of snapshot.steps ?? []) {
+    if (step.state !== "completed") continue;
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName !== "activate_skill") continue;
+    const output = objectValue(step.output);
+    if (stringValue(output.stagingSandboxId) !== stagingSandboxId) continue;
+    if (stringValue(output.location) !== skillPath) continue;
+    staged.add("SKILL.md");
+    if (!Array.isArray(output.stagedResources)) continue;
+    for (const value of output.stagedResources) {
+      if (typeof value !== "string") continue;
+      try {
+        staged.add(relativeSkillPackagePath(root, value));
+      } catch {
+        // Ignore stale or malformed tool output rather than trusting a path
+        // outside this content-addressed package root.
+      }
+    }
+  }
+  return staged;
+}
+
+async function readSkillStageManifest(
+  provider: SandboxProvider,
+  sandboxId: string,
+  manifestPath: string,
+  revision: string,
+  packagePaths: ReadonlySet<string>,
+): Promise<Set<string>> {
+  try {
+    const source = await provider.files.read({
+      sandbox_id: sandboxId,
+      path: manifestPath,
+      encoding: "utf8",
+    });
+    const manifest = objectValue(JSON.parse(source.content));
+    if (
+      manifest.version !== SKILL_STAGE_MANIFEST_VERSION
+      || stringValue(manifest.sandboxId) !== sandboxId
+      || stringValue(manifest.revision) !== revision
+      || !Array.isArray(manifest.stagedPaths)
+    ) {
+      return new Set();
+    }
+    const staged = new Set<string>();
+    for (const value of manifest.stagedPaths) {
+      if (typeof value !== "string") continue;
+      try {
+        const path = safeRelativeSkillPackagePath(value);
+        if (packagePaths.has(path)) staged.add(path);
+      } catch {
+        // A malformed cache entry is a miss; it is never a trusted path.
+      }
+    }
+    return staged;
+  } catch {
+    return new Set();
+  }
+}
+
+async function mapWithConcurrency<T, TResult>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T, index: number) => Promise<TResult>,
+): Promise<TResult[]> {
+  const results = new Array<TResult>(values.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex++;
+      results[index] = await operation(values[index]!, index);
+    }
+  }));
+  return results;
 }
 
 function safeWorkspacePath(value: string, workspaceRoot = "/workspace"): string {

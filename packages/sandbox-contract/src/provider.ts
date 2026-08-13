@@ -33,6 +33,11 @@ export interface SandboxFileWriteBytesInput {
   mode?: number;
 }
 
+export interface SandboxFileWriteManyBytesInput {
+  sandbox_id: string;
+  files: readonly Omit<SandboxFileWriteBytesInput, "sandbox_id">[];
+}
+
 export interface SandboxFileApi {
   read(input: SandboxFileReadInput): Promise<SandboxFileReadResult>;
   write(input: SandboxFileWriteInput): Promise<SandboxFileWriteResult>;
@@ -42,6 +47,8 @@ export interface SandboxFileApi {
    * must retain the base64 `write` fallback for contract compatibility.
    */
   writeBytes?(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult>;
+  /** Write several binary files in one provider operation when supported. */
+  writeManyBytes?(input: SandboxFileWriteManyBytesInput): Promise<SandboxFileWriteResult[]>;
   list(input: SandboxFileListInput): Promise<SandboxFileListResult>;
 }
 
