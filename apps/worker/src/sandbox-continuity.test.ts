@@ -722,6 +722,23 @@ describe("SandboxContinuityManager", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
+  it.each(["old_string", "new_string"] as const)("bounds edit_file %s before touching the workspace", async (field) => {
+    const read = vi.fn();
+    const write = vi.fn();
+    const manager = managerWithProvider({ read, write, list: vi.fn() });
+    const args = {
+      path: "/workspace/result.txt",
+      old_string: "before",
+      new_string: "after",
+      [field]: "x".repeat(DURABLE_FILE_TOOL_MAX_CONTENT_CHARS + 1),
+    };
+
+    await expect(manager.execute(snapshot(), toolStep("edit_file", args)))
+      .rejects.toThrow(`edit_file ${field}`);
+    expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
   it("requires edit_file new_string while still permitting an intentional empty replacement", async () => {
     const read = vi.fn(async (input: { path: string }) => ({
       path: input.path,
@@ -1655,14 +1672,22 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("stages updated skill packages in isolated content-addressed directories", async () => {
-    const write = vi.fn(async (input: { path: string; content: string }) => ({
-      path: input.path,
-      size_bytes: Buffer.from(input.content, "base64").byteLength,
-      mtime: null,
-    }));
+    const stored = new Map<string, string>();
+    const write = vi.fn(async (input: { path: string; content: string; encoding?: string }) => {
+      stored.set(input.path, input.content);
+      return {
+        path: input.path,
+        size_bytes: Buffer.byteLength(input.content, input.encoding === "base64" ? "base64" : "utf8"),
+        mtime: null,
+      };
+    });
     const manager = managerWithProvider({
       list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
-      read: vi.fn(),
+      read: vi.fn(async (input: { path: string }) => {
+        const content = stored.get(input.path);
+        if (content === undefined) throw new Error("not found");
+        return { path: input.path, content, encoding: "utf8", size_bytes: Buffer.byteLength(content), mtime: null };
+      }),
       write,
     });
     const skill = (content: string, resource?: string) => [
@@ -1672,13 +1697,79 @@ describe("SandboxContinuityManager", () => {
 
     const first = await manager.stageSkillPackage(snapshot(), "memo", skill("version one", "assets/old.docx"));
     const second = await manager.stageSkillPackage(snapshot(), "memo", skill("version two"));
+    const cached = await manager.stageSkillPackage(snapshot(), "memo", skill("version two"));
 
     expect(first.filePath).not.toBe(second.filePath);
     expect(first.resources).toHaveLength(1);
     expect(second.resources).toEqual([]);
+    expect(cached).toEqual(second);
     expect(first.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
     expect(second.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
-    expect(write).toHaveBeenCalledTimes(3);
+    expect(write).toHaveBeenCalledTimes(5);
+  });
+
+  it("writes large organization skill resources as bytes without base64 or shell-command amplification", async () => {
+    const write = vi.fn();
+    const writeBytes = vi.fn(async (input: { path: string; content: Uint8Array }) => ({
+      path: input.path,
+      size_bytes: input.content.byteLength,
+      mtime: null,
+    }));
+    const exec = vi.fn(async function* () {
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read: vi.fn(async () => { throw new Error("not found"); }),
+      write,
+      writeBytes,
+    }, exec);
+    const large = Buffer.alloc(700 * 1024, 0x5a);
+
+    const staged = await manager.stageSkillPackage(snapshot(), "branding", [
+      { path: "SKILL.md", contentBytes: Buffer.from("---\nname: branding\ndescription: Brand\n---\n"), mode: 0o644 },
+      { path: "assets/templates/report.docx", contentBytes: large, mode: 0o644 },
+    ]);
+
+    expect(writeBytes).toHaveBeenCalledTimes(2);
+    expect(writeBytes.mock.calls[1]?.[0].content).toBe(large);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write.mock.calls[0]?.[0].path).toMatch(/\.berry-package-ready$/);
+    expect(staged.filePath).toMatch(/^\/workspace\/runtime-skills\//);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("does not load database-backed resource bytes again when a package revision is already staged", async () => {
+    const markers = new Map<string, string>();
+    const write = vi.fn(async (input: { path: string; content: string }) => {
+      markers.set(input.path, input.content);
+      return { path: input.path, size_bytes: Buffer.byteLength(input.content), mtime: null };
+    });
+    const writeBytes = vi.fn(async (input: { path: string; content: Uint8Array }) => ({ path: input.path, size_bytes: input.content.byteLength, mtime: null }));
+    const content = Buffer.from("retained-template-bytes");
+    const loadContentBytes = vi.fn(async () => content);
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read: vi.fn(async (input: { path: string }) => {
+        const marker = markers.get(input.path);
+        if (!marker) throw new Error("not found");
+        return { path: input.path, content: marker, encoding: "utf8", size_bytes: Buffer.byteLength(marker), mtime: null };
+      }),
+      write,
+      writeBytes,
+    });
+    const files = [
+      { path: "SKILL.md", contentBytes: Buffer.from("---\nname: cached\ndescription: Cached\n---\n") },
+      { path: "assets/template.docx", sizeBytes: content.byteLength, sha256: createHash("sha256").update(content).digest("hex"), loadContentBytes },
+    ];
+
+    const first = await manager.stageSkillPackage(snapshot(), "cached", files);
+    const second = await manager.stageSkillPackage(snapshot(), "cached", files);
+
+    expect(second).toEqual(first);
+    expect(loadContentBytes).toHaveBeenCalledTimes(1);
+    expect(writeBytes).toHaveBeenCalledTimes(2);
+    expect(write).toHaveBeenCalledTimes(1);
   });
 });
 

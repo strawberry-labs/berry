@@ -41,11 +41,6 @@ for (const filename of [
 fs.rmSync(buildRoot, { recursive: true, force: true });
 fs.mkdirSync(buildRoot, { recursive: true });
 fs.cpSync(
-  path.join(repositoryRoot, "deploy/skills"),
-  path.join(buildRoot, "skills"),
-  { recursive: true },
-);
-fs.cpSync(
   path.join(repositoryRoot, "deploy/e2b-aesg/requirements.lock"),
   path.join(buildRoot, "requirements.lock"),
 );
@@ -75,7 +70,7 @@ const visit = (directory: string) => {
 };
 visit(buildRoot);
 const topLevel = fs.readdirSync(buildRoot).sort();
-if (JSON.stringify(topLevel) !== JSON.stringify(["fonts", "requirements.lock", "skills"])) {
+if (JSON.stringify(topLevel) !== JSON.stringify(["fonts", "requirements.lock"])) {
   throw new Error(`Unexpected build-context roots: ${topLevel.join(", ")}`);
 }
 const contextBytes = contextFiles.reduce((total, file) => total + file.bytes, 0);

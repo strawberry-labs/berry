@@ -1,19 +1,21 @@
 ---
 name: aesg-branding
-description: Apply AESG's approved identity, retained General Templates, logos, supergraphics, service icons, editorial rules, and quality checks to DOCX, PDF, PPTX, and XLSX deliverables. Use for every AESG-branded artifact together with exactly one matching format skill.
+description: Apply AESG's approved identity, retained General Templates, logos, supergraphics, service icons, editorial rules, and quality checks to DOCX, PDF, PPTX, and XLSX deliverables. Use for every AESG-branded artifact together with all matching format skills.
 ---
 
 # AESG brand authority
 
-Use this skill with exactly one of `docx`, `pdf`, `pptx`, or `xlsx`. Treat the
+Use this skill with every required format skill: `docx`, `pdf`, `pptx`, or `xlsx`.
+PDF creation also activates `docx` because the approved route is Word-to-PDF. Treat the
 retained Office template as the design authority for that format.
 
 ## Runtime contract
 
 - Work under `/workspace`; keep intermediates in `/workspace/tmp` and final
   deliverables in `/workspace/outputs`.
-- Invoke bundled resources through `/managed-skills`. Never reference a
-  protected `/.berry` path.
+- Use the exact skill directory returned by `activate_skill`. Resolve every
+  `scripts/`, `references/`, and `assets/` path against it. Never guess a
+  global skill path or reference a protected `/.berry` path.
 - Use the matching format generator before considering custom code. Extend its
   JSON specification when the existing fields can express the request.
 - Do not install packages, copy generators, publish specs, or publish previews.
@@ -58,8 +60,8 @@ social-media guidance for ordinary Office artifacts.
 ## Completion gate
 
 1. Run the matching format generator.
-2. Run `python /managed-skills/aesg-branding/scripts/validate_artifact.py <final-file>`.
-3. Render with `python /managed-skills/aesg-branding/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
+2. Run `python <aesg-branding-skill-directory>/scripts/validate_artifact.py <final-file>`.
+3. Render with `python <aesg-branding-skill-directory>/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
 4. Inspect every rendered page, slide, or relevant sheet and correct clipping,
    overlap, blank placeholders, weak pagination, or distorted images.
 5. Publish only the final artifact, once, with the correct extension and MIME

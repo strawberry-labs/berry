@@ -2705,6 +2705,10 @@ export const PersonalSkillSchema = z.object({
 });
 export type PersonalSkill = z.infer<typeof PersonalSkillSchema>;
 
+export const SKILL_PACKAGE_MAX_FILES = 500;
+export const PERSONAL_SKILL_PACKAGE_MAX_BYTES = 5 * 1024 * 1024;
+export const ORGANIZATION_SKILL_PACKAGE_MAX_BYTES = 100 * 1024 * 1024;
+
 export const SkillPackageFileSchema = z.object({
   path: z.string().trim().min(1).max(512),
   contentBase64: z.string(),
@@ -2824,6 +2828,9 @@ export const EffectiveCapabilitySchema = z.object({
   assignment: OrgCapabilityAssignmentSchema.nullable(), provenance: z.enum(["organization", "personal", "self-host-bootstrap"]),
   reason: z.enum(["required", "default", "user-enabled", "user-disabled", "available", "blocked", "personal", "personal-blocked"]), contentHash: z.string().nullable(),
   description: z.string().optional(), content: z.string().optional(),
+  packageFiles: z.array(z.string()).max(500).optional(),
+  packageStorage: z.enum(["stored", "managed", "definition-only"]).optional(),
+  packageBytes: z.number().int().nonnegative().optional(),
 });
 export type EffectiveCapability = z.infer<typeof EffectiveCapabilitySchema>;
 

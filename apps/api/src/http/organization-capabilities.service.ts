@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { BadRequestException } from "@nestjs/common";
 import type { AgentSkill, McpServerSpec } from "@berry/local-agent";
-import type { CapabilityUserOverride, EffectiveCapability, JsonValue, OrgCapability, OrgCapabilityAssignment, PersonalSkillPackage, SkillPackageFile } from "@berry/shared";
+import { ORGANIZATION_SKILL_PACKAGE_MAX_BYTES, type CapabilityUserOverride, type EffectiveCapability, type JsonValue, type OrgCapability, type OrgCapabilityAssignment, type PersonalSkillPackage, type PersonalSkillReview, type SkillPackageFile } from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 import { PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
+import type { StagedOrganizationSkillArchive, StagedOrganizationSkillFile } from "./skill-package-archive.ts";
 
 export const ORGANIZATION_CAPABILITIES = Symbol("ORGANIZATION_CAPABILITIES");
-type Upsert = { kind: "skill" | "mcp"; capabilityId: string; name: string; description?: string; assignment: OrgCapabilityAssignment; allowUserDisable?: boolean; config?: JsonValue; contentHash?: string | null; resourceFiles?: SkillPackageFile[] };
+type Upsert = { kind: "skill" | "mcp"; capabilityId: string; name: string; description?: string; assignment: OrgCapabilityAssignment; allowUserDisable?: boolean; config?: JsonValue; contentHash?: string | null; resourceFiles?: SkillPackageFile[]; stagedResourceFiles?: StagedOrganizationSkillFile[]; reviewedSkill?: PersonalSkillReview };
 type OrgSkillFileMetadata = { path: string; sizeBytes: number };
+const MAX_SKILL_PREVIEW_BYTES = 5 * 1024 * 1024;
 
 export class OrganizationCapabilitiesService {
   readonly #records = new Map<string, OrgCapability>();
@@ -31,10 +34,11 @@ export class OrganizationCapabilitiesService {
     const now = new Date().toISOString();
     let config = input.config ?? current?.config ?? {};
     let packageFiles = input.resourceFiles;
+    const stagedFiles = input.stagedResourceFiles;
     if (input.kind === "skill" && input.config !== undefined && packageFiles === undefined && current) {
       packageFiles = (await this.skillPackage(tenantId, current.id)).resourceFiles;
     }
-    if (input.kind === "skill" && (packageFiles !== undefined || object(current?.config ?? {}).packageStorageVersion === 1)) {
+    if (input.kind === "skill" && (packageFiles !== undefined || stagedFiles !== undefined || object(current?.config ?? {}).packageStorageVersion === 1)) {
       config = { ...object(config), packageStorageVersion: 1 };
     }
     let normalizedFiles: SkillPackageFile[] | undefined;
@@ -42,19 +46,22 @@ export class OrganizationCapabilitiesService {
     if (input.kind === "skill" && input.config !== undefined) {
       const content = object(config).content;
       if (typeof content === "string" && content.trim()) {
-        const preview = await this.personal.previewSkill({ content, source: "upload", resourceFiles: packageFiles ?? [], packageFiles: ["SKILL.md", ...(packageFiles ?? []).map((file) => file.path)] });
+        const preview = input.reviewedSkill
+          ? { content, review: input.reviewedSkill, resourceFiles: [] as SkillPackageFile[] }
+          : await this.personal.previewSkill({ content, source: "upload", resourceFiles: packageFiles ?? [], packageFiles: ["SKILL.md", ...(packageFiles ?? []).map((file) => file.path)] }, { maxPackageBytes: ORGANIZATION_SKILL_PACKAGE_MAX_BYTES });
         reviewedHash = preview.review.hash;
-        const metadata = parseAgentSkillMarkdown(preview.content);
+        const metadata = parseAgentSkillMarkdown(content);
         if (metadata.name !== input.capabilityId) throw new BadRequestException(`Organization skill ID must match SKILL.md name (${metadata.name})`);
-        normalizedFiles = preview.resourceFiles;
+        normalizedFiles = stagedFiles ? undefined : preview.resourceFiles;
+        config = { ...object(config), packageStorageVersion: 1 };
       } else if (input.assignment !== "blocked") {
         throw new BadRequestException("Organization skills require SKILL.md content");
       }
     }
-    const hash = input.contentHash !== undefined
-      ? input.contentHash
-      : reviewedHash
-        ? reviewedHash
+    const hash = reviewedHash
+      ? reviewedHash
+      : input.contentHash !== undefined
+        ? input.contentHash
       : input.config !== undefined && input.kind === "skill"
         ? hashContent(config)
         : current?.contentHash ?? (input.kind === "skill" ? hashContent(config) : null);
@@ -69,28 +76,82 @@ export class OrganizationCapabilitiesService {
       allowUserDisable: input.allowUserDisable ?? current?.allowUserDisable ?? false,
       contentHash: hash,
       config,
-      resources: normalizedFiles?.map((file) => file.path) ?? current?.resources ?? [],
+      resources: stagedFiles?.map((file) => file.path) ?? normalizedFiles?.map((file) => file.path) ?? current?.resources ?? [],
       packageBytes: typeof object(config).content === "string"
-        ? Buffer.byteLength(String(object(config).content)) + (normalizedFiles ?? this.#skillFiles.get(current?.id ?? "") ?? []).reduce((total, file) => total + Buffer.from(file.contentBase64, "base64").byteLength, 0)
+        ? Buffer.byteLength(String(object(config).content)) + (stagedFiles
+          ? stagedFiles.reduce((total, file) => total + file.sizeBytes, 0)
+          : (normalizedFiles ?? this.#skillFiles.get(current?.id ?? "") ?? []).reduce((total, file) => total + Buffer.from(file.contentBase64, "base64").byteLength, 0))
         : 0,
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
     };
     this.#records.set(record.id, record);
     if (normalizedFiles) this.#skillFiles.set(record.id, normalizedFiles);
+    if (stagedFiles && !this.database) {
+      this.#skillFiles.set(record.id, await Promise.all(stagedFiles.map(async (file) => ({
+        path: file.path,
+        contentBase64: (await readFile(file.absolutePath)).toString("base64"),
+        mode: file.mode,
+      }))));
+    }
     if (this.database) await this.database.withTenant(tenantId, async (db) => {
       await db.execute(`INSERT INTO organization_capabilities (id,tenant_id,kind,capability_id,name,description,assignment,allow_user_disable,content_hash,config,created_at,updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::timestamptz,$12::timestamptz) ON CONFLICT (tenant_id,kind,capability_id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,assignment=EXCLUDED.assignment,allow_user_disable=EXCLUDED.allow_user_disable,content_hash=EXCLUDED.content_hash,config=EXCLUDED.config,updated_at=EXCLUDED.updated_at`, [record.id,tenantId,record.kind,record.capabilityId,record.name,record.description,record.assignment,record.allowUserDisable,record.contentHash,JSON.stringify(record.config),record.createdAt,record.updatedAt]);
-      if (!normalizedFiles) return;
+      if (!normalizedFiles && !stagedFiles) return;
       await db.execute("DELETE FROM organization_skill_files WHERE organization_capability_id=$1", [record.id]);
-      for (const file of normalizedFiles) {
+      const bufferedFiles = (normalizedFiles ?? []).map((file) => {
         const content = Buffer.from(file.contentBase64, "base64");
-        await db.execute("INSERT INTO organization_skill_files (tenant_id,organization_capability_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7)", [tenantId,record.id,file.path,content,content.byteLength,createHash("sha256").update(content).digest("hex"),file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644)]);
+        return { file, content, sha256: createHash("sha256").update(content).digest("hex") };
+      });
+      if (bufferedFiles.length > 0) {
+        await db.execute(
+          `INSERT INTO organization_skill_files (tenant_id,organization_capability_id,path,content,size_bytes,sha256,mode)
+           SELECT $1::uuid,$2,files.path,files.content,files.size_bytes,files.sha256,files.mode
+           FROM unnest($3::text[],$4::bytea[],$5::bigint[],$6::text[],$7::int[]) AS files(path,content,size_bytes,sha256,mode)`,
+          [
+            tenantId,
+            record.id,
+            bufferedFiles.map(({ file }) => file.path),
+            bufferedFiles.map(({ content }) => content),
+            bufferedFiles.map(({ content }) => content.byteLength),
+            bufferedFiles.map(({ sha256 }) => sha256),
+            bufferedFiles.map(({ file }) => file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644)),
+          ],
+        );
+      }
+      for (const file of stagedFiles ?? []) {
+        const content = await readFile(file.absolutePath);
+        const digest = createHash("sha256").update(content).digest("hex");
+        if (content.byteLength !== file.sizeBytes || digest !== file.sha256) {
+          throw new BadRequestException(`Skill package resource changed during installation: ${file.path}`);
+        }
+        await db.execute("INSERT INTO organization_skill_files (tenant_id,organization_capability_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7)", [tenantId,record.id,file.path,content,content.byteLength,digest,file.mode]);
       }
     });
     return record;
   }
   async reviewSkill(input: { content?: string | undefined; source?: "text" | "upload" | "git" | undefined; sourceUrl?: string | null | undefined; packageFiles?: string[] | undefined; resourceFiles?: SkillPackageFile[] | undefined }) {
-    return (await this.personal.previewSkill(input)).review;
+    return (await this.personal.previewSkill(input, { maxPackageBytes: ORGANIZATION_SKILL_PACKAGE_MAX_BYTES })).review;
+  }
+  reviewStagedSkill(input: StagedOrganizationSkillArchive): PersonalSkillReview {
+    const metadata = parseAgentSkillMarkdown(input.content);
+    if (input.rootDirectory && input.rootDirectory !== metadata.name) {
+      throw new BadRequestException(`Skill name must match its package directory (${input.rootDirectory})`);
+    }
+    const warnings = [/ignore (all|previous) instructions/i, /curl\s+.*\|\s*(sh|bash)/i]
+      .filter((pattern) => pattern.test(input.content))
+      .map(() => "Skill contains instructions that should be inspected before use.");
+    if (input.resourceFiles.some((file) => file.path.startsWith("scripts/"))) {
+      warnings.push("This skill package includes executable scripts. Inspect them before use.");
+    }
+    return {
+      ...metadata,
+      source: "upload",
+      hash: input.hash,
+      bytes: input.bytes,
+      warnings,
+      resources: input.resourceFiles.map((file) => file.path),
+      hasScripts: input.resourceFiles.some((file) => file.path.startsWith("scripts/")),
+    };
   }
   async skillPackage(tenantId: string, id: string): Promise<PersonalSkillPackage> {
     const record = (await this.list(tenantId)).find((item) => item.kind === "skill" && (item.id === id || item.capabilityId === id));
@@ -100,6 +161,20 @@ export class OrganizationCapabilitiesService {
     if (!this.database) return { content, resourceFiles: this.#skillFiles.get(record.id) ?? [] };
     const rows = await this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT path,content,mode FROM organization_skill_files WHERE organization_capability_id=$1 ORDER BY path", [record.id]));
     return { content, resourceFiles: rows.map(orgSkillFileRow) };
+  }
+  async skillPackageFile(tenantId: string, id: string, path: string): Promise<SkillPackageFile> {
+    const record = (await this.list(tenantId)).find((item) => item.kind === "skill" && (item.id === id || item.capabilityId === id));
+    if (!record) throw new BadRequestException("Organization skill not found");
+    if (!this.database) {
+      const file = (this.#skillFiles.get(record.id) ?? []).find((candidate) => candidate.path === path);
+      if (!file) throw new BadRequestException("Organization skill file not found");
+      if (Buffer.from(file.contentBase64, "base64").byteLength > MAX_SKILL_PREVIEW_BYTES) throw new BadRequestException("Skill file previews are limited to 5 MB");
+      return file;
+    }
+    const rows = await this.database.withTenant(tenantId, (db) => db.query<Record<string, unknown>>("SELECT path,content,mode,size_bytes FROM organization_skill_files WHERE organization_capability_id=$1 AND path=$2 LIMIT 1", [record.id, path]));
+    if (!rows[0]) throw new BadRequestException("Organization skill file not found");
+    if (Number(rows[0].size_bytes) > MAX_SKILL_PREVIEW_BYTES) throw new BadRequestException("Skill file previews are limited to 5 MB");
+    return orgSkillFileRow(rows[0]);
   }
   async remove(tenantId: string, id: string) { const record = (await this.list(tenantId)).find((item) => item.id === id); if (!record) return { ok: false }; this.#records.delete(id); if (this.database) await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM organization_capabilities WHERE id=$1", [id])); return { ok: true }; }
   async settings(tenantId: string) { if (!this.database) return { skills: true, mcp: this.#settings.get(tenantId)?.mcp ?? true }; const rows = await this.database.withTenant(tenantId, (db) => db.query<{ allow_personal_mcp: boolean }>("SELECT allow_personal_mcp FROM organization_capability_settings")); return { skills: true, mcp: rows[0]?.allow_personal_mcp ?? true }; }
@@ -133,11 +208,18 @@ export class OrganizationCapabilitiesService {
       const enabled = item.assignment === "required" || item.assignment === "default-on" && !(userCanChange && override?.enabled === false) || item.assignment === "available" && override?.enabled === true;
       const reason: EffectiveCapability["reason"] = item.assignment === "blocked" ? "blocked" : item.assignment === "required" ? "required" : userCanChange && override?.enabled === false ? "user-disabled" : userCanChange && override?.enabled === true ? "user-enabled" : item.assignment === "default-on" ? "default" : "available";
       const config = object(item.config);
+      const managedResources = jsonStringArray(config.managedResources);
+      const packageFiles = item.resources.length > 0 ? item.resources : managedResources;
       rows.push({
         kind:item.kind,capabilityId:item.capabilityId,name:item.name,description:item.description,
         enabled:enabled && item.assignment !== "blocked",locked:!userCanChange,assignment:item.assignment,
         provenance:"organization",reason,contentHash:item.contentHash,
         ...(item.kind === "skill" && item.assignment !== "blocked" && typeof config.content === "string" ? { content: config.content } : {}),
+        ...(item.kind === "skill" ? {
+          packageFiles,
+          packageStorage: config.packageStorageVersion === 1 || item.resources.length > 0 ? "stored" as const : managedResources.length > 0 ? "managed" as const : "definition-only" as const,
+          packageBytes: item.packageBytes,
+        } : {}),
       });
       if (!enabled || item.assignment === "blocked") continue;
       if (item.kind === "skill") {
@@ -158,13 +240,14 @@ export class OrganizationCapabilitiesService {
       else { const config = object(item.config); if (typeof config.url === "string") mcpServers.push({ id:item.capabilityId,name:item.name,transport:config.transport === "http-sse" ? "http-sse" : "streamable-http",command:null,args:[],url:config.url,env:{},enabled:true,trusted:true,credentialKey:typeof config.credentialRef === "string" ? config.credentialRef : null }); }
     }
     const blocked = new Set(org.filter((item) => item.assignment === "blocked").map((item) => `${item.kind}:${item.capabilityId}`));
-    for (const skill of personal.skills) { const id = skill.name.toLowerCase(); rows.push({kind:"skill",capabilityId:id,name:skill.name,description:skill.description,content:skill.content,enabled:true,locked:false,assignment:null,provenance:"personal",reason:"personal",contentHash:hashContent({content:skill.content})}); skills.push(skill); }
+    for (const skill of personal.skills) { const id = skill.name.toLowerCase(); rows.push({kind:"skill",capabilityId:id,name:skill.name,description:skill.description,content:skill.content,enabled:true,locked:false,assignment:null,provenance:"personal",reason:"personal",contentHash:hashContent({content:skill.content}),packageFiles:(skill.resources??[]).map((path)=>path.replace(/^\/personal-skills\/[^/]+\//,"")),packageStorage:(skill.resources??[]).length>0?"stored":"definition-only",packageBytes:Buffer.byteLength(skill.content)}); skills.push(skill); }
     for (const server of personal.mcpServers) { const denied = !settings.mcp || blocked.has(`mcp:${server.id}`); rows.push({kind:"mcp",capabilityId:server.id,name:server.name,enabled:!denied,locked:denied,assignment:null,provenance:"personal",reason:denied?"personal-blocked":"personal",contentHash:null}); if (!denied) mcpServers.push(server); }
     return { rows, skills, mcpServers };
   }
   async #listOverrides(tenantId:string,userId:string) { if (!this.database) return [...this.#overrides.values()].filter((item)=>item.tenantId===tenantId&&item.userId===userId); const rows=await this.database.withTenant(tenantId,(db)=>db.query<Record<string,unknown>>("SELECT * FROM capability_user_overrides WHERE user_id=$1",[userId])); return rows.map((row)=>({tenantId:String(row.tenant_id),userId:String(row.user_id),kind:String(row.kind) as "skill"|"mcp",capabilityId:String(row.capability_id),enabled:Boolean(row.enabled),updatedAt:new Date(String(row.updated_at)).toISOString()})); }
 }
 function object(value:JsonValue):Record<string,JsonValue>{return typeof value==="object"&&value!==null&&!Array.isArray(value)?value as Record<string,JsonValue>:{};}
+function jsonStringArray(value:JsonValue|undefined):string[]{return Array.isArray(value)?value.filter((item):item is string=>typeof item==="string"&&item.trim().length>0):[];}
 function hashContent(value:JsonValue|undefined){const config=object(value??{});return typeof config.content==="string"?createHash("sha256").update(config.content).digest("hex"):null;}
 function orgRow(row:Record<string,unknown>,files:readonly OrgSkillFileMetadata[]=[]):OrgCapability{const content=object((typeof row.config==="string"?JSON.parse(row.config):row.config??{}) as JsonValue).content;return{id:String(row.id),tenantId:String(row.tenant_id),kind:String(row.kind) as "skill"|"mcp",capabilityId:String(row.capability_id),name:String(row.name),description:String(row.description??""),assignment:String(row.assignment) as OrgCapabilityAssignment,allowUserDisable:Boolean(row.allow_user_disable),contentHash:row.content_hash===null?null:String(row.content_hash),config:(typeof row.config==="string"?JSON.parse(row.config):row.config??{}) as JsonValue,resources:files.map((file)=>file.path),packageBytes:(typeof content==="string"?Buffer.byteLength(content):0)+files.reduce((total,file)=>total+file.sizeBytes,0),createdAt:new Date(String(row.created_at)).toISOString(),updatedAt:new Date(String(row.updated_at)).toISOString()};}
 function orgSkillFileRow(row:Record<string,unknown>):SkillPackageFile{const raw=row.content;const content=Buffer.isBuffer(raw)?raw:Buffer.from(raw instanceof Uint8Array?raw:String(raw??""));return{path:String(row.path),contentBase64:content.toString("base64"),mode:Number(row.mode??0o644)};}

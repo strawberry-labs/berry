@@ -129,4 +129,30 @@ describe("PersonalCapabilitiesService personalization", () => {
       expect.objectContaining({ id: "skill_external", name: "decision-brief", enabled: true }),
     ]);
   });
+
+  it("persists a multi-file skill package with one bulk resource insert", async () => {
+    const writes: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const database = {
+      withTenant: async (_tenantId: string, operation: (executor: unknown) => Promise<unknown>) => operation({
+        execute: async (sql: string, params: readonly unknown[] = []) => { writes.push({ sql, params }); },
+        query: async () => [],
+      }),
+    };
+    const service = new PersonalCapabilitiesService(database as never);
+
+    await service.saveSkill("00000000-0000-7000-8000-000000000001", "user-1", {
+      content: "---\nname: package-test\ndescription: Test a complete package\n---\n\nUse the bundled files.",
+      source: "upload",
+      resourceFiles: [
+        { path: "scripts/render.py", contentBase64: Buffer.from("print('ok')").toString("base64"), mode: 0o755 },
+        { path: "assets/template.txt", contentBase64: Buffer.from("template").toString("base64") },
+      ],
+    });
+
+    const inserts = writes.filter(({ sql }) => sql.includes("INSERT INTO personal_skill_files"));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]?.sql).toContain("unnest($3::text[],$4::bytea[]");
+    expect(inserts[0]?.params[2]).toEqual(["assets/template.txt", "scripts/render.py"]);
+    expect(inserts[0]?.params[6]).toEqual([0o644, 0o755]);
+  });
 });

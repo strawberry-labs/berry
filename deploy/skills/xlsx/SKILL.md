@@ -46,12 +46,13 @@ Run:
 
 ```bash
 mkdir -p /workspace/tmp/xlsx /workspace/outputs
-python /managed-skills/xlsx/scripts/create_aesg_xlsx.py \
+python <xlsx-skill-directory>/scripts/create_aesg_xlsx.py \
   --spec /workspace/tmp/xlsx/spec.json \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/project-controls-register.xlsx
-python /managed-skills/aesg-branding/scripts/validate_artifact.py \
+python <aesg-branding-skill-directory>/scripts/validate_artifact.py \
   /workspace/outputs/project-controls-register.xlsx
-python /managed-skills/aesg-branding/scripts/render_artifact.py \
+python <aesg-branding-skill-directory>/scripts/render_artifact.py \
   /workspace/outputs/project-controls-register.xlsx \
   --output-dir /workspace/tmp/xlsx/rendered
 ```

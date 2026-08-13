@@ -1095,12 +1095,29 @@ function throwForOpenAIStreamError(payload: unknown, response: Response, provide
   const message = stringField(payload.error, "message") ?? "The provider stream failed";
   const details = providerErrorDetails(response, payload);
   const requestId = details.requestId;
+  const status = numberField(payload.error, "status")
+    ?? providerStatusFromCode(stringField(payload.error, "code"))
+    ?? providerStatusFromCode(stringField(payload.error, "type"))
+    ?? 502;
   throw new RouterClientError(
     `${providerName} stream failed${requestId ? ` (request ${requestId})` : ""}: ${message}`,
-    numberField(payload.error, "status") ?? 502,
+    status,
     JSON.stringify(payload),
     details,
   );
+}
+
+function providerStatusFromCode(code: string | undefined): number | undefined {
+  const normalized = code?.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "invalid_request_error") return 400;
+  if (normalized === "authentication_error") return 401;
+  if (normalized === "permission_error") return 403;
+  if (normalized === "not_found_error") return 404;
+  if (normalized === "request_too_large") return 413;
+  if (normalized === "rate_limit_error") return 429;
+  if (normalized === "api_error" || normalized === "server_error") return 500;
+  if (normalized === "overloaded_error") return 529;
+  return undefined;
 }
 
 function ensureSlash(value: string): string {

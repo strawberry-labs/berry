@@ -1,16 +1,17 @@
 # AESG artifact sandbox
 
-This is the reproducible E2B image used by the AESG Berry deployment. It
-contains the seven managed skills under `deploy/skills`, retained sanitized
-templates, deterministic generators, Office/PDF renderers, and exact licensed
-Verdana files supplied at build time.
+This is the reproducible E2B execution image used by the AESG Berry deployment.
+It contains generic document dependencies, Office/PDF renderers, and exact
+licensed Verdana files supplied at build time. Skill packages are not baked
+into this image: Berry stages the organization-owned package from database
+storage into `/workspace/runtime-skills` when `activate_skill` runs.
 
 For the complete create-from-scratch, modification, deployment, and rollback
 workflow, read
 [the AESG artifact skills runbook](../../docs/aesg-artifact-skills-runbook.md).
 
-`build.ts` creates an ignored, minimal `.build-context` containing only those
-skills, the dependency lock, and the four font files. The E2B uploader never
+`build.ts` creates an ignored, minimal `.build-context` containing only the
+dependency lock and the four font files. The E2B uploader never
 receives the wider `deploy` directory or any `.env` file.
 
 ## Licensed font handling

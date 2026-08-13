@@ -5,8 +5,9 @@ description: Create, inspect, validate, or convert PDF files. Use for every PDF 
 
 # PDF
 
-For an AESG office PDF, generate the matching AESG DOCX first and convert that
-copy. This preserves the new General Report Template or retained letterhead.
+For an AESG office PDF, activate `aesg-branding`, `docx`, and `pdf`, then
+generate the matching AESG DOCX first and convert that copy. This preserves
+the new General Report Template or retained letterhead.
 
 ## Canonical workflow
 
@@ -14,12 +15,14 @@ Create `/workspace/tmp/pdfs/spec.json` using the DOCX skill schema, then run:
 
 ```bash
 mkdir -p /workspace/tmp/pdfs /workspace/outputs
-python /managed-skills/pdf/scripts/create_aesg_pdf.py \
+python <pdf-skill-directory>/scripts/create_aesg_pdf.py \
   --spec /workspace/tmp/pdfs/spec.json \
+  --docx-skill-dir <docx-skill-directory> \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/environmental-monitoring-report.pdf
-python /managed-skills/aesg-branding/scripts/validate_artifact.py \
+python <aesg-branding-skill-directory>/scripts/validate_artifact.py \
   /workspace/outputs/environmental-monitoring-report.pdf
-python /managed-skills/aesg-branding/scripts/render_artifact.py \
+python <aesg-branding-skill-directory>/scripts/render_artifact.py \
   /workspace/outputs/environmental-monitoring-report.pdf \
   --output-dir /workspace/tmp/pdfs/rendered
 ```

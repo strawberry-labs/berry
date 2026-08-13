@@ -23,8 +23,9 @@ not create QA PDFs, contact sheets, rendered previews, or other QA artifacts.
   generated intermediates under `/workspace/tmp/cv-creator`.
 - Put only the four final requested DOCX and PPTX files in
   `/workspace/outputs`.
-- Use `/managed-skills` in every shell command. Never reference a protected
-  `/.berry` path.
+- Use the exact CV Creator skill directory returned by `activate_skill` in
+  every shell command. Never guess a global skill path or reference a
+  protected `/.berry` path.
 - Run the bundled Python commands directly. Do not source or activate a virtual
   environment; the managed runtime already provides their dependencies.
 - Do not install dependencies, copy bundled generators, rebuild templates, or
@@ -86,7 +87,7 @@ For attached PDF or DOCX CVs without a separate photo, recover the likely
 embedded headshot before asking the user for another upload:
 
 ```bash
-python /managed-skills/cv-creator/scripts/extract_profile_photo.py \
+python <cv-creator-skill-directory>/scripts/extract_profile_photo.py \
   /workspace/inputs/<file-id>/candidate.docx \
   --output /workspace/tmp/cv-creator/candidate/profile-photo.jpg
 ```
@@ -99,7 +100,7 @@ Use this route for facts supplied in chat, attached CV text that Berry has
 structured, or a corrected extraction:
 
 ```bash
-python /managed-skills/cv-creator/scripts/generate_cv_from_spec.py \
+python <cv-creator-skill-directory>/scripts/generate_cv_from_spec.py \
   --spec /workspace/tmp/cv-creator/candidate/cv-input.json \
   --photo /workspace/tmp/cv-creator/candidate/profile-photo.jpg \
   --batch-root /workspace/tmp/cv-creator/candidate/batch \
@@ -125,7 +126,7 @@ Use the finalized batch runner only when the user supplies a folder of source
 PDFs and the runtime has `CANOPYWAVE_API_KEY` configured:
 
 ```bash
-python /managed-skills/cv-creator/scripts/v3/run_cv_pipeline_v3.py \
+python <cv-creator-skill-directory>/scripts/v3/run_cv_pipeline_v3.py \
   /workspace/inputs/<batch-file-id>/cvs \
   --batch-root /workspace/tmp/cv-creator/batch \
   --deliverables-dir /workspace/outputs \

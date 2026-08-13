@@ -25,6 +25,33 @@ Berry also discovers older `.berry/skills` locations and `~/.codex/skills` for c
 For cloud upgrades from the older single-file storage model, follow the
 [skill package migration and recovery runbook](./skill-package-migration-runbook.md).
 
+## Organization skill packages in Berry Cloud
+
+Organization administrators install packages from the organization Skills
+view. The uploaded `.skill` or ZIP file is only the transport envelope. After
+server-side validation, Berry stores the package as:
+
+- one `organization_capabilities` row for identity, assignment, metadata, and
+  the `SKILL.md` content;
+- one `organization_skill_files` row for every relative resource path, with
+  its bytes, size, SHA-256 digest, and executable mode.
+
+The package remains tenant-scoped and can be required, enabled by default,
+made available, or blocked for the organization. Updating an assignment does
+not rewrite or remove its package files.
+
+The execution image contains interpreters, document libraries, fonts, and
+other generic dependencies only. It does not contain organization skills.
+When the agent calls `activate_skill`, the worker reads that package from
+organization storage and stages the same directory tree into a
+content-addressed task workspace. Relative references such as
+`scripts/render.py`, `references/policy.md`, and `assets/template.docx` are
+resolved against that staged directory.
+
+This keeps organization skills dynamic: installing or updating a package does
+not require rebuilding an execution image. The organization Skills viewer
+shows the stored directory tree and loads individual previews on demand.
+
 ## Trust and scripts
 
 A `.skill` file is untrusted content. Importing one never runs scripts, hooks, installers, package managers, or dependency commands. Installing a skill does not grant it extra filesystem, shell, or network access. If its instructions later ask Berry to run a bundled script, the command goes through the same permission policy as any other tool call.

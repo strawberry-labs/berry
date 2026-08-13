@@ -5,9 +5,9 @@ description: Create, edit, inspect, or convert Word DOCX files. Use for every Wo
 
 # DOCX
 
-For AESG output, read
-`/managed-skills/aesg-branding/references/brand-system.md` and use the bundled
-generator. It routes reports through the new General Template and letters
+For AESG output, activate `aesg-branding`, read
+`<aesg-branding-skill-directory>/references/brand-system.md`, and use the bundled
+generators from their activated skill directories. This routes reports through the new General Template and letters
 through the retained letterhead.
 
 ## Canonical workflow
@@ -53,12 +53,13 @@ Run:
 
 ```bash
 mkdir -p /workspace/tmp/docx /workspace/outputs
-python /managed-skills/docx/scripts/create_aesg_docx.py \
+python <docx-skill-directory>/scripts/create_aesg_docx.py \
   --spec /workspace/tmp/docx/spec.json \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/environmental-monitoring-report.docx
-python /managed-skills/aesg-branding/scripts/validate_artifact.py \
+python <aesg-branding-skill-directory>/scripts/validate_artifact.py \
   /workspace/outputs/environmental-monitoring-report.docx
-python /managed-skills/aesg-branding/scripts/render_artifact.py \
+python <aesg-branding-skill-directory>/scripts/render_artifact.py \
   /workspace/outputs/environmental-monitoring-report.docx \
   --output-dir /workspace/tmp/docx/rendered
 ```

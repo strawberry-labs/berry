@@ -3,12 +3,18 @@ import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
   Check,
+  ChevronDown,
   Code2,
   Download,
   EllipsisVertical,
   Eye,
+  File,
+  FileCode2,
+  FileImage,
   FlaskConical,
+  Folder,
   Info,
+  LoaderCircle,
   MessageCircle,
   Plus,
   Trash2,
@@ -72,6 +78,9 @@ type SkillCatalogRow = {
   provenance: "organization" | "personal" | "self-host-bootstrap";
   assignment: EffectiveCapability["assignment"];
   reason: EffectiveCapability["reason"] | "deployment";
+  packageFiles: string[];
+  packageStorage: "stored" | "managed" | "definition-only";
+  packageBytes: number;
   personal?: PersonalSkill;
 };
 
@@ -425,6 +434,49 @@ export function PersonalSkillsScreen({
 
 type SkillViewMode = "rendered" | "source";
 
+type SkillTreeEntry = {
+  kind: "folder" | "file";
+  name: string;
+  path: string;
+  depth: number;
+};
+
+export function skillPackageTreeEntries(paths: readonly string[]): SkillTreeEntry[] {
+  type FolderNode = { folders: Map<string, FolderNode>; files: Map<string, string> };
+  const root: FolderNode = { folders: new Map(), files: new Map() };
+  for (const rawPath of paths) {
+    const path = rawPath.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+    if (!path) continue;
+    const parts = path.split("/");
+    const fileName = parts.pop()!;
+    let folder = root;
+    for (const part of parts) {
+      let child = folder.folders.get(part);
+      if (!child) {
+        child = { folders: new Map(), files: new Map() };
+        folder.folders.set(part, child);
+      }
+      folder = child;
+    }
+    folder.files.set(fileName, path);
+  }
+  const entries: SkillTreeEntry[] = [];
+  const visit = (node: FolderNode, parentPath: string, depth: number) => {
+    for (const [name, path] of [...node.files].sort(([left], [right]) => {
+      if (left === "SKILL.md") return -1;
+      if (right === "SKILL.md") return 1;
+      return left.localeCompare(right);
+    })) entries.push({ kind: "file", name, path, depth });
+    for (const [name, child] of [...node.folders].sort(([left], [right]) => left.localeCompare(right))) {
+      const path = parentPath ? `${parentPath}/${name}` : name;
+      entries.push({ kind: "folder", name, path, depth });
+      visit(child, path, depth + 1);
+    }
+  };
+  visit(root, "", 0);
+  return entries;
+}
+
 export function skillMarkdownBody(content: string): string {
   const normalized = content.replace(/\r\n?/g, "\n");
   if (!normalized.startsWith("---\n")) return normalized;
@@ -453,6 +505,10 @@ function SkillDetailsDialog({
   onUninstall?: (() => Promise<void>) | undefined;
 }) {
   const [view, setView] = React.useState<SkillViewMode>("rendered");
+  const [selectedPath, setSelectedPath] = React.useState("SKILL.md");
+  const [loadedFiles, setLoadedFiles] = React.useState<Array<{ path: string; contentBase64: string; mode?: number | undefined }>>([]);
+  const [packageLoading, setPackageLoading] = React.useState(false);
+  const [packageError, setPackageError] = React.useState("");
   const [descriptionExpanded, setDescriptionExpanded] = React.useState(false);
   const [busy, setBusy] = React.useState<"toggle" | "download" | "uninstall" | null>(null);
   const [actionError, setActionError] = React.useState("");
@@ -464,6 +520,64 @@ function SkillDetailsDialog({
   const descriptionCanExpand = skill.description.length > 220;
   const markdown = skill.content ? skillMarkdownBody(skill.content) : "";
   const controlHint = skillControlHint(skill, hasClient);
+  const packagePaths = React.useMemo(() => [
+    "SKILL.md",
+    ...new Set([...skill.packageFiles, ...loadedFiles.map((file) => file.path)].filter((path) => path !== "SKILL.md")),
+  ], [loadedFiles, skill.packageFiles]);
+  const treeEntries = React.useMemo(() => skillPackageTreeEntries(packagePaths), [packagePaths]);
+  const selectedResource = loadedFiles.find((file) => file.path === selectedPath) ?? null;
+  const selectedContent = selectedPath === "SKILL.md" ? skill.content : selectedResource ? decodeSkillTextFile(selectedResource) : null;
+  const selectedIsMarkdown = /\.md$/i.test(selectedPath) && selectedContent !== null;
+
+  React.useEffect(() => {
+    setSelectedPath("SKILL.md");
+    setLoadedFiles([]);
+    setPackageError("");
+  }, [skill.key]);
+
+  React.useEffect(() => {
+    if (!client || !skill.content || skill.provenance !== "personal" || selectedPath === "SKILL.md" || !isPreviewableSkillFile(selectedPath) || loadedFiles.some((file) => file.path === selectedPath)) return;
+    let cancelled = false;
+    setPackageLoading(true);
+    setPackageError("");
+    void loadSkillPackageForDownload(client, tenantId, skill)
+      .then((loaded) => {
+        if (!cancelled) setLoadedFiles(loaded.resourceFiles);
+      })
+      .catch((cause) => {
+        if (!cancelled) setPackageError(cause instanceof Error ? cause.message : "Could not load package files");
+      })
+      .finally(() => {
+        if (!cancelled) setPackageLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [client, loadedFiles, selectedPath, skill.content, skill.personal, skill.provenance, tenantId]);
+
+  React.useEffect(() => {
+    if (!client || skill.provenance !== "organization" || skill.packageStorage !== "stored" || selectedPath === "SKILL.md" || !isPreviewableSkillFile(selectedPath) || loadedFiles.some((file) => file.path === selectedPath)) return;
+    let cancelled = false;
+    setPackageLoading(true);
+    setPackageError("");
+    void client.organizationSkillPackageFile(tenantId, skill.capabilityId, selectedPath)
+      .then((file) => {
+        if (!cancelled) setLoadedFiles((current) => current.some((candidate) => candidate.path === file.path) ? current : [...current, file]);
+      })
+      .catch((cause) => {
+        if (!cancelled) setPackageError(cause instanceof Error ? cause.message : "Could not load this package file");
+      })
+      .finally(() => {
+        if (!cancelled) setPackageLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [client, loadedFiles, selectedPath, skill.capabilityId, skill.packageStorage, skill.provenance, tenantId]);
+
+  React.useEffect(() => {
+    if (!packagePaths.includes(selectedPath)) setSelectedPath("SKILL.md");
+  }, [packagePaths, selectedPath]);
+
+  React.useEffect(() => {
+    setView(/\.md$/i.test(selectedPath) ? "rendered" : "source");
+  }, [selectedPath]);
 
   async function changeEnabled(enabled: boolean) {
     setActionError("");
@@ -521,7 +635,7 @@ function SkillDetailsDialog({
         showCloseButton={false}
         className="flex h-[min(92dvh,920px)] w-[calc(100vw-1rem)] max-w-none flex-col gap-0 overflow-hidden rounded-[18px] border border-[var(--berry-border)] bg-[var(--berry-main-bg)] p-0 shadow-[var(--berry-shadow-floating)] sm:w-[calc(100vw-2rem)] sm:max-w-[min(1440px,calc(100vw-2rem))]"
       >
-        <div className="flex h-14 shrink-0 items-center justify-between border-b border-[var(--berry-border-subtle)] px-3 sm:px-5">
+        <div className="flex h-14 shrink-0 items-center justify-between px-3 sm:px-5">
           <DialogClose asChild>
             <Button variant="ghost" className="h-8 gap-2 px-2 text-sm font-medium">
               <ArrowLeft aria-hidden />
@@ -625,14 +739,46 @@ function SkillDetailsDialog({
           </div>
 
           <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--berry-border)] bg-[var(--berry-surface-inset)]" aria-label={`${skill.name} files`}>
-            <div className="flex min-h-12 shrink-0 items-center justify-between gap-3 border-b border-[var(--berry-border-subtle)] px-3">
+            <div className="flex min-h-12 shrink-0 items-center justify-between gap-3 bg-[var(--berry-control-bg)] px-3">
               <div className="flex min-w-0 items-center gap-2">
-                <span className="rounded-lg border border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-3 py-1.5 text-sm font-medium text-[var(--berry-text-primary)]">
-                  SKILL.md
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="secondary" className="h-8 max-w-[min(55vw,420px)] gap-2 px-3 text-sm font-medium">
+                      <SkillFileIcon path={selectedPath} />
+                      <span className="truncate">{selectedPath}</span>
+                      <ChevronDown className="size-3.5 shrink-0" aria-hidden />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="max-h-[min(60vh,520px)] w-[min(380px,calc(100vw-3rem))] overflow-y-auto border-[var(--berry-border)] bg-[var(--berry-card-bg)] p-1.5">
+                    {treeEntries.map((entry) => entry.kind === "folder" ? (
+                      <div
+                        className="flex h-8 items-center gap-2 rounded-md pe-2 text-xs font-medium text-[var(--berry-text-secondary)]"
+                        key={`folder:${entry.path}`}
+                        style={{ paddingInlineStart: `${8 + entry.depth * 16}px` }}
+                      >
+                        <Folder className="size-4 shrink-0" aria-hidden />
+                        <span className="truncate">{entry.name}</span>
+                      </div>
+                    ) : (
+                      <DropdownMenuItem
+                        className="h-8 gap-2 text-xs"
+                        key={`file:${entry.path}`}
+                        onSelect={() => setSelectedPath(entry.path)}
+                        style={{ paddingInlineStart: `${8 + entry.depth * 16}px` }}
+                      >
+                        <SkillFileIcon path={entry.path} />
+                        <span className="truncate">{entry.name}</span>
+                        {entry.path === selectedPath ? <Check className="ms-auto size-3.5" aria-hidden /> : null}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <span className="whitespace-nowrap text-xs text-[var(--berry-text-tertiary)]">
+                  {packagePaths.length} {packagePaths.length === 1 ? "file" : "files"}
                 </span>
-                <span className="text-xs text-[var(--berry-text-tertiary)]">1 file</span>
+                {packageLoading ? <LoaderCircle className="size-3.5 animate-spin text-[var(--berry-text-tertiary)] motion-reduce:animate-none" aria-label="Loading package files" /> : null}
               </div>
-              <div className="flex rounded-lg bg-[var(--berry-control-bg)] p-0.5" role="group" aria-label="Skill content view">
+              {selectedContent !== null ? <div className="flex rounded-lg bg-[var(--berry-control-bg)] p-0.5" role="group" aria-label="Skill content view">
                 <Button
                   variant="ghost"
                   size="icon-sm"
@@ -640,6 +786,7 @@ function SkillDetailsDialog({
                   onClick={() => setView("rendered")}
                   aria-label="Rendered Markdown"
                   aria-pressed={view === "rendered"}
+                  disabled={!selectedIsMarkdown}
                 >
                   <Eye aria-hidden />
                 </Button>
@@ -653,11 +800,11 @@ function SkillDetailsDialog({
                 >
                   <Code2 aria-hidden />
                 </Button>
-              </div>
+              </div> : null}
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto overscroll-contain">
-              {!skill.content ? (
+              {selectedPath === "SKILL.md" && !skill.content ? (
                 <div className="grid min-h-full place-items-center p-8 text-center">
                   <div className="max-w-md">
                     <p className="text-sm font-medium text-[var(--berry-text-primary)]">SKILL.md is not available</p>
@@ -666,12 +813,18 @@ function SkillDetailsDialog({
                     </p>
                   </div>
                 </div>
-              ) : view === "rendered" ? (
+              ) : selectedContent !== null && view === "rendered" && selectedIsMarkdown ? (
                 <Markdown className="mx-auto max-w-5xl px-5 py-6 text-[14px] leading-7 tracking-normal text-[var(--berry-text-primary)] sm:px-8 sm:py-8">
-                  {markdown}
+                  {selectedPath === "SKILL.md" ? markdown : selectedContent}
                 </Markdown>
-              ) : (
-                <SkillSource content={skill.content} />
+              ) : selectedContent !== null ? <SkillSource content={selectedContent} /> : (
+                <SkillResourceSummary
+                  file={selectedResource}
+                  managed={skill.packageStorage === "managed"}
+                  stored={skill.packageStorage === "stored"}
+                  packageError={packageError}
+                  path={selectedPath}
+                />
               )}
             </div>
           </section>
@@ -679,6 +832,88 @@ function SkillDetailsDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function SkillFileIcon({ path }: { path: string }) {
+  if (/\.(png|jpe?g|gif|webp|avif|svg)$/i.test(path)) return <FileImage className="size-4 shrink-0" aria-hidden />;
+  if (/\.(md|txt|json|ya?ml|toml|csv|py|js|jsx|ts|tsx|sh|bash|css|html?|xml|sql)$/i.test(path)) return <FileCode2 className="size-4 shrink-0" aria-hidden />;
+  return <File className="size-4 shrink-0" aria-hidden />;
+}
+
+function SkillResourceSummary({
+  file,
+  managed,
+  stored,
+  packageError,
+  path,
+}: {
+  file: { path: string; contentBase64: string; mode?: number | undefined } | null;
+  managed: boolean;
+  stored: boolean;
+  packageError: string;
+  path: string;
+}) {
+  const imageType = skillImageMediaType(path);
+  if (file && imageType) {
+    return (
+      <div className="grid min-h-full place-items-center p-6">
+        <img
+          alt={path.split("/").at(-1) ?? path}
+          className="max-h-[65vh] max-w-full rounded-lg outline outline-1 -outline-offset-1 outline-[var(--berry-image-outline)]"
+          src={`data:${imageType};base64,${file.contentBase64}`}
+        />
+      </div>
+    );
+  }
+  const bytes = file ? base64ByteLength(file.contentBase64) : null;
+  return (
+    <div className="grid min-h-full place-items-center p-8 text-center">
+      <div className="max-w-lg">
+        <SkillFileIcon path={path} />
+        <p className="mt-3 break-all text-sm font-medium text-[var(--berry-text-primary)]">{path}</p>
+        <p className="mt-1 text-xs leading-5 text-[var(--berry-text-secondary)]">
+          {managed
+            ? `This legacy organization skill lists ${path}, but its package has not been migrated into organization storage yet. An administrator should resync or re-upload the complete .skill archive.`
+            : file
+              ? `Bundled binary resource${bytes === null ? "" : ` · ${formatBytes(bytes)}`}. Berry stores it with the skill package and stages it beside SKILL.md when the skill activates.`
+              : stored && !isPreviewableSkillFile(path)
+                ? "Bundled binary resource. Berry stores it with this organization skill and stages it beside SKILL.md when the skill activates."
+              : packageError || "This file is listed in the package manifest, but its preview bytes are unavailable."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function decodeSkillTextFile(file: { path: string; contentBase64: string }): string | null {
+  if (!/\.(md|txt|json|ya?ml|toml|csv|py|js|jsx|ts|tsx|sh|bash|css|html?|xml|sql)$/i.test(file.path)) return null;
+  try {
+    const binary = atob(file.contentBase64);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function isPreviewableSkillFile(path: string): boolean {
+  return /\.(md|txt|json|ya?ml|toml|csv|py|js|jsx|ts|tsx|sh|bash|css|html?|xml|sql|png|jpe?g|gif|webp|avif|svg)$/i.test(path);
+}
+
+function skillImageMediaType(path: string): string | null {
+  const extension = path.split(".").at(-1)?.toLowerCase();
+  return ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", avif: "image/avif", svg: "image/svg+xml" } as Record<string, string>)[extension ?? ""] ?? null;
+}
+
+function base64ByteLength(value: string): number {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return value.length * 3 / 4 - padding;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function SkillSource({ content }: { content: string }) {
@@ -726,6 +961,9 @@ function buildSkillRows(
       provenance: "organization",
       assignment: item.assignment,
       reason: item.reason,
+      packageFiles: item.packageFiles ?? [],
+      packageStorage: item.packageStorage ?? "definition-only",
+      packageBytes: item.packageBytes ?? 0,
     });
   }
   for (const item of personal) {
@@ -740,6 +978,9 @@ function buildSkillRows(
       provenance: "personal",
       assignment: null,
       reason: "personal",
+      packageFiles: item.resources,
+      packageStorage: item.resources.length > 0 ? "stored" : "definition-only",
+      packageBytes: item.packageBytes,
       personal: item,
     });
   }
@@ -757,6 +998,9 @@ function buildSkillRows(
         provenance: "self-host-bootstrap",
         assignment: null,
         reason: "deployment",
+        packageFiles: [],
+        packageStorage: "definition-only",
+        packageBytes: item.content ? new TextEncoder().encode(item.content).byteLength : 0,
       });
   }
   return [...rows.values()].sort(

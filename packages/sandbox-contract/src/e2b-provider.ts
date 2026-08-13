@@ -43,7 +43,7 @@ import {
   type SandboxResourceLimits,
   type SandboxResumeInput,
 } from "./schemas.js";
-import { SandboxPausedError, type SandboxFileApi, type SandboxProvider } from "./provider.js";
+import { SandboxPausedError, type SandboxFileApi, type SandboxFileWriteBytesInput, type SandboxProvider } from "./provider.js";
 
 type ParsedCreateInput = ReturnType<typeof SandboxCreateInputSchema.parse>;
 
@@ -185,6 +185,7 @@ export class E2BSandboxProvider implements SandboxProvider {
   readonly files: SandboxFileApi = {
     read: (input) => this.readFile(input),
     write: (input) => this.writeFile(input),
+    writeBytes: (input) => this.writeFileBytes(input),
     list: (input) => this.listFiles(input),
   };
 
@@ -467,6 +468,28 @@ export class E2BSandboxProvider implements SandboxProvider {
     });
   }
 
+  async writeFileBytes(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult> {
+    const { content: _content, encoding: _encoding, ...metadata } = SandboxFileWriteInputSchema.parse({
+      ...input,
+      content: "",
+      encoding: "base64",
+    });
+    const sandbox = await this.#sandbox(metadata.sandbox_id);
+    const bytes = Buffer.isBuffer(input.content)
+      ? input.content
+      : Buffer.from(input.content.buffer, input.content.byteOffset, input.content.byteLength);
+    await sandbox.files.write(metadata.path, arrayBuffer(bytes));
+    if (metadata.mode !== undefined) {
+      await runForeground(sandbox, `chmod ${metadata.mode.toString(8)} -- ${shellQuote(metadata.path)}`);
+    }
+    const info = await sandbox.files.getInfo(metadata.path);
+    return SandboxFileWriteResultSchema.parse({
+      path: metadata.path,
+      size_bytes: info.size ?? bytes.byteLength,
+      mtime: info.modifiedTime?.toISOString() ?? this.#now().toISOString(),
+    });
+  }
+
   async listFiles(input: SandboxFileListInput): Promise<SandboxFileListResult> {
     const parsed = SandboxFileListInputSchema.parse(input);
     const sandbox = await this.#sandbox(parsed.sandbox_id);
@@ -698,6 +721,7 @@ function errorMessage(error: unknown): string {
 }
 
 function arrayBuffer(buffer: Buffer): ArrayBuffer {
+  if (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength) return buffer.buffer as ArrayBuffer;
   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
 }
 

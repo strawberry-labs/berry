@@ -54,12 +54,13 @@ Run:
 
 ```bash
 mkdir -p /workspace/tmp/pptx /workspace/outputs
-python /managed-skills/pptx/scripts/create_aesg_pptx.py \
+python <pptx-skill-directory>/scripts/create_aesg_pptx.py \
   --spec /workspace/tmp/pptx/spec.json \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/project-performance-review.pptx
-python /managed-skills/aesg-branding/scripts/validate_artifact.py \
+python <aesg-branding-skill-directory>/scripts/validate_artifact.py \
   /workspace/outputs/project-performance-review.pptx
-python /managed-skills/aesg-branding/scripts/render_artifact.py \
+python <aesg-branding-skill-directory>/scripts/render_artifact.py \
   /workspace/outputs/project-performance-review.pptx \
   --output-dir /workspace/tmp/pptx/rendered
 ```

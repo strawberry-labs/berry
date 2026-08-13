@@ -11,6 +11,7 @@ import {
   Upload,
 } from "lucide-react";
 import {
+  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
   OrgPermissionSchema,
   type OrgCapabilityAssignment,
   type OrgPermission,
@@ -85,6 +86,11 @@ function actionOf(permission: string) {
 }
 function copyText(value: string) {
   void navigator.clipboard?.writeText(value).catch(() => {});
+}
+function formatPackageBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /* -------------------------------------------------------------------- roles */
@@ -1361,6 +1367,12 @@ function SkillsMcpScreen({
   const [adding, setAdding] = React.useState(false);
   const [review, setReview] = React.useState<PersonalSkillReview | null>(null);
   const [importError, setImportError] = React.useState("");
+  const [skillArchiveFile, setSkillArchiveFile] = React.useState<File | null>(null);
+  const [skillArchiveFileId, setSkillArchiveFileId] = React.useState<string | null>(null);
+  const [skillUploadProgress, setSkillUploadProgress] = React.useState(0);
+  const [skillOperation, setSkillOperation] = React.useState<"uploading" | "reviewing" | "saving" | null>(null);
+  const skillOperationGeneration = React.useRef(0);
+  const skillUploadController = React.useRef<AbortController | null>(null);
   const [skillDraft, setSkillDraft] = React.useState({
     content: "",
     packageFiles: [] as string[],
@@ -1428,31 +1440,95 @@ function SkillsMcpScreen({
     );
     setMessage("Capability assignment updated and recorded in the audit log.");
   };
+  const discardSkillArchive = (fileId = skillArchiveFileId) => {
+    skillUploadController.current?.abort();
+    skillUploadController.current = null;
+    skillOperationGeneration.current += 1;
+    setSkillOperation(null);
+    setSkillArchiveFile(null);
+    setSkillArchiveFileId(null);
+    setSkillUploadProgress(0);
+    if (client && fileId) void client.removeFileFromLibrary(fileId).catch(() => undefined);
+  };
+  const closeSkillDialog = () => {
+    discardSkillArchive();
+    setAdding(false);
+    setReview(null);
+    setImportError("");
+  };
+  const requestCloseSkillDialog = () => {
+    if (skillOperation === "reviewing" || skillOperation === "saving") return;
+    closeSkillDialog();
+  };
   const reviewSkill = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!client) return;
+    if (!client || skillOperation) return;
+    const generation = ++skillOperationGeneration.current;
     setImportError("");
     try {
-      setReview(
-        await client.reviewOrganizationSkill(tenantId, {
+      if (skillArchiveFile) {
+        let fileId = skillArchiveFileId;
+        if (!fileId) {
+          setSkillOperation("uploading");
+          const controller = new AbortController();
+          skillUploadController.current = controller;
+          const stored = await client.uploadFile(skillArchiveFile, {
+            origin: "user_upload",
+            associationRole: "reference",
+            onProgress: ({ ratio }) => setSkillUploadProgress(ratio),
+            signal: controller.signal,
+          });
+          if (generation !== skillOperationGeneration.current) {
+            await client.removeFileFromLibrary(stored.id).catch(() => undefined);
+            return;
+          }
+          fileId = stored.id;
+          setSkillArchiveFileId(fileId);
+        }
+        setSkillOperation("reviewing");
+        const result = await client.reviewOrganizationSkillArchive(tenantId, fileId);
+        if (generation === skillOperationGeneration.current) setReview(result);
+      } else {
+        setSkillOperation("reviewing");
+        const result = await client.reviewOrganizationSkill(tenantId, {
           content: skillDraft.content,
           source: skillDraft.fileName ? "upload" : "text",
           packageFiles: skillDraft.packageFiles,
           resourceFiles: skillDraft.resourceFiles,
-        }),
-      );
+        });
+        if (generation === skillOperationGeneration.current) setReview(result);
+      }
     } catch (cause) {
+      if (generation !== skillOperationGeneration.current) return;
       setImportError(
         cause instanceof Error ? cause.message : "Skill review failed",
       );
+    } finally {
+      if (generation === skillOperationGeneration.current) {
+        skillUploadController.current = null;
+        setSkillOperation(null);
+      }
     }
   };
   const selectSkillFile = async (file: File | undefined) => {
-    if (!file) return;
+    if (!file || skillOperation) return;
+    discardSkillArchive();
     setImportError("");
     setReview(null);
     try {
+      if (/\.(skill|zip)$/i.test(file.name)) {
+        if (file.size > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES) throw new Error("Organization skill archives are limited to 100 MB");
+        setSkillArchiveFile(file);
+        setSkillArchiveFileId(null);
+        setSkillUploadProgress(0);
+        setSkillDraft((current) => ({ ...current, content: "", packageFiles: [], resourceFiles: [], fileName: file.name }));
+        setSkillSource("upload");
+        return;
+      }
       const imported = await readBrowserSkillImport(file);
+      setSkillArchiveFile(null);
+      setSkillArchiveFileId(null);
+      setSkillUploadProgress(0);
       setSkillDraft((current) => ({
         ...current,
         content: imported.content,
@@ -1470,42 +1546,43 @@ function SkillsMcpScreen({
     }
   };
   const saveSkill = async () => {
-    if (!client || !review) return;
-    const saved = await client.upsertOrganizationCapability(tenantId, {
-      kind: "skill",
-      capabilityId: review.name,
-      name: review.name,
-      description: review.description,
-      assignment: skillDraft.assignment,
-      allowUserDisable:
-        skillDraft.assignment === "required" ||
-        skillDraft.assignment === "blocked"
-          ? false
-          : skillDraft.allowUserDisable,
-      contentHash: review.hash,
-      config: { content: skillDraft.content },
-      resourceFiles: skillDraft.resourceFiles,
-    });
-    r.setData([
-      saved,
-      ...r.data.filter(
-        (item: any) =>
-          !(
-            item.kind === saved.kind && item.capabilityId === saved.capabilityId
-          ),
-      ),
-    ]);
-    setAdding(false);
-    setReview(null);
-    setSkillDraft({
-      content: "",
-      packageFiles: [],
-      resourceFiles: [],
-      fileName: "",
-      assignment: "default-on",
-      allowUserDisable: true,
-    });
-    setMessage(`$${saved.name} is now available to the organization.`);
+    if (!client || !review || skillOperation) return;
+    setImportError("");
+    setSkillOperation("saving");
+    try {
+      const allowUserDisable = skillDraft.assignment === "required" || skillDraft.assignment === "blocked"
+        ? false
+        : skillDraft.allowUserDisable;
+      const uploadedFileId = skillArchiveFileId;
+      const saved = uploadedFileId ? await client.installOrganizationSkillArchive(tenantId, {
+        fileId: uploadedFileId,
+        assignment: skillDraft.assignment,
+        allowUserDisable,
+      }) : await client.upsertOrganizationCapability(tenantId, {
+        kind: "skill",
+        capabilityId: review.name,
+        name: review.name,
+        description: review.description,
+        assignment: skillDraft.assignment,
+        allowUserDisable,
+        contentHash: review.hash,
+        config: { content: skillDraft.content },
+        resourceFiles: skillDraft.resourceFiles,
+      });
+      r.setData([saved, ...r.data.filter((item: any) => !(item.kind === saved.kind && item.capabilityId === saved.capabilityId))]);
+      if (uploadedFileId) await client.removeFileFromLibrary(uploadedFileId).catch(() => undefined);
+      setAdding(false);
+      setReview(null);
+      setSkillArchiveFile(null);
+      setSkillArchiveFileId(null);
+      setSkillUploadProgress(0);
+      setSkillDraft({ content: "", packageFiles: [], resourceFiles: [], fileName: "", assignment: "default-on", allowUserDisable: true });
+      setMessage(`$${saved.name} is now available to the organization.`);
+    } catch (cause) {
+      setImportError(cause instanceof Error ? cause.message : "Could not add this skill to the organization.");
+    } finally {
+      setSkillOperation(null);
+    }
   };
   const saveMcp = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1610,16 +1687,16 @@ function SkillsMcpScreen({
       />
       <ManagementDialog
         open={adding && tab === "skill"}
-        onOpenChange={setAdding}
+        onOpenChange={(open) => open ? setAdding(true) : requestCloseSkillDialog()}
         title={review ? "Review organization skill" : "Add organization skill"}
         description={review ? "Confirm the reviewed package and organization assignment." : "Select one source, provide the skill, then review it before publishing."}
         size="lg"
         footer={!review ? <>
-          <Button type="button" variant="secondary" onClick={() => setAdding(false)}>Cancel</Button>
-          <Button type="submit" form="organization-skill-source-form"><ShieldCheck aria-hidden />Review skill</Button>
+          <Button type="button" variant="secondary" disabled={skillOperation === "reviewing"} onClick={requestCloseSkillDialog}>Cancel</Button>
+          <Button type="submit" form="organization-skill-source-form" disabled={skillOperation !== null}><ShieldCheck aria-hidden />{skillOperation === "uploading" ? "Uploading…" : skillOperation === "reviewing" ? "Reviewing…" : "Review skill"}</Button>
         </> : <>
-          <Button type="button" variant="secondary" onClick={() => setReview(null)}>Back</Button>
-          <Button type="button" onClick={() => void saveSkill()}><Check aria-hidden />Add to organization</Button>
+          <Button type="button" variant="secondary" disabled={skillOperation !== null} onClick={() => setReview(null)}>Back</Button>
+          <Button type="button" disabled={skillOperation !== null} onClick={() => void saveSkill()}><Check aria-hidden />{skillOperation === "saving" ? "Adding…" : "Add to organization"}</Button>
         </>}
       >
         {!review ? (
@@ -1628,21 +1705,32 @@ function SkillsMcpScreen({
             className="grid gap-4"
             onSubmit={reviewSkill}
           >
-            <TabBar label="Skill source" active={skillSource} onSelect={(value) => setSkillSource(value as "upload" | "paste")} tabs={[{ id: "upload", label: "Upload package" }, { id: "paste", label: "Paste SKILL.md" }]} />
+            <TabBar label="Skill source" active={skillSource} onSelect={(value) => {
+              const source = value as "upload" | "paste";
+              setSkillSource(source);
+              setReview(null);
+              setImportError("");
+              if (source === "paste") {
+                discardSkillArchive();
+                setSkillDraft((current) => ({ ...current, fileName: "", packageFiles: [], resourceFiles: [] }));
+              }
+            }} tabs={[{ id: "upload", label: "Upload package" }, { id: "paste", label: "Paste SKILL.md" }]} />
             {skillSource === "upload" ? (
               <label
                 className="settings-skill-dropzone"
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={(event) => {
                   event.preventDefault();
+                  if (skillOperation) return;
                   void selectSkillFile(event.dataTransfer.files[0]);
                 }}
               >
-                <input type="file" accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectSkillFile(event.currentTarget.files?.[0])} />
+                <input type="file" disabled={skillOperation !== null} accept=".skill,.zip,.md,text/markdown,application/zip" onChange={(event) => void selectSkillFile(event.currentTarget.files?.[0])} />
                 <Upload aria-hidden />
                 <span className="grid gap-0.5">
                   <b>{skillDraft.fileName || "Choose or drop a .skill package"}</b>
-                  <small>.skill, .zip, or SKILL.md · up to 5 MB</small>
+                  <small>.skill or .zip up to 100 MB · SKILL.md up to 256 KB</small>
+                  {skillUploadProgress > 0 && skillUploadProgress < 1 ? <small>Uploading {Math.round(skillUploadProgress * 100)}%</small> : null}
                 </span>
               </label>
             ) : (
@@ -1653,7 +1741,10 @@ function SkillsMcpScreen({
                   required
                   value={skillDraft.content}
                   placeholder="---\nname: example\ndescription: ...\n---"
-                  onChange={(event) => setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [], resourceFiles: [] })}
+                  onChange={(event) => {
+                    if (skillArchiveFile || skillArchiveFileId) discardSkillArchive();
+                    setSkillDraft({ ...skillDraft, content: event.currentTarget.value, fileName: "", packageFiles: [], resourceFiles: [] });
+                  }}
                 />
               </label>
             )}
@@ -1816,7 +1907,7 @@ function SkillsMcpScreen({
         >
           <DataTable
             label="Organization capabilities"
-            columns={["Capability", "Assignment", "User override", "Managed"]}
+            columns={["Capability", "Assignment", "User override", "Package"]}
             onRowSelect={setActive}
             activeRow={active}
             rowLabel={(i) => rows[i].name}
@@ -1829,7 +1920,7 @@ function SkillsMcpScreen({
                 {humanize(c.assignment)}
               </StatusPill>,
               c.allowUserDisable ? "Allowed" : "Not allowed",
-              c.contentHash ? "Signed" : "Unsigned",
+              c.kind === "skill" ? `${Number(c.resources?.length ?? 0) + 1} files · ${formatPackageBytes(Number(c.packageBytes ?? 0))}` : c.contentHash ? "Signed" : "Unsigned",
             ])}
           />
         </AsyncState>
@@ -1874,6 +1965,10 @@ function SkillsMcpScreen({
                     "Unsigned"
                   ),
                 },
+                ...(detail.kind === "skill" ? [{
+                  term: "Package",
+                  detail: `${Number(detail.resources?.length ?? 0) + 1} files · ${formatPackageBytes(Number(detail.packageBytes ?? 0))}`,
+                }] : []),
                 { term: "Updated", detail: formatDateTime(detail.updatedAt) },
               ]}
             />

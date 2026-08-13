@@ -56,14 +56,13 @@ export const template = Template({
     "python3 -m venv /opt/aesg/venv && /opt/aesg/venv/bin/pip install --no-cache-dir --upgrade pip==25.1.1 && /opt/aesg/venv/bin/pip install --no-cache-dir -r /opt/aesg/requirements.lock && printf '%s\\n' '#!/bin/sh' 'exec /opt/aesg/venv/bin/python \"$@\"' > /usr/local/bin/python && cp /usr/local/bin/python /usr/local/bin/python3 && printf '%s\\n' '#!/bin/sh' 'exec /opt/aesg/venv/bin/pip \"$@\"' > /usr/local/bin/pip && chmod 0755 /usr/local/bin/python /usr/local/bin/python3 /usr/local/bin/pip",
     { user: "root" },
   )
-  .copy("skills", "/opt/aesg/skills")
   .copy("fonts", "/usr/local/share/fonts/aesg")
   .runCmd(
     "fc-cache -f && test \"$(fc-match -f '%{family}' Verdana)\" = Verdana",
     { user: "root" },
   )
   .runCmd(
-    "id -u user >/dev/null 2>&1 || useradd --create-home --shell /bin/bash user; mkdir -p /workspace/input /workspace/inputs /workspace/outputs /workspace/tmp /workspace/rendered /workspace/.berry; ln -sfn /workspace/outputs /workspace/output; ln -sfn /opt/aesg/skills /workspace/.berry/managed-skills; ln -sfn /opt/aesg/skills /managed-skills; chmod -R a+rX /opt/aesg; chown -R user:user /workspace",
+    "id -u user >/dev/null 2>&1 || useradd --create-home --shell /bin/bash user; mkdir -p /workspace/input /workspace/inputs /workspace/outputs /workspace/tmp /workspace/rendered /workspace/runtime-skills; ln -sfn /workspace/outputs /workspace/output; chmod -R a+rX /opt/aesg; chown -R user:user /workspace",
     { user: "root" },
   )
   .setEnvs({
@@ -72,8 +71,6 @@ export const template = Template({
     SAL_USE_VCLPLUGIN: "gen",
     VIRTUAL_ENV: "/opt/aesg/venv",
     PATH: "/opt/aesg/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    BERRY_SKILLS_DIR: "/opt/aesg/skills",
-    AESG_SKILLS_DIR: "/opt/aesg/skills",
   })
   .setWorkdir("/workspace")
   .setUser("user");

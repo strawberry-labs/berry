@@ -19,6 +19,7 @@ import type { ChatContentPart, ImageGenerationResult } from "@berry/router-clien
 import {
   DEFAULT_SANDBOX_INPUT_MAX_BYTES,
   DURABLE_FILE_TOOL_MAX_CONTENT_CHARS,
+  ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
   type JsonValue,
 } from "@berry/shared";
 import { parsePatch, type PatchHunk } from "@berry/local-agent";
@@ -278,15 +279,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const entries = listing.entries.filter((entry) => entry.type !== "directory");
     if (entries.some((entry) => entry.type === "symlink")) throw new Error("Skill packages cannot contain symbolic links");
     if (entries.length === 0 || entries.length > 501) throw new Error("Skill package must contain SKILL.md and at most 500 resource files");
-    const files: DurableSkillPackageFile[] = [];
-    let totalBytes = 0;
-    for (const entry of entries.sort((left, right) => left.path.localeCompare(right.path))) {
+    const sortedEntries = entries.sort((left, right) => left.path.localeCompare(right.path));
+    const totalBytes = sortedEntries.reduce((total, entry) => total + entry.size_bytes, 0);
+    if (totalBytes > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES) throw new Error("Skill packages are limited to 100 MB extracted");
+    const files = new Array<DurableSkillPackageFile>(sortedEntries.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(4, sortedEntries.length) }, async () => {
+      while (nextIndex < sortedEntries.length) {
+        const index = nextIndex++;
+        const entry = sortedEntries[index]!;
       const relativePath = relativeSkillPackagePath(root, entry.path);
-      totalBytes += entry.size_bytes;
-      if (totalBytes > 5 * 1024 * 1024) throw new Error("Skill packages are limited to 5 MB extracted");
       const source = await this.provider.files.read({ sandbox_id: sandbox.id, path: entry.path, encoding: "base64" });
-      files.push({ path: relativePath, contentBase64: source.content, mode: relativePath.startsWith("scripts/") ? 0o755 : 0o644 });
-    }
+        files[index] = { path: relativePath, contentBase64: source.content, mode: relativePath.startsWith("scripts/") ? 0o755 : 0o644 };
+      }
+    }));
     if (!files.some((file) => file.path === "SKILL.md")) throw new Error("Skill package directory must contain SKILL.md at its root");
     return files;
   }
@@ -301,28 +307,51 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const path = safeRelativeSkillPackagePath(file.path);
       if (seen.has(path)) throw new Error(`Skill package contains duplicate path: ${path}`);
       seen.add(path);
-      return { ...file, path, bytes: Buffer.from(file.contentBase64, "base64") };
+      const bytes = immediateSkillPackageBytes(file);
+      const sizeBytes = file.sizeBytes ?? bytes?.byteLength;
+      const sha256 = file.sha256?.toLowerCase() ?? (bytes ? createHash("sha256").update(bytes).digest("hex") : undefined);
+      if (!Number.isSafeInteger(sizeBytes) || sizeBytes === undefined || sizeBytes < 0 || !sha256 || !/^[a-f0-9]{64}$/.test(sha256)) {
+        throw new Error(`Skill package file metadata is invalid: ${path}`);
+      }
+      if (bytes && (bytes.byteLength !== sizeBytes || createHash("sha256").update(bytes).digest("hex") !== sha256)) {
+        throw new Error(`Skill package file metadata does not match its content: ${path}`);
+      }
+      return { ...file, path, bytes, sizeBytes, sha256 };
     });
     if (!seen.has("SKILL.md")) throw new Error("Skill package is missing SKILL.md");
     const packageRevision = createHash("sha256");
     for (const file of [...normalizedFiles].sort((left, right) => left.path.localeCompare(right.path))) {
-      packageRevision.update(file.path).update("\0").update(file.bytes).update("\0");
+      packageRevision.update(file.path).update("\0").update(String(file.sizeBytes)).update("\0").update(file.sha256).update("\0");
     }
-    const totalBytes = normalizedFiles.reduce((total, file) => total + file.bytes.byteLength, 0);
-    if (totalBytes > 5 * 1024 * 1024) throw new Error("Skill packages are limited to 5 MB extracted");
+    const totalBytes = normalizedFiles.reduce((total, file) => total + file.sizeBytes, 0);
+    if (totalBytes > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES) throw new Error("Skill packages are limited to 100 MB extracted");
     // Reused sandboxes can retain prior files. A content-addressed directory makes
     // package revisions immutable, so resources removed by an update cannot leak
     // into a later activation of the same skill.
-    const root = `${workspaceRoot}/.berry/runtime-skills/${safeId}-${packageRevision.digest("hex").slice(0, 16)}`;
-    for (const file of normalizedFiles) {
-      await this.provider.files.write({
-        sandbox_id: sandbox.id,
-        path: `${root}/${file.path}`,
-        content: file.contentBase64,
-        encoding: "base64",
-        mode: file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644),
-      });
+    const revision = packageRevision.digest("hex");
+    const root = `${workspaceRoot}/runtime-skills/${safeId}-${revision.slice(0, 16)}`;
+    const readyPath = `${root}/.berry-package-ready`;
+    const ready = await this.provider.files.read({ sandbox_id: sandbox.id, path: readyPath, encoding: "utf8" }).catch(() => null);
+    if (ready?.content.trim() === revision) {
+      return {
+        filePath: `${root}/SKILL.md`,
+        resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
+      };
     }
+    for (const file of normalizedFiles) {
+      const bytes = file.bytes ?? await loadSkillPackageBytes(file);
+      if (bytes.byteLength !== file.sizeBytes || createHash("sha256").update(bytes).digest("hex") !== file.sha256) {
+        throw new Error(`Skill package file changed while it was being staged: ${file.path}`);
+      }
+      const path = `${root}/${file.path}`;
+      const mode = file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644);
+      if (this.provider.files.writeBytes) {
+        await this.provider.files.writeBytes({ sandbox_id: sandbox.id, path, content: bytes, mode });
+      } else {
+        await this.provider.files.write({ sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64", mode });
+      }
+    }
+    await this.provider.files.write({ sandbox_id: sandbox.id, path: readyPath, content: revision, encoding: "utf8", mode: 0o444 });
     return {
       filePath: `${root}/SKILL.md`,
       resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
@@ -977,21 +1006,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
       const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
       const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
-      const directoryOutput: string[] = [];
-      for await (const event of this.provider.exec({
-        sandbox_id: sandboxId,
-        request_id: `${snapshot.id}:stage:${file.fileId}`,
-        command: ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))],
-        cwd: workspaceRoot,
-        timeout_ms: 30_000,
-      })) {
-        if (event.kind === "stdout" || event.kind === "stderr") directoryOutput.push(event.data);
-        if (event.kind === "error") throw new Error(event.message);
-        if (event.kind === "exit" && event.exit_code !== 0) {
-          const detail = directoryOutput.join("").trim().slice(-2_000);
-          throw new Error(`Unable to prepare the sandbox directory for ${file.name}${detail ? `: ${detail}` : ""}`);
-        }
-      }
+      await this.prepareSandboxDirectory(snapshot.id, sandboxId, path, file.name, workspaceRoot);
       await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name);
       const source = this.objects.streamSource
         ? this.objects.streamSource(file.objectKey, maxInputBytes, file.objectVersionId)
@@ -1028,6 +1043,42 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (event.kind === "exit" && event.exit_code !== 0) {
         throw new Error(`Unable to initialize the sandbox file for ${name}`);
       }
+    }
+  }
+
+  private async prepareSandboxDirectory(
+    runId: string,
+    sandboxId: string,
+    path: string,
+    name: string,
+    cwd?: string,
+  ): Promise<void> {
+    const directoryOutput: string[] = [];
+    for await (const event of this.provider.exec({
+      sandbox_id: sandboxId,
+      request_id: `${runId}:stage:mkdir:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
+      command: ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))],
+      ...(cwd ? { cwd } : {}),
+      timeout_ms: 30_000,
+    })) {
+      if (event.kind === "stdout" || event.kind === "stderr") directoryOutput.push(event.data);
+      if (event.kind === "error") throw new Error(event.message);
+      if (event.kind === "exit" && event.exit_code !== 0) {
+        const detail = directoryOutput.join("").trim().slice(-2_000);
+        throw new Error(`Unable to prepare the sandbox directory for ${name}${detail ? `: ${detail}` : ""}`);
+      }
+    }
+  }
+
+  private async setSandboxFileMode(runId: string, sandboxId: string, path: string, name: string, mode: number): Promise<void> {
+    for await (const event of this.provider.exec({
+      sandbox_id: sandboxId,
+      request_id: `${runId}:stage:chmod:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
+      command: ["chmod", mode.toString(8), "--", path],
+      timeout_ms: 30_000,
+    })) {
+      if (event.kind === "error") throw new Error(event.message);
+      if (event.kind === "exit" && event.exit_code !== 0) throw new Error(`Unable to set permissions for ${name}`);
     }
   }
 
@@ -1871,8 +1922,8 @@ function validateFileToolArguments(toolName: string, args: Record<string, unknow
   }
   if (toolName === "edit_file") {
     requiredToolPath(args, toolName);
-    requiredToolString(args, "old_string", toolName);
-    requiredToolString(args, "new_string", toolName, true);
+    boundedEditFileContent(requiredToolString(args, "old_string", toolName), "old_string");
+    boundedEditFileContent(requiredToolString(args, "new_string", toolName, true), "new_string");
   }
 }
 
@@ -1909,6 +1960,33 @@ function boundedFileToolContent(content: string, toolName: string): void {
   throw new Error(
     `${toolName} content is ${content.length} characters; retry append_file with one chunk at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters while repeating the exact path and the unchanged preceding sizeBytes.`,
   );
+}
+
+function boundedEditFileContent(content: string, field: "old_string" | "new_string"): void {
+  if (content.length <= DURABLE_FILE_TOOL_MAX_CONTENT_CHARS) return;
+  throw new Error(
+    `edit_file ${field} is ${content.length} characters; use apply_patch or several smaller exact replacements, and repeat the exact non-empty path on every edit_file call. Each old_string and new_string must be at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters.`,
+  );
+}
+
+function immediateSkillPackageBytes(file: DurableSkillPackageFile): Buffer | null {
+  if (file.contentBytes !== undefined) {
+    return Buffer.isBuffer(file.contentBytes)
+      ? file.contentBytes
+      : Buffer.from(file.contentBytes.buffer, file.contentBytes.byteOffset, file.contentBytes.byteLength);
+  }
+  if (file.contentBase64 !== undefined) return Buffer.from(file.contentBase64, "base64");
+  return null;
+}
+
+async function loadSkillPackageBytes(file: DurableSkillPackageFile): Promise<Buffer> {
+  const immediate = immediateSkillPackageBytes(file);
+  if (immediate) return immediate;
+  if (!file.loadContentBytes) throw new Error(`Skill package file has no content: ${file.path}`);
+  const loaded = await file.loadContentBytes();
+  return Buffer.isBuffer(loaded)
+    ? loaded
+    : Buffer.from(loaded.buffer, loaded.byteOffset, loaded.byteLength);
 }
 
 function safeWorkspacePath(value: string, workspaceRoot = "/workspace"): string {

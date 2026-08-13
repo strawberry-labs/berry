@@ -433,6 +433,29 @@ describe("router client", () => {
     expect(chunks[0]?.toolCalls?.[0]).toMatchObject({ id: "call_partial", function: { name: "list_dir" } });
   });
 
+  it("classifies in-band invalid-request stream errors as permanent even when a specific code is also present", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "text/event-stream", "x-request-id": "brq_invalid_stream" });
+      response.end('data: {"error":{"message":"tool choice is unsupported","type":"invalid_request_error","code":"unsupported_tool_choice"}}\n\ndata: [DONE]\n\n');
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "m", kind: "berry-router", name: "Berry Router" },
+      apiKey: "key",
+    });
+    const consume = async () => {
+      for await (const _chunk of client.stream({ messages: [{ role: "user", content: "hi" }] })) {
+        // Consume the stream so the in-band error is observed.
+      }
+    };
+
+    await expect(consume()).rejects.toMatchObject({
+      name: "RouterClientError",
+      status: 400,
+      code: "unsupported_tool_choice",
+      requestId: "brq_invalid_stream",
+    });
+  });
+
   it("surfaces sanitized provider code and request id on HTTP failures", async () => {
     const baseUrl = await withServer((_request, response) => {
       response.writeHead(400, {

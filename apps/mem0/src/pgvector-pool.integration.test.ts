@@ -29,6 +29,8 @@ integration("Mem0 PGVector pooled-client integration", () => {
       max: 8,
       connectionTimeoutMillis: 5_000,
       idleTimeoutMillis: 30_000,
+      queryTimeoutMillis: 5_000,
+      statementTimeoutMillis: 5_000,
       onIdleError: ({ code }) => idleErrors.push(code),
     });
     const collectionName = `berry_mem0_pool_${randomUUID().replaceAll("-", "")}`;
@@ -65,6 +67,15 @@ integration("Mem0 PGVector pooled-client integration", () => {
       const interruptedResult = await interrupted;
       expect(interruptedResult.ok).toBe(false);
       expect(postgresCode(interruptedResult.error)).toMatch(/^(57P01|ECONNRESET)$/);
+
+      const timeoutStartedAt = Date.now();
+      const timedOut = await vectorStore.client.query("SELECT pg_sleep(30)").then(
+        () => ({ ok: true as const, error: null }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      expect(timedOut.ok).toBe(false);
+      expect(Date.now() - timeoutStartedAt).toBeLessThan(7_000);
+      expect(postgresCode(timedOut.error) === "57014" || /timeout/i.test(errorMessage(timedOut.error))).toBe(true);
 
       const searches = await Promise.all(Array.from({ length: 50 }, () =>
         vectorStore!.search([1, 0, 0], 5, { user_id: "berry-pool-integration" }),
@@ -113,4 +124,8 @@ function postgresCode(error: unknown): string {
   if (!error || typeof error !== "object") return "UNKNOWN";
   const code = (error as { code?: unknown }).code;
   return typeof code === "string" ? code : "UNKNOWN";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

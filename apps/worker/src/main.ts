@@ -215,12 +215,16 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       }));
     }
   }
-  const outbox = processConfig.role === "foreground"
+  // Dispatching is safe to replicate: PostgreSQL row locks, durable delivery
+  // receipts, and deterministic BullMQ job IDs prevent duplicate delivery.
+  // Every worker pool participates so a background-worker outage cannot leave
+  // foreground capacity idle with turns stranded in the runtime outbox.
+  const outbox = env.BERRY_OUTBOX_DISPATCH_ENABLED?.trim().toLowerCase() === "false"
     ? null
     : new RuntimeOutboxDispatcher(executor, queue, {
         ...(env.BERRY_TENANT_ID ? { tenantId: env.BERRY_TENANT_ID } : {}),
         workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
-        pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 100,
+        pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 250,
       });
   await Promise.all([
     executor.query("SELECT 1"),

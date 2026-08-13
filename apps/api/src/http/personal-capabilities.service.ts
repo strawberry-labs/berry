@@ -13,13 +13,13 @@ import {
   type PersonalSkillPackage,
   type PersonalSkillReview,
   type SkillPackageFile,
+  PERSONAL_SKILL_PACKAGE_MAX_BYTES,
 } from "@berry/shared";
 import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import { parseAgentSkillMarkdown } from "./agent-skill-content.ts";
 
 export const PERSONAL_CAPABILITIES = Symbol("PERSONAL_CAPABILITIES");
 const MAX_SKILL_BYTES = 262_144;
-const MAX_PACKAGE_BYTES = 5 * 1024 * 1024;
 const MAX_PACKAGE_FILES = 500;
 type SkillFileMetadata = { path: string; sizeBytes: number };
 
@@ -76,7 +76,7 @@ export class PersonalCapabilitiesService {
     return [...this.#skills.values()].filter((item) => owns(item, tenantId, userId));
   }
 
-  async previewSkill(input: PersonalSkillInput): Promise<{ review: PersonalSkillReview; content: string; resourceFiles: SkillPackageFile[] }> {
+  async previewSkill(input: PersonalSkillInput, options: { maxPackageBytes?: number } = {}): Promise<{ review: PersonalSkillReview; content: string; resourceFiles: SkillPackageFile[] }> {
     const source = input.source ?? "text";
     const content = source === "git" ? await fetchApprovedSkill(input.sourceUrl) : input.content ?? "";
     validateSkillContent(content);
@@ -90,7 +90,8 @@ export class PersonalCapabilitiesService {
       throw new BadRequestException(`Skill package file content is missing for: ${missingResources.slice(0, 5).join(", ")}`);
     }
     const packageBytes = Buffer.byteLength(content) + resourceFiles.reduce((total, file) => total + Buffer.from(file.contentBase64, "base64").byteLength, 0);
-    if (packageBytes > MAX_PACKAGE_BYTES) throw new BadRequestException("Skill packages are limited to 5 MB extracted");
+    const maxPackageBytes = options.maxPackageBytes ?? PERSONAL_SKILL_PACKAGE_MAX_BYTES;
+    if (packageBytes > maxPackageBytes) throw new BadRequestException(`Skill packages are limited to ${Math.floor(maxPackageBytes / (1024 * 1024))} MB extracted`);
     const warnings = [/ignore (all|previous) instructions/i, /curl\s+.*\|\s*(sh|bash)/i].filter((pattern) => pattern.test(content)).map(() => "Skill contains instructions that should be inspected before use.");
     if (packageFiles.some((path) => path.startsWith("scripts/"))) warnings.push("This skill package includes executable scripts. Inspect them before use.");
     return { content, resourceFiles, review: { ...metadata, source, hash: hashSkillPackage(content, resourceFiles), bytes: packageBytes, warnings, resources: resourceFiles.map((file) => file.path), hasScripts: resourceFiles.some((file) => file.path.startsWith("scripts/")) } };
@@ -243,10 +244,25 @@ export class PersonalCapabilitiesService {
       await db.execute(`INSERT INTO personal_skills (id, tenant_id, user_id, name, description, content, enabled, trusted, source, source_url, version, hash, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::timestamptz,$15::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,content=EXCLUDED.content,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,source=EXCLUDED.source,source_url=EXCLUDED.source_url,version=EXCLUDED.version,hash=EXCLUDED.hash,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [skill.id,skill.tenantId,skill.userId,skill.name,skill.description,skill.content,skill.enabled,skill.trusted,skill.source,skill.sourceUrl,skill.version,skill.hash,JSON.stringify(skill.diagnostics),skill.createdAt,skill.updatedAt]);
       if (!files) return;
       await db.execute("DELETE FROM personal_skill_files WHERE skill_id=$1", [skill.id]);
-      for (const file of files) {
+      if (files.length === 0) return;
+      const stored = files.map((file) => {
         const content = Buffer.from(file.contentBase64, "base64");
-        await db.execute("INSERT INTO personal_skill_files (tenant_id,skill_id,path,content,size_bytes,sha256,mode) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7)", [skill.tenantId, skill.id, file.path, content, content.byteLength, sha256(content), file.mode ?? defaultSkillFileMode(file.path)]);
-      }
+        return { file, content, digest: sha256(content) };
+      });
+      await db.execute(
+        `INSERT INTO personal_skill_files (tenant_id,skill_id,path,content,size_bytes,sha256,mode)
+         SELECT $1::uuid,$2,resources.path,resources.content,resources.size_bytes,resources.sha256,resources.mode
+         FROM unnest($3::text[],$4::bytea[],$5::bigint[],$6::text[],$7::int[]) AS resources(path,content,size_bytes,sha256,mode)`,
+        [
+          skill.tenantId,
+          skill.id,
+          stored.map(({ file }) => file.path),
+          stored.map(({ content }) => content),
+          stored.map(({ content }) => content.byteLength),
+          stored.map(({ digest }) => digest),
+          stored.map(({ file }) => file.mode ?? defaultSkillFileMode(file.path)),
+        ],
+      );
     });
   }
   async #persistMcp(server: PersonalMcpServer) { if (!this.database) return; const envelope = server.credentialRef ? this.#secretEnvelopes.get(server.credentialRef) : undefined; await this.database.withTenant(server.tenantId, (db) => db.execute(`INSERT INTO personal_mcp_servers (id, tenant_id, user_id, name, url, transport, auth, credential_ref, credential_envelope, enabled, trusted, health, tool_count, last_checked_at, diagnostics, created_at, updated_at) VALUES ($1,$2::uuid,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14::timestamptz,$15::jsonb,$16::timestamptz,$17::timestamptz) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,transport=EXCLUDED.transport,auth=EXCLUDED.auth,credential_ref=EXCLUDED.credential_ref,credential_envelope=EXCLUDED.credential_envelope,enabled=EXCLUDED.enabled,trusted=EXCLUDED.trusted,health=EXCLUDED.health,tool_count=EXCLUDED.tool_count,last_checked_at=EXCLUDED.last_checked_at,diagnostics=EXCLUDED.diagnostics,updated_at=EXCLUDED.updated_at`, [server.id,server.tenantId,server.userId,server.name,server.url,server.transport,server.auth,server.credentialRef,envelope ? JSON.stringify(envelope) : null,server.enabled,server.trusted,server.health,server.toolCount,server.lastCheckedAt,JSON.stringify(server.diagnostics),server.createdAt,server.updatedAt])); }

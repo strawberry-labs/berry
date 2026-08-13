@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "backfill:skill-packages": "node dist/backfill-skill-packages.js",
+    "sync:organization-skills": "node dist/sync-organization-skill-packages.js",
     "verify:skill-package-migrations": "tsx scripts/verify-skill-package-migrations.mjs",
     "start": "node dist/main.js",
     "lint": "tsc -p tsconfig.json --noEmit",
@@ -29,16 +30,19 @@
     "@nestjs/platform-express": "11.1.28",
     "better-auth": "1.6.23",
     "ioredis": "^5.8.2",
+    "jszip": "3.10.1",
     "pg": "8.16.3",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
     "yaml": "2.9.0",
+    "yauzl": "3.4.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@nestjs/testing": "11.1.28",
     "@types/pg": "8.15.6",
     "@types/supertest": "7.2.0",
+    "@types/yauzl": "3.4.0",
     "supertest": "7.2.2",
     "typescript": "^5.8.3",
     "vitest": "^4.1.9"

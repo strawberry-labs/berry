@@ -92,6 +92,7 @@
   --berry-hover: #0000000a;
   --berry-selected: #00000014;
   --berry-border: #00000014;
+  --berry-border-subtle: color-mix(in srgb, var(--berry-border) 60%, transparent);
   --berry-border-hover: #00000022;
   --berry-command-bg: #e3e3e3;
   --berry-command-hover: #d9d9d9;

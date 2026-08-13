@@ -123,8 +123,9 @@ Use these conventions when relevant:
 - User and connector inputs are staged under `/workspace/inputs`.
 - Work-in-progress files belong under `/workspace/tmp/<skill-name>`.
 - Final user deliverables belong under `/workspace/outputs`.
-- Organization-managed skill resources are read-only under
-  `/managed-skills/<skill-name>`.
+- Organization and personal skill packages are staged when activated. Use the
+  exact skill directory returned by `activate_skill` and resolve relative
+  resources inside it.
 - Use `activate_skill` before relying on another matching skill's full
   instructions.
 - Use `persist_artifact` for final sandbox files when the runtime has not
@@ -158,7 +159,7 @@ Before saving, verify:
 - `description` clearly says what the skill does and when it should run;
 - instructions are Berry-specific and contain no Claude references;
 - referenced tools and skills exist in Berry or are described conditionally;
-- referenced sandbox paths use `/workspace` or `/managed-skills` correctly;
+- referenced sandbox paths use `/workspace` or the activated skill directory correctly;
 - no secrets or private session data appear in the content;
 - every relative file reference resolves inside the completed package;
 - reusable task attachments have been copied into stable `assets/` paths;

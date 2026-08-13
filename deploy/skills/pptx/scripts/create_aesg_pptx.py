@@ -65,14 +65,6 @@ LAYOUTS = {
 }
 
 
-def skill_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def default_template() -> Path:
-    return skill_root() / "aesg-branding/assets/templates/AESG_General_Presentation.pptx"
-
-
 def shape_by_id(container, shape_id: int):
     for shape in container.shapes:
         if shape.shape_id == shape_id:
@@ -373,18 +365,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--template", type=Path, default=default_template())
+    parser.add_argument("--template", type=Path)
+    parser.add_argument("--branding-skill-dir", required=True, type=Path)
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".pptx":
         raise ValueError("--output must end in .pptx")
-    if not args.template.is_file():
-        raise FileNotFoundError(args.template)
+    template = args.template or args.branding_skill_dir / "assets/templates/AESG_General_Presentation.pptx"
+    if not template.is_file():
+        raise FileNotFoundError(template)
     spec = json.loads(args.spec.read_text(encoding="utf-8"))
     slide_specs = spec.get("slides") or [{"layout": "cover", "title": spec.get("title", "AESG")}]
     if not isinstance(slide_specs, list):
         raise ValueError("spec.slides must be a list")
 
-    presentation = Presentation(args.template)
+    presentation = Presentation(template)
     originals = list(presentation.slides)
     for slide_spec in slide_specs:
         layout = str(slide_spec.get("layout", "text")).casefold()
@@ -410,7 +404,7 @@ def main() -> int:
                 "slides": len(presentation.slides),
                 "masters": len(presentation.slide_masters),
                 "nativeSizeEmu": [presentation.slide_width, presentation.slide_height],
-                "template": args.template.name,
+        "template": template.name,
             }
         )
     )

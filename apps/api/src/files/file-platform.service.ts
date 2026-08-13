@@ -17,6 +17,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createHash, randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { once } from "node:events";
+import { open as openFile, rm } from "node:fs/promises";
 import {
   ORGANIZATION_FAVICON_MAX_BYTES,
   ORGANIZATION_FAVICON_MEDIA_TYPES,
@@ -199,6 +200,47 @@ export class FilePlatformService {
 
   async get(tenantId: string, userId: string, fileId: string): Promise<FileRow> {
     return this.database.withTenant(tenantId, async (executor) => this.requireAccessibleFile(executor, tenantId, userId, fileId));
+  }
+
+  async downloadContentToFile(
+    tenantId: string,
+    userId: string,
+    fileId: string,
+    maxBytes: number,
+    destination: string,
+  ): Promise<{ name: string; mediaType: string; sizeBytes: number }> {
+    const config = this.requireConfig();
+    const file = await this.get(tenantId, userId, fileId);
+    if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
+    const declaredBytes = Number(file.size_bytes);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0 || declaredBytes > maxBytes) {
+      throw new BadRequestException(`File exceeds the ${maxBytes} byte limit`);
+    }
+    const object = await config.client.send(new GetObjectCommand({
+      Bucket: file.bucket,
+      Key: file.object_key,
+      ...(file.object_version_id ? { VersionId: file.object_version_id } : {}),
+    }));
+    if (!object.Body) throw new NotFoundException("File content is unavailable");
+    const output = await openFile(destination, "wx", 0o600);
+    let written = 0;
+    try {
+      for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
+        written += chunk.byteLength;
+        if (written > declaredBytes || written > maxBytes) throw new BadRequestException(`File exceeds the ${maxBytes} byte limit`);
+        await output.write(chunk);
+      }
+    } catch (cause) {
+      await output.close().catch(() => undefined);
+      await rm(destination, { force: true }).catch(() => undefined);
+      throw cause;
+    }
+    await output.close();
+    if (written !== declaredBytes) {
+      await rm(destination, { force: true }).catch(() => undefined);
+      throw new BadRequestException("Stored file size does not match its upload record");
+    }
+    return { name: file.display_name, mediaType: file.detected_media_type ?? file.media_type, sizeBytes: written };
   }
 
   async describe(tenantId: string, userId: string, fileId: string) {

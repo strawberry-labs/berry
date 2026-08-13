@@ -29,7 +29,7 @@ import {
   type SandboxFileWriteResult,
   type SandboxHandle,
 } from "./schemas.js";
-import type { SandboxFileApi, SandboxProvider } from "./provider.js";
+import type { SandboxFileApi, SandboxFileWriteBytesInput, SandboxProvider } from "./provider.js";
 
 export interface DockerCommandResult {
   stdout: string;
@@ -64,6 +64,7 @@ export class DockerSandboxProvider implements SandboxProvider {
   readonly files: SandboxFileApi = {
     read: async (input) => this.readFile(input),
     write: async (input) => this.writeFile(input),
+    writeBytes: async (input) => this.writeFileBytes(input),
     list: async (input) => this.listFiles(input),
   };
 
@@ -222,6 +223,30 @@ export class DockerSandboxProvider implements SandboxProvider {
     return SandboxFileWriteResultSchema.parse({
       path: parsed.path,
       size_bytes: Buffer.byteLength(content),
+      mtime: this.#now().toISOString(),
+    });
+  }
+
+  async writeFileBytes(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult> {
+    const { content: _content, encoding: _encoding, ...parsed } = SandboxFileWriteInputSchema.parse({
+      ...input,
+      content: "",
+      encoding: "base64",
+    });
+    const content = Buffer.isBuffer(input.content)
+      ? input.content
+      : Buffer.from(input.content.buffer, input.content.byteOffset, input.content.byteLength);
+    const result = await this.#executor.run([
+      "exec", "-i", this.#containerName(parsed.sandbox_id), "sh", "-lc",
+      "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "berry-write", parsed.path,
+    ], { stdin: content });
+    assertDockerOk(result, "write sandbox file");
+    if (parsed.mode !== undefined) {
+      assertDockerOk(await this.#executor.run(["exec", this.#containerName(parsed.sandbox_id), "chmod", parsed.mode.toString(8), "--", parsed.path]), "set sandbox file mode");
+    }
+    return SandboxFileWriteResultSchema.parse({
+      path: parsed.path,
+      size_bytes: content.byteLength,
       mtime: this.#now().toISOString(),
     });
   }

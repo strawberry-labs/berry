@@ -78,6 +78,7 @@ import {
   PersonalSkillSchema,
   PersonalSkillPackageSchema,
   PersonalSkillReviewSchema,
+  SkillPackageFileSchema,
   PersonalMcpServerSchema,
   McpOAuthFlowSchema,
   OrgCapabilitySchema,
@@ -620,7 +621,10 @@ export class BerryApiClient {
   async listOrganizationCapabilities(tenantId: string): Promise<OrgCapability[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, z.array(OrgCapabilitySchema)); }
   async upsertOrganizationCapability(tenantId: string, input: { kind: "skill" | "mcp"; capabilityId: string; name: string; description?: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean; contentHash?: string | null; config?: Record<string, unknown>; resourceFiles?: SkillPackageFile[] }): Promise<OrgCapability> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, OrgCapabilitySchema, { method: "POST", body: input }); }
   async reviewOrganizationSkill(tenantId: string, input: { content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; packageFiles?: string[]; resourceFiles?: SkillPackageFile[] }): Promise<PersonalSkillReview> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/review`, PersonalSkillReviewSchema, { method: "POST", body: input }); }
+  async reviewOrganizationSkillArchive(tenantId: string, fileId: string): Promise<PersonalSkillReview> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/packages/review`, PersonalSkillReviewSchema, { method: "POST", body: { fileId } }); }
+  async installOrganizationSkillArchive(tenantId: string, input: { fileId: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean }): Promise<OrgCapability> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/packages`, OrgCapabilitySchema, { method: "POST", body: input }); }
   async organizationSkillPackage(tenantId: string, id: string): Promise<PersonalSkillPackage> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/${encodeURIComponent(id)}/package`, PersonalSkillPackageSchema); }
+  async organizationSkillPackageFile(tenantId: string, id: string, path: string): Promise<SkillPackageFile> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/${encodeURIComponent(id)}/package/file?path=${encodeURIComponent(path)}`, SkillPackageFileSchema); }
   async deleteOrganizationCapability(tenantId: string, id: string): Promise<{ ok: boolean }> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/${encodeURIComponent(id)}`, z.object({ ok: z.boolean() }), { method: "DELETE" }); }
   async effectiveCapabilities(tenantId: string): Promise<EffectiveCapability[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/effective/me`, z.array(EffectiveCapabilitySchema)); }
   async setCapabilityOverride(tenantId: string, kind: "skill" | "mcp", capabilityId: string, enabled: boolean): Promise<unknown> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/effective/me/${kind}/${encodeURIComponent(capabilityId)}`, z.unknown(), { method: "PATCH", body: { enabled } }); }

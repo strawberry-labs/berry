@@ -327,7 +327,11 @@ export interface TurnToolResult {
 
 export interface DurableSkillPackageFile {
   path: string;
-  contentBase64: string;
+  contentBase64?: string;
+  contentBytes?: Uint8Array;
+  loadContentBytes?: () => Promise<Uint8Array>;
+  sizeBytes?: number;
+  sha256?: string;
   mode?: number;
 }
 
@@ -3443,6 +3447,7 @@ export const DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT = [
   "DeepSeek V4 Flash file-tool compatibility guard:",
   `keep write_file and append_file content at or below ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters,`,
   "and treat every file call as stateless by including the exact non-empty absolute path again.",
+  "edit_file is intentionally unavailable for this model because large multi-field edit calls can lose their path. Use apply_patch for targeted edits, or make bounded write_file/append_file calls when replacing a complete file.",
   'For append_file, always send all three fields, for example: {"path":"/home/user/workspace/output/report.html","content":"next chunk","expected_size_bytes":8421}.',
   "Replace 8421 with the exact sizeBytes from the preceding write_file or append_file result; a prior path or size is never carried forward implicitly.",
 ].join(" ");
@@ -3451,10 +3456,14 @@ export function durableProviderCompatibilityPrompt(
   model: string | null | undefined,
   toolNames: readonly string[],
 ): string {
-  if (!model || !/deepseek.*v4[-_.]?flash/i.test(model)) return "";
+  if (!isDeepSeekV4FlashModel(model)) return "";
   return toolNames.some((name) => ["read_file", "list_files", "write_file", "append_file", "edit_file"].includes(name))
     ? DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT
     : "";
+}
+
+function isDeepSeekV4FlashModel(model: string | null | undefined): boolean {
+  return typeof model === "string" && /deepseek.*v4[-_.]?flash/i.test(model);
 }
 
 function modelMessages(
@@ -3658,7 +3667,7 @@ function automaticDurableAttachmentSkill(
   ].join("\n"));
 }
 
-function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): ChatToolDefinition[] {
+export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): ChatToolDefinition[] {
   const runtime = durableRuntimeRequest(snapshot);
   const enabled = new Set<DurableBuiltInToolName>(
     runtime?.builtInTools
@@ -3670,7 +3679,9 @@ function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): ChatToolD
   const definitionsByName = new Map(
     DURABLE_TOOL_DEFINITIONS.map((definition) => [definition.function.name, definition]),
   );
+  const model = runtime?.model ?? runtime?.provider.defaultModel;
   const definitions = [...enabled].flatMap((name) => {
+    if (name === "edit_file" && isDeepSeekV4FlashModel(model)) return [];
     const definition = definitionsByName.get(name);
     return definition ? [definition] : [];
   });
@@ -3837,12 +3848,12 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "read_file",
-      description: "Read text under the exact runtime workspace root shown in the system prompt or the read-only /managed-skills tree. PDFs are converted to extracted text automatically; binary images and office files return safe metadata instead of being decoded as UTF-8.",
+      description: "Read text under the exact runtime workspace root shown in the system prompt, including activated skill-package directories. PDFs are converted to extracted text automatically; binary images and office files return safe metadata instead of being decoded as UTF-8.",
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path"],
-        properties: { path: { type: "string", minLength: 1, description: "Required on every call: the absolute path under the runtime workspace root or /managed-skills" } },
+        properties: { path: { type: "string", minLength: 1, description: "Required on every call: an absolute path under the runtime workspace root" } },
       },
     },
   },
@@ -3850,13 +3861,13 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "list_files",
-      description: "List files under the exact runtime workspace root shown in the system prompt or the read-only /managed-skills tree.",
+      description: "List files under the exact runtime workspace root shown in the system prompt, including activated skill-package directories.",
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path"],
         properties: {
-          path: { type: "string", minLength: 1, description: "Required on every call: the absolute path under the runtime workspace root or /managed-skills" },
+          path: { type: "string", minLength: 1, description: "Required on every call: an absolute path under the runtime workspace root" },
           recursive: { type: "boolean" },
         },
       },
@@ -3899,15 +3910,15 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "edit_file",
-      description: "Replace an exact string in a UTF-8 workspace file. The old string must match exactly.",
+      description: `Replace one bounded exact string in a UTF-8 workspace file. Always include the exact absolute path. old_string and new_string must each be at most ${DURABLE_FILE_TOOL_MAX_CONTENT_CHARS} characters; use apply_patch or several small edits for a larger change.`,
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["path", "old_string", "new_string"],
         properties: {
           path: { type: "string", minLength: 1, description: "Required on every call: the exact absolute workspace path" },
-          old_string: { type: "string" },
-          new_string: { type: "string" },
+          old_string: { type: "string", minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+          new_string: { type: "string", maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
           replace_all: { type: "boolean" },
         },
       },

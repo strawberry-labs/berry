@@ -26,9 +26,22 @@ export class SandboxPausedError extends Error {
   }
 }
 
+export interface SandboxFileWriteBytesInput {
+  sandbox_id: string;
+  path: string;
+  content: Uint8Array;
+  mode?: number;
+}
+
 export interface SandboxFileApi {
   read(input: SandboxFileReadInput): Promise<SandboxFileReadResult>;
   write(input: SandboxFileWriteInput): Promise<SandboxFileWriteResult>;
+  /**
+   * Write binary content without first expanding it into a base64 string.
+   * Providers that cannot transport bytes directly may omit this method; callers
+   * must retain the base64 `write` fallback for contract compatibility.
+   */
+  writeBytes?(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult>;
   list(input: SandboxFileListInput): Promise<SandboxFileListResult>;
 }
 

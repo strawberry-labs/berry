@@ -43,6 +43,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     max: config.databasePoolMax,
     connectionTimeoutMillis: config.databaseConnectionTimeoutMs,
     idleTimeoutMillis: config.databaseIdleTimeoutMs,
+    queryTimeoutMillis: config.databaseQueryTimeoutMs,
+    statementTimeoutMillis: config.databaseStatementTimeoutMs,
     onIdleError: ({ code, message }) => {
       runtimeMetrics.postgresPoolFailed(code);
       console.error(`Berry Mem0: ${message}; the pool discarded the connection`);
@@ -404,6 +406,16 @@ function configFromEnv(env: NodeJS.ProcessEnv) {
       env.BERRY_MEM0_DATABASE_IDLE_TIMEOUT_MS ?? null,
       30_000,
       600_000,
+    ),
+    databaseQueryTimeoutMs: boundedInteger(
+      env.BERRY_MEM0_DATABASE_QUERY_TIMEOUT_MS ?? null,
+      5_000,
+      60_000,
+    ),
+    databaseStatementTimeoutMs: boundedInteger(
+      env.BERRY_MEM0_DATABASE_STATEMENT_TIMEOUT_MS ?? null,
+      5_000,
+      60_000,
     ),
     llmBaseUrl: env.BERRY_MEM0_LLM_BASE_URL?.trim()
       || env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim()

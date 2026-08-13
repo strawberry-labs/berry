@@ -12,7 +12,7 @@ PPTX, and CV generation in Berry.
 
 ## 1. What the system contains
 
-Berry uses six managed skills:
+Berry uses seven organization skill packages:
 
 | Skill | Responsibility |
 |---|---|
@@ -22,6 +22,7 @@ Berry uses six managed skills:
 | `xlsx` | Sanitized branded workbook generation |
 | `pptx` | Template-preserving slide generation |
 | `cv-creator` | AESG V3 portrait and landscape CV generation from structured data or source PDFs |
+| `skill-creator` | Create and install complete personal skill packages |
 
 The committed implementation is:
 
@@ -73,8 +74,8 @@ deploy/
 There are four layers to keep aligned:
 
 1. Committed skill instructions, generators, references, and sanitized assets.
-2. The versioned E2B image containing those files and all dependencies.
-3. The six `organization_capabilities` records for the AESG tenant.
+2. The `organization_capabilities` and `organization_skill_files` rows containing each complete package.
+3. The versioned E2B image containing generic dependencies and licensed fonts, but no skill files.
 4. `BERRY_E2B_TEMPLATE_ID` in `deploy/.env.production`.
 
 Updating only one layer can leave new tasks using stale instructions or code.
@@ -99,13 +100,13 @@ Updating only one layer can leave new tasks using stale instructions or code.
 
 ### Sandbox paths
 
-- Use `/managed-skills` in agent shell commands.
+- Use the exact skill directory returned by `activate_skill` in agent shell commands.
 - Never place `/.berry` in a shell command. Berry treats it as a protected
   configuration path and rejects the command.
 - Use `/workspace/tmp/<format>` for specifications, conversions, and previews.
 - Put only final deliverables in `/workspace/outputs`.
 - Do not copy a bundled generator or write a replacement after a path error.
-  Correct the path to `/managed-skills` and rerun the canonical command.
+  Correct the path against the activated package directory and rerun the canonical command.
 
 ### Artifact publication
 
@@ -125,9 +126,10 @@ previews, or extracted images as deliverables.
 
 - Production secrets live only in `deploy/.env.production`.
 - Never commit, print, replace, or copy that file into a build context.
-- Back it up before changing the template ID.
-- Change only `BERRY_E2B_TEMPLATE_ID`.
-- A template-only change requires recreating only the API service.
+- Back it up before changing the template ID for a dependency-image release.
+- Skill instructions, scripts, references, templates, and assets deploy through
+  organization package storage and do not require an E2B image rebuild.
+- Change only `BERRY_E2B_TEMPLATE_ID` when the generic execution image itself changes.
 - Always use a new E2B alias. Never overwrite or reuse the active alias.
 - Keep the previous template ID, Git commit, and database backup for rollback.
 
@@ -323,27 +325,32 @@ The format skills should contain:
 6. The exact publication media type.
 7. A direct instruction not to install dependencies or rewrite the generator.
 
-Use `/managed-skills` in every canonical command.
+Use the activated package directories in every canonical command.
 
 ### Step 6: implement deterministic generators
 
 Keep generator interfaces small:
 
 ```bash
-python /managed-skills/docx/scripts/create_aesg_docx.py \
+python <docx-skill-directory>/scripts/create_aesg_docx.py \
   --spec /workspace/tmp/docx/spec.json \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/report.docx
 
-python /managed-skills/pdf/scripts/create_aesg_pdf.py \
+python <pdf-skill-directory>/scripts/create_aesg_pdf.py \
   --spec /workspace/tmp/pdfs/spec.json \
+  --docx-skill-dir <docx-skill-directory> \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/report.pdf
 
-python /managed-skills/xlsx/scripts/create_aesg_xlsx.py \
+python <xlsx-skill-directory>/scripts/create_aesg_xlsx.py \
   --spec /workspace/tmp/xlsx/spec.json \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/register.xlsx
 
-python /managed-skills/pptx/scripts/create_aesg_pptx.py \
+python <pptx-skill-directory>/scripts/create_aesg_pptx.py \
   --spec /workspace/tmp/pptx/spec.json \
+  --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/deck.pptx
 ```
 
@@ -381,11 +388,11 @@ broken charts, tiny text, or misplaced template artwork.
 - Python and the pinned packages in `requirements.lock`;
 - Node.js;
 - Noto, Ubuntu, and licensed Verdana fonts;
-- the six skill directories.
+- an empty `/workspace/runtime-skills` staging directory.
 
 Important runtime details:
 
-- `/managed-skills` points to `/opt/aesg/skills`.
+- `activate_skill` stages the selected database package under `/workspace/runtime-skills`.
 - `/workspace/output` points to `/workspace/outputs`.
 - `python` and `python3` use launcher wrappers that execute the pinned virtual
   environment. A plain symlink can resolve back to system Python and lose the
@@ -424,9 +431,11 @@ done
 Compile the Python scripts, generate all four formats, run the shared
 validator, render each output, and visually inspect the results.
 
-The E2B smoke test should launch a fresh sandbox and generate all four
-artifacts. It must also confirm that `/workspace/outputs` contains only the
-four final files.
+The E2B smoke test stages the same seven package directories that are synced to
+the database into a fresh sandbox, generates and validates all eight expected
+artifact outputs, then verifies fonts, generic dependencies, and input
+streaming. It must pass before either package rows or a new template ID are
+activated.
 
 ## 4. Build and deploy to AESG production
 
@@ -451,6 +460,9 @@ ssh root@aesg-v2.berry.me \
 ```
 
 Do not deploy an uncommitted local working tree.
+
+Steps 2–6 are required only when generic runtime dependencies or licensed
+fonts changed. For a skill-only release, deploy the code and continue at Step 7.
 
 ### Step 2: supply the licensed fonts
 
@@ -482,7 +494,7 @@ If the server does not have Node.js, use the repository-mounted
 `node:20-bookworm-slim` container as shown in
 `deploy/e2b-aesg/README.md`.
 
-The output must contain only the expected skill, dependency, and font roots.
+The output must contain only the expected dependency and font roots.
 No environment file may appear.
 
 ### Step 4: build a new E2B image
@@ -509,10 +521,37 @@ E2B_TEMPLATE_ID=<new-template-id> \
 ./node_modules/.bin/tsx smoke.ts
 ```
 
-Do not activate an image that cannot generate and validate all four formats
-inside a fresh sandbox.
+Do not activate an image that fails dependency, font, input-streaming, or
+dynamic-package-staging checks in a fresh sandbox.
 
-### Step 6: activate the template
+### Step 6: sync and verify the seven organization skill packages
+
+Sync the database packages while the previous E2B template is still active:
+
+```bash
+cd /opt/berry
+sh deploy/e2b-aesg/sync-skills.sh
+```
+
+The script:
+
+1. Dumps `organization_capabilities` and `organization_skill_files` to a timestamped backup.
+2. Stores `SKILL.md` plus every script, reference, asset, template, and nested file for all seven skills under tenant
+   `00000000-0000-7000-8000-000000000001`.
+3. Preserves the current assignment and user-disable policy when a skill already exists.
+4. Prints each resulting SHA-256 hash and resource-file count.
+
+Do not switch the template until all seven rows, hashes, resource counts, and
+byte counts match the smoke-tested package directories. This ordering keeps
+the old runtime available if synchronization fails.
+
+The database backup is written under:
+
+```text
+/opt/berry/backups/organization-skills/
+```
+
+### Step 7: activate the template and recreate every consumer
 
 Back up the production environment file:
 
@@ -528,38 +567,24 @@ Replace only:
 BERRY_E2B_TEMPLATE_ID=<new-template-id>
 ```
 
-Recreate only the API:
+Recreate the API and every foreground worker that consumes
+`BERRY_E2B_TEMPLATE_ID`. Preserve the configured foreground replica count:
 
 ```bash
 cd /opt/berry
+foreground_replicas="$(sed -n 's/^BERRY_WORKER_FOREGROUND_REPLICAS=//p' deploy/.env.production | tail -1)"
+: "${foreground_replicas:=5}"
 docker compose \
   --env-file deploy/.env.production \
-  -f deploy/compose.yaml \
-  up -d --no-deps --force-recreate api
+  -f deploy/compose.yaml -f deploy/compose.aws.yaml \
+  up -d --no-deps --force-recreate \
+  --scale worker-foreground="$foreground_replicas" \
+  api worker-foreground
 ```
 
-### Step 7: sync the six organization skills
-
-Run:
-
-```bash
-cd /opt/berry
-sh deploy/e2b-aesg/sync-skills.sh
-```
-
-The script:
-
-1. Dumps `organization_capabilities` to a timestamped backup.
-2. Upserts all six skills for tenant
-   `00000000-0000-7000-8000-000000000001`.
-3. Sets them to `required`.
-4. Prints the resulting SHA-256 hashes.
-
-The database backup is written under:
-
-```text
-/opt/berry/backups/organization-skills/
-```
+Verify the API and all configured foreground replicas report healthy before
+starting production acceptance. A template switch applied only to the API is
+incomplete; existing workers keep the previous environment until recreated.
 
 ### Step 8: production acceptance
 
@@ -587,14 +612,14 @@ Start by identifying the change type:
 
 | Change | Files to inspect | Required deployment |
 |---|---|---|
-| Skill prompt/workflow wording | Format `SKILL.md` and `aesg-branding/SKILL.md` | Commit, new E2B image, template switch, skill sync |
-| Shared skill auto-routing | `packages/harness/src/harness/system-prompt.ts` | Deploy API and worker; rebuild the image and sync skills only when bundled skill content also changed |
-| Brand rule or token | `brand-system.md`, `brand-tokens.json`, affected generators | Revalidate all affected formats, new image, skill sync |
-| DOCX generation | `create_aesg_docx.py`, letterhead template | New image; PDF also needs review because it depends on DOCX |
-| PDF generation | `create_aesg_pdf.py`, DOCX generator, LibreOffice runtime | New image |
-| XLSX generation | `create_aesg_xlsx.py`, workbook style evidence | New image |
-| PPTX layout | `create_aesg_pptx.py`, retained PPTX, shape/layout map | New image |
-| Template or asset | `assets/templates`, `assets/extracted`, manifest hashes | Privacy audit, visual QA, new image |
+| Skill prompt/workflow wording | Format `SKILL.md` and `aesg-branding/SKILL.md` | Commit and sync organization packages |
+| Shared skill auto-routing | `packages/harness/src/harness/system-prompt.ts` | Deploy API and worker; sync packages when skill content also changed |
+| Brand rule or token | `brand-system.md`, `brand-tokens.json`, affected generators | Revalidate affected formats and sync organization packages |
+| DOCX generation | `create_aesg_docx.py`, letterhead template | Sync organization packages; PDF also needs review because it depends on DOCX |
+| PDF generation | `create_aesg_pdf.py`, DOCX generator, LibreOffice runtime | Sync organization packages; rebuild the image only if LibreOffice dependencies changed |
+| XLSX generation | `create_aesg_xlsx.py`, workbook style evidence | Sync organization packages |
+| PPTX layout | `create_aesg_pptx.py`, retained PPTX, shape/layout map | Sync organization packages |
+| Template or asset | `assets/templates`, `assets/extracted`, manifest hashes | Privacy audit, visual QA, and organization-package sync |
 | Python dependency | `requirements.lock`, `template.ts` | Full image rebuild |
 | Node/E2B build dependency | `package.json`, Linux-generated lockfile | Full image rebuild |
 | Artifact MIME/persistence | API/worker artifact code, not only the skill | Deploy the affected service |
@@ -608,8 +633,8 @@ Start by identifying the change type:
 3. Make the smallest change in the authoritative layer.
 4. Update documentation and examples only when behaviour changed.
 5. Update `template-manifest.json` whenever an asset changes.
-6. Rebuild the E2B image whenever a sandbox file or dependency changes.
-7. Sync organization skills whenever a `SKILL.md` changes.
+6. Sync organization packages whenever any package file changes.
+7. Rebuild the E2B image only when generic dependencies, fonts, or runtime setup changes.
 8. Keep the previous commit, template ID, and database backup until the new
    version is accepted.
 
@@ -645,10 +670,9 @@ Prefer this sequence:
 Shell command references protected credential/config path: /.berry
 ```
 
-**Cause:** Skill examples used
-`/workspace/.berry/managed-skills`.
+**Cause:** Skill examples guessed a protected internal package path.
 
-**Fix:** Use `/managed-skills`. Do not copy or rewrite the bundled generator.
+**Fix:** Use the exact directory returned by `activate_skill`. Do not copy or rewrite the package generator.
 
 ### Unnecessary helper scripts were persisted
 
@@ -705,8 +729,8 @@ Record before every activation:
 
 To roll back:
 
-1. Restore the previous template ID in `deploy/.env.production`.
-2. Recreate only the API service.
+1. Restore the organization-capability and organization-skill-file backup.
+2. Restore the previous template ID only when the dependency image also changed.
 3. Deploy the previous known-good Git commit with
    `deploy/server-deploy.sh`.
 4. Run that commit’s `sync-skills.sh` to restore the previous skill content.
@@ -719,8 +743,8 @@ environment file.
 
 ### Repository
 
-- [ ] Six skills exist and pass skill validation.
-- [ ] Canonical commands use `/managed-skills`.
+- [ ] Seven skills exist as complete database packages and pass skill validation.
+- [ ] Canonical commands use activated skill directories.
 - [ ] No source PII or proposal content is packaged.
 - [ ] Verdana files remain untracked.
 - [ ] Template hashes match the committed files.
@@ -739,10 +763,8 @@ environment file.
 ### Production
 
 - [ ] Exact commit deployed to `/opt/berry`.
-- [ ] New immutable E2B template ID recorded.
-- [ ] Environment file backed up.
-- [ ] API recreated with the new template ID.
-- [ ] Six organization skills synced with expected hashes.
+- [ ] If generic dependencies changed, a new immutable E2B template ID is recorded and the environment backup is retained.
+- [ ] Seven organization skill packages are synced with expected hashes, file counts, and byte counts.
 - [ ] Generic artifact requests auto-activate `aesg-branding` and the matching format skill.
 - [ ] Previous template ID and backups retained for rollback.
 

@@ -25,18 +25,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--docx-skill-dir", required=True, type=Path)
+    parser.add_argument("--branding-skill-dir", required=True, type=Path)
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".pdf":
         raise ValueError("--output must end in .pdf")
     if not shutil.which("soffice"):
         raise RuntimeError("soffice is required")
 
-    skill_root = Path(__file__).resolve().parents[2]
-    docx_script = skill_root / "docx/scripts/create_aesg_docx.py"
+    docx_script = args.docx_skill_dir / "scripts/create_aesg_docx.py"
     work_dir = args.output.parent.parent / "tmp/pdfs"
     work_dir.mkdir(parents=True, exist_ok=True)
     temp_docx = work_dir / f"{args.output.stem}.source.docx"
-    run([sys.executable, str(docx_script), "--spec", str(args.spec), "--output", str(temp_docx)])
+    run([sys.executable, str(docx_script), "--spec", str(args.spec), "--output", str(temp_docx), "--branding-skill-dir", str(args.branding_skill_dir)])
 
     profile = Path(tempfile.mkdtemp(prefix="lo-profile-", dir=work_dir))
     run(

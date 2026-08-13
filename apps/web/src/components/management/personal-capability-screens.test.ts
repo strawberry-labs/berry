@@ -6,6 +6,7 @@ import {
   isManagedSkillDuplicate,
   skillControlHint,
   skillMarkdownBody,
+  skillPackageTreeEntries,
 } from "./personal-capability-screens";
 
 describe("personal capability screens", () => {
@@ -63,6 +64,19 @@ describe("personal capability screens", () => {
   it("renders the skill body without exposing YAML frontmatter", () => {
     expect(skillMarkdownBody("---\nname: research\ndescription: Research\n---\n\n# Research\n\nUse sources.")).toBe("# Research\n\nUse sources.");
     expect(skillMarkdownBody("# Plain Markdown")).toBe("# Plain Markdown");
+  });
+
+  it("shows nested package folders and files instead of collapsing everything to SKILL.md", () => {
+    expect(skillPackageTreeEntries(["SKILL.md", "assets/templates/cv.docx", "scripts/render.py", "references/schema.md"])).toEqual([
+      { kind: "file", name: "SKILL.md", path: "SKILL.md", depth: 0 },
+      { kind: "folder", name: "assets", path: "assets", depth: 0 },
+      { kind: "folder", name: "templates", path: "assets/templates", depth: 1 },
+      { kind: "file", name: "cv.docx", path: "assets/templates/cv.docx", depth: 2 },
+      { kind: "folder", name: "references", path: "references", depth: 0 },
+      { kind: "file", name: "schema.md", path: "references/schema.md", depth: 1 },
+      { kind: "folder", name: "scripts", path: "scripts", depth: 0 },
+      { kind: "file", name: "render.py", path: "scripts/render.py", depth: 1 },
+    ]);
   });
 
   it("recognizes organization skills republished by the runtime catalog", () => {

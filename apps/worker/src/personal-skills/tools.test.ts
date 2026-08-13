@@ -137,11 +137,10 @@ describe("DurablePersonalSkillToolExecutor", () => {
     });
     expect(execute).toHaveBeenCalledWith(
       expect.stringContaining("INSERT INTO personal_skill_files"),
-      expect.arrayContaining(["scripts/build.py", 0o755]),
-    );
-    expect(execute).toHaveBeenCalledWith(
-      expect.stringContaining("INSERT INTO personal_skill_files"),
-      expect.arrayContaining(["assets/template.docx", 0o644]),
+      expect.arrayContaining([
+        ["scripts/build.py", "assets/template.docx"],
+        [0o755, 0o644],
+      ]),
     );
   });
 });

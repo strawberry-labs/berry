@@ -22,16 +22,12 @@ WHITE = "FFFFFF"
 FONT = "Verdana"
 
 
-def skill_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def report_template(branding_skill_dir: Path) -> Path:
+    return branding_skill_dir / "assets/templates/AESG_General_Report_Template.docx"
 
 
-def report_template() -> Path:
-    return skill_root() / "aesg-branding/assets/templates/AESG_General_Report_Template.docx"
-
-
-def letter_template() -> Path:
-    return skill_root() / "aesg-branding/assets/templates/AESG_Letterhead_Dubai.docx"
+def letter_template(branding_skill_dir: Path) -> Path:
+    return branding_skill_dir / "assets/templates/AESG_Letterhead_Dubai.docx"
 
 
 def text_of(element) -> str:
@@ -451,6 +447,7 @@ def main() -> int:
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--template", type=Path)
+    parser.add_argument("--branding-skill-dir", required=True, type=Path)
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".docx":
         raise ValueError("--output must end in .docx")
@@ -458,7 +455,7 @@ def main() -> int:
     kind = str(spec.get("kind", "report")).casefold()
     if kind not in {"report", "letter"}:
         raise ValueError("kind must be report or letter")
-    template = args.template or (report_template() if kind == "report" else letter_template())
+    template = args.template or (report_template(args.branding_skill_dir) if kind == "report" else letter_template(args.branding_skill_dir))
     if not template.is_file():
         raise FileNotFoundError(template)
 

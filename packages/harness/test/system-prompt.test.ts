@@ -27,7 +27,7 @@ describe("formatSkillsForSystemPrompt", () => {
 		expect(prompt).toContain('activate "AESG branding" and the matching skill');
 		expect(prompt).toContain('activate "AESG branding" and "CV Creator"');
 		expect(prompt).toContain("`<workspace-root>/inputs/<file-id>/<filename>`");
-		expect(prompt).toContain("`/managed-skills/<skill-id>` (read-only)");
+		expect(prompt).toContain("`activate_skill` returns the exact staged skill directory");
 		expect(prompt).toContain("Final deliverables only: `<workspace-root>/outputs`");
 		expect(prompt).toContain("Any `/workspace` path in a skill is a placeholder");
 	});
@@ -56,5 +56,25 @@ describe("formatSkillsForSystemPrompt", () => {
 
 		expect(prompt).toContain("# AESG artifact workspace");
 		expect(prompt).not.toContain("For a CV or resume");
+	});
+
+	it("recognizes database-backed organization skills by their invocation name", () => {
+		const organizationSkill = (name: string, recordId: string): Skill => ({
+			name,
+			description: `${name} description`,
+			content: `${name} instructions`,
+			filePath: `/organization-skills/${recordId}/SKILL.md`,
+		});
+		const prompt = formatSkillsForSystemPrompt([
+			organizationSkill("aesg-branding", "orgcap-branding"),
+			organizationSkill("cv-creator", "orgcap-cv"),
+			organizationSkill("docx", "orgcap-docx"),
+			organizationSkill("pdf", "orgcap-pdf"),
+			organizationSkill("pptx", "orgcap-pptx"),
+			organizationSkill("xlsx", "orgcap-xlsx"),
+		]);
+
+		expect(prompt).toContain("# AESG artifact workspace");
+		expect(prompt).toContain('activate "aesg-branding" and "cv-creator"');
 	});
 });

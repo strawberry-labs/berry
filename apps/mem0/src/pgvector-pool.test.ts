@@ -11,14 +11,16 @@ class FakePool extends EventEmitter implements PgPoolLike {
   static instances: FakePool[] = [];
 
   readonly max: number;
+  readonly config: Record<string, unknown>;
   active = 0;
   maxActive = 0;
   ended = false;
   failNextQuery: Error | undefined;
   readonly #waiters: Array<() => void> = [];
 
-  constructor(config: { max?: number } = {}) {
+  constructor(config: { max?: number; [key: string]: unknown } = {}) {
     super();
+    this.config = config;
     this.max = config.max ?? 10;
     FakePool.instances.push(this);
   }
@@ -87,6 +89,8 @@ describe("Mem0 pgvector pool compatibility client", () => {
       max: 8,
       connectionTimeoutMillis: 2_000,
       idleTimeoutMillis: 30_000,
+      queryTimeoutMillis: 5_000,
+      statementTimeoutMillis: 4_000,
     });
     const Client = pg.module.Client as unknown as new (config: { connectionString: string }) => {
       connect(): Promise<void>;
@@ -105,6 +109,7 @@ describe("Mem0 pgvector pool compatibility client", () => {
     expect(results).toHaveLength(50);
     expect(FakePool.instances).toHaveLength(1);
     expect(FakePool.instances[0]?.maxActive).toBe(8);
+    expect(FakePool.instances[0]?.config).toMatchObject({ query_timeout: 5_000, statement_timeout: 4_000 });
     await memoriesClient.end();
     expect(FakePool.instances[0]?.ended).toBe(false);
     await expect(entitiesClient.query("SELECT id FROM memories_entities", [])).resolves.toBeDefined();
@@ -122,6 +127,8 @@ describe("Mem0 pgvector pool compatibility client", () => {
       max: 4,
       connectionTimeoutMillis: 2_000,
       idleTimeoutMillis: 30_000,
+      queryTimeoutMillis: 5_000,
+      statementTimeoutMillis: 5_000,
       onIdleError: (diagnostic) => diagnostics.push(diagnostic),
     });
     const Client = pg.module.Client as unknown as new (config: string) => {

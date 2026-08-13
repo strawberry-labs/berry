@@ -35,18 +35,22 @@ function formatAesgArtifactRouting(skills: Skill[]): string {
 		: "";
 	return [
 		"# AESG artifact workspace",
-		`For AESG files, activate ${named("aesg-branding")} and the matching skill before planning or using sandbox tools. Use ${named("docx")} for Word, reports, letters, briefs, and generic professional documents; ${named("pdf")} for PDFs; ${named("pptx")} for presentations; and ${named("xlsx")} for spreadsheets, registers, trackers, and schedules. Activate every matching skill when several formats are requested.`,
+		`For AESG files, activate ${named("aesg-branding")} and the matching skill before planning or using sandbox tools. Use ${named("docx")} for Word, reports, letters, briefs, and generic professional documents; activate both ${named("pdf")} and ${named("docx")} when creating an office PDF; use ${named("pptx")} for presentations; and ${named("xlsx")} for spreadsheets, registers, trackers, and schedules. Activate every matching skill when several formats are requested.`,
 		`${cvRouting}For read-only inspection, activate the file's format skill and add branding only when assessing AESG compliance or returning a branded file.`,
 		"Sandbox map:",
 		"- The runtime prompt supplies the exact workspace root. Use it verbatim. Any `/workspace` path in a skill is a placeholder for that root, not a guaranteed directory.",
 		"- Attachments: use the exact `Sandbox path:` supplied with the file, normally `<workspace-root>/inputs/<file-id>/<filename>`. Do not guess paths or look for attached content in the Library.",
-		"- Managed instructions, scripts, templates, and assets: `/managed-skills/<skill-id>` (read-only). Read the activated `SKILL.md`, use its canonical generator, and never reference `/.berry` or copy/rewrite a bundled generator.",
+		"- Skill packages: `activate_skill` returns the exact staged skill directory. Resolve every `scripts/...`, `references/...`, and `assets/...` path against that directory; never guess a global skill path, reference `/.berry`, or copy/rewrite a bundled generator.",
 		"- Working files, specs, extractions, and previews: `<workspace-root>/tmp/<skill-id>`. Final deliverables only: `<workspace-root>/outputs`.",
 		"Validate and render as the skill requires, then publish each requested final file once with its correct extension and media type. Do not publish specs, scripts, previews, or extracted images.",
 	].join("\n");
 }
 
 function skillId(skill: Skill): string {
+	const invocationName = skill.name.replace(/^\$/, "").trim().toLowerCase();
+	if (["aesg-branding", "cv-creator", "docx", "pdf", "pptx", "xlsx"].includes(invocationName)) {
+		return invocationName;
+	}
 	const normalized = skill.filePath.replace(/\\/g, "/");
 	return normalized.match(/\/([^/]+)\/SKILL\.md$/i)?.[1] ?? skill.name;
 }

@@ -25,6 +25,7 @@ import {
   createDurableTurnModel,
   durableImageToolSelectionPrompt,
   durableProviderCompatibilityPrompt,
+  durableBuiltInToolDefinitions,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -58,6 +59,7 @@ describe("durable turn runner", () => {
   it("advertises bounded, explicit file arguments and a DeepSeek compatibility guard", () => {
     const write = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "write_file");
     const append = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "append_file");
+    const edit = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "edit_file");
 
     expect(write?.function.parameters).toMatchObject({
       required: ["path", "content"],
@@ -73,13 +75,63 @@ describe("durable turn runner", () => {
         content: { minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
       },
     });
+    expect(edit?.function.parameters).toMatchObject({
+      required: ["path", "old_string", "new_string"],
+      properties: {
+        path: { minLength: 1 },
+        old_string: { minLength: 1, maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+        new_string: { maxLength: DURABLE_FILE_TOOL_MAX_CONTENT_CHARS },
+      },
+    });
     expect(durableProviderCompatibilityPrompt(
       "canopywave/deepseek/deepseek-v4-flash",
       DURABLE_BASE_BUILT_IN_TOOLS,
     )).toBe(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT);
     expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain("always send all three fields");
     expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain('"expected_size_bytes":8421');
+    expect(DEEPSEEK_V4_FLASH_FILE_TOOL_PROMPT).toContain("edit_file is intentionally unavailable");
     expect(durableProviderCompatibilityPrompt("kimi-2.6", DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
+  });
+
+  it("uses apply_patch instead of edit_file for DeepSeek V4 Flash", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = {
+      capabilityVersion: 1,
+      input: "Fix the file",
+      providerId: "router",
+      model: "canopywave/deepseek/deepseek-v4-flash",
+      provider: {
+        id: "router",
+        name: "Berry Router",
+        kind: "berry-router",
+        baseUrl: "https://router.example.test/v1",
+        defaultModel: "canopywave/deepseek/deepseek-v4-flash",
+        apiType: "openai-chat-completions",
+        endpointPath: "/chat/completions",
+        authType: "none",
+        models: [],
+      },
+      conversationKind: "chat",
+      workspacePath: "/workspace",
+      workspaceId: current.workspaceId,
+      permissionMode: "ask",
+      reasoning: "off",
+      maxTokens: 8_000,
+      contextWindowTokens: 128_000,
+      modelAcceptsImages: false,
+      modelPricing: {},
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS],
+      mcpServers: [],
+      extraSkills: [],
+      attachments: [],
+    };
+
+    const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
+    expect(names).toContain("apply_patch");
+    expect(names).not.toContain("edit_file");
+
+    current.runtimeRequest = { ...current.runtimeRequest, model: "kimi-2.6" };
+    expect(durableBuiltInToolDefinitions(current).map((tool) => tool.function.name)).toContain("edit_file");
   });
 
   it("starts in live mode without a global router for snapshot-admitted providers", () => {

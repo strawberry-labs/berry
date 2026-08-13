@@ -22,6 +22,8 @@ export interface PgVectorPoolOptions {
   max: number;
   connectionTimeoutMillis: number;
   idleTimeoutMillis: number;
+  queryTimeoutMillis: number;
+  statementTimeoutMillis: number;
   keepAliveInitialDelayMillis?: number;
   onIdleError?: (diagnostic: PgPoolErrorDiagnostic) => void;
 }
@@ -59,6 +61,8 @@ export function installPooledPgClient(
       application_name: clientConfig.application_name || "berry-mem0",
       connectionTimeoutMillis: clientConfig.connectionTimeoutMillis ?? options.connectionTimeoutMillis,
       idleTimeoutMillis: options.idleTimeoutMillis,
+      query_timeout: clientConfig.query_timeout ?? options.queryTimeoutMillis,
+      statement_timeout: clientConfig.statement_timeout ?? options.statementTimeoutMillis,
       keepAlive: clientConfig.keepAlive ?? true,
       keepAliveInitialDelayMillis:
         clientConfig.keepAliveInitialDelayMillis ?? options.keepAliveInitialDelayMillis ?? 10_000,

@@ -28,10 +28,6 @@ YELLOW = "FFC72C"
 FONT = "Verdana"
 
 
-def skill_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def normalise_columns(spec: dict) -> list[dict]:
     columns = []
     for item in spec.get("columns", []):
@@ -56,8 +52,8 @@ def table_name(value: str, index: int) -> str:
     return f"{clean[:230]}_{index}"
 
 
-def add_logo(worksheet) -> None:
-    logo_path = skill_root() / "aesg-branding/assets/logos/aesg-brandmark-rgb.png"
+def add_logo(worksheet, branding_skill_dir: Path) -> None:
+    logo_path = branding_skill_dir / "assets/logos/aesg-brandmark-rgb.png"
     if logo_path.is_file():
         logo = Image(logo_path)
         logo.width = 130
@@ -109,13 +105,13 @@ def add_chart(worksheet, spec: dict, columns: list[dict], end_row: int):
     return max(len(columns), 8), end_row + 18
 
 
-def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int) -> None:
+def build_sheet(workbook: Workbook, worksheet, spec: dict, sheet_index: int, branding_skill_dir: Path) -> None:
     columns = normalise_columns(spec)
     rows = list(spec.get("rows", []))
     worksheet.title = str(spec.get("sheet", f"Sheet {sheet_index}"))[:31]
     worksheet.sheet_view.showGridLines = False
     worksheet.freeze_panes = "A4"
-    add_logo(worksheet)
+    add_logo(worksheet, branding_skill_dir)
 
     last_column = get_column_letter(len(columns))
     worksheet.merge_cells(f"A2:{last_column}2")
@@ -204,6 +200,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--branding-skill-dir", required=True, type=Path)
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".xlsx":
         raise ValueError("--output must end in .xlsx")
@@ -217,7 +214,7 @@ def main() -> int:
         worksheet = workbook.active if index == 1 else workbook.create_sheet()
         combined = dict(sheet_spec)
         combined.setdefault("title", spec.get("title", combined.get("sheet", "AESG workbook")))
-        build_sheet(workbook, worksheet, combined, index)
+        build_sheet(workbook, worksheet, combined, index, args.branding_skill_dir)
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
     workbook.calculation.calcMode = "auto"
