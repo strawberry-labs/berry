@@ -220,7 +220,6 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       try {
         result = await client.complete({
           model: runtime.vision.model,
-          reasoningEffort: "minimal",
           temperature: 0,
           maxTokens: Math.min(
             runtime.vision.maxTokens,

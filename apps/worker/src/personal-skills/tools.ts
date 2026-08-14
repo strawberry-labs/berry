@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { formatSkillInvocation } from "@berry/harness";
-import { DurableTurnRuntimeRequestSchema, parseAgentSkillMarkdown } from "@berry/shared";
+import {
+  DEFERRED_SKILL_RESOURCE_INSTRUCTIONS,
+  DurableTurnRuntimeRequestSchema,
+  parseAgentSkillMarkdown,
+} from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
 import { z } from "zod";
 import type { SqlExecutor } from "../sql-repositories.js";
@@ -251,7 +255,7 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       ? `<skill_resources_ready name=${JSON.stringify(skill.name)} directory=${JSON.stringify(skillDirectory)}>\n${requestedResources.map((path) => `  <file>${escapeXml(path)}</file>`).join("\n")}\n</skill_resources_ready>`
       : formatSkillInvocation(activeSkill, requestedResources.length > 0
           ? `The requested resource files are materialized under ${skillDirectory}. Use only the exact paths needed for this task.`
-          : "Resource files are deferred. Before using any listed file, call activate_skill again with this skill name and one resources array containing every exact relative path needed for the next operation. Do not load unrelated resources.");
+          : `${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS} Do not load unrelated resources.`);
     const summary = requestedResources.length > 0
       ? `Loaded ${requestedResources.length} ${skill.name} resource file${requestedResources.length === 1 ? "" : "s"}`
       : `Activated ${skill.name}; ${availableResources.length} resource file${availableResources.length === 1 ? "" : "s"} available on demand`;

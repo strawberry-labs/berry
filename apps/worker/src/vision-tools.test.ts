@@ -70,10 +70,10 @@ describe("DurableVisionToolExecutor", () => {
     expect(second.usage).toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
-    expect(JSON.parse(String(request?.body))).toMatchObject({
-      max_tokens: 1_536,
-      reasoning: { effort: "minimal" },
-    });
+    const requestBody = JSON.parse(String(request?.body)) as Record<string, unknown>;
+    expect(requestBody).toMatchObject({ max_tokens: 1_536 });
+    expect(requestBody).not.toHaveProperty("reasoning");
+    expect(requestBody).not.toHaveProperty("reasoning_effort");
   });
 
   it("retries one empty reasoning-only response and persists sanitized attempt diagnostics", async () => {
@@ -141,8 +141,10 @@ describe("DurableVisionToolExecutor", () => {
     expect(result.usage).toMatchObject({ inputTokens: 200, outputTokens: 27, totalTokens: 227 });
     const firstBody = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body));
     const secondBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit | undefined)?.body));
-    expect(firstBody.reasoning).toEqual({ effort: "minimal" });
-    expect(secondBody.reasoning).toEqual({ effort: "minimal" });
+    expect(firstBody).not.toHaveProperty("reasoning");
+    expect(firstBody).not.toHaveProperty("reasoning_effort");
+    expect(secondBody).not.toHaveProperty("reasoning");
+    expect(secondBody).not.toHaveProperty("reasoning_effort");
     expect(modelContent).toHaveBeenCalledTimes(1);
   });
 

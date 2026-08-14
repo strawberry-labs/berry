@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DEFERRED_SKILL_RESOURCE_INSTRUCTIONS } from "@berry/shared";
 import { formatSkillsForSystemPrompt } from "../src/harness/system-prompt.ts";
 import type { Skill } from "../src/harness/types.ts";
 
@@ -30,6 +31,7 @@ describe("formatSkillsForSystemPrompt", () => {
 		expect(prompt).toContain("`activate_skill` returns the exact staged skill directory");
 		expect(prompt).toContain("Final deliverables only: `<workspace-root>/outputs`");
 		expect(prompt).toContain("Any `/workspace` path in a skill is a placeholder");
+		expect(prompt).toContain(DEFERRED_SKILL_RESOURCE_INSTRUCTIONS);
 	});
 
 	it("omits AESG routing when a required skill is unavailable to the model", () => {

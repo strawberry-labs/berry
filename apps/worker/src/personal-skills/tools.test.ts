@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import { DURABLE_BASE_BUILT_IN_TOOLS, DurableTurnRuntimeRequestSchema } from "@berry/shared";
+import {
+  DEFERRED_SKILL_RESOURCE_INSTRUCTIONS,
+  DURABLE_BASE_BUILT_IN_TOOLS,
+  DurableTurnRuntimeRequestSchema,
+} from "@berry/shared";
 import { describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnToolExecutor } from "../turn-runner.js";
 import { DurablePersonalSkillToolExecutor } from "./tools.js";
@@ -202,7 +206,7 @@ describe("DurablePersonalSkillToolExecutor", () => {
       stagedResources: [],
       stagingSandboxId: "sandbox-branding",
     });
-    expect(JSON.stringify(activated.output)).toContain("Resource files are deferred");
+    expect(JSON.stringify(activated.output)).toContain(DEFERRED_SKILL_RESOURCE_INSTRUCTIONS);
     expect(query.mock.calls.filter(([sql]) => String(sql).includes("SELECT path,content"))).toHaveLength(0);
 
     snapshot.steps = [{
