@@ -21,8 +21,7 @@ import type {
 export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   readonly #source: McpToolSource;
   readonly #servers: readonly McpServerSpec[];
-  readonly #ready: Promise<void>;
-  readonly #turnContexts = new Map<string, { source: McpToolSource; servers: readonly McpServerSpec[]; ready: Promise<void> }>();
+  readonly #turnContexts = new Map<string, DurableMcpTurnContext>();
 
   constructor(
     private readonly base: DurableTurnToolExecutor,
@@ -43,17 +42,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         else console.info(output);
       },
     });
-    this.#ready = this.#source.connect();
   }
 
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
     const context = await this.#context(snapshot);
-    const [inherited] = await Promise.all([
-      this.base.definitions?.(snapshot) ?? Promise.resolve([]),
-      context.ready,
-    ]);
+    const inherited = await (this.base.definitions?.(snapshot) ?? Promise.resolve([]));
+    const visibleNames = this.#visibleToolNames(snapshot, context);
     const mcpTools = context.source.listTools()
-      .filter((tool) => this.#serverForTool(tool.name, context.servers) !== undefined)
+      .filter((tool) => visibleNames.has(tool.name))
       .map((tool): ChatToolDefinition => ({
         type: "function",
         function: {
@@ -62,7 +58,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           parameters: jsonValue(tool.parameters),
         },
       }));
-    return [...inherited, ...mcpTools];
+    return [
+      ...inherited,
+      ...(context.source.listTools().length > 0
+        ? [durableToolSearchDefinition(context.servers)]
+        : []),
+      ...mcpTools,
+    ];
   }
 
   async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
@@ -86,6 +88,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     toolName: string,
     permissionMode: string,
   ): DurableToolPolicy | undefined {
+    if (toolName === "tool_search") {
+      return {
+        retryClass: "read_only",
+        requiresApproval: false,
+        approvalKind: "mcp",
+      };
+    }
     if (!toolName.startsWith("mcp__")) {
       return this.base.policy?.(snapshot, toolName, permissionMode);
     }
@@ -106,11 +115,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
 
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName === "tool_search") return this.#searchTools(snapshot, step);
     if (!toolName.startsWith("mcp__")) return this.base.execute(snapshot, step);
     const context = await this.#context(snapshot);
-    await context.ready;
     if (!this.#serverForTool(toolName, context.servers)) {
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
+    }
+    if (!this.#visibleToolNames(snapshot, context).has(toolName)) {
+      throw new Error(`MCP tool ${toolName} is deferred. Call tool_search for the required connector capability first.`);
     }
     const tool = context.source.listTools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error(`MCP tool ${toolName} is unavailable`);
@@ -148,12 +160,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     await Promise.all([...this.#turnContexts.values()].map((context) => context.source.close()));
   }
 
-  async #context(snapshot: DurableTurnSnapshot): Promise<{ source: McpToolSource; servers: readonly McpServerSpec[]; ready: Promise<void> }> {
+  async #context(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {
     const existing = this.#turnContexts.get(snapshot.id);
     if (existing) return existing;
     const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
     if (!runtime.success) {
-      return { source: this.#source, servers: this.#allowedServers(snapshot), ready: this.#ready };
+      return { source: this.#source, servers: this.#allowedServers(snapshot) };
     }
     const servers = await Promise.all(runtime.data.mcpServers
       .filter((server) => server.enabled && server.trusted)
@@ -195,9 +207,85 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         else console.info(output);
       },
     });
-    const context = { source, servers, ready: source.connect() };
+    // Cached, administrator-reviewed schemas are enough for model preparation.
+    // McpToolSource connects only when one exposed tool is actually executed.
+    const context = { source, servers };
     this.#turnContexts.set(snapshot.id, context);
     return context;
+  }
+
+  async #searchTools(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+    const context = await this.#context(snapshot);
+    const input = record(step.input.arguments) ?? {};
+    const query = stringValue(input.query);
+    if (!query) throw new Error("tool_search requires a non-empty query describing the connector capability needed");
+    const connectorId = stringValue(input.connector);
+    const connector = connectorId
+      ? context.servers.find((server) => server.id === connectorId)
+      : undefined;
+    if (connectorId && !connector) {
+      throw new Error(`Unknown or unauthorized connector: ${connectorId}`);
+    }
+    const limitValue = typeof input.limit === "number" && Number.isSafeInteger(input.limit)
+      ? input.limit
+      : 8;
+    const limit = Math.max(1, Math.min(20, limitValue));
+    let matches: ReturnType<McpToolSource["listTools"]> = [];
+    if (connector) {
+      const connectorTools = context.source.listTools().filter((tool) =>
+        this.#serverForTool(tool.name, [connector]) !== undefined
+      );
+      matches = connectorToolMatches(connectorTools, query, limit);
+    } else {
+      const search = context.source.createToolSearch(async (revealed) => {
+        matches = revealed;
+      });
+      await search.execute(stringValue(step.input.toolCallId) ?? step.id, { query, limit } as never);
+    }
+    const activatedTools = matches.map((tool) => tool.name);
+    const activatedServerIds = [...new Set(matches.flatMap((tool) => {
+      const server = this.#serverForTool(tool.name, context.servers);
+      return server ? [server.id] : [];
+    }))];
+    const connectorCatalog = context.servers
+      .filter((server) => context.source.listTools().some((tool) =>
+        this.#serverForTool(tool.name, [server]) !== undefined
+      ))
+      .map((server) => ({ id: server.id, name: server.name }));
+    const content = activatedTools.length > 0
+      ? `Enabled connector tools for the next model call: ${activatedTools.join(", ")}`
+      : `No authorized connector tools matched that capability. Retry with one connector id from: ${connectorCatalog.map((item) => `${item.id} (${item.name})`).join(", ")}.`;
+    return {
+      output: {
+        content,
+        query,
+        ...(connector ? { connector: connector.id } : {}),
+        connectors: connectorCatalog,
+        activatedTools,
+        activatedServerIds,
+        tools: matches.map((tool) => ({ name: tool.name, description: tool.description })),
+      },
+      summary: activatedTools.length > 0
+        ? `Discovered ${activatedTools.length} connector tool${activatedTools.length === 1 ? "" : "s"}`
+        : "No connector tools matched",
+    };
+  }
+
+  #visibleToolNames(snapshot: DurableTurnSnapshot, context: DurableMcpTurnContext): Set<string> {
+    const visible = revealedMcpToolNames(snapshot);
+    const selectedServerIds = explicitlyMentionedMcpServerIds(snapshot, context.servers);
+    for (const step of snapshot.steps) {
+      if (step.state !== "completed") continue;
+      const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+      if (!toolName.startsWith("mcp__")) continue;
+      const server = this.#serverForTool(toolName, context.servers);
+      if (server) selectedServerIds.add(server.id);
+    }
+    for (const tool of context.source.listTools()) {
+      const server = this.#serverForTool(tool.name, context.servers);
+      if (server && selectedServerIds.has(server.id)) visible.add(tool.name);
+    }
+    return visible;
   }
 
   #allowedServers(snapshot: DurableTurnSnapshot): readonly McpServerSpec[] {
@@ -214,6 +302,126 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   #serverForTool(toolName: string, candidates: readonly McpServerSpec[]): McpServerSpec | undefined {
     return candidates.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
   }
+}
+
+type DurableMcpTurnContext = {
+  source: McpToolSource;
+  servers: readonly McpServerSpec[];
+};
+
+function durableToolSearchDefinition(servers: readonly McpServerSpec[]): ChatToolDefinition {
+  const catalog = servers.map((server) => `${server.id} (${server.name})`).join(", ");
+  return {
+    type: "function",
+    function: {
+      name: "tool_search",
+      description: `Search authorized deferred connector tools by capability. Select a connector when the request uses a paraphrase that may not occur in a tool name. Authorized connectors: ${catalog}. Matching tools become available on the next model call.`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", minLength: 1 },
+          connector: {
+            type: "string",
+            enum: servers.map((server) => server.id),
+            description: "Authorized connector id chosen from the catalog in this tool description.",
+          },
+          limit: { type: "integer", minimum: 1, maximum: 20 },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+function explicitlyMentionedMcpServerIds(
+  snapshot: DurableTurnSnapshot,
+  servers: readonly McpServerSpec[],
+): Set<string> {
+  const intent = [
+    stringValue(snapshot.runtimeRequest.input),
+    latestUserEntryText(snapshot),
+  ].filter(Boolean).join(" ");
+  if (!intent) return new Set();
+  const normalizedIntent = ` ${normalizeCatalogIdentity(intent)} `;
+  const intentTokens = catalogIdentityTokens(intent);
+  const identities = servers.map((server) => ({
+    id: server.id,
+    fullName: normalizeCatalogIdentity(server.name),
+    tokens: new Set([
+      ...catalogIdentityTokens(server.id),
+      ...catalogIdentityTokens(server.name),
+    ]),
+  }));
+  const tokenOwners = new Map<string, number>();
+  for (const identity of identities) {
+    for (const token of identity.tokens) {
+      tokenOwners.set(token, (tokenOwners.get(token) ?? 0) + 1);
+    }
+  }
+  return new Set(identities.filter((identity) =>
+    (identity.fullName.length >= 3 && normalizedIntent.includes(` ${identity.fullName} `))
+    || [...identity.tokens].some((token) =>
+      token.length >= 3 && tokenOwners.get(token) === 1 && intentTokens.has(token)
+    )
+  ).map((identity) => identity.id));
+}
+
+function revealedMcpToolNames(snapshot: DurableTurnSnapshot): Set<string> {
+  const names = new Set<string>();
+  for (const step of snapshot.steps) {
+    if (step.state !== "completed") continue;
+    if ((stringValue(step.input.toolName) ?? step.type.slice(5)) !== "tool_search") continue;
+    const output = record(step.output);
+    for (const name of stringArray(output?.activatedTools)) {
+      if (name.startsWith("mcp__")) names.add(name);
+    }
+  }
+  return names;
+}
+
+function connectorToolMatches<T extends { name: string; description?: string }>(
+  tools: readonly T[],
+  query: string,
+  limit: number,
+): T[] {
+  const terms = [...catalogIdentityTokens(query)];
+  const ranked = tools.map((tool) => ({
+    tool,
+    score: terms.reduce((score, term) =>
+      score + (`${tool.name} ${tool.description ?? ""}`.toLowerCase().includes(term) ? 1 : 0), 0),
+  })).sort((left, right) => right.score - left.score || left.tool.name.localeCompare(right.tool.name));
+  const matches = ranked.filter((item) => item.score > 0);
+  return (matches.length > 0 ? matches : ranked).slice(0, limit).map((item) => item.tool);
+}
+
+function normalizeCatalogIdentity(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function catalogIdentityTokens(value: string): Set<string> {
+  return new Set(normalizeCatalogIdentity(value).split(/\s+/).filter(Boolean));
+}
+
+function latestUserEntryText(snapshot: DurableTurnSnapshot): string {
+  for (const entry of [...snapshot.entries].reverse()) {
+    const payload = record(entry.payload);
+    const message = record(payload?.message);
+    if (message?.role !== "user") continue;
+    const content = message.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content.flatMap((part) => {
+        const item = record(part);
+        return item?.type === "text" && typeof item.text === "string" ? [item.text] : [];
+      }).join(" ");
+    }
+  }
+  return "";
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 export function durableMcpToolPolicy(

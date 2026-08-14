@@ -1,7 +1,7 @@
 # AESG artifact skills: build, modify, and deploy runbook
 
-This is the handoff for rebuilding or changing AESG-branded PDF, DOCX, XLSX,
-PPTX, and CV generation in Berry.
+This is the handoff for rebuilding or changing AESG-branded image, PDF, DOCX,
+XLSX, PPTX, and CV generation in Berry.
 
 > **New-agent note:** Treat the committed files under `deploy/skills` and
 > `deploy/e2b-aesg` as the current source of truth. The original AESG sample
@@ -16,7 +16,7 @@ Berry uses seven organization skill packages:
 
 | Skill | Responsibility |
 |---|---|
-| `aesg-branding` | Brand authority, approved templates, assets, validation, and rendering |
+| `aesg-branding` | Brand authority, image-generation references, exact logo composition, approved templates, validation, and rendering |
 | `docx` | Template-preserving Word generation |
 | `pdf` | AESG Word-to-PDF generation and PDF operations |
 | `xlsx` | Sanitized branded workbook generation |
@@ -31,18 +31,20 @@ deploy/
 ├── skills/
 │   ├── aesg-branding/
 │   │   ├── SKILL.md
-│   │   ├── references/brand-system.md
+│   │   ├── references/
+│   │   │   ├── brand-system.md
+│   │   │   └── image-generation.md
 │   │   ├── scripts/
+│   │   │   ├── compact_pptx_template.py
+│   │   │   ├── composite_logo.py
 │   │   │   ├── validate_artifact.py
 │   │   │   ├── render_artifact.py
 │   │   │   └── prepare_office_template.py
 │   │   └── assets/
 │   │       ├── brand-tokens.json
 │   │       ├── template-manifest.json
-│   │       ├── icons/services/
 │   │       ├── logos/
 │   │       ├── reference/
-│   │       ├── supergraphics/
 │   │       └── templates/
 │   ├── docx/
 │   │   ├── SKILL.md
@@ -89,9 +91,11 @@ Updating only one layer can leave new tasks using stale instructions or code.
 - Do not package historical bid DOCX or bid PPTX files. They contain live
   people, clients, projects, awards, and proposal material.
 - The approved General Presentation source also arrived with a corrupt ZIP
-  member at `ppt/media/image5.jpeg`. The committed runtime copy is a
-  LibreOffice-repaired, metadata-sanitised package that retains 17 specimen
-  slides, 2 masters, and 59 layouts. Never restore the raw source.
+  member at `ppt/media/image5.jpeg`. After LibreOffice repair it contained 17
+  specimen slides, 2 masters, and 59 layouts. The committed runtime copy is a
+  metadata-sanitised, losslessly compacted package containing the same 17
+  specimen slides, 1 master, and 17 reachable layouts. Never restore the raw
+  source or the unused layout media.
 - Commit only sanitized templates and approved extracted assets.
 - Do not commit Verdana font files. They are licensed, ignored by Git, and
   supplied to the E2B build separately.
@@ -151,6 +155,16 @@ AESG source pack/
     └── AESG Logo/
 ```
 
+This pack contains no XLSX template. Continue using the privacy-safe workbook
+generator and sanitised style evidence; do not infer an Excel source from the
+DOCX or PPTX.
+
+Treat the original guideline PDF as maintenance evidence. Inspect every page
+when building or re-auditing the skill, record its edition and SHA-256, then
+distil its operational rules into the concise brand reference, JSON tokens,
+image-generation instructions, and visual reference boards. Do not include the
+60-page PDF in the runtime skill package.
+
 Set a task-specific variable if the location changes:
 
 ```bash
@@ -163,6 +177,7 @@ Define concrete acceptance prompts before writing the skills:
 - “Create an AESG-branded Word report.”
 - “Create an AESG Excel register with formulas and a chart.”
 - “Create an AESG presentation using the General Template.”
+- “Create a conceptual AESG headquarters hero image.”
 
 These examples determine what instructions, scripts, templates, and validators
 must be reusable.
@@ -199,18 +214,36 @@ Read the brand manual and retained templates together. Record:
 - Primary colours: Green `#008C95`, Gray `#343741`, White `#FFFFFF`.
 - Secondary colours: Purple `#6D2077`, Red `#DA291C`,
   Yellow `#FFC72C`.
-- Logo aspect ratio and clear-space rules.
+- Colour hierarchy: approximately 55% white space, 30% primary colour, and
+  15% secondary colour in total.
+- Full-colour-versus-white logo selection, 3.465:1 aspect ratio, clear-space
+  rules, and the 10 mm minimum offset-print width.
+- Photography direction for headshots, offices/sites, architecture,
+  environments, and renders.
+- The distinction between raw source imagery and final branded creative.
 - British English and AESG date conventions.
 - Word page size, margins, headers, footers, and style sizes.
 - Excel row heights, column treatment, number formats, and chart order.
-- PowerPoint aspect ratio, master/layout count, recurring furniture, and text
-  capacities.
+- PowerPoint aspect ratio, source and runtime master/layout counts, recurring
+  furniture, slide-local slot IDs, and text capacities.
 
 Store machine-readable values in `assets/brand-tokens.json`. Store human and
 editorial rules in `references/brand-system.md`. Do not duplicate long
 explanations in every format skill.
 
 ### Step 4: choose retain-versus-rebuild per format
+
+#### Images
+
+Keep the image path intentionally small: two transparent PNG logos plus the
+identity and photography reference boards derived from the canonical manual.
+Pass the boards and exactly one selected logo through `create_image` references.
+For final branded creative, ask the model for a clean placement zone and then
+overlay the exact PNG with `composite_logo.py`; do not accept a generated
+facsimile of the logo. Raw source photography normally remains unbranded.
+
+Without an authoritative site photograph, describe a generated AESG
+headquarters, office, or project as conceptual rather than factual.
 
 #### DOCX
 
@@ -219,8 +252,18 @@ Route reports and long-form documents through
 sections, relationships, media, and AESG styles, then compose new body content.
 Do not copy the source's 66 pages of sample text into outputs.
 
-Route letters through `AESG_Letterhead_Dubai.docx` so correspondence retains
-the dedicated first-page and continuation-page letterhead.
+Treat the divider as a multi-paragraph component: its full-page image anchor
+and floating heading box must travel together. Rebuild tables with bounded
+column geometry, repeating header rows, and cleared approval placeholders.
+
+Route direct, recipient-led, or signed correspondence through
+`AESG_Letterhead_Dubai.docx` so it retains the dedicated first-page and
+continuation-page letterhead. This route covers letters, leave requests, short
+memos, confirmations, and notices. Use the General Report Template for
+structured publications and formal project deliverables, even when they are
+short. Preserve the measured A4 margins, Verdana 9 pt
+body, Verdana 12 pt Bold subject, first-page brandmark/address footer, and
+continuation-page symbol/page number.
 
 #### PDF
 
@@ -251,7 +294,21 @@ Generate a new workbook with `openpyxl` using measured AESG styles:
 
 Retain `AESG_General_Presentation.pptx` at its native `10.833 × 7.5 in` size.
 Use a clone-and-fill generator that copies approved specimen slides and
-preserves both masters, all 59 layouts, relationships, city imagery, and logo.
+edits their native slide-local text and image slots. The runtime keeps one
+master and the 17 layouts reached by the 17 specimens; the repaired source's
+other 42 layouts and second master are evidence only.
+
+Create the compact runtime reproducibly from an audited, repaired copy:
+
+```bash
+python deploy/skills/aesg-branding/scripts/compact_pptx_template.py \
+  repaired-general-template.pptx \
+  compact-general-template.pptx
+```
+
+Render all 17 slides before and after compaction and require pixel-identical
+output. Then sanitise metadata with `prepare_office_template.py` and update the
+manifest hash.
 
 The specimen-backed semantic layout set is:
 
@@ -260,6 +317,8 @@ cover
 text
 two_columns
 three_columns
+five_images
+image_statement
 statement
 image_bottom
 text_image
@@ -274,9 +333,9 @@ closing
 ```
 
 Keep the complete inventory and capacity limits in
-`deploy/skills/pptx/references/layout-catalog.md`. The second master remains
-unclassified and is not a generation route. When the template changes,
-rediscover slide, layout, and shape IDs.
+`deploy/skills/pptx/references/layout-catalog.md`. The organisation-chart
+specimen remains reference-only. When the template changes, rediscover slide,
+layout, and shape IDs before updating the generator.
 
 ### Step 5: create the skill folders
 
@@ -352,6 +411,12 @@ python <pptx-skill-directory>/scripts/create_aesg_pptx.py \
   --spec /workspace/tmp/pptx/spec.json \
   --branding-skill-dir <aesg-branding-skill-directory> \
   --output /workspace/outputs/deck.pptx
+
+python <aesg-branding-skill-directory>/scripts/composite_logo.py \
+  /workspace/tmp/image/generated.png \
+  /workspace/outputs/final-branded-image.png \
+  --logo <aesg-branding-skill-directory>/assets/logos/aesg-brandmark-rgb.png \
+  --position top-right
 ```
 
 Prefer extending the JSON schema over asking the agent to generate another
@@ -364,11 +429,13 @@ high-freedom content layer.
 
 - corrupt or empty files;
 - invalid PDF signatures or MIME types;
-- placeholder text;
+- placeholder text in Word content controls, text boxes, headers, and footers;
 - missing AESG font declarations;
 - hidden or prohibited Excel sheets;
 - formula error tokens;
-- invalid PowerPoint packages.
+- invalid PowerPoint packages;
+- PowerPoint output with empty structural placeholders, unresolved picture
+  slots, or the wrong compact master/layout hierarchy.
 
 `render_artifact.py` should render:
 
@@ -428,8 +495,9 @@ do
 done
 ```
 
-Compile the Python scripts, generate all four formats, run the shared
-validator, render each output, and visually inspect the results.
+Compile the Python scripts, test both logo variants on light and dark image
+fixtures, generate all four Office formats, run the shared validator, render
+each output, and visually inspect the results.
 
 The E2B smoke test stages the same seven package directories that are synced to
 the database into a fresh sandbox, generates and validates all eight expected
@@ -606,6 +674,11 @@ and the matching format skill activating before generation. A generic request
 such as “create a project brief” should route to DOCX without requiring the
 user to name a skill or file extension.
 
+Also run a prompt such as “create an image of AESG headquarters”. Confirm that
+`aesg-branding` activates, the two visual boards and one logo are supplied to
+`create_image`, the result is described as conceptual when no real-site source
+is present, and any final logo is the exact composited PNG.
+
 ## 5. Modify or tweak an existing implementation
 
 Start by identifying the change type:
@@ -614,12 +687,12 @@ Start by identifying the change type:
 |---|---|---|
 | Skill prompt/workflow wording | Format `SKILL.md` and `aesg-branding/SKILL.md` | Commit and sync organization packages |
 | Shared skill auto-routing | `packages/harness/src/harness/system-prompt.ts` | Deploy API and worker; sync packages when skill content also changed |
-| Brand rule or token | `brand-system.md`, `brand-tokens.json`, affected generators | Revalidate affected formats and sync organization packages |
+| Brand rule, image workflow, or token | `brand-system.md`, `image-generation.md`, `brand-tokens.json`, `composite_logo.py`, affected generators | Revalidate affected formats and image compositions; sync organization packages |
 | DOCX generation | `create_aesg_docx.py`, letterhead template | Sync organization packages; PDF also needs review because it depends on DOCX |
 | PDF generation | `create_aesg_pdf.py`, DOCX generator, LibreOffice runtime | Sync organization packages; rebuild the image only if LibreOffice dependencies changed |
 | XLSX generation | `create_aesg_xlsx.py`, workbook style evidence | Sync organization packages |
-| PPTX layout | `create_aesg_pptx.py`, retained PPTX, shape/layout map | Sync organization packages |
-| Template or asset | `assets/templates`, `assets/extracted`, manifest hashes | Privacy audit, visual QA, and organization-package sync |
+| PPTX layout or compaction | `create_aesg_pptx.py`, `compact_pptx_template.py`, retained PPTX, shape/layout map | Sync organization packages |
+| Template or asset | `assets/templates`, `assets/logos`, `assets/reference`, manifest hashes | Privacy audit, visual QA, and organization-package sync |
 | Python dependency | `requirements.lock`, `template.ts` | Full image rebuild |
 | Node/E2B build dependency | `package.json`, Linux-generated lockfile | Full image rebuild |
 | Artifact MIME/persistence | API/worker artifact code, not only the skill | Deploy the affected service |
@@ -655,10 +728,13 @@ Prefer this sequence:
 2. Audit visible and hidden content.
 3. Check ZIP integrity and relationships.
 4. Compare dimensions, styles, layouts, master count, and shape IDs.
-5. Update generator mappings.
-6. Remove all sample content that is not approved for runtime.
-7. Recalculate SHA-256 hashes in the manifest.
-8. Re-render representative outputs.
+5. For PPTX, repair corruption first, then prune to layouts reached by approved
+   specimens with `compact_pptx_template.py`.
+6. Update generator mappings.
+7. Remove all sample content that is not approved for runtime.
+8. Recalculate SHA-256 hashes and byte counts in the manifest.
+9. Re-render representative outputs. For PPTX compaction, compare all specimen
+   renders pixel-for-pixel before accepting the asset.
 
 ## 6. Failures already encountered
 
@@ -753,10 +829,12 @@ environment file.
 
 ### Artifacts
 
+- [ ] Image requests activate `aesg-branding`, supply both visual boards and exactly one PNG logo, and never rely on a generated logo facsimile.
+- [ ] Full-colour logo is used on white/light compositions; white logo is used on green/gray/dark compositions with sufficient clear space.
 - [ ] DOCX retains approved letterhead and page furniture.
 - [ ] PDF is a valid A4 PDF with embedded AESG fonts.
 - [ ] XLSX has no hidden employee sheet or formula errors.
-- [ ] PPTX retains the approved master/layout system.
+- [ ] PPTX retains 17 approved specimens, 1 master, and 17 reachable layouts.
 - [ ] Rendered outputs have no clipping, overlap, or placeholder text.
 - [ ] Only final deliverables are published.
 

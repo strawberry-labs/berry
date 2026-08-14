@@ -371,6 +371,7 @@ export interface SandboxSnapshotObjectStore {
 
 export class SandboxContinuityManager implements DurableTurnToolExecutor {
   readonly #stagedInputFileIds = new Map<string, Set<string>>();
+  readonly #sandboxStarts = new Map<string, Promise<{ provider: string; id: string; state: string }>>();
 
   constructor(
     private readonly provider: SandboxProvider,
@@ -1228,6 +1229,17 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }
 
   private async ensureSandbox(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
+    const key = `${snapshot.tenantId}:${snapshot.id}`;
+    const existing = this.#sandboxStarts.get(key);
+    if (existing) return existing;
+    const started = this.ensureSandboxUncached(snapshot).finally(() => {
+      if (this.#sandboxStarts.get(key) === started) this.#sandboxStarts.delete(key);
+    });
+    this.#sandboxStarts.set(key, started);
+    return started;
+  }
+
+  private async ensureSandboxUncached(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
     if (snapshot.sandboxId) {
       try {
         return await this.withSandboxLifecycleLock(snapshot.tenantId, snapshot.sandboxId, async (repository) => {

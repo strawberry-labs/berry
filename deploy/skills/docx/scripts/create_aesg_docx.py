@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import zipfile
 from pathlib import Path
 
 from docx import Document
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
@@ -20,6 +21,22 @@ GREEN = "008C95"
 GRAY = "343741"
 WHITE = "FFFFFF"
 FONT = "Verdana"
+REPORT_USABLE_WIDTH_DXA = 10460
+CELL_MARGIN_DXA = 120
+LETTER_TEXT = "53565A"
+LETTER_BODY_PT = 9.0
+LETTER_SUBJECT_PT = 12.0
+LETTER_BLOCK_LINE_PT = 13.8
+LETTER_KINDS = {
+    "letter",
+    "letterhead",
+    "leave-request",
+    "leave_request",
+    "memo",
+    "simple",
+    "simple-document",
+    "simple_document",
+}
 
 
 def report_template(branding_skill_dir: Path) -> Path:
@@ -96,11 +113,12 @@ def remove_page_breaks(element) -> None:
 
 def source_parts(document: Document):
     body = document._element.body
+    children = list(body)
     cover = None
     approval = None
     divider = None
     section_properties = []
-    for child in body:
+    for index, child in enumerate(children):
         tag = child.tag.rsplit("}", 1)[-1]
         value = normalise(text_of(child))
         if tag == "sdt" and "report title" in value and "project name" in value:
@@ -110,7 +128,16 @@ def source_parts(document: Document):
         elif tag == "p" and "section heading i" in value and child.xpath(
             './/*[local-name()="drawing" or local-name()="pict"]'
         ):
-            divider = copy.deepcopy(child)
+            start = None
+            for candidate_index in range(index - 1, max(index - 5, -1), -1):
+                candidate = children[candidate_index]
+                if candidate.xpath(
+                    './/*[local-name()="blip"]/@*[local-name()="embed"]'
+                ):
+                    start = candidate_index
+                    break
+            if start is not None:
+                divider = [copy.deepcopy(element) for element in children[start : index + 1]]
         for sect_pr in child.xpath('.//*[local-name()="sectPr"]'):
             section_properties.append(copy.deepcopy(sect_pr))
     if body.sectPr is not None:
@@ -153,14 +180,23 @@ def add_section_break(document: Document, section_properties) -> None:
 
 
 def style_by_name(document: Document, *names: str):
-    wanted = {name.casefold() for name in names}
-    for style in document.styles:
-        if style.name and style.name.casefold() in wanted:
-            return style
+    styles = list(document.styles)
+    for name in names:
+        wanted = name.casefold()
+        for style in styles:
+            if style.name and style.name.casefold() == wanted:
+                return style
     return None
 
 
-def set_run_font(run, *, bold: bool | None = None, italic: bool | None = None) -> None:
+def set_run_font(
+    run,
+    *,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    size_pt: float | None = None,
+    color: str | None = None,
+) -> None:
     run.font.name = FONT
     fonts = run._element.get_or_add_rPr().get_or_add_rFonts()
     fonts.set(qn("w:ascii"), FONT)
@@ -169,20 +205,42 @@ def set_run_font(run, *, bold: bool | None = None, italic: bool | None = None) -
         run.bold = bold
     if italic is not None:
         run.italic = italic
+    if size_pt is not None:
+        run.font.size = Pt(size_pt)
+    if color is not None:
+        run.font.color.rgb = RGBColor.from_string(color)
 
 
 def add_text(
     document: Document,
     value: str,
     *style_names: str,
-    bold: bool = False,
-    italic: bool = False,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    size_pt: float | None = None,
+    color: str | None = None,
+    space_before_pt: float | None = None,
+    space_after_pt: float | None = None,
+    line_spacing_pt: float | None = None,
 ):
     style = style_by_name(document, *style_names)
     paragraph = document.add_paragraph(style=style)
-    paragraph.paragraph_format.space_after = Pt(7)
+    if style is None:
+        paragraph.paragraph_format.space_after = Pt(7)
+    if space_before_pt is not None:
+        paragraph.paragraph_format.space_before = Pt(space_before_pt)
+    if space_after_pt is not None:
+        paragraph.paragraph_format.space_after = Pt(space_after_pt)
+    if line_spacing_pt is not None:
+        paragraph.paragraph_format.line_spacing = Pt(line_spacing_pt)
     run = paragraph.add_run(str(value))
-    set_run_font(run, bold=bold, italic=italic)
+    set_run_font(
+        run,
+        bold=bold,
+        italic=italic,
+        size_pt=size_pt,
+        color=color,
+    )
     return paragraph
 
 
@@ -195,7 +253,98 @@ def shade(cell, fill: str) -> None:
     shading.set(qn("w:fill"), fill)
 
 
-def add_table(document: Document, spec: dict) -> None:
+def set_cell_margins(cell, value: int = CELL_MARGIN_DXA) -> None:
+    properties = cell._tc.get_or_add_tcPr()
+    margins = properties.find(qn("w:tcMar"))
+    if margins is None:
+        margins = OxmlElement("w:tcMar")
+        properties.append(margins)
+    for side in ("top", "start", "bottom", "end"):
+        node = margins.find(qn(f"w:{side}"))
+        if node is None:
+            node = OxmlElement(f"w:{side}")
+            margins.append(node)
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+
+
+def set_repeat_table_header(row) -> None:
+    properties = row._tr.get_or_add_trPr()
+    marker = properties.find(qn("w:tblHeader"))
+    if marker is None:
+        marker = OxmlElement("w:tblHeader")
+        properties.append(marker)
+    marker.set(qn("w:val"), "true")
+
+
+def usable_width_dxa(document: Document) -> int:
+    section = document.sections[-1]
+    dimensions = (section.page_width, section.left_margin, section.right_margin)
+    if any(value is None for value in dimensions):
+        return REPORT_USABLE_WIDTH_DXA
+    return int(section.page_width.twips - section.left_margin.twips - section.right_margin.twips)
+
+
+def table_width_dxa(document: Document) -> int:
+    return usable_width_dxa(document) - CELL_MARGIN_DXA
+
+
+def column_widths(spec: dict, count: int, total_width_dxa: int) -> list[int]:
+    requested = spec.get("widths")
+    if requested is None:
+        weights = [1.0] * count
+    else:
+        if not isinstance(requested, list) or len(requested) != count:
+            raise ValueError("table.widths must contain one positive value per header")
+        weights = [float(value) for value in requested]
+        if any(value <= 0 for value in weights):
+            raise ValueError("table.widths values must be positive")
+    total = sum(weights)
+    widths = [round(total_width_dxa * value / total) for value in weights]
+    widths[-1] += total_width_dxa - sum(widths)
+    return widths
+
+
+def set_table_geometry(table, widths: list[int]) -> None:
+    table.autofit = False
+    properties = table._tbl.tblPr
+    width = properties.find(qn("w:tblW"))
+    if width is None:
+        width = OxmlElement("w:tblW")
+        properties.append(width)
+    width.set(qn("w:w"), str(sum(widths)))
+    width.set(qn("w:type"), "dxa")
+    indent = properties.find(qn("w:tblInd"))
+    if indent is None:
+        indent = OxmlElement("w:tblInd")
+        properties.append(indent)
+    indent.set(qn("w:w"), str(CELL_MARGIN_DXA))
+    indent.set(qn("w:type"), "dxa")
+    grid = table._tbl.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for value in widths:
+        column = OxmlElement("w:gridCol")
+        column.set(qn("w:w"), str(value))
+        grid.append(column)
+    for row in table.rows:
+        for cell, value in zip(row.cells, widths):
+            cell_properties = cell._tc.get_or_add_tcPr()
+            cell_width = cell_properties.find(qn("w:tcW"))
+            if cell_width is None:
+                cell_width = OxmlElement("w:tcW")
+                cell_properties.append(cell_width)
+            cell_width.set(qn("w:w"), str(value))
+            cell_width.set(qn("w:type"), "dxa")
+            set_cell_margins(cell)
+
+
+def add_table(
+    document: Document,
+    spec: dict,
+    *,
+    font_size_pt: float | None = None,
+) -> None:
     headers = [str(value) for value in spec.get("headers", [])]
     rows = list(spec.get("rows", []))
     if not headers:
@@ -204,34 +353,42 @@ def add_table(document: Document, spec: dict) -> None:
     preferred = style_by_name(document, "AESG Table", "Table Grid")
     if preferred is not None:
         table.style = preferred
-    table.autofit = True
+    widths = column_widths(spec, len(headers), table_width_dxa(document))
     for index, header in enumerate(headers):
         cell = table.rows[0].cells[index]
         shade(cell, GREEN)
         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
         paragraph = cell.paragraphs[0]
         run = paragraph.add_run(header)
-        set_run_font(run, bold=True)
+        set_run_font(run, bold=True, size_pt=font_size_pt)
         run.font.color.rgb = RGBColor.from_string(WHITE)
+    set_repeat_table_header(table.rows[0])
     for row_values in rows:
         values = list(row_values.values()) if isinstance(row_values, dict) else list(row_values)
         cells = table.add_row().cells
         for index, cell in enumerate(cells):
             value = values[index] if index < len(values) else ""
             run = cell.paragraphs[0].add_run(str(value))
-            set_run_font(run)
+            set_run_font(run, size_pt=font_size_pt)
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    set_table_geometry(table, widths)
     document.add_paragraph()
 
 
-def add_callout(document: Document, value: str) -> None:
+def add_callout(
+    document: Document,
+    value: str,
+    *,
+    font_size_pt: float | None = None,
+) -> None:
     table = document.add_table(rows=1, cols=1)
     cell = table.cell(0, 0)
     shade(cell, "E6F4F5")
     paragraph = cell.paragraphs[0]
     run = paragraph.add_run(value)
-    set_run_font(run, bold=True)
+    set_run_font(run, bold=True, size_pt=font_size_pt)
     run.font.color.rgb = RGBColor.from_string(GRAY)
+    set_table_geometry(table, [table_width_dxa(document)])
     document.add_paragraph()
 
 
@@ -242,8 +399,11 @@ def add_image(document: Document, image_spec) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"image not found: {path}")
     width = float(image_spec.get("widthInches", image_spec.get("width", 6.2)))
-    caption = None
+    paragraph = document.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.add_run().add_picture(str(path), width=Inches(width))
     if image_spec.get("caption"):
+        paragraph.paragraph_format.keep_with_next = True
         caption = add_text(
             document,
             str(image_spec["caption"]),
@@ -252,37 +412,54 @@ def add_image(document: Document, image_spec) -> None:
             italic=True,
         )
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        caption.paragraph_format.keep_with_next = True
-    paragraph = document.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.add_run().add_picture(str(path), width=Inches(width))
+        caption.paragraph_format.keep_with_next = bool(image_spec.get("source"))
     if image_spec.get("source"):
         add_text(document, f"Source: {image_spec['source']}", "AESG Body Text", "Normal", italic=True)
 
 
-def add_divider(document: Document, heading: str) -> None:
-    table = document.add_table(rows=1, cols=1)
-    table.autofit = True
-    row = table.rows[0]
-    row.height = Inches(8.4)
-    row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
-    cell = row.cells[0]
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    shade(cell, GREEN)
-    paragraph = cell.paragraphs[0]
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    run = paragraph.add_run(heading)
-    set_run_font(run, bold=True)
-    run.font.size = Pt(25)
-    run.font.color.rgb = RGBColor.from_string(WHITE)
-    document.add_page_break()
+def add_divider(
+    document: Document,
+    heading: str,
+    divider_source,
+    *,
+    start_on_new_page: bool,
+) -> None:
+    if start_on_new_page:
+        document.add_page_break()
+    divider = [copy.deepcopy(element) for element in divider_source]
+    for element in divider:
+        replace_leaf_text(element, {"Section Heading II": heading})
+    next_shape_id = max(
+        [
+            int(node.get("id"))
+            for node in document._element.xpath(
+                './/*[local-name()="docPr" or local-name()="cNvPr"]'
+            )
+            if str(node.get("id", "")).isdigit()
+        ]
+        or [0]
+    ) + 1
+    for element in divider:
+        for node in element.xpath('.//*[local-name()="docPr" or local-name()="cNvPr"]'):
+            node.set("id", str(next_shape_id))
+            next_shape_id += 1
+        for node in element.xpath('.//*[local-name()="shape"]'):
+            if str(node.get("id", "")).startswith("_x0000_s"):
+                node.set("id", f"_x0000_s{next_shape_id}")
+                next_shape_id += 1
+        append_before_final_section(document, element)
 
 
 def add_sections(document: Document, sections: list[dict], divider_source=None) -> None:
     for index, section in enumerate(sections):
         heading = str(section.get("heading", "")).strip()
         if section.get("divider") and heading and divider_source is not None:
-            add_divider(document, heading)
+            add_divider(
+                document,
+                heading,
+                divider_source,
+                start_on_new_page=index > 0,
+            )
         elif section.get("pageBreak") and (index or document.paragraphs):
             document.add_page_break()
         if heading:
@@ -332,7 +509,7 @@ def populate_approval_table(table_element, spec: dict) -> None:
         7: str(spec.get("date", "")),
     }
     for row_index, value in values.items():
-        if row_index >= len(rows) or not value:
+        if row_index >= len(rows):
             continue
         cells = rows[row_index].xpath('./*[local-name()="tc"]')
         if not cells:
@@ -406,26 +583,209 @@ def create_report(document: Document, spec: dict) -> None:
     add_sections(document, list(spec.get("sections", [])), divider)
 
 
+def add_letter_multiline(document: Document, lines: list[str]) -> None:
+    if not lines:
+        return
+    style = style_by_name(document, "Heading 2", "heading 2", "Normal")
+    paragraph = document.add_paragraph(style=style)
+    paragraph.paragraph_format.line_spacing = Pt(LETTER_BLOCK_LINE_PT)
+    for index, line in enumerate(lines):
+        if index:
+            paragraph.add_run().add_break()
+        if line:
+            run = paragraph.add_run(str(line))
+            set_run_font(
+                run,
+                size_pt=LETTER_BODY_PT,
+                color=LETTER_TEXT,
+            )
+
+
+def add_letter_reference_subject(document: Document, spec: dict) -> None:
+    reference = str(spec.get("reference", "")).strip()
+    subject = str(spec.get("subject", spec.get("title", ""))).strip()
+    if not reference and not subject:
+        return
+    style = style_by_name(document, "Heading 2", "heading 2", "Normal")
+    paragraph = document.add_paragraph(style=style)
+    paragraph.paragraph_format.line_spacing = Pt(LETTER_BLOCK_LINE_PT)
+    paragraph.paragraph_format.space_after = Pt(18)
+    if reference:
+        run = paragraph.add_run(f"Reference: {reference}")
+        set_run_font(run, size_pt=LETTER_BODY_PT, color=LETTER_TEXT)
+    if reference and subject:
+        paragraph.add_run().add_break()
+        paragraph.add_run().add_break()
+    if subject:
+        run = paragraph.add_run(subject)
+        set_run_font(
+            run,
+            bold=True,
+            size_pt=LETTER_SUBJECT_PT,
+            color=LETTER_TEXT,
+        )
+
+
+def add_letter_sections(document: Document, sections: list[dict]) -> None:
+    for section in sections:
+        if section.get("pageBreak") and document.paragraphs:
+            document.add_page_break()
+        heading = str(section.get("heading", "")).strip()
+        if heading:
+            add_text(
+                document,
+                heading,
+                "Heading 1",
+                bold=True,
+                size_pt=LETTER_SUBJECT_PT,
+                color=GREEN,
+                space_before_pt=12,
+                space_after_pt=9,
+            )
+        for paragraph in section.get("paragraphs", []):
+            value = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
+            add_text(
+                document,
+                str(value),
+                "Normal",
+                size_pt=LETTER_BODY_PT,
+                color=LETTER_TEXT,
+                space_after_pt=9,
+            )
+        for bullet in section.get("bullets", []):
+            add_text(
+                document,
+                str(bullet),
+                "List Bullet",
+                "Normal",
+                size_pt=LETTER_BODY_PT,
+                color=LETTER_TEXT,
+                space_after_pt=3,
+            )
+        for numbered in section.get("numbered", []):
+            add_text(
+                document,
+                str(numbered),
+                "List Number",
+                "Normal",
+                size_pt=LETTER_BODY_PT,
+                color=LETTER_TEXT,
+                space_after_pt=3,
+            )
+        if section.get("callout"):
+            add_callout(
+                document,
+                str(section["callout"]),
+                font_size_pt=LETTER_BODY_PT,
+            )
+        if section.get("table"):
+            if section["table"].get("caption"):
+                add_text(
+                    document,
+                    str(section["table"]["caption"]),
+                    "Normal",
+                    bold=True,
+                    size_pt=LETTER_BODY_PT,
+                    color=LETTER_TEXT,
+                    space_before_pt=9,
+                    space_after_pt=3,
+                )
+            add_table(
+                document,
+                section["table"],
+                font_size_pt=LETTER_BODY_PT,
+            )
+        images = section.get("images", [])
+        if section.get("image"):
+            images = [section["image"], *images]
+        for image in images:
+            add_image(document, image)
+        if section.get("source"):
+            add_text(
+                document,
+                f"Source: {section['source']}",
+                "Normal",
+                italic=True,
+                size_pt=LETTER_BODY_PT,
+                color=LETTER_TEXT,
+                space_after_pt=9,
+            )
+
+
 def create_letter(document: Document, spec: dict) -> None:
     clear_body(document)
     recipient = spec.get("recipient", [])
     if isinstance(recipient, str):
         recipient = [recipient]
+    opening_lines = [str(line) for line in recipient]
     if spec.get("date"):
-        add_text(document, str(spec["date"]), "AESG Body Text", "Normal")
-    for line in recipient:
-        add_text(document, str(line), "AESG Body Text", "Normal")
-    if spec.get("reference"):
-        add_text(document, f"Reference: {spec['reference']}", "AESG Sub H1", "Heading 2")
-    if spec.get("subject"):
-        add_text(document, str(spec["subject"]), "AESG Sub H1", "Heading 2", bold=True)
-    add_text(document, str(spec.get("salutation", "Dear Sir or Madam,")), "AESG Body Text", "Normal")
-    add_sections(document, list(spec.get("sections", [])))
-    add_text(document, str(spec.get("closing", "Yours sincerely,")), "AESG Body Text", "Normal")
+        if opening_lines:
+            opening_lines.append("")
+        opening_lines.append(str(spec["date"]))
+    add_letter_multiline(document, opening_lines)
+    add_letter_reference_subject(document, spec)
+    add_text(
+        document,
+        str(spec.get("salutation", "Dear Sir or Madam,")),
+        "Normal",
+        size_pt=LETTER_BODY_PT,
+        color=LETTER_TEXT,
+        space_after_pt=9,
+    )
+    add_letter_sections(document, list(spec.get("sections", [])))
+    add_text(
+        document,
+        str(spec.get("closing", "Yours sincerely,")),
+        "Normal",
+        size_pt=LETTER_BODY_PT,
+        color=LETTER_TEXT,
+        space_before_pt=9,
+        space_after_pt=18,
+    )
     if spec.get("signatory"):
-        add_text(document, str(spec["signatory"]), "AESG Body Text", "Normal", bold=True)
+        add_text(
+            document,
+            str(spec["signatory"]),
+            "Normal",
+            size_pt=LETTER_BODY_PT,
+            color=LETTER_TEXT,
+        )
     if spec.get("designation"):
-        add_text(document, str(spec["designation"]), "AESG Body Text", "Normal")
+        add_text(
+            document,
+            str(spec["designation"]),
+            "Normal",
+            size_pt=LETTER_BODY_PT,
+            color=LETTER_TEXT,
+        )
+
+
+def restore_letter_template_parts(template: Path, output: Path) -> None:
+    """Restore untouched letterhead structures after python-docx serialisation."""
+
+    exact_parts = {
+        "word/styles.xml",
+        "word/numbering.xml",
+        "word/settings.xml",
+        "word/fontTable.xml",
+        "word/webSettings.xml",
+    }
+    prefixes = (
+        "word/header",
+        "word/footer",
+        "word/_rels/header",
+        "word/_rels/footer",
+        "word/theme/",
+    )
+    temporary = output.with_name(f".{output.stem}.preserved{output.suffix}")
+    with zipfile.ZipFile(template) as source, zipfile.ZipFile(output) as generated:
+        source_names = set(source.namelist())
+        with zipfile.ZipFile(temporary, "w") as target:
+            for info in generated.infolist():
+                should_restore = info.filename in exact_parts or info.filename.startswith(prefixes)
+                data = source.read(info.filename) if should_restore and info.filename in source_names else generated.read(info.filename)
+                target.writestr(info, data)
+    temporary.replace(output)
 
 
 def normalise_new_text(document: Document) -> None:
@@ -452,9 +812,18 @@ def main() -> int:
     if args.output.suffix.casefold() != ".docx":
         raise ValueError("--output must end in .docx")
     spec = json.loads(args.spec.read_text(encoding="utf-8"))
-    kind = str(spec.get("kind", "report")).casefold()
+    raw_kind = spec.get("kind")
+    if raw_kind is None:
+        letter_fields = {"recipient", "reference", "subject", "salutation", "closing", "signatory", "designation"}
+        kind = "letter" if letter_fields.intersection(spec) else "report"
+    else:
+        kind = str(raw_kind).strip().casefold()
+        if kind in LETTER_KINDS:
+            kind = "letter"
     if kind not in {"report", "letter"}:
-        raise ValueError("kind must be report or letter")
+        raise ValueError(
+            "kind must be report or a letterhead route such as letter, memo, or leave-request"
+        )
     template = args.template or (report_template(args.branding_skill_dir) if kind == "report" else letter_template(args.branding_skill_dir))
     if not template.is_file():
         raise FileNotFoundError(template)
@@ -476,6 +845,8 @@ def main() -> int:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     document.save(args.output)
+    if kind == "letter":
+        restore_letter_template_parts(template, args.output)
     print(
         json.dumps(
             {

@@ -11,56 +11,111 @@ from pathlib import Path
 from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.oxml.ns import qn
-from pptx.util import Inches, Pt
+from pptx.util import Pt
 
 
 SLIDE_LAYOUT_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout"
 NOTES_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
+FONT = "Verdana"
 GREEN = RGBColor(0x00, 0x8C, 0x95)
 GRAY = RGBColor(0x34, 0x37, 0x41)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
-FONT = "Verdana"
 
 
 LAYOUTS = {
     "cover": {"slide": 1, "mode": "cover"},
-    "text": {"slide": 2, "bodies": [499], "max": 1800},
-    "two_columns": {"slide": 3, "bodies": [500, 503], "max": 850},
-    "three_columns": {"slide": 4, "bodies": [504, 507, 508], "max": 540},
-    "statement": {"slide": 6, "bodies": [518], "max": 1000, "title_backing": True},
-    "image_bottom": {"slide": 7, "bodies": [522], "image_slots": [68], "max": 650},
-    "text_image": {"slide": 8, "bodies": [524], "image_slots": [86], "max": 700},
-    "image_text": {"slide": 9, "bodies": [528], "image_slots": [96], "max": 700},
+    "text": {"slide": 2, "title": 498, "section": 497, "bodies": [499], "max": 1800},
+    "two_columns": {
+        "slide": 3,
+        "title": 502,
+        "section": 501,
+        "bodies": [500, 503],
+        "max": 850,
+    },
+    "three_columns": {
+        "slide": 4,
+        "title": 506,
+        "section": 505,
+        "bodies": [504, 507, 508],
+        "max": 540,
+    },
+    "five_images": {
+        "slide": 5,
+        "title": 509,
+        "bodies": [515],
+        "image_slots": [510, 511, 512, 513, 514],
+        "min_images": 1,
+        "max": 760,
+    },
+    "image_statement": {
+        "slide": 6,
+        "title": 517,
+        "section": 516,
+        "bodies": [518],
+        "image_slots": [519],
+        "min_images": 1,
+        "max": 1000,
+    },
+    "image_bottom": {
+        "slide": 7,
+        "title": 521,
+        "section": 520,
+        "bodies": [522],
+        "image_slots": [523],
+        "min_images": 1,
+        "max": 650,
+    },
+    "text_image": {
+        "slide": 8,
+        "title": 527,
+        "section": 526,
+        "bodies": [524],
+        "image_slots": [525],
+        "min_images": 1,
+        "max": 700,
+    },
+    "image_text": {
+        "slide": 9,
+        "title": 531,
+        "section": 530,
+        "bodies": [528],
+        "image_slots": [529],
+        "min_images": 1,
+        "max": 700,
+    },
     "divider": {"slide": 10, "mode": "divider", "bodies": [532]},
     "gallery": {
         "slide": 11,
         "bodies": [533, 537, 541],
-        "image_slots": [223, 224, 225, 227, 228, 229, 231, 232, 233],
+        "image_slots": [534, 535, 536, 538, 539, 540, 542, 543, 544],
+        "min_images": 1,
         "max": 420,
     },
     "image_three_columns": {
         "slide": 12,
         "bodies": [546, 547, 548],
-        "image_slots": [266],
+        "image_slots": [545],
+        "min_images": 1,
         "max": 360,
-        "title_backing": True,
     },
     "three_columns_image": {
         "slide": 13,
         "bodies": [550, 551, 552],
-        "image_slots": [276],
+        "image_slots": [549],
+        "min_images": 1,
         "max": 360,
     },
     "image_two_columns": {
         "slide": 15,
         "bodies": [553, 554],
-        "image_slots": [330],
+        "image_slots": [555],
+        "min_images": 1,
         "max": 520,
-        "title_backing": True,
     },
-    "plain": {"slide": 16, "bodies": [557], "max": 1500},
+    "statement": {"slide": 16, "title": 556, "bodies": [557], "max": 1000},
+    "plain": {"slide": 16, "title": 556, "bodies": [557], "max": 1500},
     "closing": {"slide": 17, "mode": "closing"},
 }
 
@@ -72,7 +127,13 @@ def shape_by_id(container, shape_id: int):
     return None
 
 
-def replace_paragraph(paragraph, text: str) -> None:
+def replace_paragraph(
+    paragraph,
+    text: str,
+    *,
+    size: float | None = None,
+    color: RGBColor | None = None,
+) -> None:
     if paragraph.runs:
         paragraph.runs[0].text = text
         for run in list(paragraph.runs[1:]):
@@ -81,6 +142,10 @@ def replace_paragraph(paragraph, text: str) -> None:
         paragraph.add_run().text = text
     for run in paragraph.runs:
         run.font.name = FONT
+        if size is not None:
+            run.font.size = Pt(size)
+        if color is not None:
+            run.font.color.rgb = color
 
 
 def text_runs(value) -> list[tuple[str, bool, bool]]:
@@ -116,7 +181,14 @@ def set_bullet(paragraph, enabled: bool) -> None:
         properties.append(properties.makeelement(qn("a:buNone"), {}))
 
 
-def set_block(shape, value) -> None:
+def set_block(
+    shape,
+    value,
+    *,
+    size: float | None = None,
+    color: RGBColor | None = None,
+    force_bold: bool | None = None,
+) -> None:
     if shape is None or not getattr(shape, "has_text_frame", False):
         return
     values = text_runs(value)
@@ -124,12 +196,34 @@ def set_block(shape, value) -> None:
     while len(paragraphs) < len(values):
         shape.text_frame.add_paragraph()
         paragraphs = shape.text_frame.paragraphs
+    for paragraph in list(paragraphs[len(values) :]):
+        shape.text_frame._txBody.remove(paragraph._p)
+    paragraphs = shape.text_frame.paragraphs
     for index, paragraph in enumerate(paragraphs):
-        text, bold, bullet = values[index] if index < len(values) else ("", False, False)
-        replace_paragraph(paragraph, text)
+        text, bold, bullet = values[index]
+        replace_paragraph(paragraph, text, size=size, color=color)
         set_bullet(paragraph, bullet)
         if paragraph.runs:
-            paragraph.runs[0].font.bold = bold
+            paragraph.runs[0].font.bold = bold if force_bold is None else force_bold
+
+
+def remove_shape(container, shape) -> None:
+    if shape is not None:
+        container.shapes._spTree.remove(shape.element)
+
+
+def set_or_remove(container, shape_id: int | None, value, **kwargs) -> None:
+    if shape_id is None:
+        if str(value or "").strip():
+            raise ValueError("selected layout does not provide a slot for this text")
+        return
+    shape = shape_by_id(container, shape_id)
+    if shape is None and str(value or "").strip():
+        raise ValueError(f"missing text slot {shape_id}")
+    if not str(value or "").strip():
+        remove_shape(container, shape)
+        return
+    set_block(shape, value, **kwargs)
 
 
 def clone_slide(presentation: Presentation, source):
@@ -165,114 +259,37 @@ def remove_original_slides(presentation: Presentation, count: int) -> None:
         del slide_ids[0]
 
 
-def add_text_box(
-    slide,
-    text: str,
-    *,
-    left: float,
-    top: float,
-    width: float,
-    height: float,
-    size: float,
-    color: RGBColor,
-    bold: bool = False,
-    align=PP_ALIGN.LEFT,
-):
-    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
-    frame = box.text_frame
-    frame.clear()
-    frame.word_wrap = True
-    paragraph = frame.paragraphs[0]
-    paragraph.alignment = align
-    run = paragraph.add_run()
-    run.text = text
-    run.font.name = FONT
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    run.font.color.rgb = color
-    return box
-
-
-def add_title(slide, title: str, section: str = "", *, backing: bool = False) -> None:
-    if section:
-        add_text_box(
-            slide,
-            section.upper(),
-            left=0.6,
-            top=0.72,
-            width=9.4,
-            height=0.22,
-            size=8.5,
-            color=GREEN,
-            bold=True,
-        )
-    title_box = add_text_box(
-        slide,
-        title,
-        left=0.6,
-        top=0.92 if section else 0.78,
-        width=9.5,
-        height=0.72,
-        size=21,
-        color=GRAY,
-        bold=True,
-    )
-    if backing:
-        title_box.fill.solid()
-        title_box.fill.fore_color.rgb = WHITE
-        title_box.line.fill.background()
-
-
 def add_cover_text(slide, spec: dict) -> None:
-    title = str(spec.get("title", "AESG presentation"))
-    add_text_box(
+    set_or_remove(
         slide,
-        title,
-        left=0.72,
-        top=1.35,
-        width=7.6,
-        height=1.35,
+        494,
+        str(spec.get("client", "")).upper(),
+        size=10,
+        color=WHITE,
+        force_bold=True,
+    )
+    set_or_remove(
+        slide,
+        492,
+        str(spec.get("title", "AESG presentation")),
         size=30,
         color=WHITE,
-        bold=True,
+        force_bold=True,
     )
-    subtitle = str(spec.get("subtitle", "")).strip()
-    if subtitle:
-        add_text_box(
-            slide,
-            subtitle,
-            left=0.75,
-            top=2.65,
-            width=6.9,
-            height=0.85,
-            size=15,
-            color=WHITE,
-        )
-    meta = "  |  ".join(
-        str(value) for value in (spec.get("client"), spec.get("date")) if value
-    )
-    if meta:
-        add_text_box(
-            slide,
-            meta,
-            left=0.75,
-            top=6.72,
-            width=6.8,
-            height=0.35,
-            size=9,
-            color=WHITE,
-        )
+    set_or_remove(slide, 493, str(spec.get("subtitle", "")), size=15, color=WHITE)
+    set_or_remove(slide, 495, str(spec.get("reference", "")), size=9, color=WHITE)
+    set_or_remove(slide, 496, str(spec.get("date", "")), size=9, color=WHITE)
 
 
-def add_picture_cover(slide, path: Path, slot) -> None:
+def replace_picture(slide, path: Path, slot) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"slide image not found: {path}")
     with Image.open(path) as image:
         image_ratio = image.width / image.height
     frame_ratio = slot.width / slot.height
-    picture = slide.shapes.add_picture(
-        str(path), slot.left, slot.top, width=slot.width, height=slot.height
-    )
+    left, top, width, height = slot.left, slot.top, slot.width, slot.height
+    remove_shape(slide, slot)
+    picture = slide.shapes.add_picture(str(path), left, top, width=width, height=height)
     if image_ratio > frame_ratio:
         visible = frame_ratio / image_ratio
         crop = (1 - visible) / 2
@@ -299,6 +316,10 @@ def validate_capacity(layout: str, slide_spec: dict, config: dict) -> None:
     title = str(slide_spec.get("title", ""))
     if len(title) > 90:
         raise ValueError(f"{layout} title exceeds 90 characters")
+    if title and config.get("mode") not in {"cover", "divider"} and not config.get("title"):
+        raise ValueError(f"{layout} is a titleless specimen; choose a titled layout or omit title")
+    if slide_spec.get("section") and not config.get("section"):
+        raise ValueError(f"{layout} does not provide a section-label slot")
     limit = int(config.get("max", 0))
     if not limit:
         return
@@ -321,44 +342,71 @@ def fill_slide(slide, slide_spec: dict, slide_number: int) -> None:
     if mode == "cover":
         add_cover_text(slide, slide_spec)
     elif mode == "divider":
-        set_block(shape_by_id(slide, config["bodies"][0]), slide_spec.get("title", "Section"))
+        divider_shape = shape_by_id(slide, config["bodies"][0])
+        if divider_shape is None:
+            raise ValueError(f"missing divider text slot in {layout}")
+        set_block(divider_shape, slide_spec.get("title", "Section"))
     elif mode != "closing":
+        set_or_remove(
+            slide,
+            config.get("title"),
+            slide_spec.get("title", ""),
+            size=21,
+            color=GRAY,
+            force_bold=True,
+        )
+        set_or_remove(
+            slide,
+            config.get("section"),
+            str(slide_spec.get("section", "")).upper(),
+            size=8.5,
+            color=GREEN,
+            force_bold=True,
+        )
         values = slide_spec.get("columns") or slide_spec.get("items")
         if values is None:
             values = [slide_spec.get("body", "")]
         if not isinstance(values, list):
             values = [values]
         body_ids = config.get("bodies", [])
+        if len(values) > len(body_ids):
+            raise ValueError(f"{layout} supports at most {len(body_ids)} text blocks")
         for shape_id, value in zip(body_ids, values):
-            set_block(shape_by_id(slide, shape_id), value)
+            body_shape = shape_by_id(slide, shape_id)
+            if body_shape is None:
+                raise ValueError(f"missing text slot {shape_id} in {layout}")
+            set_block(body_shape, value)
         for shape_id in body_ids[len(values) :]:
-            set_block(shape_by_id(slide, shape_id), "")
+            remove_shape(slide, shape_by_id(slide, shape_id))
 
         images = slide_images(slide_spec)
         slots = config.get("image_slots", [])
-        if slots and not images:
-            raise ValueError(f"{layout} requires at least one image")
+        minimum = int(config.get("min_images", 0))
+        if len(images) < minimum:
+            raise ValueError(f"{layout} requires at least {minimum} image(s)")
         if len(images) > len(slots):
             raise ValueError(f"{layout} supports at most {len(slots)} images")
         for image_path, shape_id in zip(images, slots):
-            slot = shape_by_id(slide.slide_layout, shape_id)
+            slot = shape_by_id(slide, shape_id)
             if slot is None:
                 raise ValueError(f"missing image slot {shape_id} in {layout} layout")
-            add_picture_cover(slide, image_path, slot)
-
-        # Add the title last so it remains legible above image placeholders. A small
-        # white title panel is used only where the approved specimen places an image
-        # directly behind the title region.
-        add_title(
-            slide,
-            str(slide_spec.get("title", "")),
-            str(slide_spec.get("section", "")),
-            backing=bool(config.get("title_backing")),
-        )
+            replace_picture(slide, image_path, slot)
+        for shape_id in slots[len(images) :]:
+            remove_shape(slide, shape_by_id(slide, shape_id))
 
     for shape in list(slide.shapes):
-        if getattr(shape, "has_text_frame", False) and shape.text.strip().isdigit():
-            slide.shapes._spTree.remove(shape.element)
+        if not shape.is_placeholder:
+            continue
+        if shape.placeholder_format.type != PP_PLACEHOLDER.SLIDE_NUMBER:
+            continue
+        if mode in {"cover", "divider", "closing"}:
+            remove_shape(slide, shape)
+        else:
+            nodes = shape.element.xpath('.//*[local-name()="t"]')
+            if nodes:
+                nodes[0].text = str(slide_number)
+                for node in nodes[1:]:
+                    node.text = ""
 
 
 def main() -> int:
@@ -390,7 +438,7 @@ def main() -> int:
         fill_slide(slide, slide_spec, index)
 
     presentation.core_properties.title = str(spec.get("title", "AESG presentation"))
-    presentation.core_properties.subject = "AESG General Template"
+    presentation.core_properties.subject = "AESG Compact General Template"
     presentation.core_properties.author = "AESG"
     presentation.core_properties.last_modified_by = "AESG"
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -404,7 +452,7 @@ def main() -> int:
                 "slides": len(presentation.slides),
                 "masters": len(presentation.slide_masters),
                 "nativeSizeEmu": [presentation.slide_width, presentation.slide_height],
-        "template": template.name,
+                "template": template.name,
             }
         )
     )

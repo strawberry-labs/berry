@@ -1,7 +1,7 @@
 interface:
   display_name: "AESG Branding"
-  short_description: "Apply approved AESG branding to Office files"
+  short_description: "Choose and apply the correct AESG brand route"
   brand_color: "#008C95"
-  default_prompt: "Use $aesg-branding with the matching format skill to create an approved AESG-branded artifact."
+  default_prompt: "Use $aesg-branding to create this AESG deliverable: choose Letterhead for direct correspondence, General Report for structured publications, or the approved image, presentation, or workbook route."
 policy:
   allow_implicit_invocation: true

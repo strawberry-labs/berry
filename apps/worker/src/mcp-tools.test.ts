@@ -1,5 +1,202 @@
-import { describe, expect, it } from "vitest";
-import { connectorArtifactText, durableMcpToolPolicy, sanitizeMcpJournalValue } from "./mcp-tools.js";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { McpServerSpec } from "@berry/local-agent/mcp";
+import type { ChatToolDefinition } from "@berry/router-client";
+import { describe, expect, it, vi } from "vitest";
+import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
+import {
+  connectorArtifactText,
+  DurableMcpToolExecutor,
+  durableMcpToolPolicy,
+  sanitizeMcpJournalValue,
+} from "./mcp-tools.js";
+
+describe("durable MCP tool exposure", () => {
+  it("exposes only the relevant calendar connector plus core and lazy discovery tools", async () => {
+    const inherited: ChatToolDefinition = {
+      type: "function",
+      function: { name: "remember_memory", description: "Remember a fact", parameters: { type: "object" } },
+    };
+    const base: DurableTurnToolExecutor = {
+      definitions: vi.fn(async () => [inherited]),
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    };
+    const tools = new DurableMcpToolExecutor(base, connectorServers(), undefined);
+
+    const definitions = await tools.definitions(mcpSnapshot("Show my calendar events tomorrow"));
+    const names = definitions.map((definition) => definition.function.name);
+
+    expect(names).toContain("remember_memory");
+    expect(names).toContain("tool_search");
+    expect(names).toContain("mcp__Google_Calendar__list_events");
+    expect(names.some((name) => name.startsWith("mcp__Gmail__"))).toBe(false);
+    expect(names.some((name) => name.startsWith("mcp__Google_Workspace__"))).toBe(false);
+    expect(names.some((name) => name.startsWith("mcp__BerryCrawl__"))).toBe(false);
+    expect({
+      toolCount: definitions.length,
+      serializedBytes: Buffer.byteLength(JSON.stringify(definitions), "utf8"),
+    }).toMatchObject({ toolCount: 3, serializedBytes: expect.any(Number) });
+    expect(Buffer.byteLength(JSON.stringify(definitions), "utf8")).toBeLessThan(4_000);
+  });
+
+  it("recovers a semantically selected connector when the request is a paraphrase", async () => {
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("What appointments do I have tomorrow?");
+
+    const initial = await tools.definitions(snapshot);
+    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search"]);
+    expect(initial[0]?.function.parameters).toMatchObject({
+      properties: {
+        connector: { enum: expect.arrayContaining(["calendar", "gmail", "workspace", "crawl"]) },
+      },
+    });
+
+    const result = await tools.execute(snapshot, {
+      id: "search-appointments",
+      sequence: 1,
+      type: "tool.tool_search",
+      state: "pending",
+      input: {
+        toolName: "tool_search",
+        arguments: { query: "appointments tomorrow", connector: "calendar", limit: 5 },
+      },
+    } as never);
+
+    expect(result.output).toMatchObject({
+      connector: "calendar",
+      activatedTools: ["mcp__Google_Calendar__list_events"],
+      activatedServerIds: ["calendar"],
+    });
+  });
+
+  it("discovers an initially omitted authorized tool and exposes it on the next model call", async () => {
+    const base: DurableTurnToolExecutor = {
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    };
+    const tools = new DurableMcpToolExecutor(base, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("Answer the question");
+    const initial = await tools.definitions(snapshot);
+    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search"]);
+
+    const searchStep = {
+      id: "search-gmail",
+      sequence: 1,
+      type: "tool.tool_search",
+      state: "pending",
+      input: { toolName: "tool_search", arguments: { query: "email messages", limit: 5 } },
+      output: null,
+      retryClass: "read_only",
+      idempotencyKey: "search-gmail",
+      attempt: 0,
+      error: null,
+    } as const;
+    const result = await tools.execute(snapshot, searchStep as never);
+    expect(result.output).toMatchObject({
+      activatedTools: ["mcp__Gmail__search_messages"],
+      activatedServerIds: ["gmail"],
+    });
+    snapshot.steps = [{ ...searchStep, state: "completed", output: result.output }] as never;
+
+    const revealed = await tools.definitions(snapshot);
+    expect(revealed.map((definition) => definition.function.name))
+      .toContain("mcp__Gmail__search_messages");
+  });
+
+  it("keeps unauthorized connector schemas unavailable to exposure and discovery", async () => {
+    const unauthorized = connectorServer("private-mail", "Private Mail", false, "read_secret", "Read private email");
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, [...connectorServers(), unauthorized], undefined);
+    const snapshot = mcpSnapshot("Read private email");
+
+    const definitions = await tools.definitions(snapshot);
+    expect(definitions.map((definition) => definition.function.name).some((name) => name.includes("Private_Mail"))).toBe(false);
+    const search = await tools.execute(snapshot, {
+      id: "search-private",
+      type: "tool.tool_search",
+      input: { toolName: "tool_search", arguments: { query: "private secret" } },
+    } as never);
+    expect(search.output).toMatchObject({ activatedTools: [], activatedServerIds: [] });
+    await expect(tools.execute(snapshot, {
+      id: "search-private-by-id",
+      type: "tool.tool_search",
+      input: {
+        toolName: "tool_search",
+        arguments: { query: "private secret", connector: "private-mail" },
+      },
+    } as never)).rejects.toThrow("Unknown or unauthorized connector");
+    await expect(tools.execute(snapshot, {
+      id: "call-private",
+      type: "tool.mcp__Private_Mail__read_secret",
+      input: { toolName: "mcp__Private_Mail__read_secret", arguments: {} },
+    } as never)).rejects.toThrow("not enabled for this turn");
+  });
+
+  it("keeps tool discovery read-only while preserving MCP approval policy", () => {
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("calendar");
+
+    expect(tools.policy(snapshot, "tool_search", "ask")).toEqual({
+      retryClass: "read_only",
+      requiresApproval: false,
+      approvalKind: "mcp",
+    });
+    expect(tools.policy(snapshot, "mcp__Gmail__search_messages", "ask"))
+      .toMatchObject({ retryClass: "read_only", requiresApproval: false });
+  });
+
+  it("preserves approval classification and lazily executes an exposed connector tool", async () => {
+    const fixturePath = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../packages/local-agent/test/fixtures/mcp-echo-server.mjs",
+    );
+    const server: McpServerSpec = {
+      id: "echo",
+      name: "echo",
+      transport: "stdio",
+      command: process.execPath,
+      args: [fixturePath],
+      url: null,
+      env: {},
+      enabled: true,
+      trusted: true,
+      cachedTools: [{
+        name: "echo",
+        description: "Echo a message",
+        inputSchema: {
+          type: "object",
+          properties: { message: { type: "string" } },
+          required: ["message"],
+        },
+      }],
+    };
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, [server], undefined);
+    const snapshot = mcpSnapshot("Echo this message");
+
+    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
+      .toContain("mcp__echo__echo");
+    expect(tools.policy(snapshot, "mcp__echo__echo", "ask"))
+      .toMatchObject({ requiresApproval: true, approvalKind: "mcp" });
+    await expect(tools.execute(snapshot, {
+      id: "call-echo",
+      type: "tool.mcp__echo__echo",
+      input: {
+        toolCallId: "call-echo",
+        toolName: "mcp__echo__echo",
+        arguments: { message: "berry" },
+      },
+    } as never)).resolves.toMatchObject({
+      output: { content: "echo: berry", tool: "mcp__echo__echo" },
+    });
+    await tools.close();
+  });
+});
 
 describe("durable MCP journal serialization", () => {
   it("redacts binary content from both parts and raw result details", () => {
@@ -105,3 +302,57 @@ describe("connector artifact staging", () => {
     expect(text).toContain("searchable extraction is queued through Tika");
   });
 });
+
+function connectorServers(): McpServerSpec[] {
+  return [
+    connectorServer("calendar", "Google Calendar", true, "list_events", "List calendar events and meetings"),
+    connectorServer("gmail", "Gmail", true, "search_messages", "Search email messages"),
+    connectorServer("workspace", "Google Workspace", true, "search_drive", "Search Drive files and documents"),
+    connectorServer("crawl", "BerryCrawl", true, "search_web", "Search and crawl websites"),
+  ];
+}
+
+function connectorServer(
+  id: string,
+  name: string,
+  trusted: boolean,
+  toolName: string,
+  description: string,
+): McpServerSpec {
+  return {
+    id,
+    name,
+    transport: "streamable-http",
+    command: null,
+    args: [],
+    url: `https://${id}.example.test/mcp`,
+    env: {},
+    enabled: true,
+    trusted,
+    cachedTools: [{
+      name: toolName,
+      description,
+      inputSchema: { type: "object", properties: {} },
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    }],
+    trustReadOnlyAnnotations: true,
+  };
+}
+
+function mcpSnapshot(input: string): DurableTurnSnapshot & { steps: DurableTurnStep[] } {
+  return {
+    id: "00000000-0000-7000-8000-000000000901",
+    tenantId: "00000000-0000-7000-8000-000000000001",
+    userId: "user-1",
+    runtimeRequest: { input, permissionMode: "ask" },
+    steps: [],
+    entries: [{
+      entryId: "entry-user",
+      parentEntryId: null,
+      entryType: "message",
+      sequence: 1,
+      payload: { type: "message", message: { role: "user", content: input } },
+    }],
+    approvals: [],
+  } as unknown as DurableTurnSnapshot & { steps: DurableTurnStep[] };
+}

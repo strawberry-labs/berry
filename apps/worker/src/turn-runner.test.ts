@@ -24,6 +24,7 @@ import {
   createDurableTurnModel,
   durableImageToolSelectionPrompt,
   durableBuiltInToolDefinitions,
+  durableToolManifestMetrics,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -43,6 +44,22 @@ afterEach(() => {
 });
 
 describe("durable turn runner", () => {
+  it("measures the serialized tool manifest before model calls", () => {
+    const metrics = durableToolManifestMetrics([
+      {
+        type: "function",
+        function: { name: "read", description: "Read a file", parameters: { type: "object" } },
+      },
+    ]);
+
+    expect(metrics.toolCount).toBe(1);
+    expect(metrics.serializedBytes).toBe(Buffer.byteLength(JSON.stringify([{
+      type: "function",
+      function: { name: "read", description: "Read a file", parameters: { type: "object" } },
+    }]), "utf8"));
+    expect(metrics.approximateTokens).toBe(Math.ceil(metrics.serializedBytes / 4));
+  });
+
   it("guides ordinary image-edit turns toward the admitted image tool", () => {
     expect(durableImageToolSelectionPrompt([...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"]))
       .toBe(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
@@ -663,6 +680,148 @@ describe("durable turn runner", () => {
     expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("completed");
     const completed = repository.mutations.find((mutation) => mutation.toolResultMessage);
     expect(completed?.toolResultMessage?.id).toBe(completed?.entries?.[0]?.entryId);
+  });
+
+  it("runs independent reads concurrently and persists reverse-completing results in source order", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/first.txt");
+    const second = readOnlyToolStep("grep", 2, "/workspace/second.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, step) => {
+        const name = toolNameFromTestStep(step);
+        started.push(name);
+        await new Promise<void>((resolve) => releases.set(name, resolve));
+        return { output: { content: `${name} result` }, summary: `${name} completed` };
+      },
+    }, { owner: "worker-parallel-reads" });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    releases.get("grep")?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(repository.current.steps.find((step) => step.id === first.id)?.state).toBe("running");
+    releases.get("read")?.();
+
+    await expect(execution).resolves.toMatchObject({ state: "calling_model" });
+    expect(started).toEqual(["read", "grep"]);
+    const resultMutation = repository.mutations.find((mutation) => mutation.toolResultMessages);
+    expect(resultMutation?.toolResultMessages?.map((result) => result.toolCallId)).toEqual([
+      first.input.toolCallId,
+      second.input.toolCallId,
+    ]);
+    expect(repository.current.entries.slice(-2).map((entry) =>
+      (entry.payload as { message?: { toolName?: string } }).message?.toolName
+    )).toEqual(["read", "grep"]);
+  });
+
+  it("persists successful siblings when one parallel read fails", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/missing.txt");
+    const second = readOnlyToolStep("ls", 2, "/workspace");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, step) => {
+        if (toolNameFromTestStep(step) === "read") throw new Error("missing file");
+        return { output: { content: "second.txt" }, summary: "listed" };
+      },
+    }, { owner: "worker-parallel-sibling-failure" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+
+    expect(repository.current.steps.find((step) => step.id === first.id))
+      .toMatchObject({ state: "failed", error: "missing file" });
+    expect(repository.current.steps.find((step) => step.id === second.id))
+      .toMatchObject({ state: "completed", output: { content: "second.txt" } });
+    expect(repository.mutations.find((mutation) => mutation.toolResultMessages)?.toolResultMessages)
+      .toEqual([
+        expect.objectContaining({ toolCallId: first.input.toolCallId, status: "failed" }),
+        expect.objectContaining({ toolCallId: second.input.toolCallId, status: "completed" }),
+      ]);
+  });
+
+  it("heartbeats a parallel read batch and aborts its durable wait on cancellation", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/first.txt");
+    const second = readOnlyToolStep("find", 2, "/workspace");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    let heartbeatCount = 0;
+    repository.heartbeat = async () => {
+      heartbeatCount += 1;
+      return true;
+    };
+    const cancellations = new ActiveTurnCancellationRegistry();
+    const releases: Array<() => void> = [];
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        await new Promise<void>((resolve) => releases.push(resolve));
+        return { output: { content: "done" }, summary: "done" };
+      },
+    }, {
+      owner: "worker-parallel-cancel",
+      cancellations,
+      heartbeatMs: 1,
+      leaseSeconds: 1,
+    });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    await vi.waitFor(() => expect(heartbeatCount).toBeGreaterThan(0));
+    expect(cancellations.cancel(runId)).toBe(1);
+    for (const release of releases) release();
+
+    await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+    expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")))
+      .toEqual([
+        expect.objectContaining({ id: first.id, state: "running" }),
+        expect.objectContaining({ id: second.id, state: "running" }),
+      ]);
+    expect(repository.mutations.some((mutation) => mutation.toolResultMessages)).toBe(false);
+  });
+
+  it("falls back to ordered execution when a batch contains a stateful tool", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/source.txt");
+    const second = { ...toolStep("pending", "idempotent", false), sequence: 2 };
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    const calls: string[] = [];
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, step) => {
+        calls.push(toolNameFromTestStep(step));
+        return { output: { content: "done" }, summary: "done" };
+      },
+    }, { owner: "worker-mixed-tool-order" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "executing_tool" });
+    expect(calls).toEqual(["read"]);
+    expect(repository.current.steps.find((step) => step.id === second.id)?.state).toBe("pending");
+  });
+
+  it("recovers a running read batch without duplicating start events or completed results", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/first.txt", "running");
+    const second = readOnlyToolStep("ls", 2, "/workspace", "running");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    let toolCalls = 0;
+    const tools: DurableTurnToolExecutor = {
+      execute: async () => {
+        toolCalls += 1;
+        return { output: { content: "safe" }, summary: "read completed" };
+      },
+    };
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({ text: "done", inputTokens: 1, outputTokens: 1, toolCalls: [] }),
+    }, tools, { owner: "worker-parallel-recovery" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "lease-recovery" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(toolCalls).toBe(2);
+    expect(repository.events.filter((event) => event.kind === "tool.start")).toHaveLength(0);
+    expect(repository.mutations.filter((mutation) => mutation.toolResultMessages)).toHaveLength(1);
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "finalizing" });
+    expect(toolCalls).toBe(2);
+    expect(repository.mutations.filter((mutation) => mutation.toolResultMessages)).toHaveLength(1);
   });
 
   it("moves an ambiguous running non-idempotent tool to recovery_required", async () => {
@@ -2473,6 +2632,36 @@ function toolStep(
     attempt: state === "running" ? 1 : 0,
     error: null,
   };
+}
+
+function readOnlyToolStep(
+  name: "read" | "grep" | "find" | "ls",
+  sequence: number,
+  path: string,
+  state: DurableTurnStep["state"] = "pending",
+): DurableTurnStep {
+  return {
+    id: randomUUID(),
+    sequence,
+    type: `tool.${name}`,
+    state,
+    input: {
+      toolCallId: randomUUID(),
+      toolName: name,
+      arguments: name === "grep" ? { path, pattern: "result" } : { path },
+      requiresApproval: false,
+      approvalKind: "file-edit",
+    },
+    output: null,
+    retryClass: "read_only",
+    idempotencyKey: null,
+    attempt: state === "running" ? 1 : 0,
+    error: null,
+  };
+}
+
+function toolNameFromTestStep(step: DurableTurnStep): string {
+  return typeof step.input.toolName === "string" ? step.input.toolName : step.type.slice(5);
 }
 
 function runCommandStep(

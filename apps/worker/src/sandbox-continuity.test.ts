@@ -18,6 +18,42 @@ import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 describe("SandboxContinuityManager", () => {
+  it("creates one sandbox when independent first-use reads start concurrently", async () => {
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    const create = vi.fn(async () => {
+      await createGate;
+      return { sandbox_id: "sandbox-shared", provider: "e2b", status: "running" as const };
+    });
+    const provider = {
+      kind: "e2b",
+      create,
+      files: {
+        list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+
+    const first = manager.execute(snapshot(), lsStep());
+    const second = manager.execute(snapshot(), { ...lsStep(), id: "00000000-0000-7000-8000-000000000006" });
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    releaseCreate();
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it("pauses a terminal E2B sandbox after preserving its durable snapshot", async () => {
     const suspend = vi.fn(async () => ({
       sandbox_id: "sandbox-terminal",

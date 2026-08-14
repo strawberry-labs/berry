@@ -1,13 +1,20 @@
 ---
 name: pdf
-description: Create, inspect, validate, or convert PDF files. Use for every PDF request; combine with aesg-branding for AESG reports, letters, briefs, policies, and other branded office PDFs.
+description: Create, inspect, validate, or convert PDF files. Use for every PDF request. For an AESG office PDF, combine with aesg-branding and docx, select Letterhead for direct, recipient-led, or signed correspondence, or General Report for a structured publication, then convert the generated DOCX. Choose the source template by purpose and structure, not page count alone.
 ---
 
 # PDF
 
 For an AESG office PDF, activate `aesg-branding`, `docx`, and `pdf`, then
 generate the matching AESG DOCX first and convert that copy. This preserves
-the new General Report Template or retained letterhead.
+the General Report Template or retained letterhead, including the native
+cover, approval page, photographic section dividers, tables, and captions.
+Use the DOCX `kind: "letter"` route, or one of its letterhead aliases, for
+direct correspondence such as letters, leave requests, short memos,
+confirmations, and notices. Use `kind: "report"` for structured publications
+and formal project deliverables. The PDF must come from the selected generated
+DOCX rather than a direct PDF recreation. Do not choose Letterhead merely
+because the document is short.
 
 ## Canonical workflow
 

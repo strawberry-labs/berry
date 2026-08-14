@@ -5,9 +5,10 @@ description: Create, edit, inspect, or convert PowerPoint PPTX presentations. Us
 
 # PPTX
 
-For AESG output, clone approved specimen slides from the repaired and
-sanitised General Template. Preserve its two masters, 59 layouts, inherited
-artwork, and native `10.833 × 7.5 in` size.
+For AESG output, clone approved specimen slides from the compact, repaired, and
+sanitised General Template. Preserve its 17 specimen layouts, one retained
+master, inherited artwork, and native `10.833 × 7.5 in` size. The larger
+2-master/59-layout file is source evidence, not the runtime template.
 
 Read `references/layout-catalog.md` before choosing layouts.
 
@@ -41,6 +42,7 @@ Create `/workspace/tmp/pptx/spec.json`:
     },
     {
       "layout": "text_image",
+      "section": "Performance overview",
       "title": "Site observations",
       "body": "Use the visual to support one clear conclusion.",
       "image": "/workspace/tmp/pptx/site.jpg"
@@ -65,11 +67,13 @@ python <aesg-branding-skill-directory>/scripts/render_artifact.py \
   --output-dir /workspace/tmp/pptx/rendered
 ```
 
-Image layouts require real image paths. The generator crops images to cover
-their approved slots and rejects text beyond measured capacities. Split dense
-content across slides rather than bypassing those checks.
+Image layouts require real image paths. The generator replaces native specimen
+slots, crops images to cover, removes unused slots, and rejects text beyond
+measured capacities. Some visual specimens are intentionally titleless; do not
+add `title` or `section` to those routes. Split dense content across slides
+rather than bypassing the checks or adding generic overlays.
 
 Render and inspect every slide. Confirm titles, page numbers, image crops,
-alignment, master artwork, and absence of placeholder text. Publish only the
-final `.pptx` with media type
+alignment, master artwork, and absence of placeholder text or empty picture
+slots. Publish only the final `.pptx` with media type
 `application/vnd.openxmlformats-officedocument.presentationml.presentation`.

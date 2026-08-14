@@ -27,6 +27,8 @@ const ActivateStoredSkillInputSchema = z.object({
   resources: z.array(z.string().trim().min(1).max(512)).max(50).optional(),
 }).strict();
 
+const DIRECT_FILE_TOOLS = new Set(["read", "grep", "find", "ls"]);
+
 export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor {
   constructor(
     private readonly base: DurableTurnToolExecutor,
@@ -67,6 +69,9 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
   async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "activate_skill") return this.activateSkill(snapshot, step);
+    if (DIRECT_FILE_TOOLS.has(toolName)) {
+      await this.materializeKnownResourceForDirectFileTool(snapshot, step);
+    }
     if (toolName !== "save_personal_skill") return this.base.execute(snapshot, step);
 
     const parsedInput = SavePersonalSkillInputSchema.safeParse(step.input.arguments ?? {});
@@ -205,9 +210,6 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       && candidate.state === "completed"
       && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill"
       && stringValue((candidate.input.arguments as Record<string, unknown> | undefined)?.name) === skill.name);
-    if (alreadyActive && requestedResources.length === 0) {
-      return { output: { skill: skill.name, alreadyActive: true, content: `<skill_already_active name=${JSON.stringify(skill.name)} />` }, summary: `${skill.name} is already active` };
-    }
 
     const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
@@ -251,11 +253,27 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     );
     const activeSkill = { ...skill, filePath: staged.filePath, resources: availableResources };
     const skillDirectory = staged.filePath.slice(0, -"/SKILL.md".length);
-    const content = alreadyActive && requestedResources.length > 0
-      ? `<skill_resources_ready name=${JSON.stringify(skill.name)} directory=${JSON.stringify(skillDirectory)}>\n${requestedResources.map((path) => `  <file>${escapeXml(path)}</file>`).join("\n")}\n</skill_resources_ready>`
+    const stagedResourcePaths = staged.stagedResources;
+    const stagedPathSet = new Set(stagedResourcePaths);
+    const stagedRelativeResources = availableResources.filter((path) =>
+      stagedPathSet.has(`${skillDirectory}/${path}`)
+    );
+    const stagedRelativeSet = new Set(stagedRelativeResources);
+    const deferredResources = availableResources.filter((path) => !stagedRelativeSet.has(path));
+    const resourceState = formatSkillResourceState({
+      name: skill.name,
+      location: staged.filePath,
+      directory: skillDirectory,
+      stagedRelativeResources,
+      stagedResourcePaths,
+      deferredResources,
+    });
+    const invocation = alreadyActive
+      ? `<skill_already_active name=${JSON.stringify(skill.name)} />`
       : formatSkillInvocation(activeSkill, requestedResources.length > 0
           ? `The requested resource files are materialized under ${skillDirectory}. Use only the exact paths needed for this task.`
-          : `${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS} Do not load unrelated resources.`);
+          : "Load only resources required for the current task.");
+    const content = `${invocation}\n${resourceState}\n${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
     const summary = requestedResources.length > 0
       ? `Loaded ${requestedResources.length} ${skill.name} resource file${requestedResources.length === 1 ? "" : "s"}`
       : `Activated ${skill.name}; ${availableResources.length} resource file${availableResources.length === 1 ? "" : "s"} available on demand`;
@@ -264,8 +282,12 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
         skill: skill.name,
         alreadyActive,
         location: staged.filePath,
+        directory: skillDirectory,
         availableResources,
-        stagedResources: staged.stagedResources,
+        deferredResources,
+        stagedRelativeResources,
+        stagedResources: stagedResourcePaths,
+        stagedResourcePaths,
         stagingSandboxId: staged.stagingSandboxId,
         content,
       },
@@ -273,10 +295,120 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     };
   }
 
+  private async materializeKnownResourceForDirectFileTool(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+  ): Promise<void> {
+    const input = step.input.arguments as Record<string, unknown> | undefined;
+    const requestedPath = stringValue(input?.path);
+    if (!requestedPath) return;
+    const known = knownDeferredSkillResource(snapshot, requestedPath);
+    if (!known) return;
+    if (!this.base.stageSkillPackage) {
+      throw new ResourceNotStagedError(known.skill, known.relativePath, "skill package workspace access is unavailable");
+    }
+    try {
+      await this.activateSkill(snapshot, {
+        ...step,
+        id: `${step.id}:materialize:${createHash("sha256").update(known.relativePath).digest("hex").slice(0, 12)}`,
+        type: "tool.activate_skill",
+        input: {
+          ...step.input,
+          toolName: "activate_skill",
+          arguments: { name: known.skill, resources: [known.relativePath] },
+        },
+      });
+    } catch (error) {
+      if (error instanceof ResourceNotStagedError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ResourceNotStagedError(known.skill, known.relativePath, message);
+    }
+  }
+
   private async inTenant<T>(tenantId: string, operation: (executor: SqlExecutor) => Promise<T>): Promise<T> {
     if (!this.executor.runWithTenant) return operation(this.executor);
     return this.executor.runWithTenant(tenantId, () => operation(this.executor));
   }
+}
+
+export class ResourceNotStagedError extends Error {
+  readonly code = "RESOURCE_NOT_STAGED";
+
+  constructor(skill: string, resource: string, detail: string) {
+    super(`RESOURCE_NOT_STAGED: ${skill}/${resource}: ${detail}`);
+    this.name = "ResourceNotStagedError";
+  }
+}
+
+function knownDeferredSkillResource(
+  snapshot: DurableTurnSnapshot,
+  requestedPath: string,
+): { skill: string; relativePath: string } | null {
+  const activationSteps = snapshot.steps
+    .filter((step) => step.state === "completed")
+    .sort((left, right) => right.sequence - left.sequence);
+  for (const step of activationSteps) {
+    if ((stringValue(step.input.toolName) ?? step.type.slice(5)) !== "activate_skill") continue;
+    const output = record(step.output);
+    const skill = stringValue(output?.skill);
+    const directory = stringValue(output?.directory)
+      ?? skillDirectoryFromLocation(stringValue(output?.location));
+    const availableResources = stringArray(output?.availableResources);
+    if (!skill || !directory || availableResources.length === 0) continue;
+    const stagedResources = new Set([
+      ...stringArray(output?.stagedResources),
+      ...stringArray(output?.stagedResourcePaths),
+    ]);
+    for (const relativePath of availableResources) {
+      const absolutePath = `${directory}/${relativePath}`;
+      if (requestedPath === absolutePath) {
+        return stagedResources.has(absolutePath) ? null : { skill, relativePath };
+      }
+    }
+  }
+  return null;
+}
+
+function formatSkillResourceState(input: {
+  name: string;
+  location: string;
+  directory: string;
+  stagedRelativeResources: readonly string[];
+  stagedResourcePaths: readonly string[];
+  deferredResources: readonly string[];
+}): string {
+  const staged = input.stagedRelativeResources.length === 0
+    ? "  <staged_resources empty=\"true\" />"
+    : input.stagedRelativeResources.map((relativePath) =>
+        `    <resource relative=${JSON.stringify(relativePath)} path=${JSON.stringify(input.stagedResourcePaths.find((path) => path === `${input.directory}/${relativePath}`) ?? `${input.directory}/${relativePath}`)} />`
+      ).join("\n");
+  const deferred = input.deferredResources.length === 0
+    ? "  <deferred_resources empty=\"true\" />"
+    : input.deferredResources.map((path) => `    <resource relative=${JSON.stringify(path)} />`).join("\n");
+  return [
+    `<skill_resource_state name=${JSON.stringify(input.name)} location=${JSON.stringify(input.location)} directory=${JSON.stringify(input.directory)}>`,
+    ...(input.stagedRelativeResources.length === 0
+      ? [staged]
+      : ["  <staged_resources>", staged, "  </staged_resources>"]),
+    ...(input.deferredResources.length === 0
+      ? [deferred]
+      : ["  <deferred_resources>", deferred, "  </deferred_resources>"]),
+    "</skill_resource_state>",
+  ].join("\n");
+}
+
+function skillDirectoryFromLocation(location: string | null): string | null {
+  return location?.endsWith("/SKILL.md") ? location.slice(0, -"/SKILL.md".length) : null;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function hashSkillPackage(files: readonly DurableSkillPackageFile[]): string {

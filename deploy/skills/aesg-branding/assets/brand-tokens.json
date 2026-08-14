@@ -1,7 +1,20 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 8,
   "brand": "AESG",
-  "sourceManual": "AESG Brand Guidelines, January 2022",
+  "sourceManual": {
+    "title": "AESG Brand Guidelines",
+    "edition": "January 2022",
+    "pages": 60,
+    "sha256": "ff4568a73f5041d7234e43db1447cbd107ed0cd4a6578fe0b596f98362f13586",
+    "bundled": false,
+    "runtimeAuthority": "references/brand-system.md",
+    "maintenancePolicy": "Consult the original source pack only when maintaining or re-auditing the skill."
+  },
+  "brandStory": {
+    "values": ["Agile", "Dynamic", "Passionate", "Detail Orientated"],
+    "mission": "To solve our client's greatest challenges, through collaboration, innovation and advanced technical solutions.",
+    "vision": "To transform specialist consultancy, providing solutions for a more sustainable world."
+  },
   "colors": {
     "green": "#008C95",
     "gray": "#343741",
@@ -9,7 +22,14 @@
     "purple": "#6D2077",
     "red": "#DA291C",
     "yellow": "#FFC72C",
+    "black": "#000000",
     "templateHeadingGreen": "#059B9B"
+  },
+  "colorHierarchy": {
+    "whiteSpaceTarget": 0.55,
+    "primaryTarget": 0.30,
+    "secondaryMaximum": 0.15,
+    "secondaryColors": ["#6D2077", "#FFC72C", "#DA291C"]
   },
   "typography": {
     "office": "Verdana",
@@ -19,7 +39,76 @@
   "logo": {
     "aspectRatio": 3.465210356,
     "widthPx": 4283,
-    "heightPx": 1236
+    "heightPx": 1236,
+    "clearSpace": {
+      "manualRule": "Minimum clear space on every side equals the height of the A in the AESG logotype.",
+      "safeFallback": "Use one rendered logo height on every side when the A-height cannot be measured."
+    },
+    "minimumPrintWidthMm": 10,
+    "variants": {
+      "fullColor": {
+        "path": "logos/aesg-brandmark-rgb.png",
+        "default": true,
+        "useOn": ["white", "light neutral", "quiet light image area"]
+      },
+      "white": {
+        "path": "logos/aesg-brandmark-white-rgb.png",
+        "default": false,
+        "useOn": ["AESG Green", "AESG Gray", "uniformly dark image area"]
+      }
+    },
+    "forbidden": [
+      "redraw or recreate",
+      "separate symbol and logotype",
+      "recolour",
+      "distort or change proportions",
+      "rotate",
+      "crop",
+      "add shadow, outline, glow, or other effect",
+      "place on a clashing or visually busy background"
+    ]
+  },
+  "applications": {
+    "sourcePhotography": {
+      "applyBrandPhotographyStyle": true,
+      "logoRequired": false
+    },
+    "finalBrandedCreative": {
+      "applyBrandPhotographyStyle": true,
+      "logoRequired": true,
+      "exactLogoOverlayRequired": true
+    },
+    "officeArtifacts": {
+      "logoRequired": true,
+      "useRetainedTemplate": true
+    },
+    "physicalStationery": {
+      "logoRequired": true,
+      "useSuppliedProductionArtwork": true,
+      "recreateFromTokens": false
+    },
+    "partnerOrCoBrand": {
+      "requiresExplicitApprovedLockup": true,
+      "useDefaultAESGLogoAlone": false
+    }
+  },
+  "imageGeneration": {
+    "identityReference": "reference/AESG_Image_Generation_Identity_Reference.jpg",
+    "photographyReference": "reference/AESG_Image_Generation_Photography_Reference.jpg",
+    "referenceOrder": ["user target image when editing", "photography reference", "identity reference", "one selected logo"],
+    "photoStyles": {
+      "headshots": ["office with greenery or nature", "soft out-of-focus background", "natural light", "vibrant", "not overexposed or oversaturated"],
+      "officeOrSite": ["people working or in action", "clear main subject", "natural light", "vibrant", "generous white or breathing space", "not oversaturated"],
+      "architectureOrEnvironment": ["architecture or material texture", "close or distant viewpoint", "high contrast", "full colour or black and white", "bright and saturated without clipping"],
+      "clientOrInternalRender": ["architecture-led", "high contrast", "full colour", "bright and saturated without clipping"]
+    },
+    "promptConstraints": [
+      "identify the role of every reference image",
+      "do not invent or redraw the AESG logo",
+      "do not invent signage, labels, or claims",
+      "reserve a quiet logo placement zone for final branded creative",
+      "describe an unsourced AESG office, project, or headquarters as conceptual"
+    ]
   },
   "docx": {
     "reportTemplate": "AESG_General_Report_Template.docx",
@@ -29,7 +118,29 @@
     "heightDxa": 16840,
     "marginsDxa": {"top": 720, "right": 720, "bottom": 720, "left": 720},
     "headerDxa": 1134,
-    "footerDxa": 1134
+    "footerDxa": 1134,
+    "letterhead": {
+      "pageSize": "A4",
+      "widthDxa": 11900,
+      "heightDxa": 16840,
+      "marginsDxa": {"top": 2410, "right": 1268, "bottom": 2127, "left": 1560},
+      "headerDxa": 708,
+      "footerDxa": 878,
+      "differentFirstPage": true,
+      "typography": {
+        "family": "Verdana",
+        "bodySizePt": 9,
+        "bodyColor": "#53565A",
+        "subjectSizePt": 12,
+        "subjectBold": true,
+        "headingSizePt": 12,
+        "headingBold": true,
+        "headingColor": "#008C95",
+        "recipientReferenceLineSpacingPt": 13.8
+      },
+      "firstPage": "Full AESG brandmark, Dubai office footer, and multicolour curve artwork",
+      "continuationPage": "AESG circular symbol, reduced curve footer, and page number"
+    }
   },
   "xlsx": {
     "titleRowHeightPt": 30,
@@ -41,8 +152,10 @@
     "template": "AESG_General_Presentation.pptx",
     "widthEmu": 9906000,
     "heightEmu": 6858000,
-    "masters": 2,
-    "layouts": 59,
+    "sourceMasters": 2,
+    "sourceLayouts": 59,
+    "masters": 1,
+    "layouts": 17,
     "specimenSlides": 17
   }
 }

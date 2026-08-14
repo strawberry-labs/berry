@@ -11,15 +11,23 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree
 
 
 PLACEHOLDER_RE = re.compile(
-    r"\b(lorem ipsum|insert title|sample heading|sample sub-heading|"
+    r"(?:\b(?:lorem ipsum|insert title|sample heading|sample sub-heading|"
     r"replace text|name another|name surname|client name|click to add|"
-    r"click to edit|section heading|xxxx-xxx|xxxxxxxx)\b",
+    r"click to edit|section heading|xxxx-xxx)\b|x{8,})",
     re.IGNORECASE,
 )
 ERROR_TOKENS = ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A", "#NUM!", "#NULL!")
+WORD_TEXT_PART_RE = re.compile(
+    r"word/(?:document|header\d+|footer\d+|footnotes|endnotes|comments)\.xml$"
+)
+SLIDE_PART_RE = re.compile(r"ppt/slides/slide(\d+)\.xml$")
+PRESENTATION_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -36,6 +44,74 @@ def package_text(path: Path) -> str:
             if name.endswith((".xml", ".rels")):
                 chunks.append(archive.read(name).decode("utf-8", errors="ignore"))
     return "\n".join(chunks)
+
+
+def paragraph_texts(xml: bytes, namespace: str) -> list[str]:
+    root = ElementTree.fromstring(xml)
+    paragraph_tag = f"{{{namespace}}}p"
+    text_tag = f"{{{namespace}}}t"
+    paragraphs: list[str] = []
+    for paragraph in root.iter(paragraph_tag):
+        if any(
+            descendant is not paragraph and descendant.tag == paragraph_tag
+            for descendant in paragraph.iter()
+        ):
+            continue
+        paragraphs.append(
+            "".join(node.text or "" for node in paragraph.iter(text_tag))
+        )
+    return paragraphs
+
+
+def docx_story_text(path: Path) -> str:
+    chunks: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if WORD_TEXT_PART_RE.fullmatch(name):
+                chunks.extend(
+                    paragraph_texts(archive.read(name), WORD_NS)
+                )
+    return "\n".join(chunks)
+
+
+def inspect_pptx_slides(
+    path: Path, slide_order: dict[str, int]
+) -> tuple[str, list[str], list[str]]:
+    text: list[str] = []
+    empty_placeholders: list[str] = []
+    picture_placeholders: list[str] = []
+    namespaces = {"p": PRESENTATION_NS, "a": DRAWING_NS}
+    with zipfile.ZipFile(path) as archive:
+        slide_parts = sorted(
+            (
+                (slide_order.get(name, int(match.group(1))), name)
+                for name in archive.namelist()
+                if (match := SLIDE_PART_RE.fullmatch(name))
+            ),
+            key=lambda item: item[0],
+        )
+        for slide_number, name in slide_parts:
+            slide_xml = archive.read(name)
+            root = ElementTree.fromstring(slide_xml)
+            slide_text = paragraph_texts(slide_xml, DRAWING_NS)
+            text.extend(slide_text)
+            for shape in root.findall(".//p:sp", namespaces):
+                properties = shape.find("./p:nvSpPr/p:cNvPr", namespaces)
+                shape_name = properties.get("name", "") if properties is not None else ""
+                placeholder = shape.find("./p:nvSpPr/p:nvPr/p:ph", namespaces)
+                shape_text = "".join(
+                    node.text or "" for node in shape.findall(".//a:t", namespaces)
+                ).strip()
+                if "picture placeholder" in shape_name.casefold():
+                    picture_placeholders.append(f"slide {slide_number}, {shape_name}")
+                if placeholder is None or shape_text:
+                    continue
+                placeholder_type = placeholder.get("type", "obj")
+                if placeholder_type not in {"dt", "ftr"}:
+                    empty_placeholders.append(
+                        f"slide {slide_number}, {shape_name or placeholder_type}"
+                    )
+    return "\n".join(text), empty_placeholders, picture_placeholders
 
 
 def validate_core_author(path: Path, errors: list[str], evidence: dict) -> None:
@@ -59,14 +135,17 @@ def validate_pdf(path: Path, errors: list[str], evidence: dict) -> None:
         evidence["qpdf"] = result.stdout.strip() or result.stderr.strip()
         if result.returncode:
             errors.append("qpdf validation failed")
-    else:
-        try:
-            from pypdf import PdfReader
+    try:
+        from pypdf import PdfReader
 
-            document = PdfReader(path)
-            evidence["pypdf"] = {"pages": len(document.pages), "fallback": True}
-        except Exception as exc:
-            errors.append(f"PDF package validation failed: {exc}")
+        document = PdfReader(path)
+        extracted = "\n".join(page.extract_text() or "" for page in document.pages)
+        placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(extracted)))
+        if placeholders:
+            errors.append(f"placeholder text remains: {', '.join(placeholders)}")
+        evidence["pypdf"] = {"pages": len(document.pages), "textChecked": True}
+    except Exception as exc:
+        errors.append(f"PDF package validation failed: {exc}")
     if shutil.which("pdfinfo"):
         result = run(["pdfinfo", str(path)])
         evidence["pdfinfo"] = result.stdout.strip() or result.stderr.strip()
@@ -91,9 +170,7 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     from docx import Document
 
     document = Document(path)
-    text = "\n".join(p.text for p in document.paragraphs)
-    for table in document.tables:
-        text += "\n" + "\n".join(cell.text for row in table.rows for cell in row.cells)
+    text = docx_story_text(path)
     placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(text)))
     if placeholders:
         errors.append(f"placeholder text remains: {', '.join(placeholders)}")
@@ -154,15 +231,24 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
     from pptx import Presentation
 
     presentation = Presentation(path)
-    placeholders: list[str] = []
-    for slide_number, slide in enumerate(presentation.slides, start=1):
-        for shape in slide.shapes:
-            if getattr(shape, "has_text_frame", False):
-                text = shape.text.strip()
-                if text and PLACEHOLDER_RE.search(text):
-                    placeholders.append(f"slide {slide_number}, shape {shape.shape_id}")
+    slide_order = {
+        str(slide.part.partname).lstrip("/"): index
+        for index, slide in enumerate(presentation.slides, start=1)
+    }
+    slide_text, empty_placeholders, picture_placeholders = inspect_pptx_slides(
+        path, slide_order
+    )
+    placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(slide_text)))
     if placeholders:
         errors.append(f"placeholder text remains: {', '.join(placeholders[:12])}")
+    if empty_placeholders:
+        errors.append(
+            f"empty structural placeholders remain: {', '.join(empty_placeholders[:12])}"
+        )
+    if picture_placeholders:
+        errors.append(
+            f"unresolved picture placeholders remain: {', '.join(picture_placeholders[:12])}"
+        )
     if not presentation.slides:
         errors.append("presentation has no slides")
     xml = package_text(path).casefold()
@@ -171,11 +257,11 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
     layout_count = sum(len(master.slide_layouts) for master in presentation.slide_masters)
     expected_size = [9906000, 6858000]
     actual_size = [presentation.slide_width, presentation.slide_height]
-    if presentation.core_properties.subject == "AESG General Template":
-        if len(presentation.slide_masters) < 2 or layout_count < 59:
-            errors.append("AESG General Template master/layout hierarchy is incomplete")
+    if presentation.core_properties.subject == "AESG Compact General Template":
+        if len(presentation.slide_masters) != 1 or layout_count != 17:
+            errors.append("AESG compact runtime must contain one master and seventeen layouts")
         if actual_size != expected_size:
-            errors.append(f"unexpected AESG General Template size: {actual_size}")
+            errors.append(f"unexpected AESG compact template size: {actual_size}")
     validate_core_author(path, errors, evidence)
     evidence.update(
         {
@@ -183,6 +269,8 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
             "layouts": layout_count,
             "masters": len(presentation.slide_masters),
             "sizeEmu": actual_size,
+            "emptyPlaceholders": empty_placeholders,
+            "picturePlaceholders": picture_placeholders,
         }
     )
 

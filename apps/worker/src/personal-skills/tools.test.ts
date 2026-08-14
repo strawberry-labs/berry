@@ -202,11 +202,17 @@ describe("DurablePersonalSkillToolExecutor", () => {
 
     expect(activated.output).toMatchObject({
       skill: "branding",
+      directory: "/workspace/runtime-skills/branding-revision",
       availableResources: ["scripts/build.py", "assets/template.docx"],
+      deferredResources: ["scripts/build.py", "assets/template.docx"],
+      stagedRelativeResources: [],
       stagedResources: [],
+      stagedResourcePaths: [],
       stagingSandboxId: "sandbox-branding",
     });
     expect(JSON.stringify(activated.output)).toContain(DEFERRED_SKILL_RESOURCE_INSTRUCTIONS);
+    expect(JSON.stringify(activated.output)).toContain('location=\\"/workspace/runtime-skills/branding-revision/SKILL.md\\"');
+    expect(JSON.stringify(activated.output)).toContain('<staged_resources empty=\\"true\\" />');
     expect(query.mock.calls.filter(([sql]) => String(sql).includes("SELECT path,content"))).toHaveLength(0);
 
     snapshot.steps = [{
@@ -231,7 +237,15 @@ describe("DurablePersonalSkillToolExecutor", () => {
     } as never);
 
     expect(loaded.summary).toBe("Loaded 2 branding resource files");
-    expect(loaded.output).toMatchObject({ alreadyActive: true });
+    expect(loaded.output).toMatchObject({
+      alreadyActive: true,
+      deferredResources: [],
+      stagedRelativeResources: ["scripts/build.py", "assets/template.docx"],
+      stagedResources: [
+        "/workspace/runtime-skills/branding-revision/scripts/build.py",
+        "/workspace/runtime-skills/branding-revision/assets/template.docx",
+      ],
+    });
     expect(stageSkillPackage.mock.calls[1]?.[3]).toMatchObject({
       resourcePaths: ["scripts/build.py", "assets/template.docx"],
     });
@@ -240,6 +254,178 @@ describe("DurablePersonalSkillToolExecutor", () => {
       expect.stringContaining("path=ANY($2::text[])"),
       ["org-capability", ["scripts/build.py", "assets/template.docx"]],
     );
+
+    snapshot.steps = [
+      ...snapshot.steps,
+      {
+        id: "activate-2",
+        sequence: 2,
+        type: "tool.activate_skill",
+        state: "completed",
+        attempt: 1,
+        input: {
+          toolName: "activate_skill",
+          arguments: { name: "branding", resources: ["scripts/build.py", "assets/template.docx"] },
+        },
+        output: loaded.output,
+        error: null,
+        retryClass: "idempotent_with_key",
+        idempotencyKey: "activate-2",
+      },
+    ];
+    await tools.execute(snapshot, {
+      id: "read-staged",
+      sequence: 3,
+      type: "tool.read",
+      input: {
+        toolName: "read",
+        arguments: { path: "/workspace/runtime-skills/branding-revision/scripts/build.py" },
+      },
+    } as never);
+    expect(stageSkillPackage).toHaveBeenCalledTimes(2);
+  });
+
+  it("materializes an exact known deferred resource before delegating any direct file tool", async () => {
+    const resource = {
+      path: "references/brand.md",
+      content: Buffer.from("brand rules"),
+      size_bytes: 11,
+      sha256: createHash("sha256").update("brand rules").digest("hex"),
+      mode: 0o644,
+    };
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SELECT path,size_bytes,sha256,mode")) {
+        const { content: _content, ...metadata } = resource;
+        return [metadata];
+      }
+      if (sql.includes("SELECT path,content")) return [{ path: resource.path, content: resource.content }];
+      return [];
+    });
+    const stageSkillPackage = vi.fn(async (
+      _snapshot: DurableTurnSnapshot,
+      _packageId: string,
+      _files: unknown,
+      options?: Parameters<NonNullable<DurableTurnToolExecutor["stageSkillPackage"]>>[3],
+    ) => {
+      const requested = options?.resourcePaths ?? [];
+      if (requested.length > 0) await options?.loadContentBytes?.(requested);
+      return {
+        filePath: "/workspace/runtime-skills/branding-revision/SKILL.md",
+        resources: ["/workspace/runtime-skills/branding-revision/references/brand.md"],
+        stagedResources: requested.map((path) => `/workspace/runtime-skills/branding-revision/${path}`),
+        stagingSandboxId: "sandbox-branding",
+      };
+    });
+    const baseExecute = vi.fn(async () => ({ output: { content: "brand rules" }, summary: "read" }));
+    const tools = new DurablePersonalSkillToolExecutor({
+      execute: baseExecute,
+      stageSkillPackage: stageSkillPackage as NonNullable<DurableTurnToolExecutor["stageSkillPackage"]>,
+    }, { execute: vi.fn(), query: query as never });
+    const snapshot = storedSkillSnapshot();
+    const activated = await tools.execute(snapshot, {
+      id: "activate-read",
+      sequence: 1,
+      type: "tool.activate_skill",
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+    } as never);
+    snapshot.steps = [{
+      id: "activate-read",
+      sequence: 1,
+      type: "tool.activate_skill",
+      state: "completed",
+      attempt: 1,
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+      output: activated.output,
+      error: null,
+      retryClass: "idempotent_with_key",
+      idempotencyKey: "activate-read",
+    }];
+
+    await expect(tools.execute(snapshot, {
+      id: "read-brand",
+      sequence: 2,
+      type: "tool.read",
+      input: {
+        toolName: "read",
+        arguments: { path: "/workspace/runtime-skills/branding-revision/references/brand.md" },
+      },
+    } as never)).resolves.toMatchObject({ summary: "read" });
+
+    expect(stageSkillPackage).toHaveBeenCalledTimes(2);
+    expect(stageSkillPackage.mock.calls[1]?.[3]).toMatchObject({ resourcePaths: ["references/brand.md"] });
+    expect(baseExecute).toHaveBeenCalledTimes(1);
+    expect(baseExecute).toHaveBeenCalledWith(snapshot, expect.objectContaining({ type: "tool.read" }));
+    expect(stageSkillPackage.mock.invocationCallOrder[1])
+      .toBeLessThan(baseExecute.mock.invocationCallOrder[0]!);
+
+    for (const [index, toolName] of ["grep", "find", "ls"].entries()) {
+      await expect(tools.execute(snapshot, {
+        id: `${toolName}-brand`,
+        sequence: 3 + index,
+        type: `tool.${toolName}`,
+        input: {
+          toolName,
+          arguments: { path: "/workspace/runtime-skills/branding-revision/references/brand.md" },
+        },
+      } as never)).resolves.toMatchObject({ summary: "read" });
+    }
+
+    expect(stageSkillPackage).toHaveBeenCalledTimes(5);
+    expect(baseExecute).toHaveBeenCalledTimes(4);
+    for (let index = 1; index < 5; index += 1) {
+      expect(stageSkillPackage.mock.invocationCallOrder[index])
+        .toBeLessThan(baseExecute.mock.invocationCallOrder[index - 1]!);
+    }
+  });
+
+  it("does not materialize an unknown or out-of-scope read path", async () => {
+    const query = vi.fn(async (sql: string) => sql.includes("SELECT path,size_bytes,sha256,mode")
+      ? [{ path: "references/brand.md", size_bytes: 11, sha256: "a".repeat(64), mode: 0o644 }]
+      : []);
+    const stageSkillPackage = vi.fn(async () => ({
+      filePath: "/workspace/runtime-skills/branding-revision/SKILL.md",
+      resources: ["/workspace/runtime-skills/branding-revision/references/brand.md"],
+      stagedResources: [],
+      stagingSandboxId: "sandbox-branding",
+    }));
+    const baseExecute = vi.fn(async () => ({ output: { content: "not found" }, summary: "base behavior" }));
+    const tools = new DurablePersonalSkillToolExecutor({
+      execute: baseExecute,
+      stageSkillPackage: stageSkillPackage as never,
+    }, { execute: vi.fn(), query: query as never });
+    const snapshot = storedSkillSnapshot();
+    const activated = await tools.execute(snapshot, {
+      id: "activate-unknown",
+      sequence: 1,
+      type: "tool.activate_skill",
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+    } as never);
+    snapshot.steps = [{
+      id: "activate-unknown",
+      sequence: 1,
+      type: "tool.activate_skill",
+      state: "completed",
+      attempt: 1,
+      input: { toolName: "activate_skill", arguments: { name: "branding" } },
+      output: activated.output,
+      error: null,
+      retryClass: "idempotent_with_key",
+      idempotencyKey: "activate-unknown",
+    }];
+
+    await tools.execute(snapshot, {
+      id: "read-unknown",
+      sequence: 2,
+      type: "tool.read",
+      input: {
+        toolName: "read",
+        arguments: { path: "/workspace/runtime-skills/branding-revision/secrets/not-authorized.txt" },
+      },
+    } as never);
+
+    expect(stageSkillPackage).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("SELECT path,content"))).toBe(false);
+    expect(baseExecute).toHaveBeenCalledTimes(1);
   });
 });
 

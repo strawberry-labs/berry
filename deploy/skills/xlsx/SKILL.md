@@ -9,6 +9,10 @@ For AESG output, generate a clean workbook from the measured AESG Excel system.
 The original source workbook contained a hidden employee sheet; never clone or
 restore it.
 
+The General Template transfer pack contains no XLSX file. It improves the Word
+and PowerPoint routes but does not replace this privacy-safe generated workbook
+system.
+
 ## Canonical workflow
 
 Create `/workspace/tmp/xlsx/spec.json`:

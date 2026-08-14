@@ -14,7 +14,7 @@ export * from "./agent-skill-content.ts";
  */
 export const PROTOCOL_VERSION = 1;
 export const TURN_CANCELLATION_CHANNEL = "berry:turn-cancel:v1";
-export const DEFERRED_SKILL_RESOURCE_INSTRUCTIONS = "Deferred resources do not exist in the sandbox. Before any read, explore, run, import, render, or generator command that may use a deferred resource, call activate_skill once with every required relative path in resources. Never probe or run the consumer command first. Continue only after every required path appears in stagedResources.";
+export const DEFERRED_SKILL_RESOURCE_INSTRUCTIONS = "activate_skill reports the staged skill directory, deferredResources, stagedRelativeResources, and absolute stagedResources. A deferred resource does not exist in the sandbox. A direct read of one exact known deferred file may materialize only that file automatically. Before any explore, run, import, render, or generator command uses deferred files, call activate_skill with every required relative path in resources. Never probe for deferred files or guess their paths; continue only after each path appears in stagedRelativeResources and its absolute path appears in stagedResources.";
 
 export function protocolMajor(version: number): number {
   return Math.trunc(version);
