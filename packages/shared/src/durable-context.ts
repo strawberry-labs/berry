@@ -585,6 +585,8 @@ export const DurableMcpServerSchema = z.object({
     }).optional(),
   })).optional(),
   allowedTools: z.array(z.string().min(1)).optional(),
+  defaultTools: z.array(z.string().min(1)).optional(),
+  nonReplayableTools: z.array(z.string().min(1)).optional(),
   trustReadOnlyAnnotations: z.boolean().optional(),
   approvalRequiredTools: z.array(z.string().min(1)).optional(),
 }).strict();

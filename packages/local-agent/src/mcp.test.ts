@@ -183,6 +183,76 @@ describe("McpToolSource", () => {
     });
   });
 
+  it("installs the reviewed catalog and core defaults for the official BerryCrawl adapter", () => {
+    const servers = mcpServerSpecsFromJson(JSON.stringify([{
+      id: "berrycrawl",
+      name: "BerryCrawl",
+      transport: "streamable-http",
+      url: "https://api.berrycrawl.com/api/v1/mcp",
+      credentialEnv: "BERRYCRAWL_API_KEY",
+      enabled: true,
+      trusted: true,
+    }]), { BERRYCRAWL_API_KEY: "secret-from-worker" });
+    const server = servers[0]!;
+    const source = new McpToolSource({ servers });
+
+    expect(server.cachedTools?.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      "berrycrawl_search_web",
+      "berrycrawl_scrape_url",
+      "berrycrawl_get_brand",
+      "berrycrawl_start_crawl",
+      "berrycrawl_get_job",
+      "berrycrawl_capture_screenshot",
+      "berrycrawl_map_site",
+      "berrycrawl_start_extract",
+      "berrycrawl_get_credit_balance",
+    ]));
+    expect(server.allowedTools).toEqual(server.cachedTools?.map((tool) => tool.name));
+    expect(server.defaultTools).toEqual([
+      "berrycrawl_search_web",
+      "berrycrawl_scrape_url",
+      "berrycrawl_get_brand",
+      "berrycrawl_start_crawl",
+      "berrycrawl_get_job",
+    ]);
+    expect(server.nonReplayableTools).toEqual([
+      "berrycrawl_scrape_url",
+      "berrycrawl_capture_screenshot",
+      "berrycrawl_map_site",
+      "berrycrawl_search_web",
+      "berrycrawl_get_brand",
+    ]);
+    expect(server.trustReadOnlyAnnotations).toBe(true);
+    expect(source.approvalHints("mcp__BerryCrawl__berrycrawl_search_web"))
+      .toMatchObject({ trustedReadOnly: true, nonReplayable: true });
+    expect(source.approvalHints("mcp__BerryCrawl__berrycrawl_get_job"))
+      .not.toHaveProperty("nonReplayable");
+    expect(source.listDefaultTools().map((tool) => tool.name)).toEqual([
+      "mcp__BerryCrawl__berrycrawl_scrape_url",
+      "mcp__BerryCrawl__berrycrawl_search_web",
+      "mcp__BerryCrawl__berrycrawl_get_brand",
+      "mcp__BerryCrawl__berrycrawl_start_crawl",
+      "mcp__BerryCrawl__berrycrawl_get_job",
+    ]);
+  });
+
+  it("does not elevate a BerryCrawl lookalike on another host", () => {
+    const [server] = mcpServerSpecsFromJson(JSON.stringify([{
+      id: "berrycrawl",
+      name: "BerryCrawl",
+      transport: "streamable-http",
+      url: "https://crawl.example.test/api/v1/mcp",
+      enabled: true,
+      trusted: true,
+    }]));
+
+    expect(server).not.toHaveProperty("cachedTools");
+    expect(server).not.toHaveProperty("allowedTools");
+    expect(server).not.toHaveProperty("defaultTools");
+    expect(server).not.toHaveProperty("nonReplayableTools");
+    expect(server).not.toHaveProperty("trustReadOnlyAnnotations");
+  });
+
   it("trusts read-only annotations only for an explicitly Berry-owned adapter", () => {
     const untrusted = new McpToolSource({ servers: [stdioServer({ name: "Remote", cachedTools: [{ name: "read", description: null, inputSchema: {}, annotations: { readOnlyHint: true } }] })] });
     const native = new McpToolSource({ servers: [stdioServer({ name: "Native", trustReadOnlyAnnotations: true, cachedTools: [{ name: "read", description: null, inputSchema: {}, annotations: { readOnlyHint: true } }] })] });

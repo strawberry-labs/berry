@@ -8,6 +8,11 @@ import { ExecPolicyEngine, type ExecPolicyRule } from "@berry/execpolicy";
 import { networkDomainAllowed, type NetworkPolicy } from "@berry/shared";
 import { z } from "zod";
 import { createPublicRemoteFetch, validatedPublicRemoteUrl } from "./remote-fetch.ts";
+import {
+  BERRYCRAWL_DEFAULT_TOOL_NAMES,
+  BERRYCRAWL_NON_REPLAYABLE_TOOL_NAMES,
+  BERRYCRAWL_TOOL_CATALOG,
+} from "./berrycrawl-tools.ts";
 
 export interface McpCachedTool {
   name: string;
@@ -31,6 +36,10 @@ export interface McpServerSpec {
   cachedTools?: McpCachedTool[];
   /** Server tool names approved by the organization. Omit for unrestricted discovery. */
   allowedTools?: string[];
+  /** Remote tool names exposed on the first model call without tool_search. */
+  defaultTools?: string[];
+  /** Remote tool names whose ambiguous execution outcome must not be replayed. */
+  nonReplayableTools?: string[];
   /** Only Berry-owned adapters may make read-only annotations authoritative. */
   trustReadOnlyAnnotations?: boolean;
   /** Berry-owned tool names that require approval in every task permission mode. */
@@ -80,6 +89,8 @@ const McpServerConfigSchema = z.object({
     }).optional(),
   })).optional(),
   allowedTools: z.array(z.string().min(1)).optional(),
+  defaultTools: z.array(z.string().min(1)).optional(),
+  nonReplayableTools: z.array(z.string().min(1)).optional(),
   trustReadOnlyAnnotations: z.boolean().optional(),
   approvalRequiredTools: z.array(z.string().min(1)).optional(),
 });
@@ -91,9 +102,27 @@ export function mcpServerSpecsFromJson(
 ): McpServerSpec[] {
   if (!raw?.trim()) return [];
   return z.array(McpServerConfigSchema).parse(JSON.parse(raw)).map((server) => {
+    const bundledBerryCrawl = isOfficialBerryCrawlServer(server);
     const credential = server.credentialEnv
       ? env[server.credentialEnv]?.trim()
       : server.credential?.trim();
+    const cachedTools = server.cachedTools ?? (bundledBerryCrawl
+      ? BERRYCRAWL_TOOL_CATALOG.map((tool) => ({
+          ...tool,
+          inputSchema: structuredClone(tool.inputSchema),
+          ...(tool.annotations ? { annotations: { ...tool.annotations } } : {}),
+        }))
+      : undefined);
+    const allowedTools = server.allowedTools ?? (bundledBerryCrawl
+      ? BERRYCRAWL_TOOL_CATALOG.map((tool) => tool.name)
+      : undefined);
+    const defaultTools = server.defaultTools ?? (bundledBerryCrawl
+      ? [...BERRYCRAWL_DEFAULT_TOOL_NAMES]
+      : undefined);
+    const nonReplayableTools = server.nonReplayableTools ?? (bundledBerryCrawl
+      ? [...BERRYCRAWL_NON_REPLAYABLE_TOOL_NAMES]
+      : undefined);
+    const trustReadOnlyAnnotations = server.trustReadOnlyAnnotations ?? bundledBerryCrawl;
     return {
       id: server.id,
       name: server.name,
@@ -105,20 +134,41 @@ export function mcpServerSpecsFromJson(
       enabled: server.enabled,
       trusted: server.trusted,
       credentialKey: server.credentialKey ?? (server.credentialEnv ? `env:${server.credentialEnv}` : null),
-      ...(server.cachedTools ? {
-        cachedTools: server.cachedTools.map((tool) => ({
+      ...(cachedTools ? {
+        cachedTools: cachedTools.map((tool) => ({
           name: tool.name,
           description: tool.description,
           inputSchema: tool.inputSchema,
           ...(tool.annotations ? { annotations: compactAnnotations(tool.annotations) } : {}),
         })),
       } : {}),
-      ...(server.allowedTools ? { allowedTools: server.allowedTools } : {}),
-      ...(server.trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
+      ...(allowedTools ? { allowedTools } : {}),
+      ...(defaultTools ? { defaultTools } : {}),
+      ...(nonReplayableTools ? { nonReplayableTools } : {}),
+      ...(trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
       ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
       ...(credential ? { credential } : {}),
     };
   });
+}
+
+function isOfficialBerryCrawlServer(server: {
+  id: string;
+  name: string;
+  transport: McpServerSpec["transport"];
+  url: string | null;
+}): boolean {
+  if (server.id.toLowerCase() !== "berrycrawl") return false;
+  if (server.name.toLowerCase().replace(/[^a-z0-9]+/g, "") !== "berrycrawl") return false;
+  if (server.transport !== "streamable-http" || !server.url) return false;
+  try {
+    const url = new URL(server.url);
+    return url.protocol === "https:"
+      && url.hostname.toLowerCase() === "api.berrycrawl.com"
+      && url.pathname.replace(/\/+$/, "") === "/api/v1/mcp";
+  } catch {
+    return false;
+  }
 }
 
 interface ConnectedServer {
@@ -352,9 +402,20 @@ export class McpToolSource {
     });
   }
 
+  listDefaultTools(): AgentTool[] {
+    const names = new Set(this.#options.servers.flatMap((server) => {
+      const prefix = `mcp__${sanitizeName(server.name)}__`;
+      return (server.defaultTools ?? []).map((name) =>
+        name.startsWith("mcp__") ? name : `${prefix}${sanitizeName(name)}`
+      );
+    }));
+    return this.listTools().filter((tool) => names.has(tool.name));
+  }
+
   approvalHints(toolName: string): {
     readOnly: boolean;
     trustedReadOnly?: true;
+    nonReplayable?: true;
     requiresApproval?: true;
     destructive: boolean;
     idempotent: boolean;
@@ -370,6 +431,7 @@ export class McpToolSource {
       return {
         readOnly: tool.annotations?.readOnlyHint === true,
         ...(spec.trustReadOnlyAnnotations === true && tool.annotations?.readOnlyHint === true ? { trustedReadOnly: true as const } : {}),
+        ...(spec.nonReplayableTools?.includes(tool.name) ? { nonReplayable: true as const } : {}),
         ...(spec.trustReadOnlyAnnotations !== true || spec.approvalRequiredTools?.includes(tool.name)
           ? { requiresApproval: true as const }
           : {}),

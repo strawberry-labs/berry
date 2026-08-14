@@ -2416,6 +2416,8 @@ async function durableMcpServer(server: McpServerSpec): Promise<DurableMcpServer
     credentialRef: secret.credentialRef ?? null,
     ...(server.cachedTools ? { cachedTools: server.cachedTools } : {}),
     ...(server.allowedTools ? { allowedTools: server.allowedTools } : {}),
+    ...(server.defaultTools ? { defaultTools: server.defaultTools } : {}),
+    ...(server.nonReplayableTools ? { nonReplayableTools: server.nonReplayableTools } : {}),
     ...(server.trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
     ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
     ...(secret.credential ? { credential: secret.credential } : {}),

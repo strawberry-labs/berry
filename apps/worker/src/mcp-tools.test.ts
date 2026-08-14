@@ -71,6 +71,100 @@ describe("durable MCP tool exposure", () => {
     });
   });
 
+  it("accepts a connector display name when the model does not return its id", async () => {
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("What appointments do I have tomorrow?");
+
+    const result = await tools.execute(snapshot, {
+      id: "search-appointments-by-name",
+      type: "tool.tool_search",
+      input: {
+        toolName: "tool_search",
+        arguments: { query: "appointments tomorrow", connector: "Google Calendar", limit: 5 },
+      },
+    } as never);
+
+    expect(result.output).toMatchObject({
+      connector: "calendar",
+      activatedTools: ["mcp__Google_Calendar__list_events"],
+    });
+  });
+
+  it("prefers an exact connector id over an earlier display-name alias", async () => {
+    const alias = connectorServer(
+      "calendar-alias",
+      "calendar",
+      true,
+      "wrong_events",
+      "List events from the alias connector",
+    );
+    const exact = connectorServer(
+      "calendar",
+      "Exact Calendar",
+      true,
+      "right_events",
+      "List events from the exact connector",
+    );
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, [alias, exact], undefined);
+
+    const result = await tools.execute(mcpSnapshot("List my events"), {
+      id: "search-exact-calendar",
+      type: "tool.tool_search",
+      input: {
+        toolName: "tool_search",
+        arguments: { query: "events", connector: "calendar", limit: 5 },
+      },
+    } as never);
+
+    expect(result.output).toMatchObject({
+      connector: "calendar",
+      activatedTools: ["mcp__Exact_Calendar__right_events"],
+    });
+  });
+
+  it("rejects ambiguous connector display-name aliases", async () => {
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, [
+      connectorServer("first", "Shared Calendar", true, "first_events", "List first events"),
+      connectorServer("second", "Shared Calendar", true, "second_events", "List second events"),
+    ], undefined);
+
+    await expect(tools.execute(mcpSnapshot("List my events"), {
+      id: "search-ambiguous-calendar",
+      type: "tool.tool_search",
+      input: {
+        toolName: "tool_search",
+        arguments: { query: "events", connector: "shared calendar", limit: 5 },
+      },
+    } as never)).rejects.toThrow("Ambiguous connector alias");
+  });
+
+  it("exposes configured default connector tools without requiring a mention or tool_search", async () => {
+    const berryCrawl = connectorServer(
+      "berrycrawl",
+      "BerryCrawl",
+      true,
+      "berrycrawl_search_web",
+      "Search the web",
+    );
+    berryCrawl.defaultTools = ["berrycrawl_search_web"];
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, [berryCrawl], undefined);
+
+    const definitions = await tools.definitions(mcpSnapshot("Answer this general question"));
+
+    expect(definitions.map((definition) => definition.function.name)).toEqual([
+      "tool_search",
+      "mcp__BerryCrawl__berrycrawl_search_web",
+    ]);
+  });
+
   it("discovers an initially omitted authorized tool and exposes it on the next model call", async () => {
     const base: DurableTurnToolExecutor = {
       execute: vi.fn(async () => ({ output: {}, summary: "base" })),
@@ -255,6 +349,26 @@ describe("durable MCP approval policy", () => {
     );
 
     expect(policy).toMatchObject({ retryClass: "read_only", requiresApproval: false });
+  });
+
+  it("does not replay billed Berry-owned reads after an ambiguous interruption", () => {
+    const policy = durableMcpToolPolicy(
+      { trustReadOnlyAnnotations: true },
+      {
+        readOnly: true,
+        trustedReadOnly: true,
+        nonReplayable: true,
+        destructive: false,
+        idempotent: true,
+        openWorld: true,
+      },
+      "full-access",
+    );
+
+    expect(policy).toMatchObject({
+      retryClass: "non_idempotent_manual",
+      requiresApproval: false,
+    });
   });
 
   it("allows high-impact Berry-owned connector actions under full access", () => {

@@ -1002,7 +1002,7 @@ export class BerryAgentRuntime {
         const threshold = Math.max(1, options.mcpToolDeferral?.threshold ?? 40);
         if (options.mcpToolDeferral?.enabled !== false && canDefer && mcpTools.length > threshold) {
           let harnessRef: AgentHarness | undefined;
-          const visible = [...allTools];
+          const visible = [...allTools, ...mcp.listDefaultTools()];
           const search = mcp.createToolSearch(async (matches) => {
             const known = new Set(visible.map((tool) => tool.name));
             visible.push(...matches.filter((tool) => !known.has(tool.name)));

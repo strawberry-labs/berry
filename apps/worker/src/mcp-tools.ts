@@ -190,6 +190,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
             ...(tool.annotations ? { annotations: compactMcpAnnotations(tool.annotations) } : {}),
           })) } : {}),
           ...(server.allowedTools ? { allowedTools: server.allowedTools } : {}),
+          ...(server.defaultTools ? { defaultTools: server.defaultTools } : {}),
+          ...(server.nonReplayableTools ? { nonReplayableTools: server.nonReplayableTools } : {}),
           ...(server.trustReadOnlyAnnotations ? { trustReadOnlyAnnotations: true } : {}),
           ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
           ...(credential ? { credential } : {}),
@@ -220,9 +222,22 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const query = stringValue(input.query);
     if (!query) throw new Error("tool_search requires a non-empty query describing the connector capability needed");
     const connectorId = stringValue(input.connector);
-    const connector = connectorId
+    const normalizedConnectorId = connectorId ? normalizeCatalogIdentity(connectorId) : null;
+    const exactConnector = connectorId
       ? context.servers.find((server) => server.id === connectorId)
       : undefined;
+    const aliasMatches = connectorId && !exactConnector
+      ? context.servers.filter((server) =>
+          normalizeCatalogIdentity(server.id) === normalizedConnectorId
+          || normalizeCatalogIdentity(server.name) === normalizedConnectorId
+        )
+      : [];
+    if (connectorId && aliasMatches.length > 1) {
+      throw new Error(
+        `Ambiguous connector alias: ${connectorId}. Use one exact connector id from: ${aliasMatches.map((server) => server.id).join(", ")}`,
+      );
+    }
+    const connector = exactConnector ?? aliasMatches[0];
     if (connectorId && !connector) {
       throw new Error(`Unknown or unauthorized connector: ${connectorId}`);
     }
@@ -273,6 +288,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
 
   #visibleToolNames(snapshot: DurableTurnSnapshot, context: DurableMcpTurnContext): Set<string> {
     const visible = revealedMcpToolNames(snapshot);
+    for (const server of context.servers) {
+      const prefix = `mcp__${sanitizeName(server.name)}__`;
+      for (const toolName of server.defaultTools ?? []) {
+        visible.add(toolName.startsWith("mcp__") ? toolName : `${prefix}${sanitizeName(toolName)}`);
+      }
+    }
     const selectedServerIds = explicitlyMentionedMcpServerIds(snapshot, context.servers);
     for (const step of snapshot.steps) {
       if (step.state !== "completed") continue;
@@ -429,6 +450,13 @@ export function durableMcpToolPolicy(
   hints: ReturnType<McpToolSource["approvalHints"]>,
   permissionMode: string,
 ): DurableToolPolicy {
+  if (hints?.nonReplayable) {
+    return {
+      retryClass: "non_idempotent_manual",
+      requiresApproval: hints.requiresApproval === true && permissionMode !== "full-access",
+      approvalKind: "mcp",
+    };
+  }
   if (hints?.requiresApproval) {
     return {
       retryClass: hints.idempotent ? "idempotent_with_key" : "non_idempotent_manual",

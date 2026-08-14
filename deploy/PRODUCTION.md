@@ -16,6 +16,14 @@ For a repeatable AWS installation, use the CloudFormation stack in
 - BerryRouter inference URL/key, exact Router IDs for Kimi 2.6 and GLM 5.2, their input/output prices per million tokens, the chat-completions path, and an image model/path.
 - An E2B Cloud team with billing enabled, a server API key, and either the built-in `base` template or a reviewed custom template ID. The E2B key is injected only into the private API container and never reaches the web app or browser.
 - BerryCrawl public HTTPS MCP URL and bearer key.
+
+The official `api.berrycrawl.com/api/v1/mcp` adapter uses Berry's reviewed tool
+catalog. Web search, single-page scrape, brand lookup, crawl start, and crawl
+job polling are present on the first model call; the remaining BerryCrawl tools
+stay behind `tool_search`. If a live schema changes, Berry disables that tool
+until the bundled catalog is reviewed and updated. Credit-consuming read calls
+use manual recovery after an ambiguous worker interruption so Berry does not
+replay and bill the same request twice.
 - A retention policy for RDS automated backups and snapshots. Configure S3 versioning, lifecycle, and retention separately for the two object buckets.
 
 The AWS production profile does not start PostgreSQL, Mem0 PostgreSQL, or MinIO containers and does not expose a second files hostname. Local development can still use the single-host database and MinIO services.
