@@ -122,7 +122,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
     }
     if (!this.#visibleToolNames(snapshot, context).has(toolName)) {
-      throw new Error(`MCP tool ${toolName} is deferred. Call tool_search for the required connector capability first.`);
+      throw new Error(deferredMcpToolError(toolName));
     }
     const tool = context.source.listTools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error(`MCP tool ${toolName} is unavailable`);
@@ -295,10 +295,18 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       }
     }
     const selectedServerIds = explicitlyMentionedMcpServerIds(snapshot, context.servers);
+    // Model history survives across turns, so keep previously discovered
+    // connector schemas visible when those historical tool names remain in it.
+    for (const toolName of persistedMcpToolNames(snapshot)) {
+      const server = this.#serverForTool(toolName, context.servers);
+      if (server) selectedServerIds.add(server.id);
+    }
     for (const step of snapshot.steps) {
-      if (step.state !== "completed") continue;
       const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
       if (!toolName.startsWith("mcp__")) continue;
+      // A provider can reuse a historical tool name before calling tool_search.
+      // Reveal its admitted connector after that first deferred failure.
+      if (step.state !== "completed" && !isDeferredMcpToolFailure(step, toolName)) continue;
       const server = this.#serverForTool(toolName, context.servers);
       if (server) selectedServerIds.add(server.id);
     }
@@ -399,6 +407,42 @@ function revealedMcpToolNames(snapshot: DurableTurnSnapshot): Set<string> {
     }
   }
   return names;
+}
+
+function persistedMcpToolNames(snapshot: DurableTurnSnapshot): Set<string> {
+  const names = new Set<string>();
+  for (const entry of snapshot.entries) {
+    const payload = record(entry.payload);
+    const message = record(payload?.message);
+    if (message?.role !== "toolResult" || message.isError === true) continue;
+    const toolName = stringValue(message.toolName);
+    if (toolName?.startsWith("mcp__")) names.add(toolName);
+    if (toolName !== "tool_search") continue;
+    for (const name of mcpToolNamesInContent(message.content)) names.add(name);
+  }
+  return names;
+}
+
+function mcpToolNamesInContent(content: unknown): string[] {
+  const text = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.flatMap((part) => {
+          const item = record(part);
+          return typeof item?.text === "string" ? [item.text] : [];
+        }).join("\n")
+      : "";
+  return text.match(/mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+/g) ?? [];
+}
+
+function deferredMcpToolError(toolName: string): string {
+  return `MCP tool ${toolName} was deferred because its connector schema was not active. The connector is now enabled for the next model call; retry the tool with the provided schema.`;
+}
+
+function isDeferredMcpToolFailure(step: DurableTurnStep, toolName: string): boolean {
+  if (step.state !== "failed" || typeof step.error !== "string") return false;
+  return step.error === deferredMcpToolError(toolName)
+    || step.error === `MCP tool ${toolName} is deferred. Call tool_search for the required connector capability first.`;
 }
 
 function connectorToolMatches<T extends { name: string; description?: string }>(

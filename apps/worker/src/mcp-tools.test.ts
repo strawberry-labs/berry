@@ -198,6 +198,77 @@ describe("durable MCP tool exposure", () => {
       .toContain("mcp__Gmail__search_messages");
   });
 
+  it("keeps a connector revealed across turns after a successful tool_search", async () => {
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("d.kelly@aesg.com");
+    snapshot.entries = [{
+      entryId: "entry-prior-tool-search",
+      parentEntryId: null,
+      entryType: "message",
+      sequence: 1,
+      payload: {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "tool_search",
+          isError: false,
+          content: [{
+            type: "text",
+            text: "Enabled connector tools for the next model call: mcp__Gmail__search_messages",
+          }],
+        },
+      },
+    }, {
+      entryId: "entry-user",
+      parentEntryId: "entry-prior-tool-search",
+      entryType: "message",
+      sequence: 2,
+      payload: { type: "message", message: { role: "user", content: "d.kelly@aesg.com" } },
+    }] as never;
+
+    const definitions = await tools.definitions(snapshot);
+
+    expect(definitions.map((definition) => definition.function.name))
+      .toContain("mcp__Gmail__search_messages");
+  });
+
+  it("reveals an admitted connector after its first deferred call fails", async () => {
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("Find the address for this person");
+    const deferredStep = {
+      id: "call-deferred-gmail",
+      sequence: 1,
+      type: "tool.mcp__Gmail__search_messages",
+      state: "pending",
+      input: {
+        toolName: "mcp__Gmail__search_messages",
+        arguments: { query: "d.kelly@aesg.com" },
+      },
+      output: null,
+      retryClass: "read_only",
+      idempotencyKey: "call-deferred-gmail",
+      attempt: 0,
+      error: null,
+    } as const;
+
+    let failure = "";
+    try {
+      await tools.execute(snapshot, deferredStep as never);
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    expect(failure).toContain("connector is now enabled for the next model call");
+    snapshot.steps = [{ ...deferredStep, state: "failed", error: failure }] as never;
+
+    const definitions = await tools.definitions(snapshot);
+    expect(definitions.map((definition) => definition.function.name))
+      .toContain("mcp__Gmail__search_messages");
+  });
+
   it("keeps unauthorized connector schemas unavailable to exposure and discovery", async () => {
     const unauthorized = connectorServer("private-mail", "Private Mail", false, "read_secret", "Read private email");
     const tools = new DurableMcpToolExecutor({
