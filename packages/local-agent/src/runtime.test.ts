@@ -554,18 +554,15 @@ describe("BerryAgentRuntime", () => {
 
   it("preserves persisted artifact metadata in the tool result", async () => {
     const { db, workspace } = setup();
+    const persistFile = vi.fn(async () => ({
+      key: "artifacts/report.pdf",
+      url: "/v1/artifacts/artifacts/report.pdf",
+      storage: "s3://berry-artifacts",
+      size: 82_000,
+    }));
     const runtime = new BerryAgentRuntime({
       db,
-      artifactStore: {
-        async persistFile() {
-          return {
-            key: "artifacts/report.pdf",
-            url: "/v1/artifacts/artifacts/report.pdf",
-            storage: "s3://berry-artifacts",
-            size: 82_000,
-          };
-        },
-      },
+      artifactStore: { persistFile },
     });
     const collector = turnCollector();
     const outputs: unknown[] = [];
@@ -597,6 +594,9 @@ describe("BerryAgentRuntime", () => {
         }),
       }),
     ]);
+    expect(persistFile).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: { taskId: "task_artifact_metadata", sessionId: "session_artifact_metadata" },
+    }));
     await runtime.dispose();
     db.close();
   });

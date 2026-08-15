@@ -17,9 +17,8 @@ import {
   TriangleAlert,
   Users,
 } from "lucide-react";
-import { BerryLogo } from "@berry/desktop-ui/components/berry-logo";
 import GoogleSsoButton from "../shell/google-sso-button.tsx";
-import { resolveDeploymentBrandAssetUrl } from "../shell/deployment-brand.tsx";
+import { DeploymentBrandImage, resolveDeploymentBrandAssetUrl } from "../shell/deployment-brand.tsx";
 
 type StepStatus = "complete" | "current" | "pending";
 
@@ -158,7 +157,7 @@ export function DeploymentOnboarding({ baseUrl, initialToken }: { baseUrl: strin
     <main className="berry-onboarding-shell" aria-label="Berry deployment onboarding">
       <aside className="berry-onboarding-rail">
         <div className="berry-onboarding-brand">
-          {logoUrl ? <img src={logoUrl} alt="" /> : <BerryLogo alt="" />}
+          <DeploymentBrandImage logoUrl={logoUrl} alt="" />
           <div><strong>{status.applicationName}</strong><span>Deployment setup</span></div>
         </div>
         <nav aria-label="Setup progress">

@@ -25,9 +25,19 @@ export function useDeploymentBrand(): DeploymentBrand {
   return React.useContext(DeploymentBrandContext);
 }
 
-export function DeploymentBrandLogo({ className, alt = "" }: { className?: string; alt?: string }) {
-  const brand = useDeploymentBrand();
-  return brand.logoUrl
-    ? <img className={`${className ?? ""} berry-deployment-logo`} src={brand.logoUrl} alt={alt} />
+export function deploymentBrandLogoUrl(logoUrl: string | null, failedUrl: string | null): string | null {
+  return logoUrl && logoUrl !== failedUrl ? logoUrl : null;
+}
+
+export function DeploymentBrandImage({ logoUrl: configuredLogoUrl, className, alt = "" }: { logoUrl: string | null; className?: string; alt?: string }) {
+  const [failedUrl, setFailedUrl] = React.useState<string | null>(null);
+  React.useEffect(() => setFailedUrl(null), [configuredLogoUrl]);
+  const logoUrl = deploymentBrandLogoUrl(configuredLogoUrl, failedUrl);
+  return logoUrl
+    ? <img className={`${className ?? ""} berry-deployment-logo`} src={logoUrl} alt={alt} onError={() => setFailedUrl(logoUrl)} />
     : <BerryLogo className={className} alt={alt} />;
+}
+
+export function DeploymentBrandLogo({ className, alt = "" }: { className?: string; alt?: string }) {
+  return <DeploymentBrandImage logoUrl={useDeploymentBrand().logoUrl} alt={alt} {...(className === undefined ? {} : { className })} />;
 }

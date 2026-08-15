@@ -20,15 +20,19 @@ export function authDestination(input: {
 
 export function applyDeploymentFavicon(url: string | null): void {
   const existing = document.head.querySelector<HTMLLinkElement>('link[data-berry-organization-favicon="true"]');
+  existing?.remove();
   if (!url) {
-    existing?.remove();
     return;
   }
-  const link = existing ?? document.createElement("link");
+  const link = document.createElement("link");
   link.rel = "icon";
   link.href = url;
+  const expectedUrl = link.href;
   link.dataset.berryOrganizationFavicon = "true";
-  if (!existing) document.head.append(link);
+  link.onerror = () => {
+    if (link.href === expectedUrl) link.remove();
+  };
+  document.head.append(link);
 }
 
 export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }: {

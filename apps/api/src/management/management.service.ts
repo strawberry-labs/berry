@@ -12,6 +12,7 @@ import {
 } from "@berry/shared";
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
 import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.ts";
+import { normalizeMediaType } from "../files/file-response-security.ts";
 
 export const MANAGEMENT_SERVICE = Symbol("MANAGEMENT_SERVICE");
 export type DestinationInput = { kind:"email"|"webhook";label:string;emailRecipients:string[];secret?:string|undefined };
@@ -84,7 +85,15 @@ export class PostgresManagementRepository implements ManagementRepository {
   private setJsonPolicy<T>(t:string,table:string,schema:{parse(value:unknown):T},value:unknown){const parsed=schema.parse(value);return this.database.withTenant(t,async db=>{await db.execute(`INSERT INTO ${table}(tenant_id,policy) VALUES($1::uuid,$2::jsonb) ON CONFLICT(tenant_id) DO UPDATE SET policy=excluded.policy,updated_at=now()`,[t,JSON.stringify(parsed)]);return parsed;});}
 }
 
-type BrandingAssetRow = { id:string; media_type:string; detected_media_type:string|null; size_bytes:string|number; status:string };
+type BrandingAssetRow = {
+  id:string;
+  media_type:string;
+  detected_media_type:string|null;
+  size_bytes:string|number;
+  status:string;
+  currently_bound_logo:boolean;
+  currently_bound_favicon:boolean;
+};
 const BRANDING_MEDIA_TYPES:Record<OrganizationBrandingAssetKind,ReadonlySet<string>>={
   logo:new Set(ORGANIZATION_LOGO_MEDIA_TYPES),
   favicon:new Set(ORGANIZATION_FAVICON_MEDIA_TYPES),
@@ -120,7 +129,15 @@ async function validateBrandingAssets(db:SqlExecutor,tenantId:string,userId:stri
   if(requested.length===0)return;
   const fileIds=[...new Set(requested.map((asset)=>asset.fileId))];
   const rows=await db.query<BrandingAssetRow>(`
-    SELECT id,media_type,detected_media_type,size_bytes,status
+    SELECT id,media_type,detected_media_type,size_bytes,status,
+      EXISTS (
+        SELECT 1 FROM organization_profiles profile
+        WHERE profile.tenant_id=f.tenant_id AND profile.branding->>'logoFileId'=f.id::text
+      ) AS currently_bound_logo,
+      EXISTS (
+        SELECT 1 FROM organization_profiles profile
+        WHERE profile.tenant_id=f.tenant_id AND profile.branding->>'faviconFileId'=f.id::text
+      ) AS currently_bound_favicon
     FROM files f
     WHERE f.tenant_id=$1::uuid AND f.id=ANY($3::uuid[]) AND f.deleted_at IS NULL
       AND (
@@ -136,9 +153,16 @@ async function validateBrandingAssets(db:SqlExecutor,tenantId:string,userId:stri
   for(const asset of requested){
     const file=byId.get(asset.fileId);
     if(!file||!(["available","processing"] as const).includes(file.status as "available"|"processing"))throw new BadRequestException(`The selected ${asset.kind} is not an available Berry file owned by you`);
-    const mediaType=(file.detected_media_type??file.media_type).toLowerCase();
-    if(!BRANDING_MEDIA_TYPES[asset.kind].has(mediaType))throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must use a supported image format`);
-    if(Number(file.size_bytes)>BRANDING_MAX_BYTES[asset.kind])throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must be ${asset.kind==="logo"?"5 MB":"1 MB"} or smaller`);
+    const declaredMediaType=normalizeMediaType(file.media_type);
+    const detectedMediaType=file.detected_media_type===null?null:normalizeMediaType(file.detected_media_type);
+    const currentlyBound=asset.kind==="logo"?file.currently_bound_logo:file.currently_bound_favicon;
+    const mediaTypesMatch=declaredMediaType!==null
+      && BRANDING_MEDIA_TYPES[asset.kind].has(declaredMediaType)
+      && (detectedMediaType===null||(detectedMediaType===declaredMediaType&&BRANDING_MEDIA_TYPES[asset.kind].has(detectedMediaType)));
+    if(!mediaTypesMatch&&!currentlyBound)throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must use a supported image format`);
+    const sizeBytes=Number(file.size_bytes);
+    if(!Number.isSafeInteger(sizeBytes)||sizeBytes<=0)throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must be a non-empty stored file`);
+    if(sizeBytes>BRANDING_MAX_BYTES[asset.kind])throw new BadRequestException(`${asset.kind==="logo"?"Organization logos":"Favicons"} must be ${asset.kind==="logo"?"5 MB":"1 MB"} or smaller`);
   }
 }
 

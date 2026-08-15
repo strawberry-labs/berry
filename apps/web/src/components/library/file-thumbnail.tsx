@@ -1,5 +1,6 @@
 import * as React from "react";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
+import { isPassiveInlineImageFile } from "./file-preview-policy";
 
 /**
  * Berry-adapted Extend UI file thumbnail: durable previews come from object
@@ -39,5 +40,5 @@ export function FileThumbnail({ name, previewImageUrl, className = "" }: {
 }
 
 export function isImageFile(file: { name: string; mediaType: string }): boolean {
-  return file.mediaType.startsWith("image/") || /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|tiff?|webp)$/i.test(file.name);
+  return isPassiveInlineImageFile(file);
 }

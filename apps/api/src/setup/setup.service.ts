@@ -19,7 +19,12 @@ import {
 } from "@aws-sdk/client-s3";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
-import { isConnectorEncryptionKeyValid } from "@berry/shared";
+import {
+  FILE_RESPONSE_SECURITY_VERSION,
+  isConnectorEncryptionKeyValid,
+  ORGANIZATION_FAVICON_MEDIA_TYPES,
+  ORGANIZATION_LOGO_MEDIA_TYPES,
+} from "@berry/shared";
 import { Redis } from "ioredis";
 import { z } from "zod";
 import type { ConnectorsService } from "../connectors/connectors.service.ts";
@@ -27,6 +32,7 @@ import type { CloudDatabaseService } from "../db/cloud-database.service.ts";
 import type { EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { s3ClientOptions } from "../storage/s3-client-options.ts";
 import { resolveGoogleSsoRedirectUri } from "../auth/google-sso-callback.ts";
+import { normalizeMediaType } from "../files/file-response-security.ts";
 
 const DomainSchema = z.string().trim().toLowerCase().regex(
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
@@ -151,6 +157,16 @@ export class SetupService {
         timezone: string;
         branding: unknown;
       }>("SELECT logo_url,support_email,security_email,timezone,branding FROM organization_profiles WHERE tenant_id=$1::uuid LIMIT 1", [this.#tenantId]);
+      const profileBranding = record(profile?.branding);
+      const brandingFileIds = [uuidValue(profileBranding.logoFileId), uuidValue(profileBranding.faviconFileId)]
+        .filter((value): value is string => Boolean(value));
+      const brandingFiles = brandingFileIds.length > 0
+        ? await db.query<BrandingFileAvailability>(`
+          SELECT id, media_type, detected_media_type, status
+          FROM files
+          WHERE tenant_id=$1::uuid AND id=ANY($2::uuid[]) AND deleted_at IS NULL
+        `, [this.#tenantId, brandingFileIds])
+        : [];
       const [sso] = await db.query<{
         client_id: string | null;
         client_secret_envelope: unknown;
@@ -172,7 +188,7 @@ export class SetupService {
         "SELECT EXISTS(SELECT 1 FROM tenant_memberships WHERE tenant_id=$1::uuid AND role='owner' AND status='active') AS exists",
         [this.#tenantId],
       );
-      return { tenant, profile, sso, connector, builtIns, completed: owner?.exists === true };
+      return { tenant, profile, brandingFiles, sso, connector, builtIns, completed: owner?.exists === true };
     });
 
     const settings = record(snapshot.tenant.settings);
@@ -191,6 +207,8 @@ export class SetupService {
     const applicationName = stringValue(draft.applicationName) ?? stringValue(branding.applicationName) ?? "Berry";
     const logoFileId = uuidValue(branding.logoFileId);
     const faviconFileId = uuidValue(branding.faviconFileId);
+    const logoFileAvailable = brandingFileAvailable(snapshot.brandingFiles, logoFileId, ORGANIZATION_LOGO_MEDIA_TYPES);
+    const faviconFileAvailable = brandingFileAvailable(snapshot.brandingFiles, faviconFileId, ORGANIZATION_FAVICON_MEDIA_TYPES);
     const byKey = new Map(snapshot.builtIns.map((item) => [item.connector_key, item]));
     return {
       required: !completed,
@@ -205,8 +223,8 @@ export class SetupService {
         configured: organizationConfigured,
         name: snapshot.tenant.name,
         applicationName,
-        logoUrl: logoFileId ? `/v1/branding/logo?v=${encodeURIComponent(logoFileId)}` : snapshot.profile?.logo_url ?? null,
-        faviconUrl: faviconFileId ? `/v1/branding/favicon?v=${encodeURIComponent(faviconFileId)}` : null,
+        logoUrl: logoFileAvailable ? `/v1/branding/logo?v=${encodeURIComponent(logoFileId!)}&sv=${FILE_RESPONSE_SECURITY_VERSION}` : snapshot.profile?.logo_url ?? null,
+        faviconUrl: faviconFileAvailable ? `/v1/branding/favicon?v=${encodeURIComponent(faviconFileId!)}&sv=${FILE_RESPONSE_SECURITY_VERSION}` : null,
         accentColor: stringValue(draft.accentColor) ?? stringValue(branding.accentColor) ?? "#7c6df2",
         supportEmail: unlocked ? snapshot.profile?.support_email ?? null : null,
         securityEmail: unlocked ? snapshot.profile?.security_email ?? null : null,
@@ -614,6 +632,27 @@ function stringValue(value: unknown): string | null {
 function uuidValue(value: unknown): string | null {
   const candidate = stringValue(value);
   return candidate && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate) ? candidate : null;
+}
+
+type BrandingFileAvailability = {
+  id: string;
+  media_type: string;
+  detected_media_type: string | null;
+  status: string;
+};
+
+function brandingFileAvailable(
+  files: readonly BrandingFileAvailability[],
+  fileId: string | null,
+  allowedMediaTypes: readonly string[],
+): boolean {
+  if (!fileId) return false;
+  const file = files.find((candidate) => candidate.id === fileId);
+  if (!file || (file.status !== "available" && file.status !== "processing")) return false;
+  const declared = normalizeMediaType(file.media_type);
+  const detected = file.detected_media_type === null ? null : normalizeMediaType(file.detected_media_type);
+  const allowed = new Set(allowedMediaTypes.map((value) => normalizeMediaType(value)));
+  return declared !== null && allowed.has(declared) && (detected === null || detected === declared);
 }
 
 function normalizeEmail(value: string | undefined): string | null {

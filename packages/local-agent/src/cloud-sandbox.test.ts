@@ -209,9 +209,19 @@ describe("CloudSandboxProvider", () => {
       client: { putObject, createUploadUrl },
     });
 
-    const stored = await artifactStore.persistFile({ env: session.env, path: "/workspace/large.pdf", mediaType: "application/pdf" });
+    const taskId = "00000000-0000-7000-8000-000000000203";
+    const stored = await artifactStore.persistFile({
+      env: session.env,
+      path: "/workspace/large.pdf",
+      mediaType: "application/pdf",
+      metadata: { taskId, sessionId: "00000000-0000-7000-8000-000000000204" },
+    });
 
-    expect(createUploadUrl).toHaveBeenCalledWith(expect.objectContaining({ contentType: "application/pdf", key: expect.stringMatching(/^outputs\/.+-large\.pdf$/) }));
+    expect(createUploadUrl).toHaveBeenCalledWith(expect.objectContaining({
+      contentType: "application/pdf",
+      key: expect.stringMatching(new RegExp(`^outputs/tasks/${taskId}/.+-large\\.pdf$`)),
+      metadata: expect.objectContaining({ taskId }),
+    }));
     expect(putObject).not.toHaveBeenCalled();
     expect(stored).toMatchObject({ storage: "s3://berry-artifacts", size: 11, url: expect.stringContaining("/v1/artifacts/outputs/") });
   });

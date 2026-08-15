@@ -4,10 +4,10 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { BadRequestException, Body, Controller, Get, Header, Inject, Module, NotFoundException, Param, Post, Query, Res, type DynamicModule } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Get, Header, Inject, Module, NotFoundException, Param, Post, Query, Req, Res, UnauthorizedException, type DynamicModule } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import type { NestExpressApplication } from "@nestjs/platform-express";
-import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { ServerResponse } from "node:http";
 import { BerryDatabase } from "@berry/desktop-db";
@@ -43,6 +43,15 @@ import { PostgresAllowanceRepository } from "./budget/allowance.service.ts";
 import { PostgresManagementRepository } from "./management/management.service.ts";
 import { ExplicitPlatformAuthorizer } from "./management/platform-authorizer.ts";
 import { PostgresPlatformService } from "./management/platform.service.ts";
+import {
+  bufferBodyPrefix,
+  detectMediaType,
+  FILE_TYPE_SAMPLE_BYTES,
+  fileResponsePolicy,
+  normalizeMediaType,
+  setUntrustedFileResponseHeaders,
+} from "./files/file-response-security.ts";
+import { FilePlatformService } from "./files/file-platform.service.ts";
 import { CloudDatabaseModule } from "./db/cloud-database.module.ts";
 import { CloudDatabaseService } from "./db/cloud-database.service.ts";
 import { FilePlatformModule } from "./files/file-platform.module.ts";
@@ -58,6 +67,7 @@ import { PostgresUsageRepository } from "./usage/usage.repository.ts";
 import { createUsageEventVerifierFromEnv } from "./usage/usage.signing.ts";
 import { deploymentRuntimeDescription } from "./deployment-mode.ts";
 import { createBerryAuthRuntime, type BerryAuthRuntime } from "./auth/auth-runtime.ts";
+import type { AuthenticatedRequest } from "./auth/auth.guard.ts";
 import { PublicAuth } from "./auth/auth.decorators.ts";
 import { ConnectorsService } from "./connectors/connectors.service.ts";
 import { SetupService } from "./setup/setup.service.ts";
@@ -88,32 +98,38 @@ export class HealthController {
   }
 }
 
-const ARTIFACT_READ_CONFIG = Symbol("ARTIFACT_READ_CONFIG");
+export const ARTIFACT_READ_CONFIG = Symbol("ARTIFACT_READ_CONFIG");
 
-type ArtifactReadConfig = {
+export type ArtifactReadConfig = {
   client: S3Client;
   bucket: string;
   prefix: string;
+  tenantId: string;
 } | null;
 
 @Controller("/v1/artifacts")
-class ArtifactController {
-  constructor(@Inject(ARTIFACT_READ_CONFIG) private readonly config: ArtifactReadConfig) {}
+export class ArtifactController {
+  constructor(
+    @Inject(ARTIFACT_READ_CONFIG) private readonly config: ArtifactReadConfig,
+    @Inject(CloudDatabaseService) private readonly database: CloudDatabaseService,
+    @Inject(FilePlatformService) private readonly files: FilePlatformService,
+  ) {}
 
   @Get()
-  async list(@Query() rawQuery: Record<string, unknown>) {
+  async list(@Req() request: AuthenticatedRequest, @Query() rawQuery: Record<string, unknown>) {
     const parsed = ArtifactListQuerySchema.safeParse(rawQuery);
     if (!parsed.success) throw new BadRequestException(parsed.error.issues);
     if (!this.config) return { items: [], nextCursor: null };
+    const userPrefix = artifactUserPrefix(this.config, authenticatedUserId(request));
     const page = await this.config.client.send(new ListObjectsV2Command({
       Bucket: this.config.bucket,
-      Prefix: `${this.config.prefix}/`,
+      Prefix: `${userPrefix}/`,
       ContinuationToken: parsed.data.cursor,
       MaxKeys: parsed.data.limit,
     }));
     const items = (page.Contents ?? [])
-      .filter((object) => Boolean(object.Key) && !object.Key!.endsWith("/"))
-      .map((object) => artifactLibraryItem(this.config!.prefix, object.Key!, object.Size ?? 0, object.LastModified))
+      .filter((object) => Boolean(object.Key) && object.Key!.startsWith(`${userPrefix}/`) && !object.Key!.endsWith("/"))
+      .map((object) => artifactLibraryItem(object.Key!, object.Size ?? 0, object.LastModified))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return {
       items,
@@ -122,42 +138,63 @@ class ArtifactController {
   }
 
   @Post()
-  async upload(@Body() body: { name?: unknown; mediaType?: unknown; dataUrl?: unknown }) {
+  async upload(@Req() request: AuthenticatedRequest, @Body() body: { name?: unknown; mediaType?: unknown; dataUrl?: unknown }) {
     if (!this.config) throw new BadRequestException("Artifact storage is not configured");
+    const userId = authenticatedUserId(request);
     const name = typeof body.name === "string" ? body.name.trim() : "";
-    const mediaType = typeof body.mediaType === "string" && body.mediaType.trim() ? body.mediaType.trim() : "application/octet-stream";
+    const declaredMediaType = body.mediaType === undefined ? "application/octet-stream" : normalizeMediaType(body.mediaType);
+    if (!declaredMediaType) throw new BadRequestException("A valid MIME media type is required");
     if (!name || name.length > 240 || typeof body.dataUrl !== "string") throw new BadRequestException("A valid file is required");
     const match = /^data:([^;,]*)(?:;charset=[^;,]*)?;base64,([A-Za-z0-9+/=\r\n]+)$/.exec(body.dataUrl);
     if (!match) throw new BadRequestException("The file payload must be base64 encoded");
+    const dataUrlMediaType = match[1] ? normalizeMediaType(match[1]) : null;
+    if (match[1] && !dataUrlMediaType) throw new BadRequestException("The data URL contains an invalid MIME media type");
     const content = Buffer.from(match[2]!.replace(/[\r\n]/g, ""), "base64");
     if (content.byteLength > 10 * 1024 * 1024) throw new BadRequestException("Files are limited to 10 MB");
-    const key = `${this.config.prefix}/${crypto.randomUUID()}-${safeArtifactName(name)}`;
+    const detectedMediaType = detectMediaType(content.subarray(0, FILE_TYPE_SAMPLE_BYTES));
+    const key = `${artifactUserPrefix(this.config, userId)}/${crypto.randomUUID()}-${safeArtifactName(name)}`;
     await this.config.client.send(new PutObjectCommand({
       Bucket: this.config.bucket,
       Key: key,
       Body: content,
-      ContentType: mediaType,
-      Metadata: { "original-name": encodeURIComponent(name), source: "web-upload" },
+      ContentType: detectedMediaType,
+      Metadata: {
+        "original-name": encodeURIComponent(name),
+        "declared-media-type": declaredMediaType,
+        ...(dataUrlMediaType ? { "data-url-media-type": dataUrlMediaType } : {}),
+        "tenant-id": this.config.tenantId,
+        "owner-user-id": userId,
+        source: "web-upload",
+      },
     }));
-    return artifactLibraryItem(this.config.prefix, key, content.byteLength, new Date(), mediaType);
+    return artifactLibraryItem(key, content.byteLength, new Date(), detectedMediaType);
   }
 
   @Get("*key")
-  async read(@Param("key") rawKey: string | string[], @Res() response: ServerResponse) {
+  async read(@Req() request: AuthenticatedRequest, @Param("key") rawKey: string | string[], @Res() response: ServerResponse) {
     if (!this.config) throw new NotFoundException("Artifact storage is not configured");
     const key = Array.isArray(rawKey) ? rawKey.join("/") : rawKey;
     if (!key.startsWith(`${this.config.prefix}/`) || key.includes("\\") || key.split("/").includes("..")) {
       throw new NotFoundException("Artifact not found");
     }
+    await authorizeArtifactKey(this.database, this.files, this.config, authenticatedUserId(request), key);
     try {
       const object = await this.config.client.send(new GetObjectCommand({ Bucket: this.config.bucket, Key: key }));
       if (!object.Body) throw new NotFoundException("Artifact not found");
+      const inspected = await bufferBodyPrefix(object.Body as AsyncIterable<Uint8Array>);
+      const policy = fileResponsePolicy({
+        declaredMediaType: object.ContentType,
+        detectedMediaType: detectMediaType(inspected.sample),
+        allowInline: true,
+      });
       response.statusCode = 200;
-      response.setHeader("Content-Type", object.ContentType ?? "application/octet-stream");
       if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
       response.setHeader("Cache-Control", "private, max-age=3600");
-      response.setHeader("Content-Disposition", inlineDisposition(object.ContentType) ? "inline" : "attachment");
-      for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
+      setUntrustedFileResponseHeaders(response, {
+        fileName: artifactLibraryItem(key, object.ContentLength ?? 0).name,
+        policy,
+      });
+      for await (const chunk of inspected.body) {
         if (!response.write(chunk)) await once(response, "drain");
       }
       response.end();
@@ -172,8 +209,8 @@ class ArtifactController {
   }
 }
 
-function artifactLibraryItem(prefix: string, key: string, size: number, createdAt = new Date(0), explicitMediaType?: string) {
-  const storedName = key.slice(`${prefix}/`.length).replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i, "");
+function artifactLibraryItem(key: string, size: number, createdAt = new Date(0), explicitMediaType?: string) {
+  const storedName = (key.split("/").at(-1) ?? "artifact").replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i, "");
   const mediaType = explicitMediaType ?? mediaTypeForName(storedName);
   return {
     id: key,
@@ -185,6 +222,62 @@ function artifactLibraryItem(prefix: string, key: string, size: number, createdA
     createdAt: createdAt.toISOString(),
     category: mediaType.startsWith("image/") ? "images" as const : "documents" as const,
   };
+}
+
+function authenticatedUserId(request: AuthenticatedRequest): string {
+  const userId = request.auth?.user.id;
+  if (!userId) throw new UnauthorizedException("Authentication required");
+  return userId;
+}
+
+function artifactUserPrefix(config: Exclude<ArtifactReadConfig, null>, userId: string): string {
+  return `${config.prefix}/tenants/${config.tenantId}/users/${userId}/legacy-artifacts`;
+}
+
+async function authorizeArtifactKey(
+  database: CloudDatabaseService,
+  files: FilePlatformService,
+  config: Exclude<ArtifactReadConfig, null>,
+  userId: string,
+  key: string,
+): Promise<void> {
+  if (key.startsWith(`${artifactUserPrefix(config, userId)}/`)) return;
+  const relative = key.slice(`${config.prefix}/`.length);
+  if (relative.startsWith("tenants/")) throw new NotFoundException("Artifact not found");
+  let taskId = /^tasks\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/[^/]+$/i.exec(relative)?.[1];
+  if (!taskId && !relative.includes("/")) {
+    if (await files.authorizeRegisteredArtifactObjectKey(config.tenantId, userId, key)) return;
+    try {
+      const legacy = await config.client.send(new HeadObjectCommand({ Bucket: config.bucket, Key: key }));
+      taskId = objectMetadataValue(legacy.Metadata, "taskId");
+    } catch (error) {
+      const status = typeof error === "object" && error !== null && "$metadata" in error
+        ? (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
+        : undefined;
+      if (status === 404) throw new NotFoundException("Artifact not found");
+      throw error;
+    }
+  }
+  if (!taskId) throw new NotFoundException("Artifact not found");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId)) {
+    throw new NotFoundException("Artifact not found");
+  }
+  const allowed = await database.withTenant(config.tenantId, async (executor) => {
+    const [row] = await executor.query<{ allowed: boolean }>(`
+      SELECT EXISTS (
+        SELECT 1 FROM tasks
+        WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL
+          AND (user_id=$3::uuid OR user_id IS NULL)
+      ) AS allowed
+    `, [config.tenantId, taskId, userId]);
+    return row?.allowed === true;
+  });
+  if (!allowed) throw new NotFoundException("Artifact not found");
+}
+
+function objectMetadataValue(metadata: Record<string, string> | undefined, expectedKey: string): string | undefined {
+  const normalizedExpected = expectedKey.replace(/-/g, "").toLowerCase();
+  return Object.entries(metadata ?? {}).find(([key]) => key.replace(/-/g, "").toLowerCase() === normalizedExpected)?.[1];
 }
 
 function mediaTypeForName(name: string): string {
@@ -380,12 +473,9 @@ function createArtifactReadConfig(env: NodeJS.ProcessEnv): ArtifactReadConfig {
   return {
     bucket,
     prefix: (env.BERRY_ARTIFACT_S3_PREFIX ?? "artifacts").replace(/^\/+|\/+$/g, ""),
+    tenantId: env.BERRY_TENANT_ID ?? SELF_HOST_TENANT_ID,
     client: new S3Client(s3ClientOptions({ endpoint, region: env.BERRY_ARTIFACT_S3_REGION, accessKeyId, secretAccessKey })),
   };
-}
-
-function inlineDisposition(contentType: string | undefined): boolean {
-  return ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"].includes(contentType ?? "");
 }
 
 class S3ObjectPutClient implements ObjectPutClient {

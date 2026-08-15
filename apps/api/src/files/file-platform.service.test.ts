@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
+import { FILE_RESPONSE_SECURITY_VERSION } from "@berry/shared";
 import type { SqlExecutor } from "../db/cloud-database.service.ts";
 import { FilePlatformService } from "./file-platform.service.ts";
 
 const TENANT_ID = "00000000-0000-7000-8000-000000000001";
 const USER_ID = "00000000-0000-7000-8000-000000000201";
+const OTHER_USER_ID = "00000000-0000-7000-8000-000000000209";
 const TASK_ID = "00000000-0000-7000-8000-000000000202";
 const WORKSPACE_ID = "00000000-0000-7000-8000-000000000203";
 const SESSION_ID = "00000000-0000-7000-8000-000000000206";
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
 
 describe("FilePlatformService.list", () => {
   it("keeps searches tenant- and membership-scoped while treating wildcard input literally", async () => {
@@ -91,6 +94,54 @@ describe("FilePlatformService.list", () => {
   });
 });
 
+describe("FilePlatformService.authorizeRegisteredArtifactObjectKey", () => {
+  it("reuses normal file access for metadata-less legacy keys and rejects another user", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000204";
+    const objectKey = `artifacts/${fileId}-legacy.png`;
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        if (sql.includes("FROM files") && sql.includes("object_key=$2")) {
+          return params[1] === objectKey ? [{ id: fileId }] as T[] : [] as T[];
+        }
+        if (sql.includes("SELECT f.*")) {
+          if (params[1] !== USER_ID) return [] as T[];
+          return [{
+            id: fileId,
+            owner_user_id: USER_ID,
+            blob_id: null,
+            original_name: "legacy.png",
+            display_name: "legacy.png",
+            media_type: "image/png",
+            detected_media_type: "image/png",
+            size_bytes: PNG_BYTES.byteLength,
+            sha256: null,
+            bucket: "berry-test",
+            object_key: objectKey,
+            etag: null,
+            object_version_id: null,
+            origin: "sandbox_output",
+            status: "available",
+            created_at: new Date(),
+            updated_at: new Date(),
+            task_ids: [TASK_ID],
+            roles: ["output"],
+          }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const service = new FilePlatformService(database as never, null);
+
+    await expect(service.authorizeRegisteredArtifactObjectKey(TENANT_ID, USER_ID, objectKey)).resolves.toBe(true);
+    await expect(service.authorizeRegisteredArtifactObjectKey(TENANT_ID, OTHER_USER_ID, objectKey)).rejects.toThrow("File not found");
+    await expect(service.authorizeRegisteredArtifactObjectKey(TENANT_ID, USER_ID, `${objectKey}.missing`)).resolves.toBe(false);
+  });
+});
+
 describe("FilePlatformService.initiateUpload", () => {
   it("links a project-chat attachment as task-only knowledge by default", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
@@ -156,7 +207,7 @@ describe("FilePlatformService.streamContent", () => {
         display_name: "history.png",
         media_type: "image/png",
         detected_media_type: null,
-        size_bytes: 3,
+        size_bytes: PNG_BYTES.byteLength,
         sha256: null,
         bucket: "legacy-bucket",
         object_key: "legacy-key",
@@ -164,7 +215,7 @@ describe("FilePlatformService.streamContent", () => {
         object_version_id: null,
         resolved_bucket: "berry-test",
         resolved_object_key: "objects/history.png",
-        resolved_size_bytes: 3,
+        resolved_size_bytes: PNG_BYTES.byteLength,
         resolved_sha256: "digest",
         resolved_etag: "etag",
         resolved_object_version_id: "version-7",
@@ -180,9 +231,9 @@ describe("FilePlatformService.streamContent", () => {
       withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
     };
     const body = {
-      async *[Symbol.asyncIterator]() { yield Buffer.from("png"); },
+      async *[Symbol.asyncIterator]() { yield PNG_BYTES; },
     };
-    const client = { send: vi.fn(async () => ({ Body: body, ContentType: "image/png", ContentLength: 3 })) };
+    const client = { send: vi.fn(async () => ({ Body: body, ContentType: "image/png", ContentLength: PNG_BYTES.byteLength })) };
     const response = {
       statusCode: 0,
       setHeader: vi.fn(),
@@ -204,9 +255,48 @@ describe("FilePlatformService.streamContent", () => {
     expect(client.send).toHaveBeenCalledWith(expect.objectContaining({
       input: expect.objectContaining({ Bucket: "berry-test", Key: "objects/history.png", VersionId: "version-7" }),
     }));
-    expect(response.setHeader).toHaveBeenCalledWith("ETag", '"digest"');
+    expect(response.setHeader).toHaveBeenCalledWith("ETag", `"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-digest"`);
     expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "private, max-age=31536000, immutable");
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Disposition", expect.stringMatching(/^inline;/));
     expect(response.end).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["HTML", "text/html", Buffer.from("<!doctype html><script>top.pwned=true</script>"), "text/html"],
+    ["SVG", "image/svg+xml", Buffer.from("<svg onload=\"top.pwned=true\"></svg>"), "image/svg+xml"],
+    ["a spoofed image", "image/png", Buffer.from("<html><script>top.pwned=true</script></html>"), "text/html"],
+  ])("downloads detected %s content instead of executing it inline", async (_label, declaredMediaType, bytes, expectedDetectedType) => {
+    const result = await streamContentFixture({ declaredMediaType, bytes, objectMediaType: "image/png" });
+
+    expect(result.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(result.headers.get("Content-Disposition")).toMatch(/^attachment;/);
+    expect(result.headers.get("Content-Security-Policy")).toBe("default-src 'none'; sandbox");
+    expect(result.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(result.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(result.detectedMediaTypeUpdate?.params).toEqual([TENANT_ID, result.fileId, expectedDetectedType]);
+  });
+
+  it("keeps a signature-validated passive image available inline", async () => {
+    const result = await streamContentFixture({ declaredMediaType: "image/png", bytes: PNG_BYTES });
+
+    expect(result.headers.get("Content-Type")).toBe("image/png");
+    expect(result.headers.get("Content-Disposition")).toMatch(/^inline;/);
+    expect(Buffer.concat(result.writes)).toEqual(PNG_BYTES);
+  });
+
+  it("sanitizes stored filenames before writing Content-Disposition", async () => {
+    const result = await streamContentFixture({
+      declaredMediaType: "text/html",
+      bytes: Buffer.from("<html>download only</html>"),
+      displayName: "report.html\r\nX-Injection: yes",
+    });
+
+    const disposition = String(result.headers.get("Content-Disposition"));
+    expect(disposition).toMatch(/^attachment;/);
+    expect(disposition).not.toContain("\r");
+    expect(disposition).not.toContain("\n");
+    expect(result.headers.has("X-Injection")).toBe(false);
   });
 
   it("returns 304 without transferring a cached image again", async () => {
@@ -229,13 +319,82 @@ describe("FilePlatformService.streamContent", () => {
       maxUploadBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
     } as never);
 
-    await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never, false, 'W/"content-digest"');
+    await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never, false, `W/"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-content-digest"`);
 
     expect(response.statusCode).toBe(304);
     expect(client.send).not.toHaveBeenCalled();
     expect(response.end).toHaveBeenCalledOnce();
   });
 });
+
+async function streamContentFixture(input: {
+  declaredMediaType: string;
+  bytes: Uint8Array;
+  displayName?: string;
+  objectMediaType?: string;
+}) {
+  const fileId = "00000000-0000-7000-8000-000000000220";
+  const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+  const executor: SqlExecutor = {
+    execute: async (sql, params = []) => { executions.push({ sql, params }); },
+    query: async <T>(sql: string) => sql.includes("SELECT f.*") ? [{
+      id: fileId,
+      owner_user_id: USER_ID,
+      blob_id: null,
+      original_name: input.displayName ?? "upload.bin",
+      display_name: input.displayName ?? "upload.bin",
+      media_type: input.declaredMediaType,
+      detected_media_type: null,
+      size_bytes: input.bytes.byteLength,
+      sha256: "fixture-digest",
+      bucket: "berry-test",
+      object_key: "objects/upload.bin",
+      etag: "storage-etag",
+      object_version_id: "version-1",
+      origin: "user_upload",
+      status: "available",
+      created_at: new Date(),
+      updated_at: new Date(),
+      task_ids: [TASK_ID],
+      roles: ["input"],
+    }] as T[] : [] as T[],
+  };
+  const database = {
+    withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor),
+  };
+  const body = { async *[Symbol.asyncIterator]() { yield input.bytes; } };
+  const client = { send: vi.fn(async () => ({
+    Body: body,
+    ContentType: input.objectMediaType ?? input.declaredMediaType,
+    ContentLength: input.bytes.byteLength,
+  })) };
+  const writes: Buffer[] = [];
+  const response = {
+    statusCode: 0,
+    setHeader: vi.fn(),
+    write: vi.fn((chunk: Uint8Array) => { writes.push(Buffer.from(chunk)); return true; }),
+    end: vi.fn(),
+  };
+  const service = new FilePlatformService(database as never, {
+    client,
+    presignClient: client,
+    bucket: "berry-test",
+    prefix: "artifacts",
+    maxUploadBytes: 1024,
+    maxIndexableBytes: 1024,
+    partSize: 5 * 1024 * 1024,
+    presignSeconds: 900,
+  } as never);
+
+  await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never);
+
+  return {
+    fileId,
+    writes,
+    headers: new Map<string, unknown>(response.setHeader.mock.calls.map(([name, value]) => [String(name), value])),
+    detectedMediaTypeUpdate: executions.find((call) => call.sql.includes("SET detected_media_type")),
+  };
+}
 
 describe("FilePlatformService.streamBrandingAsset", () => {
   const fileId = "00000000-0000-7000-8000-000000000204";
@@ -246,17 +405,17 @@ describe("FilePlatformService.streamBrandingAsset", () => {
       query: async <T>(sql: string) => {
         if (sql.includes("SELECT branding")) return [{ branding: { logoFileId: fileId } }] as T[];
         if (sql.includes("SELECT f.*")) return [{
-          id: fileId, owner_user_id: USER_ID, blob_id: null, original_name: "logo.svg", display_name: "logo.svg",
-          media_type: "image/svg+xml", detected_media_type: null, size_bytes: 12, sha256: "brand-digest",
-          bucket: "berry-test", object_key: "branding/logo.svg", etag: "storage-etag", object_version_id: "version-1",
+          id: fileId, owner_user_id: USER_ID, blob_id: null, original_name: "logo.png", display_name: "logo.png",
+          media_type: "image/png", detected_media_type: null, size_bytes: PNG_BYTES.byteLength, sha256: "brand-digest",
+          bucket: "berry-test", object_key: "branding/logo.png", etag: "storage-etag", object_version_id: "version-1",
           origin: "user_upload", status: "available", created_at: new Date(), updated_at: new Date(),
         }] as T[];
         return [] as T[];
       },
     };
     const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
-    const body = { async *[Symbol.asyncIterator]() { yield Buffer.from("<svg></svg>"); } };
-    const client = { send: vi.fn(async () => ({ Body: body, ContentType: "image/svg+xml", ContentLength: 12 })) };
+    const body = { async *[Symbol.asyncIterator]() { yield PNG_BYTES; } };
+    const client = { send: vi.fn(async () => ({ Body: body, ContentType: "image/svg+xml", ContentLength: PNG_BYTES.byteLength })) };
     const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
     const service = new FilePlatformService(database as never, {
       client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
@@ -268,8 +427,151 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     expect(response.statusCode).toBe(200);
     expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "public, max-age=31536000, immutable");
     expect(response.setHeader).toHaveBeenCalledWith("Cross-Origin-Resource-Policy", "cross-origin");
-    expect(response.setHeader).toHaveBeenCalledWith("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Security-Policy", "default-src 'none'; sandbox");
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Disposition", expect.stringMatching(/^inline;/));
     expect(client.send).toHaveBeenCalledWith(expect.objectContaining({ input: expect.objectContaining({ VersionId: "version-1" }) }));
+  });
+
+  it("returns a security-versioned 304 for validated content before reading S3 or updating the database", async () => {
+    const execute = vi.fn(async () => undefined);
+    const executor: SqlExecutor = {
+      execute,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT branding")) return [{ branding: { logoFileId: fileId } }] as T[];
+        if (sql.includes("SELECT f.*")) return [{
+          id: fileId, owner_user_id: USER_ID, blob_id: null, original_name: "logo.png", display_name: "logo.png",
+          media_type: "image/png", detected_media_type: "image/png", size_bytes: PNG_BYTES.byteLength, sha256: "brand-digest",
+          bucket: "berry-test", object_key: "branding/logo.png", etag: "storage-etag", object_version_id: "version-1",
+          origin: "user_upload", status: "available", created_at: new Date(), updated_at: new Date(),
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const client = { send: vi.fn() };
+    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const service = new FilePlatformService(database as never, {
+      client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
+      maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
+    } as never);
+
+    await service.streamBrandingAsset(
+      TENANT_ID,
+      "logo",
+      fileId,
+      response as never,
+      `W/"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-brand-digest"`,
+    );
+
+    expect(response.statusCode).toBe(304);
+    expect(response.setHeader).toHaveBeenCalledWith("ETag", `"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-brand-digest"`);
+    expect(client.send).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(response.write).not.toHaveBeenCalled();
+    expect(response.end).toHaveBeenCalledOnce();
+  });
+
+  it("validates an uninspected conditional request before honoring If-None-Match", async () => {
+    let persistedDetectedMediaType: string | null = null;
+    const execute = vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+      if (sql.includes("SET detected_media_type")) persistedDetectedMediaType = String(params[2]);
+    });
+    const content = Buffer.from("<html><body>active</body></html>");
+    const executor: SqlExecutor = {
+      execute,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT branding")) return [{ branding: { logoFileId: fileId } }] as T[];
+        if (sql.includes("SELECT f.*")) return [{
+          id: fileId, owner_user_id: USER_ID, blob_id: null, original_name: "spoofed.png", display_name: "spoofed.png",
+          media_type: "image/png", detected_media_type: persistedDetectedMediaType, size_bytes: content.byteLength, sha256: "spoofed-digest",
+          bucket: "berry-test", object_key: "branding/spoofed.png", etag: "storage-etag", object_version_id: null,
+          origin: "user_upload", status: "available", created_at: new Date(), updated_at: new Date(),
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const client = { send: vi.fn(async () => ({
+      Body: { async *[Symbol.asyncIterator]() { yield content; } },
+      ContentLength: content.byteLength,
+    })) };
+    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const service = new FilePlatformService(database as never, {
+      client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
+      maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
+    } as never);
+
+    await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, response as never, "*"))
+      .rejects.toThrow("Branding asset not found");
+
+    expect(client.send).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining("SET detected_media_type"), [TENANT_ID, fileId, "text/html"]);
+    expect(response.statusCode).not.toBe(304);
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
+
+    client.send.mockClear();
+    const repeatedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, repeatedResponse as never, "*"))
+      .rejects.toThrow("Branding asset not found");
+    expect(client.send).not.toHaveBeenCalled();
+    expect(repeatedResponse.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
+  });
+
+  it("cancels the storage body when branding metadata has a stale size", async () => {
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT branding")) return [{ branding: { logoFileId: fileId } }] as T[];
+        if (sql.includes("SELECT f.*")) return [{
+          id: fileId, owner_user_id: USER_ID, blob_id: null, original_name: "logo.png", display_name: "logo.png",
+          media_type: "image/png", detected_media_type: null, size_bytes: PNG_BYTES.byteLength, sha256: "brand-digest",
+          bucket: "berry-test", object_key: "branding/logo.png", etag: "storage-etag", object_version_id: null,
+          origin: "user_upload", status: "available", created_at: new Date(), updated_at: new Date(),
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const destroy = vi.fn();
+    const body = { destroy, async *[Symbol.asyncIterator]() { yield PNG_BYTES; } };
+    const client = { send: vi.fn(async () => ({ Body: body, ContentLength: PNG_BYTES.byteLength + 1 })) };
+    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const service = new FilePlatformService(database as never, {
+      client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
+      maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
+    } as never);
+
+    await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, response as never))
+      .rejects.toThrow("Branding asset not found");
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(response.setHeader).not.toHaveBeenCalledWith("Cache-Control", "public, max-age=31536000, immutable");
+  });
+
+  it("refuses to render an SVG branding asset from Berry's origin", async () => {
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT branding")) return [{ branding: { logoFileId: fileId } }] as T[];
+        if (sql.includes("SELECT f.*")) return [{
+          id: fileId, owner_user_id: USER_ID, blob_id: null, original_name: "logo.svg", display_name: "logo.svg",
+          media_type: "image/svg+xml", detected_media_type: null, size_bytes: 11, sha256: "brand-digest",
+          bucket: "berry-test", object_key: "branding/logo.svg", etag: "storage-etag", object_version_id: null,
+          origin: "user_upload", status: "available", created_at: new Date(), updated_at: new Date(),
+        }] as T[];
+        return [] as T[];
+      },
+    };
+    const database = { withTenant: async (_tenantId: string, callback: (value: SqlExecutor) => Promise<unknown>) => callback(executor) };
+    const client = { send: vi.fn() };
+    const response = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
+    const service = new FilePlatformService(database as never, {
+      client, presignClient: client, bucket: "berry-test", prefix: "artifacts",
+      maxUploadBytes: 1024, maxIndexableBytes: 1024, partSize: 5 * 1024 * 1024, presignSeconds: 900,
+    } as never);
+
+    await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, response as never)).rejects.toThrow("Branding asset not found");
+    expect(client.send).not.toHaveBeenCalled();
   });
 
   it("does not attach immutable cache headers when S3 retrieval fails", async () => {
@@ -778,6 +1080,29 @@ describe("FilePlatformService.importConnectorArtifact", () => {
 });
 
 describe("FilePlatformService.registerSandboxOutput", () => {
+  it("rejects a task-scoped object key when its task does not match the registration context", async () => {
+    const client = { send: vi.fn() };
+    const service = new FilePlatformService({ withTenant: vi.fn() } as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+
+    await expect(service.registerSandboxOutput(TENANT_ID, USER_ID, {
+      key: "artifacts/tasks/00000000-0000-7000-8000-000000000299/00000000-0000-7000-8000-000000000204-report.pdf",
+      name: "report.pdf",
+      mediaType: "application/pdf",
+      size: 12,
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+    })).rejects.toThrow("does not belong to this task");
+    expect(client.send).not.toHaveBeenCalled();
+  });
+
   it("does not let a user claim an ownerless logical file by reusing its object key", async () => {
     const execute = vi.fn(async () => undefined);
     const executor: SqlExecutor = {
@@ -885,7 +1210,7 @@ describe("FilePlatformService.registerSandboxOutput", () => {
   it("reuses an exact stable logical identity after backend deduplication moved its canonical blob", async () => {
     const fileId = "00000000-0000-7000-8000-000000000204";
     const blobId = "00000000-0000-7000-8000-000000000205";
-    const objectKey = `artifacts/${fileId}-report.pdf`;
+    const objectKey = `artifacts/tasks/${TASK_ID}/${fileId}-report.pdf`;
     const execute = vi.fn(async () => undefined);
     const executor: SqlExecutor = {
       execute,
@@ -1103,6 +1428,10 @@ describe("FilePlatformService.completeUpload", () => {
       send: vi.fn(async (command: object) => {
         if (command.constructor.name === "CompleteMultipartUploadCommand") throw new Error("NoSuchUpload");
         if (command.constructor.name === "HeadObjectCommand") return { ContentLength: 12, ETag: "etag" };
+        if (command.constructor.name === "GetObjectCommand") return {
+          Body: { async *[Symbol.asyncIterator]() { yield Buffer.from("hello world!"); } },
+          ContentLength: 12,
+        };
         throw new Error(`Unexpected S3 command: ${command.constructor.name}`);
       }),
     };
@@ -1122,6 +1451,7 @@ describe("FilePlatformService.completeUpload", () => {
 
     expect(executions.some((call) => call.sql.includes("UPDATE file_uploads SET status = 'completed'"))).toBe(true);
     expect(executions.some((call) => call.sql.includes("UPDATE files SET status = $6"))).toBe(true);
+    expect(executions.find((call) => call.sql.includes("detected_media_type = $7"))?.params[6]).toBe("text/plain");
     expect(executions.some((call) => call.sql.includes("INSERT INTO file_library_entries"))).toBe(true);
   });
 

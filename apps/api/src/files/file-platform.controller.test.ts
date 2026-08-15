@@ -54,6 +54,38 @@ describe("FilePlatformController", () => {
     expect(files.list).not.toHaveBeenCalled();
   });
 
+  it("rejects malformed upload MIME metadata and normalizes valid values", async () => {
+    const files = {
+      list: vi.fn(async () => ({ items: [], nextCursor: null })),
+      initiateUpload: vi.fn(async () => ({
+        fileId: "00000000-0000-7000-8000-000000000204" as const,
+        uploadId: "00000000-0000-7000-8000-000000000205" as const,
+        partSize: 5 * 1024 * 1024,
+        partCount: 1,
+        expiresAt: new Date(0).toISOString(),
+      })),
+    };
+    app = await createApp(files);
+
+    await request(app.getHttpServer())
+      .post("/v1/files/uploads")
+      .set(authHeader())
+      .send({ name: "report.png", mediaType: "image/png\r\nX-Evil: yes", size: 9 })
+      .expect(400);
+    expect(files.initiateUpload).not.toHaveBeenCalled();
+
+    await request(app.getHttpServer())
+      .post("/v1/files/uploads")
+      .set(authHeader())
+      .send({ name: "report.png", mediaType: "IMAGE/PNG", size: 9 })
+      .expect(201);
+    expect(files.initiateUpload).toHaveBeenCalledWith(SELF_HOST_TENANT_ID, USER_ID, expect.objectContaining({
+      name: "report.png",
+      mediaType: "image/png",
+      size: 9,
+    }));
+  });
+
   it("removes only a valid Library membership through the authenticated file route", async () => {
     const files = {
       list: vi.fn(async () => ({ items: [], nextCursor: null })),
@@ -71,7 +103,7 @@ describe("FilePlatformController", () => {
   });
 });
 
-async function createApp(files: Pick<FilePlatformService, "list"> & Partial<Pick<FilePlatformService, "removeFromLibrary">>): Promise<INestApplication> {
+async function createApp(files: Pick<FilePlatformService, "list"> & Partial<Pick<FilePlatformService, "initiateUpload" | "removeFromLibrary">>): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [BerryAuthModule.register({ runtime: { useValue: fakeAuthRuntime() } })],
     controllers: [FilePlatformController],

@@ -19,6 +19,7 @@ import type { ServerResponse } from "node:http";
 import { once } from "node:events";
 import { open as openFile, rm } from "node:fs/promises";
 import {
+  FILE_RESPONSE_SECURITY_VERSION,
   ORGANIZATION_FAVICON_MAX_BYTES,
   ORGANIZATION_FAVICON_MEDIA_TYPES,
   ORGANIZATION_LOGO_MAX_BYTES,
@@ -28,6 +29,15 @@ import {
 } from "@berry/shared";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.ts";
 import { garbageCollectFileIfUnreferenced } from "./file-lifecycle.ts";
+import {
+  bufferBodyPrefix,
+  detectMediaType,
+  FILE_TYPE_SAMPLE_BYTES,
+  fileResponsePolicy,
+  normalizeMediaType,
+  readBodyBounded,
+  setUntrustedFileResponseHeaders,
+} from "./file-response-security.ts";
 
 export type FileStorageConfig = {
   client: S3Client;
@@ -200,6 +210,25 @@ export class FilePlatformService {
 
   async get(tenantId: string, userId: string, fileId: string): Promise<FileRow> {
     return this.database.withTenant(tenantId, async (executor) => this.requireAccessibleFile(executor, tenantId, userId, fileId));
+  }
+
+  /**
+   * Authorize a legacy object URL through its registered logical file. A false
+   * result means the key predates (or never reached) FilePlatform registration;
+   * a registered but inaccessible file still fails closed with a 404.
+   */
+  async authorizeRegisteredArtifactObjectKey(tenantId: string, userId: string, objectKey: string): Promise<boolean> {
+    return this.database.withTenant(tenantId, async (executor) => {
+      const [registered] = await executor.query<{ id: string }>(`
+        SELECT id
+        FROM files
+        WHERE tenant_id=$1::uuid AND object_key=$2 AND deleted_at IS NULL
+        LIMIT 1
+      `, [tenantId, objectKey]);
+      if (!registered) return false;
+      await this.requireAccessibleFile(executor, tenantId, userId, registered.id);
+      return true;
+    });
   }
 
   async downloadContentToFile(
@@ -411,6 +440,13 @@ export class FilePlatformService {
       });
       throw new BadRequestException("The uploaded object size does not match the requested upload");
     }
+    const completedObjectVersionId = completedVersionId ?? head.VersionId;
+    const detectedMediaType = await this.detectStoredObjectMediaType({
+      bucket: config.bucket,
+      objectKey: upload.object_key,
+      ...(completedObjectVersionId ? { objectVersionId: completedObjectVersionId } : {}),
+      sizeBytes: actualSize,
+    });
     const file = await this.database.withTenant(tenantId, async (executor) => {
       await executor.execute(`UPDATE file_uploads SET status = 'completed', completed_at = now(), updated_at = now() WHERE tenant_id = $1::uuid AND id = $2::uuid`, [tenantId, uploadId]);
       const [workspaceFile] = await executor.query<{ workspace_id: string; visibility: "project" | "task_only"; originating_task_id: string | null }>(`
@@ -432,9 +468,10 @@ export class FilePlatformService {
         );
       }
       await executor.execute(`
-        UPDATE files SET status = $6::file_status, size_bytes = $3, etag = $4, object_version_id = $5, updated_at = now()
+        UPDATE files SET status = $6::file_status, size_bytes = $3, etag = $4, object_version_id = $5,
+          detected_media_type = $7, updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
-      `, [tenantId, fileId, actualSize, cleanEtag(head.ETag ?? completedEtag), completedVersionId ?? head.VersionId ?? null, shouldIndex ? "processing" : "available"]);
+      `, [tenantId, fileId, actualSize, cleanEtag(head.ETag ?? completedEtag), completedVersionId ?? head.VersionId ?? null, shouldIndex ? "processing" : "available", detectedMediaType]);
       await reviveLibraryEntry(executor, tenantId, userId, fileId);
       if (upload.blob_id) {
         await executor.execute(`
@@ -462,7 +499,7 @@ export class FilePlatformService {
                  wf.visibility, 'pending', 'pending', 'tika-v1', 'recursive-v1',
                  jsonb_strip_nulls(jsonb_build_object(
                    'fileId', f.id,
-                   'mediaType', f.media_type,
+                   'mediaType', COALESCE(f.detected_media_type, f.media_type),
                    'objectKey', CASE WHEN f.blob_id IS NOT NULL THEN blob.object_key ELSE f.object_key END,
                    'taskId', wf.originating_task_id
                  ))
@@ -919,6 +956,10 @@ export class FilePlatformService {
   async registerSandboxOutput(tenantId: string, userId: string, input: { key: string; name: string; mediaType: string; size?: number; taskId: string; sessionId: string; turnId?: string; origin?: "sandbox_output" | "image_generation" | "browser_capture" }) {
     const config = this.requireConfig();
     if (!input.key.startsWith(`${config.prefix}/`) || input.key.includes("..") || input.key.includes("\\")) throw new BadRequestException("Invalid artifact object key");
+    const scopedTaskId = sandboxArtifactTaskId(config.prefix, input.key);
+    if (scopedTaskId && scopedTaskId !== input.taskId.toLowerCase()) {
+      throw new BadRequestException("Artifact object key does not belong to this task");
+    }
     const stableFileId = sandboxArtifactFileId(config.prefix, input.key);
     if (!stableFileId) {
       throw new BadRequestException("Artifact object key does not contain a stable logical file id");
@@ -1047,6 +1088,14 @@ export class FilePlatformService {
     response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
     response.setHeader("Vary", "Authorization, Cookie");
     response.setHeader("Accept-Ranges", "bytes");
+    setUntrustedFileResponseHeaders(response, {
+      fileName: file.display_name,
+      policy: fileResponsePolicy({
+        declaredMediaType: file.media_type,
+        detectedMediaType: file.detected_media_type,
+        allowInline: !download,
+      }),
+    });
     if (!range && requestEntityTagMatches(ifNoneMatch, etag)) {
       response.statusCode = 304;
       response.end();
@@ -1059,13 +1108,32 @@ export class FilePlatformService {
       ...(range ? { Range: range } : {}),
     }));
     if (!object.Body) throw new NotFoundException("File content is unavailable");
+    let body = object.Body as AsyncIterable<Uint8Array>;
+    let detectedMediaType = normalizeMediaType(file.detected_media_type) ?? "application/octet-stream";
+    if (!range || /^bytes=0-/i.test(range.trim())) {
+      const inspected = await bufferBodyPrefix(body);
+      detectedMediaType = detectMediaType(inspected.sample);
+      body = inspected.body;
+      if (normalizeMediaType(file.detected_media_type) !== detectedMediaType) {
+        try {
+          await this.recordDetectedMediaType(tenantId, file.id, detectedMediaType);
+        } catch (cause) {
+          await inspected.cancel();
+          throw cause;
+        }
+      }
+    }
+    const policy = fileResponsePolicy({
+      declaredMediaType: file.media_type,
+      detectedMediaType,
+      allowInline: !download,
+    });
     response.statusCode = object.ContentRange ? 206 : 200;
-    response.setHeader("Content-Type", object.ContentType ?? file.media_type);
     if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
     if (object.ContentRange) response.setHeader("Content-Range", object.ContentRange);
     response.setHeader("Accept-Ranges", object.AcceptRanges ?? "bytes");
-    response.setHeader("Content-Disposition", `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(file.display_name)}`);
-    for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
+    setUntrustedFileResponseHeaders(response, { fileName: file.display_name, policy });
+    for await (const chunk of body) {
       if (!response.write(chunk)) await once(response, "drain");
     }
     response.end();
@@ -1078,6 +1146,7 @@ export class FilePlatformService {
     response: ServerResponse,
     ifNoneMatch?: string,
   ) {
+    response.setHeader("Cache-Control", "no-store");
     const config = this.requireConfig();
     const file = await this.database.withTenant(tenantId, async (executor) => {
       const [profile] = await executor.query<{ branding: unknown }>(
@@ -1103,8 +1172,21 @@ export class FilePlatformService {
     });
     assertPublicBrandingFile(file, kind);
     const etag = contentEntityTag(file);
-    if (requestEntityTagMatches(ifNoneMatch, etag)) {
+    const allowed = kind === "logo" ? ORGANIZATION_LOGO_MEDIA_TYPES : ORGANIZATION_FAVICON_MEDIA_TYPES;
+    const cachedPolicy = fileResponsePolicy({
+      declaredMediaType: file.media_type,
+      detectedMediaType: file.detected_media_type,
+      allowInline: true,
+    });
+    const hasValidatedPassiveContent = cachedPolicy.disposition === "inline"
+      && (allowed as readonly string[]).includes(cachedPolicy.detectedMediaType);
+    if (hasValidatedPassiveContent && requestEntityTagMatches(ifNoneMatch, etag)) {
       setPublicBrandingHeaders(response, etag);
+      setUntrustedFileResponseHeaders(response, {
+        fileName: file.display_name,
+        policy: cachedPolicy,
+        crossOriginResourcePolicy: "cross-origin",
+      });
       response.statusCode = 304;
       response.end();
       return;
@@ -1121,12 +1203,58 @@ export class FilePlatformService {
       response.setHeader("Cache-Control", "no-store");
       throw cause;
     }
+    const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
+    const contentLength = Number(object.ContentLength);
+    if (object.ContentLength == null
+      || !Number.isSafeInteger(contentLength)
+      || contentLength <= 0
+      || contentLength > maximumBytes
+      || contentLength !== Number(file.size_bytes)) {
+      await cancelStoredObjectBody(object.Body).catch(() => undefined);
+      response.setHeader("Cache-Control", "no-store");
+      throw new NotFoundException("Branding asset not found");
+    }
+    let inspected: Awaited<ReturnType<typeof bufferBodyPrefix>>;
+    try {
+      inspected = await bufferBodyPrefix(object.Body as AsyncIterable<Uint8Array>);
+    } catch {
+      response.setHeader("Cache-Control", "no-store");
+      throw new NotFoundException("Branding asset not found");
+    }
+    const detectedMediaType = detectMediaType(inspected.sample);
+    const policy = fileResponsePolicy({
+      declaredMediaType: file.media_type,
+      detectedMediaType,
+      allowInline: true,
+    });
+    if (normalizeMediaType(file.detected_media_type) !== detectedMediaType) {
+      try {
+        await this.recordDetectedMediaType(tenantId, file.id, detectedMediaType);
+      } catch (cause) {
+        await inspected.cancel();
+        throw cause;
+      }
+    }
+    if (policy.disposition !== "inline" || !(allowed as readonly string[]).includes(policy.detectedMediaType)) {
+      await inspected.cancel();
+      response.setHeader("Cache-Control", "no-store");
+      throw new NotFoundException("Branding asset not found");
+    }
     setPublicBrandingHeaders(response, etag);
+    setUntrustedFileResponseHeaders(response, {
+      fileName: file.display_name,
+      policy,
+      crossOriginResourcePolicy: "cross-origin",
+    });
+    if (requestEntityTagMatches(ifNoneMatch, etag)) {
+      await inspected.cancel();
+      response.statusCode = 304;
+      response.end();
+      return;
+    }
     response.statusCode = 200;
-    response.setHeader("Content-Type", file.detected_media_type ?? object.ContentType ?? file.media_type);
-    if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
-    response.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(file.display_name)}`);
-    for await (const chunk of object.Body as AsyncIterable<Uint8Array>) {
+    response.setHeader("Content-Length", String(contentLength));
+    for await (const chunk of inspected.body) {
       if (!response.write(chunk)) await once(response, "drain");
     }
     response.end();
@@ -1135,6 +1263,40 @@ export class FilePlatformService {
   private requireConfig(): FileStorageConfig {
     if (!this.config) throw new BadRequestException("File storage is not configured");
     return this.config;
+  }
+
+  private async recordDetectedMediaType(tenantId: string, fileId: string, mediaType: string): Promise<void> {
+    await this.database.withTenant(tenantId, async (executor) => {
+      await executor.execute(`
+        UPDATE files
+        SET detected_media_type = $3
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND detected_media_type IS DISTINCT FROM $3
+      `, [tenantId, fileId, mediaType]);
+    });
+  }
+
+  private async detectStoredObjectMediaType(input: {
+    bucket: string;
+    objectKey: string;
+    objectVersionId?: string;
+    sizeBytes: number;
+  }): Promise<string> {
+    if (input.sizeBytes === 0) return "application/octet-stream";
+    const object = await this.requireConfig().client.send(new GetObjectCommand({
+      Bucket: input.bucket,
+      Key: input.objectKey,
+      ...(input.objectVersionId ? { VersionId: input.objectVersionId } : {}),
+      Range: `bytes=0-${FILE_TYPE_SAMPLE_BYTES - 1}`,
+    }));
+    if (!object.Body) throw new BadRequestException("The uploaded object could not be inspected safely");
+    let sample: Uint8Array;
+    try {
+      sample = await readBodyBounded(object.Body as AsyncIterable<Uint8Array>, FILE_TYPE_SAMPLE_BYTES);
+    } catch {
+      throw new BadRequestException("The uploaded object could not be inspected safely");
+    }
+    return detectMediaType(sample);
   }
 
   private async requireUpload(tenantId: string, userId: string, fileId: string, uploadId: string): Promise<UploadRow> {
@@ -1548,8 +1710,16 @@ function sandboxArtifactFileId(prefix: string, objectKey: string): string | null
   const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
   const leading = relative.match(new RegExp(`^(${uuid})(?:-|/)`, "i"));
   if (leading?.[1]) return leading[1].toLowerCase();
+  const taskScoped = relative.match(new RegExp(`^tasks/${uuid}/(${uuid})(?:-|/)`, "i"));
+  if (taskScoped?.[1]) return taskScoped[1].toLowerCase();
   const namespaced = relative.match(new RegExp(`(?:^|/)files/(${uuid})(?:/|$)`, "i"));
   return namespaced?.[1]?.toLowerCase() ?? null;
+}
+
+function sandboxArtifactTaskId(prefix: string, objectKey: string): string | null {
+  const relative = objectKey.slice(prefix.length + 1);
+  const taskId = relative.match(/^tasks\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?:\/|$)/i)?.[1];
+  return taskId?.toLowerCase() ?? null;
 }
 
 function escapeLikePattern(value: string): string {
@@ -1592,8 +1762,8 @@ function fileDto(row: FileRow) {
     ...(row.index_status ? { indexStatus: row.index_status } : {}),
     ...(row.vector_ready !== undefined && row.vector_ready !== null ? { vectorReady: row.vector_ready } : {}),
     ...(row.failure_reason !== undefined ? { indexFailureReason: row.failure_reason } : {}),
-    downloadUrl: `/v1/files/${row.id}/content?download=1&v=${version}`,
-    previewUrl: `/v1/files/${row.id}/content?v=${version}`,
+    downloadUrl: `/v1/files/${row.id}/content?download=1&v=${version}&sv=${FILE_RESPONSE_SECURITY_VERSION}`,
+    previewUrl: `/v1/files/${row.id}/content?v=${version}&sv=${FILE_RESPONSE_SECURITY_VERSION}`,
   };
 }
 
@@ -1606,7 +1776,7 @@ function contentCacheVersion(row: FileRow): string {
 
 function contentEntityTag(row: FileRow): string {
   const opaque = contentCacheVersion(row).replace(/["\\]/g, "");
-  return `"${opaque}"`;
+  return `"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-${opaque}"`;
 }
 
 function requestEntityTagMatches(header: string | undefined, etag: string): boolean {
@@ -1618,11 +1788,40 @@ function requestEntityTagMatches(header: string | undefined, etag: string): bool
 }
 
 function assertPublicBrandingFile(file: FileRow, kind: OrganizationBrandingAssetKind): void {
-  const mediaType = (file.detected_media_type ?? file.media_type).toLowerCase();
+  const mediaType = normalizeMediaType(file.media_type);
+  const detectedMediaType = file.detected_media_type === null ? null : normalizeMediaType(file.detected_media_type);
   const allowed = kind === "logo" ? ORGANIZATION_LOGO_MEDIA_TYPES : ORGANIZATION_FAVICON_MEDIA_TYPES;
   const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
-  if (!(allowed as readonly string[]).includes(mediaType) || Number(file.size_bytes) > maximumBytes) {
+  const sizeBytes = Number(file.size_bytes);
+  if (!mediaType
+    || !(allowed as readonly string[]).map(normalizeMediaType).includes(mediaType)
+    || (file.detected_media_type !== null && detectedMediaType !== mediaType)
+    || !Number.isSafeInteger(sizeBytes)
+    || sizeBytes <= 0
+    || sizeBytes > maximumBytes) {
     throw new NotFoundException("Branding asset not found");
+  }
+}
+
+async function cancelStoredObjectBody(body: unknown): Promise<void> {
+  if (!body || (typeof body !== "object" && typeof body !== "function")) return;
+  const candidate = body as {
+    destroy?: () => void;
+    cancel?: () => Promise<unknown> | unknown;
+    [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
+  };
+  if (typeof candidate.destroy === "function") {
+    candidate.destroy.call(body);
+    return;
+  }
+  if (typeof candidate.cancel === "function") {
+    await candidate.cancel.call(body);
+    return;
+  }
+  const createIterator = candidate[Symbol.asyncIterator];
+  if (typeof createIterator === "function") {
+    const iterator = createIterator.call(body);
+    await iterator.return?.();
   }
 }
 
@@ -1631,7 +1830,6 @@ function setPublicBrandingHeaders(response: ServerResponse, etag: string): void 
   response.setHeader("Cache-Control", "public, max-age=31536000, immutable");
   response.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   response.setHeader("X-Content-Type-Options", "nosniff");
-  response.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
 }
 
 function resolvePhysicalFile(row: FileRow): FileRow {

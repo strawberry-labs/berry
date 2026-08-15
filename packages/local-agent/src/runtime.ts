@@ -984,7 +984,9 @@ export class BerryAgentRuntime {
         ...(options.imageGeneration ? { imageGeneration: options.imageGeneration } : {}),
         ...(options.memory ? { memory: options.memory } : {}),
         ...(options.personalSkills ? { personalSkills: options.personalSkills } : {}),
-        ...(this.#artifactStore ? { artifactStore: this.#artifactStore } : {}),
+        ...(this.#artifactStore ? {
+          artifactStore: taskScopedArtifactStore(this.#artifactStore, options.taskId, options.sessionId),
+        } : {}),
         subagents: subagents.map((agent) => ({ name: agent.name, description: agent.description })),
         spawnSubagent: (params) => this.#spawnSubagent(options, params),
       });
@@ -2014,6 +2016,15 @@ export class BerryAgentRuntime {
     if (this.#ownsSandboxProvider) await this.#sandboxProvider.dispose();
     if (this.#ownsProcessExecutor) await this.#processExecutor.dispose();
   }
+}
+
+function taskScopedArtifactStore(store: ArtifactStore, taskId: string, sessionId: string): ArtifactStore {
+  return {
+    persistFile: (input) => store.persistFile({
+      ...input,
+      metadata: { ...input.metadata, taskId, sessionId },
+    }),
+  };
 }
 
 function hookJsonValue(value: unknown): JsonValue {

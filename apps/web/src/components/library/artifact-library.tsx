@@ -20,6 +20,7 @@ import { GeneratedImageLightbox, type GeneratedImageView } from "@berry/desktop-
 import type { ArtifactLibraryTab } from "@/lib/cloud-shell-state";
 import { DocumentPreviewModal } from "./document-preview-modal";
 import { fileTypeLabel, formatBytes } from "./file-metadata";
+import { FileThumbnail, isImageFile } from "./file-thumbnail";
 import { toast } from "sonner";
 
 const LIBRARY_PAGE_SIZE = 50;
@@ -104,8 +105,8 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
       if (isCurrentRequest(request)) setLoadingMore(false);
     }
   }, [beginRequest, client, isCurrentRequest, loadingMore, nextCursor, search, selectedProjectId]);
-  const images = items.filter((item) => item.mediaType.startsWith("image/"));
-  const documents = items.filter((item) => !item.mediaType.startsWith("image/"));
+  const images = items.filter(isImageFile);
+  const documents = items.filter((item) => !isImageFile(item));
   const visibleItems = libraryItemsForTab(items, tab);
   const libraryImageViews = React.useMemo<GeneratedImageView[]>(() => images.map((item) => ({
     id: item.id,
@@ -184,12 +185,12 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
       {state === "ready" && visibleItems.length > 0 ? (
         <div className="berry-library-grid">
           {visibleItems.map((item) => {
-            const isImage = item.mediaType.startsWith("image/");
+            const isImage = isImageFile(item);
             return (
             <article key={item.id} className="berry-library-item-card">
               <button type="button" className="berry-library-item-open" onClick={() => setSelected(item)}>
                 <div className="berry-library-item-preview">
-                  {isImage ? <img src={item.previewUrl} alt={item.name} loading="lazy" /> : <FileTypeIcon path={item.name} className="size-11" />}
+                  {isImage ? <FileThumbnail name={item.name} previewImageUrl={item.previewUrl} className="!size-full !rounded-none" /> : <FileTypeIcon path={item.name} className="size-11" />}
                 </div>
                 <ArtifactMeta item={item} />
               </button>
@@ -200,7 +201,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
         </div>
       ) : null}
       {state === "ready" && nextCursor ? <Button className="berry-library-load-more" variant="outline" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more files"}</Button> : null}
-      {selected?.mediaType.startsWith("image/") ? (
+      {selected && isImageFile(selected) ? (
         <GeneratedImageLightbox
           images={libraryImageViews}
           activeId={selected.id}
@@ -234,8 +235,8 @@ export function projectFilterWorkspaces(workspaces: readonly Workspace[]): Works
 }
 
 export function libraryItemsForTab(items: readonly StoredFile[], tab: ArtifactLibraryTab): StoredFile[] {
-  if (tab === "images") return items.filter((item) => item.mediaType.startsWith("image/"));
-  if (tab === "documents") return items.filter((item) => !item.mediaType.startsWith("image/"));
+  if (tab === "images") return items.filter(isImageFile);
+  if (tab === "documents") return items.filter((item) => !isImageFile(item));
   return [...items];
 }
 

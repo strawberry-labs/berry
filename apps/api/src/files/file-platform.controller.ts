@@ -6,10 +6,19 @@ import { z } from "zod";
 import { PublicAuth } from "../auth/auth.decorators.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { FilePlatformService } from "./file-platform.service.ts";
+import { normalizeMediaType } from "./file-response-security.ts";
+
+const UploadMediaTypeSchema = z.string()
+  .trim()
+  .min(1)
+  .max(255)
+  .refine((value) => normalizeMediaType(value) !== null, "A valid MIME media type is required")
+  .transform((value) => normalizeMediaType(value)!)
+  .default("application/octet-stream");
 
 const InitiateSchema = z.object({
   name: z.string().trim().min(1).max(240),
-  mediaType: z.string().trim().min(1).max(255).default("application/octet-stream"),
+  mediaType: UploadMediaTypeSchema,
   size: z.number().int().nonnegative(),
   taskId: z.string().uuid().optional(),
   sessionId: z.string().uuid().optional(),

@@ -10,6 +10,7 @@ import {
   PutObjectCommand,
   UploadPartCommand,
 } from "@aws-sdk/client-s3";
+import { FILE_RESPONSE_SECURITY_VERSION } from "@berry/shared";
 import {
   probeS3Storage,
   SetupOrganizationInputSchema,
@@ -151,8 +152,23 @@ describe("SetupService", () => {
     const faviconFileId = "00000000-0000-7000-8000-000000000205";
     const status = await setupService({ profileBranding: { applicationName: "AESG AI", logoFileId, faviconFileId } }).status();
 
-    expect(status.organization.logoUrl).toBe(`/v1/branding/logo?v=${logoFileId}`);
-    expect(status.organization.faviconUrl).toBe(`/v1/branding/favicon?v=${faviconFileId}`);
+    expect(status.organization.logoUrl).toBe(`/v1/branding/logo?v=${logoFileId}&sv=${FILE_RESPONSE_SECURITY_VERSION}`);
+    expect(status.organization.faviconUrl).toBe(`/v1/branding/favicon?v=${faviconFileId}&sv=${FILE_RESPONSE_SECURITY_VERSION}`);
+  });
+
+  it("does not advertise retained SVG branding that the public responder rejects", async () => {
+    const logoFileId = "00000000-0000-7000-8000-000000000204";
+    const status = await setupService({
+      profileBranding: { applicationName: "AESG AI", logoFileId },
+      brandingFiles: [{
+        id: logoFileId,
+        media_type: "image/svg+xml",
+        detected_media_type: null,
+        status: "available",
+      }],
+    }).status();
+
+    expect(status.organization.logoUrl).toBeNull();
   });
 
   it("keeps deployment and contact details private until setup is unlocked", async () => {
@@ -278,6 +294,7 @@ function setupService(overrides: {
   };
   deploymentSetup?: Record<string, unknown>;
   profileBranding?: Record<string, unknown>;
+  brandingFiles?: Array<{ id: string; media_type: string; detected_media_type: string | null; status: string }>;
   env?: NodeJS.ProcessEnv;
 } = {}) {
   const deploymentSetup: Record<string, unknown> = {
@@ -296,6 +313,14 @@ function setupService(overrides: {
         if (sql.includes("SELECT name, settings FROM tenants")) return [{ name: "AESG", settings: { deploymentSetup } }];
         if (sql.includes("SELECT settings FROM tenants")) return [{ settings: { deploymentSetup } }];
         if (sql.includes("FROM organization_profiles")) return [{ logo_url: null, support_email: "support@aesg.com", security_email: "security@aesg.com", timezone: "Asia/Dubai", branding: overrides.profileBranding ?? { applicationName: "AESG AI" } }];
+        if (sql.includes("FROM files") && sql.includes("detected_media_type")) {
+          if (overrides.brandingFiles) return overrides.brandingFiles;
+          const branding = overrides.profileBranding ?? {};
+          return [
+            ...(typeof branding.logoFileId === "string" ? [{ id: branding.logoFileId, media_type: "image/png", detected_media_type: null, status: "available" }] : []),
+            ...(typeof branding.faviconFileId === "string" ? [{ id: branding.faviconFileId, media_type: "image/png", detected_media_type: null, status: "available" }] : []),
+          ];
+        }
         if (sql.includes("FROM sso_connections")) return [{ client_id: "sso.apps.googleusercontent.com", client_secret_envelope: { ciphertext: "sso-plaintext-secret" }, domains: ["aesg.com"], jit_provisioning: true, status: "enabled" }];
         if (sql.includes("FROM connector_provider_credentials")) return [{ client_id: "connectors.apps.googleusercontent.com", client_secret_envelope: { ciphertext: "connector-plaintext-secret" }, picker_api_key_envelope: { ciphertext: "picker-secret" }, picker_project_number: "123456789012" }];
         if (sql.includes("FROM organization_connectors")) return [{ connector_key: "google-workspace", enabled: true, max_access_level: "read", workspace_access_mode: "selected_files" }];

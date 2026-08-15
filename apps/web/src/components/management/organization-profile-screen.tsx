@@ -1,5 +1,6 @@
 import * as React from "react";
 import {
+  FILE_RESPONSE_SECURITY_VERSION,
   ORGANIZATION_FAVICON_MAX_BYTES,
   ORGANIZATION_FAVICON_MEDIA_TYPES,
   ORGANIZATION_LOGO_MAX_BYTES,
@@ -116,7 +117,7 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
               <BrandAssetField
                 kind="logo"
                 title="Organization logo"
-                description="Shown on sign-in, the sidebar, and workspace home. PNG, JPG, WebP, or SVG up to 5 MB."
+                description="Shown on sign-in, the sidebar, and workspace home. PNG, JPG, or WebP up to 5 MB."
                 previewUrl={logoPreview}
                 pending={pendingAssets.logo}
                 progress={uploadProgress.logo}
@@ -127,7 +128,7 @@ export function OrganizationProfileScreen({ client, config, tenantId, permission
               <BrandAssetField
                 kind="favicon"
                 title="Browser favicon"
-                description="Shown in browser tabs and bookmarks. Use a square PNG, WebP, SVG, or ICO up to 1 MB."
+                description="Shown in browser tabs and bookmarks. Use a square PNG, WebP, or ICO up to 1 MB."
                 previewUrl={faviconPreview}
                 pending={pendingAssets.favicon}
                 progress={uploadProgress.favicon}
@@ -183,9 +184,12 @@ function BrandAssetField({ kind, title, description, previewUrl, pending, progre
 }) {
   const inputId = React.useId();
   const inputRef = React.useRef<HTMLInputElement>(null);
+  const [failedPreviewUrl, setFailedPreviewUrl] = React.useState<string | null>(null);
+  React.useEffect(() => setFailedPreviewUrl(null), [previewUrl]);
+  const visiblePreviewUrl = previewUrl && previewUrl !== failedPreviewUrl ? previewUrl : null;
   return <div className="flex min-w-0 items-center gap-3 rounded-xl bg-[var(--berry-control-bg)] p-3 shadow-[var(--berry-ring-subtle)]">
     <div className={cn("flex shrink-0 items-center justify-center overflow-hidden bg-[var(--berry-surface)] outline outline-1 -outline-offset-1 outline-[var(--berry-image-outline)]", kind === "logo" ? "h-14 w-24 rounded-lg" : "size-14 rounded-xl")}>
-      {previewUrl ? <img src={previewUrl} alt="" className={cn("size-full object-contain", kind === "logo" ? "p-2" : "p-1.5")} /> : <FileImage className="size-5 text-[var(--berry-text-tertiary)]" aria-hidden />}
+      {visiblePreviewUrl ? <img src={visiblePreviewUrl} alt="" className={cn("size-full object-contain", kind === "logo" ? "p-2" : "p-1.5")} onError={() => setFailedPreviewUrl(visiblePreviewUrl)} /> : <FileImage className="size-5 text-[var(--berry-text-tertiary)]" aria-hidden />}
     </div>
     <div className="min-w-0 flex-1">
       <div className="flex items-center gap-2"><strong className="truncate text-sm font-medium text-[var(--berry-text-primary)]">{title}</strong>{pending ? <span className="rounded-full bg-[var(--berry-accent-soft)] px-2 py-0.5 text-[11px] text-[var(--berry-accent)]">Ready to save</span> : null}</div>
@@ -198,7 +202,7 @@ function BrandAssetField({ kind, title, description, previewUrl, pending, progre
           className="sr-only"
           type="file"
           aria-label={`Upload ${title.toLowerCase()}`}
-          accept={kind === "logo" ? ".png,.jpg,.jpeg,.webp,.svg,image/png,image/jpeg,image/webp,image/svg+xml" : ".png,.webp,.svg,.ico,image/png,image/webp,image/svg+xml,image/x-icon,image/vnd.microsoft.icon"}
+          accept={kind === "logo" ? ".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" : ".png,.webp,.ico,image/png,image/webp,image/x-icon,image/vnd.microsoft.icon"}
           disabled={disabled}
           onChange={(event) => {
             const file = event.currentTarget.files?.[0];
@@ -218,7 +222,7 @@ export function normalizeBrandingAssetFile(file: File, kind: OrganizationBrandin
   const mediaType = (file.type || inferredType).toLowerCase();
   const allowed = kind === "logo" ? ORGANIZATION_LOGO_MEDIA_TYPES : ORGANIZATION_FAVICON_MEDIA_TYPES;
   const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
-  if (!(allowed as readonly string[]).includes(mediaType)) throw new Error(kind === "logo" ? "Choose a PNG, JPG, WebP, or SVG logo." : "Choose a PNG, WebP, SVG, or ICO favicon.");
+  if (!(allowed as readonly string[]).includes(mediaType)) throw new Error(kind === "logo" ? "Choose a PNG, JPG, or WebP logo." : "Choose a PNG, WebP, or ICO favicon.");
   if (file.size <= 0) throw new Error("The selected image is empty.");
   if (file.size > maximumBytes) throw new Error(`${kind === "logo" ? "Logo" : "Favicon"} must be ${kind === "logo" ? "5 MB" : "1 MB"} or smaller.`);
   return file.type === mediaType ? file : new File([file], file.name, { type: mediaType, lastModified: file.lastModified });
@@ -226,7 +230,7 @@ export function normalizeBrandingAssetFile(file: File, kind: OrganizationBrandin
 
 function mediaTypeForBrandingFile(name: string): string {
   const extension = name.split(".").at(-1)?.toLowerCase();
-  return ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon" } as Record<string, string>)[extension ?? ""] ?? "application/octet-stream";
+  return ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", ico: "image/x-icon" } as Record<string, string>)[extension ?? ""] ?? "application/octet-stream";
 }
 
 function brandingRecord(value: OrganizationProfile["branding"] | null | undefined): Record<string, unknown> {
@@ -238,8 +242,8 @@ function brandingFileId(branding: Record<string, unknown>, kind: OrganizationBra
   return typeof value === "string" ? value : null;
 }
 
-function brandingAssetUrl(baseUrl: string | null, kind: OrganizationBrandingAssetKind, fileId: string): string {
-  const path = `/v1/branding/${kind}?v=${encodeURIComponent(fileId)}`;
+export function brandingAssetUrl(baseUrl: string | null, kind: OrganizationBrandingAssetKind, fileId: string): string {
+  const path = `/v1/branding/${kind}?v=${encodeURIComponent(fileId)}&sv=${FILE_RESPONSE_SECURITY_VERSION}`;
   return resolveDeploymentBrandAssetUrl(baseUrl ?? "", path) ?? path;
 }
 

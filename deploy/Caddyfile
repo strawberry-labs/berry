@@ -23,11 +23,23 @@
 	@immutable_assets path /assets/*
 	header @immutable_assets Cache-Control "public, max-age=31536000, immutable"
 
+	@untrusted_file_responses path /v1/files/*/content /v1/artifacts/* /v1/branding/*
+	header @untrusted_file_responses {
+		Content-Security-Policy "default-src 'none'; sandbox"
+		X-Frame-Options "DENY"
+	}
+
+	@application_responses {
+		not path /v1/files/*/content /v1/artifacts/* /v1/branding/*
+	}
+	header @application_responses {
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com https://*.googleusercontent.com {$BERRY_CSP_EXTRA_FRAME_SOURCES:https://*.e2b.app}; worker-src 'self' blob:"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
 	header {
 		Strict-Transport-Security "max-age=31536000"
-		Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com https://*.googleusercontent.com {$BERRY_CSP_EXTRA_FRAME_SOURCES:https://*.e2b.app}; worker-src 'self' blob:"
 		X-Content-Type-Options "nosniff"
-		X-Frame-Options "SAMEORIGIN"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		Permissions-Policy "camera=(), microphone=(), geolocation=()"
 		-Server

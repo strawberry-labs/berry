@@ -21,4 +21,10 @@ describe("deployment onboarding styles", () => {
 
     expect(source).toContain('aria-label={item.label}');
   });
+
+  it("uses the shared broken-logo fallback", () => {
+    const source = readFileSync(new URL("./deployment-onboarding.tsx", import.meta.url), "utf8");
+
+    expect(source).toContain("<DeploymentBrandImage logoUrl={logoUrl}");
+  });
 });

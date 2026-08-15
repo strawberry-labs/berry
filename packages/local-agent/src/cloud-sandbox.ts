@@ -362,7 +362,11 @@ export class S3CompatibleArtifactStore implements ArtifactStore {
   }
 
   async persistFile(input: { env: ExecutionEnv; path: string; name?: string | undefined; mediaType: string; metadata?: Record<string, string> | undefined }): Promise<{ key: string; url: string; storage: string; size: number }> {
-    const key = `${this.#prefix}/${randomUUID()}-${safeObjectName(input.name ?? basename(input.path))}`;
+    const taskId = input.metadata?.taskId;
+    const taskScope = typeof taskId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId)
+      ? `/tasks/${taskId}`
+      : "";
+    const key = `${this.#prefix}${taskScope}/${randomUUID()}-${safeObjectName(input.name ?? basename(input.path))}`;
     if (this.#client.createUploadUrl) {
       const info = await input.env.fileInfo(input.path);
       if (!info.ok) throw info.error;

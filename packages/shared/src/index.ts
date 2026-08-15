@@ -2591,6 +2591,14 @@ export type ArtifactLibraryItem = z.infer<typeof ArtifactLibraryItemSchema>;
 export const FileOriginSchema = z.enum(["user_upload", "sandbox_output", "image_generation", "browser_capture", "legacy_artifact", "connector_import"]);
 export const FileStatusSchema = z.enum(["initiated", "uploading", "scanning", "processing", "available", "failed", "quarantined", "deleted"]);
 export const FileAssociationRoleSchema = z.enum(["input", "output", "reference"]);
+export const PASSIVE_INLINE_FILE_MEDIA_TYPES = [
+  "image/avif",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/x-icon",
+] as const;
 
 export const StoredFileSchema = z.object({
   id: z.string().uuid(),
@@ -3545,8 +3553,9 @@ export type DataGovernancePolicy = z.infer<typeof DataGovernancePolicySchema>;
 export const OrganizationDomainSchema = z.object({ id: z.string(), domain: z.string(), status: z.enum(["pending", "verified", "failed"]), customDomain: z.boolean(), verifiedAt: ISODateSchema.nullable() });
 export const OrganizationBrandingAssetKindSchema = z.enum(["logo", "favicon"]);
 export type OrganizationBrandingAssetKind = z.infer<typeof OrganizationBrandingAssetKindSchema>;
-export const ORGANIZATION_LOGO_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/svg+xml"] as const;
-export const ORGANIZATION_FAVICON_MEDIA_TYPES = ["image/png", "image/webp", "image/svg+xml", "image/x-icon", "image/vnd.microsoft.icon"] as const;
+export const FILE_RESPONSE_SECURITY_VERSION = 1;
+export const ORGANIZATION_LOGO_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
+export const ORGANIZATION_FAVICON_MEDIA_TYPES = ["image/png", "image/webp", "image/x-icon", "image/vnd.microsoft.icon"] as const;
 export const ORGANIZATION_LOGO_MAX_BYTES = 5 * 1024 * 1024;
 export const ORGANIZATION_FAVICON_MAX_BYTES = 1024 * 1024;
 export const OrganizationBrandingSchema = z.record(JsonValueSchema).superRefine((branding, context) => {

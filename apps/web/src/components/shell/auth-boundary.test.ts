@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { authDestination, oauthErrorMessage, sanitizedAuthUrl } from "./auth-boundary.tsx";
-import { resolveDeploymentBrandAssetUrl } from "./deployment-brand.tsx";
+import { describe, expect, it, vi } from "vitest";
+import { applyDeploymentFavicon, authDestination, oauthErrorMessage, sanitizedAuthUrl } from "./auth-boundary.tsx";
+import { deploymentBrandLogoUrl, resolveDeploymentBrandAssetUrl } from "./deployment-brand.tsx";
 import { deploymentAccentTokens } from "./deployment-accent.ts";
 import { googleSsoRequest } from "./google-sso-button.tsx";
 
@@ -39,6 +39,58 @@ describe("resolveDeploymentBrandAssetUrl", () => {
   it("preserves an external legacy logo URL", () => {
     expect(resolveDeploymentBrandAssetUrl("https://api.example.test", "https://assets.example.test/logo.svg"))
       .toBe("https://assets.example.test/logo.svg");
+  });
+});
+
+describe("deploymentBrandLogoUrl", () => {
+  it("falls back to the Berry logo after a configured asset fails to load", () => {
+    const logoUrl = "https://api.example.test/v1/branding/logo?v=legacy-svg";
+    expect(deploymentBrandLogoUrl(logoUrl, null)).toBe(logoUrl);
+    expect(deploymentBrandLogoUrl(logoUrl, logoUrl)).toBeNull();
+  });
+});
+
+describe("applyDeploymentFavicon", () => {
+  it("removes a failed organization icon so the browser can use its default", () => {
+    const link = { rel: "", href: "", dataset: {} as Record<string, string>, onerror: null as null | (() => void), remove: vi.fn() };
+    const append = vi.fn();
+    vi.stubGlobal("document", {
+      head: { querySelector: vi.fn(() => null), append },
+      createElement: vi.fn(() => link),
+    });
+    try {
+      applyDeploymentFavicon("https://api.example.test/v1/branding/favicon?v=invalid");
+      expect(append).toHaveBeenCalledWith(link);
+      link.onerror?.();
+      expect(link.remove).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("removes a failed same-origin icon after the DOM normalizes its relative URL", () => {
+    let normalizedHref = "";
+    const link = {
+      rel: "",
+      dataset: {} as Record<string, string>,
+      onerror: null as null | (() => void),
+      remove: vi.fn(),
+      get href() { return normalizedHref; },
+      set href(value: string) { normalizedHref = new URL(value, "https://berry.example.test").href; },
+    };
+    const append = vi.fn();
+    vi.stubGlobal("document", {
+      head: { querySelector: vi.fn(() => null), append },
+      createElement: vi.fn(() => link),
+    });
+    try {
+      applyDeploymentFavicon("/v1/branding/favicon?v=invalid");
+      expect(link.href).toBe("https://berry.example.test/v1/branding/favicon?v=invalid");
+      link.onerror?.();
+      expect(link.remove).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

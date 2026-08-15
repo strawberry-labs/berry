@@ -29,9 +29,11 @@ describe("libraryItemsForTab", () => {
 		const files = [
 			{ id: "document", mediaType: "application/pdf" },
 			{ id: "image", mediaType: "image/png" },
+			{ id: "active-image", name: "active.svg", mediaType: "image/svg+xml" },
 			{ id: "sheet", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
 		] as StoredFile[];
-		expect(libraryItemsForTab(files, "all").map((file) => file.id)).toEqual(["document", "image", "sheet"]);
+		expect(libraryItemsForTab(files, "all").map((file) => file.id)).toEqual(["document", "image", "active-image", "sheet"]);
 		expect(libraryItemsForTab(files, "images").map((file) => file.id)).toEqual(["image"]);
+		expect(libraryItemsForTab(files, "documents").map((file) => file.id)).toContain("active-image");
 	});
 });

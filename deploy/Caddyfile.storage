@@ -3,7 +3,11 @@
 
 	header {
 		Strict-Transport-Security "max-age=31536000"
+		Content-Security-Policy "default-src 'none'; sandbox"
 		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Cross-Origin-Resource-Policy "cross-origin"
+		Referrer-Policy "no-referrer"
 		-Server
 	}
 }

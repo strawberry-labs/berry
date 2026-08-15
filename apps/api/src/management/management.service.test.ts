@@ -29,10 +29,55 @@ it("rejects an oversized organization logo before updating the profile",async()=
   expect(execute).not.toHaveBeenCalled();
 });
 
+it("rejects active SVG organization branding",async()=>{
+  const execute=vi.fn(async()=>undefined);
+  const query=vi.fn(async(sql:string)=>sql.includes("SELECT id,media_type")
+    ?[{id:"00000000-0000-7000-8000-000000000204",media_type:"image/svg+xml",detected_media_type:"image/svg+xml",size_bytes:512,status:"available",currently_bound_logo:false,currently_bound_favicon:false}]
+    :[]);
+  const database={withTenant:async(_tenantId:string,callback:(db:{query:typeof query;execute:typeof execute})=>Promise<unknown>)=>callback({query,execute})};
+  const repository=new PostgresManagementRepository(database as never);
+  await expect(repository.setProfile(tenant,user,{
+    name:"Acme",slug:"acme",logoUrl:null,timezone:"Asia/Dubai",language:"en",supportEmail:null,securityEmail:null,
+    deploymentMode:"self-hosted",region:null,announcements:[],termsUrl:null,privacyUrl:null,
+    branding:{logoFileId:"00000000-0000-7000-8000-000000000204"},
+  })).rejects.toThrow("supported image format");
+  expect(execute).not.toHaveBeenCalled();
+});
+
+it("rejects conflicting declared and detected organization branding types",async()=>{
+  const execute=vi.fn(async()=>undefined);
+  const query=vi.fn(async(sql:string)=>sql.includes("SELECT id,media_type")
+    ?[{id:"00000000-0000-7000-8000-000000000204",media_type:"image/png",detected_media_type:"image/jpeg",size_bytes:512,status:"available",currently_bound_logo:false,currently_bound_favicon:false}]
+    :[]);
+  const database={withTenant:async(_tenantId:string,callback:(db:{query:typeof query;execute:typeof execute})=>Promise<unknown>)=>callback({query,execute})};
+  const repository=new PostgresManagementRepository(database as never);
+  await expect(repository.setProfile(tenant,user,{
+    name:"Acme",slug:"acme",logoUrl:null,timezone:"Asia/Dubai",language:"en",supportEmail:null,securityEmail:null,
+    deploymentMode:"self-hosted",region:null,announcements:[],termsUrl:null,privacyUrl:null,
+    branding:{logoFileId:"00000000-0000-7000-8000-000000000204"},
+  })).rejects.toThrow("supported image format");
+  expect(execute).not.toHaveBeenCalled();
+});
+
+it("rejects empty organization branding files",async()=>{
+  const execute=vi.fn(async()=>undefined);
+  const query=vi.fn(async(sql:string)=>sql.includes("SELECT id,media_type")
+    ?[{id:"00000000-0000-7000-8000-000000000204",media_type:"image/png",detected_media_type:"image/png",size_bytes:0,status:"available",currently_bound_logo:false,currently_bound_favicon:false}]
+    :[]);
+  const database={withTenant:async(_tenantId:string,callback:(db:{query:typeof query;execute:typeof execute})=>Promise<unknown>)=>callback({query,execute})};
+  const repository=new PostgresManagementRepository(database as never);
+  await expect(repository.setProfile(tenant,user,{
+    name:"Acme",slug:"acme",logoUrl:null,timezone:"Asia/Dubai",language:"en",supportEmail:null,securityEmail:null,
+    deploymentMode:"self-hosted",region:null,announcements:[],termsUrl:null,privacyUrl:null,
+    branding:{logoFileId:"00000000-0000-7000-8000-000000000204"},
+  })).rejects.toThrow("non-empty stored file");
+  expect(execute).not.toHaveBeenCalled();
+});
+
 it("allows another administrator to preserve the currently bound branding files",async()=>{
   const execute=vi.fn(async()=>undefined);
   const query=vi.fn(async(sql:string)=>{
-    if(sql.includes("SELECT id,media_type"))return [{id:"00000000-0000-7000-8000-000000000204",media_type:"image/svg+xml",detected_media_type:null,size_bytes:512,status:"available"}];
+    if(sql.includes("SELECT id,media_type"))return [{id:"00000000-0000-7000-8000-000000000204",media_type:"image/svg+xml",detected_media_type:"image/svg+xml",size_bytes:512,status:"available",currently_bound_logo:true,currently_bound_favicon:false}];
     if(sql.includes("FROM tenants t"))return [{
       tenant_id:tenant,tenant_name:"Acme",tenant_slug:"acme",deployment_mode:"self-hosted",region:null,logo_url:null,timezone:"Asia/Dubai",language:"en",
       support_email:null,security_email:null,announcements:[],terms_url:null,privacy_url:null,branding:{logoFileId:"00000000-0000-7000-8000-000000000204"},updated_at:new Date("2026-08-10T00:00:00.000Z"),
