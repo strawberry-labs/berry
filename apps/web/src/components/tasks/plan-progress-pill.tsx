@@ -105,6 +105,15 @@ function collectLiveTools(entries: StreamState["timeline"]): ToolEntry[] {
   return tools;
 }
 
+/** Update only the live plan slice; callers can keep the persisted snapshot
+ * memoized while token frames arrive. */
+export function planProgressFromLiveStream(stream: StreamState, fallback: PlanProgress | null = null): PlanProgress | null {
+  const liveTodo = collectLiveTools(stream.timeline)
+    .filter((tool) => tool.name === "todo_write")
+    .at(-1);
+  return liveTodo ? planFromTool(liveTodo) ?? fallback : fallback;
+}
+
 /**
  * The current plan is the last valid todo_write payload. Live tool entries
  * supersede persisted data while a turn runs, so the composer updates before
@@ -112,10 +121,7 @@ function collectLiveTools(entries: StreamState["timeline"]): ToolEntry[] {
  */
 export function planProgressFromConversation(messages: Message[], stream: StreamState): PlanProgress | null {
   const persisted = latestPersistedPlan(messages);
-  const liveTodo = collectLiveTools(stream.timeline)
-    .filter((tool) => tool.name === "todo_write")
-    .at(-1);
-  return liveTodo ? planFromTool(liveTodo) ?? persisted : persisted;
+  return planProgressFromLiveStream(stream, persisted);
 }
 
 const STATUS_ICON = {

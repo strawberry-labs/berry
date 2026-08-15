@@ -15,12 +15,13 @@ import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle } from "../prompt-editor";
 import { fileTypeLabel, formatBytes } from "../library/file-metadata";
 import { stableQuestionAnswerMessageId } from "./composer-question-overlay";
+import { sessionStreamStore, useSessionStream } from "@/lib/session-stream-store";
 
 const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, onLoadOlderMessages, hasOlderMessages = false, loadingOlderMessages = false, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream: initialStream, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, onLoadOlderMessages, hasOlderMessages = false, loadingOlderMessages = false, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -42,6 +43,11 @@ export function Thread({ sessionId, taskId, messages, stream, client, config, ta
   loadingOlderMessages?: boolean;
   scrollRequest?: number;
 }) {
+  const observedStream = useSessionStream(sessionId);
+  // The prop keeps the first render compatible with hosts that hydrate a
+  // replayed stream before the external store is populated. Subsequent token
+  // frames always come from the per-session store.
+  const stream = sessionStreamStore.has(sessionId) ? observedStream : initialStream;
   const [showReasoning, setShowReasoning] = React.useState(false);
   const [selectedAttachment, setSelectedAttachment] = React.useState<StoredFile | null>(null);
   const threadRef = React.useRef<HTMLDivElement>(null);

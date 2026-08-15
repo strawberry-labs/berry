@@ -16,7 +16,7 @@ import {
   isImageMessagePart,
   type BerryThreadAdapter,
 } from "@berry/desktop-ui/components/berry-thread-view";
-import { IDLE, reduceStream, reduceStreamDeltas, type StreamState } from "@berry/desktop-ui/components/thread-stream";
+import { IDLE, reduceStream, type StreamState } from "@berry/desktop-ui/components/thread-stream";
 import { Toaster } from "@berry/desktop-ui/components/ui/sonner";
 import type { ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
@@ -75,6 +75,7 @@ import {
   reconcileInterruptedQueuedFollowUps,
   type QueuedFollowUp,
 } from "@/lib/queued-follow-ups";
+import { sessionStreamStore } from "@/lib/session-stream-store";
 
 const ArtifactLibrary = React.lazy(async () => ({
   default: (await import("./library/artifact-library")).ArtifactLibrary,
@@ -84,6 +85,20 @@ const TaskFileLibraryDialog = React.lazy(async () => ({
 }));
 
 type StreamEvent = Parameters<typeof reduceStream>[1];
+
+/** Durable run metadata changes at lifecycle/tool boundaries, not per token or
+ * progressive tool/image output. Those high-frequency payloads belong only in
+ * the per-session stream store; updating shell state for them would wake the
+ * navigation, management, and dialog trees. */
+export function shouldUpdateDurableStateForEvent(event: StreamEvent): boolean {
+  return event.kind !== "message.delta"
+    && event.kind !== "tool.update"
+    && event.kind !== "image.partial";
+}
+
+export function shouldMountTaskSurface(surface: "task" | "settings" | "library"): boolean {
+  return surface === "task";
+}
 
 const MESSAGE_PAGE_SIZE = 50;
 const MAX_AFTER_PAGE_REQUESTS = 256;
@@ -648,7 +663,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const surface = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? "settings" : shellLocation.kind === "library" ? "library" : "task";
   const managementKind: ManagementKind = shellLocation.kind === "admin" ? "admin" : shellLocation.kind === "platform" ? "platform" : "settings";
   const managementTab = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? shellLocation.tab : "general";
-  const [streamsBySession, setStreamsBySession] = React.useState<Record<string, StreamState>>({});
+  React.useEffect(() => {
+    if (surface !== "task") setTaskFilesOpen(false);
+  }, [surface]);
   const [durableStatesBySession, setDurableStatesBySession] = React.useState<Record<string, TurnState>>({});
   const [imageGenerationBySession, setImageGenerationBySession] = React.useState<Record<string, ImageGenerationState | null>>({});
   const [imageGenerationCapability, setImageGenerationCapability] = React.useState<ImageGenerationCapabilityStatus>(() => initial.config.demoMode
@@ -663,6 +680,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [taskRouteError, setTaskRouteError] = React.useState<"not-found" | "forbidden" | "failed" | null>(null);
   const [creatingProject, setCreatingProject] = React.useState(false);
   const mainPanelRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => () => {
+    // The store is module-scoped so task subscribers can stay narrow. Clear
+    // it when the authenticated shell leaves the tree (sign-out/user switch)
+    // so a later session cannot inherit stale live output or pending frames.
+    sessionStreamStore.clear();
+  }, []);
   const [activeOrganizationId, setActiveOrganizationId] = React.useState(initial.config.activeOrganizationId);
   const activeOrganization = config.organizations.find((org) => org.id === activeOrganizationId) ?? config.organizations[0] ?? null;
   const fallbackOrgPermissions = React.useMemo(
@@ -791,7 +814,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const historyEpochRef = React.useRef(new Map<string, number>());
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
   const activeMessageHistory = activeSessionId ? messageHistoryBySession[activeSessionId] : undefined;
-  const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
+  // Keep token-frequency state outside the shell so only task-surface
+  // subscribers rerender while a response is streaming.
+  const stream = activeSessionId ? sessionStreamStore.get(activeSessionId) : IDLE;
   const durableState = activeSessionId ? durableStatesBySession[activeSessionId] : undefined;
   const turnBusy = activeSessionId ? startingSessions.has(activeSessionId) : false;
   const interruptedTurnAvailable = isInterruptedTurnAvailable(
@@ -835,7 +860,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (!historyRequestTailsRef.current.has(id)) historyEpochRef.current.delete(id);
         pendingRequestMessageIdsBySessionRef.current.delete(id);
         pendingSubmissionsRef.current.delete(id);
-        pendingStreamDeltasRef.current.delete(id);
+        sessionStreamStore.delete(id);
         lastEventCursorBySessionRef.current.delete(id);
         durableEventSequencesBySessionRef.current.delete(id);
         sessionModelsRef.current.delete(id);
@@ -855,11 +880,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         for (const id of evicted) {
           delete updated[id];
         }
-        return updated;
-      });
-      setStreamsBySession((current) => {
-        const updated = { ...current };
-        for (const id of evicted) delete updated[id];
         return updated;
       });
       setDurableStatesBySession((current) => {
@@ -910,64 +930,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (pending.size === 0) pendingRequestMessageIdsBySessionRef.current.delete(sessionId);
   }, []);
 
-  const pendingStreamDeltasRef = React.useRef(new Map<string, {
-    text: string;
-    reasoning: string;
-    messageId: string;
-    frameId: number | null;
-  }>());
-
-  const flushSessionDeltas = React.useCallback((sessionId: string) => {
-    const pending = pendingStreamDeltasRef.current.get(sessionId);
-    if (!pending) return;
-    if (pending.frameId !== null) cancelAnimationFrame(pending.frameId);
-    pendingStreamDeltasRef.current.delete(sessionId);
-    if (!pending.text && !pending.reasoning) return;
-    setStreamsBySession((current) => ({
-      ...current,
-      [sessionId]: reduceStreamDeltas(current[sessionId] ?? IDLE, pending),
-    }));
-  }, []);
-
   const updateSessionStream = React.useCallback((sessionId: string, event: Parameters<typeof reduceStream>[1]) => {
-    if (event.kind === "message.delta") {
-      const pending = pendingStreamDeltasRef.current.get(sessionId) ?? {
-        text: "",
-        reasoning: "",
-        messageId: event.messageId,
-        frameId: null,
-      };
-      pending.messageId = event.messageId;
-      if (event.channel === "reasoning") pending.reasoning += event.delta;
-      else pending.text += event.delta;
-      if (pending.frameId === null) {
-        pending.frameId = requestAnimationFrame(() => flushSessionDeltas(sessionId));
-      }
-      pendingStreamDeltasRef.current.set(sessionId, pending);
-      return;
-    }
-
-    // Preserve event order: all text received before a tool/end event must be
-    // visible before that event changes the live turn state.
-    flushSessionDeltas(sessionId);
-    setStreamsBySession((current) => ({
-      ...current,
-      [sessionId]: reduceStream(current[sessionId] ?? IDLE, event),
-    }));
-  }, [flushSessionDeltas]);
+    sessionStreamStore.update(sessionId, event);
+  }, []);
 
   const resetSessionStream = React.useCallback((sessionId: string) => {
-    const pending = pendingStreamDeltasRef.current.get(sessionId);
-    if (pending?.frameId !== null && pending?.frameId !== undefined) cancelAnimationFrame(pending.frameId);
-    pendingStreamDeltasRef.current.delete(sessionId);
-    setStreamsBySession((current) => ({ ...current, [sessionId]: IDLE }));
-  }, []);
-
-  React.useEffect(() => () => {
-    for (const pending of pendingStreamDeltasRef.current.values()) {
-      if (pending.frameId !== null) cancelAnimationFrame(pending.frameId);
-    }
-    pendingStreamDeltasRef.current.clear();
+    sessionStreamStore.reset(sessionId);
   }, []);
 
   const navigateToTask = React.useCallback((taskId: string) => {
@@ -1696,13 +1664,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       durableEventSequencesBySessionRef.current.set(sessionId, reconciled.sequences);
     }
     if (!rebuildStream) return;
-    const pending = pendingStreamDeltasRef.current.get(sessionId);
-    if (pending?.frameId !== null && pending?.frameId !== undefined) cancelAnimationFrame(pending.frameId);
-    pendingStreamDeltasRef.current.delete(sessionId);
-    setStreamsBySession((current) => ({
-      ...current,
-      [sessionId]: replayDurableStreamState(state),
-    }));
+    sessionStreamStore.set(sessionId, replayDurableStreamState(state));
   }, []);
 
   const updateDurableStateFromEvent = React.useCallback((
@@ -1775,8 +1737,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           );
           if (cursor) lastEventCursorBySessionRef.current.set(sessionId, cursor);
           updateSessionStream(sessionId, event);
-          updateDurableStateFromEvent(sessionId, event);
-          const streamedTask = tasksRef.current.find((task) => task.activeSessionId === sessionId);
+          if (shouldUpdateDurableStateForEvent(event)) updateDurableStateFromEvent(sessionId, event);
+          const needsTaskMetadata = event.kind === "tool.start" || event.kind === "turn.end";
+          const streamedTask = needsTaskMetadata
+            ? tasksRef.current.find((task) => task.activeSessionId === sessionId)
+            : undefined;
           if (event.kind === "tool.start" && streamedTask) {
             notifyBackgroundProgress({
               sessionId,
@@ -2208,7 +2173,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       activeSessionsRef.current.delete(sessionId);
       const terminalEvent = {
         kind: "turn.end",
-        turnId: streamsBySession[sessionId]?.turnId ?? `cancelled_${Date.now()}`,
+        turnId: sessionStreamStore.get(sessionId).turnId ?? `cancelled_${Date.now()}`,
         status: "cancelled",
       } as const;
       updateSessionStream(sessionId, terminalEvent);
@@ -2218,7 +2183,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "Unable to stop the active turn");
     }
-  }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, streamsBySession, updateDurableStateFromEvent, updateSessionStream]);
+  }, [activeTask?.activeSessionId, client, refreshSessionMessages, stopSessionConnection, updateDurableStateFromEvent, updateSessionStream]);
 
   const recoverDurableTurn = React.useCallback(async () => {
     const sessionId = activeTask?.activeSessionId;
@@ -3084,8 +3049,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         )}
       >
       <div ref={mainPanelRef} className="berry-web-main flex h-full min-h-0 flex-col">
-        <div className={surface === "task" ? "contents" : "hidden"}>
-        {activeTask && !activeTask.deletedAt ? (
+        <div className={shouldMountTaskSurface(surface) ? "contents" : "hidden"}>
+        {shouldMountTaskSurface(surface) && activeTask && !activeTask.deletedAt ? (
         <>
         <BerryTaskHeaderFrame
           leading={
@@ -3242,6 +3207,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onSteerMessage={steerActiveTurn}
               planProgress={planProgressFromConversation(messages, stream)}
               question={stream.question}
+              streamSessionId={activeTask.activeSessionId}
+              streamMessages={messages}
               showProjectSwitcher={shouldShowComposerProjectSwitcher(messages)}
               personalization={personalization}
               imageGenerationCapability={imageGenerationCapability}
@@ -3280,7 +3247,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           </section>
         </div>
         </>
-        ) : shellLocation.kind === "task" ? (
+        ) : (
+          (shouldMountTaskSurface(surface) && shellLocation.kind === "task") ? (
           <TaskRouteState
             state={!tasksLoaded || (!taskRouteError && !activeTask) ? "loading" : activeTask?.deletedAt ? "deleted" : taskRouteError ?? "not-found"}
             onRetry={() => {
@@ -3291,7 +3259,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             onHome={navigateHome}
             onRestore={activeTask?.deletedAt ? () => void restoreTask(activeTask) : undefined}
           />
-        ) : (
+        ) : shouldMountTaskSurface(surface) ? (
           <BerryWorkspaceHomeFrame
             logo={<DeploymentBrandLogo className="berry-home-greeting-logo" alt="" />}
             greeting={greeting()}
@@ -3344,7 +3312,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               />
             )}
           />
-        )}
+        ) : null)}
         </div>
         {surface === "settings" ? (
           <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
@@ -3387,7 +3355,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         onSettings={() => navigateToSettings("general")}
         onHelp={() => toast.info("Berry help and diagnostics are available from the ? button.")}
       />
-      {activeTask && taskFilesOpen ? (
+      {shouldMountTaskSurface(surface) && activeTask && taskFilesOpen ? (
         <React.Suspense fallback={null}>
           <TaskFileLibraryDialog
             open

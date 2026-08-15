@@ -13,6 +13,7 @@ import {
   shouldReplaceLatestSettledAssistantWithLiveTurn,
   settledTurnKey,
   stableTurnGroupKey,
+  shouldUseLiveMarkdown,
 } from "./berry-thread-view";
 import { classifyTurnSegments } from "./thread-stream";
 
@@ -188,6 +189,11 @@ describe("transcript search targets", () => {
 });
 
 describe("continued assistant turn projection", () => {
+  it("uses settled Markdown after a terminal stream even if refresh is pending", () => {
+    expect(shouldUseLiveMarkdown({ turnActive: true })).toBe(true);
+    expect(shouldUseLiveMarkdown({ turnActive: false })).toBe(false);
+  });
+
   it("keeps the interrupted settled assistant visible beside resumed live work", () => {
     expect(shouldReplaceLatestSettledAssistantWithLiveTurn({
       liveVisible: true,

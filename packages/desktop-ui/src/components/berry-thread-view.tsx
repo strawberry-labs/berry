@@ -463,6 +463,10 @@ export function shouldReplaceLatestSettledAssistantWithLiveTurn(input: {
   return input.liveVisible && input.latestTurnHasUser && !input.continuation;
 }
 
+export function shouldUseLiveMarkdown(stream: Pick<StreamState, "turnActive">): boolean {
+  return stream.turnActive;
+}
+
 /**
  * The full Berry conversation presentation: settled turn groups (user bubbles
  * + "Worked for Xs" assistant turns) and the live streaming turn, inside the
@@ -922,7 +926,7 @@ export function BerryThreadView({
                       <BerryQuestionAccordion question={stream.question} adapter={adapter} />
                     </BerryActivityStackBlock>
                   ) : null}
-                  {stream.text ? <BerryAssistantMarkdownBlock live>{stream.text}</BerryAssistantMarkdownBlock> : null}
+                  {stream.text ? <BerryAssistantMarkdownBlock live={shouldUseLiveMarkdown(stream)}>{stream.text}</BerryAssistantMarkdownBlock> : null}
                   {stream.error ? <BerryAssistantErrorBlock>{stream.error}</BerryAssistantErrorBlock> : null}
                   {liveContent}
                 </div>
@@ -1145,7 +1149,7 @@ const BerryHistoricalUserMessage = React.memo(function BerryHistoricalUserMessag
  * rendered under a single "Worked for Xs" header (Berry shows one per user
  * turn). Tool runs that span message boundaries merge into one flow.
  */
-const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGroup({
+export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGroup({
   messages,
   turnKey,
   showReasoning,
@@ -1155,6 +1159,7 @@ const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGroup({
   inlineError,
   writingBlockParts,
   conversationImageParts,
+  onRender,
 }: {
   messages: Message[];
   turnKey: string;
@@ -1165,7 +1170,10 @@ const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGroup({
   inlineError?: string;
   writingBlockParts: Map<string, MessageDraftPartResolution>;
   conversationImageParts: MessagePart[];
+  /** Internal render probe used by the streaming isolation regression test. */
+  onRender?: () => void;
 }) {
+  onRender?.();
   const allParts = messages.flatMap((message) => message.parts);
   const imageParts = allParts.filter(isImageMessagePart);
   const boundaryMessageId = messages[messages.length - 1]?.id;

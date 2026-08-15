@@ -3,10 +3,24 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
+  it("does not rebuild shell durable state for token-only deltas", () => {
+    expect(shouldUpdateDurableStateForEvent({ kind: "message.delta", messageId: "m", delta: "token", channel: "text" })).toBe(false);
+    expect(shouldUpdateDurableStateForEvent({ kind: "tool.update", toolCallId: "tool", detail: "partial" })).toBe(false);
+    expect(shouldUpdateDurableStateForEvent({ kind: "image.partial", toolCallId: "tool", requestIndex: 0, index: 0, percentComplete: 50, b64: "data", mimeType: "image/png", aspectRatio: "1:1" })).toBe(false);
+    expect(shouldUpdateDurableStateForEvent({ kind: "message.start", messageId: "m", role: "assistant" })).toBe(true);
+    expect(shouldUpdateDurableStateForEvent({ kind: "tool.start", toolCallId: "tool", name: "search" })).toBe(true);
+  });
+
+  it("unmounts task surfaces when management or library replaces the route", () => {
+    expect(shouldMountTaskSurface("task")).toBe(true);
+    expect(shouldMountTaskSurface("settings")).toBe(false);
+    expect(shouldMountTaskSurface("library")).toBe(false);
+  });
+
   it("falls back to the legacy array when a rolling-deploy API lacks message lookup", async () => {
     const persisted = { id: "message_old", sessionId: "session_1" } as never;
     const client = {

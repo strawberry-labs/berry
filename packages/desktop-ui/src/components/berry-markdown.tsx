@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { toast } from "sonner";
 import type { BundledLanguage, BundledTheme, ThemedToken } from "shiki";
+import type { HighlightResponse } from "./berry-markdown-highlight.worker";
 
 import { Copy } from "@berry/desktop-ui/lib/icons";
 import { cn } from "@berry/desktop-ui/lib/utils";
@@ -81,31 +82,6 @@ function useWordReveal(text: string, streaming: boolean): string {
 
   const current = stateRef.current;
   return current.visible >= current.units.length ? current.content : current.units.slice(0, current.visible).join("");
-}
-
-/* ------------------------------------------------------------------------ */
-/* Incomplete-markdown completion for partially streamed tokens.              */
-/* While streaming, dangling syntax is closed so partial tokens don't flash  */
-/* as raw markdown; disabled once settled (Berry passes it `streaming`).      */
-/* ------------------------------------------------------------------------ */
-
-function completeIncompleteMarkdown(text: string): string {
-  let out = text;
-  // Unclosed fenced code block: close it so the partial block renders as code.
-  const fences = (out.match(/^```/gm) ?? []).length;
-  const inFence = fences % 2 === 1;
-  if (inFence) return `${out}\n\`\`\``;
-  // Unclosed inline code span.
-  const lastLine = out.slice(out.lastIndexOf("\n") + 1);
-  if (((lastLine.match(/`/g) ?? []).length) % 2 === 1) out += "`";
-  // Unclosed bold / italic on the trailing line.
-  const trailing = out.slice(out.lastIndexOf("\n") + 1);
-  if (((trailing.match(/\*\*/g) ?? []).length) % 2 === 1) out += "**";
-  else {
-    const singles = (trailing.replace(/\*\*/g, "").match(/\*/g) ?? []).length;
-    if (singles % 2 === 1) out += "*";
-  }
-  return out;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -206,13 +182,29 @@ export const Markdown = memo(function Markdown({
 }: {
   children: string;
   className?: string;
-  /** Live decode: reveal streamed words with Berry's catch-up lag and close
-   * dangling markdown syntax while the stream is still running. */
+  /** Live decode: reveal streamed words with Berry's catch-up lag on a cheap
+   * accessible text surface; full Markdown parsing resumes after settling. */
   streaming?: boolean;
 }) {
   const settings = useCodePreviewSettings();
   const revealed = useWordReveal(children, streaming);
-  const source = streaming ? completeIncompleteMarkdown(revealed) : revealed;
+  const source = revealed;
+  if (streaming) {
+    // Markdown parsing and syntax highlighting are deliberately deferred until
+    // the response settles. A plain, accessible live surface keeps token
+    // updates cheap while the final render still uses the full GFM/KaTeX path.
+    return (
+      <div
+        data-markdown-live="true"
+        className={cn(
+          "font-sans min-w-0 whitespace-pre-wrap text-[13px] leading-[1.75] tracking-wide wrap-break-word",
+          className,
+        )}
+      >
+        {source}
+      </div>
+    );
+  }
   return (
     <div
       className={cn(
@@ -365,13 +357,10 @@ interface HighlightedCode {
 
 const HIGHLIGHT_CACHE = new Map<string, HighlightedCode>();
 const HIGHLIGHT_CACHE_CAP = 100;
-const THEME_MAP: Record<string, BundledTheme> = {
-  "berry-light": "vitesse-light",
-  "berry-dark": "vitesse-dark",
-  "github-light": "github-light",
-  "one-dark": "one-dark-pro",
-};
-
+// Worker support is the normal path. If a restrictive CSP or legacy host
+// prevents workers, keep the synchronous fallback bounded so an abandoned
+// revision cannot spend unbounded time on the main thread.
+export const MAIN_THREAD_HIGHLIGHT_MAX_CHARS = 128_000;
 function rememberHighlight(key: string, value: HighlightedCode): HighlightedCode {
   HIGHLIGHT_CACHE.delete(key);
   HIGHLIGHT_CACHE.set(key, value);
@@ -380,10 +369,6 @@ function rememberHighlight(key: string, value: HighlightedCode): HighlightedCode
     if (first) HIGHLIGHT_CACHE.delete(first);
   }
   return value;
-}
-
-function shikiTheme(value: string): BundledTheme {
-  return THEME_MAP[value] ?? "vitesse-dark";
 }
 
 function tokenStyle(token: ThemedToken): React.CSSProperties | undefined {
@@ -403,6 +388,32 @@ function fallbackTokens(lines: string[]): ThemedToken[][] {
   return lines.map((line, index) => [{ content: line || " ", offset: index }]);
 }
 
+/** Schedule expensive highlighting away from the token/render path. */
+export function scheduleIdleWork(work: () => void, timeout = 500): () => void {
+  let cancelled = false;
+  const run = () => {
+    if (!cancelled) work();
+  };
+  const idleWindow = typeof window !== "undefined"
+    ? window as Window & {
+        requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+        cancelIdleCallback?: (handle: number) => void;
+      }
+    : null;
+  if (idleWindow?.requestIdleCallback) {
+    const handle = idleWindow.requestIdleCallback(run, { timeout });
+    return () => {
+      cancelled = true;
+      idleWindow.cancelIdleCallback?.(handle);
+    };
+  }
+  const handle = globalThis.setTimeout(run, timeout);
+  return () => {
+    cancelled = true;
+    globalThis.clearTimeout(handle);
+  };
+}
+
 function useHighlightedCode(code: string, language: string, theme: string): HighlightedCode {
   const lines = React.useMemo(() => code.split("\n"), [code]);
   const cacheKey = React.useMemo(() => `${theme}\0${language}\0${code}`, [code, language, theme]);
@@ -417,37 +428,84 @@ function useHighlightedCode(code: string, language: string, theme: string): High
       return;
     }
     let cancelled = false;
+    let worker: Worker | null = null;
     setHighlighted({ status: "idle", lines: fallbackTokens(lines) });
-    void import("shiki")
-      .then(async (shiki) => {
-        const lang = shikiLanguage(language, shiki.bundledLanguages);
-        if (!lang) {
-          setHighlighted(rememberHighlight(cacheKey, { status: "fallback", lines: fallbackTokens(lines) }));
+    const runMainThreadFallback = () => {
+      if (cancelled) return;
+      if (code.length > MAIN_THREAD_HIGHLIGHT_MAX_CHARS) {
+        setHighlighted(rememberHighlight(cacheKey, { status: "fallback", lines: fallbackTokens(lines) }));
+        return;
+      }
+      void import("shiki")
+        .then(async (shiki) => {
+          if (cancelled) return;
+          const normalized = language.trim().toLowerCase();
+          const aliases: Record<string, string> = { plaintext: "markdown", text: "markdown" };
+          const lang = normalized in shiki.bundledLanguages
+            ? normalized
+            : aliases[normalized];
+          if (!lang) {
+            setHighlighted(rememberHighlight(cacheKey, { status: "fallback", lines: fallbackTokens(lines) }));
+            return;
+          }
+          if (cancelled) return;
+          const themeMap: Record<string, string> = {
+            "berry-light": "vitesse-light",
+            "berry-dark": "vitesse-dark",
+            "github-light": "github-light",
+            "one-dark": "one-dark-pro",
+          };
+          const result = await shiki.codeToTokens(code, {
+            lang: lang as BundledLanguage,
+            theme: (themeMap[theme] ?? "vitesse-dark") as BundledTheme,
+          });
+          if (!cancelled) setHighlighted(rememberHighlight(cacheKey, { status: "highlighted", lines: result.tokens }));
+        })
+        .catch(() => {
+          if (!cancelled) setHighlighted(rememberHighlight(cacheKey, { status: "fallback", lines: fallbackTokens(lines) }));
+        });
+    };
+    const run = () => {
+      if (cancelled) return;
+      if (typeof Worker !== "undefined") {
+        try {
+          worker = new Worker(new URL("./berry-markdown-highlight.worker.ts", import.meta.url), { type: "module" });
+          worker.onmessage = (event: MessageEvent<HighlightResponse>) => {
+            if (cancelled) return;
+            if (event.data.status === "highlighted") {
+              setHighlighted(rememberHighlight(cacheKey, { status: "highlighted", lines: event.data.lines }));
+            } else {
+              setHighlighted(rememberHighlight(cacheKey, { status: "fallback", lines: fallbackTokens(lines) }));
+            }
+            worker?.terminate();
+            worker = null;
+          };
+          worker.onerror = () => {
+            worker?.terminate();
+            worker = null;
+            runMainThreadFallback();
+          };
+          worker.postMessage({ code, language, theme });
           return;
+        } catch {
+          worker?.terminate();
+          worker = null;
+          runMainThreadFallback();
         }
-        const result = await shiki.codeToTokens(code, { lang, theme: shikiTheme(theme) });
-        if (!cancelled) setHighlighted(rememberHighlight(cacheKey, { status: "highlighted", lines: result.tokens }));
-      })
-      .catch(() => {
-        if (!cancelled) setHighlighted(rememberHighlight(cacheKey, { status: "fallback", lines: fallbackTokens(lines) }));
-      });
+        return;
+      }
+      runMainThreadFallback();
+    };
+    const cancelIdleWork = scheduleIdleWork(run);
     return () => {
       cancelled = true;
+      cancelIdleWork();
+      worker?.terminate();
+      worker = null;
     };
   }, [cacheKey, code, language, lines, theme]);
 
   return highlighted;
-}
-
-const LANGUAGE_ALIASES: Record<string, BundledLanguage> = {
-  plaintext: "markdown",
-  text: "markdown",
-};
-
-function shikiLanguage(language: string, bundledLanguages: Record<string, unknown>): BundledLanguage | null {
-  const normalized = language.trim().toLowerCase();
-  if (normalized in bundledLanguages) return normalized as BundledLanguage;
-  return LANGUAGE_ALIASES[normalized] ?? null;
 }
 
 /**

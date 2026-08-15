@@ -15,11 +15,12 @@ import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle, type PromptMentionConfig } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
-import { PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
+import { planProgressFromLiveStream, PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 import { COMPOSER_SEND_ARROW_SIZE, COMPOSER_SEND_BUTTON_CLASS, ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, strictQuestionAnswerAttachment, type ComposerQuestionAnswer } from "./composer-question-overlay";
 import { QueuedMessageList } from "./queued-message-list";
 import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
 import { resolveComposerSubmitIntent } from "@/lib/composer-submit-intent";
+import { sessionStreamStore, useSessionStream } from "@/lib/session-stream-store";
 
 interface PendingFileUpload {
   id: string;
@@ -147,6 +148,8 @@ export function Composer({
   onSteerMessage,
   planProgress,
   question,
+  streamSessionId,
+  streamMessages,
   showProjectSwitcher,
   personalization,
   imageGenerationCapability,
@@ -186,14 +189,26 @@ export function Composer({
   onSteerMessage: (task: Task, input: string, attachments: AttachmentInput[], intent?: TurnIntent) => Promise<void>;
   planProgress?: PlanProgress | null;
   question?: QuestionPrompt | null;
+  streamSessionId?: string | null;
+  streamMessages?: Message[];
   showProjectSwitcher: boolean;
   personalization: PersonalizationProfile;
   imageGenerationCapability: ImageGenerationCapabilityStatus;
 }) {
+  const observedStream = useSessionStream(streamSessionId);
+  const hasExternalStream = Boolean(streamSessionId);
+  const hasObservedStream = Boolean(streamSessionId && sessionStreamStore.has(streamSessionId));
+  const effectiveStreaming = hasExternalStream ? (streaming || observedStream.turnActive) : streaming;
+  // Once the per-session store exists, null is authoritative: a reset must
+  // clear an old question rather than falling back to the shell's last prop.
+  const effectiveQuestion = hasObservedStream ? observedStream.question : question;
+  const effectivePlanProgress = hasObservedStream && streamMessages
+    ? planProgressFromLiveStream(observedStream, planProgress)
+    : planProgress;
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [continuing, setContinuing] = React.useState(false);
-  const working = busy || continuing || streaming;
+  const working = busy || continuing || effectiveStreaming;
   const [attachments, setAttachments] = React.useState<AttachmentInput[]>([]);
   const [pendingUploads, setPendingUploads] = React.useState<PendingFileUpload[]>([]);
   const [pastedTextPresentations, setPastedTextPresentations] = React.useState<Record<string, PastedTextPresentation>>({});
@@ -285,10 +300,10 @@ export function Composer({
     void refreshContextStats();
     const interval = window.setInterval(
       () => void refreshContextStats(),
-      streaming ? 1_500 : 15_000,
+      effectiveStreaming ? 1_500 : 15_000,
     );
     return () => window.clearInterval(interval);
-  }, [client, contextSessionId, refreshContextStats, streaming]);
+  }, [client, contextSessionId, effectiveStreaming, refreshContextStats]);
   React.useEffect(() => {
     setPastedTextPresentations((current) => (
       prunePastedTextPresentations(current, attachments, queuedFollowUps)
@@ -391,12 +406,12 @@ export function Composer({
   }, [editingFollowUp, onReorderFollowUps]);
 
   const answerQuestion = React.useCallback(async (answers: ComposerQuestionAnswer[]) => {
-    if (!question || !activeTask?.activeSessionId || !client) throw new Error("This question is no longer available. Refresh and try again.");
+    if (!effectiveQuestion || !activeTask?.activeSessionId || !client) throw new Error("This question is no longer available. Refresh and try again.");
     const sessionId = activeTask.activeSessionId;
     const transcript = questionAnswerTranscript(answers);
     const answerAttachments = answers.flatMap((answer) => answer.attachments);
-    const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
-    const result = await client.answerQuestion(question.questionId, {
+    const answerMessageId = await stableQuestionAnswerMessageId(effectiveQuestion.questionId);
+    const result = await client.answerQuestion(effectiveQuestion.questionId, {
       answer: questionToolAnswer(answers),
       answerMessageId,
       selectedOptions: answers.flatMap((item) => item.selectedOptions),
@@ -413,7 +428,7 @@ export function Composer({
     if (optimisticMessageId && result.message) {
       onUserMessagePersisted(sessionId, optimisticMessageId, result.message);
     }
-  }, [activeTask, client, onUserMessage, onUserMessagePersisted, question]);
+  }, [activeTask, client, effectiveQuestion, onUserMessage, onUserMessagePersisted]);
 
   const improvePrompt = React.useCallback(async () => {
     const prompt = improvableComposerPrompt(text);
@@ -817,10 +832,10 @@ export function Composer({
         before={
           <>
             <MentionMenu controller={mentions} />
-            {variant === "thread" && question ? <ComposerQuestionOverlay question={question} onSubmit={answerQuestion} onUploadFiles={uploadQuestionFiles} /> : null}
-            {variant === "thread" && (planProgress || queuedFollowUps.length > 0) ? (
+            {variant === "thread" && effectiveQuestion ? <ComposerQuestionOverlay question={effectiveQuestion} onSubmit={answerQuestion} onUploadFiles={uploadQuestionFiles} /> : null}
+            {variant === "thread" && (effectivePlanProgress || queuedFollowUps.length > 0) ? (
               <div className="berry-thread-composer-stack">
-                {planProgress ? <PlanProgressPill plan={planProgress} /> : null}
+                {effectivePlanProgress ? <PlanProgressPill plan={effectivePlanProgress} /> : null}
                 {queuedFollowUps.length > 0 ? (
                   <QueuedMessageList
                     followUps={editingFollowUp ? queuedFollowUps.filter((followUp) => followUp.id !== editingFollowUp.id) : queuedFollowUps}
