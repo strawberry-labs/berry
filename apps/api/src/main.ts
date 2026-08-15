@@ -48,7 +48,9 @@ import {
   detectMediaType,
   FILE_TYPE_SAMPLE_BYTES,
   fileResponsePolicy,
+  INVALID_FILE_CACHE_CONTROL,
   normalizeMediaType,
+  PROTECTED_FILE_CACHE_CONTROL,
   setUntrustedFileResponseHeaders,
 } from "./files/file-response-security.ts";
 import { FilePlatformService } from "./files/file-platform.service.ts";
@@ -172,6 +174,7 @@ export class ArtifactController {
 
   @Get("*key")
   async read(@Req() request: AuthenticatedRequest, @Param("key") rawKey: string | string[], @Res() response: ServerResponse) {
+    response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
     if (!this.config) throw new NotFoundException("Artifact storage is not configured");
     const key = Array.isArray(rawKey) ? rawKey.join("/") : rawKey;
     if (!key.startsWith(`${this.config.prefix}/`) || key.includes("\\") || key.split("/").includes("..")) {
@@ -189,7 +192,8 @@ export class ArtifactController {
       });
       response.statusCode = 200;
       if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
-      response.setHeader("Cache-Control", "private, max-age=3600");
+      response.setHeader("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
+      response.setHeader("Vary", "Authorization, Cookie");
       setUntrustedFileResponseHeaders(response, {
         fileName: artifactLibraryItem(key, object.ContentLength ?? 0).name,
         policy,

@@ -34,7 +34,10 @@ import {
   detectMediaType,
   FILE_TYPE_SAMPLE_BYTES,
   fileResponsePolicy,
+  INVALID_FILE_CACHE_CONTROL,
   normalizeMediaType,
+  PROTECTED_FILE_CACHE_CONTROL,
+  PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL,
   readBodyBounded,
   setUntrustedFileResponseHeaders,
 } from "./file-response-security.ts";
@@ -1080,12 +1083,12 @@ export class FilePlatformService {
     download = false,
     ifNoneMatch?: string,
   ) {
+    response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
     const config = this.requireConfig();
     const file = await this.get(tenantId, userId, fileId);
     if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
     const etag = contentEntityTag(file);
     response.setHeader("ETag", etag);
-    response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
     response.setHeader("Vary", "Authorization, Cookie");
     response.setHeader("Accept-Ranges", "bytes");
     setUntrustedFileResponseHeaders(response, {
@@ -1097,6 +1100,7 @@ export class FilePlatformService {
       }),
     });
     if (!range && requestEntityTagMatches(ifNoneMatch, etag)) {
+      response.setHeader("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
       response.statusCode = 304;
       response.end();
       return;
@@ -1128,6 +1132,7 @@ export class FilePlatformService {
       detectedMediaType,
       allowInline: !download,
     });
+    response.setHeader("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
     response.statusCode = object.ContentRange ? 206 : 200;
     if (object.ContentLength != null) response.setHeader("Content-Length", String(object.ContentLength));
     if (object.ContentRange) response.setHeader("Content-Range", object.ContentRange);
@@ -1146,7 +1151,7 @@ export class FilePlatformService {
     response: ServerResponse,
     ifNoneMatch?: string,
   ) {
-    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
     const config = this.requireConfig();
     const file = await this.database.withTenant(tenantId, async (executor) => {
       const [profile] = await executor.query<{ branding: unknown }>(
@@ -1200,7 +1205,7 @@ export class FilePlatformService {
       }));
       if (!object.Body) throw new NotFoundException("Branding asset content is unavailable");
     } catch (cause) {
-      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
       throw cause;
     }
     const maximumBytes = kind === "logo" ? ORGANIZATION_LOGO_MAX_BYTES : ORGANIZATION_FAVICON_MAX_BYTES;
@@ -1211,14 +1216,14 @@ export class FilePlatformService {
       || contentLength > maximumBytes
       || contentLength !== Number(file.size_bytes)) {
       await cancelStoredObjectBody(object.Body).catch(() => undefined);
-      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
       throw new NotFoundException("Branding asset not found");
     }
     let inspected: Awaited<ReturnType<typeof bufferBodyPrefix>>;
     try {
       inspected = await bufferBodyPrefix(object.Body as AsyncIterable<Uint8Array>);
     } catch {
-      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
       throw new NotFoundException("Branding asset not found");
     }
     const detectedMediaType = detectMediaType(inspected.sample);
@@ -1237,7 +1242,7 @@ export class FilePlatformService {
     }
     if (policy.disposition !== "inline" || !(allowed as readonly string[]).includes(policy.detectedMediaType)) {
       await inspected.cancel();
-      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
       throw new NotFoundException("Branding asset not found");
     }
     setPublicBrandingHeaders(response, etag);
@@ -1827,7 +1832,7 @@ async function cancelStoredObjectBody(body: unknown): Promise<void> {
 
 function setPublicBrandingHeaders(response: ServerResponse, etag: string): void {
   response.setHeader("ETag", etag);
-  response.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  response.setHeader("Cache-Control", PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL);
   response.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   response.setHeader("X-Content-Type-Options", "nosniff");
 }

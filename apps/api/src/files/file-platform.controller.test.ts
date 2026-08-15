@@ -8,6 +8,7 @@ import { BerryAuthModule } from "../auth/auth.module.ts";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { FilePlatformController } from "./file-platform.controller.ts";
 import { FilePlatformService } from "./file-platform.service.ts";
+import { INVALID_FILE_CACHE_CONTROL } from "./file-response-security.ts";
 
 const USER_ID = "00000000-0000-7000-8000-000000000201";
 
@@ -86,6 +87,22 @@ describe("FilePlatformController", () => {
     }));
   });
 
+  it("marks an invalid protected-content request as non-cacheable", async () => {
+    const files = {
+      list: vi.fn(async () => ({ items: [], nextCursor: null })),
+      streamContent: vi.fn(),
+    };
+    app = await createApp(files);
+
+    const response = await request(app.getHttpServer())
+      .get("/v1/files/not-a-uuid/content")
+      .set(authHeader())
+      .expect(400);
+
+    expect(response.headers["cache-control"]).toBe(INVALID_FILE_CACHE_CONTROL);
+    expect(files.streamContent).not.toHaveBeenCalled();
+  });
+
   it("removes only a valid Library membership through the authenticated file route", async () => {
     const files = {
       list: vi.fn(async () => ({ items: [], nextCursor: null })),
@@ -103,7 +120,7 @@ describe("FilePlatformController", () => {
   });
 });
 
-async function createApp(files: Pick<FilePlatformService, "list"> & Partial<Pick<FilePlatformService, "initiateUpload" | "removeFromLibrary">>): Promise<INestApplication> {
+async function createApp(files: Pick<FilePlatformService, "list"> & Partial<Pick<FilePlatformService, "initiateUpload" | "removeFromLibrary" | "streamContent">>): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [BerryAuthModule.register({ runtime: { useValue: fakeAuthRuntime() } })],
     controllers: [FilePlatformController],

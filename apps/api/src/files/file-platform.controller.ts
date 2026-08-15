@@ -6,7 +6,7 @@ import { z } from "zod";
 import { PublicAuth } from "../auth/auth.decorators.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { FilePlatformService } from "./file-platform.service.ts";
-import { normalizeMediaType } from "./file-response-security.ts";
+import { INVALID_FILE_CACHE_CONTROL, normalizeMediaType } from "./file-response-security.ts";
 
 const UploadMediaTypeSchema = z.string()
   .trim()
@@ -109,10 +109,11 @@ export class FilePlatformController {
 
   @Get(":fileId/content")
   content(@Req() request: AuthenticatedRequest, @Param("fileId") fileId: string, @Query("download") download: string | undefined, @Res() response: ServerResponse) {
+    response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
     return this.files.streamContent(
       tenant(),
       user(request),
-      z.string().uuid().parse(fileId),
+      parse(z.string().uuid(), fileId),
       typeof request.headers.range === "string" ? request.headers.range : undefined,
       response,
       download === "1",
@@ -138,6 +139,7 @@ export class BrandingAssetController {
     @Query("v") version: string | undefined,
     @Res() response: ServerResponse,
   ) {
+    response.setHeader("Cache-Control", INVALID_FILE_CACHE_CONTROL);
     return this.files.streamBrandingAsset(
       tenant(),
       parse(OrganizationBrandingAssetKindSchema, kind),

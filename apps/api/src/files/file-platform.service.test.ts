@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { FILE_RESPONSE_SECURITY_VERSION } from "@berry/shared";
 import type { SqlExecutor } from "../db/cloud-database.service.ts";
 import { FilePlatformService } from "./file-platform.service.ts";
+import {
+  INVALID_FILE_CACHE_CONTROL,
+  PROTECTED_FILE_CACHE_CONTROL,
+  PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL,
+} from "./file-response-security.ts";
 
 const TENANT_ID = "00000000-0000-7000-8000-000000000001";
 const USER_ID = "00000000-0000-7000-8000-000000000201";
@@ -256,10 +261,74 @@ describe("FilePlatformService.streamContent", () => {
       input: expect.objectContaining({ Bucket: "berry-test", Key: "objects/history.png", VersionId: "version-7" }),
     }));
     expect(response.setHeader).toHaveBeenCalledWith("ETag", `"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-digest"`);
-    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "private, max-age=31536000, immutable");
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
     expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
     expect(response.setHeader).toHaveBeenCalledWith("Content-Disposition", expect.stringMatching(/^inline;/));
     expect(response.end).toHaveBeenCalledOnce();
+  });
+
+  it("reauthorizes a protected file after access is revoked", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000204";
+    let accessGranted = true;
+    let accessChecks = 0;
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => {
+        if (!sql.includes("SELECT f.*")) return [] as T[];
+        accessChecks += 1;
+        if (!accessGranted) return [] as T[];
+        return [{
+          id: fileId,
+          owner_user_id: USER_ID,
+          blob_id: null,
+          original_name: "revocable.png",
+          display_name: "revocable.png",
+          media_type: "image/png",
+          detected_media_type: "image/png",
+          size_bytes: PNG_BYTES.byteLength,
+          sha256: "revocable-digest",
+          bucket: "berry-test",
+          object_key: "revocable.png",
+          etag: "storage-etag",
+          object_version_id: null,
+          origin: "user_upload",
+          status: "available",
+          created_at: new Date(),
+          updated_at: new Date(),
+          task_ids: [TASK_ID],
+          roles: ["input"],
+        }] as T[];
+      },
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const client = { send: vi.fn(async () => ({
+      Body: { async *[Symbol.asyncIterator]() { yield PNG_BYTES; } },
+      ContentLength: PNG_BYTES.byteLength,
+    })) };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+    const grantedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
+
+    await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, grantedResponse as never);
+    expect(grantedResponse.setHeader).toHaveBeenCalledWith("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
+
+    accessGranted = false;
+    const revokedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(() => true), end: vi.fn() };
+    await expect(service.streamContent(TENANT_ID, USER_ID, fileId, undefined, revokedResponse as never))
+      .rejects.toThrow("File not found");
+
+    expect(revokedResponse.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+    expect(accessChecks).toBe(2);
+    expect(client.send).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -322,6 +391,7 @@ describe("FilePlatformService.streamContent", () => {
     await service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never, false, `W/"berry-file-response-v${FILE_RESPONSE_SECURITY_VERSION}-content-digest"`);
 
     expect(response.statusCode).toBe(304);
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", PROTECTED_FILE_CACHE_CONTROL);
     expect(client.send).not.toHaveBeenCalled();
     expect(response.end).toHaveBeenCalledOnce();
   });
@@ -425,7 +495,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     await service.streamBrandingAsset(TENANT_ID, "logo", fileId, response as never);
 
     expect(response.statusCode).toBe(200);
-    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "public, max-age=31536000, immutable");
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL);
     expect(response.setHeader).toHaveBeenCalledWith("Cross-Origin-Resource-Policy", "cross-origin");
     expect(response.setHeader).toHaveBeenCalledWith("Content-Security-Policy", "default-src 'none'; sandbox");
     expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
@@ -508,14 +578,14 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     expect(client.send).toHaveBeenCalledOnce();
     expect(execute).toHaveBeenCalledWith(expect.stringContaining("SET detected_media_type"), [TENANT_ID, fileId, "text/html"]);
     expect(response.statusCode).not.toBe(304);
-    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
 
     client.send.mockClear();
     const repeatedResponse = { statusCode: 0, setHeader: vi.fn(), write: vi.fn(), end: vi.fn() };
     await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, repeatedResponse as never, "*"))
       .rejects.toThrow("Branding asset not found");
     expect(client.send).not.toHaveBeenCalled();
-    expect(repeatedResponse.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
+    expect(repeatedResponse.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
   });
 
   it("cancels the storage body when branding metadata has a stale size", async () => {
@@ -545,7 +615,7 @@ describe("FilePlatformService.streamBrandingAsset", () => {
     await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, response as never))
       .rejects.toThrow("Branding asset not found");
     expect(destroy).toHaveBeenCalledOnce();
-    expect(response.setHeader).not.toHaveBeenCalledWith("Cache-Control", "public, max-age=31536000, immutable");
+    expect(response.setHeader).not.toHaveBeenCalledWith("Cache-Control", PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL);
   });
 
   it("refuses to render an SVG branding asset from Berry's origin", async () => {
@@ -598,8 +668,8 @@ describe("FilePlatformService.streamBrandingAsset", () => {
 
     await expect(service.streamBrandingAsset(TENANT_ID, "logo", fileId, response as never))
       .rejects.toThrow("temporary S3 failure");
-    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
-    expect(response.setHeader).not.toHaveBeenCalledWith("Cache-Control", "public, max-age=31536000, immutable");
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
+    expect(response.setHeader).not.toHaveBeenCalledWith("Cache-Control", PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL);
   });
 
   it("rejects a stale version URL after the selected asset changes", async () => {

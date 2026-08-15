@@ -3,6 +3,11 @@ import { PASSIVE_INLINE_FILE_MEDIA_TYPES } from "@berry/shared";
 
 export const FILE_RESPONSE_CSP = "default-src 'none'; sandbox";
 export const FILE_TYPE_SAMPLE_BYTES = 8 * 1024;
+// Protected content must reauthorize on every browser request. Public immutable
+// caching is reserved for security-versioned, revocation-safe asset URLs.
+export const PROTECTED_FILE_CACHE_CONTROL = "private, max-age=0, must-revalidate";
+export const PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+export const INVALID_FILE_CACHE_CONTROL = "no-store";
 
 const PASSIVE_INLINE_MEDIA_TYPES = new Set<string>(PASSIVE_INLINE_FILE_MEDIA_TYPES);
 

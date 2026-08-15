@@ -8,7 +8,11 @@ import { BerryAuthModule } from "./auth/auth.module.ts";
 import type { BerryAuthRuntime } from "./auth/auth-runtime.ts";
 import { CloudDatabaseService } from "./db/cloud-database.service.ts";
 import { FilePlatformService } from "./files/file-platform.service.ts";
-import { FILE_TYPE_SAMPLE_BYTES } from "./files/file-response-security.ts";
+import {
+  FILE_TYPE_SAMPLE_BYTES,
+  INVALID_FILE_CACHE_CONTROL,
+  PROTECTED_FILE_CACHE_CONTROL,
+} from "./files/file-response-security.ts";
 import {
   ARTIFACT_READ_CONFIG,
   ArtifactController,
@@ -92,6 +96,7 @@ describe("ArtifactController", () => {
       expect(read.headers["content-security-policy"]).toBe("default-src 'none'; sandbox");
       expect(read.headers["x-content-type-options"]).toBe("nosniff");
       expect(read.headers["x-frame-options"]).toBe("DENY");
+      expect(read.headers["cache-control"]).toBe(PROTECTED_FILE_CACHE_CONTROL);
     }
   });
 
@@ -176,10 +181,11 @@ describe("ArtifactController", () => {
     expect(fixture.queries).toContainEqual(expect.objectContaining({ params: [TENANT_ID, TASK_ID, USER_ID] }));
 
     fixture.client.send.mockClear();
-    await request(app.getHttpServer())
+    const denied = await request(app.getHttpServer())
       .get(`/v1/artifacts/${foreignRegisteredKey}`)
       .set(authHeader())
       .expect(404);
+    expect(denied.headers["cache-control"]).toBe(INVALID_FILE_CACHE_CONTROL);
     await request(app.getHttpServer())
       .get(`/v1/artifacts/artifacts/tasks/${OTHER_TASK_ID}/${OBJECT_ID}-foreign-task.png`)
       .set(authHeader())
