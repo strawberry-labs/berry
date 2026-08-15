@@ -136,7 +136,13 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   return (
     <Sidebar variant="inset" className="berry-app-sidebar">
       {management ? (
-        <WebSettingsNavigation {...management} />
+        <WebSettingsNavigation
+          {...management}
+          onNavigate={(kind, tab) => {
+            management.onNavigate(kind, tab);
+            if (isMobile) setOpenMobile(false);
+          }}
+        />
       ) : <BerryConversationSidebarContent
         showKindControl={false}
         pinnedConversations={allTasks.filter((task) => task.pinned)}

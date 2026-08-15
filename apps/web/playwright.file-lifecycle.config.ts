@@ -8,6 +8,7 @@ export default defineConfig({
   reporter: "list",
   timeout: 60_000,
   expect: { timeout: 15_000 },
+  outputDir: "test-results/file-lifecycle",
   webServer: [
     {
       command: "node ../api/scripts/file-lifecycle-e2e-server.mjs",
@@ -29,6 +30,8 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:3109",
     trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+    video: "retain-on-failure",
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },

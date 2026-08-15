@@ -35,7 +35,7 @@ export function TaskRouteState({ state, onRetry, onHome, onRestore }: {
           <EmptyMedia variant="icon" className="bg-[var(--berry-surface-inset)] text-[var(--berry-text-secondary)]">
             <Icon aria-hidden />
           </EmptyMedia>
-          <EmptyTitle id="task-route-state-title" className="text-[var(--berry-text-primary)]">{copy.title}</EmptyTitle>
+          <EmptyTitle id="task-route-state-title" role="heading" aria-level={2} className="text-[var(--berry-text-primary)]">{copy.title}</EmptyTitle>
           <EmptyDescription className="text-[var(--berry-text-secondary)]">{copy.detail}</EmptyDescription>
         </EmptyHeader>
         <EmptyContent className="flex-row flex-wrap justify-center">

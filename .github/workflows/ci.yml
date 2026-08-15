@@ -85,6 +85,45 @@ jobs:
           pnpm --filter @berry/shared --filter @berry/db --filter @berry/api
           --filter @berry/worker --filter @berry/mem0 --filter @berry/web test
 
+  chromium-workflow:
+    name: Chromium web workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm --filter @berry/web exec playwright install --with-deps chromium
+
+      - name: Run required Chromium workflows
+        run: pnpm --filter @berry/web exec playwright test --project=chromium
+
+      - name: Upload Chromium failure artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-workflow-failures
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            apps/web/test-results/
+            apps/web/playwright-report/
+
   production-integration:
     name: Production runtime integration
     runs-on: ubuntu-24.04
@@ -190,3 +229,14 @@ jobs:
           BERRY_FILE_LIFECYCLE_E2E_S3_ACCESS_KEY_ID: berry
           BERRY_FILE_LIFECYCLE_E2E_S3_SECRET_ACCESS_KEY: berry-integration-password
         run: pnpm --filter @berry/web exec playwright test --config playwright.file-lifecycle.config.ts
+
+      - name: Upload file-lifecycle failure artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-lifecycle-playwright-failures
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            apps/web/test-results/file-lifecycle/
+            apps/web/playwright-report/

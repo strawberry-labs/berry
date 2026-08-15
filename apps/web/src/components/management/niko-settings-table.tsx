@@ -133,6 +133,7 @@ export function DataTable({
     >
       <div
         className="min-w-0 overflow-hidden rounded-xl border border-border bg-card shadow-[0_1px_1px_oklch(0_0_0/0.02)]"
+        role="region"
         aria-label={label}
       >
         <DataTableToolbarSection className="flex-wrap justify-between border-b border-border bg-muted/20 p-3">

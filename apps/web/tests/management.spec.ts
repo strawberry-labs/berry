@@ -14,7 +14,7 @@ test("settings use the shared sidebar contract", async ({ page }) => {
   await expect(sidebarInner).toBeVisible();
   expect(await sidebarInner.evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(workspaceSidebarColor);
 
-  const navigation = page.getByRole("navigation", { name: "Personal settings" });
+  const navigation = page.getByRole("navigation", { name: "Settings and administration" });
   const general = navigation.getByRole("button", { name: "General", exact: true });
   await expect(general).toHaveAttribute("data-slot", "sidebar-menu-button");
   await expect(general).toHaveAttribute("data-active", "true");
@@ -22,7 +22,7 @@ test("settings use the shared sidebar contract", async ({ page }) => {
   let toggle = page.getByRole("button", { name: "Toggle sidebar" });
   await toggle.click();
   await expect(sidebar).toHaveAttribute("data-state", "collapsed");
-  toggle = page.getByRole("button", { name: "Expand sidebar" });
+  toggle = page.getByRole("button", { name: "Open sidebar" });
   await toggle.click();
   await expect(sidebar).toHaveAttribute("data-state", "expanded");
 
@@ -32,32 +32,31 @@ test("settings use the shared sidebar contract", async ({ page }) => {
   await expect(sidebar).toHaveAttribute("data-state", "expanded");
 });
 
-test("personal settings routes own their screens and preserve local preferences", async ({ page }) => {
-  await page.goto("/settings/general");
+test("personalization settings own their screen and save explicit profile context", async ({ page }) => {
+  await page.goto("/settings/personalization");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
-  await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Personalization" })).toBeVisible();
   await page.getByLabel("Custom instructions").fill("Keep answers concise and show verification results.");
   await page.getByRole("button", { name: "Save changes" }).click();
-  await expect(page.getByText("Preferences saved in this browser.")).toBeVisible();
-  await page.reload();
+  await expect(page.getByRole("button", { name: "Save changes" })).toHaveCount(0);
   await expect(page.getByLabel("Custom instructions")).toHaveValue("Keep answers concise and show verification results.");
 });
 
 test("archived tasks are a final personal setting and stay out of the home composer", async ({ page }) => {
   await page.goto("/settings/archived");
   await expect(page.getByRole("heading", { name: "Archived tasks", exact: true })).toBeVisible();
-  const navigation = page.getByRole("navigation", { name: "Personal settings" });
+  const navigation = page.getByRole("navigation", { name: "Settings and administration" });
   await expect(navigation.getByRole("button", { name: "Archived tasks" })).toBeVisible();
 });
 
 test("organization admin routes support direct navigation and validated analytics search", async ({ page }) => {
   await page.goto("/admin/analytics?view=models&from=2026-07-01T00%3A00%3A00.000Z&to=2026-07-21T23%3A59%3A59.999Z");
-  await expect(page.getByRole("heading", { name: "Analytics" })).toBeVisible();
-  await expect(page.getByRole("tab", { name: "Models" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("heading", { name: "Usage", exact: true })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Models", exact: true })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByText("Demo adapter")).toHaveCount(0);
-  await page.getByRole("button", { name: "Spend limits" }).click();
+  await page.getByRole("button", { name: "Allowances", exact: true }).click();
   await expect(page).toHaveURL(/\/admin\/spend-limits$/);
-  await expect(page.getByRole("heading", { name: "Spend limits" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Allowances" })).toBeVisible();
 });
 
 test("organization branding uploads and timezone selection stay usable on narrow screens", async ({ page }) => {
@@ -68,9 +67,9 @@ test("organization branding uploads and timezone selection stay usable on narrow
   await expect(page.getByText("Browser favicon", { exact: true })).toBeVisible();
 
   await page.getByLabel("Upload organization logo").setInputFiles({
-    name: "aesg-logo.svg",
-    mimeType: "image/svg+xml",
-    buffer: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32"/></svg>'),
+    name: "aesg-logo.png",
+    mimeType: "image/png",
+    buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
   });
   await expect(page.getByText("Ready to save")).toBeVisible();
 
@@ -86,23 +85,24 @@ test("organization branding uploads and timezone selection stay usable on narrow
 
 test("management navigation uses the shared mobile sidebar sheet", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/settings/privacy");
+  await page.goto("/settings/account");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
-  await expect(page.getByRole("heading", { name: "Privacy & permissions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Account" })).toBeVisible();
   const toggle = page.getByRole("button", { name: "Toggle sidebar" });
   const mobileSidebar = page.locator('[data-slot="sidebar"][data-mobile="true"]');
   await toggle.click();
   await expect(mobileSidebar).toBeVisible();
-  await expect(mobileSidebar.getByRole("navigation", { name: "Personal settings" })).toBeVisible();
+  await expect(mobileSidebar.getByRole("navigation", { name: "Settings and administration" })).toBeVisible();
   await mobileSidebar.getByRole("button", { name: "General", exact: true }).click();
   await expect(page).toHaveURL(/\/settings\/general$/);
-  await expect(mobileSidebar).toHaveCount(0);
+  await expect(mobileSidebar).not.toBeVisible();
   await expect(toggle).toBeFocused();
 });
 
 test("platform console remains visually separate and exposes no organization switcher", async ({ page }) => {
   await page.goto("/platform/overview");
-  await expect(page.getByText("Platform console")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
+  await expect(page.getByText("Platform operations", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Active organization")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: /Overview|Insufficient permission/ })).toBeVisible();
 });

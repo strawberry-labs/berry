@@ -247,7 +247,7 @@ test("recognized slash commands invoke handlers instead of becoming model text",
   await expect(page.locator("[data-user-message-bubble]").filter({ hasText: "/pr" })).toHaveCount(0);
 });
 
-test("web task conversation uses the shared task presentation", async ({ page }) => {
+test("web task view uses the shared task presentation", async ({ page }) => {
   await openTask(page);
 
   const userBubble = page.locator("[data-user-message-bubble]").first();
@@ -387,21 +387,26 @@ test("web shell exposes provider, MCP HTTP, and skills settings", async ({ page 
   await openTask(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(page.getByLabel("Organization")).toHaveCount(0);
+  await page.getByRole("button", { name: "AI & tools", exact: true }).click();
   await page.getByRole("button", { name: "Models", exact: true }).click();
-  await expect(page.getByText("Berry Router")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Models", exact: true })).toBeVisible();
+  await expect(page.getByText("Berry Router Auto", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "MCP servers" }).click();
   await expect(page.getByText("Docs MCP")).toBeVisible();
-  await expect(page.getByRole("table", { name: "MCP servers" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "MCP servers" }).getByRole("table")).toBeVisible();
   await expect(page.getByRole("button", { name: "Add server" })).toBeDisabled();
-  await expect(page.getByRole("table", { name: "MCP servers" })).not.toContainText("stdio");
+  await expect(page.getByRole("region", { name: "MCP servers" }).getByRole("table")).not.toContainText("stdio");
   await page.getByRole("button", { name: "Skills" }).click();
   await expect(page.getByText("$review")).toBeVisible();
   await expect(page.getByRole("button", { name: "Import skill" })).toBeDisabled();
-  await page.getByRole("button", { name: "Open admin console" }).click();
+  const settingsNavigation = page.getByRole("navigation", { name: "Settings and administration" });
+  await settingsNavigation.getByRole("button", { name: "Overview", exact: true }).first().click();
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
-  await page.getByRole("button", { name: "SSO & SCIM" }).click();
+  await page.getByRole("button", { name: "Identity & security", exact: true }).click();
+  await page.getByRole("button", { name: "SSO & SCIM", exact: true }).click();
   await expect(page.getByText("No identity connections")).toBeVisible();
-  await page.getByRole("button", { name: "Managed policy" }).click();
+  await page.getByRole("button", { name: "Identity & security", exact: true }).click();
+  await page.getByRole("button", { name: "Managed policy", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Managed policy" })).toBeVisible();
   await page.getByRole("button", { name: "Audit log" }).click();
   await expect(page.getByRole("heading", { name: "Audit log" })).toBeVisible();
@@ -428,41 +433,38 @@ test("desktop-style settings navigation replaces the task surface and returns", 
   await openTask(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
-  const settings = page.getByRole("region", { name: "Personal settings" });
+  const settings = page.getByRole("main");
   await expect(settings).toBeVisible();
-  await page.getByRole("button", { name: "Prompts & commands", exact: true }).click();
-  await expect(settings.getByRole("textbox", { name: "Prompt" })).toBeVisible();
-  await page.getByRole("button", { name: "Privacy & permissions", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Privacy & permissions" })).toBeVisible();
-  await page.getByRole("button", { name: "My usage", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "My usage" })).toBeVisible();
+  await page.getByRole("button", { name: "Personalization", exact: true }).click();
+  await expect(settings.getByRole("textbox", { name: "Custom instructions" })).toBeVisible();
+  await page.getByRole("button", { name: "Account", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Account", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Usage", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Usage", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Skills", exact: true }).click();
   await expect(settings.getByText("$review")).toBeVisible();
   await page.getByRole("button", { name: "Back to workspace", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cloud sandbox smoke" })).toBeVisible();
 });
 
-test("saved prompts insert into the Lexical composer", async ({ page }) => {
+test("personalization changes return to the same task surface", async ({ page }) => {
   await openTask(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Prompts & commands", exact: true }).click();
-  await page.getByRole("textbox", { name: "Prompt" }).fill("Review the current task for regressions.");
-  await page.getByRole("button", { name: "Use in composer" }).click();
-  await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByTestId("composer-input")).toContainText("Review the current task for regressions.");
+  await page.getByRole("button", { name: "Personalization", exact: true }).click();
+  await page.getByLabel("Custom instructions").fill("Keep task responses concise.");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await page.getByRole("button", { name: "Back to workspace", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Cloud sandbox smoke", exact: true })).toBeVisible();
 });
 
 test("visible browser settings persist and apply after reload", async ({ page }) => {
   await openTask(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  const queue = page.getByRole("switch", { name: /Queued follow-ups/ });
-  await queue.uncheck();
-  await page.locator("label").filter({ hasText: "Theme" }).getByRole("combobox").selectOption("light");
-  await page.locator("label").filter({ hasText: "Language" }).getByRole("combobox").selectOption("en");
+  await page.getByRole("combobox", { name: "Theme" }).click();
+  await page.getByRole("option", { name: "Light", exact: true }).click();
   await page.reload();
-  await expect(queue).not.toBeChecked();
+  await expect(page.getByRole("combobox", { name: "Theme" })).toContainText("Light");
   await expect(page.locator("html")).not.toHaveClass(/dark/);
-  await expect(page.locator("html")).toHaveAttribute("lang", "en");
 });
 
 test("web tasks use server-enforced full access", async ({ page }) => {
@@ -589,10 +591,10 @@ test("primary shell workflows and settings are keyboard reachable", async ({ pag
   await page.getByRole("button", { name: "Settings", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
-  const privacy = page.getByRole("button", { name: "Privacy & permissions", exact: true });
-  await privacy.focus();
+  const account = page.getByRole("button", { name: "Account", exact: true });
+  await account.focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("heading", { name: "Privacy & permissions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Account", exact: true })).toBeVisible();
 });
 
 test("composer controls stay reachable across supported viewport sizes", async ({ page }) => {
@@ -657,6 +659,7 @@ test("help exposes browser-safe support actions and diagnostics", async ({ page 
 
 test("captures the rebuilt settings and administration references", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "Pixel references are Chromium-only");
+  await page.context().grantPermissions(["notifications"]);
 
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/settings/general");
@@ -665,9 +668,12 @@ test("captures the rebuilt settings and administration references", async ({ pag
 
   await page.goto("/admin/overview");
   await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
-  // The Recharts trend renders with sub-pixel variance between runs; mask it so
-  // the snapshot asserts layout/IA, not the chart's internal rasterization.
-  await expect(page).toHaveScreenshot("management-admin-desktop.png", { mask: [page.locator(".mgmt-chart")] });
+  await expect(page.getByText("Active members", { exact: true })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Loading organization data" })).toHaveCount(0);
+  // Charts intentionally vary with the demo data and browser rendering; mask
+  // their real container while keeping the surrounding layout and metrics in
+  // the reference image.
+  await expect(page).toHaveScreenshot("management-admin-desktop.png", { mask: [page.locator(".settings-chart")] });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/settings/general");

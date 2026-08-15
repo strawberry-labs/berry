@@ -4,6 +4,7 @@ export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,
   reporter: "list",
+  outputDir: "test-results",
   webServer: {
     command: "corepack pnpm dev",
     url: "http://127.0.0.1:3108",
@@ -13,6 +14,8 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:3108",
     trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+    video: "retain-on-failure",
   },
   // The shared desktop-ui graph is intentionally broad; under the default
   // seven-worker Chromium fan-out, the first TanStack Start hydration can

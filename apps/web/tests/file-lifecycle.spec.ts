@@ -5,7 +5,7 @@ const API_URL = "http://127.0.0.1:3199";
 
 test.skip(process.env.BERRY_FILE_LIFECYCLE_E2E_REAL !== "true", "requires the PostgreSQL + MinIO lifecycle fixture server");
 
-test("conversation images survive real Library removal and unavailable assets fail cleanly", async ({ browser }) => {
+test("task images survive real Library removal and unavailable assets fail cleanly", async ({ browser }) => {
   const ownerContext = await browser.newContext();
   const otherContext = await browser.newContext();
   await ownerContext.addCookies([{ name: "berry-e2e-user", value: "owner", url: API_URL }]);
@@ -18,9 +18,9 @@ test("conversation images survive real Library removal and unavailable assets fa
     expect(reset.ok()).toBe(true);
     await ownerPage.goto(`${WEB_URL}/tasks/task_chat`);
     await expect(ownerPage.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
-    const conversationImage = ownerPage.getByAltText("Berry orchard at dusk");
-    await expect(conversationImage).toBeVisible();
-    await expect.poll(() => conversationImage.evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+    const taskImage = ownerPage.getByAltText("Berry orchard at dusk");
+    await expect(taskImage).toBeVisible();
+    await expect.poll(() => taskImage.evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
 
     await ownerPage.getByRole("button", { name: "Open library" }).click();
     await expect(ownerPage).toHaveURL(`${WEB_URL}/library/all`);
