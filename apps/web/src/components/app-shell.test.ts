@@ -3,10 +3,87 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
+  it("falls back to the legacy array when a rolling-deploy API lacks message lookup", async () => {
+    const persisted = { id: "message_old", sessionId: "session_1" } as never;
+    const client = {
+      getMessage: vi.fn(async () => { throw new BerryApiError("Not found", 404, null); }),
+      listMessagePage: vi.fn(async () => ({ messages: [persisted], hasOlder: false, hasNewer: false, oldestSequence: null, newestSequence: null, cursorPresent: null, historyRevision: null, historyDeletionRevision: null })),
+    };
+
+    await expect(findPersistedMessageById(client, "session_1", "message_old")).resolves.toBe(persisted);
+    expect(client.listMessagePage).toHaveBeenCalledWith("session_1", { limit: 200 });
+  });
+
+  it("uses one legacy fallback for a batch of queued message probes", async () => {
+    const messages = [{ id: "message_old" }, { id: "message_other" }] as never[];
+    const client = {
+      getMessage: vi.fn(async () => { throw new BerryApiError("Not found", 404, null); }),
+      listMessagePage: vi.fn(async () => ({ messages, hasOlder: false, hasNewer: false, oldestSequence: null, newestSequence: null, cursorPresent: null, historyRevision: null, historyDeletionRevision: null })),
+    };
+    await expect(findPersistedMessagesByIds(client, "session_1", ["message_old", "message_other"]))
+      .resolves.toEqual(messages);
+    expect(client.listMessagePage).toHaveBeenCalledOnce();
+  });
+
+  it("retains loaded older pages while replacing a refreshed newest page", () => {
+    const message = (id: string) => ({ id, role: "user", status: "complete", parts: [], sessionId: "s", inputTokens: 0, outputTokens: 0, generationMs: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }) as never;
+    const older = [message("older-1"), message("older-2")];
+    const current = [...older, message("new-1"), message("stale-tail")];
+    const newest = [message("new-1"), message("new-2")];
+
+    expect(mergeRefreshedMessagePage(current, newest, newest)).toEqual([...older, ...newest]);
+    expect(mergeRefreshedMessagePage(current, [], [])).toEqual([]);
+    expect(mergeRefreshedMessagePage(current, [message("replacement")], [message("replacement")])).toEqual([message("replacement")]);
+    expect(mergeRefreshedMessagePage(current, [message("replacement")], [message("replacement")], { preserveNoOverlap: true }))
+      .toEqual([...current, message("replacement")]);
+  });
+
+  it("keeps every drained after-page when the newest overlay refreshes projections", () => {
+    const message = (id: string) => ({ id, role: "user", status: "complete", parts: [], sessionId: "s", inputTokens: 0, outputTokens: 0, generationMs: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }) as never;
+    const current = Array.from({ length: 100 }, (_, index) => message(`message-${index + 1}`));
+    const after = Array.from({ length: 200 }, (_, index) => message(`message-${index + 101}`));
+    const newest = after.slice(-50);
+    const appended = mergeMessagePage(current, after, "append");
+    const merged = mergeRefreshedMessagePage(appended, newest, newest, { preserveNoOverlap: true });
+    expect(merged).toHaveLength(300);
+    expect(merged[100]?.id).toBe("message-101");
+    expect(merged.at(-1)?.id).toBe("message-300");
+  });
+
+  it("lets a refreshed older projection replace the cached copy", () => {
+    const message = (id: string, content: string) => ({ id, role: "assistant", status: "complete", parts: [{ id: `${id}-part`, messageId: id, kind: "text", content, position: 0, createdAt: "2026-01-01T00:00:00.000Z" }], sessionId: "s", inputTokens: 0, outputTokens: 0, generationMs: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }) as never;
+    const current = [message("older", "stale output"), message("newest", "latest output")];
+    const refreshed = [message("older", "updated tool output"), message("newest", "latest output")];
+    expect(mergeRefreshedMessagePage(current, refreshed, refreshed)).toEqual(refreshed);
+  });
+
+  it("treats a revision change as authoritative after a delete-and-append", () => {
+    expect(historyRevisionChanged("7", "8")).toBe(true);
+    expect(historyRevisionChanged("7", "7")).toBe(false);
+    expect(historyRevisionChanged(null, "0")).toBe(true);
+    expect(historyDeletionRevisionChanged("3", "4")).toBe(true);
+    expect(historyDeletionRevisionChanged("3", "3")).toBe(false);
+  });
+
+  it("recognizes a legacy full-history response instead of an incremental page", () => {
+    const page = {
+      messages: [{ id: "legacy-message" }],
+      hasOlder: false,
+      hasNewer: false,
+      oldestSequence: null,
+      newestSequence: null,
+      cursorPresent: null,
+      historyRevision: null,
+    };
+    expect(isLegacyMessageHistoryPage(page as never)).toBe(true);
+    expect(isLegacyMessageHistoryPage({ ...page, messages: [] } as never)).toBe(true);
+    expect(isLegacyMessageHistoryPage({ ...page, newestSequence: "42" } as never)).toBe(false);
+  });
+
   it("uses the account name and then email for the sidebar avatar fallback", () => {
     expect(accountAvatarInitial({ name: " strawberry", email: "user@example.com" })).toBe("S");
     expect(accountAvatarInitial({ name: "", email: "user@example.com" })).toBe("U");

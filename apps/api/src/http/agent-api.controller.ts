@@ -50,7 +50,7 @@ import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { BUDGET_SERVICE, budgetEstimateFromRequest, modelCostSnapshot, usageCostMicros, type BudgetService } from "../budget/budget.service.ts";
 import { MODEL_GOVERNANCE_SERVICE, type ModelGovernanceService } from "../model-governance/model-governance.service.ts";
-import { CLOUD_TASK_STORE, type CloudTaskStore } from "./cloud-task-store.ts";
+import { CLOUD_TASK_STORE, InMemoryCloudTaskStore, MESSAGE_HISTORY_MAX_CURSOR, type CloudTaskStore } from "./cloud-task-store.ts";
 import { ApiEventStreamService } from "./event-stream.service.ts";
 import { CompanionPushService, MOBILE_DEVICE_REGISTRY, type MobileDeviceRegistry } from "./mobile-devices.ts";
 import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
@@ -138,6 +138,38 @@ const CreateSessionRequestSchema = z.object({
   parentSessionId: z.string().nullable().optional(),
   permissionMode: PermissionModeSchema.optional(),
 }).strict();
+
+const MessageHistoryCursorSchema = z.string()
+  .regex(/^[1-9]\d*$/)
+  .refine((value) => BigInt(value) <= BigInt(MESSAGE_HISTORY_MAX_CURSOR), "Message history cursor is too large");
+const MessageHistoryRevisionSchema = z.string()
+  .regex(/^\d+$/)
+  .refine((value) => BigInt(value) <= BigInt(MESSAGE_HISTORY_MAX_CURSOR), "Message history revision is too large");
+const MessageIdSchema = z.string().uuid();
+const SelfHostMessageIdSchema = z.union([
+  MessageIdSchema,
+  z.string().regex(/^msg_[A-Za-z0-9_-]+$/),
+]);
+// Cloud/Postgres sessions are UUIDs; the self-host/in-memory adapter keeps its
+// deterministic `session_*` identifiers. Both are validated before any SQL
+// UUID cast, while malformed arbitrary path segments still fail with 400.
+const SessionIdSchema = z.union([
+  z.string().uuid(),
+  z.string().regex(/^session_[A-Za-z0-9_-]+$/),
+]);
+
+const ListMessagesQuerySchema = z.object({
+  // An omitted limit means "use the bounded default". An explicitly empty
+  // query value is malformed and must not fall through to the legacy,
+  // unbounded array response.
+  limit: z.preprocess((value) => value === undefined ? undefined : Number(value), z.number().int().min(1).max(200).optional()),
+  before: MessageHistoryCursorSchema.optional(),
+  after: MessageHistoryCursorSchema.optional(),
+  historyRevision: MessageHistoryRevisionSchema.optional(),
+}).strict().refine((query) => !(query.before && query.after), {
+  message: "Use either before or after, not both",
+  path: ["before"],
+});
 
 const AppendMessageRequestSchema = z.object({
   messageId: z.string().uuid().optional(),
@@ -1247,10 +1279,37 @@ export class AgentApiController {
   }
 
   @Get("/sessions/:sessionId/messages")
-  async listMessages(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+  async listMessages(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Query() query: unknown) {
     await this.ownedSession(httpRequest, sessionId);
     await this.#projectionWrites.get(sessionId);
-    return this.store.listMessages(sessionId);
+    const request = parseQuery(ListMessagesQuerySchema, query);
+    // Preserve the array response for older clients that have not adopted the
+    // cursor contract. New web clients always send `limit` and receive a
+    // bounded page instead of forcing the server to materialize the history.
+    if (
+      request.limit === undefined
+      && request.before === undefined
+      && request.after === undefined
+      && request.historyRevision === undefined
+    ) {
+      return this.store.listMessages(sessionId);
+    }
+    return this.store.listMessagePage(sessionId, request);
+  }
+
+  @Get("/sessions/:sessionId/messages/:messageId")
+  async getMessage(
+    @Req() httpRequest: AuthenticatedRequest,
+    @Param("sessionId") sessionId: string,
+    @Param("messageId") messageId: string,
+  ) {
+    const parsedSessionId = (this.store instanceof InMemoryCloudTaskStore ? SessionIdSchema : MessageIdSchema).safeParse(sessionId);
+    if (!parsedSessionId.success) throw new BadRequestException("Invalid session id");
+    await this.ownedSession(httpRequest, parsedSessionId.data);
+    await this.#projectionWrites.get(parsedSessionId.data);
+    const parsedMessageId = (this.store instanceof InMemoryCloudTaskStore ? SelfHostMessageIdSchema : MessageIdSchema).safeParse(messageId);
+    if (!parsedMessageId.success) throw new BadRequestException("Invalid message id");
+    return this.store.getMessage(parsedSessionId.data, parsedMessageId.data);
   }
 
   @Post("/sessions/:sessionId/context-stats")
@@ -2029,8 +2088,7 @@ export class AgentApiController {
       throw new BadRequestException("This task is already running");
     }
     await this.#projectionWrites.get(sessionId);
-    const messages = await this.store.listMessages(sessionId);
-    const latestMessage = messages.at(-1);
+    const latestMessage = (await this.store.listMessagePage(sessionId, { limit: 1 })).messages.at(-1);
     if (!latestMessage || latestMessage.role !== "assistant" || !["failed", "cancelled"].includes(latestMessage.status)) {
       throw new BadRequestException("Only a failed or cancelled assistant turn can be continued");
     }
@@ -2050,16 +2108,15 @@ export class AgentApiController {
     attachments: z.infer<typeof AttachmentInputSchema>[] | undefined,
     replacementMessageId?: string,
   ): Promise<void> {
-    const messages = await this.store.listMessages(sessionId);
-    const targetIndex = messages.findIndex((message) => message.id === replaceFromMessageId);
-    if (targetIndex !== -1) {
-      const ordinal = messages
-        .slice(0, targetIndex + 1)
-        .filter((message) => message.role === "user").length;
-      if (ordinal > 0) {
+    const target = await this.store.getMessagePosition(sessionId, replaceFromMessageId).catch((cause) => {
+      if (cause instanceof NotFoundException) return null;
+      throw cause;
+    });
+    if (target) {
+      if (target.userOrdinal > 0) {
         // The runtime session may not exist after a server restart; the turn
         // that follows starts from the truncated projection either way.
-        await Promise.resolve(this.sessionHost.rewindForEdit(sessionId, ordinal)).catch(() => undefined);
+        await Promise.resolve(this.sessionHost.rewindForEdit(sessionId, target.userOrdinal)).catch(() => undefined);
       }
       if (this.durableTurns.enabled) {
         await this.durableTurns.rewindJournalBefore(tenantId, sessionId, replaceFromMessageId);
@@ -2093,11 +2150,17 @@ export class AgentApiController {
         questionId,
         request,
       );
-      const message = ok && request.answerMessageId
-        ? (await this.store.listMessages(context.sessionId)).find(
-            (candidate) => candidate.id === request.answerMessageId,
-          )
-        : undefined;
+      let message: Message | undefined;
+      if (ok && request.answerMessageId) {
+        try {
+          message = await this.store.getMessage(context.sessionId, request.answerMessageId);
+        } catch (cause) {
+          // The durable answer can commit before its message projection is
+          // visible. Preserve the successful answer result; a later history
+          // refresh will pick up the projected message.
+          if (!(cause instanceof NotFoundException)) throw cause;
+        }
+      }
       return { ok, ...(message ? { message } : {}) };
     }
     return {
@@ -2125,7 +2188,14 @@ export class AgentApiController {
       );
     }
     const state = this.sessionHost.turnState(sessionId);
-    return this.events.stream(sessionId, state.bufferedEvents);
+    // SessionHost clears turnId after a terminal run, but its replay buffer
+    // still contains that run's events. Derive the replay identity from the
+    // buffered turn marker so identical events from an older run cannot be
+    // matched to the wrong legacy sequence during reconnect.
+    const replayRunKey = state.turnId
+      ?? [...state.bufferedEvents].reverse().find((event) => "turnId" in event)?.turnId
+      ?? null;
+    return this.events.stream(sessionId, state.bufferedEvents, cursor ?? lastEventId ?? null, replayRunKey);
   }
 
   @Get("/sessions/:sessionId/turn-state")
@@ -2158,21 +2228,24 @@ export class AgentApiController {
     const ok = await this.sessionHost.cancel(sessionId);
     await this.#projectionWrites.get(sessionId);
     if (ok && turn.active) {
-      const messages = await this.store.listMessages(sessionId);
-      let latestUserIndex = -1;
-      for (let index = messages.length - 1; index >= 0; index -= 1) {
-        if (messages[index]?.role !== "user") continue;
-        latestUserIndex = index;
-        break;
-      }
-      const interruptedAssistants = latestUserIndex === -1
-        ? []
-        : messages.slice(latestUserIndex + 1).filter((message) => message.role === "assistant");
+      const latestUser = await this.store.getLatestUserMessage(sessionId);
+      const recentMessages = (await this.store.listMessagePage(sessionId, { limit: 200 })).messages;
+      const latestUserIndex = latestUser
+        ? recentMessages.findIndex((message) => message.id === latestUser.id)
+        : -1;
+      const interruptedAssistants = latestUserIndex >= 0
+        ? recentMessages.slice(latestUserIndex + 1).filter((message) => message.role !== "user")
+        : [];
+      const hasCancelledBoundary = latestUser
+        ? this.store.hasCancelledMessageAfter
+          ? await this.store.hasCancelledMessageAfter(sessionId, latestUser.id)
+          : interruptedAssistants.some((message) => message.status === "cancelled")
+        : false;
       // A provider can abort without producing a final assistant message.
       // Persist a cancelled boundary before the next user prompt. If earlier
       // assistant/tool projections exist, the boundary also marks their whole
       // turn as cancelled in the settled UI.
-      if (latestUserIndex !== -1 && !interruptedAssistants.some((message) => message.status === "cancelled")) {
+      if (latestUser && !hasCancelledBoundary) {
         await this.store.appendMessage(sessionId, {
           role: "assistant",
           status: "cancelled",
@@ -2196,7 +2269,10 @@ export class AgentApiController {
     const inFlight = this.#steerWrites.get(steeringKey);
     if (inFlight) return inFlight;
     const pending = (async (): Promise<{ queued: true; message: Message }> => {
-      const existingMessage = (await this.store.listMessages(sessionId)).find((message) => message.id === request.messageId);
+      const existingMessage = await this.store.getMessage(sessionId, request.messageId).catch((cause) => {
+        if (cause instanceof NotFoundException) return null;
+        throw cause;
+      });
       if (existingMessage) return { queued: true, message: existingMessage };
       const runtimeAttachments = await this.files.runtimeAttachments(tenantIdFromRequest(httpRequest), httpRequest.auth!.user.id, request.attachments ?? [], { taskId: session.taskId, sessionId });
       // Only persist the user message after the active runtime accepts it. That
@@ -2223,7 +2299,9 @@ export class AgentApiController {
   }
 
   private async ownedSession(httpRequest: AuthenticatedRequest, sessionId: string) {
-    const session = await this.store.getSession(sessionId);
+    const parsedSessionId = (this.store instanceof InMemoryCloudTaskStore ? SessionIdSchema : MessageIdSchema).safeParse(sessionId);
+    if (!parsedSessionId.success) throw new BadRequestException("Invalid session id");
+    const session = await this.store.getSession(parsedSessionId.data);
     const task = await this.store.getTask(session.taskId, httpRequest.auth?.user.id ?? null);
     return { session, task };
   }
@@ -2515,6 +2593,12 @@ function normalizeDecision(decision: z.infer<typeof ApprovalDecisionSchema>["dec
 
 function parseBody<TSchema extends z.ZodTypeAny>(schema: TSchema, body: unknown): z.infer<TSchema> {
   const result = schema.safeParse(body);
+  if (!result.success) throw new BadRequestException(result.error.flatten());
+  return result.data;
+}
+
+function parseQuery<TSchema extends z.ZodTypeAny>(schema: TSchema, query: unknown): z.infer<TSchema> {
+  const result = schema.safeParse(query ?? {});
   if (!result.success) throw new BadRequestException(result.error.flatten());
   return result.data;
 }

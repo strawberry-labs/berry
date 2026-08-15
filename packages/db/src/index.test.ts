@@ -58,6 +58,8 @@ import {
   MANAGEMENT_ADMIN_TABLES,
   MANAGEMENT_ADMIN_TENANT_SCOPED_TABLES,
   MAINTENANCE_RUNS_MIGRATION,
+  MESSAGE_HISTORY_DELETION_REVISION_MIGRATION,
+  MESSAGE_HISTORY_REVISION_MIGRATION,
   MESSAGE_CITATIONS_MIGRATION,
   MESSAGE_SEQUENCE_MIGRATION,
   POLICY_DISTRIBUTION_MIGRATION,
@@ -91,6 +93,7 @@ import {
   cloudMigrations,
   conversationKindEnum,
   messagePartKindEnum,
+  messageHistoryRevisionDelta,
   messageRoleEnum,
   permissionModeEnum,
   sessionStatusEnum,
@@ -183,7 +186,30 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55]);
+  });
+
+  it("tracks projection updates separately from message deletions", () => {
+    expect(MESSAGE_HISTORY_REVISION_MIGRATION).toContain("AFTER UPDATE OR DELETE ON messages");
+    expect(MESSAGE_HISTORY_REVISION_MIGRATION).toContain("AFTER UPDATE OR DELETE ON message_parts");
+    expect(MESSAGE_HISTORY_DELETION_REVISION_MIGRATION).toContain("AFTER UPDATE OR DELETE ON messages");
+    expect(MESSAGE_HISTORY_DELETION_REVISION_MIGRATION).toContain("TG_TABLE_NAME = 'messages' AND TG_OP = 'DELETE'");
+  });
+
+  it("executes the history trigger contract for every row operation", () => {
+    const operations = ["INSERT", "UPDATE", "DELETE"] as const;
+    for (const table of ["messages", "message_parts"] as const) {
+      for (const operation of operations) {
+        const delta = messageHistoryRevisionDelta(table, operation);
+        expect(delta.historyRevision).toBe(operation === "INSERT" ? 0 : 1);
+        expect(delta.historyDeletionRevision).toBe(table === "messages" && operation === "DELETE" ? 1 : 0);
+      }
+    }
+    // Keep the executable contract tied to the deployed trigger expression,
+    // so a future SQL edit cannot silently change the client reset semantics.
+    expect(MESSAGE_HISTORY_DELETION_REVISION_MIGRATION).toContain(
+      "message_history_deletion_revision = message_history_deletion_revision + CASE WHEN TG_TABLE_NAME = 'messages' AND TG_OP = 'DELETE' THEN 1 ELSE 0 END",
+    );
   });
 
   it("stores personal and organization skill package files with tenant isolation", () => {
@@ -377,6 +403,15 @@ describe("cloud postgres schema", () => {
     expect(PERSONAL_CAPABILITIES_MIGRATION).not.toContain("credential text");
     expect(ORG_CAPABILITIES_MIGRATION).toContain("organization_capabilities");
     expect(ORG_CAPABILITIES_MIGRATION).toContain("capability_user_overrides");
+  });
+
+  it("adds a session history revision trigger without destructive SQL", () => {
+    const migration = cloudMigrations.find((candidate) => candidate.id === 54);
+    expect(migration).toMatchObject({ id: 54, name: "message_history_revision_v1" });
+    expect(migration?.sql).toContain("message_history_revision");
+    expect(migration?.sql).toContain("AFTER UPDATE OR DELETE ON messages");
+    expect(migration?.sql).toContain("AFTER UPDATE OR DELETE ON message_parts");
+    expect(migration?.sql).not.toMatch(/\bDROP\s+(TABLE|COLUMN)\b/i);
   });
 
   it("adds enterprise identity tables and host mapping additively in Phase 9", () => {

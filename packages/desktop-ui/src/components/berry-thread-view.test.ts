@@ -2,11 +2,17 @@ import { describe, expect, it } from "vitest";
 import type { Message } from "@berry/shared";
 import {
   collectMessageDraftParts,
+  calculateVariableHeightRange,
+  calculateVariableHeightRangeFromStarts,
+  findMessageSearchTarget,
+  historyWindowScrollTop,
   isContinuableAssistantTurn,
   latestTerminalMessageStatus,
   latestArtifactToolCallIds,
   partitionAssistantParts,
   shouldReplaceLatestSettledAssistantWithLiveTurn,
+  settledTurnKey,
+  stableTurnGroupKey,
 } from "./berry-thread-view";
 import { classifyTurnSegments } from "./thread-stream";
 
@@ -52,6 +58,132 @@ describe("failed assistant turn recovery", () => {
       assistant("failed", "assistant_failure"),
       assistant("complete", "assistant_recovered"),
     ])).toBe(false);
+  });
+});
+
+describe("variable-height transcript window", () => {
+  it("accounts for transcript controls and padding when jumping to a row", () => {
+    expect(historyWindowScrollTop(100, 240, 180, 600)).toBe(920);
+  });
+
+  it("keeps a 10,000-row history bounded to the viewport and overscan", () => {
+    const keys = Array.from({ length: 10_000 }, (_, index) => `message-${index}`);
+    const heights = new Map(keys.slice(0, 16).map((key, index) => [key, 80 + index * 7]));
+    const startedAt = performance.now();
+    const ranges = Array.from({ length: 20 }, (_, index) => calculateVariableHeightRange(keys, index * 25_000, 720, heights, 200, 6));
+    const elapsedMs = performance.now() - startedAt;
+    const range = ranges.at(-1)!;
+    expect(range.totalHeight).toBeGreaterThan(1_000_000);
+    expect(range.last - range.first + 1).toBeLessThanOrEqual(18);
+    expect(range.first).toBeGreaterThan(0);
+    expect(range.last).toBeLessThan(keys.length);
+    // Budget the CPU work needed to locate and size a window without falling
+    // back to an all-history render. This is deliberately generous for CI.
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  it("uses cached prefix offsets for repeated 10,000-row range lookups", () => {
+    const keys = Array.from({ length: 10_000 }, (_, index) => `message-${index}`);
+    const starts = keys.map((_, index) => index * 200);
+    const heights = new Map<string, number>();
+    const startedAt = performance.now();
+    const ranges = Array.from({ length: 200 }, (_, index) => calculateVariableHeightRangeFromStarts(
+      keys,
+      starts,
+      index * 10_000,
+      720,
+      heights,
+      200,
+      6,
+    ));
+    const elapsedMs = performance.now() - startedAt;
+    expect(ranges.at(-1)!.last - ranges.at(-1)!.first + 1).toBeLessThanOrEqual(18);
+    expect(elapsedMs).toBeLessThan(100);
+  });
+
+  it("keys settled turn state by message identity rather than position", () => {
+    expect(settledTurnKey("session-1", "user-10")).toBe("session-1:turn-user-10");
+    expect(settledTurnKey("session-1", "user-10")).toBe(settledTurnKey("session-1", "user-10"));
+  });
+
+  it("keeps the same activity identity when an older page adds the owning user", () => {
+    const assistantMessage = assistant("complete", "assistant-boundary");
+    const assistantOnlyGroup = { key: assistantMessage.id, assistants: [assistantMessage] };
+    const ownedGroup = { key: "user-boundary", user: { id: "user-boundary" } as Message, assistants: [assistantMessage] };
+    const identities = new Map([[assistantMessage.id, assistantMessage.id]]);
+    expect(stableTurnGroupKey(assistantOnlyGroup, identities)).toBe(stableTurnGroupKey(ownedGroup, identities));
+  });
+
+  it("keeps the same activity identity when an earlier assistant page is prepended", () => {
+    const firstLoaded = assistant("complete", "assistant-2");
+    const earlier = assistant("complete", "assistant-1");
+    const identities = new Map([[firstLoaded.id, firstLoaded.id]]);
+    expect(stableTurnGroupKey({ key: firstLoaded.id, assistants: [firstLoaded] }, identities)).toBe("assistant-2");
+    expect(stableTurnGroupKey({ key: earlier.id, assistants: [earlier, firstLoaded] }, identities)).toBe("assistant-2");
+  });
+});
+
+describe("transcript search targets", () => {
+  it("maps assistant matches to their owning user row", () => {
+    const user = { id: "user_1", role: "user", parts: [{ id: "u_part", messageId: "user_1", kind: "text", content: "prompt", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    const assistantMessage = { id: "assistant_1", role: "assistant", parts: [{ id: "a_part", messageId: "assistant_1", kind: "text", content: "needle answer", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    expect(findMessageSearchTarget([user, assistantMessage], "needle")).toBe("user_1");
+  });
+
+  it("maps tool-result matches to their owning user row", () => {
+    const user = { id: "user_1", role: "user", parts: [{ id: "u_part", messageId: "user_1", kind: "text", content: "prompt", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    const toolMessage = { id: "tool_1", role: "tool", parts: [{ id: "t_part", messageId: "tool_1", kind: "text", content: "tool needle", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    expect(findMessageSearchTarget([user, toolMessage], "tool needle")).toBe("user_1");
+  });
+
+  it("searches object-valued tool-result output that is visible in the activity row", () => {
+    const user = { id: "user_object_tool", role: "user", parts: [{ id: "u_part", messageId: "user_object_tool", kind: "text", content: "prompt", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    const toolMessage = {
+      id: "tool_object",
+      role: "tool",
+      parts: [{
+        id: "t_part",
+        messageId: "tool_object",
+        kind: "tool-result",
+        content: { toolCallId: "call_private", name: "run", output: { result: "object needle" } },
+        position: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    } as unknown as Message;
+    expect(findMessageSearchTarget([user, toolMessage], "object needle")).toBe("user_object_tool");
+  });
+
+  it("searches visible fields on interrupted tool-call rows", () => {
+    const user = { id: "user_tool_call", role: "user", parts: [{ id: "u_part", messageId: "user_tool_call", kind: "text", content: "prompt", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    const toolCall = {
+      id: "tool_call",
+      role: "tool",
+      parts: [{
+        id: "call_part",
+        messageId: "tool_call",
+        kind: "tool-call",
+        content: { toolCallId: "call_private", name: "shell", arguments: { command: "visible command" } },
+        position: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    } as unknown as Message;
+    expect(findMessageSearchTarget([user, toolCall], "visible command")).toBe("user_tool_call");
+  });
+
+  it("searches a mid-page assistant safely when its owner is not loaded yet", () => {
+    const assistantMessage = { id: "assistant_2", role: "assistant", parts: [{ id: "a_part", messageId: "assistant_2", kind: "text", content: "needle answer", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    expect(findMessageSearchTarget([assistantMessage], "needle")).toBeNull();
+  });
+
+  it("continues past an orphan projection to a later owned match", () => {
+    const orphan = { id: "assistant_3", role: "assistant", parts: [{ id: "a_part", messageId: "assistant_3", kind: "text", content: "needle in an older projection", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    const user = { id: "user_3", role: "user", parts: [{ id: "u_part", messageId: "user_3", kind: "text", content: "needle in a later prompt", position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as Message;
+    expect(findMessageSearchTarget([orphan, user], "needle")).toBe("user_3");
+  });
+
+  it("does not match serialized tool metadata that is not visible text", () => {
+    const toolMessage = { id: "tool_2", role: "tool", parts: [{ id: "t_part", messageId: "tool_2", kind: "tool-call", content: { toolCallId: "needle-in-id", name: "read" }, position: 0, createdAt: "2026-01-01T00:00:00.000Z" }] } as unknown as Message;
+    expect(findMessageSearchTarget([toolMessage], "needle-in-id")).toBeNull();
   });
 });
 

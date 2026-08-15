@@ -8,6 +8,8 @@ export interface SqlExecutor {
   execute(sql: string, params?: readonly unknown[]): Promise<unknown>;
   query<T>(sql: string, params?: readonly unknown[]): Promise<readonly T[]>;
   transaction?<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T>;
+  /** Run several statements on one dedicated, non-transactional connection. */
+  session?<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T>;
 }
 
 @Injectable()
@@ -28,22 +30,82 @@ export class CloudDatabaseService {
         applied_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    const applyPending = async (executor: SqlExecutor): Promise<void> => {
+    const applyTransactionalRange = async (executor: SqlExecutor, start: number, end: number): Promise<void> => {
       await executor.execute("SELECT pg_advisory_xact_lock(hashtextextended('berry-cloud-migrations', 0))");
       const applied = new Set(
         (await executor.query<{ id: number }>("SELECT id FROM schema_migrations")).map((row) => row.id),
       );
-      for (const migration of cloudMigrations) {
+      for (const migration of cloudMigrations.slice(start, end)) {
+        if ("transactional" in migration && migration.transactional === false) continue;
         if (applied.has(migration.id)) continue;
         await executor.execute(migration.sql);
         await executor.execute("INSERT INTO schema_migrations (id, name) VALUES ($1, $2)", [migration.id, migration.name]);
       }
     };
-    if (this.executor.transaction) {
-      await this.executor.transaction(applyPending);
-      return;
+    const applyOnlineMigration = async (migration: (typeof cloudMigrations)[number]): Promise<void> => {
+      const run = async (executor: SqlExecutor): Promise<void> => {
+        // CREATE/DROP INDEX CONCURRENTLY cannot run in a transaction. Keep a
+        // session-level advisory lock on the same connection so two API pods
+        // cannot race an invalid or half-built index.
+        await executor.execute("SELECT pg_advisory_lock(hashtextextended('berry-cloud-migrations', 0))");
+        try {
+          const applied = new Set(
+            (await executor.query<{ id: number }>("SELECT id FROM schema_migrations")).map((row) => row.id),
+          );
+          const indexName = "onlineIndexName" in migration ? migration.onlineIndexName : undefined;
+          if (!indexName) {
+            if (!applied.has(migration.id)) await executor.execute(migration.sql);
+          } else {
+            const indexRows = await executor.query<{ indisvalid: boolean }>(
+              `SELECT c.relname AS index_name, i.indisvalid
+               FROM pg_class c
+               JOIN pg_index i ON i.indexrelid = c.oid
+               WHERE c.relname = '${indexName}'`,
+            );
+            const index = indexRows[0];
+            if (index && !index.indisvalid) {
+              // Only an invalid index object is removed; table/message data is
+              // never touched. A failed CONCURRENTLY build is safe to repair
+              // on the next startup before retrying the migration.
+              await executor.execute(`DROP INDEX CONCURRENTLY IF EXISTS ${indexName}`);
+            }
+            if (!applied.has(migration.id) || !index || !index.indisvalid) {
+              await executor.execute(migration.sql);
+            }
+            const [valid] = await executor.query<{ indisvalid: boolean }>(
+              `SELECT i.indisvalid
+               FROM pg_class c
+               JOIN pg_index i ON i.indexrelid = c.oid
+               WHERE c.relname = '${indexName}'`,
+            );
+            if (!valid || !valid.indisvalid) throw new Error(`${indexName} is missing or invalid after migration`);
+          }
+          await executor.execute(
+            "INSERT INTO schema_migrations (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+            [migration.id, migration.name],
+          );
+        } finally {
+          await executor.execute("SELECT pg_advisory_unlock(hashtextextended('berry-cloud-migrations', 0))");
+        }
+      };
+      if (this.executor.session) await this.executor.session(run);
+      else await run(this.executor);
+    };
+    let start = 0;
+    while (start < cloudMigrations.length) {
+      const onlineIndex = cloudMigrations.findIndex((migration, index) =>
+        index >= start && "transactional" in migration && migration.transactional === false,
+      );
+      const end = onlineIndex === -1 ? cloudMigrations.length : onlineIndex;
+      if (end > start) {
+        const run = (executor: SqlExecutor) => applyTransactionalRange(executor, start, end);
+        if (this.executor.transaction) await this.executor.transaction(run);
+        else await run(this.executor);
+      }
+      if (onlineIndex === -1) break;
+      await applyOnlineMigration(cloudMigrations[onlineIndex]!);
+      start = onlineIndex + 1;
     }
-    await applyPending(this.executor);
   }
 
   async withTenant<T>(tenantId: string, callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {

@@ -44,7 +44,7 @@ function MessageScrollerViewport({
         // `scrollbar-width:none` — removing it entirely collapses the gutter
         // and re-centers the message column, jolting it left/right every time
         // autoscroll toggles (most visible while tables stream in).
-        "size-full min-h-0 min-w-0 scroll-fade-b scrollbar-thin scrollbar-gutter-stable overflow-y-auto overscroll-contain contain-content data-autoscrolling:[scrollbar-color:transparent_transparent]",
+        "size-full min-h-0 min-w-0 scroll-fade-b scrollbar-thin scrollbar-gutter-stable overflow-y-auto overscroll-contain contain-content [overflow-anchor:none] data-autoscrolling:[scrollbar-color:transparent_transparent]",
         className
       )}
       {...props}
@@ -68,54 +68,12 @@ function MessageScrollerContent({
 function MessageScrollerItem({
   className,
   scrollAnchor = false,
-  virtualize = false,
-  style,
   ...props
-}: React.ComponentProps<typeof MessageScrollerPrimitive.Item> & { virtualize?: boolean }) {
-  // CSS virtualization for stable (settled) items: skip rendering + painting
-  // off-screen rows via `content-visibility:auto`. The catch is the placeholder
-  // size — WKWebView doesn't reliably honor the `contain-intrinsic-size: auto`
-  // "remember the last rendered size" keyword, so off-screen rows fell back to a
-  // fixed guess and shifted scrollHeight, jumping the scroll. We instead measure
-  // each row's real height in JS and pin `contain-intrinsic-size` to it, so a
-  // skipped row reserves exactly its true height — no jump. Never virtualize the
-  // live/streaming row (pass virtualize={false}); it grows every frame.
-  const ref = React.useRef<HTMLDivElement>(null)
-  const [intrinsic, setIntrinsic] = React.useState<number | null>(null)
-  React.useEffect(() => {
-    if (!virtualize) {
-      setIntrinsic(null)
-      return
-    }
-    const el = ref.current
-    if (!el) return
-    let raf = 0
-    const observer = new ResizeObserver(() => {
-      cancelAnimationFrame(raf)
-      raf = requestAnimationFrame(() => {
-        const height = Math.round(el.getBoundingClientRect().height)
-        // 0 = the row is currently skipped off-screen; keep the last good size.
-        if (height > 0) {
-          setIntrinsic((prev) => (prev != null && Math.abs(prev - height) <= 1 ? prev : height))
-        }
-      })
-    })
-    observer.observe(el)
-    return () => {
-      cancelAnimationFrame(raf)
-      observer.disconnect()
-    }
-  }, [virtualize])
-  const virtualStyle: React.CSSProperties | undefined =
-    virtualize && intrinsic != null
-      ? { contentVisibility: "auto", containIntrinsicSize: `auto ${intrinsic}px` }
-      : undefined
+}: React.ComponentProps<typeof MessageScrollerPrimitive.Item>) {
   return (
     <MessageScrollerPrimitive.Item
       data-slot="message-scroller-item"
-      ref={ref}
       scrollAnchor={scrollAnchor}
-      style={virtualStyle ? { ...style, ...virtualStyle } : style}
       className={cn("min-w-0 shrink-0", className)}
       {...props}
     />

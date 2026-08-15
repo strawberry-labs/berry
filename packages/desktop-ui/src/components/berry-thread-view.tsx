@@ -1,6 +1,6 @@
 import * as React from "react";
 import { MessageAttachmentContentSchema, type ImageAspectRatio, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
-import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
+import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, Search, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 
 import {
@@ -91,6 +91,10 @@ export interface BerryThreadAdapter {
 
 const rememberedTurnElapsed = new Map<string, number>();
 const REMEMBERED_TURN_ELAPSED_CAP = 800;
+const HISTORY_ESTIMATED_ROW_HEIGHT = 180;
+const HISTORY_ROW_GAP = 20;
+const HISTORY_OVERSCAN_ROWS = 6;
+const HISTORY_MEASURED_HEIGHT_CAP = 512;
 
 function rememberTurnElapsed(turnKey: string, elapsedMs: number): void {
   if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return;
@@ -104,6 +108,320 @@ function rememberTurnElapsed(turnKey: string, elapsedMs: number): void {
 
 function rememberedTurnElapsedMs(turnKey: string): number | undefined {
   return rememberedTurnElapsed.get(turnKey);
+}
+
+export interface VariableHeightRange {
+  first: number;
+  last: number;
+  totalHeight: number;
+}
+
+function upperBound(values: readonly number[], target: number): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (values[middle]! <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+export function calculateVariableHeightRangeFromStarts(
+  keys: readonly string[],
+  starts: readonly number[],
+  scrollTop: number,
+  viewportHeight: number,
+  measuredHeights: ReadonlyMap<string, number>,
+  estimate: number,
+  overscan: number,
+): VariableHeightRange {
+  if (keys.length === 0) return { first: 0, last: -1, totalHeight: 0 };
+  const lastHeight = Math.max(48, measuredHeights.get(keys[keys.length - 1]!) ?? estimate);
+  const totalHeight = starts[starts.length - 1]! + lastHeight;
+  const viewportStart = Math.max(0, scrollTop);
+  const viewportEnd = viewportStart + Math.max(1, viewportHeight);
+  const firstVisible = Math.min(keys.length - 1, Math.max(0, upperBound(starts, viewportStart) - 1));
+  let lastVisible = Math.min(keys.length - 1, Math.max(0, upperBound(starts, viewportEnd) - 1));
+  if (lastVisible > firstVisible && starts[lastVisible] === viewportEnd) lastVisible -= 1;
+  return {
+    first: Math.max(0, firstVisible - overscan),
+    last: Math.min(keys.length - 1, lastVisible + overscan),
+    totalHeight,
+  };
+}
+
+/** Pure range calculation kept exportable for the 10k-message performance test. */
+export function calculateVariableHeightRange(
+  keys: readonly string[],
+  scrollTop: number,
+  viewportHeight: number,
+  measuredHeights: ReadonlyMap<string, number> = new Map(),
+  estimate = HISTORY_ESTIMATED_ROW_HEIGHT + HISTORY_ROW_GAP,
+  overscan = HISTORY_OVERSCAN_ROWS,
+): VariableHeightRange {
+  if (keys.length === 0) return { first: 0, last: -1, totalHeight: 0 };
+  const starts = new Array<number>(keys.length);
+  let totalHeight = 0;
+  for (let index = 0; index < keys.length; index += 1) {
+    starts[index] = totalHeight;
+    totalHeight += Math.max(48, measuredHeights.get(keys[index]!) ?? estimate);
+  }
+  return calculateVariableHeightRangeFromStarts(
+    keys,
+    starts,
+    scrollTop,
+    viewportHeight,
+    measuredHeights,
+    estimate,
+    overscan,
+  );
+}
+
+/** Convert a row offset inside the history window into a viewport scrollTop. */
+export function historyWindowScrollTop(
+  viewportTop: number,
+  viewportScrollTop: number,
+  historyWindowTop: number,
+  rowStart: number,
+): number {
+  return Math.max(0, viewportScrollTop + historyWindowTop - viewportTop + rowStart);
+}
+
+export function settledTurnKey(sessionId: string, groupKey: string): string {
+  return `${sessionId}:turn-${groupKey}`;
+}
+
+/** Resolve a turn identity from an overlap-aware message-id map. */
+export function stableTurnGroupKey(
+  group: { key: string; user?: Message; assistants: Message[] },
+  knownIdentities?: ReadonlyMap<string, string>,
+): string {
+  const ids = [group.user?.id, ...group.assistants.map((message) => message.id)].filter((id): id is string => Boolean(id));
+  const known = ids.map((id) => knownIdentities?.get(id)).find((key): key is string => Boolean(key));
+  return known ?? group.key;
+}
+
+function useVariableHeightWindow(keys: readonly string[], containerRef: React.RefObject<HTMLElement | null>) {
+  const measuredHeightsRef = React.useRef(new Map<string, number>());
+  const elementsRef = React.useRef(new Map<string, HTMLElement>());
+  const itemRefsRef = React.useRef(new Map<string, (element: HTMLDivElement | null) => void>());
+  const observerRef = React.useRef<ResizeObserver | null>(null);
+  const [viewport, setViewport] = React.useState({ scrollTop: 0, height: 720 });
+  const [measurementVersion, setMeasurementVersion] = React.useState(0);
+  const [focusedKey, setFocusedKey] = React.useState<string | null>(null);
+  const [selectedKeys, setSelectedKeys] = React.useState<string[]>([]);
+
+  React.useEffect(() => {
+    const root = containerRef.current?.querySelector<HTMLElement>('[data-slot="message-scroller-viewport"]');
+    if (!root) return;
+    let frame = 0;
+    const updateViewport = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => setViewport({ scrollTop: root.scrollTop, height: root.clientHeight || 720 }));
+    };
+    updateViewport();
+    root.addEventListener("scroll", updateViewport, { passive: true });
+    const viewportObserver = new ResizeObserver(updateViewport);
+    viewportObserver.observe(root);
+    return () => {
+      cancelAnimationFrame(frame);
+      root.removeEventListener("scroll", updateViewport);
+      viewportObserver.disconnect();
+    };
+  }, [containerRef]);
+
+  React.useEffect(() => {
+    const root = containerRef.current;
+    if (!root) return;
+    const updateSelection = () => {
+      const selection = document.getSelection();
+      if (!selection || selection.isCollapsed || !root.contains(selection.anchorNode)) {
+        setSelectedKeys([]);
+        return;
+      }
+      const endpoints = [selection.anchorNode, selection.focusNode]
+        .map((node) => (node instanceof Element ? node : node?.parentElement)?.closest<HTMLElement>("[data-history-key]")?.dataset.historyKey)
+        .filter((key): key is string => Boolean(key));
+      if (endpoints.length < 2) {
+        setSelectedKeys([...new Set(endpoints)]);
+        return;
+      }
+      const first = keys.indexOf(endpoints[0]!);
+      const last = keys.indexOf(endpoints[1]!);
+      if (first < 0 || last < 0) {
+        setSelectedKeys([...new Set(endpoints)]);
+        return;
+      }
+      const start = Math.min(first, last);
+      const end = Math.max(first, last);
+      // Keep every row touched by a native selection mounted. This is an
+      // intentional interaction exception to the viewport budget: unmounting
+      // an intermediate row would destroy the browser's selection range.
+      setSelectedKeys(keys.slice(start, end + 1));
+    };
+    document.addEventListener("selectionchange", updateSelection);
+    return () => document.removeEventListener("selectionchange", updateSelection);
+  }, [containerRef, keys]);
+
+  React.useEffect(() => {
+    const observer = new ResizeObserver((entries) => {
+      let changed = false;
+      for (const entry of entries) {
+        const key = (entry.target as HTMLElement).dataset.historyKey;
+        if (!key) continue;
+        const next = Math.max(48, Math.round(entry.contentRect.height) + HISTORY_ROW_GAP);
+        const previous = measuredHeightsRef.current.get(key);
+        if (previous !== next) {
+          measuredHeightsRef.current.delete(key);
+          measuredHeightsRef.current.set(key, next);
+          while (measuredHeightsRef.current.size > HISTORY_MEASURED_HEIGHT_CAP) {
+            const oldest = measuredHeightsRef.current.keys().next().value;
+            if (!oldest) break;
+            measuredHeightsRef.current.delete(oldest);
+          }
+          changed = true;
+        }
+      }
+      if (changed) setMeasurementVersion((value) => value + 1);
+    });
+    observerRef.current = observer;
+    for (const element of elementsRef.current.values()) observer.observe(element);
+    return () => {
+      observer.disconnect();
+      observerRef.current = null;
+    };
+  }, []);
+
+  React.useEffect(() => {
+    const root = containerRef.current;
+    if (!root) return;
+    const updateFocusedKey = (event: FocusEvent) => {
+      const row = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-history-key]");
+      setFocusedKey(row?.dataset.historyKey ?? null);
+    };
+    const clearFocusIfOutside = () => {
+      if (!root.contains(document.activeElement)) setFocusedKey(null);
+    };
+    root.addEventListener("focusin", updateFocusedKey);
+    root.addEventListener("focusout", clearFocusIfOutside);
+    return () => {
+      root.removeEventListener("focusin", updateFocusedKey);
+      root.removeEventListener("focusout", clearFocusIfOutside);
+    };
+  }, [containerRef]);
+
+  const starts = React.useMemo(() => {
+    const values: number[] = [];
+    let offset = 0;
+    for (const key of keys) {
+      values.push(offset);
+      offset += Math.max(48, measuredHeightsRef.current.get(key) ?? HISTORY_ESTIMATED_ROW_HEIGHT + HISTORY_ROW_GAP);
+    }
+    return values;
+  }, [keys, measurementVersion]);
+  const previousStartsRef = React.useRef<number[] | null>(null);
+  const previousKeysRef = React.useRef<string[] | null>(null);
+  React.useLayoutEffect(() => {
+    const root = containerRef.current?.querySelector<HTMLElement>('[data-slot="message-scroller-viewport"]');
+    const previousStarts = previousStartsRef.current;
+    const previousKeys = previousKeysRef.current;
+    const sameKeys = previousKeys !== null
+      && previousKeys.length === keys.length
+      && previousKeys.every((key, index) => key === keys[index]);
+    if (root && sameKeys && previousStarts && previousStarts.length === starts.length && starts.length > 0) {
+      const anchorIndex = Math.min(starts.length - 1, Math.max(0, upperBound(previousStarts, root.scrollTop) - 1));
+      const delta = starts[anchorIndex]! - previousStarts[anchorIndex]!;
+      if (delta !== 0) root.scrollTop += delta;
+    }
+    previousStartsRef.current = [...starts];
+    previousKeysRef.current = [...keys];
+  }, [containerRef, keys, starts]);
+  // Prefix offsets are rebuilt only when keys or measured heights change;
+  // scroll events binary-search this stable array instead of scanning 10k rows.
+  const range = React.useMemo(
+    () => calculateVariableHeightRangeFromStarts(
+      keys,
+      starts,
+      viewport.scrollTop,
+      viewport.height,
+      measuredHeightsRef.current,
+      HISTORY_ESTIMATED_ROW_HEIGHT + HISTORY_ROW_GAP,
+      HISTORY_OVERSCAN_ROWS,
+    ),
+    [keys, starts, measurementVersion, viewport.height, viewport.scrollTop],
+  );
+
+  const getItemRef = React.useCallback((key: string) => {
+    const existing = itemRefsRef.current.get(key);
+    if (existing) return existing;
+    const callback = (element: HTMLDivElement | null) => {
+      const previous = elementsRef.current.get(key);
+      if (previous && previous !== element) observerRef.current?.unobserve(previous);
+      if (!element) {
+        elementsRef.current.delete(key);
+        itemRefsRef.current.delete(key);
+        return;
+      }
+      element.dataset.historyKey = key;
+      elementsRef.current.set(key, element);
+      observerRef.current?.observe(element);
+      const height = Math.max(48, Math.round(element.getBoundingClientRect().height));
+      if (measuredHeightsRef.current.get(key) !== height) {
+        measuredHeightsRef.current.delete(key);
+        measuredHeightsRef.current.set(key, height);
+        while (measuredHeightsRef.current.size > HISTORY_MEASURED_HEIGHT_CAP) {
+          const oldest = measuredHeightsRef.current.keys().next().value;
+          if (!oldest) break;
+          measuredHeightsRef.current.delete(oldest);
+        }
+        setMeasurementVersion((value) => value + 1);
+      }
+    };
+    itemRefsRef.current.set(key, callback);
+    return callback;
+  }, []);
+
+  const virtualItems = React.useMemo(() => {
+    const indexes = new Set<number>();
+    for (let index = range.first; index <= range.last; index += 1) indexes.add(index);
+    if (focusedKey) {
+      const focusedIndex = keys.indexOf(focusedKey);
+      if (focusedIndex >= 0) indexes.add(focusedIndex);
+    }
+    for (const selectedKey of selectedKeys) {
+      const selectedIndex = keys.indexOf(selectedKey);
+      if (selectedIndex >= 0) indexes.add(selectedIndex);
+    }
+    return [...indexes].sort((left, right) => left - right).map((index) => ({
+      index,
+      key: keys[index]!,
+      start: starts[index]!,
+      size: measuredHeightsRef.current.get(keys[index]!) ?? HISTORY_ESTIMATED_ROW_HEIGHT + HISTORY_ROW_GAP,
+    }));
+  }, [focusedKey, keys, range.first, range.last, selectedKeys, starts]);
+
+  const scrollToKey = React.useCallback((key: string, behavior: ScrollBehavior = "smooth") => {
+    const index = keys.indexOf(key);
+    const userIndex = index >= 0 ? index : keys.indexOf(`${key}:user`);
+    const root = containerRef.current?.querySelector<HTMLElement>('[data-slot="message-scroller-viewport"]');
+    const historyWindow = root?.querySelector<HTMLElement>('[data-history-window="true"]');
+    if (userIndex < 0 || !root || !historyWindow) return false;
+    const viewportRect = root.getBoundingClientRect();
+    const historyWindowRect = historyWindow.getBoundingClientRect();
+    root.scrollTo({
+      top: historyWindowScrollTop(
+        viewportRect.top,
+        root.scrollTop,
+        historyWindowRect.top,
+        starts[userIndex] ?? 0,
+      ),
+      behavior,
+    });
+    return true;
+  }, [containerRef, keys, starts]);
+
+  return { range, virtualItems, getItemRef, scrollToKey };
 }
 
 export interface BerryThreadViewProps {
@@ -128,6 +446,13 @@ export interface BerryThreadViewProps {
   /** Native desktop keeps the rail 16px from its window edge; web uses 12px. */
   navigatorInset?: number;
   adapter?: BerryThreadAdapter;
+  onLoadOlderMessages?: () => Promise<boolean> | boolean;
+  hasOlderMessages?: boolean;
+  loadingOlderMessages?: boolean;
+  /** Search the full task history and return the matching user/row message ID. */
+  onSearchMessages?: (query: string) => Promise<string | null>;
+  /** Disable near-top auto-fetch for deterministic hosts/benchmarks. */
+  autoLoadOlderOnScroll?: boolean;
 }
 
 export function shouldReplaceLatestSettledAssistantWithLiveTurn(input: {
@@ -160,22 +485,48 @@ export function BerryThreadView({
   latestTurnError,
   navigatorInset = 12,
   adapter = {},
+  onLoadOlderMessages,
+  hasOlderMessages = false,
+  loadingOlderMessages = false,
+  autoLoadOlderOnScroll = true,
+  onSearchMessages,
 }: BerryThreadViewProps) {
   const now = useNow(stream.turnActive);
-  const settled = messages.filter((message) => message.id !== stream.messageId || !stream.turnActive);
+  const settled = React.useMemo(
+    () => messages.filter((message) => message.id !== stream.messageId || !stream.turnActive),
+    [messages, stream.messageId, stream.turnActive],
+  );
+  const turnIdentityRef = React.useRef(new Map<string, string>());
 
   // Berry shows ONE "Worked for Xs" per user turn; the agent loop persists
   // several assistant messages per turn, so group consecutive ones.
-  const turnGroups: Array<{ key: string; user?: Message; assistants: Message[] }> = [];
-  for (const message of settled) {
-    if (message.role === "user") {
-      turnGroups.push({ key: message.id, user: message, assistants: [] });
-    } else {
-      const last = turnGroups[turnGroups.length - 1];
-      if (last) last.assistants.push(message);
-      else turnGroups.push({ key: message.id, assistants: [message] });
+  const turnGroups = React.useMemo(() => {
+    const groups: Array<{ key: string; user?: Message; assistants: Message[] }> = [];
+    for (const message of settled) {
+      if (message.role === "user") {
+        groups.push({ key: message.id, user: message, assistants: [] });
+      } else {
+        const last = groups[groups.length - 1];
+        if (last) last.assistants.push(message);
+        else groups.push({ key: message.id, assistants: [message] });
+      }
     }
-  }
+    const identities = turnIdentityRef.current;
+    const currentMessageIds = new Set<string>();
+    for (const group of groups) {
+      const ids = [group.user?.id, ...group.assistants.map((message) => message.id)].filter((id): id is string => Boolean(id));
+      const key = stableTurnGroupKey(group, identities);
+      group.key = key;
+      for (const id of ids) {
+        currentMessageIds.add(id);
+        identities.set(id, key);
+      }
+    }
+    for (const id of identities.keys()) {
+      if (!currentMessageIds.has(id)) identities.delete(id);
+    }
+    return groups;
+  }, [settled]);
   const latestTurn = turnGroups[turnGroups.length - 1];
   const liveHasContent =
     stream.turnActive ||
@@ -200,18 +551,16 @@ export function BerryThreadView({
       || liveHasSessionNote
       || !latestTurnHasSettledAssistant
     );
-  const renderedTurnGroups =
-    shouldReplaceLatestSettledAssistantWithLiveTurn({
-      liveVisible,
-      latestTurnHasUser: Boolean(latestTurn?.user),
-      continuation: stream.continuation,
-    })
-      ? turnGroups.map((group, index) => (index === turnGroups.length - 1 ? { ...group, assistants: [] } : group))
-      : turnGroups;
-  // Turn accordion state is keyed by session + turn ordinal: stable across the
-  // live → persisted render-path handoff, so disclosure state never resets.
-  const liveTurnIndex = latestTurn?.user ? turnGroups.length - 1 : turnGroups.length;
-  const liveTurnKey = `${sessionId}:turn-${liveTurnIndex}`;
+  const replaceLatestSettledAssistant = shouldReplaceLatestSettledAssistantWithLiveTurn({
+    liveVisible,
+    latestTurnHasUser: Boolean(latestTurn?.user),
+    continuation: stream.continuation,
+  });
+  // Turn accordion state is keyed by the stable owning message (or the active
+  // run id before its first persisted message), not by array position. Older
+  // pages can prepend while a turn is live without resetting its disclosure
+  // state or elapsed activity identity.
+  const liveTurnKey = settledTurnKey(sessionId, latestTurn?.key ?? stream.turnId ?? "live");
   const writingBlockParts = React.useMemo(
     () => collectMessageDraftParts(settled),
     [settled],
@@ -230,8 +579,8 @@ export function BerryThreadView({
   // inherit disclosure state from the turns it replaced. Clear until the
   // answer starts — after that the user may be toggling this very turn.
   React.useEffect(() => {
-    if (stream.turnActive && !stream.sawText) forgetTurnDisclosure(sessionId, liveTurnIndex);
-  }, [sessionId, stream.turnActive, stream.sawText, liveTurnIndex]);
+    if (stream.turnActive && !stream.sawText) forgetTurnDisclosure(sessionId, liveTurnKey);
+  }, [sessionId, stream.turnActive, stream.sawText, liveTurnKey]);
 
   const liveTimelineWindow = windowLiveTimeline(stream.timeline);
   const omittedLiveActivity = stream.timelineOmitted + liveTimelineWindow.omitted;
@@ -296,50 +645,231 @@ export function BerryThreadView({
   ];
 
   const navContainerRef = React.useRef<HTMLDivElement>(null);
-  const navigatorItems: NavigatorItem[] = renderedTurnGroups
+  const historyRows = React.useMemo(() => turnGroups.flatMap((group, groupIndex) => [
+    ...(group.user ? [{ key: `${group.user.id}:user`, kind: "user" as const, group, groupIndex }] : []),
+    ...((!replaceLatestSettledAssistant || groupIndex !== turnGroups.length - 1) && group.assistants.length > 0
+      ? [{ key: `${stableTurnGroupKey(group)}:assistant`, kind: "assistant" as const, group, groupIndex }]
+      : []),
+  ]), [replaceLatestSettledAssistant, turnGroups]);
+  const historyKeys = React.useMemo(() => historyRows.map((row) => row.key), [historyRows]);
+  const { range: historyRange, virtualItems: virtualHistoryItems, getItemRef: getHistoryItemRef, scrollToKey } = useVariableHeightWindow(historyKeys, navContainerRef);
+  const olderLoadInFlightRef = React.useRef(false);
+  const sessionIdRef = React.useRef(sessionId);
+  sessionIdRef.current = sessionId;
+  const searchSessionRef = React.useRef(sessionId);
+  const searchGenerationRef = React.useRef(0);
+  if (searchSessionRef.current !== sessionId) {
+    searchSessionRef.current = sessionId;
+    searchGenerationRef.current += 1;
+  }
+  const [historyLoadError, setHistoryLoadError] = React.useState<string | null>(null);
+  const [searchOpen, setSearchOpen] = React.useState(false);
+  const [searchQuery, setSearchQuery] = React.useState("");
+  const [searching, setSearching] = React.useState(false);
+  const [searchError, setSearchError] = React.useState<string | null>(null);
+  const [searchTargetId, setSearchTargetId] = React.useState<string | null>(null);
+  const searchInputRef = React.useRef<HTMLInputElement>(null);
+  React.useEffect(() => {
+    setHistoryLoadError(null);
+    olderLoadInFlightRef.current = false;
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearching(false);
+    setSearchError(null);
+    setSearchTargetId(null);
+  }, [sessionId]);
+  const loadOlderMessages = React.useCallback(async () => {
+    if (!onLoadOlderMessages) return false;
+    try {
+      const loaded = await onLoadOlderMessages();
+      setHistoryLoadError(null);
+      return loaded;
+    } catch (cause) {
+      setHistoryLoadError(cause instanceof Error ? cause.message : "Unable to load older messages");
+      return false;
+    }
+  }, [onLoadOlderMessages]);
+  const loadOlderWithScroll = React.useCallback(async (viewport: HTMLElement) => {
+    if (!onLoadOlderMessages || olderLoadInFlightRef.current) return false;
+    const beforeHeight = viewport.scrollHeight;
+    const beforeTop = viewport.scrollTop;
+    const beforeAnchor = viewport.querySelector<HTMLElement>('[data-history-key]');
+    const beforeAnchorKey = beforeAnchor?.dataset.historyKey ?? null;
+    const beforeAnchorTop = beforeAnchor?.getBoundingClientRect().top ?? null;
+    olderLoadInFlightRef.current = true;
+    try {
+      const loaded = await loadOlderMessages();
+      if (!loaded) return;
+      requestAnimationFrame(() => {
+        if (sessionIdRef.current !== sessionId || !viewport.isConnected) return;
+        const delta = viewport.scrollHeight - beforeHeight;
+        viewport.scrollTop = beforeTop + delta;
+        const correctAnchor = (attempt: number) => {
+          if (sessionIdRef.current !== sessionId || !viewport.isConnected) return;
+          const currentAnchor = beforeAnchorKey
+            ? viewport.querySelector<HTMLElement>(`[data-history-key="${CSS.escape(beforeAnchorKey)}"]`)
+            : null;
+          if (currentAnchor && beforeAnchorTop !== null) {
+            viewport.scrollTop += currentAnchor.getBoundingClientRect().top - beforeAnchorTop;
+          } else if (attempt < 2) {
+            requestAnimationFrame(() => correctAnchor(attempt + 1));
+          }
+        };
+        requestAnimationFrame(() => correctAnchor(0));
+      });
+      return true;
+    } finally {
+      olderLoadInFlightRef.current = false;
+    }
+  }, [loadOlderMessages, onLoadOlderMessages, sessionId]);
+  React.useEffect(() => {
+    if (!onSearchMessages) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.key.toLowerCase() !== "f") return;
+      event.preventDefault();
+      setSearchOpen(true);
+      window.requestAnimationFrame(() => searchInputRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onSearchMessages]);
+  React.useEffect(() => {
+    if (!searchTargetId) return;
+    if (scrollToKey(searchTargetId, "smooth")) {
+      setSearchTargetId(null);
+      setSearchError(null);
+    }
+  }, [historyKeys, scrollToKey, searchTargetId]);
+  const submitSearch = React.useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!onSearchMessages || !searchQuery.trim() || searching) return;
+    const requestSessionId = sessionId;
+    const requestGeneration = searchGenerationRef.current;
+    const isCurrentSearch = () => sessionIdRef.current === requestSessionId
+      && searchGenerationRef.current === requestGeneration;
+    setSearching(true);
+    setSearchError(null);
+    try {
+      const messageId = await onSearchMessages(searchQuery);
+      if (!isCurrentSearch()) return;
+      if (!messageId) setSearchError("No matching task message found.");
+      else setSearchTargetId(messageId);
+    } catch (cause) {
+      if (!isCurrentSearch()) return;
+      setSearchError(cause instanceof Error ? cause.message : "Unable to search task messages");
+    } finally {
+      if (isCurrentSearch()) setSearching(false);
+    }
+  }, [onSearchMessages, searchQuery, searching, sessionId]);
+  const handleHistoryScroll = React.useCallback((event: React.UIEvent<HTMLElement>) => {
+    if (!autoLoadOlderOnScroll || !onLoadOlderMessages || event.currentTarget.scrollTop > 160) return;
+    void loadOlderWithScroll(event.currentTarget);
+  }, [autoLoadOlderOnScroll, loadOlderWithScroll, onLoadOlderMessages]);
+  const navigatorItems = React.useMemo<NavigatorItem[]>(() => turnGroups
     .filter((group): group is typeof group & { user: Message } => Boolean(group.user))
     .map((group) => ({
       id: group.user.id,
       label: userMessageText(group.user),
       preview: assistantMessageText(group.assistants),
       resources: messageAttachmentNames([...group.user.parts, ...group.assistants.flatMap((assistant) => assistant.parts)]),
-    }));
+    })), [turnGroups]);
 
   return (
     <MessageScrollerProvider autoScroll={autoScroll} scrollEdgeThreshold={96}>
       <div ref={navContainerRef} className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-        <ConversationNavigator containerRef={navContainerRef} items={navigatorItems} inset={navigatorInset} />
+        {onSearchMessages ? (
+          <div className="absolute right-3 top-3 z-30 flex flex-col items-end gap-1">
+            <button
+              type="button"
+              aria-label="Search task messages"
+              className="rounded-full border border-border bg-background/90 p-1.5 text-muted-foreground shadow-sm hover:bg-muted"
+              onClick={() => { setSearchOpen((open) => !open); setSearchError(null); window.requestAnimationFrame(() => searchInputRef.current?.focus()); }}
+            >
+              <Search className="size-3.5" aria-hidden="true" />
+            </button>
+            {searchOpen ? (
+              <form role="search" aria-label="Search task messages" onSubmit={submitSearch} className="flex w-64 flex-col gap-1 rounded-md border border-border bg-background p-2 shadow-lg">
+                <input
+                  ref={searchInputRef}
+                  value={searchQuery}
+                  disabled={searching}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Search task messages…"
+                  aria-label="Search task messages"
+                  className="h-8 rounded border border-border bg-transparent px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+                <button type="submit" disabled={searching || !searchQuery.trim()} className="rounded bg-primary px-2 py-1 text-xs text-primary-foreground disabled:opacity-60">
+                  {searching ? "Searching…" : "Find message"}
+                </button>
+                {searchError ? <div role="status" className="text-[11px] text-destructive">{searchError}</div> : null}
+              </form>
+            ) : null}
+          </div>
+        ) : null}
+        <ConversationNavigator
+          containerRef={navContainerRef}
+          items={navigatorItems}
+          inset={navigatorInset}
+          onLoadOlder={loadOlderMessages}
+          hasOlderMessages={hasOlderMessages}
+          onScrollToAnchor={scrollToKey}
+          onNavigationFailure={() => setHistoryLoadError("That message is no longer available in the loaded history.")}
+        />
         <MessageScroller className="flex-1">
-        <MessageScrollerViewport className="px-6">
-          <MessageScrollerContent data-density={density} className="berry-thread-content mx-auto w-full gap-5 py-10">
-            {renderedTurnGroups.map((group, groupIndex) => (
-              <React.Fragment key={group.key}>
-                {group.user ? (
-                  <MessageScrollerItem virtualize>
-                    <div data-user-anchor={group.user.id}>
-                      <BerryHistoricalUserMessage message={group.user} adapter={adapter} />
-                    </div>
-                  </MessageScrollerItem>
-                ) : null}
-                {group.assistants.length > 0 ? (
-                  <MessageScrollerItem virtualize>
-                    <BerryAssistantTurnGroup
-                      messages={group.assistants}
-                      turnKey={`${sessionId}:turn-${groupIndex}`}
-                      showReasoning={showReasoning}
-                      showTodos={showTodos}
-                      density={density}
-                      adapter={adapter}
-                      writingBlockParts={writingBlockParts}
-                      conversationImageParts={conversationImageParts}
-                      {...(groupIndex === renderedTurnGroups.length - 1 && latestTurnError
-                        ? { inlineError: latestTurnError }
-                        : {})}
-                    />
-                  </MessageScrollerItem>
-                ) : null}
-              </React.Fragment>
-            ))}
+        <MessageScrollerViewport className="px-6" onScroll={handleHistoryScroll}>
+          <MessageScrollerContent role="feed" aria-label="Task message history" aria-busy={loadingOlderMessages || searching} data-density={density} className="berry-thread-content mx-auto w-full gap-5 py-10">
+            {hasOlderMessages ? (
+              <div className="flex justify-center pb-1">
+                {loadingOlderMessages ? <span className="sr-only" role="status" aria-live="polite">Loading older messages…</span> : null}
+                <button
+                  type="button"
+                  className="rounded-full border border-border px-3 py-1 text-[11px] text-muted-foreground hover:bg-muted disabled:opacity-60"
+                  disabled={loadingOlderMessages}
+                  onClick={(event) => { void loadOlderWithScroll(event.currentTarget.closest<HTMLElement>('[data-slot="message-scroller-viewport"]') ?? event.currentTarget); }}
+                >
+                  {loadingOlderMessages ? "Loading older messages…" : "Load older messages"}
+                </button>
+              </div>
+            ) : null}
+            {historyLoadError ? <div role="alert" className="px-1 text-center text-[11px] text-destructive">{historyLoadError}</div> : null}
+            <div data-history-window="true" data-history-mounted={virtualHistoryItems.length} className="relative w-full" style={{ height: historyRange.totalHeight }}>
+              {virtualHistoryItems.map((item) => {
+                const row = historyRows[item.index];
+                if (!row) return null;
+                return (
+                  <div
+                    key={row.key}
+                    role="article"
+                    {...(hasOlderMessages ? { "aria-setsize": -1 } : { "aria-setsize": historyRows.length, "aria-posinset": item.index + 1 })}
+                    ref={getHistoryItemRef(row.key)}
+                    className="absolute inset-x-0 top-0"
+                    style={{ transform: `translateY(${item.start}px)`, paddingBottom: `${HISTORY_ROW_GAP}px` }}
+                  >
+                    <MessageScrollerItem>
+                      {row.kind === "user" && row.group.user ? (
+                        <div data-user-anchor={row.group.user.id}>
+                          <BerryHistoricalUserMessage message={row.group.user} adapter={adapter} />
+                        </div>
+                      ) : row.kind === "assistant" ? (
+                        <BerryAssistantTurnGroup
+                          messages={row.group.assistants}
+                          turnKey={settledTurnKey(sessionId, stableTurnGroupKey(row.group))}
+                          showReasoning={showReasoning}
+                          showTodos={showTodos}
+                          density={density}
+                          adapter={adapter}
+                          writingBlockParts={writingBlockParts}
+                          conversationImageParts={conversationImageParts}
+                          {...(row.groupIndex === turnGroups.length - 1 && latestTurnError
+                            ? { inlineError: latestTurnError }
+                            : {})}
+                        />
+                      ) : null}
+                    </MessageScrollerItem>
+                  </div>
+                );
+              })}
+            </div>
 
             {liveVisible ? (
               <MessageScrollerItem>
@@ -455,7 +985,89 @@ export function fullUserText(message: Message): string {
     .join("\n");
 }
 
-function BerryHistoricalUserMessage({ message, adapter }: { message: Message; adapter: BerryThreadAdapter }) {
+/** Return the rendered row owner for a transcript search match. */
+export function findMessageSearchTarget(messages: Message[], query: string): string | null {
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return null;
+  for (let matchIndex = 0; matchIndex < messages.length; matchIndex += 1) {
+    const match = messages[matchIndex]!;
+    if (!searchableMessageText(match).includes(needle)) continue;
+    if (match.role === "user") return match.id;
+    for (let index = matchIndex - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "user") return messages[index]!.id;
+    }
+    // A non-user-only page is a bounded-page boundary, not a renderable
+    // anchor. Keep scanning: a later user match in this page is still a valid
+    // target even when the first matching projection has no owner in-page.
+  }
+  return null;
+}
+
+function searchableMessageText(message: Message): string {
+  const visibleParts = message.parts.flatMap((part) => {
+    if (part.kind === "attachment") {
+      const attachment = MessageAttachmentContentSchema.safeParse(part.content);
+      return attachment.success ? [attachment.data.name] : [];
+    }
+    if (part.kind === "tool-call" || part.kind === "tool-result") {
+      return searchableToolResultText(part.content);
+    }
+    // Search rendered text/code/reasoning and plain error/terminal output, but
+    // never serialized tool metadata, IDs, or object keys that are not shown
+    // in the transcript.
+    return typeof part.content === "string"
+      && ["text", "code", "reasoning", "error", "terminal"].includes(part.kind)
+      ? [part.content]
+      : [];
+  });
+  return visibleParts.join("\n").toLocaleLowerCase();
+}
+
+function searchableToolResultText(content: unknown): string[] {
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return typeof content === "string" ? [content] : [];
+  }
+  const meta = content as Record<string, unknown>;
+  const visible: string[] = [];
+  if (typeof meta.name === "string") visible.push(meta.name);
+  if (typeof meta.title === "string") visible.push(meta.title);
+  if (typeof meta.summary === "string") visible.push(meta.summary);
+  for (const key of ["arguments", "args"]) {
+    const args = meta[key];
+    if (args === undefined || args === null) continue;
+    try { visible.push(typeof args === "string" ? args : JSON.stringify(args)); } catch { /* ignore */ }
+  }
+  if (typeof meta.output === "string") visible.push(meta.output);
+  else if (meta.output !== undefined && meta.output !== null) {
+    try {
+      visible.push(JSON.stringify(meta.output));
+    } catch {
+      // Ignore non-serializable provider output just as the renderer does.
+    }
+  }
+  if (Array.isArray(meta.children)) {
+    for (const child of meta.children) {
+      if (!child || typeof child !== "object" || Array.isArray(child)) continue;
+      const output = (child as Record<string, unknown>).output;
+      const childRecord = child as Record<string, unknown>;
+      if (typeof childRecord.name === "string") visible.push(childRecord.name);
+      if (typeof childRecord.title === "string") visible.push(childRecord.title);
+      if (typeof childRecord.summary === "string") visible.push(childRecord.summary);
+      for (const key of ["arguments", "args"]) {
+        const args = childRecord[key];
+        if (args === undefined || args === null) continue;
+        try { visible.push(typeof args === "string" ? args : JSON.stringify(args)); } catch { /* ignore */ }
+      }
+      if (typeof output === "string") visible.push(output);
+      else if (output !== undefined && output !== null) {
+        try { visible.push(JSON.stringify(output)); } catch { /* ignore */ }
+      }
+    }
+  }
+  return visible;
+}
+
+const BerryHistoricalUserMessage = React.memo(function BerryHistoricalUserMessage({ message, adapter }: { message: Message; adapter: BerryThreadAdapter }) {
   const [editing, setEditing] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
 
@@ -526,14 +1138,14 @@ function BerryHistoricalUserMessage({ message, adapter }: { message: Message; ad
       </MessageContent>
     </MessageRow>
   );
-}
+});
 
 /**
  * One settled agent turn: possibly several persisted assistant messages
  * rendered under a single "Worked for Xs" header (Berry shows one per user
  * turn). Tool runs that span message boundaries merge into one flow.
  */
-function BerryAssistantTurnGroup({
+const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGroup({
   messages,
   turnKey,
   showReasoning,
@@ -734,7 +1346,7 @@ function BerryAssistantTurnGroup({
       </MessageContent>
     </MessageRow>
   );
-}
+});
 
 export function isContinuableAssistantTurn(messages: Message[]): boolean {
   const latestAssistant = messages.at(-1);

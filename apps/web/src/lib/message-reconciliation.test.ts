@@ -107,4 +107,11 @@ describe("reconcileDurableEventCursor", () => {
     expect(reconcileDurableEventCursor({}, null).accepted).toBe(true);
     expect(reconcileDurableEventCursor({}, "legacy-event-id").accepted).toBe(true);
   });
+
+  it("deduplicates numbered legacy SSE replay cursors", () => {
+    const first = reconcileDurableEventCursor({}, "legacy:4");
+    expect(first.accepted).toBe(true);
+    expect(reconcileDurableEventCursor(first.sequences, "legacy:4").accepted).toBe(false);
+    expect(reconcileDurableEventCursor(first.sequences, "legacy:5").accepted).toBe(true);
+  });
 });

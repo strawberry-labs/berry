@@ -439,6 +439,8 @@ export const sessions = pgTable("sessions", {
   model: text("model"),
   permissionMode: permissionModeEnum("permission_mode").notNull().default("full-access"),
   runtimeMetadata: jsonObject("runtime_metadata"),
+  messageHistoryRevision: bigint("message_history_revision", { mode: "bigint" }).notNull().default(0n),
+  messageHistoryDeletionRevision: bigint("message_history_deletion_revision", { mode: "bigint" }).notNull().default(0n),
   createdAt,
   updatedAt,
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -479,6 +481,7 @@ export const messageParts = pgTable("message_parts", {
 }, (table) => [
   uniqueIndex("message_parts_message_ordinal_unique").on(table.messageId, table.ordinal),
   index("message_parts_tenant_message_idx").on(table.tenantId, table.messageId),
+  index("message_parts_tenant_message_ordinal_idx").on(table.tenantId, table.messageId, table.ordinal),
 ]);
 
 export const fileBlobs = pgTable("file_blobs", {
@@ -2786,6 +2789,114 @@ CREATE INDEX IF NOT EXISTS messages_tenant_session_sequence_idx
   ON messages (tenant_id, session_id, sequence_id);
 `.trim();
 
+export const MESSAGE_HISTORY_PAGINATION_MIGRATION = `
+CREATE INDEX CONCURRENTLY IF NOT EXISTS message_parts_tenant_message_ordinal_idx
+  ON message_parts (tenant_id, message_id, ordinal);
+`.trim();
+
+export type MessageHistoryTriggerTable = "messages" | "message_parts";
+export type MessageHistoryTriggerOperation = "INSERT" | "UPDATE" | "DELETE";
+
+/**
+ * Contract shared by the history-revision migration and its regression tests:
+ * every mutation of an existing message/projection invalidates ordinary
+ * history, while only a deleted message row invalidates already-loaded
+ * cursors. Inserts are discovered by the after-cursor itself and therefore
+ * do not force a full loaded-range refresh on every completed turn.
+ */
+export function messageHistoryRevisionDelta(
+  table: MessageHistoryTriggerTable,
+  operation: MessageHistoryTriggerOperation,
+): { historyRevision: 0 | 1; historyDeletionRevision: 0 | 1 } {
+  return {
+    historyRevision: operation === "INSERT" ? 0 : 1,
+    historyDeletionRevision: table === "messages" && operation === "DELETE" ? 1 : 0,
+  };
+}
+
+export const MESSAGE_HISTORY_REVISION_MIGRATION = `
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS message_history_revision bigint NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION berry_touch_session_message_history()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  touched_session_id uuid;
+  touched_tenant_id uuid;
+BEGIN
+  IF TG_TABLE_NAME = 'message_parts' THEN
+    IF TG_OP = 'DELETE' THEN
+      SELECT session_id, tenant_id INTO touched_session_id, touched_tenant_id
+      FROM messages WHERE id = OLD.message_id AND tenant_id = OLD.tenant_id;
+    ELSE
+      SELECT session_id, tenant_id INTO touched_session_id, touched_tenant_id
+      FROM messages WHERE id = NEW.message_id AND tenant_id = NEW.tenant_id;
+    END IF;
+  ELSIF TG_OP = 'DELETE' THEN
+    touched_session_id := OLD.session_id;
+    touched_tenant_id := OLD.tenant_id;
+  ELSE
+    touched_session_id := NEW.session_id;
+    touched_tenant_id := NEW.tenant_id;
+  END IF;
+  UPDATE sessions
+  SET message_history_revision = message_history_revision + 1,
+      updated_at = now()
+  WHERE id = touched_session_id AND tenant_id = touched_tenant_id;
+  RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS sessions_message_history_revision ON messages;
+CREATE TRIGGER sessions_message_history_revision
+AFTER UPDATE OR DELETE ON messages
+FOR EACH ROW EXECUTE FUNCTION berry_touch_session_message_history();
+DROP TRIGGER IF EXISTS message_parts_history_revision ON message_parts;
+CREATE TRIGGER message_parts_history_revision
+AFTER UPDATE OR DELETE ON message_parts
+FOR EACH ROW EXECUTE FUNCTION berry_touch_session_message_history();
+`.trim();
+
+export const MESSAGE_HISTORY_DELETION_REVISION_MIGRATION = `
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS message_history_deletion_revision bigint NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION berry_touch_session_message_history()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  touched_session_id uuid;
+  touched_tenant_id uuid;
+BEGIN
+  IF TG_TABLE_NAME = 'message_parts' THEN
+    IF TG_OP = 'DELETE' THEN
+      SELECT session_id, tenant_id INTO touched_session_id, touched_tenant_id
+      FROM messages WHERE id = OLD.message_id AND tenant_id = OLD.tenant_id;
+    ELSE
+      SELECT session_id, tenant_id INTO touched_session_id, touched_tenant_id
+      FROM messages WHERE id = NEW.message_id AND tenant_id = NEW.tenant_id;
+    END IF;
+  ELSIF TG_OP = 'DELETE' THEN
+    touched_session_id := OLD.session_id;
+    touched_tenant_id := OLD.tenant_id;
+  ELSE
+    touched_session_id := NEW.session_id;
+    touched_tenant_id := NEW.tenant_id;
+  END IF;
+  UPDATE sessions
+  SET message_history_revision = message_history_revision + 1,
+      message_history_deletion_revision = message_history_deletion_revision + CASE WHEN TG_TABLE_NAME = 'messages' AND TG_OP = 'DELETE' THEN 1 ELSE 0 END,
+      updated_at = now()
+  WHERE id = touched_session_id AND tenant_id = touched_tenant_id;
+  RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS sessions_message_history_revision ON messages;
+CREATE TRIGGER sessions_message_history_revision
+AFTER UPDATE OR DELETE ON messages
+FOR EACH ROW EXECUTE FUNCTION berry_touch_session_message_history();
+`.trim();
+
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -4774,4 +4885,13 @@ export const cloudMigrations = [
   { id: 50, name: "skill_package_files_v1", sql: SKILL_PACKAGE_FILES_MIGRATION },
   { id: 51, name: "turn_admission_intents_v1", sql: TURN_ADMISSION_INTENTS_MIGRATION },
   { id: 52, name: "deep_research_skill_v1", sql: DEEP_RESEARCH_SKILL_MIGRATION },
+  {
+    id: 53,
+    name: "message_history_pagination_v1",
+    sql: MESSAGE_HISTORY_PAGINATION_MIGRATION,
+    transactional: false,
+    onlineIndexName: "message_parts_tenant_message_ordinal_idx",
+  },
+  { id: 54, name: "message_history_revision_v1", sql: MESSAGE_HISTORY_REVISION_MIGRATION },
+  { id: 55, name: "message_history_deletion_revision_v1", sql: MESSAGE_HISTORY_DELETION_REVISION_MIGRATION },
 ] as const;

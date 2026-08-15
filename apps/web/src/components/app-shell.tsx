@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type MessageHistoryPage, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
@@ -84,6 +84,120 @@ const TaskFileLibraryDialog = React.lazy(async () => ({
 }));
 
 type StreamEvent = Parameters<typeof reduceStream>[1];
+
+const MESSAGE_PAGE_SIZE = 50;
+const MAX_AFTER_PAGE_REQUESTS = 256;
+const MAX_TRANSCRIPT_CACHE_SESSIONS = 8;
+
+type MessageHistoryState = Pick<MessageHistoryPage, "hasOlder" | "hasNewer" | "oldestSequence" | "newestSequence" | "historyRevision" | "historyDeletionRevision"> & {
+  loadingOlder: boolean;
+};
+
+/**
+ * Recover one queued message without assuming it is in the newest bounded
+ * page. The list-page fallback is deliberately only used for a 404 from the
+ * new route: during a rolling deploy an older API returns 404 for that route
+ * but still serves its legacy array response, which can contain the persisted
+ * message. Other errors remain visible so a transient outage cannot be
+ * mistaken for a missing message.
+ */
+export async function findPersistedMessageById(
+  client: Pick<BerryApiClient, "getMessage" | "listMessagePage">,
+  sessionId: string,
+  messageId: string,
+): Promise<Message | undefined> {
+  try {
+    return await client.getMessage(sessionId, messageId);
+  } catch (cause) {
+    if (!(cause instanceof BerryApiError) || cause.status !== 404) throw cause;
+    const fallback = await client.listMessagePage(sessionId, { limit: 200 });
+    return fallback.messages.find((message) => message.id === messageId);
+  }
+}
+
+/** Probe a queued batch with the bounded route first, then perform at most one
+ * legacy-array fallback during a rolling deploy. */
+export async function findPersistedMessagesByIds(
+  client: Pick<BerryApiClient, "getMessage" | "listMessagePage">,
+  sessionId: string,
+  messageIds: string[],
+): Promise<Array<Message | undefined>> {
+  if (messageIds.length === 0) return [];
+  const results = await Promise.all(messageIds.map(async (messageId) => {
+    try {
+      return { messageId, message: await client.getMessage(sessionId, messageId) };
+    } catch (cause) {
+      if (!(cause instanceof BerryApiError) || cause.status !== 404) throw cause;
+      return { messageId, message: undefined };
+    }
+  }));
+  const missingIds = results.filter(({ message }) => !message).map(({ messageId }) => messageId);
+  if (missingIds.length === 0) return results.map(({ message }) => message);
+  const fallback = await client.listMessagePage(sessionId, { limit: 200 });
+  const byId = new Map(fallback.messages.map((message) => [message.id, message]));
+  return results.map(({ messageId, message }) => message ?? byId.get(messageId));
+}
+
+export function mergeMessagePage(
+  current: Message[],
+  incoming: Message[],
+  direction: "replace" | "prepend" | "append",
+): Message[] {
+  const ordered = direction === "prepend" ? [...incoming, ...current] : direction === "append" ? [...current, ...incoming] : incoming;
+  const byId = new Map<string, Message>();
+  // Keep the server copy for duplicate IDs. This matters when a settled page
+  // overlaps an optimistic/stream projection while older rows are prepended.
+  for (const message of direction === "prepend" ? [...current, ...incoming] : ordered) byId.set(message.id, message);
+  const seen = new Set<string>();
+  return ordered.filter((message) => {
+    if (seen.has(message.id)) return false;
+    if (byId.get(message.id) !== message) return false;
+    seen.add(message.id);
+    return true;
+  });
+}
+
+/**
+ * Replace the bounded newest page without discarding older pages already
+ * materialized in the shell. The first overlap identifies the retained prefix;
+ * a zero-row server page is authoritative and drops every settled row except
+ * still-pending optimistic submissions.
+ */
+export function mergeRefreshedMessagePage(
+  current: Message[],
+  serverMessages: Message[],
+  reconciledMessages: Message[],
+  options: { preserveNoOverlap?: boolean } = {},
+): Message[] {
+  if (serverMessages.length === 0) return reconciledMessages;
+  const serverIds = new Set(serverMessages.map((message) => message.id));
+  const firstOverlap = current.findIndex((message) => serverIds.has(message.id));
+  // A page with no overlap is normally a new bounded snapshot (for example
+  // after an external truncate). Revisit loads can also legitimately have no
+  // overlap when a large append moved the newest window past the cached tail;
+  // callers opt into retaining that known cached prefix for that case.
+  const retainedPrefix = firstOverlap < 0
+    ? (options.preserveNoOverlap ? current : [])
+    : current.slice(0, firstOverlap);
+  return mergeMessagePage(retainedPrefix, reconciledMessages, "append");
+}
+
+export function historyRevisionChanged(previous: string | null, next: string | null): boolean {
+  return previous !== next;
+}
+
+export function historyDeletionRevisionChanged(previous: string | null, next: string | null): boolean {
+  return previous !== next;
+}
+
+/**
+ * Older API instances return the original unbounded message array. The API
+ * client wraps it as a page with no sequence metadata; it must be treated as
+ * a complete compatibility snapshot, never as an after-cursor delta.
+ */
+export function isLegacyMessageHistoryPage(page: MessageHistoryPage): boolean {
+  return page.newestSequence === null && page.cursorPresent === null;
+}
 
 export function replayDurableStreamState(state: TurnState): StreamState {
   const parsedStartedAt = state.startedAt ? Date.parse(state.startedAt) : Number.NaN;
@@ -358,7 +472,95 @@ export function AppShell({ initial, user, onSignedOut }: {
   user: SignedInUser | null;
   onSignedOut?: (() => void) | undefined;
 }) {
+  const [benchmark, setBenchmark] = React.useState(false);
+  React.useEffect(() => {
+    setBenchmark(
+      initial.config.demoMode
+      && import.meta.env.DEV
+      && new URLSearchParams(window.location.search).get("benchmark") === "message-history",
+    );
+  }, [initial.config.demoMode]);
+  if (benchmark) return <MessageHistoryBenchmark />;
   return <CloudShell initial={initial} user={user} onSignedOut={onSignedOut} />;
+}
+
+/**
+ * A development-only route target for the history performance contract. It
+ * deliberately exercises the real BerryThreadView with 10,000
+ * persisted-shaped rows; the Playwright benchmark measures DOM, observer,
+ * scroll, update, and heap budgets around this component rather than a
+ * duplicate synthetic list.
+ */
+function MessageHistoryBenchmark() {
+  const [revision, setRevision] = React.useState(0);
+  const [olderBatchLoaded, setOlderBatchLoaded] = React.useState(false);
+  const messages = React.useMemo<Message[]>(() => [...(olderBatchLoaded ? Array.from({ length: 50 }, (_, index) => ({
+    id: "benchmark-older-message-" + index,
+    sessionId: "benchmark-session",
+    role: index % 2 === 0 ? "user" : "assistant",
+    status: "complete",
+    parts: [{
+      id: "benchmark-older-part-" + index,
+      messageId: "benchmark-older-message-" + index,
+      kind: "text",
+      content: "Older benchmark row " + index,
+      position: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    }],
+    inputTokens: 0,
+    outputTokens: 0,
+    generationMs: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  } as Message)) : []), ...Array.from({ length: 10_000 }, (_, index) => {
+    const role = index % 2 === 0 ? "user" : "assistant";
+    return {
+      id: `benchmark-message-${index}`,
+      sessionId: "benchmark-session",
+      role,
+      status: "complete",
+      parts: [{
+        id: `benchmark-part-${index}`,
+        messageId: `benchmark-message-${index}`,
+        kind: "text",
+        content: role === "user" ? `Benchmark prompt ${index / 2}` : `Benchmark response ${index / 2}`,
+        position: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+      inputTokens: 0,
+      outputTokens: 0,
+      generationMs: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    } as Message;
+  })], [olderBatchLoaded]);
+  const loadOlderMessages = React.useCallback(() => {
+    if (olderBatchLoaded) return false;
+    setOlderBatchLoaded(true);
+    return true;
+  }, [olderBatchLoaded]);
+  return (
+    <main data-testid="message-history-benchmark" data-benchmark-total-rows={messages.length} data-benchmark-older-loaded={olderBatchLoaded ? "true" : "false"} className="flex h-screen w-screen flex-col gap-2 bg-background p-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-sm font-medium">Message history benchmark</h1>
+        <button data-testid="benchmark-update" type="button" onClick={() => setRevision((value) => value + 1)}>
+          Update {revision}
+        </button>
+      </div>
+      <div className="flex min-h-0 flex-1">
+        <BerryThreadView
+          sessionId="benchmark-session"
+          stream={IDLE}
+          messages={messages}
+          autoScroll={false}
+          autoLoadOlderOnScroll={false}
+          hasOlderMessages={!olderBatchLoaded}
+          onLoadOlderMessages={loadOlderMessages}
+          liveContent={<span data-testid="benchmark-revision">{revision}</span>}
+        />
+      </div>
+    </main>
+  );
 }
 
 function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: SignedInUser | null; onSignedOut?: (() => void) | undefined }) {
@@ -428,11 +630,21 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const [workspaces, setWorkspaces] = React.useState<Workspace[]>([fixtureWorkspace, fixtureGeneralWorkspace]);
   const [activeWorkspaceId, setActiveWorkspaceId] = React.useState(initial.config.workspaceId);
   const activeTask = tasks.find((task) => task.id === activeTaskId) ?? null;
+  const taskTitles = React.useMemo(() => tasks.map((task) => task.title), [tasks]);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null;
   const bootstrapSessionId = bootstrapContent.tasks[0]?.activeSessionId ?? null;
   const [messagesBySession, setMessagesBySession] = React.useState<Record<string, Message[]>>(() =>
     bootstrapSessionId ? { [bootstrapSessionId]: bootstrapContent.messages } : {},
   );
+  const messagesBySessionRef = React.useRef(messagesBySession);
+  React.useEffect(() => {
+    messagesBySessionRef.current = messagesBySession;
+  }, [messagesBySession]);
+  const [messageHistoryBySession, setMessageHistoryBySession] = React.useState<Record<string, MessageHistoryState>>({});
+  const messageHistoryRef = React.useRef(new Map<string, MessageHistoryState>());
+  const transcriptLruRef = React.useRef(new Map<string, number>(
+    bootstrapSessionId ? [[bootstrapSessionId, Date.now()]] : [],
+  ));
   const surface = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? "settings" : shellLocation.kind === "library" ? "library" : "task";
   const managementKind: ManagementKind = shellLocation.kind === "admin" ? "admin" : shellLocation.kind === "platform" ? "platform" : "settings";
   const managementTab = shellLocation.kind === "settings" || shellLocation.kind === "admin" || shellLocation.kind === "platform" ? shellLocation.tab : "general";
@@ -510,6 +722,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
     ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
     : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
+  const findPersistedMessage = React.useCallback(async (sessionId: string, messageId: string): Promise<Message | undefined> => {
+    if (!client) return undefined;
+    return findPersistedMessageById(client, sessionId, messageId);
+  }, [client]);
   const [allowance, setAllowance] = React.useState<AllowanceBalance | null>(null);
   const [allowanceLoading, setAllowanceLoading] = React.useState(false);
   const refreshAllowance = React.useCallback(() => {
@@ -565,7 +781,16 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const pendingSubmissionsRef = React.useRef(new Map<string, PendingTurnSubmission>());
   const pendingRequestMessageIdsBySessionRef = React.useRef(new Map<string, Set<string>>());
   const activeSessionId = activeTask?.activeSessionId ?? null;
+  // Async history work can outlive a route change. Keep the active id and
+  // connection closer current than any callback closure so an old response
+  // cannot evict the newly selected task.
+  const activeSessionIdRef = React.useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
+  const stopSessionConnectionRef = React.useRef<(sessionId: string) => void>(() => undefined);
+  const historyRequestTailsRef = React.useRef(new Map<string, Promise<void>>());
+  const historyEpochRef = React.useRef(new Map<string, number>());
   const messages = activeSessionId ? messagesBySession[activeSessionId] ?? [] : [];
+  const activeMessageHistory = activeSessionId ? messageHistoryBySession[activeSessionId] : undefined;
   const stream = activeSessionId ? streamsBySession[activeSessionId] ?? IDLE : IDLE;
   const durableState = activeSessionId ? durableStatesBySession[activeSessionId] : undefined;
   const turnBusy = activeSessionId ? startingSessions.has(activeSessionId) : false;
@@ -576,10 +801,83 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   );
 
   const replaceSessionMessages = React.useCallback((sessionId: string, next: Message[] | ((current: Message[]) => Message[])) => {
-    setMessagesBySession((current) => ({
-      ...current,
-      [sessionId]: typeof next === "function" ? next(current[sessionId] ?? []) : next,
-    }));
+    transcriptLruRef.current.delete(sessionId);
+    transcriptLruRef.current.set(sessionId, Date.now());
+    const evicted: string[] = [];
+    // Keep the transcript cache hard-bounded. Only the currently rendered
+    // session is protected; a background turn continues on the server and is
+    // rehydrated from turn-state/history when the user returns to it.
+    while (transcriptLruRef.current.size > MAX_TRANSCRIPT_CACHE_SESSIONS) {
+      const candidate = [...transcriptLruRef.current.keys()].find((id) =>
+        id !== sessionId && id !== activeSessionIdRef.current,
+      );
+      if (!candidate) break;
+      transcriptLruRef.current.delete(candidate);
+      evicted.push(candidate);
+    }
+    setMessagesBySession((current) => {
+      const candidate = typeof next === "function" ? next(current[sessionId] ?? []) : next;
+      const updated = { ...current, [sessionId]: mergeMessagePage([], candidate, "append") };
+      for (const id of evicted) delete updated[id];
+      return updated;
+    });
+    if (evicted.length > 0) {
+      // Keep eviction side effects outside React state updaters. StrictMode
+      // may evaluate an updater more than once; cancellation, teardown, and
+      // epoch changes must happen exactly once.
+      for (const id of evicted) {
+        const pending = pendingSubmissionsRef.current.get(id);
+        if (pending) prepareTurnCancellation(pending);
+        stopSessionConnectionRef.current(id);
+        activeSessionsRef.current.delete(id);
+        messageHistoryRef.current.delete(id);
+        historyEpochRef.current.set(id, (historyEpochRef.current.get(id) ?? 0) + 1);
+        if (!historyRequestTailsRef.current.has(id)) historyEpochRef.current.delete(id);
+        pendingRequestMessageIdsBySessionRef.current.delete(id);
+        pendingSubmissionsRef.current.delete(id);
+        pendingStreamDeltasRef.current.delete(id);
+        lastEventCursorBySessionRef.current.delete(id);
+        durableEventSequencesBySessionRef.current.delete(id);
+        sessionModelsRef.current.delete(id);
+        explicitSessionModelsRef.current.delete(id);
+        editingFollowUpIdsRef.current.delete(id);
+      }
+      setMessageHistoryBySession((current) => {
+        const updated = { ...current };
+        for (const id of evicted) delete updated[id];
+        return updated;
+      });
+      const nextFollowUps = { ...followUpsBySessionRef.current };
+      for (const id of evicted) delete nextFollowUps[id];
+      followUpsBySessionRef.current = nextFollowUps;
+      setFollowUpsBySession((current) => {
+        const updated = { ...current };
+        for (const id of evicted) {
+          delete updated[id];
+        }
+        return updated;
+      });
+      setStreamsBySession((current) => {
+        const updated = { ...current };
+        for (const id of evicted) delete updated[id];
+        return updated;
+      });
+      setDurableStatesBySession((current) => {
+        const updated = { ...current };
+        for (const id of evicted) delete updated[id];
+        return updated;
+      });
+      setImageGenerationBySession((current) => {
+        const updated = { ...current };
+        for (const id of evicted) delete updated[id];
+        return updated;
+      });
+      setStartingSessions((current) => {
+        const updated = new Set(current);
+        for (const id of evicted) updated.delete(id);
+        return updated;
+      });
+    }
   }, []);
 
   const markRequestMessagePending = React.useCallback((sessionId: string, messageId: string) => {
@@ -601,11 +899,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     serverMessages: Message[],
     localMessages: Message[],
   ) => {
-    const pending = pendingRequestMessageIdsBySessionRef.current.get(sessionId) ?? new Set<string>();
-    const reconciled = reconcileFetchedSessionMessages(serverMessages, localMessages, pending);
+    const pending = pendingRequestMessageIdsBySessionRef.current.get(sessionId);
+    return reconcileFetchedSessionMessages(serverMessages, localMessages, pending ? new Set(pending) : new Set());
+  }, []);
+
+  const clearPersistedRequestMessages = React.useCallback((sessionId: string, serverMessages: Message[]) => {
+    const pending = pendingRequestMessageIdsBySessionRef.current.get(sessionId);
+    if (!pending) return;
     for (const message of serverMessages) pending.delete(message.id);
     if (pending.size === 0) pendingRequestMessageIdsBySessionRef.current.delete(sessionId);
-    return reconciled;
   }, []);
 
   const pendingStreamDeltasRef = React.useRef(new Map<string, {
@@ -1071,11 +1373,317 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const reconcileQueueWithTurnStateRef = React.useRef<(sessionId: string, active: boolean, messages: Message[]) => void>(() => undefined);
   const sendNextQueuedFollowUpRef = React.useRef<(sessionId: string) => void>(() => undefined);
 
-  const refreshSessionMessages = React.useCallback(async (sessionId: string) => {
-    if (!client) return;
-    const nextMessages = await client.listMessages(sessionId);
-    replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, nextMessages, current));
-  }, [client, reconcileSessionMessageSnapshot, replaceSessionMessages]);
+  const setMessageHistoryState = React.useCallback((sessionId: string, next: MessageHistoryState) => {
+    messageHistoryRef.current.set(sessionId, next);
+    setMessageHistoryBySession((current) => ({ ...current, [sessionId]: next }));
+  }, []);
+
+  /**
+   * Re-read the currently materialized range after a projection-only revision
+   * change. The newest-page overlay is insufficient when an older tool/result
+   * row changes, because that row may be outside the newest bounded page.
+   * Starting from the cached oldest cursor keeps the request bounded to the
+   * loaded window while still including newly appended rows.
+   */
+  const refreshLoadedMessageRange = React.useCallback(async (
+    sessionId: string,
+    previous: MessageHistoryState,
+    epoch: number,
+    seedMessages?: Message[],
+    stateOverrides?: { hasOlder?: boolean; hasNewer?: boolean },
+  ): Promise<Message[] | null> => {
+    if (!client || !previous.oldestSequence) return null;
+    const current = seedMessages ?? messagesBySessionRef.current[sessionId] ?? [];
+    const anchorCandidate = current[0]?.id.startsWith(OPTIMISTIC_MESSAGE_ID_PREFIX) ? undefined : current[0];
+    let anchor: Message | undefined;
+    if (anchorCandidate) {
+      try {
+        anchor = await client.getMessage(sessionId, anchorCandidate.id);
+      } catch (cause) {
+        if (!(cause instanceof BerryApiError) || cause.status !== 404) throw cause;
+        // The cached anchor was deleted or the API is an incompatible older
+        // version. Let the caller take the authoritative newest-page path.
+        return null;
+      }
+    }
+    if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+
+    const refreshed = anchor ? [anchor] : [];
+    let cursor = previous.oldestSequence;
+    let latest: MessageHistoryPage | null = null;
+    for (let attempt = 0; attempt < MAX_AFTER_PAGE_REQUESTS; attempt += 1) {
+      const page = await client.listMessagePage(sessionId, {
+        limit: MESSAGE_PAGE_SIZE,
+        after: cursor,
+        ...(previous.historyRevision ? { historyRevision: previous.historyRevision } : {}),
+      });
+      if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+      if (isLegacyMessageHistoryPage(page) || page.cursorPresent === false) return null;
+      latest = page;
+      refreshed.push(...page.messages);
+      if (!page.hasNewer || !page.newestSequence || page.newestSequence === cursor) break;
+      cursor = page.newestSequence;
+    }
+    if (!latest) return null;
+
+    clearPersistedRequestMessages(sessionId, refreshed);
+    replaceSessionMessages(sessionId, (local) => {
+      const reconciled = reconcileSessionMessageSnapshot(sessionId, refreshed, local);
+      return mergeRefreshedMessagePage(local, refreshed, reconciled, { preserveNoOverlap: true });
+    });
+    setMessageHistoryState(sessionId, {
+      ...latest,
+      hasOlder: stateOverrides?.hasOlder ?? previous.hasOlder,
+      hasNewer: stateOverrides?.hasNewer ?? latest.hasNewer,
+      oldestSequence: previous.oldestSequence,
+      newestSequence: latest.newestSequence ?? previous.newestSequence,
+      loadingOlder: false,
+    });
+    return refreshed;
+  }, [client, clearPersistedRequestMessages, reconcileSessionMessageSnapshot, replaceSessionMessages, setMessageHistoryState]);
+
+  const enqueueHistoryRequest = React.useCallback(<T,>(sessionId: string, work: () => Promise<T>, cancelledValue: T) => {
+    const previous = historyRequestTailsRef.current.get(sessionId) ?? Promise.resolve();
+    const requestEpoch = historyEpochRef.current.get(sessionId) ?? 0;
+    const request = previous.catch(() => undefined).then(() => {
+      if ((historyEpochRef.current.get(sessionId) ?? 0) !== requestEpoch) return cancelledValue;
+      return work();
+    });
+    const tail = request.then(() => undefined, () => undefined);
+    historyRequestTailsRef.current.set(sessionId, tail);
+    void tail.then(() => {
+      if (historyRequestTailsRef.current.get(sessionId) !== tail) return;
+      historyRequestTailsRef.current.delete(sessionId);
+      if (!transcriptLruRef.current.has(sessionId) && !sessionConnectionsRef.current.has(sessionId)) {
+        historyEpochRef.current.delete(sessionId);
+      }
+    });
+    return request as Promise<T>;
+  }, []);
+
+  const refreshSessionMessages = React.useCallback(async (sessionId: string, options: { reset?: boolean; preserveNoOverlap?: boolean } = {}) => {
+    if (!client) return [] as Message[];
+    return await enqueueHistoryRequest(sessionId, async () => {
+      const epoch = historyEpochRef.current.get(sessionId) ?? 0;
+      const previous = messageHistoryRef.current.get(sessionId);
+      const replaceWithNewest = (page: MessageHistoryPage) => {
+        clearPersistedRequestMessages(sessionId, page.messages);
+        replaceSessionMessages(sessionId, (current) => {
+          const reconciled = reconcileSessionMessageSnapshot(sessionId, page.messages, current);
+          return mergeRefreshedMessagePage(current, page.messages, reconciled, {
+            ...(options.preserveNoOverlap === undefined ? {} : { preserveNoOverlap: options.preserveNoOverlap }),
+          });
+        });
+        setMessageHistoryState(sessionId, { ...page, loadingOlder: false });
+        return page.messages;
+      };
+      const replaceAuthoritativeNewest = (page: MessageHistoryPage) => {
+        clearPersistedRequestMessages(sessionId, page.messages);
+        replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, page.messages, current));
+        setMessageHistoryState(sessionId, { ...page, loadingOlder: false });
+        return page.messages;
+      };
+      const loadAuthoritativeNewest = async (): Promise<Message[] | null> => {
+        const page = await client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE });
+        if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+        return replaceAuthoritativeNewest(page);
+      };
+      const collectAfterPages = async (cursor: string): Promise<{ messages: Message[]; latest: MessageHistoryPage | null } | null> => {
+        const messages: Message[] = [];
+        let nextCursor = cursor;
+        let latest: MessageHistoryPage | null = null;
+        for (let attempt = 0; attempt < MAX_AFTER_PAGE_REQUESTS; attempt += 1) {
+          if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+          const page = await client.listMessagePage(sessionId, {
+            limit: MESSAGE_PAGE_SIZE,
+            after: nextCursor,
+            ...(previous?.historyRevision ? { historyRevision: previous.historyRevision } : {}),
+          });
+          if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+          latest = page;
+          messages.push(...page.messages);
+          if (!page.hasNewer || !page.newestSequence || page.newestSequence === nextCursor) break;
+          nextCursor = page.newestSequence;
+        }
+        return { messages, latest };
+      };
+      if (options.reset || !previous?.newestSequence) {
+        const page = await client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE });
+        if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return [] as Message[];
+        return replaceWithNewest(page);
+      }
+
+      // Normal completion reconciliation is incremental. Sequence ids are
+      // table-global, so gaps are expected whenever another session writes a
+      // message; only the page contents/cursor probes determine freshness.
+      const afterResult = await collectAfterPages(previous.newestSequence);
+      if (!afterResult) return [] as Message[];
+      const page = afterResult.latest;
+      if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return [] as Message[];
+      if (afterResult.messages.length > 0 && page) {
+        // A non-empty after page can still accompany a rewind/delete followed
+        // by replacement rows. Revision changes are authoritative; discard
+        // the stale prefix and reload the bounded newest snapshot instead of
+        // appending new rows onto deleted history.
+        // A rolling-back API may return the legacy unbounded array shape. The
+        // client wraps that response for compatibility, but it has no cursor
+        // metadata; never append it as though it were an incremental page.
+        if (isLegacyMessageHistoryPage(page)) {
+          return replaceAuthoritativeNewest(page);
+        }
+        if (historyDeletionRevisionChanged(previous.historyDeletionRevision, page.historyDeletionRevision)) {
+          return (await loadAuthoritativeNewest()) ?? [];
+        }
+        if (page.cursorPresent === false) {
+          return (await loadAuthoritativeNewest()) ?? [];
+        }
+        if (historyRevisionChanged(previous.historyRevision, page.historyRevision)) {
+          return (await refreshLoadedMessageRange(sessionId, previous, epoch))
+            ?? (await loadAuthoritativeNewest())
+            ?? [];
+        }
+        // Append every page returned after the known cursor. A large completed
+        // turn can span more than one page; replacing with only the newest
+        // bounded snapshot would discard the already-loaded older prefix.
+        replaceSessionMessages(sessionId, (current) => mergeMessagePage(current, afterResult.messages, "append"));
+        setMessageHistoryState(sessionId, {
+          hasOlder: previous.hasOlder || page.hasOlder,
+          hasNewer: page.hasNewer,
+          oldestSequence: previous.oldestSequence,
+          newestSequence: page.newestSequence ?? previous.newestSequence,
+          historyRevision: page.historyRevision ?? previous.historyRevision,
+          historyDeletionRevision: page.historyDeletionRevision ?? previous.historyDeletionRevision,
+          loadingOlder: false,
+        });
+        return afterResult.messages;
+      }
+
+      // An empty `after` page is ambiguous: it may mean “nothing changed” or
+      // that the cursor was deleted. A one-row newest probe distinguishes the
+      // cases without materializing the transcript.
+      if (page?.cursorPresent === false) {
+        return (await loadAuthoritativeNewest()) ?? [];
+      }
+      const newest = await client.listMessagePage(sessionId, { limit: 1 });
+      if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return [] as Message[];
+      if (historyDeletionRevisionChanged(previous.historyDeletionRevision, newest.historyDeletionRevision)) {
+        return (await loadAuthoritativeNewest()) ?? [];
+      }
+      if (newest.historyRevision !== previous.historyRevision) {
+        if (newest.cursorPresent === false) return (await loadAuthoritativeNewest()) ?? [];
+        return (await refreshLoadedMessageRange(sessionId, previous, epoch))
+          ?? (await loadAuthoritativeNewest())
+          ?? [];
+      }
+      if (!newest.newestSequence || BigInt(newest.newestSequence) < BigInt(previous.newestSequence)) {
+        return (await loadAuthoritativeNewest()) ?? [];
+      }
+      if (BigInt(newest.newestSequence) > BigInt(previous.newestSequence)) {
+        const retryResult = await collectAfterPages(previous.newestSequence);
+        if (!retryResult) return [] as Message[];
+        if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return [] as Message[];
+        const retry = retryResult.latest;
+        if (retryResult.messages.length > 0 && retry) {
+          if (isLegacyMessageHistoryPage(retry)) {
+            return replaceAuthoritativeNewest(retry);
+          }
+          if (historyDeletionRevisionChanged(previous.historyDeletionRevision, retry.historyDeletionRevision)) {
+            return (await loadAuthoritativeNewest()) ?? [];
+          }
+          if (retry.cursorPresent === false) {
+            return (await loadAuthoritativeNewest()) ?? [];
+          }
+          if (historyRevisionChanged(previous.historyRevision, retry.historyRevision)) {
+            return (await refreshLoadedMessageRange(sessionId, previous, epoch))
+              ?? (await loadAuthoritativeNewest())
+              ?? [];
+          }
+          replaceSessionMessages(sessionId, (current) => mergeMessagePage(current, retryResult.messages, "append"));
+          setMessageHistoryState(sessionId, {
+            hasOlder: previous.hasOlder || retry.hasOlder,
+            hasNewer: retry.hasNewer,
+            oldestSequence: previous.oldestSequence,
+            newestSequence: retry.newestSequence ?? previous.newestSequence,
+            historyRevision: retry.historyRevision ?? previous.historyRevision,
+            historyDeletionRevision: retry.historyDeletionRevision ?? previous.historyDeletionRevision,
+            loadingOlder: false,
+          });
+          return retryResult.messages;
+        }
+      }
+      return [] as Message[];
+    }, [] as Message[]);
+  }, [clearPersistedRequestMessages, client, enqueueHistoryRequest, reconcileSessionMessageSnapshot, refreshLoadedMessageRange, replaceSessionMessages, setMessageHistoryState]);
+
+  const loadOlderSessionMessages = React.useCallback(async (sessionId: string) => {
+    if (!client) return false;
+    return await enqueueHistoryRequest(sessionId, async () => {
+      const epoch = historyEpochRef.current.get(sessionId) ?? 0;
+      const previous = messageHistoryRef.current.get(sessionId);
+      if (!previous?.hasOlder || !previous.oldestSequence || previous.loadingOlder) return false;
+      setMessageHistoryState(sessionId, { ...previous, loadingOlder: true });
+      try {
+        const page = await client.listMessagePage(sessionId, {
+          limit: MESSAGE_PAGE_SIZE,
+          before: previous.oldestSequence,
+        });
+        if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return false;
+        if (historyDeletionRevisionChanged(previous.historyDeletionRevision, page.historyDeletionRevision)) {
+          const newest = await client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE });
+          if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return false;
+          clearPersistedRequestMessages(sessionId, newest.messages);
+          replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, newest.messages, current));
+          setMessageHistoryState(sessionId, { ...newest, loadingOlder: false });
+          return newest.messages.length > 0;
+        }
+        if (isLegacyMessageHistoryPage(page) || page.cursorPresent === false) {
+          const newest = await client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE });
+          if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return false;
+          clearPersistedRequestMessages(sessionId, newest.messages);
+          replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, newest.messages, current));
+          setMessageHistoryState(sessionId, { ...newest, loadingOlder: false });
+          return newest.messages.length > 0;
+        }
+        if (historyRevisionChanged(previous.historyRevision, page.historyRevision)) {
+          const seeded = mergeMessagePage(messagesBySessionRef.current[sessionId] ?? [], page.messages, "prepend");
+          const refreshed = await refreshLoadedMessageRange(
+            sessionId,
+            { ...previous, oldestSequence: page.oldestSequence ?? previous.oldestSequence },
+            epoch,
+            seeded,
+            { hasOlder: page.hasOlder, hasNewer: page.hasNewer || previous.hasNewer },
+          );
+          if (refreshed) return refreshed.length > 0;
+          const newest = await client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE });
+          if ((historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return false;
+          clearPersistedRequestMessages(sessionId, newest.messages);
+          replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, newest.messages, current));
+          setMessageHistoryState(sessionId, { ...newest, loadingOlder: false });
+          return newest.messages.length > 0;
+        }
+        replaceSessionMessages(sessionId, (current) => mergeMessagePage(current, page.messages, "prepend"));
+        setMessageHistoryState(sessionId, {
+          hasOlder: page.hasOlder,
+          hasNewer: page.hasNewer || previous.hasNewer,
+          oldestSequence: page.oldestSequence ?? previous.oldestSequence,
+          newestSequence: previous.newestSequence,
+          historyRevision: page.historyRevision ?? previous.historyRevision,
+          historyDeletionRevision: page.historyDeletionRevision ?? previous.historyDeletionRevision,
+          loadingOlder: false,
+        });
+        return page.messages.length > 0;
+      } catch (cause) {
+        if ((historyEpochRef.current.get(sessionId) ?? 0) === epoch) {
+          setMessageHistoryState(sessionId, { ...previous, loadingOlder: false });
+        }
+        throw cause;
+      }
+    }, false);
+  }, [clearPersistedRequestMessages, client, enqueueHistoryRequest, reconcileSessionMessageSnapshot, refreshLoadedMessageRange, replaceSessionMessages, setMessageHistoryState]);
+  const loadOlderActiveMessages = React.useCallback(
+    () => activeSessionId ? loadOlderSessionMessages(activeSessionId) : false,
+    [activeSessionId, loadOlderSessionMessages],
+  );
 
   const applyDurableState = React.useCallback((sessionId: string, state: TurnState, rebuildStream = false) => {
     setDurableStatesBySession((current) => ({ ...current, [sessionId]: state }));
@@ -1117,6 +1725,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     if (connection.reconnectTimer !== null) window.clearTimeout(connection.reconnectTimer);
     sessionConnectionsRef.current.delete(sessionId);
   }, []);
+  stopSessionConnectionRef.current = stopSessionConnection;
 
   const attachSessionStream = React.useCallback((sessionId: string) => {
     if (!client) return Promise.resolve();
@@ -1135,20 +1744,27 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         resolveReady = resolve;
         rejectReady = reject;
       });
-      const source = client.streamEvents(sessionId, {
+      let source!: EventSource;
+      const isCurrentConnection = () => (
+        trackedSessionsRef.current.has(sessionId)
+        && sessionConnectionsRef.current.get(sessionId)?.source === source
+      );
+      source = client.streamEvents(sessionId, {
         onOpen: () => {
+          if (!isCurrentConnection()) return;
           const current = sessionConnectionsRef.current.get(sessionId);
           if (current) current.attempts = 0;
           setConnectionState("online");
           resolveReady();
         },
         onEvent: (event, cursor) => {
+          if (!isCurrentConnection()) return;
           const reconciled = reconcileDurableEventCursor(
             durableEventSequencesBySessionRef.current.get(sessionId) ?? {},
             cursor,
           );
           if (!reconciled.accepted) return;
-          const currentRunId = event.kind === "turn.start" && cursor
+          const currentRunId = event.kind === "turn.start" && cursor && /^[0-9a-f-]{36}:\d+$/i.test(cursor)
             ? cursor.slice(0, cursor.lastIndexOf(":"))
             : null;
           durableEventSequencesBySessionRef.current.set(
@@ -1202,9 +1818,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           activeSessionsRef.current.delete(sessionId);
           stopSessionConnection(sessionId);
           handleQueueTurnEndRef.current(sessionId, event.status);
+          const terminalEpoch = historyEpochRef.current.get(sessionId) ?? 0;
           const reconcileTerminal = (attempt: number): void => {
             void Promise.all([refreshSessionMessages(sessionId), client.turnState(sessionId)])
               .then(([, state]) => {
+                if ((historyEpochRef.current.get(sessionId) ?? 0) !== terminalEpoch) return;
                 // A queued follow-up can begin locally before its POST is
                 // admitted. Do not let this older terminal snapshot erase
                 // that newer pending turn.
@@ -1224,13 +1842,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           reconcileTerminal(0);
         },
         onError: () => {
-          if (terminal || !trackedSessionsRef.current.has(sessionId)) return;
+          if (terminal || !isCurrentConnection()) return;
           rejectReady(new Error("The live response stream could not be opened"));
           source.close();
           sessionConnectionsRef.current.delete(sessionId);
           setConnectionState(navigator.onLine ? "reconnecting" : "offline");
           const nextAttempts = attempts + 1;
           const reconnectTimer = window.setTimeout(() => {
+            if (sessionConnectionsRef.current.get(sessionId)?.source !== source) return;
             sessionConnectionsRef.current.delete(sessionId);
             void connect(nextAttempts);
           }, Math.min(5_000, 500 * (2 ** Math.min(nextAttempts, 4))));
@@ -1264,29 +1883,56 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     const sessionId = activeTask?.activeSessionId;
     if (!sessionId) return;
     if (!client) {
-      setMessagesBySession((current) => current[sessionId]
-        ? current
-        : { ...current, [sessionId]: fixtureMessages(sessionId) });
+      replaceSessionMessages(sessionId, (current) => current.length > 0 ? current : fixtureMessages(sessionId));
+      setMessageHistoryState(sessionId, { hasOlder: false, hasNewer: false, oldestSequence: null, newestSequence: null, historyRevision: null, historyDeletionRevision: null, loadingOlder: false });
       return;
     }
     let cancelled = false;
-    void Promise.all([client.listMessages(sessionId), client.turnState(sessionId)])
-      .then(([items, state]) => {
-        if (cancelled) return;
-        replaceSessionMessages(sessionId, (current) => reconcileSessionMessageSnapshot(sessionId, items, current));
-        const preserveDurableSurface = state.active || state.runState === "recovery_required";
-        applyDurableState(sessionId, state, preserveDurableSurface);
-        if (state.active) activeSessionsRef.current.add(sessionId);
-        else activeSessionsRef.current.delete(sessionId);
-        reconcileQueueWithTurnStateRef.current(sessionId, state.active, items);
-        if (state.active) void attachSessionStream(sessionId).catch(() => undefined);
-        else if (!preserveDurableSurface) resetSessionStream(sessionId);
-      })
+    const epoch = historyEpochRef.current.get(sessionId) ?? 0;
+    void enqueueHistoryRequest(sessionId, async () => {
+      const [page, state] = await Promise.all([client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE }), client.turnState(sessionId)]);
+      if (cancelled || (historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+      setMessageHistoryState(sessionId, { ...page, loadingOlder: false });
+      const items = page.messages;
+      const visibleMessageIds = new Set(items.map((message) => message.id));
+      const queued = followUpsBySessionRef.current[sessionId] ?? readQueuedFollowUps(sessionId);
+      const missingQueuedMessageIds = [...new Set(queued
+        .filter((followUp) => followUp.status === "sending" && followUp.messageId && !visibleMessageIds.has(followUp.messageId))
+        .map((followUp) => followUp.messageId!))];
+      // The newest page is intentionally bounded. Probe only queued message
+      // IDs that fall outside it so a refresh cannot turn an older, already
+      // persisted submission into a duplicate retry. Keep these probes in the
+      // same per-session queue so a terminal refresh cannot interleave with a
+      // stale bootstrap snapshot.
+      const recoveredQueuedMessages = await findPersistedMessagesByIds(client, sessionId, missingQueuedMessageIds);
+      if (cancelled || (historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
+      clearPersistedRequestMessages(sessionId, items);
+      replaceSessionMessages(sessionId, (current) => {
+        const reconciled = reconcileSessionMessageSnapshot(sessionId, items, current);
+        const cachedHistory = messageHistoryRef.current.get(sessionId);
+        const preserveNoOverlap = current.length > items.length
+          && Boolean(cachedHistory?.newestSequence && page.newestSequence
+            && BigInt(page.newestSequence) >= BigInt(cachedHistory.newestSequence));
+        return mergeRefreshedMessagePage(current, items, reconciled, { preserveNoOverlap });
+      });
+      const preserveDurableSurface = state.active || state.runState === "recovery_required";
+      applyDurableState(sessionId, state, preserveDurableSurface);
+      if (state.active) activeSessionsRef.current.add(sessionId);
+      else activeSessionsRef.current.delete(sessionId);
+      const persistedQueuedMessages = recoveredQueuedMessages.filter(Boolean) as Message[];
+      reconcileQueueWithTurnStateRef.current(sessionId, state.active, [
+        ...items,
+        ...persistedQueuedMessages,
+      ]);
+      if (state.active) void attachSessionStream(sessionId).catch(() => undefined);
+      else if (!preserveDurableSurface) resetSessionStream(sessionId);
+      return null;
+    }, null)
       .catch((cause) => {
         if (!cancelled) setResourceError("messages", cause instanceof Error ? cause.message : "Unable to load this task");
       });
     return () => { cancelled = true; };
-  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, client, reconcileSessionMessageSnapshot, replaceSessionMessages, resetSessionStream]);
+  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, clearPersistedRequestMessages, client, enqueueHistoryRequest, findPersistedMessage, reconcileSessionMessageSnapshot, replaceSessionMessages, resetSessionStream, setMessageHistoryState]);
 
   const runTurn = React.useCallback(async (
     task: Task,
@@ -1632,7 +2278,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       ...(attachments.length > 0 ? { attachments } : {}),
       replaceFromMessageId: target.id,
     });
-    await refreshSessionMessages(sessionId);
+    // The optimistic edit truncates the visible tail before the server
+    // rewinds the task. If the edited turn is older than the newest bounded
+    // page, that page has no id overlap with the retained prefix; keep the
+    // prefix while the authoritative rewrite arrives instead of dropping a
+    // user's already-loaded history.
+    await refreshSessionMessages(sessionId, { reset: true, preserveNoOverlap: true });
   }, [activeTask, markRequestMessagePending, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, runTurn]);
 
   const continueTurn = React.useCallback(async () => {
@@ -1640,7 +2291,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     const sessionId = activeTask.activeSessionId;
     requestThreadBottom(sessionId);
     await continueAfterMessageRefresh(
-      () => refreshSessionMessages(sessionId),
+      async () => { await refreshSessionMessages(sessionId); },
       () => runTurn(activeTask, { continueInterruptedTurn: true }),
     );
   }, [activeTask, refreshSessionMessages, requestThreadBottom, runTurn]);
@@ -1934,8 +2585,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       });
     } catch (cause) {
       const recovered = !(cause instanceof BerryApiError)
-        ? (await client.listMessages(sessionId).catch(() => []))
-          .find((message) => message.id === messageId)
+        ? await findPersistedMessage(sessionId, messageId).catch(() => undefined)
         : undefined;
       if (!recovered) {
         replaceSessionMessages(sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
@@ -1953,7 +2603,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     });
     requestThreadBottom(sessionId);
     return persisted;
-  }, [client, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, resetSessionStream, runTurn, stopSessionConnection]);
+  }, [client, findPersistedMessage, refreshSessionMessages, replaceSessionMessages, requestThreadBottom, resetSessionStream, runTurn, stopSessionConnection]);
 
   const deliverFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
     if (!client) return;
@@ -1967,7 +2617,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     rememberFollowUp({ ...followUp, status: "sending", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
     try {
       if (deliveryMode === "steer" && !currentlyActive) {
-        const acceptedMessage = (await client.listMessages(followUp.sessionId)).find((message) => message.id === messageId);
+        const acceptedMessage = await findPersistedMessage(followUp.sessionId, messageId);
         if (acceptedMessage) {
           updateSessionFollowUps(followUp.sessionId, (current) => current.filter((item) => item.id !== followUp.id));
           return;
@@ -1985,7 +2635,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           return;
         }
         const existingMessage = followUp.messageId
-          ? (await client.listMessages(followUp.sessionId)).find((message) => message.id === messageId)
+          ? await findPersistedMessage(followUp.sessionId, messageId)
           : undefined;
         if (!existingMessage) {
           const optimistic = optimisticUserMessage(followUp.sessionId, followUp.input, followUp.attachments);
@@ -2004,8 +2654,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             rememberFollowUp({ ...followUp, status: "sending", messageId, deliveryMode, error: null, pausedReason: null, updatedAt: new Date().toISOString() });
           } catch (cause) {
             const recovered = !(cause instanceof BerryApiError)
-              ? (await client.listMessages(followUp.sessionId).catch(() => []))
-                .find((message) => message.id === messageId)
+              ? await findPersistedMessage(followUp.sessionId, messageId).catch(() => undefined)
               : undefined;
             if (!recovered) {
               replaceSessionMessages(followUp.sessionId, (current) => current.filter((message) => message.id !== optimistic.id));
@@ -2032,7 +2681,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     } finally {
       followUpSendInFlightRef.current.delete(followUp.id);
     }
-  }, [client, interruptAndStartTurn, rememberFollowUp, replaceSessionMessages, runTurn, tasks, updateSessionFollowUps]);
+  }, [client, findPersistedMessage, interruptAndStartTurn, rememberFollowUp, replaceSessionMessages, runTurn, tasks, updateSessionFollowUps]);
 
   const sendFollowUpNow = React.useCallback(async (requestedFollowUp: QueuedFollowUp) => {
     const deliverCurrent = async () => {
@@ -2545,7 +3194,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               stream={stream}
               client={client}
               config={config}
-              taskTitles={tasks.map((task) => task.title)}
+              taskTitles={taskTitles}
               imageGeneration={imageGenerationBySession[activeTask.activeSessionId ?? activeTask.id] ?? null}
               onRetryImage={(prompt) => void generateImage(activeTask, prompt, false)}
               onEditGeneratedImage={editGeneratedImage}
@@ -2555,12 +3204,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               activeStatus={durableTurnPhase(durableState)}
               cancelTurn={cancelTurn}
               onViewTaskFiles={() => setTaskFilesOpen(true)}
+              onLoadOlderMessages={client ? loadOlderActiveMessages : undefined}
+              hasOlderMessages={activeMessageHistory?.hasOlder ?? false}
+              loadingOlderMessages={activeMessageHistory?.loadingOlder ?? false}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
             />
             <Composer
               config={config}
               activeTask={activeTask}
-              taskTitles={tasks.map((task) => task.title)}
+              taskTitles={taskTitles}
               client={client}
               workspaces={workspaces}
               activeWorkspaceId={activeWorkspaceId}
@@ -2649,7 +3301,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               <Composer
                 config={config}
                 activeTask={null}
-                taskTitles={tasks.map((task) => task.title)}
+                taskTitles={taskTitles}
                 client={client}
                 workspaces={workspaces}
                 activeWorkspaceId={activeWorkspaceId}

@@ -8,6 +8,7 @@ import { Button } from "@berry/desktop-ui/components/ui/button";
 import {
   BerryThreadView,
   BerryUserEditorFrame,
+  findMessageSearchTarget,
   fullUserText,
   isImageMessagePart,
   type BerryThreadAdapter,
@@ -194,6 +195,11 @@ function ThreadView({ sessionId, taskId, stream, density, autoScroll }: { sessio
   const messages = messagesQuery.data ?? [];
   const showReasoning = showReasoningQuery.data === true;
   const showTodos = showTodosQuery.data !== false;
+  const searchMessages = React.useCallback(async (query: string): Promise<string | null> => {
+    const needle = query.trim().toLocaleLowerCase();
+    if (!needle) return null;
+    return findMessageSearchTarget(messages, needle);
+  }, [messages]);
 
   const adapter = React.useMemo<BerryThreadAdapter>(
     () => ({
@@ -243,6 +249,7 @@ function ThreadView({ sessionId, taskId, stream, density, autoScroll }: { sessio
       showTodos={showTodos}
       navigatorInset={16}
       adapter={adapter}
+      onSearchMessages={searchMessages}
     />
   );
 }

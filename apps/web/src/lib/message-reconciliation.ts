@@ -78,6 +78,14 @@ export function reconcileDurableEventCursor(
   cursor: string | null | undefined,
 ): { accepted: boolean; sequences: DurableEventSequences } {
   if (!cursor) return { accepted: true, sequences: current };
+  const legacyMatch = /^legacy:(\d+)$/.exec(cursor);
+  if (legacyMatch) {
+    const sequence = Number(legacyMatch[1]);
+    if (!Number.isSafeInteger(sequence) || sequence <= (current.__legacy__ ?? 0)) {
+      return { accepted: false, sequences: current };
+    }
+    return { accepted: true, sequences: { ...current, __legacy__: sequence } };
+  }
   const match = /^([0-9a-f-]{36}):(\d+)$/i.exec(cursor);
   if (!match) return { accepted: true, sequences: current };
   const runId = match[1]!;

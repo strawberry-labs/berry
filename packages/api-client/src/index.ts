@@ -91,6 +91,7 @@ import {
   EffectivePermissionsSchema,
   FeatureFlagSchema,
   HostPushEventSchema,
+  MessageHistoryPageSchema,
   MessageSchema,
   MemoryItemSchema,
   PersonalizationProfileSchema,
@@ -207,6 +208,7 @@ import {
   type FeatureFlag,
   type HostPushEvent,
   type Message,
+  type MessageHistoryPage,
   type MemoryItem,
   type PersonalizationProfile,
   type ModelGovernanceDecision,
@@ -1038,6 +1040,47 @@ export class BerryApiClient {
 
   async listMessages(sessionId: string): Promise<Message[]> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, z.array(MessageSchema));
+  }
+
+  async getMessage(sessionId: string, messageId: string): Promise<Message> {
+    return this.#request(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+      MessageSchema,
+    );
+  }
+
+  async listMessagePage(sessionId: string, options: {
+    limit?: number;
+    before?: string;
+    after?: string;
+    historyRevision?: string;
+  } = {}): Promise<MessageHistoryPage> {
+    const params = new URLSearchParams({ limit: String(options.limit ?? 50) });
+    if (options.before) params.set("before", options.before);
+    if (options.after) params.set("after", options.after);
+    if (options.historyRevision) params.set("historyRevision", options.historyRevision);
+    const response = await this.#request(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/messages?${params.toString()}`,
+      z.union([MessageHistoryPageSchema, z.array(MessageSchema)]),
+    );
+    // During a rolling deploy an older API ignores the cursor query and
+    // returns the legacy array. Keep that response usable as a short-lived
+    // compatibility path; the old endpoint itself may have materialized the
+    // complete history, so the API migration must precede the web rollout for
+    // long-history production traffic.
+    if (Array.isArray(response)) {
+      return {
+        messages: response,
+        hasOlder: false,
+        hasNewer: false,
+        oldestSequence: null,
+        newestSequence: null,
+        cursorPresent: null,
+        historyRevision: null,
+        historyDeletionRevision: null,
+      };
+    }
+    return response;
   }
 
   async getSession(sessionId: string): Promise<Session> {

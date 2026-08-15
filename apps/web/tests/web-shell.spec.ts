@@ -252,8 +252,10 @@ test("web task view uses the shared task presentation", async ({ page }) => {
 
   const userBubble = page.locator("[data-user-message-bubble]").first();
   const assistant = page.locator(".berry-assistant-message").first();
+  const historyWindow = page.locator("[data-history-window]");
   await expect(userBubble).toBeVisible();
   await expect(assistant).toBeVisible();
+  await expect.poll(async () => Number(await historyWindow.getAttribute("data-history-mounted"))).toBeLessThanOrEqual(18);
   await expect(page.getByTestId("turn-activity").first()).toContainText("Worked for 3s");
   await page.getByTestId("turn-activity").first().click();
   const thought = page.getByRole("button", { name: /Thought for a few seconds/ }).first();

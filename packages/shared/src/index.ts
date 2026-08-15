@@ -909,6 +909,31 @@ export const MessageSchema = z.object({
 });
 export type Message = z.infer<typeof MessageSchema>;
 
+/**
+ * Bounded, cursor-based history responses.  `sequence` values are strings so
+ * PostgreSQL bigint cursors stay lossless in browsers and across clients.
+ */
+export const MessageHistoryPageSchema = z.object({
+  messages: z.array(MessageSchema),
+  hasOlder: z.boolean(),
+  hasNewer: z.boolean(),
+  oldestSequence: z.string().regex(/^\d+$/).nullable(),
+  newestSequence: z.string().regex(/^\d+$/).nullable(),
+  // For cursor pages, tells the client whether the exact after/before anchor
+  // still exists. This distinguishes ordinary appends from delete-and-append
+  // rewrites without treating every revision increment as a reset.
+  cursorPresent: z.boolean().nullable().default(null),
+  // Optional for one rolling-deploy window where an API has pagination but
+  // predates the revision trigger; new servers always return a string.
+  historyRevision: z.string().regex(/^\d+$/).nullable().default(null),
+  // Structural deletion marker. Projection updates can change historyRevision
+  // without invalidating an already-loaded older prefix; clients use this
+  // marker to discard rows removed by another writer. New rows are discovered
+  // through the after cursor and do not need a revision bump.
+  historyDeletionRevision: z.string().regex(/^\d+$/).nullable().default(null),
+});
+export type MessageHistoryPage = z.infer<typeof MessageHistoryPageSchema>;
+
 export const ToolCallSchema = z.object({
   id: z.string(),
   messageId: z.string().nullable(),

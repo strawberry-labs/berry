@@ -368,6 +368,73 @@ describe("BerryApiClient", () => {
     } satisfies Partial<BerryApiError>);
   });
 
+  it("requests bounded message pages with lossless cursors", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("https://api.berry.test/v1/sessions/session_1/messages?limit=25&before=9007199254740993");
+      return json({
+        messages: [],
+        hasOlder: true,
+        hasNewer: false,
+        oldestSequence: null,
+        newestSequence: null,
+        historyRevision: "0",
+      });
+    });
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.listMessagePage("session_1", { limit: 25, before: "9007199254740993" })).resolves.toMatchObject({
+      hasOlder: true,
+      hasNewer: false,
+    });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("looks up one persisted message by ID for retry recovery", async () => {
+    const message = {
+      id: "00000000-0000-7000-8000-000000000001",
+      sessionId: "session_1",
+      role: "user",
+      status: "complete",
+      parts: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      generationMs: 0,
+      createdAt: "2026-07-23T00:00:00.000Z",
+      updatedAt: "2026-07-23T00:00:00.000Z",
+    };
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("https://api.berry.test/v1/sessions/session_1/messages/00000000-0000-7000-8000-000000000001");
+      return json(message);
+    });
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.getMessage("session_1", message.id)).resolves.toEqual(message);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("keeps old array responses usable during an API rolling deploy", async () => {
+    const message = {
+      id: "message_legacy",
+      sessionId: "session_1",
+      role: "user",
+      status: "complete",
+      parts: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      generationMs: 0,
+      createdAt: "2026-07-23T00:00:00.000Z",
+      updatedAt: "2026-07-23T00:00:00.000Z",
+    };
+    const fetchImpl = vi.fn(async () => json([message]));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.listMessagePage("session_1")).resolves.toMatchObject({
+      messages: [message],
+      hasOlder: false,
+      newestSequence: null,
+    });
+  });
+
   it("validates enterprise org and SSO responses through shared schemas", async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

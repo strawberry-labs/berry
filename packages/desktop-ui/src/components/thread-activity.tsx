@@ -1458,8 +1458,8 @@ function SubagentActivity({ tool, active = false }: { tool: ActivityTool; active
 
 /**
  * Codex `RO`: the user's manual expand/collapse choice per turn, keyed by
- * session + turn ordinal. In-memory only, and shared between the live and
- * persisted render paths so a remount at turn settle can't reset the state.
+ * session + stable turn identity. In-memory only, and shared between the live
+ * and persisted render paths so a remount at turn settle can't reset the state.
  */
 const turnCollapsedChoice = new Map<string, boolean>();
 const CHOICE_CAP = 800;
@@ -1475,18 +1475,22 @@ function rememberTurnChoice(turnKey: string, collapsed: boolean): void {
 
 /**
  * Drop remembered disclosure state (turn accordion choice + thought rows) for
- * a session's turn ordinal onward. Called when a fresh turn starts, so an
- * edit-and-resubmit rerun at the same ordinal cannot inherit the disclosure
- * of the turns it replaced (Codex keys by turnId, which makes this automatic
- * there; Berry keys by ordinal, so stale entries must be cleared).
+ * a session's turn ordinal or stable identity. Called when a fresh turn starts,
+ * so an edit-and-resubmit rerun cannot inherit the disclosure of the turn it
+ * replaced.
  */
-export function forgetTurnDisclosure(sessionId: string, fromOrdinal: number): void {
+export function forgetTurnDisclosure(sessionId: string, fromTurn: number | string): void {
   const prefix = `${sessionId}:turn-`;
   for (const map of [turnCollapsedChoice, openMap]) {
     for (const key of [...map.keys()]) {
       if (!key.startsWith(prefix)) continue;
+      if (typeof fromTurn === "string") {
+        const target = fromTurn.startsWith(prefix) ? fromTurn : `${prefix}${fromTurn}`;
+        if (key === target) map.delete(key);
+        continue;
+      }
       const ordinal = Number.parseInt(key.slice(prefix.length), 10);
-      if (Number.isFinite(ordinal) && ordinal >= fromOrdinal) map.delete(key);
+      if (Number.isFinite(ordinal) && ordinal >= fromTurn) map.delete(key);
     }
   }
 }

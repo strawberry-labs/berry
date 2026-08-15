@@ -8,9 +8,13 @@ class FakeExecutor implements SqlExecutor {
   readonly calls: Array<{ sql: string; params: readonly unknown[] }> = [];
   appliedIds: number[] = [];
   transactionCount = 0;
+  sessionCount = 0;
+  indexValid: boolean | undefined;
 
   async execute(sql: string, params: readonly unknown[] = []): Promise<void> {
     this.calls.push({ sql, params });
+    if (sql.includes("CREATE INDEX CONCURRENTLY")) this.indexValid = true;
+    if (sql.includes("DROP INDEX CONCURRENTLY")) this.indexValid = false;
   }
 
   async query<T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> {
@@ -18,11 +22,19 @@ class FakeExecutor implements SqlExecutor {
     if (sql.includes("SELECT id FROM schema_migrations")) {
       return this.appliedIds.map((id) => ({ id }) as T);
     }
+    if (sql.includes("FROM pg_class c") && sql.includes("message_parts_tenant_message_ordinal_idx")) {
+      return (this.indexValid === undefined ? [] : [{ index_name: "message_parts_tenant_message_ordinal_idx", indisvalid: this.indexValid }]) as T[];
+    }
     return [];
   }
 
   async transaction<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {
     this.transactionCount += 1;
+    return callback(this);
+  }
+
+  async session<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {
+    this.sessionCount += 1;
     return callback(this);
   }
 }
@@ -47,7 +59,26 @@ describe("CloudDatabaseService", () => {
         "INSERT INTO schema_migrations (id, name) VALUES ($1, $2)",
       ]),
     );
-    expect(executor.transactionCount).toBe(1);
+    expect(executor.transactionCount).toBe(2);
+    expect(executor.sessionCount).toBe(1);
+    expect(executor.calls.map((call) => call.sql)).toContain("SELECT pg_advisory_lock(hashtextextended('berry-cloud-migrations', 0))");
+    expect(executor.calls.map((call) => call.sql)).toContain("SELECT pg_advisory_unlock(hashtextextended('berry-cloud-migrations', 0))");
+  });
+
+  it("repairs an invalid online index without touching message data", async () => {
+    const executor = new FakeExecutor();
+    executor.appliedIds = [53];
+    executor.indexValid = false;
+    const moduleRef = await Test.createTestingModule({
+      imports: [CloudDatabaseModule.register({ useValue: executor })],
+    }).compile();
+
+    await moduleRef.get(CloudDatabaseService).migrate();
+
+    expect(executor.calls.map((call) => call.sql)).toContain("DROP INDEX CONCURRENTLY IF EXISTS message_parts_tenant_message_ordinal_idx");
+    expect(executor.calls.map((call) => call.sql).some((sql) => sql.includes("CREATE INDEX CONCURRENTLY"))).toBe(true);
+    expect(executor.calls.map((call) => call.sql).some((sql) => sql.includes("DELETE FROM messages") || sql.includes("DELETE FROM message_parts"))).toBe(false);
+    expect(executor.indexValid).toBe(true);
   });
 
   it("skips already-applied migrations", async () => {

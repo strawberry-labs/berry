@@ -412,12 +412,31 @@ describe("AgentApiController", () => {
       expect(body.lastReadAt).toEqual(expect.any(String));
     });
     await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).send({
+      messageId: "00000000-0000-7000-8000-000000000001",
       role: "user",
       parts: [{ kind: "text", content: "hello" }],
     }).expect(201);
-    await request(app.getHttpServer()).get(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).expect(200).expect(({ body }) => {
-      expect(body[0]).toMatchObject({ role: "user", parts: [expect.objectContaining({ kind: "text", content: "hello" })] });
-    });
+    const messages = await request(app.getHttpServer()).get(`/v1/sessions/${created.body.session.id}/messages`).set(authHeader()).expect(200);
+    expect(messages.body[0]).toMatchObject({ role: "user", parts: [expect.objectContaining({ kind: "text", content: "hello" })] });
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${created.body.session.id}/messages/${messages.body[0].id}`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body).toEqual(messages.body[0]));
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${created.body.session.id}/messages/not-a-uuid`)
+      .set(authHeader())
+      .expect(400);
+    const generated = await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/messages`)
+      .set(authHeader())
+      .send({ role: "user", parts: [{ kind: "text", content: "generated id" }] })
+      .expect(201);
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${created.body.session.id}/messages/${generated.body.id}`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body.id).toBe(generated.body.id));
     await request(app.getHttpServer()).delete(`/v1/tasks/${created.body.task.id}`).set(authHeader()).expect(200).expect(({ body }) => {
       expect(body.deletedAt).toEqual(expect.any(String));
     });
@@ -574,6 +593,107 @@ describe("AgentApiController", () => {
     });
   });
 
+  it("pages message history by stable insertion sequence and supports both directions", async () => {
+    app = await createApp(fakeSessionHost());
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Paged history" })
+      .expect(201);
+    const sessionId = created.body.session.id as string;
+    const ids = [1, 2, 3, 4, 5].map((value) => `00000000-0000-7000-8000-${String(value).padStart(12, "0")}`);
+    for (const [index, id] of ids.entries()) {
+      await request(app.getHttpServer())
+        .post(`/v1/sessions/${sessionId}/messages`)
+        .set(authHeader())
+        .send({ messageId: id, role: "user", parts: [{ kind: "text", content: `message-${index + 1}` }] })
+        .expect(201);
+    }
+
+    const newest = await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?limit=2`)
+      .set(authHeader())
+      .expect(200);
+    expect(newest.body.messages.map((message: { id: string }) => message.id)).toEqual(ids.slice(-2));
+    expect(newest.body.hasOlder).toBe(true);
+    expect(newest.body.hasNewer).toBe(false);
+    expect(newest.body.cursorPresent).toBeNull();
+    expect(newest.body.oldestSequence).toBe("4");
+    expect(newest.body.newestSequence).toBe("5");
+
+    const older = await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?limit=2&before=${newest.body.oldestSequence}`)
+      .set(authHeader())
+      .expect(200);
+    expect(older.body.messages.map((message: { id: string }) => message.id)).toEqual(ids.slice(1, 3));
+    expect(older.body.hasOlder).toBe(true);
+    expect(older.body.hasNewer).toBe(true);
+    expect(older.body.cursorPresent).toBe(true);
+
+    const newer = await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?limit=2&after=2`)
+      .set(authHeader())
+      .expect(200);
+    expect(newer.body.messages.map((message: { id: string }) => message.id)).toEqual(ids.slice(2, 4));
+    expect(newer.body.hasOlder).toBe(true);
+    expect(newer.body.hasNewer).toBe(true);
+    expect(newer.body.cursorPresent).toBe(true);
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?before=2&after=1`)
+      .set(authHeader())
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get("/v1/sessions/not-a-session/messages?limit=1")
+      .set(authHeader())
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?after=9223372036854775808`)
+      .set(authHeader())
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?limit=1&historyRevision=0`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body.historyRevision).toBe("0"));
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?limit=`)
+      .set(authHeader())
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?limit=201`)
+      .set(authHeader())
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${sessionId}/messages?historyRevision=0`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(Array.isArray(body)).toBe(false);
+        expect(body).toEqual(expect.objectContaining({
+          messages: expect.any(Array),
+          historyRevision: "0",
+        }));
+      });
+
+    const emptyTask = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Empty revision" })
+      .expect(201);
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${emptyTask.body.session.id}/messages?limit=1&historyRevision=0`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => expect(body.historyRevision).toBe("0"));
+  });
+
   it("isolates General tasks by user and ignores legacy kind updates", async () => {
     app = await createApp(fakeSessionHost());
     const first = await request(app.getHttpServer())
@@ -630,10 +750,10 @@ describe("AgentApiController", () => {
       .set(authHeader())
       .send({ workspaceId: workspace.body.id, title: "Private task" })
       .expect(201);
-    await request(app.getHttpServer())
+    const privateMessage = await request(app.getHttpServer())
       .post(`/v1/sessions/${created.body.session.id}/messages`)
       .set(authHeader())
-      .send({ role: "user", parts: [{ kind: "text", content: "private" }] })
+      .send({ messageId: "00000000-0000-7000-8000-000000000002", role: "user", parts: [{ kind: "text", content: "private" }] })
       .expect(201);
 
     await request(app.getHttpServer())
@@ -654,6 +774,14 @@ describe("AgentApiController", () => {
       .get(`/v1/sessions/${created.body.session.id}/messages`)
       .set(authHeader("berry-other-session"))
       .expect(404);
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/${created.body.session.id}/messages/${privateMessage.body.id}`)
+      .set(authHeader("berry-other-session"))
+      .expect(404);
+    await request(app.getHttpServer())
+      .get(`/v1/sessions/not-a-uuid/messages/${privateMessage.body.id}`)
+      .set(authHeader())
+      .expect(400);
     await request(app.getHttpServer())
       .post(`/v1/tasks/${created.body.task.id}/sessions`)
       .set(authHeader("berry-other-session"))

@@ -16,6 +16,38 @@ const PREVIEW_DELAY_MS = 500;
 const PREVIEW_WIDTH_PX = 288;
 const PREVIEW_FALLBACK_HEIGHT_PX = 172;
 const VIEWPORT_GUTTER_PX = 12;
+const RAIL_MARKER_HEIGHT_PX = 10;
+const RAIL_OVERSCAN_MARKERS = 12;
+const MAX_NAVIGATOR_LOAD_ATTEMPTS = 256;
+
+export function shouldMaterializeOlderPages(hasDomAnchor: boolean, virtualizerHandled: boolean): boolean {
+  return !hasDomAnchor && !virtualizerHandled;
+}
+
+export function isFocusedMarkerMounted(focusedIndex: number, range: { first: number; last: number }): boolean {
+  return focusedIndex >= range.first && focusedIndex <= range.last;
+}
+
+/** Pick a mounted marker to inherit focus when the old focused marker unmounts. */
+export function focusedMarkerFallbackIndex(
+  focusedIndex: number,
+  range: { first: number; last: number } | null,
+  itemCount: number,
+): number | null {
+  if (focusedIndex < 0 || !range || itemCount <= 0 || isFocusedMarkerMounted(focusedIndex, range)) return null;
+  return Math.max(0, Math.min(itemCount - 1, focusedIndex < range.first ? range.first : range.last));
+}
+
+export function preserveNavigatorScrollTop(
+  previousScrollTop: number,
+  previousFirstId: string | null,
+  currentFirstIndex: number,
+  previousLength: number,
+  currentLength: number,
+): number {
+  if (!previousFirstId || currentFirstIndex <= 0 || currentLength < previousLength) return previousScrollTop;
+  return previousScrollTop + currentFirstIndex * RAIL_MARKER_HEIGHT_PX;
+}
 
 type VisibleRange = { first: number; last: number } | null;
 type PreviewPosition = { left: number; top: number };
@@ -28,11 +60,23 @@ export function ConversationNavigator({
   containerRef,
   items,
   inset = 12,
+  onLoadOlder,
+  hasOlderMessages = false,
+  onScrollToAnchor,
+  onNavigationFailure,
 }: {
   containerRef: React.RefObject<HTMLElement | null>;
   items: NavigatorItem[];
   /** Native desktop leaves a slightly wider 16px window-edge gutter. */
   inset?: number;
+  /** Allow a virtualized transcript to materialize older rows before jumping. */
+  onLoadOlder?: (() => Promise<boolean> | boolean) | undefined;
+  /** Whether the host can still materialize an older page. */
+  hasOlderMessages?: boolean;
+  /** Scroll the virtual history window to an offscreen anchor already loaded. */
+  onScrollToAnchor?: ((id: string, behavior: ScrollBehavior) => boolean) | undefined;
+  /** Surface a bounded/deleted deep-link failure instead of silently no-oping. */
+  onNavigationFailure?: ((id: string) => void) | undefined;
 }) {
   const [visibleRange, setVisibleRange] = React.useState<VisibleRange>(null);
   const [hoveredId, setHoveredId] = React.useState<string | null>(null);
@@ -43,61 +87,57 @@ export function ConversationNavigator({
   const [railVisible, setRailVisible] = React.useState(false);
   const [previewId, setPreviewId] = React.useState<string | null>(null);
   const [previewPosition, setPreviewPosition] = React.useState<PreviewPosition | null>(null);
+  const onLoadOlderRef = React.useRef(onLoadOlder);
+  onLoadOlderRef.current = onLoadOlder;
+  const hasOlderMessagesRef = React.useRef(hasOlderMessages);
+  hasOlderMessagesRef.current = hasOlderMessages;
   const railRef = React.useRef<HTMLDivElement>(null);
   const previewRef = React.useRef<HTMLElement>(null);
   const rowRefs = React.useRef(new Map<string, HTMLButtonElement>());
+  const pendingFocusIndexRef = React.useRef<number | null>(null);
   const scrubPointerRef = React.useRef<{ id: number; x: number; y: number } | null>(null);
   const scrubbingRef = React.useRef(false);
   const scrubbedIdRef = React.useRef<string | null>(null);
   const suppressClickRef = React.useRef(false);
   const hoveredIdRef = React.useRef<string | null>(null);
   const previewTimerRef = React.useRef<number | null>(null);
-  const idsKey = items.map((item) => item.id).join("|");
+  const navigationTokenRef = React.useRef(0);
+  const previousItemsRef = React.useRef({ firstId: items[0]?.id ?? null, length: items.length });
   const shouldRender = items.length >= MIN_ITEMS && hasLeftSpace;
 
+  React.useLayoutEffect(() => {
+    const previous = previousItemsRef.current;
+    const rail = railRef.current;
+    const currentFirstIndex = previous.firstId ? items.findIndex((item) => item.id === previous.firstId) : -1;
+    if (rail && currentFirstIndex > 0) {
+      rail.scrollTop = preserveNavigatorScrollTop(
+        rail.scrollTop,
+        previous.firstId,
+        currentFirstIndex,
+        previous.length,
+        items.length,
+      );
+    }
+    previousItemsRef.current = { firstId: items[0]?.id ?? null, length: items.length };
+  }, [items]);
+
   React.useEffect(() => {
-    const scrollEl = containerRef.current?.querySelector<HTMLElement>(VIEWPORT_SELECTOR);
-    if (!scrollEl || items.length < MIN_ITEMS) return;
-
-    const order = items.map((item) => item.id);
-    const visible = new Set<string>();
+    const rail = railRef.current;
+    if (!rail || items.length < MIN_ITEMS) return;
     const updateVisibleRange = () => {
-      const indexes = order.map((id, index) => visible.has(id) ? index : -1).filter((index) => index >= 0);
-      const first = indexes.at(0);
-      const last = indexes.at(-1);
-      const next = first !== undefined && last !== undefined ? { first, last } : null;
-      setVisibleRange((current) => current?.first === next?.first && current?.last === next?.last ? current : next);
+      const first = Math.max(0, Math.floor(rail.scrollTop / RAIL_MARKER_HEIGHT_PX) - RAIL_OVERSCAN_MARKERS);
+      const last = Math.min(
+        items.length - 1,
+        Math.ceil((rail.scrollTop + rail.clientHeight) / RAIL_MARKER_HEIGHT_PX) + RAIL_OVERSCAN_MARKERS,
+      );
+      setVisibleRange((current) => current?.first === first && current.last === last ? current : { first, last });
     };
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          const id = (entry.target as HTMLElement).dataset.userAnchor;
-          if (!id) continue;
-          if (entry.isIntersecting) visible.add(id);
-          else visible.delete(id);
-        }
-        updateVisibleRange();
-      },
-      { root: scrollEl, rootMargin: "-16px 0px 0px 0px" },
-    );
-    const observed = new Set<Element>();
-    const scan = () => {
-      for (const node of scrollEl.querySelectorAll("[data-user-anchor]")) {
-        if (!observed.has(node)) {
-          observed.add(node);
-          observer.observe(node);
-        }
-      }
-    };
-    scan();
-    const mutation = new MutationObserver(scan);
-    mutation.observe(scrollEl, { childList: true, subtree: true });
+    updateVisibleRange();
+    rail.addEventListener("scroll", updateVisibleRange, { passive: true });
     return () => {
-      observer.disconnect();
-      mutation.disconnect();
+      rail.removeEventListener("scroll", updateVisibleRange);
     };
-  }, [containerRef, idsKey, items.length]);
+  }, [items.length, shouldRender]);
 
   React.useEffect(() => {
     const scrollEl = containerRef.current?.querySelector<HTMLElement>(VIEWPORT_SELECTOR);
@@ -109,16 +149,16 @@ export function ConversationNavigator({
       setHasLeftSpace(available >= RAIL_MIN_LEFT_SPACE_PX);
     };
     measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(scrollEl);
+    const containerObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    containerObserver?.observe(scrollEl);
     const content = scrollEl.querySelector<HTMLElement>(".berry-thread-content");
-    if (content) observer.observe(content);
+    if (content) containerObserver?.observe(content);
     window.addEventListener("resize", measure);
     return () => {
-      observer.disconnect();
+      containerObserver?.disconnect();
       window.removeEventListener("resize", measure);
     };
-  }, [containerRef, idsKey, items.length]);
+  }, [containerRef, items.length]);
 
   React.useEffect(() => {
     if (!shouldRender) {
@@ -129,26 +169,74 @@ export function ConversationNavigator({
     return () => window.cancelAnimationFrame(frame);
   }, [shouldRender]);
 
-  React.useLayoutEffect(() => {
-    if (visibleRange?.first == null) return;
-    const rail = railRef.current;
-    const item = items[visibleRange.first];
-    if (!item) return;
-    const row = rowRefs.current.get(item.id);
-    if (!rail || !row) return;
-    const railRect = rail.getBoundingClientRect();
-    const rowRect = row.getBoundingClientRect();
-    if (rowRect.top < railRect.top) rail.scrollTop += rowRect.top - railRect.top;
-    else if (rowRect.bottom > railRect.bottom) rail.scrollTop += rowRect.bottom - railRect.bottom;
-  }, [idsKey, items, visibleRange]);
-
-  const scrollTo = React.useCallback((id: string, behavior: ScrollBehavior) => {
+  const scrollTo = React.useCallback(async (id: string, behavior: ScrollBehavior) => {
+    const navigationToken = ++navigationTokenRef.current;
     const scrollEl = containerRef.current?.querySelector<HTMLElement>(VIEWPORT_SELECTOR);
-    const node = scrollEl?.querySelector<HTMLElement>(`[data-user-anchor="${CSS.escape(id)}"]`);
-    if (!scrollEl || !node) return;
+    if (!scrollEl) return;
+    let node = scrollEl.querySelector<HTMLElement>(`[data-user-anchor="${CSS.escape(id)}"]`);
+    // The transcript virtualizer can already know this row while its DOM
+    // anchor is unmounted. Let it jump by its cached prefix offset first;
+    // otherwise a deep link to an already-loaded row would fetch every older
+    // page before the virtualizer gets a chance to scroll.
+    const virtualizerHandled = !node && Boolean(onScrollToAnchor?.(id, behavior));
+    if (virtualizerHandled) return;
+    try {
+      let attempts = 0;
+      while (
+        shouldMaterializeOlderPages(Boolean(node), virtualizerHandled)
+        && onLoadOlder
+        && hasOlderMessagesRef.current
+        && attempts < MAX_NAVIGATOR_LOAD_ATTEMPTS
+      ) {
+        attempts += 1;
+        if (!(await onLoadOlder())) break;
+        if (navigationTokenRef.current !== navigationToken) return;
+        // Loading a page legitimately replaces `items`; compare the loader
+        // identity instead so a task switch cancels this old navigation while
+        // a multi-page deep link can continue materializing the same task.
+        if (onLoadOlderRef.current !== onLoadOlder || !scrollEl.isConnected || containerRef.current?.querySelector<HTMLElement>(VIEWPORT_SELECTOR) !== scrollEl) return;
+        node = scrollEl.querySelector<HTMLElement>(`[data-user-anchor="${CSS.escape(id)}"]`);
+      }
+    } catch {
+      return;
+    }
+    if (navigationTokenRef.current !== navigationToken) return;
+    if (!node && onScrollToAnchor?.(id, behavior)) return;
+    if (!node) {
+      onNavigationFailure?.(id);
+      return;
+    }
     if (behavior === "smooth") flashAfterScrollEnd(scrollEl, node);
     node.scrollIntoView({ behavior, block: "start" });
-  }, [containerRef]);
+  }, [containerRef, onLoadOlder, onNavigationFailure, onScrollToAnchor]);
+
+  const moveKeyboardFocus = React.useCallback((index: number) => {
+    const nextIndex = Math.max(0, Math.min(items.length - 1, index));
+    const item = items[nextIndex];
+    const rail = railRef.current;
+    if (!item || !rail) return;
+    pendingFocusIndexRef.current = nextIndex;
+    rail.scrollTop = Math.max(0, nextIndex * RAIL_MARKER_HEIGHT_PX - rail.clientHeight / 2);
+    setFocusedId(item.id);
+  }, [items]);
+  React.useLayoutEffect(() => {
+    const index = pendingFocusIndexRef.current;
+    if (index !== null) {
+      const item = items[index];
+      const button = item ? rowRefs.current.get(item.id) : undefined;
+      if (!button) return;
+      pendingFocusIndexRef.current = null;
+      button.focus();
+      return;
+    }
+    const focusedIndex = focusedId ? items.findIndex((item) => item.id === focusedId) : -1;
+    const fallbackIndex = focusedMarkerFallbackIndex(focusedIndex, visibleRange, items.length);
+    if (fallbackIndex === null) return;
+    const fallback = items[fallbackIndex];
+    if (!fallback) return;
+    pendingFocusIndexRef.current = fallbackIndex;
+    setFocusedId(fallback.id);
+  }, [focusedId, items, visibleRange]);
 
   const clearPreviewTimer = React.useCallback(() => {
     if (previewTimerRef.current === null) return;
@@ -214,14 +302,19 @@ export function ConversationNavigator({
   }, [previewId, updatePreviewPosition]);
 
   const updateScrub = React.useCallback((clientX: number, clientY: number) => {
-    const id = markerIdFromTarget(document.elementFromPoint(clientX, clientY));
+    const rail = railRef.current;
+    const rect = rail?.getBoundingClientRect();
+    const index = rail && rect
+      ? Math.max(0, Math.min(items.length - 1, Math.floor((clientY - rect.top + rail.scrollTop) / RAIL_MARKER_HEIGHT_PX)))
+      : -1;
+    const id = items[index]?.id ?? markerIdFromTarget(document.elementFromPoint(clientX, clientY));
     if (!id || scrubbedIdRef.current === id) return;
     scrubbedIdRef.current = id;
     setScrubbedId(id);
     scrollTo(id, "auto");
     setHoveredId(id);
     hoveredIdRef.current = id;
-  }, [scrollTo]);
+  }, [items, scrollTo]);
 
   if (!shouldRender) return null;
 
@@ -232,6 +325,9 @@ export function ConversationNavigator({
   const previewResources = previewItem?.resources ?? [];
   const visibleResources = previewResources.slice(0, 3);
   const hiddenResourceCount = Math.max(0, previewResources.length - visibleResources.length);
+  const railRange = visibleRange ?? { first: 0, last: Math.min(items.length - 1, RAIL_OVERSCAN_MARKERS * 2) };
+  const focusedIndex = focusedId ? items.findIndex((item) => item.id === focusedId) : -1;
+  const focusedMarkerMounted = isFocusedMarkerMounted(focusedIndex, railRange);
 
   return (
     <nav
@@ -269,8 +365,9 @@ export function ConversationNavigator({
           if (!scrubbingRef.current) updateHovered(null);
         }}
       >
-        <div className="flex min-h-full flex-col justify-center">
-          {items.map((item, index) => {
+        <div className="relative" style={{ height: items.length * RAIL_MARKER_HEIGHT_PX }}>
+          {items.slice(railRange.first, railRange.last + 1).map((item, offset) => {
+            const index = railRange.first + offset;
             const selected = targetIndex === index;
             const visible = visibleRange !== null && index >= visibleRange.first && index <= visibleRange.last;
             const dimVisible = visible && ((railHovered && !selected) || (scrubbing && !selected));
@@ -334,9 +431,26 @@ export function ConversationNavigator({
                   setFocusedId(null);
                   if (!hoveredIdRef.current) closePreview();
                 }}
-                aria-current={visibleRange?.first === index ? "true" : undefined}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+                    event.preventDefault();
+                    moveKeyboardFocus(index + 1);
+                  } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+                    event.preventDefault();
+                    moveKeyboardFocus(index - 1);
+                  } else if (event.key === "Home") {
+                    event.preventDefault();
+                    moveKeyboardFocus(0);
+                  } else if (event.key === "End") {
+                    event.preventDefault();
+                    moveKeyboardFocus(items.length - 1);
+                  }
+                }}
+                tabIndex={focusedMarkerMounted ? (focusedId === item.id ? 0 : -1) : (index === railRange.first ? 0 : -1)}
+                aria-current={selected ? "true" : undefined}
                 aria-label={`Jump to message ${index + 1}`}
-                className="flex h-2.5 w-9 shrink-0 cursor-pointer items-center p-0 text-left outline-none focus-visible:bg-muted/60"
+                className="absolute left-0 flex h-2.5 w-9 shrink-0 cursor-pointer items-center p-0 text-left outline-none focus-visible:bg-muted/60"
+                style={{ top: index * RAIL_MARKER_HEIGHT_PX }}
               >
                 <span
                   className="h-0.5 rounded-full transition-[width] duration-[160ms] ease-[cubic-bezier(.34,1.56,.64,1)] motion-reduce:transition-none"

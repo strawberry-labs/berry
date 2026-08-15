@@ -40,6 +40,16 @@ export class PgSqlExecutor implements SqlExecutor {
     }
   }
 
+  async session<T>(callback: (executor: SqlExecutor) => Promise<T>): Promise<T> {
+    if (!this.#pool) return callback(this);
+    const client = await this.#pool.connect();
+    try {
+      return await callback(new PgSqlExecutor(client));
+    } finally {
+      client.release();
+    }
+  }
+
   async close(): Promise<void> {
     await this.#pool?.end();
   }

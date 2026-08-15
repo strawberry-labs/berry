@@ -10,6 +10,7 @@ import {
   SessionSchema,
   TaskSchema,
   normalizeTaskForWeb,
+  type MessageHistoryPage,
   TaskStatusSchema,
   type JsonValue,
   type Message,
@@ -29,6 +30,17 @@ import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.ser
 import { garbageCollectFileIfUnreferenced } from "../files/file-lifecycle.ts";
 
 export const CLOUD_TASK_STORE = Symbol("CLOUD_TASK_STORE");
+
+export const MESSAGE_HISTORY_DEFAULT_LIMIT = 50;
+export const MESSAGE_HISTORY_MAX_LIMIT = 200;
+export const MESSAGE_HISTORY_MAX_CURSOR = "9223372036854775807";
+
+export interface ListMessagesOptions {
+  limit?: number | undefined;
+  before?: string | undefined;
+  after?: string | undefined;
+  historyRevision?: string | undefined;
+}
 
 export interface CreateTaskInput {
   workspaceId?: string | undefined;
@@ -88,6 +100,11 @@ export interface CloudTaskStore {
   updateSessionModel(sessionId: string, providerId: string, model: string): Promise<Session>;
   appendMessage(sessionId: string, input: AppendMessageInput): Promise<Message>;
   listMessages(sessionId: string): Promise<Message[]>;
+  listMessagePage(sessionId: string, options?: ListMessagesOptions): Promise<MessageHistoryPage>;
+  getMessage(sessionId: string, messageId: string): Promise<Message>;
+  getLatestUserMessage(sessionId: string): Promise<Message | null>;
+  hasCancelledMessageAfter?(sessionId: string, messageId: string): Promise<boolean>;
+  getMessagePosition(sessionId: string, messageId: string): Promise<{ message: Message; userOrdinal: number }>;
   /**
    * Drop the given message and every message after it in the session
    * (insertion order). Parts cascade. Used by edit-and-resubmit to truncate
@@ -102,6 +119,10 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   readonly #tasks = new Map<string, Task>();
   readonly #sessions = new Map<string, Session>();
   readonly #messages = new Map<string, Message[]>();
+  readonly #messageSequences = new Map<string, Map<string, number>>();
+  readonly #nextMessageSequence = new Map<string, number>();
+  readonly #messageHistoryRevisions = new Map<string, number>();
+  readonly #messageHistoryDeletionRevisions = new Map<string, number>();
   readonly #taskOwners = new Map<string, string | null>();
 
   constructor() {
@@ -312,6 +333,8 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     });
     this.#sessions.set(session.id, session);
     this.#messages.set(session.id, []);
+    this.#messageHistoryRevisions.set(session.id, 0);
+    this.#messageHistoryDeletionRevisions.set(session.id, 0);
     this.#tasks.set(task.id, TaskSchema.parse({ ...task, activeSessionId: session.id, updatedAt: now }));
     return session;
   }
@@ -366,6 +389,10 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       updatedAt: now,
     });
     this.#messages.set(sessionId, [...(this.#messages.get(sessionId) ?? []), message]);
+    const sequences = this.#messageSequences.get(sessionId) ?? new Map<string, number>();
+    sequences.set(messageId, this.#nextMessageSequence.get(sessionId) ?? 1);
+    this.#messageSequences.set(sessionId, sequences);
+    this.#nextMessageSequence.set(sessionId, (this.#nextMessageSequence.get(sessionId) ?? 1) + 1);
     return message;
   }
 
@@ -374,12 +401,113 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     return [...(this.#messages.get(sessionId) ?? [])];
   }
 
+  async getMessage(sessionId: string, messageId: string): Promise<Message> {
+    await this.getSession(sessionId);
+    const message = (this.#messages.get(sessionId) ?? []).find((candidate) => candidate.id === messageId);
+    if (!message) throw new NotFoundException(`Message not found: ${messageId}`);
+    return message;
+  }
+
+  async hasCancelledMessageAfter(sessionId: string, messageId: string): Promise<boolean> {
+    await this.getSession(sessionId);
+    const messages = this.#messages.get(sessionId) ?? [];
+    const sequences = this.#messageSequences.get(sessionId) ?? new Map<string, number>();
+    const anchor = sequences.get(messageId);
+    if (anchor === undefined) return false;
+    return messages.some((message) => (
+      message.role !== "user"
+      && message.status === "cancelled"
+      && (sequences.get(message.id) ?? 0) > anchor
+    ));
+  }
+
+  async getLatestUserMessage(sessionId: string): Promise<Message | null> {
+    await this.getSession(sessionId);
+    return [...(this.#messages.get(sessionId) ?? [])].reverse().find((message) => message.role === "user") ?? null;
+  }
+
+  async getMessagePosition(sessionId: string, messageId: string): Promise<{ message: Message; userOrdinal: number }> {
+    await this.getSession(sessionId);
+    const messages = this.#messages.get(sessionId) ?? [];
+    const index = messages.findIndex((candidate) => candidate.id === messageId);
+    if (index < 0) throw new NotFoundException(`Message not found: ${messageId}`);
+    return {
+      message: messages[index]!,
+      userOrdinal: messages.slice(0, index + 1).filter((candidate) => candidate.role === "user").length,
+    };
+  }
+
+  async listMessagePage(sessionId: string, options: ListMessagesOptions = {}): Promise<MessageHistoryPage> {
+    await this.getSession(sessionId);
+    if (options.before && options.after) throw new ConflictException("Only one message history cursor may be used");
+    const messages = [...(this.#messages.get(sessionId) ?? [])];
+    const limit = boundedMessageLimit(options.limit);
+    const before = parseMessageCursor(options.before);
+    const after = parseMessageCursor(options.after);
+    const sequences = this.#messageSequences.get(sessionId) ?? new Map<string, number>();
+    const indexed = messages.map((message, index) => ({
+      message,
+      sequence: BigInt(sequences.get(message.id) ?? index + 1),
+    }));
+    const filtered = indexed.filter(({ sequence }) =>
+      (before === null || sequence < before) && (after === null || sequence > after));
+    // The initial page and `before` pages are taken from the newest end;
+    // `after` pages move forward from a known sequence.
+    const descending = after === null;
+    const selected = descending ? filtered.slice(-limit - 1).reverse() : filtered.slice(0, limit + 1);
+    const page = selected.slice(0, limit);
+    if (descending) page.reverse();
+    const oldest = page[0]?.sequence ?? null;
+    const newest = page.at(-1)?.sequence ?? null;
+    // Existence is based on the retained sequence set, not on the next
+    // sequence counter. Deletes leave gaps, so comparing against that counter
+    // would claim that a deleted row still exists. Cursor-only empty pages also
+    // need directional flags so callers can distinguish a boundary from an
+    // empty session.
+    const hasOlder = oldest !== null
+      ? indexed.some(({ sequence }) => sequence < oldest)
+      : before !== null
+        ? indexed.some(({ sequence }) => sequence < before)
+        : after !== null
+          ? indexed.some(({ sequence }) => sequence <= after)
+          : false;
+    const hasNewer = newest !== null
+      ? indexed.some(({ sequence }) => sequence > newest)
+      : after !== null
+        ? indexed.some(({ sequence }) => sequence > after)
+        : before !== null
+          ? indexed.some(({ sequence }) => sequence >= before)
+          : false;
+    const cursorPresent = before !== null
+      ? indexed.some(({ sequence }) => sequence === before)
+      : after !== null
+        ? indexed.some(({ sequence }) => sequence === after)
+        : null;
+    return {
+      messages: page.map(({ message }) => message),
+      hasOlder,
+      hasNewer,
+      oldestSequence: oldest === null ? null : oldest.toString(),
+      newestSequence: newest === null ? null : newest.toString(),
+      cursorPresent,
+      historyRevision: String(this.#messageHistoryRevisions.get(sessionId) ?? 0),
+      historyDeletionRevision: String(this.#messageHistoryDeletionRevisions.get(sessionId) ?? 0),
+    };
+  }
+
   async deleteMessagesFrom(sessionId: string, messageId: string): Promise<void> {
     await this.getSession(sessionId);
     const messages = this.#messages.get(sessionId) ?? [];
     const index = messages.findIndex((message) => message.id === messageId);
     if (index === -1) return;
     this.#messages.set(sessionId, messages.slice(0, index));
+    const sequences = this.#messageSequences.get(sessionId);
+    if (sequences) {
+      for (const message of messages.slice(index)) sequences.delete(message.id);
+      this.#messageSequences.set(sessionId, sequences);
+    }
+    this.#messageHistoryRevisions.set(sessionId, (this.#messageHistoryRevisions.get(sessionId) ?? 0) + 1);
+    this.#messageHistoryDeletionRevisions.set(sessionId, (this.#messageHistoryDeletionRevisions.get(sessionId) ?? 0) + 1);
   }
 }
 
@@ -686,14 +814,168 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::message_part_kind, $5::jsonb, $6, $7)
       await this.getSessionInTenant(executor, sessionId);
       const rows = await executor.query<MessageRow>(
         `
-SELECT id, session_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid
 ORDER BY sequence_id ASC
         `.trim(),
         [this.tenantId, sessionId],
       );
-      return Promise.all(rows.map((row) => this.messageFromRow(executor, row)));
+      return this.messagesFromRows(executor, rows);
+    });
+  }
+
+  async getMessage(sessionId: string, messageId: string): Promise<Message> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      await this.getSessionInTenant(executor, sessionId);
+      const [row] = await executor.query<MessageRow>(
+        `
+SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+FROM messages
+WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND id = $3::uuid
+        `.trim(),
+        [this.tenantId, sessionId, messageId],
+      );
+      if (!row) throw new NotFoundException(`Message not found: ${messageId}`);
+      return this.messageFromRow(executor, row);
+    });
+  }
+
+  async hasCancelledMessageAfter(sessionId: string, messageId: string): Promise<boolean> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      await this.getSessionInTenant(executor, sessionId);
+      const [row] = await executor.query<{ exists: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1
+           FROM messages anchor
+           JOIN messages cancelled
+             ON cancelled.tenant_id = anchor.tenant_id
+            AND cancelled.session_id = anchor.session_id
+            AND cancelled.sequence_id > anchor.sequence_id
+           WHERE anchor.tenant_id = $1::uuid AND anchor.session_id = $2::uuid
+             AND anchor.id = $3::uuid
+             AND cancelled.role <> 'user'::message_role
+             AND cancelled.status = 'cancelled'::message_status
+         ) AS exists`,
+        [this.tenantId, sessionId, messageId],
+      );
+      return Boolean(row?.exists);
+    });
+  }
+
+  async getLatestUserMessage(sessionId: string): Promise<Message | null> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      await this.getSessionInTenant(executor, sessionId);
+      const [row] = await executor.query<MessageRow>(
+        `
+SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+FROM messages
+WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND role = 'user'::message_role
+ORDER BY sequence_id DESC
+LIMIT 1
+        `.trim(),
+        [this.tenantId, sessionId],
+      );
+      return row ? this.messageFromRow(executor, row) : null;
+    });
+  }
+
+  async getMessagePosition(sessionId: string, messageId: string): Promise<{ message: Message; userOrdinal: number }> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      await this.getSessionInTenant(executor, sessionId);
+      const [row] = await executor.query<MessageRow & { user_ordinal: string | number }>(
+        `
+SELECT m.id, m.session_id, m.sequence_id, m.role, m.status, m.input_tokens, m.output_tokens, m.generation_ms, m.created_at, m.updated_at,
+       (SELECT COUNT(*) FROM messages prior
+        WHERE prior.tenant_id = m.tenant_id AND prior.session_id = m.session_id
+          AND prior.role = 'user'::message_role AND prior.sequence_id <= m.sequence_id) AS user_ordinal
+FROM messages m
+WHERE m.tenant_id = $1::uuid AND m.session_id = $2::uuid AND m.id = $3::uuid
+        `.trim(),
+        [this.tenantId, sessionId, messageId],
+      );
+      if (!row) throw new NotFoundException(`Message not found: ${messageId}`);
+      return { message: await this.messageFromRow(executor, row), userOrdinal: Number(row.user_ordinal) };
+    });
+  }
+
+  async listMessagePage(sessionId: string, options: ListMessagesOptions = {}): Promise<MessageHistoryPage> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      await this.getSessionInTenant(executor, sessionId);
+      if (options.before !== undefined && options.after !== undefined) {
+        throw new ConflictException("Only one message history cursor may be used");
+      }
+      const limit = boundedMessageLimit(options.limit);
+      const before = validateMessageCursor(options.before);
+      const after = validateMessageCursor(options.after);
+      const descending = after === null;
+      const rows = await executor.query<MessageRow>(
+        `
+SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+FROM messages
+WHERE tenant_id = $1::uuid AND session_id = $2::uuid
+  AND ($3::bigint IS NULL OR sequence_id < $3::bigint)
+  AND ($4::bigint IS NULL OR sequence_id > $4::bigint)
+ORDER BY sequence_id ${descending ? "DESC" : "ASC"}
+LIMIT $5
+FOR SHARE
+        `.trim(),
+        [this.tenantId, sessionId, before, after, limit + 1],
+      );
+      const hasMoreInDirection = rows.length > limit;
+      const pageRows = rows.slice(0, limit);
+      if (descending) pageRows.reverse();
+      const messages = await this.messagesFromRows(executor, pageRows);
+      // Read the revision after the locked rows and their batched parts. A
+      // concurrent delete therefore either waits on FOR SHARE or is reflected
+      // in the revision returned to the client.
+      const [sessionRevision] = await executor.query<{ message_history_revision: string; message_history_deletion_revision: string }>(
+        `SELECT message_history_revision, message_history_deletion_revision
+         FROM sessions
+         WHERE tenant_id = $1::uuid AND id = $2::uuid`,
+        [this.tenantId, sessionId],
+      );
+      const oldest = pageRows[0]?.sequence_id;
+      const newest = pageRows.at(-1)?.sequence_id;
+      const newerAnchor = newest ?? (before === null ? null : before);
+      const olderAnchor = oldest ?? (after === null ? null : after);
+      const newerOperator = newest === undefined && before !== null ? ">=" : ">";
+      const olderOperator = oldest === undefined && after !== null ? "<=" : "<";
+      const [newerCheck, olderCheck] = await Promise.all([
+        newerAnchor === null ? Promise.resolve([{ exists: false }]) : executor.query<{ exists: boolean }>(
+          `SELECT EXISTS(
+             SELECT 1 FROM messages
+             WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND sequence_id ${newerOperator} $3::bigint
+           ) AS exists`,
+          [this.tenantId, sessionId, newerAnchor],
+        ),
+        olderAnchor === null ? Promise.resolve([{ exists: false }]) : executor.query<{ exists: boolean }>(
+          `SELECT EXISTS(
+             SELECT 1 FROM messages
+             WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND sequence_id ${olderOperator} $3::bigint
+           ) AS exists`,
+          [this.tenantId, sessionId, olderAnchor],
+        ),
+      ]);
+      const [cursorCheck] = after === null && before === null
+        ? [{ exists: false }]
+        : await executor.query<{ exists: boolean }>(
+          `SELECT EXISTS(
+             SELECT 1 FROM messages
+             WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND sequence_id = $3::bigint
+           ) AS exists`,
+          [this.tenantId, sessionId, before ?? after],
+        );
+      return {
+        messages,
+        hasOlder: Boolean(olderCheck[0]?.exists) || (descending && hasMoreInDirection),
+        hasNewer: Boolean(newerCheck[0]?.exists) || (!descending && hasMoreInDirection),
+        oldestSequence: oldest === undefined ? null : String(oldest),
+        newestSequence: newest === undefined ? null : String(newest),
+        cursorPresent: before === null && after === null ? null : Boolean(cursorCheck?.exists),
+        historyRevision: sessionRevision?.message_history_revision == null ? "0" : String(sessionRevision.message_history_revision),
+        historyDeletionRevision: sessionRevision?.message_history_deletion_revision == null ? "0" : String(sessionRevision.message_history_deletion_revision),
+      };
     });
   }
 
@@ -779,7 +1061,7 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid
   private async getMessageInTenant(executor: SqlExecutor, messageId: string): Promise<Message> {
     const [row] = await executor.query<MessageRow>(
       `
-SELECT id, session_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND id = $2::uuid
       `.trim(),
@@ -819,6 +1101,49 @@ ORDER BY ordinal ASC
       updatedAt: iso(row.updated_at),
     });
   }
+
+  private async messagesFromRows(executor: SqlExecutor, rows: readonly MessageRow[]): Promise<Message[]> {
+    if (rows.length === 0) return [];
+    const messageIds = rows.map((row) => row.id);
+    const parts = await executor.query<MessagePartRow>(
+      `
+SELECT id, message_id, type, content, ordinal, created_at
+FROM message_parts
+WHERE tenant_id = $1::uuid AND message_id = ANY($2::uuid[])
+ORDER BY message_id ASC, ordinal ASC
+      `.trim(),
+      [this.tenantId, messageIds],
+    );
+    const partsByMessage = new Map<string, MessagePartRow[]>();
+    for (const part of parts) {
+      const messageParts = partsByMessage.get(part.message_id) ?? [];
+      messageParts.push(part);
+      partsByMessage.set(part.message_id, messageParts);
+    }
+    return rows.map((row) => messageFromRowParts(row, partsByMessage.get(row.id) ?? []));
+  }
+}
+
+function boundedMessageLimit(limit: number | undefined): number {
+  if (!Number.isFinite(limit)) return MESSAGE_HISTORY_DEFAULT_LIMIT;
+  return Math.max(1, Math.min(MESSAGE_HISTORY_MAX_LIMIT, Math.floor(limit!)));
+}
+
+function parseMessageCursor(cursor: string | undefined): bigint | null {
+  if (cursor === undefined) return null;
+  if (!/^[1-9]\d*$/.test(cursor)) throw new ConflictException("Invalid message history cursor");
+  const value = BigInt(cursor);
+  if (value > BigInt(MESSAGE_HISTORY_MAX_CURSOR)) throw new ConflictException("Message history cursor is too large");
+  return value;
+}
+
+function validateMessageCursor(cursor: string | undefined): string | null {
+  if (cursor === undefined) return null;
+  if (!/^[1-9]\d*$/.test(cursor)) throw new ConflictException("Invalid message history cursor");
+  if (BigInt(cursor) > BigInt(MESSAGE_HISTORY_MAX_CURSOR)) {
+    throw new ConflictException("Message history cursor is too large");
+  }
+  return cursor;
 }
 
 interface TaskRow {
@@ -869,6 +1194,7 @@ interface SessionRow {
 interface MessageRow {
   id: string;
   session_id: string;
+  sequence_id: number | string;
   role: string;
   status: string;
   input_tokens: number;
@@ -885,6 +1211,28 @@ interface MessagePartRow {
   content: unknown;
   ordinal: number;
   created_at: Date | string;
+}
+
+function messageFromRowParts(row: MessageRow, parts: MessagePartRow[]): Message {
+  return MessageSchema.parse({
+    id: row.id,
+    sessionId: row.session_id,
+    role: row.role,
+    status: row.status,
+    parts: parts.map((part) => ({
+      id: part.id,
+      messageId: part.message_id,
+      kind: part.type,
+      content: part.content as JsonValue,
+      position: part.ordinal,
+      createdAt: iso(part.created_at),
+    })),
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    generationMs: row.generation_ms,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  });
 }
 
 function taskFromRow(row: TaskRow): Task {
