@@ -99,7 +99,8 @@ const DURABLE_PREPARING_ADMISSION_STALE_MS = 120_000;
 const CreateTaskRequestSchema = z.object({
   workspaceId: z.string().min(1).optional(),
   workspaceKind: WorkspaceKindSchema.default("project"),
-  conversationKind: ConversationKindSchema.default("chat"),
+  // Legacy clients may still send this field. It is intentionally ignored.
+  conversationKind: ConversationKindSchema.optional(),
   title: z.string().trim().min(1).optional(),
   permissionMode: PermissionModeSchema.optional(),
   modelProviderId: z.string().nullable().optional(),
@@ -949,13 +950,16 @@ export class AgentApiController {
     const request = parseBody(CreateTaskRequestSchema, body);
     const tenantId = tenantIdFromRequest(httpRequest);
     const userId = httpRequest.auth?.user.id ?? null;
-    const mode = request.conversationKind;
+    // `conversationKind` is accepted only as a legacy input. Web tasks use one
+    // normal assistant flow, so model routing never branches on that value.
+    const mode = "chat" as const;
+    const { conversationKind: _legacyConversationKind, ...taskRequest } = request;
     const explicitModel = request.model ?? null;
     const requestedProviderId = explicitModel ? request.modelProviderId ?? null : null;
     const catalog = await this.runtimeConfig.catalog(tenantId);
     if (!catalog) {
       return this.store.createTask({
-        ...request,
+        ...taskRequest,
         permissionMode: "full-access",
         ownerUserId: userId,
       });
@@ -998,7 +1002,7 @@ export class AgentApiController {
       });
     }
     return this.store.createTask({
-      ...request,
+      ...taskRequest,
       permissionMode: "full-access",
       modelProviderId: modelDecision.providerId,
       model: modelDecision.model,
@@ -1403,7 +1407,7 @@ export class AgentApiController {
       resolveAdmissionPreparation(departmentIdWork),
     ]);
     await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
-    const mode = conversationKindFromTask(task);
+    const mode = "chat" as const;
     const modelDecision = await this.modelGovernance.resolve({
       tenantId,
       mode,
@@ -2591,14 +2595,10 @@ function resolveImageReferenceUrls(
   return [...new Set(urls)].slice(0, 16);
 }
 
-function conversationKindFromTask(task: { conversationKind: ConversationKind }): ConversationKind {
-  return task.conversationKind;
-}
-
 function modelGovernanceMessage(reason: string): string {
-  if (reason === "mode_default_enforced") return "The organization enforces a different default model for this mode.";
+  if (reason === "mode_default_enforced") return "The organization enforces a different default model for this task.";
   if (reason === "model_blocked") return "The requested model is blocked by organization policy.";
-  if (reason === "mode_not_allowed") return "The requested model is not allowed for this mode.";
+  if (reason === "mode_not_allowed") return "The requested model is not allowed by organization policy.";
   if (reason === "not_in_enforced_allowlist") return "The requested model is not in the organization allow-list.";
   if (reason === "blocked_by_organization_rule") return "The requested model is blocked for this organization.";
   if (reason === "blocked_by_department_rule") return "The requested model is blocked for your department.";

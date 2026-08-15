@@ -1,6 +1,6 @@
 import type { Task, Workspace } from "@berry/shared";
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@berry/desktop-ui/components/ui/command";
-import { CodeXml, MessageSquare, Settings, CircleHelp } from "@berry/desktop-ui/lib/icons";
+import { MessageSquare, Settings, CircleHelp } from "@berry/desktop-ui/lib/icons";
 
 export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpenTask, onSettings, onHelp }: {
   open: boolean;
@@ -37,17 +37,16 @@ export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpe
         </CommandGroup>
         <CommandGroup heading="Tasks">
           {tasks.map((task) => {
-            const Icon = task.conversationKind === "code" ? CodeXml : MessageSquare;
             const provenance = workspaceNames.get(task.workspaceId) ?? "Tasks";
             return (
               <CommandItem
                 key={task.id}
-                value={`${task.title} ${task.conversationKind} ${provenance} ${task.status}`}
+                value={`${task.title} ${provenance} ${task.status}`}
                 onSelect={() => select(() => onOpenTask(task.id))}
               >
-                <Icon />
+                <MessageSquare />
                 <span className="min-w-0 flex-1 truncate">{task.title}</span>
-                <span className="text-xs text-muted-foreground">{task.conversationKind === "code" ? "Code" : "Task"} · {provenance} · {task.deletedAt ? "deleted" : task.archived ? "archived" : task.status}</span>
+                <span className="text-xs text-muted-foreground">Task · {provenance} · {task.deletedAt ? "deleted" : task.archived ? "archived" : task.status}</span>
               </CommandItem>
             );
           })}

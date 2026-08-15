@@ -1,11 +1,17 @@
 import * as React from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { ArchivedChatsSearchSchema } from "@berry/shared";
+import { z } from "zod";
 import { PersonalSettingsScreen } from "@/components/management/personal-settings-screen";
 import { useManagementRouteContext } from "@/components/management/management-route-context";
 
 export const Route = createFileRoute("/settings/$tab")({
-  validateSearch: ArchivedChatsSearchSchema.partial().passthrough(),
+  // Search state is partial while the route is mounted; the screen applies
+  // the shared defaulting/legacy-kind normalization when it reads it.
+  validateSearch: z.object({
+    q: z.string().optional(),
+    workspace: z.string().optional(),
+    state: z.enum(["archived", "deleted", "all"]).optional(),
+  }).passthrough(),
   component: PersonalSettingsRoute,
 });
 

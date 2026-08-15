@@ -264,7 +264,13 @@ export class ModelGovernanceService {
   }): Promise<ModelGovernanceDecision> {
     const policies = await this.repository.listPolicies(input.tenantId);
     const defaults = await this.repository.listDefaults(input.tenantId);
-    const modeDefault = defaults.find((entry) => entry.mode === input.mode) ?? null;
+    // New web tasks use the normal task policy. If an older tenant has only a
+    // code/cowork default row, reuse that row as a compatibility fallback so a
+    // migration does not strand existing organizations without a model.
+    const modeDefault = defaults.find((entry) => entry.mode === input.mode)
+      ?? defaults.find((entry) => entry.mode === "chat")
+      ?? defaults[0]
+      ?? null;
     const requestedProviderId = input.providerId ?? null;
     const requestedModel = input.model ?? null;
     const providerId = requestedProviderId ?? modeDefault?.providerId ?? "";
@@ -280,7 +286,14 @@ export class ModelGovernanceService {
     if (!providerId || !model) return decision(input, providerId, model, false, false, "no_model_selected", policy, modeDefault, null);
     if (enforcedDefaultMismatch) return decision(input, providerId, model, false, true, "mode_default_enforced", policy, modeDefault, null);
     if (policy?.status === "blocked") return decision(input, providerId, model, false, policy.enforce, "model_blocked", policy, modeDefault, null);
-    if (policy && !policy.modeAllow.includes(input.mode)) return decision(input, providerId, model, false, policy.enforce, "mode_not_allowed", policy, modeDefault, null);
+    // Normal web tasks no longer have a mode dimension. Preserve an empty
+    // legacy allowlist as an explicit deny, while treating a non-empty
+    // historical allowlist (including code-only rows) as available to the
+    // unified task. Legacy non-chat callers retain the old per-kind check.
+    const taskAllowed = input.mode === "chat"
+      ? (policy?.modeAllow.length ?? 0) > 0
+      : Boolean(policy?.modeAllow.includes(input.mode));
+    if (policy && !taskAllowed) return decision(input, providerId, model, false, policy.enforce, "mode_not_allowed", policy, modeDefault, null);
     if (!policy && enforcedAllowList) return decision(input, providerId, model, false, true, "not_in_enforced_allowlist", null, modeDefault, null);
 
     return this.#resolveAccess(input, providerId, model, policy, modeDefault);
@@ -618,7 +631,7 @@ DO UPDATE SET
   capabilities = excluded.capabilities,
   status = excluded.status,
   enforce = excluded.enforce,
-  mode_allow = excluded.mode_allow,
+  mode_allow = CASE WHEN $12::boolean THEN excluded.mode_allow ELSE model_governance_policies.mode_allow END,
   metadata = excluded.metadata,
   updated_at = now()
 RETURNING *
@@ -635,6 +648,7 @@ RETURNING *
           input.enforce ?? false,
           JSON.stringify(input.modeAllow ?? ["chat", "code"]),
           JSON.stringify(input.metadata ?? {}),
+          input.modeAllow !== undefined,
         ],
       );
       return modelPolicyFromRow(rows[0]!);

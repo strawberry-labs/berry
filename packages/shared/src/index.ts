@@ -275,6 +275,16 @@ export const TaskSchema = z.preprocess((value) => {
 }, TaskFieldsSchema);
 export type Task = z.infer<typeof TaskSchema>;
 
+/**
+ * The web product has one task experience. Keep the persisted conversation
+ * kind readable for desktop/host compatibility, but never let a legacy web
+ * record select a different presentation or creation flow.
+ */
+export function normalizeTaskForWeb(value: unknown): Task {
+  const task = TaskSchema.parse(value);
+  return { ...task, conversationKind: "chat" };
+}
+
 export const DeploymentModeSchema = z.enum(["shared", "dedicated", "selfhost"]);
 export type DeploymentMode = z.infer<typeof DeploymentModeSchema>;
 
@@ -3355,13 +3365,24 @@ export const AdminAnalyticsSearchSchema = UsageAnalyticsQueryFieldsSchema.partia
   view: z.enum(["overview", "people", "models", "agents", "requests", "reports"]).optional(),
 });
 export type AdminAnalyticsSearch = z.infer<typeof AdminAnalyticsSearchSchema>;
-export const ArchivedChatsSearchSchema = z.object({
+const ArchivedTasksSearchFieldsSchema = z.object({
   q: z.string().trim().max(200).optional(),
-  kind: z.enum(["all", "chat", "code"]).default("all"),
   workspace: z.string().trim().max(200).default("all"),
   state: z.enum(["archived", "deleted", "all"]).default("archived"),
 });
-export type ArchivedChatsSearch = z.infer<typeof ArchivedChatsSearchSchema>;
+
+/** Legacy `kind` query parameters are deliberately ignored for old links. */
+export const ArchivedTasksSearchSchema = z.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const { kind: _legacyKind, ...rest } = value as Record<string, unknown>;
+  return rest;
+}, ArchivedTasksSearchFieldsSchema);
+export type ArchivedTasksSearch = z.infer<typeof ArchivedTasksSearchSchema>;
+
+/** @deprecated Use ArchivedTasksSearchSchema. Kept as a compatibility alias. */
+export const ArchivedChatsSearchSchema = ArchivedTasksSearchSchema;
+/** @deprecated Use ArchivedTasksSearch. */
+export type ArchivedChatsSearch = ArchivedTasksSearch;
 
 export const UsageSeriesPointSchema = z.object({
   ts: ISODateSchema, billedCostMicros: z.string(), requests: z.number().int().nonnegative(), tokens: z.number().int().nonnegative(),

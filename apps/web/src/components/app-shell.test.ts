@@ -3,7 +3,7 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingChatTurnModelOverride, hydratedExistingChatModel, initialCloudContent, isInterruptedTurnAvailable, mergeTaskSnapshots, newChatModelOverride, preferredNewChatModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
@@ -54,45 +54,45 @@ describe("cloud shell bootstrap", () => {
     expect(shouldKeepTurnPendingAfterFailedConfirmation(new BerryApiError("Invalid request", 400, null))).toBe(false);
   });
 
-  it("prefers a valid browser model for new chats and otherwise uses the organization default", () => {
+  it("prefers a valid browser model for new tasks and otherwise uses the organization default", () => {
     const organization = { providerId: "router", model: "default-model" };
-    expect(preferredNewChatModel(
+    expect(preferredNewTaskModel(
       { providerId: "router", model: "browser-model" },
       organization,
       [{ id: "default-model" }, { id: "browser-model" }],
     )).toEqual({ providerId: "router", model: "browser-model", source: "user" });
-    expect(preferredNewChatModel(
+    expect(preferredNewTaskModel(
       { providerId: "router", model: "retired-model" },
       organization,
       [{ id: "default-model" }],
     )).toEqual({ ...organization, source: "organization" });
-    expect(preferredNewChatModel(
+    expect(preferredNewTaskModel(
       { providerId: "retired-provider", model: "default-model" },
       organization,
       [{ id: "default-model" }],
     )).toEqual({ providerId: "retired-provider", model: "default-model", source: "user" });
-    expect(preferredNewChatModel(
+    expect(preferredNewTaskModel(
       { providerId: "router", model: "browser-model" },
       organization,
       [],
     )).toEqual({ providerId: "router", model: "browser-model", source: "user" });
   });
 
-  it("never leaks a cached new-chat model into an existing chat while its session snapshot loads", async () => {
+  it("never leaks a cached new-task model into an existing task while its session snapshot loads", async () => {
     let finishLoading!: (selection: { providerId: string; model: string }) => void;
     const delayedSessionModel = new Promise<{ providerId: string; model: string }>((resolve) => {
       finishLoading = resolve;
     });
 
-    expect(existingChatTurnModelOverride(null)).toEqual({});
-    const hydrated = hydratedExistingChatModel(delayedSessionModel, () => null);
+    expect(existingTaskTurnModelOverride(null)).toEqual({});
+    const hydrated = hydratedExistingTaskModel(delayedSessionModel, () => null);
     finishLoading({ providerId: "session-provider", model: "session-model" });
     await expect(hydrated).resolves.toEqual({
       providerId: "session-provider",
       model: "session-model",
       source: "session",
     });
-    expect(existingChatTurnModelOverride(null)).toEqual({});
+    expect(existingTaskTurnModelOverride(null)).toEqual({});
   });
 
   it("keeps an explicit in-session model change when delayed hydration completes", async () => {
@@ -101,7 +101,7 @@ describe("cloud shell bootstrap", () => {
     const delayedSessionModel = new Promise<{ providerId: string; model: string }>((resolve) => {
       finishLoading = resolve;
     });
-    const hydrated = hydratedExistingChatModel(delayedSessionModel, () => explicit);
+    const hydrated = hydratedExistingTaskModel(delayedSessionModel, () => explicit);
     explicit = { providerId: "failover-provider", model: "selected-model" };
     finishLoading({ providerId: "original-provider", model: "original-model" });
 
@@ -109,19 +109,19 @@ describe("cloud shell bootstrap", () => {
       ...explicit,
       source: "user",
     });
-    expect(existingChatTurnModelOverride(explicit)).toEqual({
+    expect(existingTaskTurnModelOverride(explicit)).toEqual({
       provider: { id: "failover-provider" },
       model: "selected-model",
     });
   });
 
-  it("sends only a browser override when creating a chat", () => {
-    expect(newChatModelOverride("user", "router", "browser-model")).toEqual({
+  it("sends only a browser override when creating a task", () => {
+    expect(newTaskModelOverride("user", "router", "browser-model")).toEqual({
       modelProviderId: "router",
       model: "browser-model",
     });
-    expect(newChatModelOverride("organization", "router", "default-model")).toEqual({});
-    expect(newChatModelOverride("session", "router", "previous-task-model")).toEqual({});
+    expect(newTaskModelOverride("organization", "router", "default-model")).toEqual({});
+    expect(newTaskModelOverride("session", "router", "previous-task-model")).toEqual({});
   });
 
   it("aborts and scopes interruption cancellation to a pending admission", () => {

@@ -9,7 +9,7 @@ import {
   MobileDeviceRegistrationSchema,
   MessageDraftSchema,
   AlertRuleCreateSchema,
-  ArchivedChatsSearchSchema,
+  ArchivedTasksSearchSchema,
   BulkLimitMutationSchema,
   EffectiveLimitSchema,
   FinancialMutationSchema,
@@ -23,6 +23,7 @@ import {
   TerminalSessionSchema,
   TaskGroupSchema,
   TaskSchema,
+  normalizeTaskForWeb,
   UiModeSchema,
   WorkspaceSchema,
   resolveModelCapabilities,
@@ -247,12 +248,13 @@ describe("conversation kind compatibility", () => {
     updatedAt: "2026-07-20T00:00:00.000Z",
   };
 
-  it("prefers the durable kind and decodes old task rows deterministically", () => {
+  it("keeps host compatibility while normalizing web tasks", () => {
     expect(TaskSchema.parse({ ...baseTask, conversationKind: "chat", uiMode: "code" }).conversationKind).toBe("chat");
     expect(TaskSchema.parse({ ...baseTask, uiMode: "code" }).conversationKind).toBe("code");
     expect(TaskSchema.parse({ ...baseTask, uiMode: "cowork" }).conversationKind).toBe("chat");
     expect(TaskSchema.parse({ ...baseTask, uiMode: null, worktreePath: "/tmp/worktree" }).conversationKind).toBe("code");
     expect(TaskSchema.parse({ ...baseTask, uiMode: null }).conversationKind).toBe("chat");
+    expect(normalizeTaskForWeb({ ...baseTask, uiMode: "code" }).conversationKind).toBe("chat");
   });
 
   it("defaults legacy workspaces to projects without inventing an owner", () => {
@@ -582,10 +584,10 @@ describe("shared slash commands", () => {
   });
 });
 
-describe("ArchivedChatsSearchSchema", () => {
+describe("ArchivedTasksSearchSchema", () => {
   it("defaults archive filters and rejects unsupported states", () => {
-    expect(ArchivedChatsSearchSchema.parse({})).toEqual({ kind: "all", workspace: "all", state: "archived" });
-    expect(ArchivedChatsSearchSchema.parse({ q: "release", kind: "code", workspace: "workspace_1", state: "deleted" })).toMatchObject({ q: "release", kind: "code", state: "deleted" });
-    expect(() => ArchivedChatsSearchSchema.parse({ state: "active" })).toThrow();
+    expect(ArchivedTasksSearchSchema.parse({})).toEqual({ workspace: "all", state: "archived" });
+    expect(ArchivedTasksSearchSchema.parse({ q: "release", kind: "code", workspace: "workspace_1", state: "deleted" })).toMatchObject({ q: "release", workspace: "workspace_1", state: "deleted" });
+    expect(() => ArchivedTasksSearchSchema.parse({ state: "active" })).toThrow();
   });
 });

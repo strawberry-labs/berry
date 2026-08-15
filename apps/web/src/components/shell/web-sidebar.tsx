@@ -88,13 +88,13 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, chatsSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectChats, onOpenTask, onToggleConversationPinned, onArchiveConversation, onDeleteConversation, onRenameConversation, onShareConversation, onToggleProjectPinned, onRenameProject, onArchiveProjectChats, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onUsage, onSettings, onSignOut }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onUsage, onSettings, onSignOut }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
   activeWorkspaceId: string;
   activeTaskId: string | null;
-  chatsSelected: boolean;
+  tasksSelected: boolean;
   librarySelected: boolean;
   management: {
     kind: ManagementKind;
@@ -112,16 +112,16 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   onNewTask: () => void;
   onCreateProject: () => void;
   onSelectWorkspace: (id: string) => void;
-  onSelectChats: () => void;
+  onSelectTasks: () => void;
   onOpenTask: (id: string) => void;
-  onToggleConversationPinned: (task: Task) => void | Promise<void>;
-  onArchiveConversation: (task: Task) => void | Promise<void>;
-  onDeleteConversation: (task: Task) => void | Promise<void>;
-  onRenameConversation: (task: Task) => void | Promise<void>;
-  onShareConversation: (task: Task) => void | Promise<void>;
+  onToggleTaskPinned: (task: Task) => void | Promise<void>;
+  onArchiveTask: (task: Task) => void | Promise<void>;
+  onDeleteTask: (task: Task) => void | Promise<void>;
+  onRenameTask: (task: Task) => void | Promise<void>;
+  onShareTask: (task: Task) => void | Promise<void>;
   onToggleProjectPinned: (workspace: Workspace) => void | Promise<void>;
   onRenameProject: (workspace: Workspace, name: string) => void | Promise<void>;
-  onArchiveProjectChats: (workspace: Workspace, tasks: Task[]) => void | Promise<void>;
+  onArchiveProjectTasks: (workspace: Workspace, tasks: Task[]) => void | Promise<void>;
   onRemoveProject: (workspace: Workspace) => void | Promise<void>;
   onRevealProject: (workspace: Workspace) => void | Promise<void>;
   onUploadToProject: (workspace: Workspace, file: File, onProgress: (ratio: number) => void) => Promise<void>;
@@ -138,29 +138,28 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
       {management ? (
         <WebSettingsNavigation {...management} />
       ) : <BerryConversationSidebarContent
-        selectedKind="chat"
         showKindControl={false}
         pinnedConversations={allTasks.filter((task) => task.pinned)}
         projects={workspaces.map((workspace) => ({ workspace, conversations: tasksByWorkspace[workspace.id] ?? [] }))}
         generalConversations={generalTasks}
-        chatsSelected={chatsSelected}
+        chatsSelected={tasksSelected}
         activeWorkspaceId={activeWorkspaceId}
         activeConversationId={activeTaskId}
         projectsError={loadError || null}
         onKindChange={() => {}}
         onSelectProject={onSelectWorkspace}
-        onSelectChats={onSelectChats}
+        onSelectChats={onSelectTasks}
         onOpenConversation={onOpenTask}
-        onToggleConversationPinned={onToggleConversationPinned}
-        onArchiveConversation={onArchiveConversation}
-        onDeleteConversation={onDeleteConversation}
-        onRenameConversation={onRenameConversation}
-        onShareConversation={onShareConversation}
+        onToggleConversationPinned={onToggleTaskPinned}
+        onArchiveConversation={onArchiveTask}
+        onDeleteConversation={onDeleteTask}
+        onRenameConversation={onRenameTask}
+        onShareConversation={onShareTask}
         onCreateProject={onCreateProject}
         onNewProjectConversation={(workspace) => onSelectWorkspace(workspace.id)}
         onAfterNavigate={() => { if (isMobile) setOpenMobile(false); }}
         formatAge={timeAgo}
-        renderProjectAction={(workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveChats={onArchiveProjectChats} onRemove={onRemoveProject} onReveal={onRevealProject} onUpload={onUploadToProject} />}
+        renderProjectAction={(workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveTasks={onArchiveProjectTasks} onRemove={onRemoveProject} onReveal={onRevealProject} onUpload={onUploadToProject} />}
         commands={(
           <>
             <SidebarMenu className="berry-sidebar-commands">
@@ -252,12 +251,12 @@ export function formatAllowanceResetDate(value: string): string {
   }).format(new Date(value));
 }
 
-function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveChats, onRemove, onReveal, onUpload }: {
+function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onArchiveTasks, onRemove, onReveal, onUpload }: {
   workspace: Workspace;
   tasks: Task[];
   onTogglePinned: (workspace: Workspace) => void | Promise<void>;
   onRename: (workspace: Workspace, name: string) => void | Promise<void>;
-  onArchiveChats: (workspace: Workspace, tasks: Task[]) => void | Promise<void>;
+  onArchiveTasks: (workspace: Workspace, tasks: Task[]) => void | Promise<void>;
   onRemove: (workspace: Workspace) => void | Promise<void>;
   onReveal: (workspace: Workspace) => void | Promise<void>;
   onUpload: (workspace: Workspace, file: File, onProgress: (ratio: number) => void) => Promise<void>;
@@ -301,7 +300,7 @@ function WebProjectRowActions({ workspace, tasks, onTogglePinned, onRename, onAr
       </Dialog>
 
       <AlertDialog open={archiveOpen} onOpenChange={setArchiveOpen}>
-        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Archive tasks in {workspace.name}?</AlertDialogTitle><AlertDialogDescription>This archives {tasks.length} task{tasks.length === 1 ? "" : "s"}. Archived tasks remain recoverable.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void onArchiveChats(workspace, tasks)}>Archive tasks</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
+        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Archive tasks in {workspace.name}?</AlertDialogTitle><AlertDialogDescription>This archives {tasks.length} task{tasks.length === 1 ? "" : "s"}. Archived tasks remain recoverable.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void onArchiveTasks(workspace, tasks)}>Archive tasks</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
       </AlertDialog>
 
       <AlertDialog open={removeOpen} onOpenChange={setRemoveOpen}>

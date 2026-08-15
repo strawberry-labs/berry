@@ -168,6 +168,29 @@ describe("model governance scoped access", () => {
     })).rejects.toThrow("must declare vision support");
   });
 
+  it("maps non-empty legacy mode allowlists to the unified task while preserving empty deny", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    await service.upsertPolicy({
+      tenantId,
+      providerId: "router",
+      model: "legacy-code-only",
+      status: "allowed",
+      modeAllow: ["code"],
+    });
+    await service.upsertPolicy({
+      tenantId,
+      providerId: "router",
+      model: "legacy-denied",
+      status: "allowed",
+      modeAllow: [],
+    });
+
+    await expect(service.resolve({ tenantId, mode: "chat", providerId: "router", model: "legacy-code-only" }))
+      .resolves.toMatchObject({ allowed: true, model: "legacy-code-only" });
+    await expect(service.resolve({ tenantId, mode: "chat", providerId: "router", model: "legacy-denied" }))
+      .resolves.toMatchObject({ allowed: false, reason: "mode_not_allowed" });
+  });
+
   it("stores chat defaults as overridable while preserving code enforcement", async () => {
     const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
 

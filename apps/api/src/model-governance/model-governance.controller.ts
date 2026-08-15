@@ -40,7 +40,10 @@ const UpsertModelPolicyRequestSchema = z.object({
   capabilities: ModelCapabilitiesSchema.optional(),
   status: z.enum(["allowed", "blocked"]).optional(),
   enforce: z.boolean().optional(),
-  modeAllow: z.array(ConversationKindSchema).optional(),
+  // Accepted for wire compatibility with older desktop clients. The web
+  // policy surface no longer writes mode-specific policy values; upsertPolicy
+  // deliberately strips this field before calling the repository.
+  modeAllow: z.array(z.enum(["chat", "code", "cowork"])).optional(),
   metadata: JsonValueSchema.optional(),
 }).strict();
 
@@ -51,7 +54,9 @@ const UpsertModelDefaultRequestSchema = z.object({
 }).strict();
 
 const ResolveModelRequestSchema = z.object({
-  mode: ConversationKindSchema,
+  // Kept optional for older clients; all requests now resolve the one task
+  // experience regardless of any legacy mode value.
+  mode: ConversationKindSchema.optional(),
   providerId: z.string().trim().min(1).nullable().optional(),
   model: z.string().trim().min(1).nullable().optional(),
 }).strict();
@@ -81,6 +86,8 @@ export class ModelGovernanceController {
     const stored = await this.models.listModels(tenantId, { includeBlocked: true });
     const synchronized = synchronizeRuntimeModels(tenantId, stored)
       .filter((policy) => includeBlockedModels || policy.status === "allowed")
+      // Legacy `?mode=` remains a read-only compatibility filter. The web
+      // catalog no longer sends it or renders separate mode choices.
       .filter((policy) => !parsedMode || policy.modeAllow.includes(parsedMode));
     return z.array(OrgModelPolicySchema).parse(synchronized);
   }
@@ -89,7 +96,8 @@ export class ModelGovernanceController {
   async upsertPolicy(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
     await this.requirePermission(request, tenantId, "models:write");
     const parsed = parseBody(UpsertModelPolicyRequestSchema, body);
-    const policy = OrgModelPolicySchema.parse(await this.models.upsertPolicy({ tenantId, ...parsed }));
+    const { modeAllow: _legacyModeAllow, ...taskPolicy } = parsed;
+    const policy = OrgModelPolicySchema.parse(await this.models.upsertPolicy({ tenantId, ...taskPolicy }));
     await this.audit?.append({
       tenantId,
       actorUserId: request.auth?.user.id ?? null,
@@ -151,18 +159,32 @@ export class ModelGovernanceController {
     return z.array(OrgModelDefaultSchema).parse(await this.models.listDefaults(tenantId));
   }
 
+  @Put("/default")
+  async upsertTaskDefault(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
+    return this.saveTaskDefault(request, tenantId, body);
+  }
+
+  /** Compatibility route for old clients; the web client uses `/default`. */
   @Put("/defaults/:mode")
   async upsertDefault(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Param("mode") mode: string, @Body() body: unknown) {
+    return this.saveLegacyDefault(request, tenantId, parseConversationKind(mode), body);
+  }
+
+  private async saveTaskDefault(request: AuthenticatedRequest, tenantId: string, body: unknown) {
+    return this.saveLegacyDefault(request, tenantId, "chat", body);
+  }
+
+  private async saveLegacyDefault(request: AuthenticatedRequest, tenantId: string, mode: "chat" | "code", body: unknown) {
     await this.requirePermission(request, tenantId, "models:write");
     const parsed = parseBody(UpsertModelDefaultRequestSchema, body);
-    const modelDefault = OrgModelDefaultSchema.parse(await this.models.upsertDefault({ tenantId, mode: parseConversationKind(mode), ...parsed }));
+    const modelDefault = OrgModelDefaultSchema.parse(await this.models.upsertDefault({ tenantId, mode, ...parsed }));
     await this.audit?.append({
       tenantId,
       actorUserId: request.auth?.user.id ?? null,
       category: "models",
       action: "default-upserted",
       targetType: "model_default",
-      targetId: modelDefault.mode,
+      targetId: mode === "chat" ? "task" : mode,
       after: modelDefault as never,
       metadata: { surface: "admin-api" },
     });
@@ -219,7 +241,9 @@ export class ModelGovernanceController {
     const membership = userId ? await this.identity.getMembership(tenantId, userId) : null;
     return ModelGovernanceDecisionSchema.parse(await this.models.resolve({
       tenantId,
-      ...parsed,
+      mode: parsed.mode ?? "chat",
+      providerId: parsed.providerId,
+      model: parsed.model,
       userId,
       departmentId: membership?.primaryDepartmentId ?? membership?.departmentIds[0] ?? null,
     }));
@@ -460,7 +484,7 @@ function parseQuery<TSchema extends z.ZodTypeAny>(schema: TSchema, query: unknow
 }
 
 function parseConversationKind(value: string) {
-  const result = ConversationKindSchema.safeParse(value);
+  const result = ConversationKindSchema.safeParse(value === "cowork" ? "chat" : value);
   if (!result.success) throw new BadRequestException(result.error.flatten());
   return result.data;
 }

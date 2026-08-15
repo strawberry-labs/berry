@@ -114,6 +114,7 @@ import {
   SsoConnectionSchema,
   SessionSchema,
   TaskSchema,
+  normalizeTaskForWeb,
   TurnStateSchema,
   WorkspaceSchema,
   type AgentStreamEvent,
@@ -274,7 +275,6 @@ export interface BerryApiClientOptions {
 export interface CreateTaskRequest {
   workspaceId?: string | undefined;
   workspaceKind?: "project" | "general" | undefined;
-  conversationKind?: "chat" | "code" | undefined;
   title?: string | undefined;
   permissionMode?: PermissionMode | undefined;
   modelProviderId?: string | null | undefined;
@@ -286,7 +286,6 @@ export interface UpdateTaskRequest {
   status?: "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled" | undefined;
   pinned?: boolean | undefined;
   archived?: boolean | undefined;
-  conversationKind?: "chat" | "code" | undefined;
   read?: boolean | undefined;
   readThrough?: string | undefined;
 }
@@ -492,6 +491,9 @@ export interface UpsertOrgModelPolicyRequest {
   metadata?: Record<string, unknown> | undefined;
 }
 
+/** The web policy surface has one normal task experience. */
+export type UpsertOrgTaskModelPolicyRequest = Omit<UpsertOrgModelPolicyRequest, "modeAllow">;
+
 export interface UpsertOrgModelDefaultRequest {
   providerId: string;
   model: string;
@@ -504,6 +506,9 @@ export interface ResolveOrgModelRequest {
   model?: string | null | undefined;
 }
 
+/** Mode-free request used by the web task runtime. */
+export type ResolveOrgTaskModelRequest = Omit<ResolveOrgModelRequest, "mode">;
+
 export type PublishManagedPolicyRequest = ManagedPolicyPublishRequest;
 export type UpsertAuditExportConfigRequest = CloudAuditExportConfigUpsert;
 export type UpdateAuditSettingsRequest = CloudAuditSettingsUpdate;
@@ -512,7 +517,7 @@ export type CreateBillingMeterEventRequest = z.input<typeof BillingMeterEventCre
 export type RegisterMobileDeviceRequest = MobileDeviceRegistrationCreate;
 
 export const CreateTaskResponseSchema = z.object({
-  task: TaskSchema,
+  task: TaskSchema.transform(normalizeTaskForWeb),
   session: SessionSchema,
 });
 export type CreateTaskResponse = z.output<typeof CreateTaskResponseSchema>;
@@ -671,11 +676,11 @@ export class BerryApiClient {
     if (filter.offset !== undefined) params.set("offset", String(filter.offset));
     if (filter.taskIds) params.set("taskIds", [...new Set(filter.taskIds)].join(","));
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
-    return this.#request(`/v1/tasks${suffix}`, z.array(TaskSchema));
+    return this.#request(`/v1/tasks${suffix}`, z.array(TaskSchema.transform(normalizeTaskForWeb)));
   }
 
   async getTask(taskId: string): Promise<Task> {
-    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, TaskSchema);
+    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, TaskSchema.transform(normalizeTaskForWeb));
   }
 
   async ensureTaskWorkspace(taskId: string): Promise<CloudWorkspaceState> {
@@ -1010,18 +1015,18 @@ export class BerryApiClient {
   }
 
   async updateTask(taskId: string, input: UpdateTaskRequest): Promise<Task> {
-    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, TaskSchema, {
+    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, TaskSchema.transform(normalizeTaskForWeb), {
       method: "PATCH",
       body: input,
     });
   }
 
   async deleteTask(taskId: string): Promise<Task> {
-    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, TaskSchema, { method: "DELETE" });
+    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}`, TaskSchema.transform(normalizeTaskForWeb), { method: "DELETE" });
   }
 
   async restoreTask(taskId: string): Promise<Task> {
-    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}/restore`, TaskSchema, { method: "POST" });
+    return this.#request(`/v1/tasks/${encodeURIComponent(taskId)}/restore`, TaskSchema.transform(normalizeTaskForWeb), { method: "POST" });
   }
 
   async createSession(taskId: string, input: { parentSessionId?: string | null | undefined; permissionMode?: PermissionMode | undefined } = {}): Promise<Session> {
@@ -1432,6 +1437,11 @@ export class BerryApiClient {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models${suffix}`, z.array(OrgModelPolicySchema));
   }
 
+  async listOrgTaskModels(tenantId: string, filter: { includeBlocked?: boolean | undefined } = {}): Promise<OrgModelPolicy[]> {
+    const suffix = filter.includeBlocked ? "?includeBlocked=true" : "";
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models${suffix}`, z.array(OrgModelPolicySchema));
+  }
+
   async listOrganizationModelProviders(tenantId: string): Promise<OrganizationModelProvider[]> {
     return this.#requestTyped(`/v1/orgs/${encodeURIComponent(tenantId)}/providers`);
   }
@@ -1468,12 +1478,26 @@ export class BerryApiClient {
     });
   }
 
+  async upsertOrgTaskModelPolicy(tenantId: string, input: UpsertOrgTaskModelPolicyRequest): Promise<OrgModelPolicy> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models/policies`, OrgModelPolicySchema, {
+      method: "PUT",
+      body: input,
+    });
+  }
+
   async listOrgModelDefaults(tenantId: string): Promise<OrgModelDefault[]> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models/defaults`, z.array(OrgModelDefaultSchema));
   }
 
   async upsertOrgModelDefault(tenantId: string, mode: "chat" | "code", input: UpsertOrgModelDefaultRequest): Promise<OrgModelDefault> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models/defaults/${encodeURIComponent(mode)}`, OrgModelDefaultSchema, {
+      method: "PUT",
+      body: input,
+    });
+  }
+
+  async upsertOrgTaskDefault(tenantId: string, input: UpsertOrgModelDefaultRequest): Promise<OrgModelDefault> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models/default`, OrgModelDefaultSchema, {
       method: "PUT",
       body: input,
     });
@@ -1499,6 +1523,13 @@ export class BerryApiClient {
   }
 
   async resolveOrgModel(tenantId: string, input: ResolveOrgModelRequest): Promise<ModelGovernanceDecision> {
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models/resolve`, ModelGovernanceDecisionSchema, {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  async resolveOrgTaskModel(tenantId: string, input: ResolveOrgTaskModelRequest): Promise<ModelGovernanceDecision> {
     return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/models/resolve`, ModelGovernanceDecisionSchema, {
       method: "POST",
       body: input,
@@ -1608,7 +1639,10 @@ export class BerryApiClient {
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
       try {
-        callbacks.onEvent(HostPushEventSchema.parse(JSON.parse(event.data)));
+        const parsed = HostPushEventSchema.parse(JSON.parse(event.data));
+        callbacks.onEvent(parsed.type === "task.updated"
+          ? { ...parsed, task: normalizeTaskForWeb(parsed.task) }
+          : parsed);
       } catch (error) {
         callbacks.onError?.(error);
       }

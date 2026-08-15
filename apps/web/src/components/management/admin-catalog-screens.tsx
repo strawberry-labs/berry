@@ -522,7 +522,7 @@ function ProvidersScreen({
       client
         ? Promise.all([
             client.listOrganizationModelProviders(tenantId),
-            client.listOrgModels(tenantId, { includeBlocked: true }),
+            client.listOrgTaskModels(tenantId, { includeBlocked: true }),
           ])
         : [[], []],
     [[], []] as any,
@@ -664,11 +664,7 @@ function ProvidersScreen({
 }
 
 /* ------------------------------------------------------------------ models */
-export function modelDefaultEnforcement(mode: "chat" | "code", policyEnforced: boolean): boolean {
-  return mode === "chat" ? false : policyEnforced;
-}
-
-export async function saveNewChatDefaultSafely<T>(
+export async function saveNewTaskDefaultSafely<T>(
   save: () => T | Promise<T>,
 ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
   try {
@@ -695,7 +691,7 @@ function ModelsScreen({
     async () =>
       client
         ? Promise.all([
-            client.listOrgModels(tenantId, { includeBlocked: true }),
+            client.listOrgTaskModels(tenantId, { includeBlocked: true }),
             client.listOrgModelDefaults(tenantId),
             client.listOrgAuxiliaryModelDefaults(tenantId),
             client.listOrganizationModelProviders(tenantId),
@@ -725,9 +721,9 @@ function ModelsScreen({
   const [active, setActive] = React.useState<number | null>(null);
   const [draft, setDraft] = React.useState<any>(null);
   const [message, setMessage] = React.useState("");
-  const [newChatDefaultKey, setNewChatDefaultKey] = React.useState("");
-  const [savingNewChatDefault, setSavingNewChatDefault] = React.useState(false);
-  const [newChatDefaultError, setNewChatDefaultError] = React.useState("");
+  const [newTaskDefaultKey, setNewTaskDefaultKey] = React.useState("");
+  const [savingNewTaskDefault, setSavingNewTaskDefault] = React.useState(false);
+  const [newTaskDefaultError, setNewTaskDefaultError] = React.useState("");
   const [adding, setAdding] = React.useState(false);
   const [addingRule, setAddingRule] = React.useState(false);
   const [ruleScope, setRuleScope] = React.useState<"org" | "department" | "user">("department");
@@ -758,36 +754,25 @@ function ModelsScreen({
   const detail = active != null ? rows[active] : null;
   React.useEffect(() => {
     setDraft(
-      detail ? { ...detail, modeAllow: [...(detail.modeAllow ?? [])] } : null,
+      detail ? { ...detail } : null,
     );
     setMessage("");
   }, [active, r.data]);
-  const defaultFor = (mode: string) =>
-    (defaults ?? []).find((d) => d.mode === mode);
-  const currentNewChatDefault = defaultFor("chat");
-  const currentNewChatDefaultKey = currentNewChatDefault
-    ? `${currentNewChatDefault.providerId}:${currentNewChatDefault.model}`
+  const currentNewTaskDefault = (defaults ?? []).find((d) => d.mode === "chat") ?? defaults?.[0];
+  const currentNewTaskDefaultKey = currentNewTaskDefault
+    ? `${currentNewTaskDefault.providerId}:${currentNewTaskDefault.model}`
     : "";
-  const newChatModelOptions = (models ?? [])
-    .filter((item) => item.status === "allowed" && (item.modeAllow ?? []).includes("chat"))
+  const newTaskModelOptions = (models ?? [])
+    .filter((item) => item.status === "allowed" && (item.modeAllow ?? ["chat"]).length > 0)
     .map((item) => ({
       value: `${item.providerId}:${item.model}`,
       label: `${item.displayName || item.model} · ${item.providerId}`,
     }));
   React.useEffect(() => {
-    setNewChatDefaultKey(currentNewChatDefaultKey);
-  }, [currentNewChatDefaultKey]);
-  const isDefault = (m: any, mode: string) => {
-    const d = defaultFor(mode);
-    return d && d.model === m.model && d.providerId === m.providerId;
-  };
-  const setMode = (mode: "chat" | "code", on: boolean) =>
-    setDraft((d: any) => ({
-      ...d,
-      modeAllow: on
-        ? [...new Set([...(d.modeAllow ?? []), mode])]
-        : (d.modeAllow ?? []).filter((x: string) => x !== mode),
-    }));
+    setNewTaskDefaultKey(currentNewTaskDefaultKey);
+  }, [currentNewTaskDefaultKey]);
+  const isTaskDefault = (m: any) =>
+    currentNewTaskDefault && currentNewTaskDefault.model === m.model && currentNewTaskDefault.providerId === m.providerId;
   const setCost = (key: "input" | "output" | "cacheRead" | "cacheWrite", value: string) =>
     setDraft((current: any) => ({
       ...current,
@@ -806,13 +791,12 @@ function ModelsScreen({
     }));
   const save = async () => {
     if (!draft) return;
-    await client?.upsertOrgModelPolicy(tenantId, {
+    await client?.upsertOrgTaskModelPolicy(tenantId, {
       providerId: draft.providerId,
       model: draft.model,
       displayName: draft.displayName ?? null,
       status: draft.status,
       enforce: draft.enforce,
-      modeAllow: draft.modeAllow,
       apiType: draft.apiType ?? null,
       capabilities: draft.capabilities ?? {},
     });
@@ -827,19 +811,19 @@ function ModelsScreen({
     ]);
     setMessage("Model policy saved and recorded in the audit log.");
   };
-  const makeDefault = async (mode: "chat" | "code") => {
+  const makeTaskDefault = async () => {
     if (!draft) return;
-    const enforce = modelDefaultEnforcement(mode, Boolean(draft.enforce));
-    await client?.upsertOrgModelDefault(tenantId, mode, {
+    const enforce = false;
+    await client?.upsertOrgTaskDefault(tenantId, {
       providerId: draft.providerId,
       model: draft.model,
       enforce,
     });
     const next = [
-      ...(defaults ?? []).filter((d) => d.mode !== mode),
+      ...(defaults ?? []).filter((d) => d.mode !== "chat"),
       {
         tenantId,
-        mode,
+        mode: "chat",
         providerId: draft.providerId,
         model: draft.model,
         enforce,
@@ -847,26 +831,26 @@ function ModelsScreen({
       },
     ];
     r.setData([models, next, auxiliaryDefaults, registeredProviders, accessRules, members, departments]);
-    setMessage(`Set as the ${mode} default and recorded in the audit log.`);
+    setMessage("Set as the task default and recorded in the audit log.");
   };
-  const saveNewChatDefault = async () => {
+  const saveNewTaskDefault = async () => {
     const selected = (models ?? []).find(
-      (item) => `${item.providerId}:${item.model}` === newChatDefaultKey,
+      (item) => `${item.providerId}:${item.model}` === newTaskDefaultKey,
     );
     if (!selected) return;
-    setSavingNewChatDefault(true);
+    setSavingNewTaskDefault(true);
     setMessage("");
-    setNewChatDefaultError("");
+    setNewTaskDefaultError("");
     try {
-      const result = await saveNewChatDefaultSafely(() =>
-        client?.upsertOrgModelDefault(tenantId, "chat", {
+      const result = await saveNewTaskDefaultSafely(() =>
+        client?.upsertOrgTaskDefault(tenantId, {
           providerId: selected.providerId,
           model: selected.model,
           enforce: false,
         }),
       );
       if (!result.ok) {
-        setNewChatDefaultError(result.error);
+        setNewTaskDefaultError(result.error);
         return;
       }
       const saved = result.value;
@@ -889,7 +873,7 @@ function ModelsScreen({
       ]);
       setMessage("New tasks will now start with this model. Existing tasks were not changed.");
     } finally {
-      setSavingNewChatDefault(false);
+      setSavingNewTaskDefault(false);
     }
   };
   const makeVisionDefault = async () => {
@@ -918,14 +902,13 @@ function ModelsScreen({
       const value = String(form.get(name) ?? "");
       return value === "" ? undefined : Number(value);
     };
-    await client?.upsertOrgModelPolicy(tenantId, {
+    await client?.upsertOrgTaskModelPolicy(tenantId, {
       providerId: String(form.get("providerId")),
       model: String(form.get("model")),
       displayName: String(form.get("displayName")) || null,
       apiType: String(form.get("apiType")) as any,
       status: "allowed",
       enforce: false,
-      modeAllow: ["chat", "code"],
       capabilities: {
         cost: { input: number("inputPrice"), output: number("outputPrice"), cacheRead: number("cacheReadPrice"), cacheWrite: number("cacheWritePrice") },
         context: { windowTokens: number("contextWindow"), maxOutputTokens: number("maxOutput") },
@@ -984,49 +967,44 @@ function ModelsScreen({
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
               Organization default
               <FormSelect
-                value={newChatDefaultKey}
+                value={newTaskDefaultKey}
                 onChange={(value) => {
-                  setNewChatDefaultKey(value);
-                  setNewChatDefaultError("");
+                  setNewTaskDefaultKey(value);
+                  setNewTaskDefaultError("");
                 }}
-                options={newChatModelOptions}
+                options={newTaskModelOptions}
                 placeholder="Choose a model"
-                disabled={!canWrite || savingNewChatDefault || newChatModelOptions.length === 0}
+                disabled={!canWrite || savingNewTaskDefault || newTaskModelOptions.length === 0}
                 ariaLabel="Default model for new tasks"
               />
             </label>
             <Button
-              onClick={() => void saveNewChatDefault()}
-              disabled={!canWrite || savingNewChatDefault || !newChatDefaultKey || newChatDefaultKey === currentNewChatDefaultKey}
+              onClick={() => void saveNewTaskDefault()}
+              disabled={!canWrite || savingNewTaskDefault || !newTaskDefaultKey || newTaskDefaultKey === currentNewTaskDefaultKey}
             >
               <Save aria-hidden />
-              {savingNewChatDefault ? "Saving…" : "Save default"}
+              {savingNewTaskDefault ? "Saving…" : "Save default"}
             </Button>
           </div>
-          {newChatDefaultError ? (
+          {newTaskDefaultError ? (
             <p className="text-xs text-[var(--berry-danger)]" role="alert">
-              {newChatDefaultError}
+              {newTaskDefaultError}
             </p>
           ) : null}
         </Section>
         <section
-          className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
+          className="grid gap-3 sm:grid-cols-2"
           aria-label="Model defaults"
         >
-          {(["chat", "code"] as const).map((mode) => {
-            const d = defaultFor(mode);
-            return (
-              <article key={mode} data-status={d ? "good" : "warning"}>
-                <span>Default for {mode === "chat" ? "Task" : "Code"}</span>
-                <strong>{d ? d.model : "Not set"}</strong>
-                <small>
-                  {d
-                    ? `${d.providerId}${d.enforce ? " · Enforced" : ""}`
-                    : "Choose a model below"}
-                </small>
-              </article>
-            );
-          })}
+          <article data-status={currentNewTaskDefault ? "good" : "warning"}>
+            <span>Default for tasks</span>
+            <strong>{currentNewTaskDefault ? currentNewTaskDefault.model : "Not set"}</strong>
+            <small>
+              {currentNewTaskDefault
+                ? `${currentNewTaskDefault.providerId}${currentNewTaskDefault.enforce ? " · Enforced" : ""}`
+                : "Choose a model below"}
+            </small>
+          </article>
           {(() => {
             const visionDefault = (auxiliaryDefaults ?? []).find((item) => item.purpose === "vision");
             return (
@@ -1075,7 +1053,7 @@ function ModelsScreen({
           >
             <DataTable
               label="Model catalog"
-              columns={["Model", "Provider", "Modes", "Policy", "Default"]}
+              columns={["Model", "Provider", "Policy", "Default"]}
               onRowSelect={setActive}
               activeRow={active}
               rowLabel={(i) => rows[i].model}
@@ -1086,13 +1064,6 @@ function ModelsScreen({
                 </span>,
                 m.providerId,
                 <span className="flex flex-wrap gap-1.5">
-                  {(m.modeAllow ?? []).map((mode: string) => (
-                    <StatusPill key={mode} tone="neutral">
-                      {mode}
-                    </StatusPill>
-                  ))}
-                </span>,
-                <span className="flex flex-wrap gap-1.5">
                   <StatusPill tone={m.status === "allowed" ? "good" : "danger"}>
                     {humanize(m.status)}
                   </StatusPill>
@@ -1100,7 +1071,7 @@ function ModelsScreen({
                     <StatusPill tone="info">Enforced</StatusPill>
                   ) : null}
                 </span>,
-                isDefault(m, "chat") || isDefault(m, "code") ? (
+                isTaskDefault(m) ? (
                   <Check
                     aria-label="Default"
                     className="size-4 text-[var(--berry-accent)]"
@@ -1169,25 +1140,6 @@ function ModelsScreen({
                   </Button>
                 </div>
               </fieldset>
-              <fieldset
-                className="grid gap-3 border-0 p-0"
-                disabled={!canWrite}
-              >
-                <legend>Available in</legend>
-                {(["chat", "code"] as const).map((mode) => (
-                  <label
-                    key={mode}
-                    className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm"
-                  >
-                    <span>{mode === "chat" ? "Task" : "Code"}</span>
-                    <ManagementSwitch
-                      checked={(draft.modeAllow ?? []).includes(mode)}
-                      onCheckedChange={(checked) => setMode(mode, checked)}
-                      aria-label={`${mode} access`}
-                    />
-                  </label>
-                ))}
-              </fieldset>
               <label className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-2.5 text-sm">
                 <span>
                   Enforce policy
@@ -1242,17 +1194,10 @@ function ModelsScreen({
                   <div className="flex flex-wrap gap-2">
                     <Button
                       variant="secondary"
-                      onClick={() => makeDefault("chat")}
-                      disabled={isDefault(draft, "chat")}
+                      onClick={() => void makeTaskDefault()}
+                      disabled={isTaskDefault(draft)}
                     >
-                      Set as new-chat default
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      onClick={() => makeDefault("code")}
-                      disabled={isDefault(draft, "code")}
-                    >
-                      Set as Code default
+                      Set as task default
                     </Button>
                     <Button
                       variant="secondary"

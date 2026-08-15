@@ -15,6 +15,17 @@ describe("cloud workspace identifiers", () => {
 });
 
 describe("task unread state", () => {
+  it("normalizes legacy task kinds without persisting a web mode choice", async () => {
+    const store = new InMemoryCloudTaskStore();
+    const workspace = await store.createWorkspace({ name: "Project", ownerUserId: "user_1" });
+    const created = await store.createTask({ workspaceId: workspace.id, ownerUserId: "user_1", conversationKind: "code" });
+
+    expect(created.task.conversationKind).toBe("chat");
+    const updated = await store.updateTask(created.task.id, { conversationKind: "code" }, "user_1");
+    expect(updated.conversationKind).toBe("chat");
+    expect(updated.updatedAt).toBe(created.task.updatedAt);
+  });
+
   it("marks terminal work unread and clears it when the task is opened", async () => {
     const store = new InMemoryCloudTaskStore();
     const workspace = await store.createWorkspace({ name: "Project", ownerUserId: "user_1" });

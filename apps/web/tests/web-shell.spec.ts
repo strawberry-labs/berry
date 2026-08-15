@@ -142,10 +142,10 @@ test("shared sidebar preserves the active task while project sections change", a
   await expect(page).toHaveURL(/\/tasks\/task_cloud$/);
 });
 
-test("web tasks use the chat workspace without desktop code controls", async ({ page }) => {
+test("web tasks use one normal workspace while keeping code tools available", async ({ page }) => {
   await openTask(page);
   await expect(page.getByTestId("web-code-workspace")).toHaveCount(0);
-  await expect(page.getByTestId("web-thread")).toHaveAttribute("data-mode", "chat");
+  await expect(page.getByTestId("web-task-thread")).toBeVisible();
   await expect(page.getByRole("button", { name: "View all files" })).toBeVisible();
 });
 
@@ -174,7 +174,7 @@ test("task deep links and invalid routes remain durable", async ({ page }) => {
   await expect(page.getByTestId("composer-input")).toHaveCount(0);
 });
 
-test("web shell sends a fixture-backed chat turn", async ({ page }) => {
+test("web shell sends a fixture-backed task turn", async ({ page }) => {
   await openTask(page);
   await page.getByTestId("composer-input").click();
   await page.keyboard.type("What is ready?");
@@ -247,7 +247,7 @@ test("recognized slash commands invoke handlers instead of becoming model text",
   await expect(page.locator("[data-user-message-bubble]").filter({ hasText: "/pr" })).toHaveCount(0);
 });
 
-test("web thread uses the desktop conversation presentation", async ({ page }) => {
+test("web task conversation uses the shared task presentation", async ({ page }) => {
   await openTask(page);
 
   const userBubble = page.locator("[data-user-message-bubble]").first();
@@ -341,7 +341,7 @@ test("turn presentation remains scoped to its session while navigating between t
   await expect(page.getByText(/Fixture sandbox ready/).last()).toBeVisible();
 });
 
-test("home route opens the centered new-chat composer without creating a thread", async ({ page }) => {
+test("home route opens the centered new-task composer without creating a task", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
   await expect(page.getByRole("button", { name: "New task", exact: true })).toBeVisible();
@@ -366,7 +366,7 @@ test("composer keyboard: Enter submits while idle", async ({ page }) => {
   await page.keyboard.press("Enter");
 
   await expect(page).toHaveURL(/\/tasks\//);
-  await expect(page.getByTestId("web-thread").getByText(prompt, { exact: true })).toBeVisible();
+  await expect(page.getByTestId("web-task-thread").getByText(prompt, { exact: true })).toBeVisible();
 });
 
 for (const shortcut of ["Meta+Enter", "Control+Enter"] as const) {
@@ -465,10 +465,10 @@ test("visible browser settings persist and apply after reload", async ({ page })
   await expect(page.locator("html")).toHaveAttribute("lang", "en");
 });
 
-test("web tasks remain in chat mode with server-enforced full access", async ({ page }) => {
+test("web tasks use server-enforced full access", async ({ page }) => {
   await openTask(page);
   await expect(page).toHaveURL(/\/tasks\/task_cloud$/);
-  await expect(page.getByTestId("web-thread")).toHaveAttribute("data-mode", "chat");
+  await expect(page.getByTestId("web-task-thread")).toBeVisible();
   await expect(page.getByRole("button", { name: "Permission mode" })).toHaveCount(0);
   await expect(page.locator(".mode-tabs")).toHaveCount(0);
   await expect(page.getByTestId("code-workbench")).toHaveCount(0);
@@ -510,11 +510,11 @@ test("web task chrome keeps Home branding, title editing, and action menus", asy
   await expect(page.getByRole("heading", { name: "Launch plan polished" })).toBeVisible();
 });
 
-test("chat row actions stay visible while their upward menu is open", async ({ page }) => {
+test("task row actions stay visible while their upward menu is open", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("web-app-shell")).toHaveAttribute("data-hydrated", "true");
-  const chatRow = page.locator(".berry-sidebar-task-row").filter({ hasText: "Cloud sandbox smoke" });
-  await chatRow.hover();
+  const taskRow = page.locator(".berry-sidebar-task-row").filter({ hasText: "Cloud sandbox smoke" });
+  await taskRow.hover();
   const actions = page.locator('[aria-label="Actions for Cloud sandbox smoke"]');
   await expect(actions).toBeVisible();
   await actions.click();
@@ -526,7 +526,7 @@ test("chat row actions stay visible while their upward menu is open", async ({ p
   await expect(actions).toBeVisible();
 });
 
-test("archived and deleted conversations can be restored", async ({ page }) => {
+test("archived and deleted tasks can be restored", async ({ page }) => {
   await openTask(page);
   await page.getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menuitem", { name: "Archive task" }).click();
@@ -549,7 +549,7 @@ test("archived and deleted conversations can be restored", async ({ page }) => {
   await page.getByLabel("Archive state").selectOption("deleted");
   await expect(page.getByText("Cloud sandbox smoke")).toBeVisible();
   await page.getByRole("button", { name: "Restore" }).click();
-  await expect(page.getByText("No recently deleted chats")).toBeVisible();
+  await expect(page.getByText("No recently deleted tasks")).toBeVisible();
 });
 
 test("web composer keeps model and reasoning controls and opens the mobile sidebar sheet", async ({ page }) => {

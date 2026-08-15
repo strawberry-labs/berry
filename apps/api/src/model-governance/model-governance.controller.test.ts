@@ -21,7 +21,7 @@ describe("Model governance API", () => {
     vi.unstubAllEnvs();
   });
 
-  it("filters allowed models through /models and resolves enforced per-mode defaults", async () => {
+  it("normalizes policy writes while preserving legacy read and default routes", async () => {
     app = await createApp();
 
     await request(app.getHttpServer())
@@ -41,7 +41,7 @@ describe("Model governance API", () => {
       })
       .expect(200)
       .expect(({ body }) => {
-        expect(body).toMatchObject({ model: "gpt-5", enforce: true, modeAllow: ["code"] });
+        expect(body).toMatchObject({ model: "gpt-5", enforce: true, modeAllow: ["chat", "code"] });
       });
 
     await request(app.getHttpServer())
@@ -51,6 +51,15 @@ describe("Model governance API", () => {
       .expect(200)
       .expect(({ body }) => {
         expect(body).toMatchObject({ mode: "code", providerId: "router", model: "gpt-5", enforce: true });
+      });
+
+    await request(app.getHttpServer())
+      .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/models/default`)
+      .set(authHeader())
+      .send({ providerId: "router", model: "gpt-5" })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({ mode: "chat", providerId: "router", model: "gpt-5", enforce: false });
       });
 
     await request(app.getHttpServer())
@@ -80,20 +89,22 @@ describe("Model governance API", () => {
       });
   });
 
-  it("rejects legacy Co-work values on active model-governance routes", async () => {
+  it("normalizes legacy Co-work values on compatibility routes", async () => {
     app = await createApp();
 
     await request(app.getHttpServer())
       .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/models/policies`)
       .set(authHeader())
       .send({ providerId: "router", model: "legacy", modeAllow: ["cowork"] })
-      .expect(400);
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({ model: "legacy", modeAllow: ["chat", "code"] }));
 
     await request(app.getHttpServer())
       .put(`/v1/orgs/${SELF_HOST_TENANT_ID}/models/defaults/cowork`)
       .set(authHeader())
       .send({ providerId: "router", model: "legacy" })
-      .expect(400);
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({ mode: "chat" }));
   });
 
   it("keeps blocked models out of the default list unless requested by an admin", async () => {

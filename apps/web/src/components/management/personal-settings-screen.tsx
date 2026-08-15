@@ -20,8 +20,8 @@ const PersonalizationSettingsScreen = React.lazy(async () => ({
 const PersonalUsageScreen = React.lazy(async () => ({
   default: (await import("./personal-usage-screen")).PersonalUsageScreen,
 }));
-const ArchivedChatsScreen = React.lazy(async () => ({
-  default: (await import("./archived-chats-screen")).ArchivedChatsScreen,
+const ArchivedTasksScreen = React.lazy(async () => ({
+  default: (await import("./archived-chats-screen")).ArchivedTasksScreen,
 }));
 
 export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps & { tab: string }) {
@@ -32,6 +32,6 @@ export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps 
   if (tab === "skills") return <PersonalSkillsScreen {...props} />;
   if (tab === "mcp") return <PersonalMcpScreen {...props} />;
   if (tab === "usage") return <PersonalUsageScreen {...props} />;
-  if (tab === "archived") return <ArchivedChatsScreen {...props} />;
+  if (tab === "archived") return <ArchivedTasksScreen {...props} />;
   return <GeneralSettingsScreen />;
 }

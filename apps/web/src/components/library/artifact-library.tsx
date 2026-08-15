@@ -215,7 +215,7 @@ export function ArtifactLibrary({ client, tab, onTabChange, workspaces }: {
           <AlertDialogHeader>
             <AlertDialogTitle>Remove {pendingDelete?.name} from Library?</AlertDialogTitle>
             <AlertDialogDescription>
-              The file will remain in conversations and projects where it is used. Storage is cleaned up after nothing references it.
+              The file will remain in tasks and projects where it is used. Storage is cleaned up after nothing references it.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

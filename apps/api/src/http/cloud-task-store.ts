@@ -1,7 +1,6 @@
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import {
   createId,
-  ConversationKindSchema,
   MessagePartKindSchema,
   MessageRoleSchema,
   MessageSchema,
@@ -10,6 +9,7 @@ import {
   SessionStatusSchema,
   SessionSchema,
   TaskSchema,
+  normalizeTaskForWeb,
   TaskStatusSchema,
   type JsonValue,
   type Message,
@@ -197,7 +197,9 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       title: input.title?.trim() || "Untitled task",
       status: "queued",
       activeSessionId: null,
-      conversationKind: input.conversationKind ?? "chat",
+      // Persist the single web task experience. The optional input remains in
+      // the compatibility type so older callers can be upgraded safely.
+      conversationKind: "chat",
       pinned: false,
       archived: false,
       deletedAt: null,
@@ -259,8 +261,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     const taskMetadataChanged = input.title !== undefined
       || input.status !== undefined
       || input.pinned !== undefined
-      || input.archived !== undefined
-      || input.conversationKind !== undefined;
+      || input.archived !== undefined;
     const updatedAt = taskMetadataChanged ? readAt : current.updatedAt;
     const becameUnread = input.status !== undefined
       && input.status !== current.status
@@ -273,9 +274,6 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       ...(input.status !== undefined ? { status: TaskStatusSchema.parse(input.status) } : {}),
       ...(input.pinned !== undefined ? { pinned: input.pinned } : {}),
       ...(input.archived !== undefined ? { archived: input.archived } : {}),
-      ...(input.conversationKind !== undefined ? {
-        conversationKind: ConversationKindSchema.parse(input.conversationKind),
-      } : {}),
       ...(canMarkRead
         ? { unreadAt: null, lastReadAt: readAt }
         : becameUnread ? { unreadAt: readAt } : {}),
@@ -506,13 +504,12 @@ ORDER BY updated_at DESC
         [this.tenantId, workspaceId, input.ownerUserId ?? null],
       );
       if (!workspace) throw new NotFoundException(`Workspace not found: ${workspaceId}`);
-      const conversationKind = ConversationKindSchema.parse(input.conversationKind ?? "chat");
       await executor.execute(
         `
 INSERT INTO tasks (id, tenant_id, workspace_id, user_id, title, status, conversation_kind, created_at, updated_at)
 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_kind, $7, $7)
         `.trim(),
-        [taskId, this.tenantId, workspaceId, input.ownerUserId ?? null, input.title?.trim() || "Untitled task", conversationKind, now],
+        [taskId, this.tenantId, workspaceId, input.ownerUserId ?? null, input.title?.trim() || "Untitled task", "chat", now],
       );
       const session = await this.createSessionInTenant(executor, {
         taskId,
@@ -569,23 +566,22 @@ SET title = COALESCE($3, title),
     status = COALESCE($4::task_status, status),
     pinned = COALESCE($5, pinned),
     archived = COALESCE($6, archived),
-    conversation_kind = COALESCE($7::conversation_kind, conversation_kind),
     unread_at = CASE
-      WHEN $8::boolean AND ($9::timestamptz IS NULL OR unread_at IS NULL OR unread_at <= $9::timestamptz) THEN NULL
-      WHEN $4::task_status IN ('completed', 'failed') AND status IS DISTINCT FROM $4::task_status THEN $10
+      WHEN $7::boolean AND ($8::timestamptz IS NULL OR unread_at IS NULL OR unread_at <= $8::timestamptz) THEN NULL
+      WHEN $4::task_status IN ('completed', 'failed') AND status IS DISTINCT FROM $4::task_status THEN $9
       ELSE unread_at
     END,
     last_read_at = CASE
-      WHEN $8::boolean AND ($9::timestamptz IS NULL OR unread_at IS NULL OR unread_at <= $9::timestamptz) THEN $10
+      WHEN $7::boolean AND ($8::timestamptz IS NULL OR unread_at IS NULL OR unread_at <= $8::timestamptz) THEN $9
       ELSE last_read_at
     END,
     updated_at = CASE
-      WHEN $3 IS NOT NULL OR $4 IS NOT NULL OR $5 IS NOT NULL OR $6 IS NOT NULL OR $7 IS NOT NULL THEN $10
+      WHEN $3 IS NOT NULL OR $4 IS NOT NULL OR $5 IS NOT NULL OR $6 IS NOT NULL THEN $9
       ELSE updated_at
     END
-WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($11::uuid IS NULL OR user_id IS NULL OR user_id = $11::uuid)
+WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($10::uuid IS NULL OR user_id IS NULL OR user_id = $10::uuid)
         `.trim(),
-        [this.tenantId, taskId, input.title, input.status, input.pinned, input.archived, input.conversationKind, input.read === true, input.readThrough ?? null, nowIso(), ownerUserId ?? null],
+        [this.tenantId, taskId, input.title, input.status, input.pinned, input.archived, input.read === true, input.readThrough ?? null, nowIso(), ownerUserId ?? null],
       );
       return this.getTaskInTenant(executor, taskId, ownerUserId);
     });
@@ -892,7 +888,7 @@ interface MessagePartRow {
 }
 
 function taskFromRow(row: TaskRow): Task {
-  return TaskSchema.parse({
+  return normalizeTaskForWeb({
     id: row.id,
     workspaceId: row.workspace_id,
     title: row.title,
@@ -977,6 +973,6 @@ function isoNullable(value: Date | string | null): string | null {
 }
 
 function requiredOwner(ownerUserId: string | null | undefined): string {
-  if (!ownerUserId) throw new NotFoundException("A signed-in user is required for General chats");
+  if (!ownerUserId) throw new NotFoundException("A signed-in user is required for General tasks");
   return ownerUserId;
 }

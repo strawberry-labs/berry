@@ -401,7 +401,7 @@ describe("AgentApiController", () => {
       expect(body[0].id).toBe(created.body.task.id);
     });
     await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ title: "Renamed", pinned: true, conversationKind: "code" }).expect(200).expect(({ body }) => {
-      expect(body).toMatchObject({ title: "Renamed", pinned: true, conversationKind: "code" });
+      expect(body).toMatchObject({ title: "Renamed", pinned: true, conversationKind: "chat" });
     });
     await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ status: "running" }).expect(200);
     await request(app.getHttpServer()).patch(`/v1/tasks/${created.body.task.id}`).set(authHeader()).send({ status: "completed" }).expect(200).expect(({ body }) => {
@@ -427,7 +427,7 @@ describe("AgentApiController", () => {
     });
   });
 
-  it("snapshots the current organization default on each new chat", async () => {
+  it("snapshots the current organization default on each new task", async () => {
     const runtimeConfig = new CloudRuntimeConfigService({
       ...chatRuntimeEnv(),
       BERRY_ROUTER_DEFAULT_MODEL: "primary-model",
@@ -574,12 +574,12 @@ describe("AgentApiController", () => {
     });
   });
 
-  it("isolates General chats by user and publishes one canonical kind update", async () => {
+  it("isolates General tasks by user and ignores legacy kind updates", async () => {
     app = await createApp(fakeSessionHost());
     const first = await request(app.getHttpServer())
       .post("/v1/tasks")
       .set(authHeader())
-      .send({ workspaceKind: "general", conversationKind: "chat", title: "Private chat", permissionMode: "plan" })
+      .send({ workspaceKind: "general", title: "Private task", permissionMode: "plan" })
       .expect(201);
     const taskId = first.body.task.id as string;
     const sessionId = first.body.session.id as string;
@@ -603,9 +603,9 @@ describe("AgentApiController", () => {
       .send({ conversationKind: "code" })
       .expect(200)
       .expect(({ body }) => {
-        expect(body).toMatchObject({ id: taskId, workspaceId, activeSessionId: sessionId, conversationKind: "code" });
+        expect(body).toMatchObject({ id: taskId, workspaceId, activeSessionId: sessionId, conversationKind: "chat" });
       });
-    await expect(updatedEvent).resolves.toMatchObject({ data: { type: "task.updated", task: { id: taskId, conversationKind: "code" } } });
+    await expect(updatedEvent).resolves.toMatchObject({ data: { type: "task.updated", task: { id: taskId, conversationKind: "chat" } } });
     expect(first.body.session).toMatchObject({ id: sessionId, permissionMode: "full-access" });
 
     await request(app.getHttpServer()).get("/v1/tasks?workspaceKind=general").set(authHeader("berry-other-session")).expect(200).expect([]);
@@ -613,7 +613,7 @@ describe("AgentApiController", () => {
     const other = await request(app.getHttpServer())
       .post("/v1/tasks")
       .set(authHeader("berry-other-session"))
-      .send({ workspaceKind: "general", title: "Other chat" })
+      .send({ workspaceKind: "general", title: "Other task" })
       .expect(201);
     expect(other.body.task.workspaceId).not.toBe(workspaceId);
   });
@@ -928,7 +928,7 @@ describe("AgentApiController", () => {
 
   it("owns a bounded browser-safe sandbox workspace per task", async () => {
     app = await createApp(fakeSessionHost());
-    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Code workspace", conversationKind: "code", permissionMode: "ask" }).expect(201);
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader()).send({ workspaceId: "workspace_cloud", title: "Task workspace", conversationKind: "code", permissionMode: "ask" }).expect(201);
     const taskId = created.body.task.id as string;
 
     await request(app.getHttpServer()).get(`/v1/tasks/${taskId}/workspace`).set(authHeader()).expect(404);
@@ -1346,7 +1346,7 @@ describe("AgentApiController", () => {
     }));
   });
 
-  it("hides auxiliary-only models from the chat model catalog", async () => {
+  it("hides auxiliary-only models from the task model catalog", async () => {
     const repository = new InMemoryModelGovernanceRepository(false);
     await repository.upsertPolicy({
       tenantId: SELF_HOST_TENANT_ID,

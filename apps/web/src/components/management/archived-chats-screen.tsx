@@ -1,11 +1,11 @@
 import * as React from "react";
 import { ArchiveRestore, Folder, Trash2 } from "lucide-react";
-import { ArchivedChatsSearchSchema, type Task } from "@berry/shared";
+import { ArchivedTasksSearchSchema, type Task } from "@berry/shared";
 import { Button, FormSelect, ManagementPage, SearchInput, StatusPill } from "./management-primitives";
 import type { ManagementScreenProps } from "./management-context";
 
-export function ArchivedChatsScreen({ tasks, workspaces, onArchiveTask, onDeleteTask, onRestoreTask }: ManagementScreenProps) {
-  const initial = React.useMemo(() => ArchivedChatsSearchSchema.parse(typeof window === "undefined" ? {} : Object.fromEntries(new URLSearchParams(window.location.search))), []);
+export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDeleteTask, onRestoreTask }: ManagementScreenProps) {
+  const initial = React.useMemo(() => ArchivedTasksSearchSchema.parse(typeof window === "undefined" ? {} : Object.fromEntries(new URLSearchParams(window.location.search))), []);
   const [filters, setFilters] = React.useState(initial);
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const [error, setError] = React.useState("");
@@ -19,10 +19,9 @@ export function ArchivedChatsScreen({ tasks, workspaces, onArchiveTask, onDelete
       : filters.state === "archived"
         ? task.archived && !task.deletedAt
         : Boolean(task.deletedAt);
-    const matchesKind = filters.kind === "all" || task.conversationKind === filters.kind;
     const matchesWorkspace = filters.workspace === "all" || task.workspaceId === filters.workspace;
     const matchesQuery = !filters.q || task.title.toLocaleLowerCase().includes(filters.q.toLocaleLowerCase());
-    return matchesState && matchesKind && matchesWorkspace && matchesQuery;
+    return matchesState && matchesWorkspace && matchesQuery;
   }), [filters, tasks]);
 
   const groups = React.useMemo(() => {
@@ -35,11 +34,10 @@ export function ArchivedChatsScreen({ tasks, workspaces, onArchiveTask, onDelete
   }, [matching, workspaceById]);
 
   function update(next: Partial<typeof filters>) {
-    const value = ArchivedChatsSearchSchema.parse({ ...filters, ...next });
+    const value = ArchivedTasksSearchSchema.parse({ ...filters, ...next });
     setFilters(value);
     const search = new URLSearchParams();
     if (value.q) search.set("q", value.q);
-    if (value.kind !== "all") search.set("kind", value.kind);
     if (value.workspace !== "all") search.set("workspace", value.workspace);
     if (value.state !== "archived") search.set("state", value.state);
     window.history.replaceState(null, "", `${window.location.pathname}${search.size ? `?${search}` : ""}`);
@@ -85,7 +83,6 @@ export function ArchivedChatsScreen({ tasks, workspaces, onArchiveTask, onDelete
     >
       <div className="grid gap-2 rounded-xl border border-border bg-card p-3 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1fr)_repeat(3,minmax(140px,auto))]" aria-label="Archived task filters">
         <SearchInput label="Search archived tasks" value={filters.q ?? ""} onChange={(value) => update({ q: value || undefined })} placeholder="Search archived tasks" />
-        <label><span className="sr-only">Task type</span><FormSelect value={filters.kind} onChange={(value) => update({ kind: value as typeof filters.kind })} options={[{ value: "all", label: "All tasks" }, { value: "chat", label: "Task" }, { value: "code", label: "Code" }]} /></label>
         <label><span className="sr-only">Project</span><FormSelect value={filters.workspace} onChange={(value) => update({ workspace: value })} options={[{ value: "all", label: "All projects" }, ...workspaces.map((workspace) => ({ value: workspace.id, label: workspace.workspaceKind === "general" ? "Tasks" : workspace.name }))]} /></label>
         <label><span className="sr-only">Archive state</span><FormSelect value={filters.state} onChange={(value) => update({ state: value as typeof filters.state })} options={[{ value: "archived", label: "Archived" }, { value: "deleted", label: "Recently deleted" }, { value: "all", label: "Archived and deleted" }]} /></label>
       </div>
@@ -100,7 +97,7 @@ export function ArchivedChatsScreen({ tasks, workspaces, onArchiveTask, onDelete
           <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
             {items.map((task) => <article className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto]" key={task.id}>
               <div className="grid min-w-0 gap-0.5"><b className="truncate text-sm font-medium text-foreground" title={task.title}>{task.title}</b><time className="text-xs text-muted-foreground" dateTime={task.updatedAt}>{new Date(task.updatedAt).toLocaleString()}</time></div>
-              <StatusPill tone={task.deletedAt ? "warning" : "info"}>{task.deletedAt ? "Recently deleted" : task.conversationKind === "code" ? "Code" : "Task"}</StatusPill>
+              <StatusPill tone={task.deletedAt ? "warning" : "info"}>{task.deletedAt ? "Recently deleted" : "Task"}</StatusPill>
               {!task.deletedAt ? <Button variant="ghost" size="icon" aria-label={`Delete ${task.title}`} disabled={busyId !== null} onClick={() => void mutate(task, "delete")}><Trash2 /></Button> : null}
               <Button variant="secondary" disabled={busyId !== null} onClick={() => void mutate(task, task.deletedAt ? "restore" : "unarchive")}>{task.deletedAt ? "Restore" : "Unarchive"}</Button>
             </article>)}

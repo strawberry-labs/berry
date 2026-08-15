@@ -1,12 +1,12 @@
-import type { ConversationKind, Message, Task } from "@berry/shared";
+import type { Message, Task } from "@berry/shared";
 
 export const FIXED_NOW = "2026-07-10T00:00:00.000Z";
 
 export function fixtureTasks(): Task[] {
   return [
-    task("task_cloud", "Cloud sandbox smoke", "running", "session_cloud", "code"),
-    task("task_launch", "Launch plan review", "completed", "session_launch", "chat"),
-    task("task_chat", "Quick model question", "completed", "session_chat", "chat"),
+    task("task_cloud", "Cloud sandbox smoke", "running", "session_cloud"),
+    task("task_launch", "Launch plan review", "completed", "session_launch"),
+    task("task_chat", "Quick model question", "completed", "session_chat"),
   ];
 }
 
@@ -274,14 +274,14 @@ function fixtureImageSvg(
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
-function task(id: string, title: string, status: Task["status"], activeSessionId: string, conversationKind: ConversationKind): Task {
+function task(id: string, title: string, status: Task["status"], activeSessionId: string): Task {
   return {
     id,
     workspaceId: "self-host",
     title,
     status,
     activeSessionId,
-    conversationKind,
+    conversationKind: "chat",
     pinned: id === "task_cloud",
     archived: false,
     deletedAt: null,

@@ -307,7 +307,7 @@ describe("BerryAgentRuntime", () => {
     db.close();
   });
 
-  it("uses the same full tool registry for Chat and Code", async () => {
+  it("uses one task runtime for legacy Chat and Code records", async () => {
     const { db, workspace } = setup();
     const workspaceRow = db.workspaces().open(workspace, "ws", true);
 
@@ -336,8 +336,8 @@ describe("BerryAgentRuntime", () => {
     const code = await observe("code");
     expect(chat.tools).toEqual(code.tools);
     expect(chat.tools).toEqual(expect.arrayContaining(["bash", "write_file", "apply_patch"]));
-    expect(chat.systemPrompt).toContain("# Chat presentation");
-    expect(code.systemPrompt).toContain("# Code presentation");
+    expect(chat.systemPrompt).toContain("# Task presentation");
+    expect(code.systemPrompt).toBe(chat.systemPrompt);
     db.close();
   });
 

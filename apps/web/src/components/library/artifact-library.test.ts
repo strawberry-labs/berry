@@ -17,7 +17,7 @@ const workspace = (id: string, workspaceKind: Workspace["workspaceKind"]): Works
 });
 
 describe("projectFilterWorkspaces", () => {
-	it("keeps project workspaces and excludes the general chat workspace", () => {
+	it("keeps project workspaces and excludes the general task workspace", () => {
 		expect(projectFilterWorkspaces([workspace("project", "project"), workspace("general", "general")])).toEqual([
 			workspace("project", "project"),
 		]);

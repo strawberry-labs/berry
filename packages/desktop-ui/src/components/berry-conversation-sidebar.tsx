@@ -40,7 +40,7 @@ export interface BerryConversationProject {
 }
 
 export interface BerryConversationSidebarContentProps {
-  selectedKind: ConversationKind;
+  selectedKind?: ConversationKind;
   showKindControl?: boolean;
   pinnedConversations: Task[];
   projects: BerryConversationProject[];
@@ -52,7 +52,7 @@ export interface BerryConversationSidebarContentProps {
   projectsError?: string | null;
   chatsLoading?: boolean;
   chatsError?: string | null;
-  onKindChange: (kind: ConversationKind) => void | Promise<void>;
+  onKindChange?: (kind: ConversationKind) => void | Promise<void>;
   onSelectProject?: (workspaceId: string) => void;
   chatsSelected?: boolean;
   onSelectChats?: () => void;
@@ -153,14 +153,14 @@ export function taskHasUnreadActivity(task: Pick<Task, "unreadAt" | "lastReadAt"
 
 export function BerryConversationSidebarContent(props: BerryConversationSidebarContentProps) {
   const [sectionState, dispatch] = React.useReducer(conversationSectionReducer, INITIAL_CONVERSATION_SECTION_STATE);
-  const [optimisticKind, setOptimisticKind] = React.useState(props.selectedKind);
+  const [optimisticKind, setOptimisticKind] = React.useState<ConversationKind>(props.selectedKind ?? "chat");
   const [pendingKind, setPendingKind] = React.useState<ConversationKind | null>(null);
   const [failedKind, setFailedKind] = React.useState<ConversationKind | null>(null);
   const [kindError, setKindError] = React.useState<string | null>(null);
   const [projectSort, setProjectSort] = React.useState<(typeof PROJECT_SORT_OPTIONS)[number]["value"]>("last-updated");
 
   React.useEffect(() => {
-    if (!pendingKind) setOptimisticKind(props.selectedKind);
+    if (!pendingKind) setOptimisticKind(props.selectedKind ?? "chat");
   }, [pendingKind, props.selectedKind]);
 
   const selectKind = React.useCallback(async (kind: ConversationKind) => {
@@ -170,9 +170,9 @@ export function BerryConversationSidebarContent(props: BerryConversationSidebarC
     setFailedKind(null);
     setKindError(null);
     try {
-      await props.onKindChange(kind);
+      await props.onKindChange?.(kind);
     } catch (error) {
-      setOptimisticKind(props.selectedKind);
+      setOptimisticKind(props.selectedKind ?? "chat");
       setFailedKind(kind);
       setKindError(error instanceof Error ? error.message : "Unable to change task type");
     } finally {

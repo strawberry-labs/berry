@@ -3,7 +3,7 @@ import type { ManagedPolicyBundle } from "@berry/shared";
 import { BerryApiClient, BerryApiError } from "./index.ts";
 
 describe("BerryApiClient", () => {
-  it("improves a composer prompt without creating a chat turn", async () => {
+  it("improves a task prompt without creating a task turn", async () => {
     const fetchImpl = vi.fn(async () => json({
       prompt: "Write a concise executive summary with three recommendations.",
       model: "canopywave/deepseek/deepseek-v4-flash",
@@ -102,7 +102,7 @@ describe("BerryApiClient", () => {
     expect(receiver).toBeUndefined();
   });
 
-  it("decodes legacy task list mode fields through the shared compatibility schema", async () => {
+  it("normalizes legacy task list mode fields for the web task experience", async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify([
       {
         id: "task_1",
@@ -138,10 +138,10 @@ describe("BerryApiClient", () => {
     expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/tasks?workspaceId=workspace_1", expect.objectContaining({ method: "GET" }));
   });
 
-  it("sends explicit kind targets and stable task-list pagination", async () => {
+  it("creates one normal task and preserves stable task-list pagination", async () => {
     const createdAt = "2026-07-20T00:00:00.000Z";
     const task = {
-      id: "task_1", workspaceId: "general_1", title: "General code", status: "queued", activeSessionId: "session_1",
+      id: "task_1", workspaceId: "general_1", title: "General task", status: "queued", activeSessionId: "session_1",
       conversationKind: "code", pinned: false, archived: false,
       deletedAt: null, unreadAt: null, lastReadAt: null, worktreePath: null, worktreeBranch: null, worktreeBaseRef: null,
       worktreeBaseSha: null, pullRequestUrl: null, pullRequestNumber: null, createdAt, updatedAt: createdAt,
@@ -150,12 +150,12 @@ describe("BerryApiClient", () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => String(input).includes("/v1/tasks?") ? json([task]) : json({ task, session }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
-    await client.createTask({ workspaceKind: "general", conversationKind: "code", title: "General code" });
+    await client.createTask({ workspaceKind: "general", title: "General task" });
     await client.listTasks({ workspaceKind: "general", limit: 6, offset: 0, taskIds: ["task_1", "task_2", "task_1"] });
 
     expect(fetchImpl).toHaveBeenNthCalledWith(1, "https://api.berry.test/v1/tasks", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ workspaceKind: "general", conversationKind: "code", title: "General code" }),
+      body: JSON.stringify({ workspaceKind: "general", title: "General task" }),
     }));
     expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks?workspaceKind=general&limit=6&offset=0&taskIds=task_1%2Ctask_2", expect.objectContaining({ method: "GET" }));
   });
@@ -190,6 +190,24 @@ describe("BerryApiClient", () => {
       method: "PATCH",
       body: JSON.stringify({ title: "Persistent title", read: true, readThrough: "2026-07-10T00:00:00.000Z" }),
     }));
+  });
+
+  it("uses mode-free governance requests for web tasks", async () => {
+    const responses = [
+      { id: "model_1", tenantId: "tenant_1", providerId: "router", model: "gpt-5", displayName: null, presetId: null, apiType: null, capabilities: {}, status: "allowed", enforce: false, modeAllow: ["chat", "code"], metadata: {}, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" },
+      { tenantId: "tenant_1", mode: "chat", providerId: "router", model: "gpt-5", enforce: false, updatedAt: "2026-07-10T00:00:00.000Z" },
+      { tenantId: "tenant_1", mode: "chat", requestedProviderId: null, requestedModel: null, providerId: "router", model: "gpt-5", allowed: true, enforced: false, reason: "allowed_by_policy", policy: null, default: null, accessRule: null },
+    ];
+    const fetchImpl = vi.fn(async () => json(responses.shift()));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await client.upsertOrgTaskModelPolicy("tenant_1", { providerId: "router", model: "gpt-5" });
+    await client.upsertOrgTaskDefault("tenant_1", { providerId: "router", model: "gpt-5" });
+    await client.resolveOrgTaskModel("tenant_1", { providerId: "router", model: "gpt-5" });
+
+    expect(fetchImpl).toHaveBeenNthCalledWith(1, "https://api.berry.test/v1/orgs/tenant_1/models/policies", expect.objectContaining({ body: JSON.stringify({ providerId: "router", model: "gpt-5" }) }));
+    expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/orgs/tenant_1/models/default", expect.objectContaining({ body: JSON.stringify({ providerId: "router", model: "gpt-5" }) }));
+    expect(fetchImpl).toHaveBeenNthCalledWith(3, "https://api.berry.test/v1/orgs/tenant_1/models/resolve", expect.objectContaining({ body: JSON.stringify({ providerId: "router", model: "gpt-5" }) }));
   });
 
   it("cancels an active session turn", async () => {

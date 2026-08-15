@@ -293,7 +293,7 @@ export function shouldShowComposerProjectSwitcher(messages: readonly unknown[]):
 type ModelSelection = { providerId: string; model: string };
 type ModelSelectionSource = "organization" | "session" | "user";
 
-export function preferredNewChatModel(
+export function preferredNewTaskModel(
   browserModel: ModelSelection | null,
   organizationModel: ModelSelection | null,
   availableModels: readonly { id: string }[],
@@ -312,7 +312,7 @@ export function preferredNewChatModel(
   return organizationModel ? { ...organizationModel, source: "organization" } : null;
 }
 
-export async function hydratedExistingChatModel(
+export async function hydratedExistingTaskModel(
   loadedSessionModel: Promise<ModelSelection | null>,
   explicitSessionModel: () => ModelSelection | null,
 ): Promise<(ModelSelection & { source: "session" | "user" }) | null> {
@@ -322,7 +322,7 @@ export async function hydratedExistingChatModel(
   return loaded ? { ...loaded, source: "session" } : null;
 }
 
-export function existingChatTurnModelOverride(
+export function existingTaskTurnModelOverride(
   explicitSessionModel: ModelSelection | null,
 ): { provider?: { id: string }; model?: string } {
   return explicitSessionModel
@@ -330,7 +330,7 @@ export function existingChatTurnModelOverride(
     : {};
 }
 
-export function newChatModelOverride(
+export function newTaskModelOverride(
   source: ModelSelectionSource,
   providerId: string,
   model: string,
@@ -941,7 +941,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           if (loaded) sessionModelsRef.current.set(sessionId, loaded);
           return loaded;
         });
-    void hydratedExistingChatModel(
+    void hydratedExistingTaskModel(
       loadedSessionModel,
       () => explicitSessionModelsRef.current.get(sessionId) ?? null,
     )
@@ -956,7 +956,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   React.useEffect(() => {
     if (shellLocation.kind === "task") return;
-    const preferredModel = preferredNewChatModel(browserModelRef.current, organizationModelRef.current, modelOptions);
+    const preferredModel = preferredNewTaskModel(browserModelRef.current, organizationModelRef.current, modelOptions);
     if (preferredModel) {
       applyModelSelection(preferredModel.providerId, preferredModel.model, preferredModel.source);
     } else {
@@ -1001,14 +1001,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     const title = options?.title?.trim().slice(0, 80) || "New cloud task";
     if (client) {
       try {
-        const preferredModel = preferredNewChatModel(browserModelRef.current, organizationModelRef.current, modelOptions);
+        const preferredModel = preferredNewTaskModel(browserModelRef.current, organizationModelRef.current, modelOptions);
         const created = await client.createTask({
           workspaceId: activeWorkspaceId,
-          conversationKind: "chat",
           title,
           permissionMode,
           ...(preferredModel
-            ? newChatModelOverride(preferredModel.source, preferredModel.providerId, preferredModel.model)
+            ? newTaskModelOverride(preferredModel.source, preferredModel.providerId, preferredModel.model)
             : {}),
         });
         if (created.session.modelProviderId && created.session.model) {
@@ -1306,7 +1305,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       cancelRequested: false,
     };
     pendingSubmissionsRef.current.set(sessionId, submission);
-    const turnModelOverride = existingChatTurnModelOverride(
+    const turnModelOverride = existingTaskTurnModelOverride(
       explicitSessionModelsRef.current.get(sessionId) ?? null,
     );
     const taskWorkspacePath = workspaces.find((workspace) => workspace.id === task.workspaceId)?.path ?? initial.config.workspacePath;
@@ -1788,7 +1787,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     }
   }, [client]);
 
-  const archiveProjectChats = React.useCallback(async (workspace: Workspace, projectTasks: Task[]) => {
+  const archiveProjectTasks = React.useCallback(async (workspace: Workspace, projectTasks: Task[]) => {
     try {
       await Promise.all(projectTasks.map((task) => archiveTask(task, true)));
       toast.success(`Archived ${projectTasks.length} task${projectTasks.length === 1 ? "" : "s"}`);
@@ -2402,22 +2401,22 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               if (task && workspaces.some((workspace) => workspace.id === task.workspaceId)) setActiveWorkspaceId(task.workspaceId);
               navigateToTask(id);
             }}
-            onToggleConversationPinned={toggleTaskPinned}
-            onArchiveConversation={(task) => archiveTask(task, true)}
-            onDeleteConversation={deleteTask}
-            onRenameConversation={renameTask}
-            onShareConversation={shareTask}
+            onToggleTaskPinned={toggleTaskPinned}
+            onArchiveTask={(task) => archiveTask(task, true)}
+            onDeleteTask={deleteTask}
+            onRenameTask={renameTask}
+            onShareTask={shareTask}
             onToggleProjectPinned={toggleProjectPinned}
             onRenameProject={renameProject}
-            onArchiveProjectChats={archiveProjectChats}
+            onArchiveProjectTasks={archiveProjectTasks}
             onRemoveProject={removeProject}
             onRevealProject={revealProject}
             onUploadToProject={uploadToProject}
-            onSelectChats={() => {
+            onSelectTasks={() => {
               if (generalWorkspace) setActiveWorkspaceId(generalWorkspace.id);
               navigateHome();
             }}
-            chatsSelected={!activeTask && Boolean(generalWorkspace && activeWorkspaceId === generalWorkspace.id)}
+            tasksSelected={!activeTask && Boolean(generalWorkspace && activeWorkspaceId === generalWorkspace.id)}
             librarySelected={surface === "library"}
             management={surface === "settings" ? {
               kind: managementKind,
@@ -2537,14 +2536,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             </>
           }
         />
-        <div className="workspace" data-mode="chat">
-          <section className="thread-pane berry-task-thread berry-task-thread--chat" aria-label="Thread">
+        <div className="workspace">
+          <section className="thread-pane berry-task-thread" aria-label="Task">
             <Thread
               sessionId={activeTask.activeSessionId ?? activeTask.id}
               taskId={activeTask.id}
               messages={messages}
               stream={stream}
-              mode="chat"
               client={client}
               config={config}
               taskTitles={tasks.map((task) => task.title)}

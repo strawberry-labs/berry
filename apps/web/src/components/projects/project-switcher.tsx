@@ -32,7 +32,7 @@ export function ProjectSwitcher({
   const [open, setOpen] = React.useState(false);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? workspaces[0] ?? null;
   const projects = workspaces.filter((workspace) => workspace.workspaceKind === "project");
-  const chats = workspaces.filter((workspace) => workspace.workspaceKind === "general");
+  const otherWorkspaces = workspaces.filter((workspace) => workspace.workspaceKind === "general");
 
   return (
     <div className="contents">
@@ -81,11 +81,11 @@ export function ProjectSwitcher({
                 ))}
               </CommandGroup>
             ) : null}
-            {chats.length > 0 ? (
+            {otherWorkspaces.length > 0 ? (
               <>
                 {projects.length > 0 ? <CommandSeparator /> : null}
                 <CommandGroup heading="Other">
-                  {chats.map((workspace) => (
+                  {otherWorkspaces.map((workspace) => (
                     <CommandItem
                       key={workspace.id}
                       value={workspace.name}

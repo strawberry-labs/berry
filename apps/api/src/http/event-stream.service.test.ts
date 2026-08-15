@@ -92,7 +92,7 @@ describe("ApiEventStreamService", () => {
       createdAt: "2026-07-20T00:00:00.000Z",
       updatedAt: "2026-07-20T00:00:01.000Z",
     });
-    expect(received).toEqual([expect.objectContaining({ data: expect.objectContaining({ type: "task.updated", task: expect.objectContaining({ id: "task_1", conversationKind: "code" }) }) })]);
+    expect(received).toEqual([expect.objectContaining({ data: expect.objectContaining({ type: "task.updated", task: expect.objectContaining({ id: "task_1", conversationKind: "chat" }) }) })]);
     subscription.unsubscribe();
   });
 

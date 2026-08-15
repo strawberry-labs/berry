@@ -1,7 +1,7 @@
 import * as React from "react";
 import { ArrowUp, X } from "lucide-react";
 import { type BerryApiClient } from "@berry/api-client";
-import { MessageAttachmentContentSchema, type ConversationKind, type Message, type StoredFile } from "@berry/shared";
+import { MessageAttachmentContentSchema, type Message, type StoredFile } from "@berry/shared";
 import { BerryThreadView, BerryUserEditorFrame, fullUserText, type BerryThreadAdapter } from "@berry/desktop-ui/components/berry-thread-view";
 import { ImageGeneration, ImageGenerationError, type ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
@@ -20,12 +20,11 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream, mode, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
   stream: StreamState;
-  mode: ConversationKind;
   client: BerryApiClient | null;
   config: WebConfig;
   taskTitles: string[];
@@ -163,7 +162,7 @@ export function Thread({ sessionId, taskId, messages, stream, mode, client, conf
   ) : null;
 
   return (
-    <div ref={threadRef} className="berry-web-thread contents" data-testid="web-thread" data-mode={mode}>
+    <div ref={threadRef} className="berry-web-thread contents" data-testid="web-task-thread">
       <BerryThreadView
         sessionId={sessionId}
         taskId={taskId}

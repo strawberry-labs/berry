@@ -1,5 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common";
-import { AgentStreamEventSchema, HostPushEventSchema, type AgentStreamEvent, type HostPushEvent, type Task } from "@berry/shared";
+import { AgentStreamEventSchema, HostPushEventSchema, normalizeTaskForWeb, type AgentStreamEvent, type HostPushEvent, type Task } from "@berry/shared";
 import { Observable, Subject } from "rxjs";
 import { DurableTurnService, parseEventCursor } from "../runtime/durable-turn.service.js";
 
@@ -108,7 +108,7 @@ export class ApiEventStreamService {
   }
 
   publishTask(task: Task): HostPushEvent {
-    const event = HostPushEventSchema.parse({ type: "task.updated", task });
+    const event = HostPushEventSchema.parse({ type: "task.updated", task: normalizeTaskForWeb(task) });
     this.#taskSubjects.get(task.id)?.next({ data: event } as MessageEvent<HostPushEvent>);
     return event;
   }

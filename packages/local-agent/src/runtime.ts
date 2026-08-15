@@ -22,7 +22,7 @@ import {
 } from "@berry/harness";
 import { LocalProcessExecutor } from "@berry/harness/node";
 import { OpenAIResponsesClient } from "@berry/router-client";
-import { createId, networkPolicyForSandbox, resolveModelCapabilities, sandboxPolicyForPermission, type AgentStreamEvent, type ApprovalKind, type ConversationKind, type GroundingContext, type JsonValue, type NetworkPolicy, type PermissionMode, type ReasoningLevel, type SandboxPolicy, type SandboxStatus, type SessionCheckpointV2 } from "@berry/shared";
+import { createId, networkPolicyForSandbox, resolveModelCapabilities, sandboxPolicyForPermission, type AgentStreamEvent, type ApprovalKind, type GroundingContext, type JsonValue, type NetworkPolicy, type PermissionMode, type ReasoningLevel, type SandboxPolicy, type SandboxStatus, type SessionCheckpointV2 } from "@berry/shared";
 import type { AssistantMessage, Context, ImageContent, ToolCall } from "@earendil-works/pi-ai";
 import type { BerryAssistantMessage } from "./model.ts";
 import { artifactMediaType, isAutoPublishableArtifact } from "./artifacts.ts";
@@ -891,7 +891,6 @@ export class BerryAgentRuntime {
 
   async #ensureSession(options: StartTurnOptions): Promise<SessionState> {
     const sessionTarget = this.#activeSessionTarget(options.sessionId);
-    const conversationKind: ConversationKind = this.#db.tasks().getTask(options.taskId)?.conversation_kind ?? "chat";
     const hookConfig = this.#sandboxProvider.kind === "local"
       ? loadHookConfiguration(options.workspacePath, options.extraHooks ?? [])
       : { hooks: [], fingerprint: "cloud-sandbox", diagnostics: ["command hooks are disabled until the cloud hook executor is configured"] };
@@ -929,7 +928,6 @@ export class BerryAgentRuntime {
       options.systemPrompt?.trim() ?? "",
       (options.images?.length ?? 0) > 0 ? "with-images" : "text-only",
       sessionTarget ? [sessionTarget.goalText, sessionTarget.tokenBudget, sessionTarget.timeBudgetMin] : null,
-      conversationKind,
       hookConfig.fingerprint,
       execPolicy.rules,
       sandboxPolicy,
@@ -1052,8 +1050,7 @@ export class BerryAgentRuntime {
         const withActivated = activated.length > 0
           ? `${base}\n\n# Activated Agent Skills\nThe following skill instructions remain active for this conversation, including after context compaction.\n\n${activated.map((skill) => formatSkillInvocation(skill)).join("\n\n")}`
           : base;
-        const currentKind: ConversationKind = this.#db.tasks().getTask(options.taskId)?.conversation_kind ?? "chat";
-        const fragment = conversationProfilePrompt(currentKind);
+        const fragment = conversationProfilePrompt();
         const stableAndProfile = fragment ? `${withActivated}\n\n${fragment}` : withActivated;
         const checkpoint = this.#checkpointBySession.get(options.sessionId);
         const stableAndCheckpoint = appendPortableCheckpoint(stableAndProfile, checkpoint);
