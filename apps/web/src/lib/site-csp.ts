@@ -22,7 +22,7 @@ export function buildSiteContentSecurityPolicy(options: {
 }): string {
   const connectOrigins = normalizeSources(options.connectOrigins);
   const imageOrigins = normalizeSources(options.imageOrigins);
-  const frameSources = normalizeSources(options.frameSources?.length ? options.frameSources : DEFAULT_FRAME_SOURCES);
+  const frameSources = normalizeSources([...DEFAULT_FRAME_SOURCES, ...(options.frameSources ?? [])]);
   return [
     "default-src 'self'",
     "base-uri 'self'",
@@ -48,5 +48,5 @@ export function buildSiteContentSecurityPolicy(options: {
 }
 
 function normalizeSources(sources: readonly string[] | undefined): string {
-  return (sources ?? []).map((source) => source.trim()).filter(Boolean).join(" ");
+  return [...new Set((sources ?? []).map((source) => source.trim()).filter(Boolean))].join(" ");
 }

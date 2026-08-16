@@ -14,6 +14,8 @@ describe("site CSP", () => {
     expect(policy).toContain("style-src 'self'; style-src-elem 'self'; style-src-attr 'unsafe-inline'");
     expect(policy).toContain("connect-src 'self' https://api.example.test");
     expect(policy).toContain("img-src 'self' data: blob: https://*.googleusercontent.com https://files.example.test");
+    expect(policy).toContain("frame-src 'self' https://accounts.google.com");
+    expect(policy).toContain("https://sandbox.example.test");
     expect(policy).toContain("worker-src 'self' blob:");
     expect(policy).not.toContain("script-src 'self' 'unsafe-inline'");
     expect(policy).not.toContain("connect-src 'self' https:;");
