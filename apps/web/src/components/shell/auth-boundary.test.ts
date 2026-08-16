@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { applyDeploymentFavicon, authDestination, oauthErrorMessage, sanitizedAuthUrl } from "./auth-boundary.tsx";
+import { applyDeploymentFavicon, authDestination, probeAuthSession, oauthErrorMessage, sanitizedAuthUrl } from "./auth-boundary.tsx";
 import { deploymentBrandLogoUrl, resolveDeploymentBrandAssetUrl } from "./deployment-brand.tsx";
 import { deploymentAccentTokens } from "./deployment-accent.ts";
 import { googleSsoRequest } from "./google-sso-button.tsx";
@@ -27,6 +27,36 @@ describe("authDestination", () => {
       loading: false,
       pathname: "/login",
     })).toBe("/");
+  });
+
+  it("does not redirect a known route while authentication is temporarily unavailable", () => {
+    expect(authDestination({ authenticated: false, loading: false, unavailable: true, pathname: "/tasks/1" })).toBeNull();
+  });
+});
+
+describe("probeAuthSession", () => {
+  it("treats 401 and 403 as signed out rather than an outage", async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 401 }));
+    await expect(probeAuthSession("https://api.example.test", fetchImpl)).resolves.toEqual({ state: "unauthenticated", user: null });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("retries a transient network failure and preserves the returned identity", async () => {
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ user: { id: "user-1", email: "user@example.test" } }), { status: 200 }));
+    await expect(probeAuthSession("https://api.example.test", fetchImpl)).resolves.toMatchObject({ state: "authenticated", user: { id: "user-1" } });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("can be cancelled while the auth endpoint is unreachable", async () => {
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(() => new Promise<Response>((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+    const pending = probeAuthSession("https://api.example.test", fetchImpl, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });
 

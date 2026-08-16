@@ -1,10 +1,14 @@
 import { createServerFn } from "@tanstack/react-start";
-import { getRequestHeaders, getRequestHost } from "@tanstack/react-start/server";
+import { getRequestHeaders, getRequestHost, setResponseHeader } from "@tanstack/react-start/server";
 import { getWebConfig } from "./env.server";
 
 export const loadWebConfig = createServerFn({ method: "GET" }).handler(() => getWebConfig());
 
 export const loadWebBootstrap = createServerFn({ method: "GET" }).handler(async () => {
+  // The loader can serialize the signed-in user into SSR HTML. Never let a
+  // proxy or browser cache replay that document to another request.
+  setResponseHeader("Cache-Control", "private, no-store, max-age=0");
+  setResponseHeader("Vary", "Cookie, Authorization");
   const config = getWebConfig();
   if (config.demoMode || !config.apiBaseUrl) {
     return { config, user: null, sessionResolved: true };

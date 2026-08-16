@@ -7,15 +7,74 @@ const GoogleSsoButton = React.lazy(() => import("./google-sso-button.tsx"));
 const DeploymentOnboarding = React.lazy(() => import("../onboarding/deployment-onboarding.tsx").then((module) => ({ default: module.DeploymentOnboarding })));
 
 export type SignedInUser = { id: string; email: string; name?: string | null; image?: string | null };
+export type AuthState = "authenticated" | "unauthenticated" | "unavailable" | "loading";
+export type AuthProbeResult = { state: Exclude<AuthState, "loading">; user: SignedInUser | null };
+
+export const AUTH_SESSION_TIMEOUT_MS = 5_000;
+export const AUTH_SESSION_RETRY_DELAYS_MS = [0, 250, 1_000] as const;
 
 export function authDestination(input: {
   authenticated: boolean;
   loading: boolean;
+  unavailable?: boolean;
   pathname: string;
 }): "/" | "/login" | null {
-  if (input.loading) return null;
+  if (input.loading || input.unavailable) return null;
   if (!input.authenticated) return input.pathname === "/login" ? null : "/login";
   return input.pathname === "/login" ? "/" : null;
+}
+
+export async function probeAuthSession(
+  baseUrl: string,
+  fetchImpl: typeof fetch = fetch,
+  signal?: AbortSignal,
+): Promise<AuthProbeResult> {
+  let lastError: unknown = null;
+  for (const [attempt, delayMs] of AUTH_SESSION_RETRY_DELAYS_MS.entries()) {
+    if (delayMs > 0) await abortableDelay(delayMs, signal);
+    const controller = new AbortController();
+    const relayAbort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", relayAbort, { once: true });
+    const timeout = globalThis.setTimeout(() => controller.abort(new DOMException("Authentication request timed out", "TimeoutError")), AUTH_SESSION_TIMEOUT_MS);
+    try {
+      const response = await fetchImpl(`${baseUrl}/v1/auth/get-session`, { credentials: "include", signal: controller.signal });
+      if (response.status === 401 || response.status === 403) return { state: "unauthenticated", user: null };
+      if (!response.ok) {
+        lastError = new Error(`Authentication request failed with ${response.status}`);
+        if (attempt === AUTH_SESSION_RETRY_DELAYS_MS.length - 1) return { state: "unavailable", user: null };
+        continue;
+      }
+      const data = await response.json() as { user?: SignedInUser | null } | null;
+      const user = data?.user;
+      if (!user || typeof user.id !== "string" || typeof user.email !== "string") return { state: "unauthenticated", user: null };
+      return { state: "authenticated", user };
+    } catch (cause) {
+      if (signal?.aborted) throw cause;
+      lastError = cause;
+      if (attempt === AUTH_SESSION_RETRY_DELAYS_MS.length - 1) return { state: "unavailable", user: null };
+    } finally {
+      globalThis.clearTimeout(timeout);
+      signal?.removeEventListener("abort", relayAbort);
+    }
+  }
+  void lastError;
+  return { state: "unavailable", user: null };
+}
+
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timeout = globalThis.setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, delayMs);
+    const abort = () => {
+      globalThis.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 export function applyDeploymentFavicon(url: string | null): void {
@@ -44,7 +103,8 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
   const location = useLocation();
   const navigate = useNavigate();
   const [user, setUser] = React.useState<SignedInUser | null>(initialUser);
-  const [loading, setLoading] = React.useState(!sessionResolved);
+  const [authState, setAuthState] = React.useState<AuthState>(() => sessionResolved ? (initialUser ? "authenticated" : "unauthenticated") : "loading");
+  const sessionAbortRef = React.useRef<AbortController | null>(null);
   const [brand, setBrand] = React.useState<DeploymentBrand>(DEFAULT_DEPLOYMENT_BRAND);
   const [brandRevision, setBrandRevision] = React.useState(0);
 
@@ -86,21 +146,31 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
   }, [baseUrl, brandRevision]);
 
   const refreshSession = React.useCallback(async () => {
-    setLoading(true);
+    sessionAbortRef.current?.abort();
+    const controller = new AbortController();
+    sessionAbortRef.current = controller;
+    setAuthState("loading");
     try {
-      const response = await fetch(`${baseUrl}/v1/auth/get-session`, { credentials: "include" });
-      if (!response.ok) {
+      const result = await probeAuthSession(baseUrl, fetch, controller.signal);
+      if (controller.signal.aborted) return;
+      if (result.state === "authenticated") {
+        setUser(result.user);
+        setAuthState("authenticated");
+      } else if (result.state === "unauthenticated") {
         setUser(null);
-        return;
+        setAuthState("unauthenticated");
+      } else {
+        // Keep a previously known identity while the auth service is down.
+        setAuthState("unavailable");
       }
-      const data = await response.json() as { user?: SignedInUser | null } | null;
-      setUser(data?.user ?? null);
     } catch {
-      setUser(null);
+      if (!controller.signal.aborted) setAuthState("unavailable");
     } finally {
-      setLoading(false);
+      if (sessionAbortRef.current === controller) sessionAbortRef.current = null;
     }
   }, [baseUrl]);
+
+  React.useEffect(() => () => sessionAbortRef.current?.abort(), []);
 
   React.useEffect(() => {
     if (sessionResolved) return;
@@ -109,7 +179,8 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
 
   const destination = authDestination({
     authenticated: Boolean(user),
-    loading,
+    loading: authState === "loading",
+    unavailable: authState === "unavailable",
     pathname: location.pathname,
   });
   React.useEffect(() => {
@@ -119,14 +190,29 @@ export function AuthBoundary({ baseUrl, initialUser, sessionResolved, children }
 
   const signedOut = React.useCallback(() => {
     setUser(null);
+    setAuthState("unauthenticated");
     void navigate({ to: "/login", replace: true });
   }, [navigate]);
 
   let content: React.ReactNode;
-  if (loading) content = <div className="auth-shell" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading workspace" /></div>;
+  if (authState === "loading") content = <div className="auth-shell" role="status" aria-live="polite" aria-busy="true"><CircularActivitySpinner size={28} label="Loading workspace" /></div>;
+  else if (authState === "unavailable") content = <AuthUnavailable onRetry={refreshSession} knownUser={Boolean(user)} />;
   else if (!user) content = <AuthScreen baseUrl={baseUrl} onAuthenticated={refreshSession} />;
   else content = children(user, signedOut);
   return <DeploymentBrandContext.Provider value={brand}>{content}</DeploymentBrandContext.Provider>;
+}
+
+function AuthUnavailable({ onRetry, knownUser }: { onRetry: () => Promise<void>; knownUser: boolean }) {
+  return (
+    <div className="auth-shell">
+      <div className="auth-card" role="alert">
+        <AuthBrand />
+        <h1>{knownUser ? "Berry could not verify your session" : "Authentication service unavailable"}</h1>
+        <p>Your identity has not been cleared. Check the API connection and try again.</p>
+        <button className="primary-button" type="button" onClick={() => void onRetry()}>Retry</button>
+      </div>
+    </div>
+  );
 }
 
 function AuthScreen({ baseUrl, onAuthenticated }: { baseUrl: string; onAuthenticated: () => Promise<void> }) {
@@ -153,7 +239,7 @@ function AuthScreen({ baseUrl, onAuthenticated }: { baseUrl: string; onAuthentic
     let cancelled = false;
     setConfigLoading(true);
     setConfigError("");
-    void fetch(`${baseUrl}/v1/auth/config`, { credentials: "include" })
+    void fetchWithTimeout(`${baseUrl}/v1/auth/config`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) throw new Error("Berry could not load the deployment authentication policy.");
         return response.json() as Promise<AuthConfig>;
@@ -318,7 +404,7 @@ export function oauthErrorMessage(search: unknown): string {
 }
 
 async function postJson(url: string, body: unknown, fallbackMessage: string): Promise<void> {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     credentials: "include",
@@ -328,6 +414,19 @@ async function postJson(url: string, body: unknown, fallbackMessage: string): Pr
   if (!response.ok) {
     const message = Array.isArray(result?.message) ? result.message.join(" ") : result?.message;
     throw new Error(message ?? fallbackMessage);
+  }
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = AUTH_SESSION_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const relayAbort = () => controller.abort(init.signal?.reason);
+  init.signal?.addEventListener("abort", relayAbort, { once: true });
+  const timeout = globalThis.setTimeout(() => controller.abort(new DOMException("Authentication request timed out", "TimeoutError")), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    globalThis.clearTimeout(timeout);
+    init.signal?.removeEventListener("abort", relayAbort);
   }
 }
 
