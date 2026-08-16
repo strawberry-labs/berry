@@ -88,6 +88,24 @@ export interface DurableTurnStep {
   idempotencyKey: string | null;
   attempt: number;
   error: string | null;
+  resultFingerprint?: string | null;
+  deadlineAt?: string | null;
+  idleDeadlineAt?: string | null;
+  timedOut?: boolean;
+  abortAcknowledged?: boolean;
+  outcomeCertainty?: "known" | "unknown" | "not_applicable" | null;
+}
+
+export interface DurableTurnProgress {
+  progressEpoch: number;
+  progressKind: string | null;
+  consecutiveNoProgress: number;
+  physicalModelAttempt: number;
+  logicalModelIteration: number;
+  toolRepairAttempts: number;
+  cumulativeToolMs: number;
+  cumulativeActiveComputeMs: number;
+  budgetReason: string | null;
 }
 
 export interface DurableSessionEntry {
@@ -137,6 +155,7 @@ export interface DurableTurnSnapshot {
     totalTokens: number;
     costMicros: string;
   };
+  progress?: DurableTurnProgress;
   steps: readonly DurableTurnStep[];
   entries: readonly DurableSessionEntry[];
   approvals: readonly DurableApproval[];
@@ -154,6 +173,13 @@ export interface DurableStepMutation {
   incrementAttempt?: boolean;
   error?: string | null;
   sessionEntryId?: string | null;
+  resultFingerprint?: string | null;
+  cancellationAcknowledged?: boolean;
+  deadlineAt?: string | null;
+  idleDeadlineAt?: string | null;
+  timedOut?: boolean;
+  abortAcknowledged?: boolean;
+  outcomeCertainty?: "known" | "unknown" | "not_applicable" | null;
 }
 
 export interface DurableTurnMutation {
@@ -251,6 +277,7 @@ export interface DurableTurnMutation {
   }>;
   keepLease?: boolean;
   promptManifest?: PromptManifest;
+  progress?: Partial<DurableTurnProgress>;
 }
 
 export interface DurableTurnRepository {
@@ -362,7 +389,12 @@ export interface DurableTurnToolExecutor {
   definitions?(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]>;
   modelContent?(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
-  execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult>;
+  execute(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<TurnToolResult>;
   stageAssociatedInputFiles?(snapshot: DurableTurnSnapshot, fileIds: readonly string[]): Promise<readonly {
     fileId: string;
     name: string;
@@ -385,10 +417,28 @@ export interface DurableTurnToolExecutor {
   finalize?(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]>;
 }
 
+export interface ToolExecutionLimit {
+  idleTimeoutMs: number;
+  maxDurationMs: number;
+}
+
 const OUTPUT_REPETITION_WINDOW = 1_024;
 const OUTPUT_REPETITION_MAX_PERIOD = 128;
 const OUTPUT_REPETITION_CHECK_INTERVAL = 128;
 const MODEL_CONTEXT_SAFETY_TOKENS = 1_024;
+const DEFAULT_NO_PROGRESS_WARNING_THRESHOLD = 3;
+const DEFAULT_NO_PROGRESS_HARD_THRESHOLD = 5;
+const DEFAULT_CUMULATIVE_TOOL_TIME_MS = 30 * 60_000;
+const DEFAULT_ACTIVE_COMPUTE_MS = 2 * 60 * 60_000;
+const MAX_TOOL_RESULT_CONTEXT_CHARS = 12_000;
+const MAX_TOOL_CONTEXT_CHARS = 48_000;
+const DEFAULT_TOOL_LIMITS: Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit> = {
+  read: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
+  command: { idleTimeoutMs: 180_000, maxDurationMs: 20 * 60_000 },
+  connector: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
+  image: { idleTimeoutMs: 300_000, maxDurationMs: 20 * 60_000 },
+  default: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
+};
 
 interface RepetitionChannelState {
   tail: string;
@@ -445,6 +495,14 @@ export class DurableTurnRunner {
       modelPreparationTimeoutMs?: number;
       modelIdleTimeoutMs?: number;
       modelMaxDurationMs?: number;
+      toolIdleTimeoutMs?: number;
+      toolMaxDurationMs?: number;
+      toolClassLimits?: Partial<Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit>>;
+      maxCumulativeToolTimeMs?: number;
+      maxActiveComputeMs?: number;
+      noProgressWarningThreshold?: number;
+      noProgressHardThreshold?: number;
+      maxToolRepairAttempts?: number;
       abortCleanupTimeoutMs?: number;
       compactor?: SessionCompactionRunner;
       cancellations?: ActiveTurnCancellationRegistry;
@@ -492,9 +550,29 @@ export class DurableTurnRunner {
       return { runId: snapshot.id, state: snapshot.state, noOp: true };
     } catch (error) {
       if (error instanceof DurableTurnCancellationError) {
+        if (hasAmbiguousNonIdempotentTool(snapshot)) {
+          try {
+            await this.transitionAmbiguousToolToRecovery(
+              snapshot,
+              "The external mutation was interrupted before Berry received a receipt.",
+              { outcomeCertainty: "unknown" },
+            );
+            return { runId: snapshot.id, state: "recovery_required" };
+          } catch {
+            // The API may have already terminalized the run concurrently.
+          }
+        }
         return { runId: snapshot.id, state: "cancelled" };
       }
       const message = error instanceof Error ? error.message : String(error);
+      if (hasAmbiguousNonIdempotentTool(snapshot)) {
+        try {
+          await this.transitionAmbiguousToolToRecovery(snapshot, message);
+          return { runId: snapshot.id, state: "recovery_required" };
+        } catch (persistenceError) {
+          if (persistenceError instanceof DurableTurnRetryableError) throw persistenceError;
+        }
+      }
       if (error instanceof DurableTurnRetryableError
         || error instanceof CompactionRetryableError
         || (error instanceof RouterClientError && isRetryableProviderStatus(error.status))) {
@@ -519,6 +597,74 @@ export class DurableTurnRunner {
         throw new DurableTurnTerminalError(message, error);
       }
     }
+  }
+
+  private async transitionAmbiguousToolToRecovery(
+    snapshot: DurableTurnSnapshot,
+    reason: string,
+    details: {
+      timedOut?: boolean;
+      outcomeCertainty?: "known" | "unknown" | "not_applicable";
+      abortAcknowledged?: boolean;
+    } = {},
+  ): Promise<void> {
+    const step = snapshot.steps.find((candidate) =>
+      candidate.type.startsWith("tool.")
+      && candidate.state === "running"
+      && candidate.retryClass === "non_idempotent_manual"
+    );
+    if (!step) throw new DurableTurnRetryableError("The interrupted tool reference was not available");
+    const toolCallId = toolCallIdForStep(step);
+    await this.repository.commit(snapshot, {
+      expectedState: "executing_tool",
+      nextState: "recovery_required",
+      steps: [{
+        ...step,
+        state: "recovery_required",
+        error: reason.slice(0, 4_000),
+        cancellationAcknowledged: true,
+        ...(details.timedOut !== undefined ? { timedOut: details.timedOut } : {}),
+        ...(details.outcomeCertainty ? { outcomeCertainty: details.outcomeCertainty } : {}),
+        ...(details.abortAcknowledged !== undefined ? { abortAcknowledged: details.abortAcknowledged } : {}),
+      }],
+      events: [
+        { kind: "tool.end", toolCallId, status: "failed", summary: "The external mutation outcome is uncertain." },
+        { kind: "error", message: "The external mutation outcome is uncertain. Operator review is required before retry." },
+        { kind: "turn.end", turnId: snapshot.id, status: "failed" },
+      ],
+      toolResultMessage: {
+        id: randomUUID(),
+        toolCallId,
+        name: toolNameForStep(step),
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "failed",
+        summary: "The external mutation outcome is uncertain. Operator review is required before retry.",
+      },
+      terminalAssistant: {
+        status: "failed",
+        error: "The external mutation outcome is uncertain. Operator review is required before retry.",
+      },
+      error: "ambiguous_external_operation",
+      nextAction: "Review the external operation outcome before choosing retry or completion",
+      taskStatus: "failed",
+      progress: {
+        ...progressState(snapshot),
+        progressEpoch: progressState(snapshot).progressEpoch + 1,
+        progressKind: "budget_exceeded",
+        budgetReason: "ambiguous_external_operation",
+      },
+      ...(snapshot.sandboxId ? {
+        outbox: [{
+          eventType: "sandbox.snapshot" as const,
+          dedupeKey: `${snapshot.id}:snapshot:recovery-required`,
+          payload: {
+            tenantId: snapshot.tenantId,
+            runId: snapshot.id,
+            reason: "before-finalize",
+          },
+        }],
+      } : {}),
+    });
   }
 
   private async assemble(snapshot: DurableTurnSnapshot): Promise<void> {
@@ -582,16 +728,26 @@ export class DurableTurnRunner {
         `The task exceeded the ${durationMinutes}-minute execution safety limit. Berry stopped it to prevent an abandoned or looping task from blocking other work.`,
       );
     }
+    if (progressState(snapshot).cumulativeActiveComputeMs >= Math.max(60_000, this.options.maxActiveComputeMs ?? DEFAULT_ACTIVE_COMPUTE_MS)) {
+      throw new DurableTurnTerminalError(
+        "The task exceeded its active-compute budget. Berry stopped it before starting another model request.",
+      );
+    }
     const maxModelAttempts = Math.max(1, this.options.maxModelAttempts ?? 3);
     if (step.attempt >= maxModelAttempts) {
       throw new DurableTurnTerminalError(
         `Model request failed after ${step.attempt} attempts.`,
       );
     }
+    const modelProgress = progressState(snapshot);
     await this.repository.commit(snapshot, {
       expectedState: "calling_model",
       nextState: "calling_model",
       steps: [{ ...step, state: "running", incrementAttempt: true }],
+      progress: {
+        physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
+        logicalModelIteration: modelIteration(snapshot.steps),
+      },
       nextAction: "Preparing tools and files for the model request",
       keepLease: true,
     });
@@ -615,6 +771,7 @@ export class DurableTurnRunner {
     }, {
       label: "Model input preparation",
       abortable: true,
+      operation: "model_preparation",
       maxDurationMs: this.options.modelPreparationTimeoutMs ?? 120_000,
     });
     const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
@@ -731,6 +888,7 @@ export class DurableTurnRunner {
       }, {
         label: "Model request",
         abortable: true,
+        operation: "model",
         idleTimeoutMs: this.options.modelIdleTimeoutMs ?? 240_000,
         maxDurationMs: this.options.modelMaxDurationMs ?? 900_000,
       });
@@ -851,6 +1009,12 @@ export class DurableTurnRunner {
           },
         ],
         events: emptyEvents,
+        progress: {
+          ...modelProgress,
+          physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
+          logicalModelIteration: modelIteration(snapshot.steps),
+          cumulativeActiveComputeMs: modelProgress.cumulativeActiveComputeMs + Math.max(0, Date.now() - modelStartedAt),
+        },
         ...(result.promptManifest ? { promptManifest: result.promptManifest } : {}),
         nextAction: "Retry the model once because it returned no text or tool call",
       });
@@ -936,6 +1100,12 @@ export class DurableTurnRunner {
         ...toolSteps,
       ],
       events: messageEvents,
+      progress: {
+        ...modelProgress,
+        physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
+        logicalModelIteration: modelIteration(snapshot.steps),
+        cumulativeActiveComputeMs: modelProgress.cumulativeActiveComputeMs + Math.max(0, Date.now() - modelStartedAt),
+      },
       entries,
       assistantMessage: {
         id: messageId,
@@ -1041,6 +1211,20 @@ export class DurableTurnRunner {
     }
     const toolCallId = stringValue(step.input.toolCallId) ?? step.id;
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    const progress = progressState(snapshot);
+    const cumulativeToolBudget = Math.max(60_000, this.options.maxCumulativeToolTimeMs ?? DEFAULT_CUMULATIVE_TOOL_TIME_MS);
+    if (progress.cumulativeToolMs >= cumulativeToolBudget) {
+      throw new DurableTurnTerminalError(
+        "The task exceeded its cumulative tool-time budget. Berry stopped it before another tool call.",
+      );
+    }
+    const priorRepairAttempts = matchingToolFailureCount(snapshot, step);
+    const repairBudget = Math.max(1, this.options.maxToolRepairAttempts ?? IDENTICAL_TOOL_FAILURE_LIMIT);
+    if (repairBudget < IDENTICAL_TOOL_FAILURE_LIMIT && priorRepairAttempts >= repairBudget) {
+      throw new DurableTurnTerminalError(
+        `${toolName} exhausted its ${repairBudget}-attempt repair budget. Berry stopped the repair loop; choose a different strategy or provide corrected input.`,
+      );
+    }
     const repeatedFailure = repeatedToolFailure(snapshot, step);
     if (repeatedFailure) {
       throw new DurableTurnTerminalError(
@@ -1245,10 +1429,20 @@ export class DurableTurnRunner {
       return "waiting";
     }
 
+    const toolLimits = toolExecutionLimits(toolName, this.options);
+    const toolStartedAt = Date.now();
+    const deadlineAt = new Date(toolStartedAt + toolLimits.maxDurationMs).toISOString();
+    const idleDeadlineAt = new Date(toolStartedAt + toolLimits.idleTimeoutMs).toISOString();
     await this.repository.commit(snapshot, {
       expectedState: "executing_tool",
       nextState: "executing_tool",
-      steps: [{ ...step, state: "running", incrementAttempt: true }],
+      steps: [{
+        ...step,
+        state: "running",
+        incrementAttempt: true,
+        deadlineAt,
+        idleDeadlineAt,
+      }],
       events: [{
         kind: "tool.start",
         toolCallId,
@@ -1258,7 +1452,16 @@ export class DurableTurnRunner {
       nextAction: `Execute ${step.type}`,
       keepLease: true,
     });
-    const toolStartedAt = Date.now();
+    step.state = "running";
+    step.deadlineAt = deadlineAt;
+    step.idleDeadlineAt = idleDeadlineAt;
+    const toolOperation = ({ signal, reportProgress }: { signal: AbortSignal; reportProgress(): void }) =>
+      this.tools.execute(snapshot, step, signal, reportProgress);
+    // Legacy adapters may ignore extra arguments. Passing the signal is safe,
+    // but racing their promise is only safe when the adapter declares that it
+    // can observe the signal; otherwise a read may still be settling while a
+    // recovery worker receives the lease.
+    const toolAbortable = step.retryClass === "read_only" && this.tools.execute.length >= 3;
     let result: TurnToolResult;
     try {
       if (toolName === "create_image") {
@@ -1284,15 +1487,48 @@ export class DurableTurnRunner {
         ? durableSkills(snapshot).find((skill) => skill.name === stringValue(record(step.input.arguments)?.name))
         : undefined;
       result = storedSkill && (/^\/(personal|organization)-skills\//.test(storedSkill.filePath))
-        ? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step))
+        ? await this.withHeartbeat(snapshot, toolOperation, {
+            label: `${toolName} tool`,
+            abortable: toolAbortable,
+            operation: "tool",
+            idleTimeoutMs: toolLimits.idleTimeoutMs,
+            maxDurationMs: toolLimits.maxDurationMs,
+          })
         : builtInPresentationToolResult(snapshot, toolName, step.input.arguments)
-          ?? await this.withHeartbeat(snapshot, () => this.tools.execute(snapshot, step));
+          ?? await this.withHeartbeat(snapshot, toolOperation, {
+              label: `${toolName} tool`,
+              abortable: toolAbortable,
+              operation: "tool",
+              idleTimeoutMs: toolLimits.idleTimeoutMs,
+              maxDurationMs: toolLimits.maxDurationMs,
+            });
     } catch (error) {
-      if (error instanceof DurableTurnRetryableError || error instanceof DurableTurnTerminalError) {
+      if (error instanceof DurableToolTimeoutError && step.retryClass === "non_idempotent_manual") {
+        await this.transitionAmbiguousToolToRecovery(snapshot, error.message, {
+          timedOut: true,
+          outcomeCertainty: "unknown",
+        });
+        return "recovery_required";
+      }
+      if (error instanceof DurableTurnCancellationError) {
+        throw error;
+      }
+      if (!(error instanceof DurableToolTimeoutError)
+        && (error instanceof DurableTurnRetryableError || error instanceof DurableTurnTerminalError)) {
         throw error;
       }
       const failureUsage = error instanceof DurableToolExecutionError ? error.usage : undefined;
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000);
+      const repairAttempt = priorRepairAttempts + 1;
+      const timedOut = error instanceof DurableToolTimeoutError;
+      const failureDurationMs = Math.max(0, Date.now() - toolStartedAt);
+      const failureProgress = nextProgress(snapshot, {
+        kind: "repair_budget",
+        noProgress: false,
+        toolMs: failureDurationMs,
+        toolRepairAttempts: 1,
+      });
+      const typedRepairMessage = `Tool failed (repair attempt ${repairAttempt}/${repairBudget}). ${message}`;
       const entryId = randomUUID();
       const remaining = snapshot.steps.some((candidate) =>
         candidate.id !== step.id && isRunnableToolStep(candidate)
@@ -1302,7 +1538,16 @@ export class DurableTurnRunner {
         expectedState: "executing_tool",
         nextState: remaining ? "executing_tool" : "calling_model",
         steps: [
-          { ...step, state: "failed", error: message },
+          {
+            ...step,
+            state: "failed",
+            error: typedRepairMessage,
+            ...(timedOut ? {
+              timedOut: true,
+              outcomeCertainty: "known" as const,
+              abortAcknowledged: toolAbortable,
+            } : {}),
+          },
           ...(!remaining ? [{
             id: randomUUID(),
             sequence: nextStepSequence(snapshot.steps),
@@ -1320,6 +1565,11 @@ export class DurableTurnRunner {
             status: "failed",
             summary: message.slice(0, 2_000),
           },
+          ...(timedOut ? [{
+            kind: "phase.deadline_exceeded" as const,
+            phase: "tool" as const,
+            deadlineKind: error.phase,
+          }] : []),
           ...(failureUsage ? [AgentStreamEventSchema.parse(failureUsage)] : []),
         ],
         toolResultMessage: {
@@ -1329,7 +1579,7 @@ export class DurableTurnRunner {
           input: (step.input.arguments ?? {}) as JsonValue,
           status: "failed",
           summary: message.slice(0, 2_000),
-          durationMs: Math.max(0, Date.now() - toolStartedAt),
+          durationMs: failureDurationMs,
         },
         entries: [{
           entryId,
@@ -1344,16 +1594,51 @@ export class DurableTurnRunner {
               role: "toolResult",
               toolCallId,
               toolName,
-              content: [{ type: "text", text: `Tool failed: ${message}` }],
+              content: [{ type: "text", text: typedRepairMessage }],
               isError: true,
               timestamp: Date.now(),
             },
           },
         }],
         nextAction: remaining ? "Execute the next tool step" : "Let the model handle the failed tool result",
+        progress: failureProgress,
       });
       return remaining ? "executing_tool" : "calling_model";
     }
+    const toolDurationMs = Math.max(0, Date.now() - toolStartedAt);
+    const resultFingerprint = progressFingerprint(snapshot.id, result.output);
+    const progressAssessment = assessToolProgress(snapshot, step, resultFingerprint);
+    const updatedProgress = nextProgress(snapshot, {
+      kind: progressAssessment.kind,
+      noProgress: progressAssessment.noProgress,
+      toolMs: toolDurationMs,
+    });
+    const noProgressWarningThreshold = Math.max(
+      1,
+      this.options.noProgressWarningThreshold ?? DEFAULT_NO_PROGRESS_WARNING_THRESHOLD,
+    );
+    const noProgressHardThreshold = Math.max(
+      noProgressWarningThreshold + 1,
+      this.options.noProgressHardThreshold ?? DEFAULT_NO_PROGRESS_HARD_THRESHOLD,
+    );
+    if (progressAssessment.noProgress && updatedProgress.consecutiveNoProgress >= noProgressHardThreshold) {
+      return this.stopForNoProgress(
+        snapshot,
+        step,
+        result,
+        resultFingerprint,
+        updatedProgress,
+        toolDurationMs,
+      );
+    }
+    const progressEvent = progressAssessment.noProgress && updatedProgress.consecutiveNoProgress >= noProgressWarningThreshold
+      ? {
+          kind: "turn.progress" as const,
+          progressKind: progressAssessment.kind,
+          progressEpoch: updatedProgress.progressEpoch,
+          consecutiveNoProgress: updatedProgress.consecutiveNoProgress,
+        }
+      : null;
     const entryId = randomUUID();
     const remaining = snapshot.steps.some((candidate) =>
       candidate.id !== step.id && isRunnableToolStep(candidate)
@@ -1367,6 +1652,7 @@ export class DurableTurnRunner {
           ...step,
           state: "completed",
           output: result.output,
+          resultFingerprint,
           sessionEntryId: entryId,
         },
         ...(!remaining ? [{
@@ -1399,6 +1685,7 @@ export class DurableTurnRunner {
             })]
           : []),
         ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
+        ...(progressEvent ? [progressEvent] : []),
       ],
       toolResultMessage: {
         id: entryId,
@@ -1408,7 +1695,7 @@ export class DurableTurnRunner {
         status: "completed",
         output: result.output,
         summary: result.summary.slice(0, 2_000),
-        durationMs: Math.max(0, Date.now() - toolStartedAt),
+        durationMs: toolDurationMs,
       },
       entries: [{
         entryId,
@@ -1430,6 +1717,7 @@ export class DurableTurnRunner {
         },
       }],
       ...(result.sandbox ? { sandbox: result.sandbox } : {}),
+      progress: updatedProgress,
       nextAction: remaining ? "Execute the next tool step" : "Continue the model with persisted tool results",
       ...(result.sandbox ? {
         outbox: [scheduledSandboxSnapshot(snapshot, this.options.snapshotIntervalSeconds ?? 900)],
@@ -1442,6 +1730,13 @@ export class DurableTurnRunner {
     snapshot: DurableTurnSnapshot,
     steps: readonly DurableTurnStep[],
   ): Promise<TurnRunState> {
+    const currentProgress = progressState(snapshot);
+    const cumulativeToolBudget = Math.max(60_000, this.options.maxCumulativeToolTimeMs ?? DEFAULT_CUMULATIVE_TOOL_TIME_MS);
+    if (currentProgress.cumulativeToolMs >= cumulativeToolBudget) {
+      throw new DurableTurnTerminalError(
+        "The task exceeded its cumulative tool-time budget. Berry stopped it before another tool batch.",
+      );
+    }
     for (const step of steps) {
       const repeatedFailure = repeatedToolFailure(snapshot, step);
       if (repeatedFailure) {
@@ -1451,10 +1746,20 @@ export class DurableTurnRunner {
       }
     }
     const pendingSteps = steps.filter((step) => step.state === "pending");
+    const toolLimits = toolExecutionLimits("read", this.options);
+    const batchStartedAt = Date.now();
+    const deadlineAt = new Date(batchStartedAt + toolLimits.maxDurationMs).toISOString();
+    const idleDeadlineAt = new Date(batchStartedAt + toolLimits.idleTimeoutMs).toISOString();
     await this.repository.commit(snapshot, {
       expectedState: "executing_tool",
       nextState: "executing_tool",
-      steps: steps.map((step) => ({ ...step, state: "running", incrementAttempt: true })),
+      steps: steps.map((step) => ({
+        ...step,
+        state: "running",
+        incrementAttempt: true,
+        deadlineAt,
+        idleDeadlineAt,
+      })),
       events: pendingSteps.map((step) => ({
         kind: "tool.start" as const,
         toolCallId: toolCallIdForStep(step),
@@ -1464,13 +1769,26 @@ export class DurableTurnRunner {
       nextAction: `Execute ${steps.length} independent read-only tools concurrently`,
       keepLease: true,
     });
+    for (const step of steps) {
+      step.state = "running";
+      step.deadlineAt = deadlineAt;
+      step.idleDeadlineAt = idleDeadlineAt;
+    }
 
-    const startedAt = Date.now();
+    const startedAt = batchStartedAt;
     const entryIds = steps.map(() => randomUUID());
     const settled = await this.withHeartbeat(
       snapshot,
-      () => Promise.allSettled(steps.map((step) => this.tools.execute(snapshot, step))),
-      { label: "Parallel read-only tool batch", abortable: true },
+      ({ signal, reportProgress }) => Promise.allSettled(
+        steps.map((step) => this.tools.execute(snapshot, step, signal, reportProgress)),
+      ),
+      {
+        label: "Parallel read-only tool batch",
+        abortable: this.tools.execute.length >= 3,
+        operation: "tool",
+        idleTimeoutMs: toolLimits.idleTimeoutMs,
+        maxDurationMs: toolLimits.maxDurationMs,
+      },
     );
     const cancellation = settled.find((outcome): outcome is PromiseRejectedResult =>
       outcome.status === "rejected" && outcome.reason instanceof DurableTurnCancellationError
@@ -1482,6 +1800,10 @@ export class DurableTurnRunner {
     const entries: Array<NonNullable<DurableTurnMutation["entries"]>[number]> = [];
     const toolResultMessages: Array<NonNullable<DurableTurnMutation["toolResultMessages"]>[number]> = [];
     let sandbox: TurnToolResult["sandbox"] | undefined;
+    let batchProgress = currentProgress;
+    let hardNoProgress = false;
+    const noProgressWarningThreshold = Math.max(1, this.options.noProgressWarningThreshold ?? DEFAULT_NO_PROGRESS_WARNING_THRESHOLD);
+    const noProgressHardThreshold = Math.max(noProgressWarningThreshold + 1, this.options.noProgressHardThreshold ?? DEFAULT_NO_PROGRESS_HARD_THRESHOLD);
     for (let index = 0; index < steps.length; index += 1) {
       const step = steps[index]!;
       const outcome = settled[index]!;
@@ -1491,11 +1813,44 @@ export class DurableTurnRunner {
       const durationMs = Math.max(0, Date.now() - startedAt);
       if (outcome.status === "fulfilled") {
         const result = outcome.value;
+        const resultFingerprint = progressFingerprint(snapshot.id, result.output);
+        const assessmentSnapshot: DurableTurnSnapshot = {
+          ...snapshot,
+          progress: batchProgress,
+          steps: [
+            ...snapshot.steps,
+            ...mutations.map((mutation) => {
+              const original = steps.find((candidate) => candidate.id === mutation.id) ?? step;
+              return {
+                ...original,
+                state: mutation.state,
+                output: mutation.output ?? null,
+                resultFingerprint: mutation.resultFingerprint ?? null,
+              };
+            }),
+          ],
+        };
+        const assessment = assessToolProgress(assessmentSnapshot, step, resultFingerprint);
+        batchProgress = nextProgress(assessmentSnapshot, {
+          kind: assessment.kind,
+          noProgress: assessment.noProgress,
+          toolMs: durationMs,
+        });
+        if (assessment.noProgress && batchProgress.consecutiveNoProgress >= noProgressHardThreshold) hardNoProgress = true;
+        if (assessment.noProgress && batchProgress.consecutiveNoProgress >= noProgressWarningThreshold) {
+          events.push({
+            kind: "turn.progress",
+            progressKind: assessment.kind,
+            progressEpoch: batchProgress.progressEpoch,
+            consecutiveNoProgress: batchProgress.consecutiveNoProgress,
+          });
+        }
         sandbox ??= result.sandbox;
         mutations.push({
           ...step,
           state: "completed",
           output: result.output,
+          resultFingerprint,
           sessionEntryId: entryId,
         });
         events.push({
@@ -1549,6 +1904,12 @@ export class DurableTurnRunner {
         summary: message.slice(0, 2_000),
       });
       if (failureUsage) events.push(AgentStreamEventSchema.parse(failureUsage));
+      batchProgress = nextProgress({ ...snapshot, progress: batchProgress }, {
+        kind: "repair_budget",
+        noProgress: false,
+        toolMs: durationMs,
+        toolRepairAttempts: 1,
+      });
       toolResultMessages.push({
         id: entryId,
         toolCallId,
@@ -1580,31 +1941,122 @@ export class DurableTurnRunner {
     }
 
     const iteration = modelIteration(snapshot.steps) + 1;
+    const nextState: TurnRunState = hardNoProgress ? "failed" : "calling_model";
+    const finalEvents = hardNoProgress
+      ? [
+          ...events,
+          { kind: "error" as const, message: "Berry stopped the task after repeated successful read results made no durable progress." },
+          { kind: "turn.end" as const, turnId: snapshot.id, status: "failed" as const },
+        ]
+      : events;
     await this.commitAndWake(snapshot, {
       expectedState: "executing_tool",
-      nextState: "calling_model",
+      nextState,
       steps: [
         ...mutations,
-        {
+        ...(!hardNoProgress ? [{
           id: randomUUID(),
           sequence: nextStepSequence(snapshot.steps),
           type: "model.call",
-          state: "pending",
+          state: "pending" as const,
           input: { iteration },
-          retryClass: "idempotent_with_key",
+          retryClass: "idempotent_with_key" as const,
           idempotencyKey: `${snapshot.id}:model:${iteration}`,
-        },
+        }] : []),
       ],
-      events,
+      events: finalEvents,
       entries,
       toolResultMessages,
       ...(sandbox ? { sandbox } : {}),
-      nextAction: "Continue the model with the persisted read-only tool batch",
+      ...(hardNoProgress ? {
+        terminalAssistant: { status: "failed" as const, error: "no_progress_budget" },
+        error: "no_progress_budget",
+        taskStatus: "failed" as const,
+        nextAction: null,
+        waitingReason: null,
+      } : {
+        nextAction: "Continue the model with the persisted read-only tool batch",
+      }),
+      progress: batchProgress,
       ...(sandbox ? {
         outbox: [scheduledSandboxSnapshot(snapshot, this.options.snapshotIntervalSeconds ?? 900)],
       } : {}),
     });
-    return "calling_model";
+    return nextState;
+  }
+
+  private async stopForNoProgress(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    result: TurnToolResult,
+    resultFingerprint: string,
+    progress: DurableTurnProgress,
+    durationMs: number,
+  ): Promise<TurnRunState> {
+    const toolCallId = toolCallIdForStep(step);
+    const toolName = toolNameForStep(step);
+    const entryId = randomUUID();
+    const error = "no_progress_budget";
+    const summary = "Berry stopped the task after repeated successful tool results made no durable progress.";
+    await this.repository.commit(snapshot, {
+      expectedState: "executing_tool",
+      nextState: "failed",
+      steps: [{
+        ...step,
+        state: "completed",
+        output: result.output,
+        resultFingerprint,
+        sessionEntryId: entryId,
+      }],
+      events: [
+        { kind: "tool.end", toolCallId, status: "completed", summary: result.summary.slice(0, 2_000) },
+        {
+          kind: "turn.progress",
+          progressKind: progress.progressKind === "alternating_no_progress" ? "alternating_no_progress" : "result_repeated",
+          progressEpoch: progress.progressEpoch,
+          consecutiveNoProgress: progress.consecutiveNoProgress,
+          budgetReason: error,
+        },
+        { kind: "error", message: summary },
+        { kind: "turn.end", turnId: snapshot.id, status: "failed" },
+      ],
+      toolResultMessage: {
+        id: entryId,
+        toolCallId,
+        name: toolName,
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "completed",
+        output: result.output,
+        summary,
+        durationMs,
+      },
+      entries: [{
+        entryId,
+        entryType: "message",
+        stepId: step.id,
+        payload: {
+          type: "message",
+          id: entryId,
+          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId,
+            toolName,
+            content: [{ type: "text", text: summary }],
+            isError: true,
+            timestamp: Date.now(),
+          },
+        },
+      }],
+      terminalAssistant: { status: "failed", error: summary },
+      nextAction: null,
+      waitingReason: null,
+      error,
+      taskStatus: "failed",
+      progress: { ...progress, budgetReason: error },
+    });
+    return "failed";
   }
 
   private async finalize(snapshot: DurableTurnSnapshot): Promise<void> {
@@ -1691,7 +2143,11 @@ export class DurableTurnRunner {
     await this.repository.commit(snapshot, {
       expectedState: snapshot.state,
       nextState: "cancelled",
-      steps: unfinishedSteps.map((step) => ({ ...step, state: "cancelled" as const })),
+      steps: unfinishedSteps.map((step) => ({
+        ...step,
+        state: "cancelled" as const,
+        cancellationAcknowledged: true,
+      })),
       events: [
         ...unfinishedTools.map((step) => ({
           kind: "tool.end" as const,
@@ -1857,7 +2313,13 @@ export class DurableTurnRunner {
   private async withHeartbeat<T>(
     snapshot: DurableTurnSnapshot,
     operation: (control: { signal: AbortSignal; reportProgress(): void; abort(reason?: unknown): void }) => Promise<T>,
-    limits: { label?: string; abortable?: boolean; idleTimeoutMs?: number; maxDurationMs?: number } = {},
+    limits: {
+      label?: string;
+      abortable?: boolean;
+      idleTimeoutMs?: number;
+      maxDurationMs?: number;
+      operation?: "tool" | "model" | "model_preparation" | "compaction" | "finalization" | "generic";
+    } = {},
   ): Promise<T> {
     const leaseSeconds = this.options.leaseSeconds ?? 90;
     const heartbeatMs = this.options.heartbeatMs ?? Math.max(5_000, Math.floor(leaseSeconds * 1_000 / 3));
@@ -1869,13 +2331,15 @@ export class DurableTurnRunner {
     let durationTimer: NodeJS.Timeout | null = null;
     let stopped = false;
     let heartbeatFailure: unknown;
-    let timeoutFailure: DurableTurnRetryableError | null = null;
+    let timeoutFailure: DurableToolTimeoutError | null = null;
     const reportProgress = () => {
       if (!limits.idleTimeoutMs || stopped) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
-        timeoutFailure = new DurableTurnRetryableError(
+        timeoutFailure = new DurableToolTimeoutError(
           `${limits.label ?? "Operation"} stalled for ${Math.ceil(limits.idleTimeoutMs! / 1_000)} seconds without progress.`,
+          "idle",
+          limits.operation ?? "generic",
         );
         if (limits.abortable) controller.abort(timeoutFailure);
       }, limits.idleTimeoutMs);
@@ -1907,8 +2371,10 @@ export class DurableTurnRunner {
     timer.unref?.();
     if (limits.maxDurationMs) {
       durationTimer = setTimeout(() => {
-        timeoutFailure = new DurableTurnRetryableError(
+        timeoutFailure = new DurableToolTimeoutError(
           `${limits.label ?? "Operation"} exceeded its maximum duration of ${Math.ceil(limits.maxDurationMs! / 1_000)} seconds.`,
+          "wall",
+          limits.operation ?? "generic",
         );
         if (limits.abortable) controller.abort(timeoutFailure);
       }, limits.maxDurationMs);
@@ -1965,6 +2431,9 @@ export class DurableTurnRunner {
         throw heartbeatFailure instanceof DurableTurnRetryableError
           ? heartbeatFailure
           : new DurableTurnRetryableError("Turn heartbeat failed during a long-running operation", heartbeatFailure);
+      }
+      if (controller.signal.aborted && controller.signal.reason instanceof DurableTurnCancellationError) {
+        throw controller.signal.reason;
       }
       return result;
     } finally {
@@ -2451,9 +2920,18 @@ SET state=$4,
     completed_at=CASE WHEN $4 IN ('completed','failed','cancelled','recovery_required') THEN now() ELSE NULL END,
     lease_owner=CASE WHEN $8::boolean THEN lease_owner ELSE NULL END,
     lease_expires_at=CASE WHEN $8::boolean THEN lease_expires_at ELSE NULL END,
+    progress_epoch=COALESCE($10::integer,progress_epoch),
+    progress_kind=COALESCE($11,progress_kind),
+    consecutive_no_progress=COALESCE($12::integer,consecutive_no_progress),
+    physical_model_attempt=COALESCE($13::integer,physical_model_attempt),
+    logical_model_iteration=COALESCE($14::integer,logical_model_iteration),
+    tool_repair_attempts=COALESCE($15::integer,tool_repair_attempts),
+    cumulative_tool_ms=COALESCE($16::bigint,cumulative_tool_ms),
+    cumulative_active_compute_ms=COALESCE($17::bigint,cumulative_active_compute_ms),
+    progress_budget_reason=COALESCE($18,progress_budget_reason),
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
-  AND ($10::bigint IS NULL OR ownership_generation=$10::bigint)
+  AND ($19::bigint IS NULL OR ownership_generation=$19::bigint)
         `.trim(),
         [
           snapshot.tenantId,
@@ -2465,6 +2943,15 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
           mutation.error ?? null,
           mutation.keepLease ?? false,
           mutation.promptManifest ? JSON.stringify(mutation.promptManifest) : null,
+          mutation.progress?.progressEpoch ?? null,
+          mutation.progress?.progressKind ?? null,
+          mutation.progress?.consecutiveNoProgress ?? null,
+          mutation.progress?.physicalModelAttempt ?? null,
+          mutation.progress?.logicalModelIteration ?? null,
+          mutation.progress?.toolRepairAttempts ?? null,
+          mutation.progress?.cumulativeToolMs ?? null,
+          mutation.progress?.cumulativeActiveComputeMs ?? null,
+          mutation.progress?.budgetReason ?? null,
           snapshot.ownershipGeneration ?? null,
         ],
       );
@@ -3069,6 +3556,17 @@ export class DurableTurnRetryableError extends Error {
   }
 }
 
+export class DurableToolTimeoutError extends DurableTurnRetryableError {
+  constructor(
+    message: string,
+    readonly phase: "idle" | "wall",
+    readonly operation: "tool" | "model" | "model_preparation" | "compaction" | "finalization" | "generic" = "generic",
+  ) {
+    super(message);
+    this.name = "DurableToolTimeoutError";
+  }
+}
+
 export class DurableTurnTerminalError extends Error {
   constructor(message: string, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause });
@@ -3231,6 +3729,126 @@ function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnSte
     }
   }
   return null;
+}
+
+function matchingToolFailureCount(snapshot: DurableTurnSnapshot, step: DurableTurnStep): number {
+  const fingerprint = toolArgumentFingerprint(step.input.arguments);
+  const precedingToolSteps = snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence && candidate.type === step.type)
+    .sort((left, right) => right.sequence - left.sequence);
+  let count = 0;
+  let error: string | null = null;
+  for (const candidate of precedingToolSteps) {
+    const candidateError = typeof candidate.error === "string" ? candidate.error.trim() : "";
+    if (candidate.state !== "failed"
+      || toolArgumentFingerprint(candidate.input.arguments) !== fingerprint
+      || !candidateError
+      || (error !== null && candidateError !== error)) break;
+    error = candidateError;
+    count += 1;
+  }
+  return count;
+}
+
+function progressState(snapshot: DurableTurnSnapshot): DurableTurnProgress {
+  return {
+    progressEpoch: snapshot.progress?.progressEpoch ?? 0,
+    progressKind: snapshot.progress?.progressKind ?? null,
+    consecutiveNoProgress: snapshot.progress?.consecutiveNoProgress ?? 0,
+    physicalModelAttempt: snapshot.progress?.physicalModelAttempt ?? 0,
+    logicalModelIteration: snapshot.progress?.logicalModelIteration ?? modelIteration(snapshot.steps),
+    toolRepairAttempts: snapshot.progress?.toolRepairAttempts ?? 0,
+    cumulativeToolMs: snapshot.progress?.cumulativeToolMs ?? 0,
+    cumulativeActiveComputeMs: snapshot.progress?.cumulativeActiveComputeMs ?? 0,
+    budgetReason: snapshot.progress?.budgetReason ?? null,
+  };
+}
+
+function progressFingerprint(runId: string, value: unknown): string {
+  return createHash("sha256")
+    .update(`${runId}:result:`)
+    .update(JSON.stringify(canonicalizeToolArguments(value)) ?? String(value))
+    .digest("hex");
+}
+
+function declaredPolling(step: DurableTurnStep): boolean {
+  const argumentsValue = record(step.input.arguments);
+  return argumentsValue?.progressPolicy === "polling" || argumentsValue?.allowNoProgress === true;
+}
+
+function assessToolProgress(
+  snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
+  fingerprint: string,
+): { noProgress: boolean; kind: "tool_progress" | "result_repeated" | "alternating_no_progress" | "declared_polling" } {
+  if (declaredPolling(step)) return { noProgress: false, kind: "declared_polling" };
+  const completed = snapshot.steps
+    .filter((candidate) => candidate.state === "completed" && candidate.type.startsWith("tool."))
+    .slice(-8);
+  const fingerprints = completed
+    .map((candidate) => candidate.resultFingerprint ?? (
+      candidate.output === null || candidate.output === undefined
+        ? null
+        : progressFingerprint(snapshot.id, candidate.output)
+    ))
+    .filter((value): value is string => Boolean(value));
+  if (fingerprints.includes(fingerprint)) {
+    const previous = fingerprints.at(-1);
+    const twoBack = fingerprints.at(-2);
+    if (previous && twoBack && previous !== twoBack && twoBack === fingerprint) {
+      return { noProgress: true, kind: "alternating_no_progress" };
+    }
+    return { noProgress: true, kind: "result_repeated" };
+  }
+  return { noProgress: false, kind: "tool_progress" };
+}
+
+function nextProgress(
+  snapshot: DurableTurnSnapshot,
+  update: {
+    kind: DurableTurnProgress["progressKind"];
+    noProgress: boolean;
+    toolMs?: number;
+    activeComputeMs?: number;
+    toolRepairAttempts?: number;
+    budgetReason?: string | null;
+  },
+): DurableTurnProgress {
+  const current = progressState(snapshot);
+  return {
+    ...current,
+    progressEpoch: current.progressEpoch + 1,
+    progressKind: update.kind,
+    consecutiveNoProgress: update.noProgress ? current.consecutiveNoProgress + 1 : 0,
+    toolRepairAttempts: current.toolRepairAttempts + (update.toolRepairAttempts ?? 0),
+    cumulativeToolMs: current.cumulativeToolMs + Math.max(0, Math.round(update.toolMs ?? 0)),
+    cumulativeActiveComputeMs: current.cumulativeActiveComputeMs + Math.max(0, Math.round(update.activeComputeMs ?? 0)),
+    budgetReason: update.budgetReason === undefined ? current.budgetReason : update.budgetReason,
+  };
+}
+
+function toolExecutionLimits(
+  toolName: string,
+  options: {
+    toolIdleTimeoutMs?: number;
+    toolMaxDurationMs?: number;
+    toolClassLimits?: Partial<Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit>>;
+  },
+): ToolExecutionLimit {
+  const category = toolName === "create_image" || toolName === "inspect_images"
+    ? "image"
+    : PARALLEL_READ_ONLY_TOOLS.has(toolName) || toolName === "read"
+      ? "read"
+      : ["bash", "write", "edit", "mkdir", "move", "copy", "delete"].includes(toolName)
+        ? "command"
+        : ["browser", "calendar", "drive", "mail", "mcp"].some((prefix) => toolName.startsWith(prefix))
+          ? "connector"
+          : "default";
+  const configured = options.toolClassLimits?.[category] ?? DEFAULT_TOOL_LIMITS[category];
+  return {
+    idleTimeoutMs: Math.max(1, options.toolIdleTimeoutMs ?? configured.idleTimeoutMs),
+    maxDurationMs: Math.max(1, options.toolMaxDurationMs ?? configured.maxDurationMs),
+  };
 }
 
 function toolArgumentFingerprint(value: unknown): string {
@@ -3782,7 +4400,7 @@ export function durableVisionToolSelectionPrompt(toolNames: readonly string[]): 
   return toolNames.includes("inspect_images") ? DURABLE_VISION_TOOL_SELECTION_PROMPT : "";
 }
 
-function modelMessages(
+export function modelMessages(
   snapshot: DurableTurnSnapshot,
   additionalUserContent: readonly ChatContentPart[] = [],
 ): {
@@ -3835,6 +4453,7 @@ function modelMessages(
   ].filter(Boolean).join("\n\n");
   const system = [stableSystemPrompt, dynamicSystem].filter(Boolean).join("\n\n");
   const messages: ChatMessage[] = [{ role: "system", content: system }];
+  let toolContextCharacters = 0;
   for (const entry of uncompactedEntries(snapshot)) {
     const payload = record(entry.payload);
     const message = record(payload?.message);
@@ -3870,11 +4489,18 @@ function modelMessages(
         ...(toolCalls.length > 0 ? { toolCalls } : {}),
       });
     } else if (role === "toolResult") {
+      const rawToolContent = contentText(message?.content, workspacePath);
+      const toolContent = boundedToolResultContext(
+        entry.entryId,
+        rawToolContent,
+        Math.max(0, MAX_TOOL_CONTEXT_CHARS - toolContextCharacters),
+      );
+      toolContextCharacters += toolContent.length;
       messages.push({
         role: "tool",
         toolCallId: stringValue(message?.toolCallId) ?? entry.entryId,
         ...(stringValue(message?.toolName) ? { name: stringValue(message?.toolName)! } : {}),
-        content: contentText(message?.content, workspacePath),
+        content: toolContent,
       });
     }
   }
@@ -3945,6 +4571,19 @@ function durableToolResultText(output: JsonValue): string {
     if (typeof text === "string") return text;
   }
   return JSON.stringify(output);
+}
+
+function boundedToolResultContext(entryId: string, content: string, remainingBudget: number): string {
+  const reference = `[durable-result:${entryId}] The complete tool result is persisted; rerun the tool with a narrower scope if more detail is needed.`;
+  if (!content) return reference;
+  const budget = Math.min(MAX_TOOL_RESULT_CONTEXT_CHARS, remainingBudget);
+  if (budget <= reference.length) return reference;
+  if (content.length <= budget) return content;
+  const available = budget - reference.length - 32;
+  if (available <= 0) return reference;
+  const head = Math.ceil(available * 0.7);
+  const tail = Math.max(0, available - head);
+  return `${reference}\n${content.slice(0, head)}\n…[result content bounded]…\n${tail > 0 ? content.slice(-tail) : ""}`;
 }
 
 function automaticDurableAttachmentSkill(
@@ -4375,15 +5014,26 @@ async function upsertStep(
     step.incrementAttempt ?? false,
     step.error ?? null,
     step.sessionEntryId ?? null,
+    step.resultFingerprint ?? null,
+    step.cancellationAcknowledged ?? false,
+    step.deadlineAt ?? null,
+    step.idleDeadlineAt ?? null,
+    step.timedOut ?? false,
+    step.abortAcknowledged ?? false,
+    step.outcomeCertainty ?? null,
   ];
   const inserted = await executor.query<{ id: string }>(
     `
 INSERT INTO turn_steps (
   id,tenant_id,run_id,sequence,step_type,state,input,output,retry_class,
-  idempotency_key,attempt,error,session_entry_id,started_at,completed_at
+  idempotency_key,attempt,error,session_entry_id,result_fingerprint,cancellation_acknowledged_at,
+  deadline_at,idle_deadline_at,timed_out_at,abort_acknowledged_at,outcome_certainty,started_at,completed_at
 ) VALUES (
   $1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,
-  CASE WHEN $11::boolean THEN 1 ELSE 0 END,$12,$13,
+  CASE WHEN $11::boolean THEN 1 ELSE 0 END,$12,$13,$14,
+  CASE WHEN $15::boolean THEN now() ELSE NULL END,$16::timestamptz,$17::timestamptz,
+  CASE WHEN $18::boolean THEN now() ELSE NULL END,
+  CASE WHEN $19::boolean THEN now() ELSE NULL END,$20,
   CASE WHEN $6='running' THEN now() ELSE NULL END,
   CASE WHEN $6 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END
 )
@@ -4435,6 +5085,13 @@ LIMIT 1
         step.incrementAttempt ?? false,
         step.error ?? null,
         step.sessionEntryId ?? null,
+        step.resultFingerprint ?? null,
+        step.cancellationAcknowledged ?? false,
+        step.deadlineAt ?? null,
+        step.idleDeadlineAt ?? null,
+        step.timedOut ?? false,
+        step.abortAcknowledged ?? false,
+        step.outcomeCertainty ?? null,
       ];
       await executor.execute(
         `
@@ -4447,6 +5104,22 @@ SET state=$4,
     attempt=attempt + CASE WHEN $9::boolean THEN 1 ELSE 0 END,
     error=$10,
     session_entry_id=COALESCE($11,session_entry_id),
+    result_fingerprint=COALESCE($12,result_fingerprint),
+    cancellation_acknowledged_at=CASE
+      WHEN $13::boolean THEN COALESCE(cancellation_acknowledged_at,now())
+      ELSE cancellation_acknowledged_at
+    END,
+    deadline_at=COALESCE($14::timestamptz,deadline_at),
+    idle_deadline_at=COALESCE($15::timestamptz,idle_deadline_at),
+    timed_out_at=CASE
+      WHEN $16::boolean THEN COALESCE(timed_out_at,now())
+      ELSE timed_out_at
+    END,
+    abort_acknowledged_at=CASE
+      WHEN $17::boolean THEN COALESCE(abort_acknowledged_at,now())
+      ELSE abort_acknowledged_at
+    END,
+    outcome_certainty=COALESCE($18,outcome_certainty),
     started_at=COALESCE(started_at,CASE WHEN $4='running' THEN now() ELSE NULL END),
     completed_at=CASE WHEN $4 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END,
     updated_at=now()
@@ -5430,6 +6103,17 @@ function mapSnapshot(
       totalTokens: Number(usageTotals?.total_tokens ?? 0),
       costMicros: String(usageTotals?.cost_micros ?? "0"),
     },
+    progress: {
+      progressEpoch: Number(run.progress_epoch ?? 0),
+      progressKind: run.progress_kind,
+      consecutiveNoProgress: Number(run.consecutive_no_progress ?? 0),
+      physicalModelAttempt: Number(run.physical_model_attempt ?? 0),
+      logicalModelIteration: Number(run.logical_model_iteration ?? 0),
+      toolRepairAttempts: Number(run.tool_repair_attempts ?? 0),
+      cumulativeToolMs: Number(run.cumulative_tool_ms ?? 0),
+      cumulativeActiveComputeMs: Number(run.cumulative_active_compute_ms ?? 0),
+      budgetReason: run.progress_budget_reason,
+    },
     steps: steps.map((step) => ({
       id: step.id,
       sequence: step.sequence,
@@ -5441,6 +6125,12 @@ function mapSnapshot(
       idempotencyKey: step.idempotency_key,
       attempt: step.attempt,
       error: step.error,
+      resultFingerprint: step.result_fingerprint,
+      deadlineAt: dateString(step.deadline_at),
+      idleDeadlineAt: dateString(step.idle_deadline_at),
+      timedOut: Boolean(step.timed_out_at),
+      abortAcknowledged: Boolean(step.abort_acknowledged_at),
+      outcomeCertainty: step.outcome_certainty,
     })),
     entries: entries.map((entry) => ({
       entryId: entry.entry_id,
@@ -5592,6 +6282,15 @@ interface RunRow {
   attempt: number;
   ownership_generation: number | string;
   version: number | null;
+  progress_epoch: number | string | null;
+  progress_kind: string | null;
+  consecutive_no_progress: number | string | null;
+  physical_model_attempt: number | string | null;
+  logical_model_iteration: number | string | null;
+  tool_repair_attempts: number | string | null;
+  cumulative_tool_ms: number | string | null;
+  cumulative_active_compute_ms: number | string | null;
+  progress_budget_reason: string | null;
   cancelled_at: Date | string | null;
   runtime_request: unknown;
   grounding_context: unknown;
@@ -5620,6 +6319,12 @@ interface StepRow {
   idempotency_key: string | null;
   attempt: number;
   error: string | null;
+  result_fingerprint: string | null;
+  deadline_at: Date | string | null;
+  idle_deadline_at: Date | string | null;
+  timed_out_at: Date | string | null;
+  abort_acknowledged_at: Date | string | null;
+  outcome_certainty: "known" | "unknown" | "not_applicable" | null;
 }
 
 interface EntryRow {

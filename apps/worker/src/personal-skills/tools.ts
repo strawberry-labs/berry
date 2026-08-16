@@ -66,13 +66,22 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     return this.base.policy?.(snapshot, toolName, permissionMode);
   }
 
-  async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  async execute(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "activate_skill") return this.activateSkill(snapshot, step);
     if (DIRECT_FILE_TOOLS.has(toolName)) {
       await this.materializeKnownResourceForDirectFileTool(snapshot, step);
     }
-    if (toolName !== "save_personal_skill") return this.base.execute(snapshot, step);
+    if (toolName !== "save_personal_skill") {
+      return signal || reportProgress
+        ? this.base.execute(snapshot, step, signal, reportProgress)
+        : this.base.execute(snapshot, step);
+    }
 
     const parsedInput = SavePersonalSkillInputSchema.safeParse(step.input.arguments ?? {});
     if (!parsedInput.success) {

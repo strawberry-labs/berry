@@ -2361,6 +2361,25 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
   }),
   z.object({ kind: z.literal("session.note"), note: SessionNoteKindSchema, detail: z.string().optional() }),
   z.object({
+    kind: z.literal("turn.progress"),
+    progressKind: z.enum([
+      "tool_progress",
+      "result_repeated",
+      "alternating_no_progress",
+      "declared_polling",
+      "repair_budget",
+      "budget_exceeded",
+    ]),
+    progressEpoch: z.number().int().nonnegative(),
+    consecutiveNoProgress: z.number().int().nonnegative(),
+    budgetReason: z.string().max(256).optional(),
+  }),
+  z.object({
+    kind: z.literal("phase.deadline_exceeded"),
+    phase: z.enum(["tool", "model", "model_preparation", "compaction", "finalization", "generic"]),
+    deadlineKind: z.enum(["idle", "wall"]),
+  }),
+  z.object({
     kind: z.literal("mode.changed"),
     mode: UiModeSchema,
     source: UiModeSourceSchema,

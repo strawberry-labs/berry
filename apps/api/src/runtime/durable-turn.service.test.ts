@@ -1084,7 +1084,9 @@ describe("DurableTurnService", () => {
     expect(executions.some(({ sql, params }) =>
       sql.startsWith("INSERT INTO messages") && params.includes("cancelled")
     )).toBe(true);
-    expect(executions.some(({ sql }) => sql.startsWith("UPDATE turn_runs") && sql.includes("state='cancelled'"))).toBe(true);
+    expect(executions.some(({ sql }) =>
+      sql.startsWith("UPDATE turn_runs") && sql.includes("state=CASE") && sql.includes("ELSE 'cancelled'")
+    )).toBe(true);
     expect(executions.some(({ params }) =>
       params.some((value) => typeof value === "string" && value.includes('"kind":"turn.end"'))
     )).toBe(true);
@@ -1115,7 +1117,9 @@ describe("DurableTurnService", () => {
     await expect(service.deleteTask(tenantId, userId, taskId)).resolves.toBe(true);
 
     expect(transactionCount).toBe(1);
-    expect(executions.some(({ sql }) => sql.startsWith("UPDATE turn_runs") && sql.includes("state='cancelled'"))).toBe(true);
+    expect(executions.some(({ sql }) =>
+      sql.startsWith("UPDATE turn_runs") && sql.includes("state=CASE") && sql.includes("ELSE 'cancelled'")
+    )).toBe(true);
     expect(executions.some(({ sql }) => sql.includes("SET deleted_at=COALESCE(deleted_at,now())"))).toBe(true);
   });
 

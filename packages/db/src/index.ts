@@ -837,6 +837,15 @@ export const turnRuns = pgTable("turn_runs", {
   attempt: integer("attempt").notNull().default(0),
   ownershipGeneration: bigint("ownership_generation", { mode: "number" }).notNull().default(0),
   version: integer("version").notNull().default(0),
+  progressEpoch: integer("progress_epoch").notNull().default(0),
+  progressKind: text("progress_kind"),
+  consecutiveNoProgress: integer("consecutive_no_progress").notNull().default(0),
+  physicalModelAttempt: integer("physical_model_attempt").notNull().default(0),
+  logicalModelIteration: integer("logical_model_iteration").notNull().default(0),
+  toolRepairAttempts: integer("tool_repair_attempts").notNull().default(0),
+  cumulativeToolMs: bigint("cumulative_tool_ms", { mode: "number" }).notNull().default(0),
+  cumulativeActiveComputeMs: bigint("cumulative_active_compute_ms", { mode: "number" }).notNull().default(0),
+  progressBudgetReason: text("progress_budget_reason"),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   nextAction: text("next_action"),
@@ -937,6 +946,13 @@ export const turnSteps = pgTable("turn_steps", {
   checkpointId: uuid("checkpoint_id"),
   attempt: integer("attempt").notNull().default(0),
   error: text("error"),
+  resultFingerprint: text("result_fingerprint"),
+  cancellationAcknowledgedAt: timestamp("cancellation_acknowledged_at", { withTimezone: true }),
+  deadlineAt: timestamp("deadline_at", { withTimezone: true }),
+  idleDeadlineAt: timestamp("idle_deadline_at", { withTimezone: true }),
+  timedOutAt: timestamp("timed_out_at", { withTimezone: true }),
+  abortAcknowledgedAt: timestamp("abort_acknowledged_at", { withTimezone: true }),
+  outcomeCertainty: text("outcome_certainty"),
   closureReason: text("closure_reason"),
   closedAt: timestamp("closed_at", { withTimezone: true }),
   startedAt: timestamp("started_at", { withTimezone: true }),
@@ -4936,6 +4952,32 @@ ALTER TABLE turn_questions
   ADD COLUMN IF NOT EXISTS closed_at timestamptz;
 `.trim();
 
+export const AGENT_HARNESS_BOUNDS_MIGRATION = `
+ALTER TABLE turn_runs
+  ADD COLUMN IF NOT EXISTS progress_epoch integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS progress_kind text,
+  ADD COLUMN IF NOT EXISTS consecutive_no_progress integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS physical_model_attempt integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS logical_model_iteration integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS tool_repair_attempts integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS cumulative_tool_ms bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS cumulative_active_compute_ms bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS progress_budget_reason text;
+
+ALTER TABLE turn_steps
+  ADD COLUMN IF NOT EXISTS result_fingerprint text,
+  ADD COLUMN IF NOT EXISTS cancellation_acknowledged_at timestamptz,
+  ADD COLUMN IF NOT EXISTS deadline_at timestamptz,
+  ADD COLUMN IF NOT EXISTS idle_deadline_at timestamptz,
+  ADD COLUMN IF NOT EXISTS timed_out_at timestamptz,
+  ADD COLUMN IF NOT EXISTS abort_acknowledged_at timestamptz,
+  ADD COLUMN IF NOT EXISTS outcome_certainty text;
+
+CREATE INDEX IF NOT EXISTS turn_steps_result_fingerprint_idx
+  ON turn_steps (tenant_id, run_id, result_fingerprint)
+  WHERE result_fingerprint IS NOT NULL;
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5077,4 +5119,5 @@ export const cloudMigrations = [
   },
   { id: 57, name: "queued_follow_ups_server_owned_v1", sql: QUEUED_FOLLOW_UPS_MIGRATION },
   { id: 58, name: "agent_harness_convergence_v1", sql: AGENT_HARNESS_CONVERGENCE_MIGRATION },
+  { id: 59, name: "agent_harness_bounds_v1", sql: AGENT_HARNESS_BOUNDS_MIGRATION },
 ] as const;

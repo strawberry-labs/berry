@@ -1811,29 +1811,55 @@ async function cancelActiveDurableRun(
   tenantId: string,
   active: { id: string; task_id: string; session_id: string; request_message_id: string | null },
 ): Promise<void> {
-  await projectInterruptedTools(transaction, tenantId, active.session_id, active.task_id, active.id);
-  await projectTerminalAssistant(transaction, tenantId, active.session_id, active.task_id, active.id, "cancelled");
+  const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
+    `
+SELECT s.id AS step_id,tc.id AS tool_call_id
+FROM turn_steps s
+LEFT JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.step_id=s.id
+WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid
+  AND s.state='running' AND s.retry_class='non_idempotent_manual'
+ORDER BY s.sequence DESC
+LIMIT 1
+FOR UPDATE OF s
+    `.trim(),
+    [tenantId, active.id],
+  );
+  const ambiguous = ambiguousRows[0] ?? null;
+  if (!ambiguous) {
+    await projectInterruptedTools(transaction, tenantId, active.session_id, active.task_id, active.id);
+  }
+  await projectTerminalAssistant(
+    transaction,
+    tenantId,
+    active.session_id,
+    active.task_id,
+    active.id,
+    ambiguous ? "failed" : "cancelled",
+    ambiguous ? "The external mutation outcome is uncertain. Operator review is required before retry." : undefined,
+  );
   await transaction.execute(
     `
 UPDATE turn_steps
-SET state='cancelled',completed_at=COALESCE(completed_at,now()),
-    closure_reason=COALESCE(closure_reason,'turn_cancelled'),
+SET state=CASE WHEN $3::uuid IS NOT NULL AND id=$3::uuid THEN 'recovery_required' ELSE 'cancelled' END,
+    completed_at=COALESCE(completed_at,now()),
+    closure_reason=COALESCE(closure_reason,CASE WHEN $3::uuid IS NOT NULL AND id=$3::uuid THEN 'ambiguous_external_operation' ELSE 'turn_cancelled' END),
     closed_at=COALESCE(closed_at,now()),updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   AND state IN ('pending','running','waiting')
     `.trim(),
-    [tenantId, active.id],
+    [tenantId, active.id, ambiguous?.step_id ?? null],
   );
   await transaction.execute(
     `
 UPDATE tool_calls
-SET status='cancelled',completed_at=COALESCE(completed_at,now()),
-    closure_reason=COALESCE(closure_reason,'turn_cancelled'),
+SET status=CASE WHEN $3::uuid IS NOT NULL AND id=$3::uuid THEN 'failed'::tool_call_status ELSE 'cancelled'::tool_call_status END,
+    completed_at=COALESCE(completed_at,now()),
+    closure_reason=COALESCE(closure_reason,CASE WHEN $3::uuid IS NOT NULL AND id=$3::uuid THEN 'ambiguous_external_operation' ELSE 'turn_cancelled' END),
     closed_at=COALESCE(closed_at,now()),updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   AND status IN ('pending','waiting-for-approval','running')
     `.trim(),
-    [tenantId, active.id],
+    [tenantId, active.id, ambiguous?.tool_call_id ?? null],
   );
   await transaction.execute(
     "UPDATE approvals SET status='expired',decided_at=now(),closure_reason=COALESCE(closure_reason,'turn_cancelled'),closed_at=COALESCE(closed_at,now()) WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
@@ -1844,17 +1870,18 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
     [tenantId, active.id],
   );
   await appendDurableEvents(transaction, tenantId, active.id, active.session_id, [
-    { kind: "turn.end", turnId: active.id, status: "cancelled" },
+    { kind: "turn.end", turnId: active.id, status: ambiguous ? "failed" : "cancelled" },
   ]);
   await transaction.execute(
     `
 UPDATE turn_runs
-SET state='cancelled',cancelled_at=now(),completed_at=now(),
+SET state=CASE WHEN $3::boolean THEN 'recovery_required' ELSE 'cancelled' END,
+    cancelled_at=now(),completed_at=now(),
     lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
     version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
     `.trim(),
-    [tenantId, active.id],
+    [tenantId, active.id, Boolean(ambiguous)],
   );
   await transaction.execute(
     `
@@ -1865,16 +1892,16 @@ WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND completed_at IS NULL
     [tenantId, active.id],
   );
   await transaction.execute(
-    "UPDATE tasks SET status='cancelled',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
-    [tenantId, active.task_id],
+    "UPDATE tasks SET status=$3::task_status,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+    [tenantId, active.task_id, ambiguous ? "failed" : "cancelled"],
   );
-  await reconcileTerminalUsage(transaction, tenantId, active.id, "cancelled");
+  await reconcileTerminalUsage(transaction, tenantId, active.id, ambiguous ? "recovery_required" : "cancelled");
   await transaction.execute(
     `
 UPDATE sessions
 SET runtime_metadata=runtime_metadata || jsonb_build_object(
       'activeRunId',$2::text,
-      'lastRunState','cancelled',
+      'lastRunState',CASE WHEN $4::boolean THEN 'recovery_required' ELSE 'cancelled' END,
       'leafId',COALESCE((
         SELECT entry_id FROM session_entries
         WHERE tenant_id=$1::uuid AND session_id=$3::uuid AND is_leaf_marker=true
@@ -1884,7 +1911,7 @@ SET runtime_metadata=runtime_metadata || jsonb_build_object(
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$3::uuid
     `.trim(),
-    [tenantId, active.id, active.session_id],
+    [tenantId, active.id, active.session_id, Boolean(ambiguous)],
   );
 }
 

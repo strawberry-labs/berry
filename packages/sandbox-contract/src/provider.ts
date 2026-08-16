@@ -39,8 +39,8 @@ export interface SandboxFileWriteManyBytesInput {
 }
 
 export interface SandboxFileApi {
-  read(input: SandboxFileReadInput): Promise<SandboxFileReadResult>;
-  write(input: SandboxFileWriteInput): Promise<SandboxFileWriteResult>;
+  read(input: SandboxFileReadInput, options?: { signal?: AbortSignal }): Promise<SandboxFileReadResult>;
+  write(input: SandboxFileWriteInput, options?: { signal?: AbortSignal }): Promise<SandboxFileWriteResult>;
   /**
    * Write binary content without first expanding it into a base64 string.
    * Providers that cannot transport bytes directly may omit this method; callers
@@ -49,7 +49,7 @@ export interface SandboxFileApi {
   writeBytes?(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult>;
   /** Write several binary files in one provider operation when supported. */
   writeManyBytes?(input: SandboxFileWriteManyBytesInput): Promise<SandboxFileWriteResult[]>;
-  list(input: SandboxFileListInput): Promise<SandboxFileListResult>;
+  list(input: SandboxFileListInput, options?: { signal?: AbortSignal }): Promise<SandboxFileListResult>;
 }
 
 export interface SandboxProvider {

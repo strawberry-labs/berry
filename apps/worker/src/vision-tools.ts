@@ -148,9 +148,18 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     return this.base.policy?.(snapshot, toolName, permissionMode);
   }
 
-  async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  async execute(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (toolName !== "inspect_images") return this.base.execute(snapshot, step);
+    if (toolName !== "inspect_images") {
+      return signal || reportProgress
+        ? this.base.execute(snapshot, step, signal, reportProgress)
+        : this.base.execute(snapshot, step);
+    }
     const priorFailure = latestUnresolvedVisionFailure(snapshot, step);
     if (priorFailure) {
       throw new Error(

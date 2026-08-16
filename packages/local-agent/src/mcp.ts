@@ -239,13 +239,17 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-function cachedTool(spec: McpServerSpec, cached: McpCachedTool, invoke: (name: string, args: Record<string, unknown>) => Promise<AgentToolResult<Record<string, unknown>>>): AgentTool {
+function cachedTool(
+  spec: McpServerSpec,
+  cached: McpCachedTool,
+  invoke: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<AgentToolResult<Record<string, unknown>>>,
+): AgentTool {
   return {
     name: `mcp__${sanitizeName(spec.name)}__${sanitizeName(cached.name)}`,
     label: `${spec.name}: ${cached.name}`,
     description: cached.description ?? `Tool ${cached.name} from MCP server ${spec.name}`,
     parameters: cached.inputSchema as TSchema,
-    execute: async (_toolCallId, params) => invoke(cached.name, (params ?? {}) as Record<string, unknown>),
+    execute: async (_toolCallId, params, signal) => invoke(cached.name, (params ?? {}) as Record<string, unknown>, signal),
   } as AgentTool;
 }
 
@@ -372,12 +376,22 @@ export class McpToolSource {
       }
       return [approved];
     });
-    const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args) => this.#call(client, name, args)));
+    const tools = cachedTools.map((tool) => cachedTool(spec, tool, async (name, args, signal) => this.#call(client, name, args, signal)));
     return { spec, client, tools, cachedTools };
   }
 
-  async #call(client: Client, name: string, args: Record<string, unknown>): Promise<AgentToolResult<Record<string, unknown>>> {
-    const result = await client.callTool({ name, arguments: args });
+  async #call(
+    client: Client,
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<AgentToolResult<Record<string, unknown>>> {
+    if (signal?.aborted) throw signal.reason;
+    const result = await client.callTool(
+      { name, arguments: args },
+      undefined,
+      signal ? { signal } : undefined,
+    );
     if (result.isError) {
       const failure = contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
       const text = failure.content[0];
@@ -392,12 +406,12 @@ export class McpToolSource {
       const live = this.#servers.get(spec.id);
       const allowed = spec.allowedTools ? new Set(spec.allowedTools) : null;
       const cached = (live?.cachedTools ?? spec.cachedTools ?? []).filter((tool) => !allowed || allowed.has(tool.name));
-      return cached.map((tool) => cachedTool(spec, tool, async (name, args) => {
+      return cached.map((tool) => cachedTool(spec, tool, async (name, args, signal) => {
         const server = await this.#ensureConnected(spec);
         if (spec.allowedTools && !server.cachedTools.some((candidate) => candidate.name === name)) {
           throw new Error(`MCP tool ${spec.name}:${name} is unavailable because its definition changed after administrator review`);
         }
-        return this.#call(server.client, name, args);
+        return this.#call(server.client, name, args, signal);
       }));
     });
   }

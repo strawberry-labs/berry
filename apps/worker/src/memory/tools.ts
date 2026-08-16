@@ -146,10 +146,17 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     return this.base.policy?.(snapshot, toolName, permissionMode);
   }
 
-  async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  async execute(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "remember_memory" && toolName !== "forget_memory") {
-      return this.base.execute(snapshot, step);
+      return signal || reportProgress
+        ? this.base.execute(snapshot, step, signal, reportProgress)
+        : this.base.execute(snapshot, step);
     }
     if (!await this.enabled(snapshot)) {
       throw new Error("Personal memory is disabled for this user");

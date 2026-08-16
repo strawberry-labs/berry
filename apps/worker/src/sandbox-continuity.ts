@@ -680,7 +680,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     };
   }
 
-  async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  async execute(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     const prepared = prepareCoreToolArguments(toolName, step.input.arguments);
     const args = prepared.args;
@@ -694,7 +699,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const mediaType = binaryMediaType(path);
       if (mediaType === "application/pdf") {
-        const content = await extractPdfText(this.provider, sandbox.id, path, step, workspaceRoot);
+        const content = await extractPdfText(this.provider, sandbox.id, path, step, workspaceRoot, signal, reportProgress);
         const formatted = piReadContent(content, args);
         return {
           output: {
@@ -732,6 +737,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         path,
         args,
         workspaceRoot,
+        signal,
+        reportProgress,
       );
       return {
         output: { path, content: result.content, sizeBytes: result.sizeBytes, ...result.details, ...inputRepairDetails },
@@ -742,7 +749,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (toolName === "ls") {
       const path = safeReadablePath(stringValue(args.path) ?? workspaceRoot, workspaceRoot);
       const limit = numberValue(args.limit) ?? 500;
-      const result = await this.provider.files.list({ sandbox_id: sandbox.id, path, recursive: false });
+      const listInput = { sandbox_id: sandbox.id, path, recursive: false };
+      const result = await (signal
+        ? this.provider.files.list(listInput, { signal })
+        : this.provider.files.list(listInput));
+      reportProgress?.();
       const entries = result.entries
         .flatMap((entry) => {
           if (entry.path.replace(/\/+$/, "") === path.replace(/\/+$/, "")) return [];
@@ -768,12 +779,16 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (toolName === "write") {
       const path = safeWorkspacePath(requiredToolPath(args, toolName), workspaceRoot);
       const content = requiredToolString(args, "content", toolName, true);
-      const result = await this.provider.files.write({
+      const writeInput = {
         sandbox_id: sandbox.id,
         path,
         content,
         encoding: "utf8",
-      });
+      } as const;
+      const result = await (signal
+        ? this.provider.files.write(writeInput, { signal })
+        : this.provider.files.write(writeInput));
+      reportProgress?.();
       return {
         output: { path: result.path, sizeBytes: result.size_bytes, mtime: result.mtime, ...inputRepairDetails },
         summary: `Wrote ${result.path}`,
@@ -786,7 +801,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         oldText: edit.oldText.replace(/\r\n/g, "\n").replace(/\r/g, "\n"),
         newText: edit.newText.replace(/\r\n/g, "\n").replace(/\r/g, "\n"),
       }));
-      const existing = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "utf8" });
+      const readInput = { sandbox_id: sandbox.id, path, encoding: "utf8" } as const;
+      const existing = await (signal
+        ? this.provider.files.read(readInput, { signal })
+        : this.provider.files.read(readInput));
+      reportProgress?.();
       const bom = existing.content.startsWith("\uFEFF") ? "\uFEFF" : "";
       const source = bom ? existing.content.slice(1) : existing.content;
       const lineEnding = source.includes("\r\n") ? "\r\n" : source.includes("\r") ? "\r" : "\n";
@@ -811,7 +830,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         content = `${content.slice(0, replacement.start)}${replacement.newText}${content.slice(replacement.end)}`;
       }
       const finalContent = bom + (lineEnding === "\n" ? content : content.replace(/\n/g, lineEnding));
-      const written = await this.provider.files.write({ sandbox_id: sandbox.id, path, content: finalContent, encoding: "utf8" });
+      const writeInput = { sandbox_id: sandbox.id, path, content: finalContent, encoding: "utf8" } as const;
+      const written = await (signal
+        ? this.provider.files.write(writeInput, { signal })
+        : this.provider.files.write(writeInput));
+      reportProgress?.();
       return {
         output: { path: written.path, replacements: replacements.length, sizeBytes: written.size_bytes, ...inputRepairDetails },
         summary: `Edited ${written.path}`,
@@ -827,7 +850,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         "sh", "-c",
         'root="$1"; pattern="$2"; if ! command -v rg >/dev/null 2>&1; then echo "ripgrep (rg) is required for find" >&2; exit 127; fi; cd "$root" || exit; rg --files --hidden -g "!.git/**" -g "!node_modules/**" -g "$pattern"; status=$?; [ "$status" -eq 0 ] || [ "$status" -eq 1 ]',
         "berry-find", path, pattern,
-      ], workspaceRoot);
+      ], workspaceRoot, signal, reportProgress);
       const allFiles = result.split("\n").filter(Boolean);
       const files = allFiles.slice(0, limit);
       const truncated = truncatePiHead(files.join("\n"), Number.MAX_SAFE_INTEGER);
@@ -865,7 +888,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         String(context),
         String(limit),
         PI_GREP_FILTER_SCRIPT,
-      ], workspaceRoot);
+      ], workspaceRoot, signal, reportProgress);
       const meta = parsePiGrepMetadata(result.stderr);
       const notices = [
         ...(meta.limitReached ? [`${limit} matches limit reached. Use limit=${limit * 2} for more, or refine pattern`] : []),
@@ -895,7 +918,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         const path = safeReadablePath(reference, workspaceRoot);
         const mediaType = binaryMediaType(path);
         if (!mediaType?.startsWith("image/")) throw new Error(`Reference is not a supported image: ${path}`);
-        const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
+        const readInput = { sandbox_id: sandbox.id, path, encoding: "base64" } as const;
+        const source = await (signal
+          ? this.provider.files.read(readInput, { signal })
+          : this.provider.files.read(readInput));
+        reportProgress?.();
         referenceImageUrls.push(`data:${mediaType};base64,${source.content}`);
       }
       const generated = await generateDurableImage(config, {
@@ -1034,7 +1061,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         ],
         cwd: workspaceRoot,
         timeout_ms: requestedTimeoutMs,
-      })) {
+      }, { signal })) {
+        reportProgress?.();
         if (event.kind === "stdout" || event.kind === "stderr") output.append(event.data);
         else if (event.kind === "exit") exitCode = event.exit_code;
         else if (event.kind === "error") throw new Error(event.message);
@@ -2107,8 +2135,10 @@ async function sandboxCommand(
   requestId: string,
   command: string[],
   cwd: string,
+  signal?: AbortSignal,
+  reportProgress?: () => void,
 ): Promise<string> {
-  const result = await sandboxCommandOutput(provider, sandboxId, requestId, command, cwd);
+  const result = await sandboxCommandOutput(provider, sandboxId, requestId, command, cwd, signal, reportProgress);
   return result.stdout;
 }
 
@@ -2118,6 +2148,8 @@ async function sandboxCommandOutput(
   requestId: string,
   command: string[],
   cwd: string,
+  signal?: AbortSignal,
+  reportProgress?: () => void,
 ): Promise<{ stdout: string; stderr: string }> {
   let stdout = "";
   let stderr = "";
@@ -2128,7 +2160,8 @@ async function sandboxCommandOutput(
     command,
     cwd,
     timeout_ms: 0,
-  })) {
+  }, { signal })) {
+    reportProgress?.();
     if (event.kind === "stdout") stdout = appendBoundedHead(stdout, event.data, 1_000_000);
     else if (event.kind === "stderr") stderr = appendBoundedTail(stderr, event.data, 100_000);
     else if (event.kind === "exit") exitCode = event.exit_code;
@@ -2159,6 +2192,8 @@ async function readSandboxText(
   path: string,
   args: Record<string, unknown>,
   cwd: string,
+  signal?: AbortSignal,
+  reportProgress?: () => void,
 ): Promise<{ content: string; details: Record<string, JsonValue>; sizeBytes: number }> {
   const offset = numberValue(args.offset) ?? 1;
   const limit = numberValue(args.limit) ?? 0;
@@ -2172,7 +2207,7 @@ async function readSandboxText(
     String(PI_TOOL_MAX_LINES),
     String(PI_TOOL_MAX_BYTES),
     String(PI_READ_MAX_LINE_LENGTH),
-  ], cwd);
+  ], cwd, signal, reportProgress);
   let parsed: Record<string, unknown>;
   try {
     parsed = objectValue(JSON.parse(result.stdout));
@@ -2936,6 +2971,8 @@ async function extractPdfText(
   path: string,
   step: DurableTurnStep,
   workspaceRoot: string,
+  signal?: AbortSignal,
+  reportProgress?: () => void,
 ): Promise<string> {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -2946,7 +2983,8 @@ async function extractPdfText(
     command: ["pdftotext", "-layout", path, "-"],
     cwd: workspaceRoot,
     timeout_ms: 120_000,
-  })) {
+  }, { signal })) {
+    reportProgress?.();
     if (event.kind === "stdout") stdout.push(event.data);
     else if (event.kind === "stderr") stderr.push(event.data);
     else if (event.kind === "exit") exitCode = event.exit_code;

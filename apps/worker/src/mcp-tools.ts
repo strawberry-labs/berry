@@ -113,10 +113,19 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return durableMcpToolPolicy(server, hints, permissionMode);
   }
 
-  async execute(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  async execute(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "tool_search") return this.#searchTools(snapshot, step);
-    if (!toolName.startsWith("mcp__")) return this.base.execute(snapshot, step);
+    if (!toolName.startsWith("mcp__")) {
+      return signal || reportProgress
+        ? this.base.execute(snapshot, step, signal, reportProgress)
+        : this.base.execute(snapshot, step);
+    }
     const context = await this.#context(snapshot);
     if (!this.#serverForTool(toolName, context.servers)) {
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
@@ -127,10 +136,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const tool = context.source.listTools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error(`MCP tool ${toolName} is unavailable`);
     const callId = stringValue(step.input.toolCallId) ?? step.id;
-    const result = await tool.execute(
-      callId,
-      (record(step.input.arguments) ?? {}) as never,
-    );
+    const result = signal || reportProgress
+      ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
+      : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
     let text = result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n").slice(0, 120_000);

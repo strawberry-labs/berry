@@ -26,6 +26,7 @@ import {
   durableBuiltInToolDefinitions,
   durableToolManifestMetrics,
   queuedFollowUpRuntimeRequest,
+  modelMessages,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -33,6 +34,7 @@ import {
   type DurableTurnSnapshot,
   type DurableTurnStep,
   type DurableTurnToolExecutor,
+  type TurnToolResult,
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
@@ -489,6 +491,88 @@ describe("durable turn runner", () => {
     await expect(execution).resolves.toMatchObject({ state: "cancelled" });
   });
 
+  it("bounds a hung signal-aware read and persists timeout progress", async () => {
+    const tool = readOnlyToolStep("read", 1, "/workspace/hung.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    let aborted = false;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, _step, signal) => new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(signal.reason);
+        }, { once: true });
+      }),
+    }, {
+      owner: "worker-hung-read",
+      toolIdleTimeoutMs: 10,
+      toolMaxDurationMs: 1_000,
+      abortCleanupTimeoutMs: 50,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(aborted).toBe(true);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "failed",
+      timedOut: true,
+      outcomeCertainty: "known",
+    });
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "phase.deadline_exceeded",
+      phase: "tool",
+      deadlineKind: "idle",
+    }));
+  });
+
+  it("cancels a read-only adapter that observes its signal", async () => {
+    const tool = readOnlyToolStep("read", 1, "/workspace/cancel.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let started!: () => void;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, _step, signal) => new Promise<never>((_resolve, reject) => {
+        started();
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    }, { owner: "worker-read-cancel", cancellations });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await startedPromise;
+    expect(cancellations.cancel(runId)).toBe(1);
+    await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+  });
+
+  it("moves an ignored cancellation during mutation to recovery without replaying it", async () => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const cancellations = new ActiveTurnCancellationRegistry();
+    let started!: () => void;
+    let finish!: (result: TurnToolResult) => void;
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        calls += 1;
+        started();
+        return new Promise<TurnToolResult>((resolve) => { finish = resolve; });
+      },
+    }, { owner: "worker-mutation-cancel", cancellations });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    await startedPromise;
+    expect(cancellations.cancel(runId)).toBe(1);
+    finish({ output: { accepted: true }, summary: "Mutation settled after cancellation" });
+
+    await expect(execution).resolves.toMatchObject({ state: "recovery_required" });
+    expect(calls).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "recovery_required",
+      outcomeCertainty: "unknown",
+    });
+    expect(repository.current.error).toBe("ambiguous_external_operation");
+  });
+
   it("caps the model output allowance to the remaining context capacity", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest = {
@@ -513,6 +597,33 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "finalizing" });
     expect(receivedMaxTokens).toBeGreaterThan(0);
     expect(receivedMaxTokens).toBeLessThanOrEqual(49_000);
+  });
+
+  it("bounds accumulated tool results and leaves a durable-result reference", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    for (let index = 0; index < 4; index += 1) {
+      current.entries.push({
+        entryId: `tool-entry-${index}`,
+        parentEntryId: current.entries.at(-1)?.entryId ?? null,
+        entryType: "message",
+        sequence: current.entries.length + 1,
+        payload: {
+          type: "message",
+          id: `tool-entry-${index}`,
+          message: {
+            role: "toolResult",
+            toolCallId: `tool-call-${index}`,
+            toolName: "read",
+            content: [{ type: "text", text: `${"unchanged-result ".repeat(20_000)}-${index}` }],
+          },
+        },
+      });
+    }
+
+    const toolMessages = modelMessages(current).messages.filter((message) => message.role === "tool");
+    expect(toolMessages).toHaveLength(4);
+    expect(toolMessages.reduce((total, message) => total + String(message.content).length, 0)).toBeLessThanOrEqual(48_000);
+    expect(String(toolMessages[0]?.content)).toContain("[durable-result:tool-entry-0]");
   });
 
   it("reclaims an expired lease from the persisted pending model step", async () => {
@@ -1312,7 +1423,7 @@ describe("durable turn runner", () => {
     expect(repository.current.error).toBeNull();
     expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
       state: "failed",
-      error: "Command exited with 2: file not found",
+      error: "Tool failed (repair attempt 1/5). Command exited with 2: file not found",
     });
   });
 
@@ -1321,7 +1432,7 @@ describe("durable turn runner", () => {
     const failures = Array.from({ length: 4 }, (_, index) => ({
       ...toolStep("failed", "idempotent", false),
       sequence: index + 1,
-      error,
+      error: `Tool failed (repair attempt 5/5). ${error}`,
     }));
     const pending = { ...toolStep("pending", "idempotent", false), sequence: 5 };
     let executions = 0;
@@ -1338,7 +1449,7 @@ describe("durable turn runner", () => {
     expect(executions).toBe(1);
     expect(repository.current.steps.find((step) => step.id === pending.id)).toMatchObject({
       state: "failed",
-      error,
+      error: `Tool failed (repair attempt 5/5). ${error}`,
     });
   });
 
@@ -1487,6 +1598,147 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
     expect(modelCalls).toBe(0);
     expect(repository.current.error).toContain("80-step model safety limit");
+  });
+
+  it("allows the 79th and 80th model steps but denies the 81st before the provider call", async () => {
+    const cases = [
+      { count: 79, expectedState: "finalizing" as const, expectedCalls: 1 },
+      { count: 80, expectedState: "finalizing" as const, expectedCalls: 1 },
+      { count: 81, expectedState: "failed" as const, expectedCalls: 0 },
+    ];
+
+    for (const testCase of cases) {
+      const steps = Array.from({ length: testCase.count }, (_, index) => ({
+        ...modelStep(index === testCase.count - 1 ? "pending" : "completed", index + 1),
+        id: randomUUID(),
+        idempotencyKey: `${runId}:model:${index + 1}`,
+        input: { iteration: index + 1 },
+      }));
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), ...steps]));
+      let calls = 0;
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => {
+          calls += 1;
+          return { text: "ok", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        },
+      }, noTools(), { maxModelIterations: 80 });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: testCase.expectedState });
+      expect(calls).toBe(testCase.expectedCalls);
+    }
+  });
+
+  it("stops twenty successful identical reads with a durable no-progress budget", async () => {
+    const prior = Array.from({ length: 19 }, (_, index) => ({
+      ...readOnlyToolStep("read", index + 1, `/workspace/read-${index}.txt`, "completed"),
+      output: { content: "unchanged" } as const,
+    }));
+    const pending = readOnlyToolStep("read", 20, "/workspace/read-19.txt");
+    const current = snapshot("executing_tool", [admittedStep(), ...prior, pending]);
+    current.progress = {
+      progressEpoch: 19,
+      progressKind: "result_repeated",
+      consecutiveNoProgress: 19,
+      physicalModelAttempt: 0,
+      logicalModelIteration: 0,
+      toolRepairAttempts: 0,
+      cumulativeToolMs: 0,
+      cumulativeActiveComputeMs: 0,
+      budgetReason: null,
+    };
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => ({ output: { content: "unchanged" }, summary: "same read" }),
+    }, { noProgressHardThreshold: 20 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(repository.current.progress).toMatchObject({
+      consecutiveNoProgress: 20,
+      budgetReason: "no_progress_budget",
+    });
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "turn.progress",
+      progressKind: "result_repeated",
+      budgetReason: "no_progress_budget",
+    }));
+  });
+
+  it("detects same-output progress loss after read arguments change", async () => {
+    const first = { ...readOnlyToolStep("read", 1, "/workspace/old-a.txt", "completed"), output: { content: "same" } as const };
+    const second = { ...readOnlyToolStep("read", 2, "/workspace/old-b.txt", "completed"), output: { content: "same" } as const };
+    const pending = readOnlyToolStep("read", 3, "/workspace/new.txt");
+    const current = snapshot("executing_tool", [admittedStep(), first, second, pending]);
+    current.progress = {
+      progressEpoch: 4,
+      progressKind: "result_repeated",
+      consecutiveNoProgress: 4,
+      physicalModelAttempt: 0,
+      logicalModelIteration: 0,
+      toolRepairAttempts: 0,
+      cumulativeToolMs: 0,
+      cumulativeActiveComputeMs: 0,
+      budgetReason: null,
+    };
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => ({ output: { content: "same" }, summary: "same result" }),
+    }, { noProgressHardThreshold: 5 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(repository.current.progress?.consecutiveNoProgress).toBe(5);
+  });
+
+  it("labels alternating read results as no progress and allows declared polling", async () => {
+    const readA = { ...readOnlyToolStep("read", 1, "/workspace/a.txt", "completed"), output: { content: "a" } as const };
+    const grepB = { ...readOnlyToolStep("grep", 2, "/workspace/b.txt", "completed"), output: { content: "b" } as const };
+    const alternatingPending = readOnlyToolStep("read", 3, "/workspace/c.txt");
+    const alternatingCurrent = snapshot("executing_tool", [admittedStep(), readA, grepB, alternatingPending]);
+    alternatingCurrent.progress = {
+      progressEpoch: 4,
+      progressKind: "result_repeated",
+      consecutiveNoProgress: 4,
+      physicalModelAttempt: 0,
+      logicalModelIteration: 0,
+      toolRepairAttempts: 0,
+      cumulativeToolMs: 0,
+      cumulativeActiveComputeMs: 0,
+      budgetReason: null,
+    };
+    const alternatingRepository = new FakeTurnRepository(alternatingCurrent);
+    const alternatingRunner = new DurableTurnRunner(alternatingRepository, unusedModel(), {
+      execute: async () => ({ output: { content: "a" }, summary: "alternating result" }),
+    }, { noProgressHardThreshold: 5 });
+
+    await expect(alternatingRunner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(alternatingRepository.events).toContainEqual(expect.objectContaining({
+      kind: "turn.progress",
+      progressKind: "alternating_no_progress",
+    }));
+
+    const pollingPending = {
+      ...readOnlyToolStep("read", 3, "/workspace/poll.txt"),
+      input: {
+        ...readOnlyToolStep("read", 3, "/workspace/poll.txt").input,
+        arguments: { path: "/workspace/poll.txt", progressPolicy: "polling" },
+      },
+    };
+    const pollingCurrent = snapshot("executing_tool", [admittedStep(), readA, grepB, pollingPending]);
+    pollingCurrent.progress = { ...alternatingCurrent.progress };
+    const pollingRepository = new FakeTurnRepository(pollingCurrent);
+    const pollingRunner = new DurableTurnRunner(pollingRepository, unusedModel(), {
+      execute: async () => ({ output: { content: "a" }, summary: "poll result" }),
+    }, { noProgressHardThreshold: 5 });
+
+    await expect(pollingRunner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(pollingRepository.current.progress).toMatchObject({
+      consecutiveNoProgress: 0,
+      progressKind: "declared_polling",
+    });
   });
 
   it("advertises compose_message as a no-approval presentation tool", async () => {
@@ -2272,8 +2524,8 @@ describe("durable turn runner", () => {
     const update = statements.find(({ sql }) => sql.startsWith("UPDATE turn_steps"));
     expect(update?.sql).toContain("SET state=$4");
     expect(update?.sql).toContain("session_entry_id=COALESCE($11,session_entry_id)");
-    expect(update?.sql).not.toMatch(/\$1[2-9]/);
-    expect(update?.params).toHaveLength(11);
+    expect(update?.sql).toContain("result_fingerprint=COALESCE($12,result_fingerprint)");
+    expect(update?.params).toHaveLength(18);
     expect(update?.params[3]).toBe("running");
     expect(update?.params[8]).toBe(true);
   });
@@ -2488,6 +2740,18 @@ class FakeTurnRepository implements DurableTurnRepository {
         state: patch.state,
         input: patch.input ?? previous?.input ?? {},
         output: patch.output === undefined ? previous?.output ?? null : patch.output,
+        resultFingerprint: patch.resultFingerprint === undefined
+          ? previous?.resultFingerprint ?? null
+          : patch.resultFingerprint,
+        deadlineAt: patch.deadlineAt === undefined ? previous?.deadlineAt ?? null : patch.deadlineAt,
+        idleDeadlineAt: patch.idleDeadlineAt === undefined ? previous?.idleDeadlineAt ?? null : patch.idleDeadlineAt,
+        timedOut: patch.timedOut === undefined ? previous?.timedOut ?? false : patch.timedOut,
+        abortAcknowledged: patch.abortAcknowledged === undefined
+          ? previous?.abortAcknowledged ?? false
+          : patch.abortAcknowledged,
+        outcomeCertainty: patch.outcomeCertainty === undefined
+          ? previous?.outcomeCertainty ?? null
+          : patch.outcomeCertainty,
         retryClass: patch.retryClass === undefined ? previous?.retryClass ?? null : patch.retryClass,
         idempotencyKey: patch.idempotencyKey === undefined ? previous?.idempotencyKey ?? null : patch.idempotencyKey,
         attempt: (previous?.attempt ?? 0) + (patch.incrementAttempt ? 1 : 0),
@@ -2518,6 +2782,20 @@ class FakeTurnRepository implements DurableTurnRepository {
     this.current.state = mutation.nextState;
     this.current.version += 1;
     this.current.error = mutation.error ?? null;
+    if (mutation.progress) {
+      this.current.progress = {
+        progressEpoch: this.current.progress?.progressEpoch ?? 0,
+        progressKind: this.current.progress?.progressKind ?? null,
+        consecutiveNoProgress: this.current.progress?.consecutiveNoProgress ?? 0,
+        physicalModelAttempt: this.current.progress?.physicalModelAttempt ?? 0,
+        logicalModelIteration: this.current.progress?.logicalModelIteration ?? 0,
+        toolRepairAttempts: this.current.progress?.toolRepairAttempts ?? 0,
+        cumulativeToolMs: this.current.progress?.cumulativeToolMs ?? 0,
+        cumulativeActiveComputeMs: this.current.progress?.cumulativeActiveComputeMs ?? 0,
+        budgetReason: this.current.progress?.budgetReason ?? null,
+        ...mutation.progress,
+      };
+    }
     this.current.leaseOwner = mutation.keepLease ? snapshotValue.leaseOwner : "";
   }
 
