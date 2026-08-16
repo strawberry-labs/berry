@@ -531,6 +531,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const bootstrapContent = initialCloudContent(initial);
   const [config, setConfig] = React.useState(initial.config);
   const [hydrated, setHydrated] = React.useState(false);
+  const [homeGreeting, setHomeGreeting] = React.useState("Welcome");
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [taskFilesOpen, setTaskFilesOpen] = React.useState(false);
   const searchReturnFocusRef = React.useRef<HTMLElement | null>(null);
@@ -1043,6 +1044,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
 
   React.useEffect(() => {
     setHydrated(true);
+    // Timezones belong to the browser. Keep the server and first client render
+    // on the same neutral text, then choose the local greeting after hydration.
+    setHomeGreeting(greetingForDate(new Date()));
     applyDocumentTheme();
     const language = window.localStorage.getItem("berry.web.language") ?? "system";
     document.documentElement.lang = language === "system" ? navigator.language : language;
@@ -3367,7 +3371,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         ) : shouldMountTaskSurface(surface) ? (
           <BerryWorkspaceHomeFrame
             logo={<DeploymentBrandLogo className="berry-home-greeting-logo" alt="" />}
-            greeting={greeting()}
+            greeting={homeGreeting}
             help={<WebHelpMenu />}
             error={Object.values(resourceErrors).find(Boolean) ? <p className="composer-error" role="alert">{Object.values(resourceErrors).find(Boolean)}</p> : undefined}
             composer={(
@@ -3536,12 +3540,15 @@ function optimisticUserMessage(sessionId: string, text: string, attachments: Att
 }
 
 
-function greeting(): string {
-  const hour = new Date().getHours();
+export function greetingForHour(hour: number): string {
   if (hour < 5) return "Good evening";
   if (hour < 12) return "Good morning";
   if (hour < 17) return "Good afternoon";
   return "Good evening";
+}
+
+export function greetingForDate(date: Date): string {
+  return greetingForHour(date.getHours());
 }
 
 function LazySurfaceFallback({ label }: { label: string }) {

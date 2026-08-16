@@ -3,10 +3,24 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, greetingForDate, greetingForHour, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
+  it("keeps greeting thresholds deterministic at hour boundaries", () => {
+    expect(greetingForHour(4)).toBe("Good evening");
+    expect(greetingForHour(5)).toBe("Good morning");
+    expect(greetingForHour(11)).toBe("Good morning");
+    expect(greetingForHour(12)).toBe("Good afternoon");
+    expect(greetingForHour(16)).toBe("Good afternoon");
+    expect(greetingForHour(17)).toBe("Good evening");
+  });
+
+  it("uses the browser-local date only after hydration", () => {
+    const localDate = new Date(2026, 7, 16, 5, 0, 0);
+    expect(greetingForDate(localDate)).toBe(greetingForHour(localDate.getHours()));
+  });
+
   it("does not rebuild shell durable state for token-only deltas", () => {
     expect(shouldUpdateDurableStateForEvent({ kind: "message.delta", messageId: "m", delta: "token", channel: "text" })).toBe(false);
     expect(shouldUpdateDurableStateForEvent({ kind: "tool.update", toolCallId: "tool", detail: "partial" })).toBe(false);
