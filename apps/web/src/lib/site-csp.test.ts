@@ -1,16 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
-import { buildSiteContentSecurityPolicy, readCspNonceFromDocument } from "./site-csp.ts";
+import { describe, expect, it } from "vitest";
+import { buildSiteContentSecurityPolicy } from "./site-csp.ts";
 
 describe("site CSP", () => {
-  it("reuses the SSR nonce during browser hydration", () => {
-    vi.stubGlobal("document", {
-      querySelector: () => ({ nonce: "ssr-nonce" }),
-    });
-
-    expect(readCspNonceFromDocument()).toBe("ssr-nonce");
-    vi.unstubAllGlobals();
-  });
-
   it("uses a per-response nonce and narrow production source lists", () => {
     const policy = buildSiteContentSecurityPolicy({
       nonce: "nonce123",

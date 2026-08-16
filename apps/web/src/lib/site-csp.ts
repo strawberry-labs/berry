@@ -14,11 +14,6 @@ export function createCspNonce(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
 }
 
-export function readCspNonceFromDocument(): string | undefined {
-  if (typeof document === "undefined") return undefined;
-  return document.querySelector<HTMLScriptElement>("script[nonce]")?.nonce || undefined;
-}
-
 export function buildSiteContentSecurityPolicy(options: {
   nonce: string;
   connectOrigins?: readonly string[];
