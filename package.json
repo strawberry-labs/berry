@@ -19,7 +19,7 @@
     "check:desktop:full": "node scripts/check-desktop-full.mjs",
     "check:compose": "node scripts/verify-compose-config.mjs",
     "check:docker": "node scripts/verify-docker-context.mjs",
-    "check:deploy": "sh deploy/test-deployment-impact.sh",
+    "check:deploy": "sh deploy/test-deployment-impact.sh && node scripts/verify-production-headers.mjs",
     "check:ci": "node scripts/verify-ci-matrix.mjs",
     "check:sandbox": "node scripts/verify-windows-sandbox-status.mjs",
     "check:security": "node scripts/verify-security-pass.mjs",

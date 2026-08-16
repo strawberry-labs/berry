@@ -33,7 +33,10 @@
 		not path /v1/files/*/content /v1/artifacts/* /v1/branding/*
 	}
 	header @application_responses {
-		Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com https://*.googleusercontent.com {$BERRY_CSP_EXTRA_FRAME_SOURCES:https://*.e2b.app}; worker-src 'self' blob:"
+		# The web SSR emits a per-response nonce-bearing CSP. Do not add a
+		# second static policy here: browsers intersect multiple policies and a
+		# stale edge policy would either break SSR hydration or re-enable inline
+		# script execution.
 		X-Frame-Options "SAMEORIGIN"
 	}
 
