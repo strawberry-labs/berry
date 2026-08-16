@@ -3,6 +3,7 @@ import {
   mergeSessionCheckpoints,
   parseSessionCheckpoint,
   rebaseSessionCheckpoint,
+  validateSessionCheckpoint,
   type CheckpointDeterministicFields,
   type SessionCheckpointV2,
 } from "./index.ts";
@@ -128,5 +129,32 @@ describe("portable session checkpoints", () => {
     expect(rebased.currentWork).toEqual(["three"]);
     expect(rebased.coveredEntryStart).toBe("entry-1");
     expect(rebased.coveredEntryEnd).toBe("entry-4");
+  });
+
+  it("rejects unbounded output, missing tool-call coverage, and pathological reductions", () => {
+    const oversized = checkpoint({
+      successCriteria: Array.from({ length: 257 }, (_, index) => `criterion-${index}`),
+    });
+    expect(validateSessionCheckpoint(oversized, deterministic()).issues.join(" ")).toContain("maximum is 256");
+
+    const requiredToolCall = {
+      toolCallId: "tool-1",
+      toolName: "write_file",
+      retryClass: "idempotent_with_key" as const,
+      idempotencyKey: "key-1",
+      outcome: "completed" as const,
+    };
+    const missingCoverage = validateSessionCheckpoint(
+      checkpoint(),
+      deterministic({ toolCalls: [requiredToolCall] }),
+    );
+    expect(missingCoverage.issues.join(" ")).toContain("missing tool-call coverage");
+
+    const pathological = validateSessionCheckpoint(
+      checkpoint({ toolCalls: [requiredToolCall] }),
+      deterministic({ toolCalls: [requiredToolCall] }),
+      { tokensBefore: 1_000, tokensAfter: 950 },
+    );
+    expect(pathological.issues.join(" ")).toContain("reduce the persisted context enough");
   });
 });

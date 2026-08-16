@@ -213,14 +213,12 @@ export function workerFailureForRetryPolicy(jobName: string, error: unknown): un
     category: failure.category,
     status: failure.status ?? null,
     code: failure.code ?? null,
-    requestId: failure.requestId ?? null,
   };
   console.warn(JSON.stringify(diagnostics));
   return new UnrecoverableError([
     `Non-retryable ${jobName} provider failure`,
     failure.status ? `status=${failure.status}` : null,
     failure.code ? `code=${failure.code}` : null,
-    failure.requestId ? `requestId=${failure.requestId}` : null,
   ].filter(Boolean).join(" "));
 }
 

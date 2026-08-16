@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { RouterClientError } from "@berry/router-client";
+import { describe, expect, it, vi } from "vitest";
+import { RouterClientError, type OpenAIChatCompletionsClient } from "@berry/router-client";
 import type { SessionCheckpointV2 } from "@berry/shared";
 import {
   CompactionRetryableError,
   CompactionTerminalError,
   DurableSessionCompactor,
+  RouterCheckpointGenerator,
   SqlSessionCompactionRepository,
   createCheckpointGenerator,
   type CheckpointGenerator,
@@ -56,6 +57,48 @@ function compactionState(): CompactionSessionState {
   };
 }
 
+function checkpointOutput(): SessionCheckpointV2 {
+  return {
+    schema: "berry.session-checkpoint",
+    version: 2,
+    generatedAt: "2026-07-28T12:00:00.000Z",
+    goal: "Implement durable compaction.",
+    successCriteria: [],
+    constraints: [],
+    standingInstructions: [],
+    completedWork: ["Persist the bounded checkpoint."],
+    currentWork: [],
+    blockers: [],
+    waitingState: null,
+    decisions: [],
+    unresolvedQuestions: [],
+    nextAction: "Continue the task.",
+    filesRead: [],
+    filesModified: [],
+    artifacts: [],
+    commands: [],
+    toolCalls: [],
+    approvals: [],
+    promptManifestHash: null,
+    retrievalSnapshotIds: [],
+    coveredEntryStart: "entry-1",
+    coveredEntryEnd: "entry-1",
+    currentLeafId: "entry-2",
+    narrative: "The persisted session segment is checkpointed.",
+  };
+}
+
+function modelResponse(content: string, usage = { inputTokens: 12, outputTokens: 8, totalTokens: 20 }) {
+  return {
+    id: "checkpoint-response",
+    model: "checkpoint-test",
+    content,
+    finishReason: "stop" as const,
+    raw: {},
+    usage,
+  };
+}
+
 describe("durable session compactor", () => {
   it("uses the tool-capable compaction model instead of inheriting the chat default", () => {
     const generator = createCheckpointGenerator({
@@ -85,6 +128,72 @@ describe("durable session compactor", () => {
       provider: "dedicated-compactor",
       model: "dedicated-compaction-model",
     });
+  });
+
+  it("accepts a validated checkpoint from the first physical attempt and records usage", async () => {
+    const complete = vi.fn().mockResolvedValue(modelResponse(JSON.stringify(checkpointOutput())));
+    const generator = new RouterCheckpointGenerator(
+      { complete } as unknown as OpenAIChatCompletionsClient,
+      "router",
+      "checkpoint-test",
+    );
+    const reports: unknown[] = [];
+    const result = await generator.generate({
+      conversation: '{"entryId":"entry-1"}',
+      deterministic: {
+        generatedAt: "2026-07-28T12:00:00.000Z",
+        coveredEntryStart: "entry-1",
+        coveredEntryEnd: "entry-1",
+        currentLeafId: "entry-2",
+      },
+      previousRolling: null,
+      maxTokens: 128,
+      tokensBefore: 128,
+      algorithmVersion: "checkpoint-v2-bounded",
+      onProviderAttempt: (report) => reports.push(report),
+    });
+
+    expect(result).toMatchObject({
+      validationStatus: "valid",
+      attempts: 1,
+      usage: {
+        inputTokens: 12,
+        outputTokens: 8,
+        pricingSource: "estimated",
+      },
+    });
+    expect(complete).toHaveBeenCalledWith(expect.objectContaining({ providerAttemptOrdinal: 1 }));
+    expect(reports).toEqual([]);
+  });
+
+  it("repairs malformed checkpoint output once and never exceeds two physical attempts", async () => {
+    const complete = vi.fn()
+      .mockResolvedValueOnce(modelResponse("not-json"))
+      .mockResolvedValueOnce(modelResponse(JSON.stringify(checkpointOutput()), { inputTokens: 5, outputTokens: 6, totalTokens: 11 }));
+    const generator = new RouterCheckpointGenerator(
+      { complete } as unknown as OpenAIChatCompletionsClient,
+      "router",
+      "checkpoint-test",
+    );
+
+    const result = await generator.generate({
+      conversation: "persisted segment",
+      deterministic: {
+        generatedAt: "2026-07-28T12:00:00.000Z",
+        coveredEntryStart: "entry-1",
+        coveredEntryEnd: "entry-1",
+        currentLeafId: "entry-2",
+      },
+      previousRolling: null,
+      maxTokens: 128,
+      tokensBefore: 128,
+      algorithmVersion: "checkpoint-v2-bounded",
+      maxPhysicalAttempts: 2,
+    });
+
+    expect(result).toMatchObject({ validationStatus: "repaired", attempts: 2, usage: { inputTokens: 17, outputTokens: 14 } });
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(complete.mock.calls.map((call) => call[0].providerAttemptOrdinal)).toEqual([1, 2]);
   });
 
   it("checks governance against the compaction provider and model actually selected", async () => {

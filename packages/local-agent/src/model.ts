@@ -16,6 +16,7 @@ import {
   type BerryRouterStreamMetadata,
 } from "@berry/router-client";
 import {
+  classifyProviderFailure,
   resolveModelCapabilities,
   type JsonValue,
   type ModelApiType,
@@ -238,16 +239,18 @@ export class FallbackChatCompletionClient implements ChatCompletionStreamClient 
 
   async *stream(options: ChatCompletionOptions): AsyncGenerator<import("@berry/router-client").ChatCompletionChunk> {
     let emitted = false;
+    const primaryAttempt = options.providerAttemptOrdinal ?? 1;
     try {
-      for await (const chunk of this.primary.stream(options)) {
+      for await (const chunk of this.primary.stream({ ...options, providerAttemptOrdinal: primaryAttempt })) {
         emitted = true;
         yield chunk;
       }
       if (emitted) return;
     } catch (error) {
-      if (emitted || options.signal?.aborted) throw error;
+      if (emitted || options.signal?.aborted || !classifyProviderFailure(error).retryable) throw error;
+      options.onProviderAttemptDecision?.(primaryAttempt, "fallback");
     }
-    yield* this.fallback.stream(options);
+    yield* this.fallback.stream({ ...options, providerAttemptOrdinal: primaryAttempt + 1 });
   }
 }
 
@@ -266,8 +269,9 @@ export class ContentFallbackChatCompletionClient implements ChatCompletionStream
   async *stream(options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
     let emittedContent = false;
     const pending: ChatCompletionChunk[] = [];
+    const primaryAttempt = options.providerAttemptOrdinal ?? 1;
     try {
-      for await (const chunk of this.primary.stream(options)) {
+      for await (const chunk of this.primary.stream({ ...options, providerAttemptOrdinal: primaryAttempt })) {
         if (emittedContent) {
           yield chunk;
           continue;
@@ -281,15 +285,11 @@ export class ContentFallbackChatCompletionClient implements ChatCompletionStream
       yield* pending;
       return;
     } catch (error) {
-      if (emittedContent || options.signal?.aborted || !isRetryableCompletionError(error)) throw error;
+      if (emittedContent || options.signal?.aborted || !classifyProviderFailure(error).retryable) throw error;
+      options.onProviderAttemptDecision?.(primaryAttempt, "fallback");
     }
-    yield* this.fallback.stream(options);
+    yield* this.fallback.stream({ ...options, providerAttemptOrdinal: primaryAttempt + 1 });
   }
-}
-
-function isRetryableCompletionError(error: unknown): boolean {
-  if (!(error instanceof RouterClientError) || error.status === undefined) return true;
-  return [408, 409, 425, 429, 500, 502, 503, 504].includes(error.status);
 }
 
 function emptyUsage(): Usage {

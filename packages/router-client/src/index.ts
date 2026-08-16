@@ -1,4 +1,17 @@
-import type { JsonValue, ModelApiType, ProviderAuthType, RemoteModel, RouterAccount, RouterAttribution } from "@berry/shared";
+import {
+  ProviderAttemptError,
+  classifyProviderFailure,
+  providerAttemptStatusClass,
+  type JsonValue,
+  type ModelApiType,
+  type ProviderAttemptDecision,
+  type ProviderAttemptErrorDetails,
+  type ProviderAttemptReport,
+  type ProviderAuthType,
+  type RemoteModel,
+  type RouterAccount,
+  type RouterAttribution,
+} from "@berry/shared";
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 
@@ -150,6 +163,11 @@ export interface ChatCompletionOptions {
   promptCacheKey?: string;
   /** Requested cache retention; "short" uses the provider default, "long" maps to 24h. */
   promptCacheRetention?: "short" | "long";
+  /** Low-cardinality callback for one physical transport attempt. */
+  onProviderAttempt?: (report: ProviderAttemptReport) => void;
+  /** Fallback wrappers annotate the already-reported physical attempt. */
+  onProviderAttemptDecision?: (physicalAttempt: number, decision: ProviderAttemptDecision) => void;
+  providerAttemptOrdinal?: number;
 }
 
 export interface ImageGenerationOptions {
@@ -180,27 +198,26 @@ export interface ImageGenerationResult {
   data: ImageGenerationData[];
 }
 
-export interface RouterClientErrorDetails {
+export interface RouterClientErrorDetails extends ProviderAttemptErrorDetails {
   /** Sanitized provider/router error code, suitable for retry classification and metrics. */
   code?: string;
   /** Sanitized provider/router request identifier, suitable for support correlation. */
   requestId?: string;
 }
 
-export class RouterClientError extends Error {
-  readonly code: string | undefined;
-  readonly requestId: string | undefined;
-
+export class RouterClientError extends ProviderAttemptError {
   constructor(
     message: string,
-    readonly status?: number,
+    status?: number,
     readonly body?: string,
     details: RouterClientErrorDetails = {},
   ) {
-    super(redactSecrets(message));
+    super(redactSecrets(message), {
+      ...(status === undefined ? {} : { status }),
+      ...(details.code ? { code: safeDiagnosticValue(details.code, 128) } : {}),
+      ...(details.requestId ? { requestId: safeDiagnosticValue(details.requestId, 240) } : {}),
+    });
     this.name = "RouterClientError";
-    this.code = safeDiagnosticValue(details.code, 128);
-    this.requestId = safeDiagnosticValue(details.requestId, 240);
   }
 }
 
@@ -572,55 +589,86 @@ export class OpenAIChatCompletionsClient {
   }
 
   async complete(options: ChatCompletionOptions): Promise<ChatCompletionResult> {
-    const response = await this.#post({ ...options, stream: false });
-    const payload = (await response.json()) as OpenAICompletionResponse;
-    const choice = payload.choices[0];
-    if (!choice) {
-      throw new RouterClientError(
-        "Provider returned no choices",
-        response.status,
-        JSON.stringify(payload),
-        providerErrorDetails(response, payload),
-      );
+    const startedAt = Date.now();
+    const physicalAttempt = Math.max(1, Math.floor(options.providerAttemptOrdinal ?? 1));
+    try {
+      const response = await this.#post({ ...options, stream: false });
+      const payload = (await response.json()) as OpenAICompletionResponse;
+      const choice = payload.choices[0];
+      if (!choice) {
+        throw new RouterClientError(
+          "Provider returned no choices",
+          response.status,
+          JSON.stringify(payload),
+          providerErrorDetails(response, payload),
+        );
+      }
+      const model = payload.model ?? options.model ?? this.#provider.defaultModel;
+      const rawContent = choice.message?.content ?? "";
+      const taggedContent = usesThinkTaggedReasoning(model)
+        ? new ThinkTaggedContentParser().push(rawContent, true)
+        : { text: rawContent, reasoning: "" };
+      const nativeToolCalls = normalizeToolCalls(choice.message?.tool_calls);
+      const kimiToolCalls = nativeToolCalls ? undefined : parseKimiToolCalls(taggedContent.text);
+      const requestId = requestIdHeader(response.headers);
+      const result: ChatCompletionResult = {
+        id: payload.id,
+        model,
+        ...(requestId ? { requestId } : {}),
+        content: kimiToolCalls?.content ?? taggedContent.text,
+        finishReason: kimiToolCalls ? "tool_calls" : choice.finish_reason ?? null,
+        raw: payload as unknown as JsonValue,
+      };
+      const nativeReasoning = choice.message?.reasoning ?? choice.message?.reasoning_content;
+      const reasoning = `${typeof nativeReasoning === "string" ? nativeReasoning : ""}${taggedContent.reasoning}`;
+      if (reasoning.length > 0) result.reasoning = reasoning;
+      const toolCalls = nativeToolCalls ?? kimiToolCalls?.toolCalls;
+      if (toolCalls) result.toolCalls = toolCalls;
+      const usage = normalizeUsage(payload.usage);
+      const headerUsage = normalizeUsageHeaders(response.headers);
+      const finalUsage = usage ?? headerUsage;
+      if (finalUsage) result.usage = finalUsage;
+      const attribution = routerAttribution(this.#provider, options.model ?? this.#provider.defaultModel, response.headers, payload as unknown as Record<string, unknown>);
+      if (attribution) result.attribution = attribution;
+      reportProviderAttempt(options, {
+        physicalAttempt,
+        model,
+        status: response.status,
+        statusClass: providerAttemptStatusClass(response.status),
+        category: "success",
+        retryDecision: "none",
+        latencyMs: Math.max(0, Date.now() - startedAt),
+        ...(finalUsage ? {
+          inputTokens: finalUsage.inputTokens,
+          outputTokens: finalUsage.outputTokens,
+          cacheReadTokens: finalUsage.cacheReadTokens ?? 0,
+          cacheWriteTokens: finalUsage.cacheWriteTokens ?? 0,
+        } : {}),
+        finishReason: result.finishReason,
+      });
+      return result;
+    } catch (error) {
+      reportProviderFailure(options, error, startedAt, physicalAttempt);
+      throw error;
     }
-    const model = payload.model ?? options.model ?? this.#provider.defaultModel;
-    const rawContent = choice.message?.content ?? "";
-    const taggedContent = usesThinkTaggedReasoning(model)
-      ? new ThinkTaggedContentParser().push(rawContent, true)
-      : { text: rawContent, reasoning: "" };
-    const nativeToolCalls = normalizeToolCalls(choice.message?.tool_calls);
-    const kimiToolCalls = nativeToolCalls ? undefined : parseKimiToolCalls(taggedContent.text);
-    const requestId = requestIdHeader(response.headers);
-    const result: ChatCompletionResult = {
-      id: payload.id,
-      model,
-      ...(requestId ? { requestId } : {}),
-      content: kimiToolCalls?.content ?? taggedContent.text,
-      finishReason: kimiToolCalls ? "tool_calls" : choice.finish_reason ?? null,
-      raw: payload as unknown as JsonValue,
-    };
-    const nativeReasoning = choice.message?.reasoning ?? choice.message?.reasoning_content;
-    const reasoning = `${typeof nativeReasoning === "string" ? nativeReasoning : ""}${taggedContent.reasoning}`;
-    if (reasoning.length > 0) result.reasoning = reasoning;
-    const toolCalls = nativeToolCalls ?? kimiToolCalls?.toolCalls;
-    if (toolCalls) result.toolCalls = toolCalls;
-    const usage = normalizeUsage(payload.usage);
-    const headerUsage = normalizeUsageHeaders(response.headers);
-    const finalUsage = usage ?? headerUsage;
-    if (finalUsage) result.usage = finalUsage;
-    const attribution = routerAttribution(this.#provider, options.model ?? this.#provider.defaultModel, response.headers, payload as unknown as Record<string, unknown>);
-    if (attribution) result.attribution = attribution;
-    return result;
   }
 
   async *stream(options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
-    const response = await this.#post({ ...options, stream: true });
+    const startedAt = Date.now();
+    const physicalAttempt = Math.max(1, Math.floor(options.providerAttemptOrdinal ?? 1));
     const requestedModel = options.model ?? this.#provider.defaultModel;
-    const requestId = requestIdHeader(response.headers);
-    const headerUsage = normalizeUsageHeaders(response.headers);
-    const taggedContentParser = usesThinkTaggedReasoning(requestedModel) ? new ThinkTaggedContentParser() : undefined;
+    let response: Response | undefined;
+    let requestId: string | undefined;
+    let headerUsage: ChatCompletionUsage | undefined;
+    let lastUsage: ChatCompletionUsage | undefined;
+    let lastFinishReason: string | null = null;
+    let lastModel = requestedModel;
     let lastChunk: ChatCompletionChunk | undefined;
     try {
+      response = await this.#post({ ...options, stream: true });
+      requestId = requestIdHeader(response.headers);
+      headerUsage = normalizeUsageHeaders(response.headers);
+      const taggedContentParser = usesThinkTaggedReasoning(requestedModel) ? new ThinkTaggedContentParser() : undefined;
       for await (const event of parseSse(response)) {
         if (event === "[DONE]") break;
         const rawPayload = JSON.parse(event) as unknown;
@@ -657,6 +705,8 @@ export class OpenAIChatCompletionsClient {
           finishReason: choice?.finish_reason ?? null,
           raw: payload as unknown as JsonValue,
         };
+        lastModel = chunk.model;
+        if (chunk.finishReason) lastFinishReason = chunk.finishReason;
         const nativeReasoningDelta = choice?.delta?.reasoning ?? choice?.delta?.reasoning_content;
         const reasoningDelta = `${typeof nativeReasoningDelta === "string" ? nativeReasoningDelta : ""}${taggedContent.reasoning}`;
         if (reasoningDelta.length > 0) {
@@ -666,7 +716,10 @@ export class OpenAIChatCompletionsClient {
         if (toolCalls) chunk.toolCalls = toolCalls;
         const usage = normalizeUsage(payload.usage);
         const finalUsage = usage ?? (choice?.finish_reason ? headerUsage : undefined);
-        if (finalUsage) chunk.usage = finalUsage;
+        if (finalUsage) {
+          chunk.usage = finalUsage;
+          lastUsage = finalUsage;
+        }
         const attribution = routerAttribution(this.#provider, requestedModel, response.headers, rawPayload);
         if (attribution) chunk.attribution = attribution;
         lastChunk = chunk;
@@ -684,20 +737,38 @@ export class OpenAIChatCompletionsClient {
           raw: lastChunk.raw,
         };
       }
+      reportProviderAttempt(options, {
+        physicalAttempt,
+        model: lastModel,
+        status: response.status,
+        statusClass: providerAttemptStatusClass(response.status),
+        category: "success",
+        retryDecision: "none",
+        latencyMs: Math.max(0, Date.now() - startedAt),
+        ...(lastUsage ? {
+          inputTokens: lastUsage.inputTokens,
+          outputTokens: lastUsage.outputTokens,
+          cacheReadTokens: lastUsage.cacheReadTokens ?? 0,
+          cacheWriteTokens: lastUsage.cacheWriteTokens ?? 0,
+        } : {}),
+        finishReason: lastFinishReason,
+      });
     } catch (error) {
-      if (error instanceof RouterClientError || options.signal?.aborted) throw error;
-      const cause = redactSecrets(error instanceof Error ? error.message : String(error));
-      throw new RouterClientError(
-        `${this.#provider.name} stream failed before completion${requestId ? ` (request ${requestId})` : ""}: ${cause}`,
-        undefined,
-        cause,
-        {
-          code: error instanceof Error && "code" in error && typeof error.code === "string"
-            ? error.code
-            : "stream_interrupted",
-          ...(requestId ? { requestId } : {}),
-        },
-      );
+      const finalError = error instanceof RouterClientError || options.signal?.aborted
+        ? error
+        : new RouterClientError(
+            `${this.#provider.name} stream failed before completion${requestId ? ` (request ${requestId})` : ""}: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+            undefined,
+            redactSecrets(error instanceof Error ? error.message : String(error)),
+            {
+              code: error instanceof Error && "code" in error && typeof error.code === "string"
+                ? error.code
+                : "stream_interrupted",
+              ...(requestId ? { requestId } : {}),
+            },
+          );
+      reportProviderFailure(options, finalError, startedAt, physicalAttempt, response?.status);
+      throw finalError;
     }
   }
 
@@ -746,6 +817,43 @@ export class OpenAIChatCompletionsClient {
     }
     return response;
   }
+}
+
+function reportProviderAttempt(options: ChatCompletionOptions, report: ProviderAttemptReport): void {
+  try {
+    options.onProviderAttempt?.(report);
+  } catch {
+    // Observability callbacks are deliberately isolated from the provider
+    // result. A telemetry consumer must never change request semantics.
+  }
+}
+
+function reportProviderFailure(
+  options: ChatCompletionOptions,
+  error: unknown,
+  startedAt: number,
+  physicalAttempt: number,
+  responseStatus?: number,
+): void {
+  const classification = classifyProviderFailure(error);
+  const status = classification.status ?? responseStatus;
+  const category = options.signal?.aborted ? "aborted" : classification.category;
+  reportProviderAttempt(options, {
+    physicalAttempt,
+    model: options.model ?? "unknown",
+    ...(status === undefined ? {} : { status }),
+    statusClass: providerAttemptStatusClass(status, error),
+    category,
+    retryDecision: category === "aborted"
+      ? "cancelled"
+      : classification.retryable ? "retry" : "terminal",
+    latencyMs: Math.max(0, Date.now() - startedAt),
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    finishReason: null,
+  });
 }
 
 /** Native Ollama `/api/chat` transport used when its OpenAI-compatible stream is unavailable or malformed. */

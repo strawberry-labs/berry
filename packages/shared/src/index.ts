@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { PromptManifestSchema, TurnIntentSchema } from "./durable-context.ts";
+import { ProviderAttemptEventSchema } from "./provider-errors.ts";
 
 export { BUILT_IN_COMMANDS, builtInCommandManifests, parseSlashCommand, type BuiltInCommandDefinition } from "./commands.ts";
 export * from "./durable-context.ts";
@@ -8,6 +9,7 @@ export * from "./retrieval.ts";
 export * from "./memory.ts";
 export * from "./agent-skill-content.ts";
 export * from "./durable-job-contracts.ts";
+export * from "./provider-errors.ts";
 
 /**
  * Pre-1.0 host protocol version shared by desktop, host, CLI, and future
@@ -2339,6 +2341,7 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     reminderCount: z.number().int().positive(),
   }),
   z.object({ kind: z.literal("approval.expired"), approvalId: z.string() }),
+  ProviderAttemptEventSchema,
   z.object({
     kind: z.literal("finalization.start"),
     runId: z.string(),

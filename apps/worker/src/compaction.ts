@@ -3,22 +3,39 @@ import { DEFAULT_COMPACTION_SETTINGS } from "@berry/harness";
 import {
   applyCheckpointDeterminism,
   checkpointFallback,
+  classifyProviderFailure,
   mergeSessionCheckpoints,
   parseSessionCheckpoint,
   rebaseSessionCheckpoint,
+  SESSION_CHECKPOINT_MAX_ITEMS,
+  validateSessionCheckpoint,
+  type ProviderAttemptReport,
   type CheckpointDeterministicFields,
   type JsonValue,
   type SessionCheckpointV2,
 } from "@berry/shared";
 import {
   OpenAIChatCompletionsClient,
-  RouterClientError,
+  type ChatCompletionUsage,
 } from "@berry/router-client";
 import type { CompactionJobPayload } from "./jobs.js";
-import { isRetryableProviderStatus } from "./provider-retry.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 export const WORKER_CHECKPOINT_REBASE_INTERVAL = 5;
+export const DEFAULT_COMPACTION_ALGORITHM_VERSION = "checkpoint-v2-bounded";
+export const DEFAULT_COMPACTION_MAX_DURATION_MS = 180_000;
+export const MAX_COMPACTION_PHYSICAL_ATTEMPTS = 2;
+
+export interface CompactionUsage {
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costRawMicros: string;
+  pricingSource: "measured" | "estimated";
+}
 
 export interface CompactionJobResult {
   sessionId: string;
@@ -29,6 +46,12 @@ export interface CompactionJobResult {
   validationStatus?: "valid" | "repaired" | "fallback" | undefined;
   segmentCheckpointId?: string | null | undefined;
   rollingCheckpointId?: string | null | undefined;
+  algorithmVersion?: string | undefined;
+  physicalAttempts?: number | undefined;
+  fallbackReason?: string | null | undefined;
+  usageEventId?: string | null | undefined;
+  usage?: CompactionUsage | undefined;
+  providerAttempts?: readonly ProviderAttemptReport[] | undefined;
 }
 
 export interface SessionCompactionRunner {
@@ -46,6 +69,7 @@ export interface CompactionEntryRecord {
 }
 
 export interface CompactionSessionState {
+  runId?: string;
   tenantId: string;
   taskId: string;
   sessionId: string;
@@ -76,7 +100,17 @@ export interface SessionCompactionRepository {
     provider: string;
     model: string;
     rebased: boolean;
-  }): Promise<{ segmentCheckpointId: string | null; rollingCheckpointId: string | null }>;
+    algorithmVersion: string;
+    tokensBefore: number;
+    tokensAfter: number;
+    physicalAttempts: number;
+    fallbackReason: string | null;
+    usage: CompactionUsage | null;
+  }): Promise<{
+    segmentCheckpointId: string | null;
+    rollingCheckpointId: string | null;
+    usageEventId?: string | null;
+  }>;
   release(input: CompactionJobPayload, leaseOwner: string, error?: string): Promise<void>;
 }
 
@@ -84,6 +118,8 @@ export interface GeneratedCheckpoint {
   checkpoint: SessionCheckpointV2 | null;
   validationStatus: "valid" | "repaired" | "fallback";
   attempts: number;
+  fallbackReason?: string | null | undefined;
+  usage?: CompactionUsage | undefined;
 }
 
 export interface CheckpointGenerator {
@@ -94,6 +130,11 @@ export interface CheckpointGenerator {
     deterministic: CheckpointDeterministicFields;
     previousRolling: SessionCheckpointV2 | null;
     maxTokens: number;
+    tokensBefore: number;
+    algorithmVersion: string;
+    maxPhysicalAttempts?: number;
+    onProviderAttempt?: (report: ProviderAttemptReport) => void;
+    signal?: AbortSignal;
   }): Promise<GeneratedCheckpoint>;
 }
 
@@ -108,6 +149,9 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       fallbackModel?: string;
       maxInputCharacters?: number;
       keepRecentTokens?: number;
+      maxDurationMs?: number;
+      maxPhysicalAttempts?: number;
+      algorithmVersion?: string;
     } = {},
   ) {}
 
@@ -120,6 +164,13 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
     try {
       const provider = this.generator?.provider ?? this.options.fallbackProvider ?? "deterministic";
       const model = this.generator?.model ?? this.options.fallbackModel ?? "checkpoint-v2";
+      const algorithmVersion = input.algorithmVersion
+        ?? this.options.algorithmVersion
+        ?? DEFAULT_COMPACTION_ALGORITHM_VERSION;
+      const maxPhysicalAttempts = Math.min(
+        MAX_COMPACTION_PHYSICAL_ATTEMPTS,
+        Math.max(1, this.options.maxPhysicalAttempts ?? MAX_COMPACTION_PHYSICAL_ATTEMPTS),
+      );
       const state = await this.repository.load(input, { provider, model });
       if (!state.modelAllowed) {
         throw new CompactionTerminalError(`Model ${provider}/${model} is denied by tenant governance`);
@@ -156,18 +207,54 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
 
       const deterministic = extractDeterministicEvidence(segmentEntries, state.sourceLeafId);
       const conversation = serializeEntries(segmentEntries, this.options.maxInputCharacters ?? 240_000);
+      const segmentTokensBefore = estimateTokens(segmentEntries);
+      const providerAttempts: ProviderAttemptReport[] = [];
       const generated = this.generator
-        ? await this.withHeartbeat(input, leaseOwner, leaseSeconds, () => this.generator!.generate({
+        ? await this.withCompactionDeadline(input, leaseOwner, leaseSeconds, (signal) => this.generator!.generate({
             conversation,
             deterministic,
             previousRolling: state.previousRolling,
             maxTokens: input.maxTokens ?? 4_000,
-          }))
-        : { checkpoint: null, validationStatus: "fallback" as const, attempts: 0 };
+            tokensBefore: segmentTokensBefore,
+            algorithmVersion,
+            maxPhysicalAttempts,
+            onProviderAttempt: (report) => providerAttempts.push(report),
+            signal,
+          }), input.maxDurationMs ?? this.options.maxDurationMs ?? DEFAULT_COMPACTION_MAX_DURATION_MS)
+        : { checkpoint: null, validationStatus: "fallback" as const, attempts: 0, fallbackReason: "generator_unavailable" };
+      if (generated.attempts > maxPhysicalAttempts) {
+        throw new CompactionTerminalError(`Compaction exceeded the ${maxPhysicalAttempts}-attempt physical safety limit`);
+      }
       const fallbackContext = inferFallbackContext(segmentEntries);
-      const segment = generated.checkpoint
+      let segment = generated.checkpoint
         ? applyCheckpointDeterminism(generated.checkpoint, deterministic)
         : checkpointFallback(null, deterministic, fallbackContext);
+      let validationStatus = generated.validationStatus;
+      let fallbackReason = generated.fallbackReason ?? null;
+      const validatedSegment = validateSessionCheckpoint(segment, deterministic, {
+        tokensBefore: segmentTokensBefore,
+        tokensAfter: estimateCheckpointTokens(segment),
+      });
+      if (!validatedSegment.checkpoint) {
+        const boundedFallback = {
+          goal: fallbackContext.goal.slice(0, 512),
+          nextAction: fallbackContext.nextAction.slice(0, 768),
+          narrative: fallbackContext.narrative.slice(-1_024),
+          currentWork: fallbackContext.currentWork.map((item) => item.slice(0, 512)),
+        };
+        segment = checkpointFallback(null, deterministic, boundedFallback);
+        const fallbackValidation = validateSessionCheckpoint(segment, deterministic, {
+          tokensBefore: segmentTokensBefore,
+          tokensAfter: estimateCheckpointTokens(segment),
+        });
+        if (!fallbackValidation.checkpoint) {
+          throw new CompactionTerminalError(
+            `Deterministic compaction fallback failed validation: ${fallbackValidation.issues.join("; ").slice(0, 2_000)}`,
+          );
+        }
+        validationStatus = "fallback";
+        fallbackReason = fallbackReason ?? validatedSegment.issues.join("; ").slice(0, 2_000);
+      }
       const allSegments = [...state.priorSegments, segment];
       const rebased = allSegments.length > 1
         && allSegments.length % WORKER_CHECKPOINT_REBASE_INTERVAL === 0;
@@ -185,10 +272,16 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         leaseOwner,
         segment,
         rolling,
-        validationStatus: generated.validationStatus,
+        validationStatus,
         provider,
         model,
         rebased,
+        algorithmVersion,
+        tokensBefore: segmentTokensBefore,
+        tokensAfter: estimateCheckpointTokens(segment),
+        physicalAttempts: generated.attempts,
+        fallbackReason,
+        usage: generated.usage ?? null,
       });
       await this.repository.release(input, leaseOwner);
       return {
@@ -196,9 +289,15 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         summary: rolling.narrative || rolling.nextAction || "Portable checkpoint created.",
         tokensBefore: estimateTokens(pendingEntries),
         tokensAfter: estimateCheckpointTokens(rolling) + estimateTokens(selection.retained),
-        validationStatus: generated.validationStatus,
+        validationStatus,
         segmentCheckpointId: persisted.segmentCheckpointId,
         rollingCheckpointId: persisted.rollingCheckpointId,
+        algorithmVersion,
+        physicalAttempts: generated.attempts,
+        fallbackReason,
+        usageEventId: persisted.usageEventId,
+        usage: generated.usage,
+        ...(providerAttempts.length > 0 ? { providerAttempts } : {}),
       };
     } catch (error) {
       await this.repository.release(
@@ -207,8 +306,11 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         error instanceof Error ? error.message.slice(0, 4_000) : String(error).slice(0, 4_000),
       );
       if (error instanceof CompactionTerminalError || error instanceof CompactionRetryableError) throw error;
-      if (error instanceof RouterClientError && isRetryableProviderStatus(error.status)) {
-        throw new CompactionRetryableError(error.message, error);
+      if (classifyProviderFailure(error).retryable) {
+        throw new CompactionRetryableError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
       }
       throw new CompactionTerminalError(
         error instanceof Error ? error.message : String(error),
@@ -246,6 +348,37 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
       return result;
     } finally {
       stopped = true;
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async withCompactionDeadline<T>(
+    input: CompactionJobPayload,
+    leaseOwner: string,
+    leaseSeconds: number,
+    operation: (signal: AbortSignal) => Promise<T>,
+    maxDurationMs: number,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const boundedDurationMs = Math.max(5_000, Math.min(300_000, Math.floor(maxDurationMs)));
+    const operationPromise = this.withHeartbeat(
+      input,
+      leaseOwner,
+      leaseSeconds,
+      () => operation(controller.signal),
+    );
+    void operationPromise.catch(() => undefined);
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new CompactionRetryableError("Compaction exceeded its wall-clock deadline"));
+      }, boundedDurationMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([operationPromise, timeout]);
+    } finally {
       if (timer) clearTimeout(timer);
     }
   }
@@ -380,6 +513,7 @@ ORDER BY created_at ASC, id ASC
 
     return {
       tenantId: input.tenantId,
+      ...(input.runId ? { runId: input.runId } : {}),
       taskId: input.taskId,
       sessionId: input.sessionId,
       sourceLeafId,
@@ -403,7 +537,13 @@ ORDER BY created_at ASC, id ASC
     provider: string;
     model: string;
     rebased: boolean;
-  }): Promise<{ segmentCheckpointId: string | null; rollingCheckpointId: string | null }> {
+    algorithmVersion: string;
+    tokensBefore: number;
+    tokensAfter: number;
+    physicalAttempts: number;
+    fallbackReason: string | null;
+    usage: CompactionUsage | null;
+  }): Promise<{ segmentCheckpointId: string | null; rollingCheckpointId: string | null; usageEventId: string | null }> {
     const run = async (executor: SqlExecutor) => {
       const lease = await executor.query<{ lease_owner: string }>(
         `
@@ -415,13 +555,23 @@ FOR UPDATE
         [input.state.tenantId, input.state.sessionId, input.leaseOwner],
       );
       if (!lease[0]) throw new CompactionRetryableError("Compaction lease expired before checkpoint persistence");
+      const usageEventId = input.usage
+        ? await insertCompactionUsage(executor, {
+            state: input.state,
+            segment: input.segment,
+            algorithmVersion: input.algorithmVersion,
+            physicalAttempts: input.physicalAttempts,
+            fallbackReason: input.fallbackReason,
+            usage: input.usage,
+          })
+        : null;
       const segmentRows = await executor.query<{ id: string }>(
         checkpointInsertSql(),
-        checkpointInsertParams(input, "segment", input.segment),
+        checkpointInsertParams(input, "segment", input.segment, usageEventId),
       );
       const rollingRows = await executor.query<{ id: string }>(
         checkpointInsertSql(),
-        checkpointInsertParams(input, "rolling", input.rolling),
+        checkpointInsertParams(input, "rolling", input.rolling, usageEventId),
       );
       await executor.execute(
         `
@@ -442,6 +592,7 @@ WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND lease_owner = $3
       return {
         segmentCheckpointId: segmentRows[0]?.id ?? null,
         rollingCheckpointId: rollingRows[0]?.id ?? null,
+        usageEventId,
       };
     };
     return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
@@ -471,39 +622,87 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     deterministic: CheckpointDeterministicFields;
     previousRolling: SessionCheckpointV2 | null;
     maxTokens: number;
+    tokensBefore: number;
+    algorithmVersion: string;
+    maxPhysicalAttempts?: number;
+    onProviderAttempt?: (report: ProviderAttemptReport) => void;
+    signal?: AbortSignal;
   }): Promise<GeneratedCheckpoint> {
     const messages = checkpointMessages(input);
-    const first = await this.complete(messages, input.maxTokens);
-    let parsed = parseSessionCheckpoint(first);
-    if (parsed.checkpoint) {
-      return { checkpoint: parsed.checkpoint, validationStatus: "valid", attempts: 1 };
+    const maxPhysicalAttempts = Math.min(
+      MAX_COMPACTION_PHYSICAL_ATTEMPTS,
+      Math.max(1, Math.floor(input.maxPhysicalAttempts ?? MAX_COMPACTION_PHYSICAL_ATTEMPTS)),
+    );
+    const first = await this.complete(messages, input.maxTokens, input.signal, 1, input.onProviderAttempt);
+    let parsed = parseSessionCheckpoint(first.text);
+    let validation = parsed.checkpoint
+      ? validateSessionCheckpoint(parsed.checkpoint, input.deterministic, {
+          tokensBefore: input.tokensBefore,
+          tokensAfter: estimateCheckpointTokens(parsed.checkpoint),
+        })
+      : { checkpoint: null, issues: parsed.issues };
+    if (validation.checkpoint) {
+      return {
+        checkpoint: validation.checkpoint,
+        validationStatus: "valid",
+        attempts: 1,
+        usage: compactUsage(this.provider, this.model, [first]),
+      };
+    }
+    if (maxPhysicalAttempts < 2) {
+      return {
+        checkpoint: null,
+        validationStatus: "fallback",
+        attempts: 1,
+        fallbackReason: `checkpoint_validation_failed:${validation.issues.join("; ").slice(0, 1_800)}`,
+        usage: compactUsage(this.provider, this.model, [first]),
+      };
     }
     const repaired = await this.complete([
       ...messages,
       {
         role: "user" as const,
         content: [
-          `The previous checkpoint failed validation: ${parsed.issues.join("; ").slice(0, 4_000)}.`,
-          `Invalid output: ${first.slice(0, 12_000)}`,
+          `The previous checkpoint failed validation: ${validation.issues.join("; ").slice(0, 4_000)}.`,
+          `Invalid output: ${first.text.slice(0, 12_000)}`,
           "Return one corrected checkpoint_v2 tool call only. Do not invent facts.",
         ].join("\n"),
       },
-    ], input.maxTokens);
-    parsed = parseSessionCheckpoint(repaired);
-    return parsed.checkpoint
-      ? { checkpoint: parsed.checkpoint, validationStatus: "repaired", attempts: 2 }
-      : { checkpoint: null, validationStatus: "fallback", attempts: 2 };
+    ], input.maxTokens, input.signal, 2, input.onProviderAttempt);
+    parsed = parseSessionCheckpoint(repaired.text);
+    validation = parsed.checkpoint
+      ? validateSessionCheckpoint(parsed.checkpoint, input.deterministic, {
+          tokensBefore: input.tokensBefore,
+          tokensAfter: estimateCheckpointTokens(parsed.checkpoint),
+        })
+      : { checkpoint: null, issues: parsed.issues };
+    const usage = compactUsage(this.provider, this.model, [first, repaired]);
+    return validation.checkpoint
+      ? { checkpoint: validation.checkpoint, validationStatus: "repaired", attempts: 2, usage }
+      : {
+          checkpoint: null,
+          validationStatus: "fallback",
+          attempts: 2,
+          fallbackReason: `checkpoint_validation_failed:${validation.issues.join("; ").slice(0, 1_800)}`,
+          usage,
+        };
   }
 
   private async complete(
     messages: Array<{ role: "system" | "user"; content: string }>,
     maxTokens: number,
-  ): Promise<string> {
+    signal: AbortSignal | undefined,
+    physicalAttempt: number,
+    onProviderAttempt: ((report: ProviderAttemptReport) => void) | undefined,
+  ): Promise<{ text: string; usage?: ChatCompletionUsage; model: string }> {
     const result = await this.client.complete({
       model: this.model,
       messages,
       temperature: 0,
       maxTokens: Math.min(maxTokens, 6_000),
+      ...(signal ? { signal } : {}),
+      ...(onProviderAttempt ? { onProviderAttempt } : {}),
+      providerAttemptOrdinal: physicalAttempt,
       tools: [{
         type: "function",
         function: {
@@ -515,8 +714,34 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       toolChoice: { type: "function", function: { name: "checkpoint_v2" } },
     });
     const call = result.toolCalls?.find((candidate) => candidate.function.name === "checkpoint_v2");
-    return call?.function.arguments ?? result.content;
+    return {
+      text: call?.function.arguments ?? result.content,
+      ...(result.usage ? { usage: result.usage } : {}),
+      model: result.model,
+    };
   }
+}
+
+function compactUsage(
+  provider: string,
+  model: string,
+  calls: ReadonlyArray<{ usage?: ChatCompletionUsage; model: string }>,
+): CompactionUsage | undefined {
+  const measured = calls.filter((call) => call.usage);
+  if (measured.length === 0) return undefined;
+  return {
+    provider,
+    model: calls.at(-1)?.model || model,
+    inputTokens: measured.reduce((sum, call) => sum + (call.usage?.inputTokens ?? 0), 0),
+    outputTokens: measured.reduce((sum, call) => sum + (call.usage?.outputTokens ?? 0), 0),
+    cacheReadTokens: measured.reduce((sum, call) => sum + (call.usage?.cacheReadTokens ?? 0), 0),
+    cacheWriteTokens: measured.reduce((sum, call) => sum + (call.usage?.cacheWriteTokens ?? 0), 0),
+    // The compaction lane does not receive a pricing table from the job. Keep
+    // the receipt explicit and conservative instead of silently billing zero
+    // as a measured price.
+    costRawMicros: "0",
+    pricingSource: "estimated",
+  };
 }
 
 export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGenerator | null {
@@ -702,14 +927,18 @@ function extractDeterministicEvidence(
     coveredEntryStart: entries[0]?.entryId ?? null,
     coveredEntryEnd: entries.at(-1)?.entryId ?? null,
     currentLeafId: sourceLeafId,
-    filesRead: [...filesRead],
-    filesModified: [...filesModified],
-    commands,
-    toolCalls: [...toolCalls.values()],
-    approvals: [...approvals.values()],
+    filesRead: boundedEvidence([...filesRead]),
+    filesModified: boundedEvidence([...filesModified]),
+    commands: boundedEvidence(commands, SESSION_CHECKPOINT_MAX_ITEMS),
+    toolCalls: boundedEvidence([...toolCalls.values()], SESSION_CHECKPOINT_MAX_ITEMS),
+    approvals: boundedEvidence([...approvals.values()], SESSION_CHECKPOINT_MAX_ITEMS),
     promptManifestHash,
-    retrievalSnapshotIds: [...retrievalSnapshotIds],
+    retrievalSnapshotIds: boundedEvidence([...retrievalSnapshotIds]),
   };
+}
+
+function boundedEvidence<T>(values: readonly T[], limit = SESSION_CHECKPOINT_MAX_ITEMS): T[] {
+  return values.length <= limit ? [...values] : values.slice(-limit);
 }
 
 function inferFallbackContext(entries: readonly CompactionEntryRecord[]): {
@@ -722,8 +951,8 @@ function inferFallbackContext(entries: readonly CompactionEntryRecord[]): {
   for (const entry of entries) {
     collectUserText(entry.payload, userTexts);
   }
-  const goal = userTexts[0]?.slice(0, 2_000) ?? "";
-  const latest = userTexts.at(-1)?.slice(0, 2_000) ?? "";
+  const goal = userTexts[0]?.slice(0, 512) ?? "";
+  const latest = userTexts.at(-1)?.slice(0, 768) ?? "";
   return {
     goal,
     nextAction: latest ? `Continue the requested work: ${latest}` : "Continue from the latest durable checkpoint.",
@@ -774,6 +1003,7 @@ function checkpointMessages(input: {
   conversation: string;
   deterministic: CheckpointDeterministicFields;
   previousRolling: SessionCheckpointV2 | null;
+  algorithmVersion?: string;
 }): Array<{ role: "system" | "user"; content: string }> {
   return [
     {
@@ -790,8 +1020,9 @@ function checkpointMessages(input: {
       role: "user",
       content: [
         `Deterministic evidence (overrides prose):\n${JSON.stringify(input.deterministic)}`,
+        input.algorithmVersion ? `Checkpoint algorithm: ${input.algorithmVersion}` : "",
         input.previousRolling
-          ? `Previous rolling checkpoint (context only):\n${JSON.stringify(input.previousRolling)}`
+          ? `Previous rolling checkpoint (bounded context only):\n${JSON.stringify(boundedRollingContext(input.previousRolling))}`
           : "",
         `New persisted session entries:\n${input.conversation}`,
         "Required keys: schema, version, generatedAt, goal, successCriteria, constraints, standingInstructions, completedWork, currentWork, blockers, waitingState, decisions, unresolvedQuestions, nextAction, filesRead, filesModified, artifacts, commands, toolCalls, approvals, promptManifestHash, retrievalSnapshotIds, coveredEntryStart, coveredEntryEnd, currentLeafId, narrative.",
@@ -801,16 +1032,57 @@ function checkpointMessages(input: {
   ];
 }
 
+function boundedRollingContext(checkpoint: SessionCheckpointV2): Record<string, unknown> {
+  return {
+    schema: checkpoint.schema,
+    version: checkpoint.version,
+    goal: checkpoint.goal.slice(0, 2_000),
+    successCriteria: checkpoint.successCriteria.slice(-64),
+    constraints: checkpoint.constraints.slice(-64),
+    standingInstructions: checkpoint.standingInstructions.slice(-64),
+    completedWork: checkpoint.completedWork.slice(-128),
+    currentWork: checkpoint.currentWork.slice(-64),
+    blockers: checkpoint.blockers.slice(-64),
+    waitingState: checkpoint.waitingState?.slice(0, 1_000) ?? null,
+    decisions: checkpoint.decisions.slice(-64),
+    unresolvedQuestions: checkpoint.unresolvedQuestions.slice(-64),
+    nextAction: checkpoint.nextAction.slice(0, 2_000),
+    filesRead: checkpoint.filesRead.slice(-128),
+    filesModified: checkpoint.filesModified.slice(-128),
+    artifacts: checkpoint.artifacts.slice(-128).map((artifact) => ({
+      id: artifact.id,
+      path: artifact.path,
+      label: artifact.label.slice(0, 500),
+    })),
+    commands: checkpoint.commands.slice(-128).map((command) => ({
+      command: command.command.slice(0, 1_000),
+      status: command.status,
+      result: command.result.slice(-1_000),
+    })),
+    toolCalls: checkpoint.toolCalls.slice(-128),
+    approvals: checkpoint.approvals.slice(-128),
+    promptManifestHash: checkpoint.promptManifestHash,
+    retrievalSnapshotIds: checkpoint.retrievalSnapshotIds.slice(-128),
+    coveredEntryStart: checkpoint.coveredEntryStart,
+    coveredEntryEnd: checkpoint.coveredEntryEnd,
+    currentLeafId: checkpoint.currentLeafId,
+    narrative: checkpoint.narrative.slice(-4_000),
+  };
+}
+
 function checkpointInsertSql(): string {
   return `
 INSERT INTO session_checkpoints (
   tenant_id, session_id, kind, source_leaf_id, covered_entry_start, covered_entry_end,
-  schema_version, checkpoint, validation_status, model_provider, model, prompt_manifest_hash
+  schema_version, checkpoint, validation_status, algorithm_version, tokens_before, tokens_after,
+  covered_sequence, physical_attempts, fallback_reason, usage_event_id,
+  model_provider, model, prompt_manifest_hash
 ) VALUES (
-  $1::uuid, $2::uuid, $3, $4, $5, $6, 2, $7::jsonb, $8, $9, $10, $11
+  $1::uuid, $2::uuid, $3, $4, $5, $6, 2, $7::jsonb, $8, $9, $10, $11,
+  $12::bigint, $13, $14, $15::uuid, $16, $17, $18
 )
-ON CONFLICT (
-  tenant_id, session_id, kind, source_leaf_id, covered_entry_end, schema_version
+  ON CONFLICT (
+  tenant_id, session_id, kind, source_leaf_id, covered_entry_end, schema_version, algorithm_version
 ) DO NOTHING
 RETURNING id
   `.trim();
@@ -825,10 +1097,18 @@ function checkpointInsertParams(
     provider: string;
     model: string;
     rebased: boolean;
+    algorithmVersion: string;
+    tokensBefore: number;
+    tokensAfter: number;
+    physicalAttempts: number;
+    fallbackReason: string | null;
+    usage: CompactionUsage | null;
   },
   kind: "segment" | "rolling",
   checkpoint: SessionCheckpointV2,
+  usageEventId: string | null,
 ): readonly unknown[] {
+  const coveredSequence = input.state.entries.find((entry) => entry.entryId === checkpoint.coveredEntryEnd)?.sequence ?? null;
   return [
     input.state.tenantId,
     input.state.sessionId,
@@ -838,10 +1118,76 @@ function checkpointInsertParams(
     checkpoint.coveredEntryEnd,
     JSON.stringify(checkpoint),
     input.validationStatus,
+    input.algorithmVersion,
+    input.tokensBefore,
+    input.tokensAfter,
+    coveredSequence,
+    input.physicalAttempts,
+    input.fallbackReason,
+    usageEventId,
     input.provider,
     input.model,
     checkpoint.promptManifestHash,
   ];
+}
+
+async function insertCompactionUsage(
+  executor: SqlExecutor,
+  input: {
+    state: CompactionSessionState;
+    segment: SessionCheckpointV2;
+    algorithmVersion: string;
+    physicalAttempts: number;
+    fallbackReason: string | null;
+    usage: CompactionUsage;
+  },
+): Promise<string> {
+  const coveredEnd = input.segment.coveredEntryEnd ?? "unknown";
+  const requestId = `compaction:${input.state.sessionId}:${input.algorithmVersion}:${coveredEnd}`;
+  const metadata = JSON.stringify({
+    runId: input.state.runId ?? null,
+    sessionId: input.state.sessionId,
+    algorithmVersion: input.algorithmVersion,
+    physicalAttempts: input.physicalAttempts,
+    fallbackReason: input.fallbackReason,
+  });
+  const rows = await executor.query<{ id: string }>(
+    `
+INSERT INTO usage_events (
+  tenant_id,request_id,idempotency_key,source,task_id,session_id,
+  feature,provider,model,tokens_in,tokens_out,tokens_cached,
+  cache_read_tokens,cache_write_tokens,cost_raw_micros,cost_billed_micros,status,metadata
+) VALUES (
+  $1::uuid,$2,$3,'worker',$4::uuid,$5::uuid,
+  'session.compaction',$6,$7,$8,$9,$10,$11,$12,$13,$13,'completed',$14::jsonb
+)
+ON CONFLICT (tenant_id,request_id) DO NOTHING
+RETURNING id
+    `.trim(),
+    [
+      input.state.tenantId,
+      requestId,
+      requestId,
+      input.state.taskId,
+      input.state.sessionId,
+      input.usage.provider,
+      input.usage.model,
+      input.usage.inputTokens,
+      input.usage.outputTokens,
+      input.usage.cacheReadTokens + input.usage.cacheWriteTokens,
+      input.usage.cacheReadTokens,
+      input.usage.cacheWriteTokens,
+      input.usage.costRawMicros,
+      metadata,
+    ],
+  );
+  if (rows[0]?.id) return rows[0].id;
+  const existing = await executor.query<{ id: string }>(
+    "SELECT id FROM usage_events WHERE tenant_id=$1::uuid AND request_id=$2 LIMIT 1",
+    [input.state.tenantId, requestId],
+  );
+  if (!existing[0]?.id) throw new CompactionRetryableError("Compaction usage receipt was not durable");
+  return existing[0].id;
 }
 
 function estimateTokens(entries: readonly CompactionEntryRecord[]): number {

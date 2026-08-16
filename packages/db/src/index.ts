@@ -800,12 +800,20 @@ export const sessionCheckpoints = pgTable("session_checkpoints", {
   schemaVersion: integer("schema_version").notNull().default(2),
   checkpoint: jsonb("checkpoint").$type<JsonValue>().notNull(),
   validationStatus: text("validation_status").notNull().default("valid"),
+  algorithmVersion: text("algorithm_version").notNull().default("checkpoint-v2"),
+  tokensBefore: integer("tokens_before").notNull().default(0),
+  tokensAfter: integer("tokens_after").notNull().default(0),
+  coveredSequence: bigint("covered_sequence", { mode: "number" }),
+  physicalAttempts: integer("physical_attempts").notNull().default(0),
+  fallbackReason: text("fallback_reason"),
+  usageEventId: uuid("usage_event_id").references(() => usageEvents.id, { onDelete: "set null" }),
   modelProvider: text("model_provider"),
   model: text("model"),
   promptManifestHash: text("prompt_manifest_hash"),
   createdAt,
 }, (table) => [
   uniqueIndex("session_checkpoints_idempotency_unique").on(table.tenantId, table.sessionId, table.kind, table.sourceLeafId, table.coveredEntryEnd, table.schemaVersion),
+  uniqueIndex("session_checkpoints_algorithm_unique").on(table.tenantId, table.sessionId, table.kind, table.sourceLeafId, table.coveredEntryEnd, table.schemaVersion, table.algorithmVersion),
   index("session_checkpoints_latest_idx").on(table.tenantId, table.sessionId, table.createdAt),
 ]);
 
@@ -850,6 +858,8 @@ export const turnRuns = pgTable("turn_runs", {
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   waitingStartedAt: timestamp("waiting_started_at", { withTimezone: true }),
   humanWaitMs: bigint("human_wait_ms", { mode: "number" }).notNull().default(0),
+  recoveryStepId: uuid("recovery_step_id"),
+  recoveryToolCallId: uuid("recovery_tool_call_id"),
   nextAction: text("next_action"),
   waitingReason: text("waiting_reason"),
   heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
@@ -5120,6 +5130,34 @@ ${tenantRlsSql("turn_finalizations")}
 ${tenantRlsSql("artifact_operations")}
 `.trim();
 
+export const AGENT_HARNESS_PROVIDER_RECOVERY_MIGRATION = `
+ALTER TABLE turn_runs
+  ADD COLUMN IF NOT EXISTS recovery_step_id uuid REFERENCES turn_steps(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS recovery_tool_call_id uuid REFERENCES tool_calls(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS turn_runs_recovery_reference_idx
+  ON turn_runs (tenant_id, recovery_tool_call_id)
+  WHERE state='recovery_required' AND recovery_tool_call_id IS NOT NULL;
+`.trim();
+
+export const AGENT_HARNESS_COMPACTION_MIGRATION = `
+ALTER TABLE session_checkpoints
+  ADD COLUMN IF NOT EXISTS algorithm_version text NOT NULL DEFAULT 'checkpoint-v2',
+  ADD COLUMN IF NOT EXISTS tokens_before integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS tokens_after integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS covered_sequence bigint,
+  ADD COLUMN IF NOT EXISTS physical_attempts integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS fallback_reason text,
+  ADD COLUMN IF NOT EXISTS usage_event_id uuid REFERENCES usage_events(id) ON DELETE SET NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS session_checkpoints_algorithm_unique
+  ON session_checkpoints (
+    tenant_id,session_id,kind,source_leaf_id,covered_entry_end,schema_version,algorithm_version
+  );
+CREATE INDEX IF NOT EXISTS session_checkpoints_coverage_idx
+  ON session_checkpoints (tenant_id,session_id,covered_sequence,created_at);
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5263,4 +5301,6 @@ export const cloudMigrations = [
   { id: 58, name: "agent_harness_convergence_v1", sql: AGENT_HARNESS_CONVERGENCE_MIGRATION },
   { id: 59, name: "agent_harness_bounds_v1", sql: AGENT_HARNESS_BOUNDS_MIGRATION },
   { id: 60, name: "agent_harness_wait_finalization_v1", sql: AGENT_HARNESS_WAIT_FINALIZATION_MIGRATION },
+  { id: 61, name: "agent_harness_provider_recovery_v1", sql: AGENT_HARNESS_PROVIDER_RECOVERY_MIGRATION },
+  { id: 62, name: "agent_harness_compaction_v1", sql: AGENT_HARNESS_COMPACTION_MIGRATION },
 ] as const;

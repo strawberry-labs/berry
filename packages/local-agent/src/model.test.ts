@@ -206,6 +206,32 @@ describe("BerryModelAdapter", () => {
     expect(completed).toBe(0);
   });
 
+  it("does not retry a provider HTTP 409 conflict", async () => {
+    let completed = 0;
+    const compatible = {
+      async complete(): Promise<never> {
+        completed += 1;
+        throw new Error("must not run");
+      },
+      async *stream(): AsyncGenerator<never> {
+        throw new RouterClientError("conflicting request", 409);
+      },
+    };
+    const client = new ContentFallbackChatCompletionClient(
+      compatible,
+      new BufferedChatCompletionClient(compatible),
+    );
+
+    const consume = async () => {
+      for await (const _chunk of client.stream({ messages: [] })) {
+        // Consume until the provider rejection is surfaced.
+      }
+    };
+
+    await expect(consume()).rejects.toThrow("conflicting request");
+    expect(completed).toBe(0);
+  });
+
   it("resolves manual capability overrides into model limits, costs, and image support", () => {
     const model = createBerryModel(
       {

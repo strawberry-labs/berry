@@ -18,10 +18,12 @@ import {
 } from "@berry/local-agent";
 import {
   AgentStreamEventSchema,
+  classifyProviderFailure,
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
   VISION_ADAPTER_MAX_ATTEMPTS,
   openDurableSecret,
+  providerAttemptStatusClass,
   latestAssistantStreamDraft,
   MessageDraftSchema,
   PromptManifestSchema,
@@ -34,6 +36,8 @@ import {
   type JsonValue,
   type PromptCachingCapabilities,
   type PromptManifest,
+  ProviderAttemptError,
+  type ProviderAttemptReport,
   type SessionCheckpointV2,
   type ToolRetryClass,
   type TurnRunState,
@@ -41,7 +45,6 @@ import {
 import {
   OpenAIChatCompletionsClient,
   parseKimiToolCalls,
-  RouterClientError,
   type ChatContentPart,
   type ChatMessage,
   type ChatToolCall,
@@ -55,7 +58,6 @@ import {
   planDurablePromptCache,
   promptCacheCapabilityFromEnv,
 } from "./prompt-cache.js";
-import { isRetryableProviderStatus } from "./provider-retry.js";
 import {
   CompactionRetryableError,
   type CompactionJobResult,
@@ -280,6 +282,10 @@ export interface DurableTurnMutation {
   keepLease?: boolean;
   promptManifest?: PromptManifest;
   progress?: Partial<DurableTurnProgress>;
+  recoveryReference?: {
+    stepId: string;
+    toolCallId: string;
+  };
 }
 
 export interface DurableTurnRepository {
@@ -337,6 +343,8 @@ export interface DurableModelCallContext {
   additionalUserContent?: readonly ChatContentPart[];
   signal?: AbortSignal;
   reportProgress?(): void;
+  onProviderAttempt?: (report: ProviderAttemptReport) => void;
+  onProviderAttemptDecision?: (physicalAttempt: number, decision: "none" | "retry" | "fallback" | "terminal" | "cancelled") => void;
   emitDelta(delta: string, channel: "text" | "reasoning"): Promise<void>;
   policyForTool(name: string): DurableToolPolicy;
 }
@@ -575,9 +583,12 @@ export class DurableTurnRunner {
           if (persistenceError instanceof DurableTurnRetryableError) throw persistenceError;
         }
       }
+      const providerFailure = error instanceof ProviderAttemptError
+        ? classifyProviderFailure(error)
+        : null;
       if (error instanceof DurableTurnRetryableError
         || error instanceof CompactionRetryableError
-        || (error instanceof RouterClientError && isRetryableProviderStatus(error.status))) {
+        || providerFailure?.retryable === true) {
         await this.repository.release(snapshot, message, retryableProviderDiagnostics(snapshot));
         throw error instanceof DurableTurnRetryableError
           ? error
@@ -649,6 +660,7 @@ export class DurableTurnRunner {
       error: "ambiguous_external_operation",
       nextAction: "Review the external operation outcome before choosing retry or completion",
       taskStatus: "failed",
+      recoveryReference: { stepId: step.id, toolCallId },
       progress: {
         ...progressState(snapshot),
         progressEpoch: progressState(snapshot).progressEpoch + 1,
@@ -864,6 +876,7 @@ export class DurableTurnRunner {
     ]);
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
     const repetitionGuard = new ExactOutputRepetitionGuard();
+    const providerAttempts: ProviderAttemptReport[] = [];
     let result: TurnModelResult;
     try {
       result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress, abort }) => {
@@ -875,6 +888,13 @@ export class DurableTurnRunner {
             additionalUserContent,
             signal,
             reportProgress,
+            onProviderAttempt: (report) => {
+              providerAttempts.push({ ...report });
+            },
+            onProviderAttemptDecision: (physicalAttempt, decision) => {
+              const report = [...providerAttempts].reverse().find((candidate) => candidate.physicalAttempt === physicalAttempt);
+              if (report) report.retryDecision = decision;
+            },
             emitDelta: async (delta, channel) => {
               reportProgress();
               try {
@@ -906,6 +926,10 @@ export class DurableTurnRunner {
         ...(record(activeModelStep.output) ?? {}),
         providerDiagnostics: diagnostics,
       };
+      const failureEvents = providerAttempts.length > 0
+        ? providerAttempts.map((attempt) => providerAttemptEventFromReport(step.id, attempt))
+        : [providerAttemptEvent(step.id, diagnostics)];
+      await this.repository.appendEvents(snapshot, failureEvents).catch(() => undefined);
       console.warn(JSON.stringify({ event: "berry.turn.provider_failure", runId: snapshot.id, ...diagnostics }));
       throw error;
     }
@@ -930,8 +954,12 @@ export class DurableTurnRunner {
     const responseUsageEvents: AgentStreamEvent[] = result.usage
       ? [AgentStreamEventSchema.parse(result.usage)]
       : [];
+    const responseProviderAttempts = providerAttempts.length > 0
+      ? providerAttempts.map((attempt) => providerAttemptEventFromReport(step.id, attempt))
+      : [providerAttemptEvent(step.id, providerDiagnostics)];
     const responseEndEvents: AgentStreamEvent[] = [
       { kind: "message.end", messageId },
+      ...responseProviderAttempts,
       ...responseUsageEvents,
     ];
     const normalizedFinishReason = result.finishReason?.toLowerCase() ?? null;
@@ -952,7 +980,7 @@ export class DurableTurnRunner {
       // the reasoning/text already received alongside the provider error. A
       // message.end here made insertTerminalAssistantProjection treat the
       // draft as settled and replace it with an error-only message.
-      await this.repository.appendEvents(snapshot, responseUsageEvents);
+      await this.repository.appendEvents(snapshot, [...responseProviderAttempts, ...responseUsageEvents]);
       throw new DurableTurnTerminalError(
         providerLengthStopMessage(result, effectiveMaxTokens),
       );
@@ -1029,6 +1057,7 @@ export class DurableTurnRunner {
 
     const messageEvents: AgentStreamEvent[] = [
       { kind: "message.end", messageId },
+      ...responseProviderAttempts,
       ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
     ];
     const entries: DurableTurnMutation["entries"] = [{
@@ -1155,6 +1184,7 @@ export class DurableTurnRunner {
       keepLease: true,
     });
     const result = await this.withHeartbeat(snapshot, () => compactor.compactSession({
+      runId: snapshot.id,
       tenantId: snapshot.tenantId,
       taskId: snapshot.taskId,
       sessionId: snapshot.sessionId,
@@ -1184,7 +1214,36 @@ export class DurableTurnRunner {
         detail: result.tokensAfter === undefined
           ? `Context compacted from ${result.tokensBefore} tokens into a portable checkpoint.`
           : `Context compacted from ${result.tokensBefore} to ${result.tokensAfter} tokens.`,
-      }],
+      },
+      ...(result.providerAttempts ?? []).map((attempt, index) => AgentStreamEventSchema.parse({
+        kind: "provider.attempt",
+        logicalStepId: step.id,
+        physicalAttempt: attempt.physicalAttempt ?? index + 1,
+        model: attempt.model ?? "unknown",
+        statusClass: attempt.statusClass ?? providerAttemptStatusClass(attempt.status),
+        category: attempt.category,
+        retryDecision: attempt.retryDecision,
+        latencyMs: attempt.latencyMs,
+        inputTokens: attempt.inputTokens ?? 0,
+        outputTokens: attempt.outputTokens ?? 0,
+        cacheReadTokens: attempt.cacheReadTokens ?? 0,
+        cacheWriteTokens: attempt.cacheWriteTokens ?? 0,
+        finishReason: attempt.finishReason ?? null,
+      })),
+      ...(result.usage ? [AgentStreamEventSchema.parse({
+        kind: "usage",
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        totalTokens: result.usage.inputTokens + result.usage.outputTokens,
+        costRawMicros: result.usage.costRawMicros,
+        pricingSource: result.usage.pricingSource,
+        cacheReadTokens: result.usage.cacheReadTokens,
+        cacheWriteTokens: result.usage.cacheWriteTokens,
+        model: result.usage.model,
+        servedModel: result.usage.model,
+        servedProvider: result.usage.provider,
+      })] : []),
+      ],
       nextAction: "Resume the pending model request from the portable checkpoint",
     });
   }
@@ -1319,6 +1378,7 @@ export class DurableTurnRunner {
         error: "ambiguous_non_idempotent_tool",
         nextAction: "Review the tool outcome and choose retry, mark complete, or cancel",
         taskStatus: "failed",
+        recoveryReference: { stepId: step.id, toolCallId },
         ...(snapshot.sandboxId ? {
           outbox: [{
             eventType: "sandbox.snapshot",
@@ -2944,6 +3004,14 @@ SET state=$4,
     cumulative_tool_ms=COALESCE($16::bigint,cumulative_tool_ms),
     cumulative_active_compute_ms=COALESCE($17::bigint,cumulative_active_compute_ms),
     progress_budget_reason=COALESCE($18,progress_budget_reason),
+    recovery_step_id=CASE
+      WHEN $4='recovery_required' THEN $20::uuid
+      ELSE NULL
+    END,
+    recovery_tool_call_id=CASE
+      WHEN $4='recovery_required' THEN $21::uuid
+      ELSE NULL
+    END,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
   AND ($19::bigint IS NULL OR ownership_generation=$19::bigint)
@@ -2968,6 +3036,8 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
           mutation.progress?.cumulativeActiveComputeMs ?? null,
           mutation.progress?.budgetReason ?? null,
           snapshot.ownershipGeneration ?? null,
+          mutation.recoveryReference?.stepId ?? null,
+          mutation.recoveryReference?.toolCallId ?? null,
         ],
       );
       if (TERMINAL_STATES.has(mutation.nextState)) {
@@ -3203,6 +3273,8 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       temperature: 0,
       maxTokens: numberValue(snapshot.runtimeRequest.maxTokens) ?? 8_000,
       ...(context.signal ? { signal: context.signal } : {}),
+      ...(context.onProviderAttempt ? { onProviderAttempt: context.onProviderAttempt } : {}),
+      ...(context.onProviderAttemptDecision ? { onProviderAttemptDecision: context.onProviderAttemptDecision } : {}),
       ...(selectedReasoningEffort ? { reasoningEffort: selectedReasoningEffort } : {}),
       metadata: { "Idempotency-Key": step.idempotencyKey ?? `${snapshot.id}:${step.sequence}` },
       ...(cachePlan.cacheKey ? { promptCacheKey: cachePlan.cacheKey } : {}),
@@ -3678,9 +3750,16 @@ function successfulProviderDiagnostics(
       ?? stringValue(snapshot.runtimeRequest.model)
       ?? "unknown",
     status: 200,
-    routerRequestId: result.routerRequestId ?? null,
-    providerResponseId: result.providerResponseId ?? null,
+    statusClass: "2xx",
+    category: "success",
+    retryDecision: "none",
+    physicalAttempt: Math.max(1, (latestStep(snapshot.steps, "model.call")?.attempt ?? 0) + 1),
     latencyMs: Math.max(0, Date.now() - startedAt),
+    inputTokens: Math.max(0, Math.floor(result.inputTokens)),
+    outputTokens: Math.max(0, Math.floor(result.outputTokens)),
+    cacheReadTokens: result.usage?.cacheReadTokens ?? 0,
+    cacheWriteTokens: result.usage?.cacheWriteTokens ?? 0,
+    finishReason: result.finishReason ?? null,
     errorCode: null,
   };
 }
@@ -3690,49 +3769,68 @@ function providerFailureDiagnostics(
   error: unknown,
   startedAt: number,
 ): Record<string, JsonValue> {
-  const details = providerErrorDetails(error);
+  const details = classifyProviderFailure(error);
+  const status = details.status ?? null;
   return {
     outcome: error instanceof DurableTurnCancellationError ? "cancelled" : "failure",
     model: stringValue(snapshot.runtimeRequest.model) ?? "unknown",
-    status: details.status,
-    routerRequestId: details.requestId,
-    providerResponseId: null,
+    status,
+    statusClass: providerAttemptStatusClass(details.status, error),
+    category: error instanceof DurableTurnCancellationError ? "aborted" : details.category,
+    retryDecision: error instanceof DurableTurnCancellationError
+      ? "cancelled"
+      : details.retryable ? "retry" : "terminal",
+    physicalAttempt: Math.max(1, (latestStep(snapshot.steps, "model.call")?.attempt ?? 0) + 1),
     latencyMs: Math.max(0, Date.now() - startedAt),
-    errorCode: details.code,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    finishReason: null,
+    errorCode: details.code ?? null,
   };
 }
 
-function providerErrorDetails(error: unknown): {
-  status: number | null;
-  code: string | null;
-  requestId: string | null;
-} {
-  const seen = new Set<unknown>();
-  let candidate: unknown = error;
-  let status: number | null = null;
-  let code: string | null = null;
-  let requestId: string | null = null;
-  for (let depth = 0; candidate && depth < 8 && !seen.has(candidate); depth += 1) {
-    seen.add(candidate);
-    if (candidate instanceof RouterClientError) {
-      if (status === null && candidate.status !== undefined) status = candidate.status;
-      if (code === null && candidate.code) code = candidate.code;
-      if (requestId === null && candidate.requestId) requestId = candidate.requestId;
-    } else if (typeof candidate === "object") {
-      const item = candidate as Record<string, unknown>;
-      if (status === null) {
-        const value = item.status ?? item.statusCode;
-        if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) status = value;
-      }
-      if (code === null && typeof item.code === "string") code = item.code.trim().slice(0, 128);
-      const request = item.requestId ?? item.request_id;
-      if (requestId === null && typeof request === "string") requestId = request.trim().slice(0, 240);
-    }
-    candidate = typeof candidate === "object" && candidate !== null
-      ? (candidate as { cause?: unknown }).cause
-      : null;
-  }
-  return { status, code, requestId };
+function providerAttemptEvent(
+  logicalStepId: string,
+  diagnostics: Record<string, JsonValue>,
+): Extract<AgentStreamEvent, { kind: "provider.attempt" }> {
+  return AgentStreamEventSchema.parse({
+    kind: "provider.attempt",
+    logicalStepId,
+    physicalAttempt: Math.max(1, Math.floor(nonnegativeNumber(diagnostics.physicalAttempt) ?? 1)),
+    model: stringValue(diagnostics.model) ?? "unknown",
+    statusClass: stringValue(diagnostics.statusClass) ?? "unknown",
+    category: stringValue(diagnostics.category) ?? "unknown",
+    retryDecision: stringValue(diagnostics.retryDecision) ?? "none",
+    latencyMs: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.latencyMs) ?? 0)),
+    inputTokens: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.inputTokens) ?? 0)),
+    outputTokens: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.outputTokens) ?? 0)),
+    cacheReadTokens: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.cacheReadTokens) ?? 0)),
+    cacheWriteTokens: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.cacheWriteTokens) ?? 0)),
+    finishReason: stringValue(diagnostics.finishReason) ?? null,
+  }) as Extract<AgentStreamEvent, { kind: "provider.attempt" }>;
+}
+
+function providerAttemptEventFromReport(
+  logicalStepId: string,
+  report: ProviderAttemptReport,
+): Extract<AgentStreamEvent, { kind: "provider.attempt" }> {
+  return AgentStreamEventSchema.parse({
+    kind: "provider.attempt",
+    logicalStepId,
+    physicalAttempt: Math.max(1, Math.floor(report.physicalAttempt ?? 1)),
+    model: report.model ?? "unknown",
+    statusClass: report.statusClass ?? providerAttemptStatusClass(report.status),
+    category: report.category,
+    retryDecision: report.retryDecision,
+    latencyMs: Math.max(0, Math.floor(report.latencyMs)),
+    inputTokens: Math.max(0, Math.floor(report.inputTokens ?? 0)),
+    outputTokens: Math.max(0, Math.floor(report.outputTokens ?? 0)),
+    cacheReadTokens: Math.max(0, Math.floor(report.cacheReadTokens ?? 0)),
+    cacheWriteTokens: Math.max(0, Math.floor(report.cacheWriteTokens ?? 0)),
+    finishReason: report.finishReason ?? null,
+  }) as Extract<AgentStreamEvent, { kind: "provider.attempt" }>;
 }
 
 function retryableProviderDiagnostics(

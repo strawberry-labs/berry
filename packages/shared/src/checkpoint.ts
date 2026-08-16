@@ -22,6 +22,17 @@ export interface CheckpointParseResult {
   issues: readonly string[];
 }
 
+export const SESSION_CHECKPOINT_MAX_BYTES = 64 * 1024;
+export const SESSION_CHECKPOINT_MAX_ITEMS = 256;
+
+export interface CheckpointValidationOptions {
+  maxBytes?: number;
+  maxItems?: number;
+  tokensBefore?: number;
+  tokensAfter?: number;
+  minimumReductionRatio?: number;
+}
+
 export function parseSessionCheckpoint(value: string | unknown): CheckpointParseResult {
   let candidate = value;
   if (typeof value === "string") {
@@ -40,6 +51,49 @@ export function parseSessionCheckpoint(value: string | unknown): CheckpointParse
     checkpoint: null,
     issues: parsed.error.issues.map((issue) => `${issue.path.join(".") || "checkpoint"}: ${issue.message}`),
   };
+}
+
+/** Validate a generated checkpoint before it can advance the covered leaf. */
+export function validateSessionCheckpoint(
+  checkpoint: SessionCheckpointV2,
+  deterministic: CheckpointDeterministicFields,
+  options: CheckpointValidationOptions = {},
+): CheckpointParseResult {
+  const maxBytes = Math.max(1, options.maxBytes ?? SESSION_CHECKPOINT_MAX_BYTES);
+  const maxItems = Math.max(1, options.maxItems ?? SESSION_CHECKPOINT_MAX_ITEMS);
+  const issues: string[] = [];
+  const serialized = JSON.stringify(checkpoint);
+  if (utf8ByteLength(serialized) > maxBytes) {
+    issues.push(`checkpoint exceeds ${maxBytes} bytes`);
+  }
+  for (const [field, value] of Object.entries(checkpoint)) {
+    if (!Array.isArray(value) || value.length <= maxItems) continue;
+    issues.push(`${field} contains ${value.length} items; maximum is ${maxItems}`);
+  }
+  if (checkpoint.coveredEntryStart !== deterministic.coveredEntryStart) {
+    issues.push("coveredEntryStart does not match persisted evidence");
+  }
+  if (checkpoint.coveredEntryEnd !== deterministic.coveredEntryEnd) {
+    issues.push("coveredEntryEnd does not match persisted evidence");
+  }
+  if (checkpoint.currentLeafId !== deterministic.currentLeafId) {
+    issues.push("currentLeafId does not match persisted evidence");
+  }
+  const toolCalls = new Set(checkpoint.toolCalls.map((call) => call.toolCallId));
+  for (const required of deterministic.toolCalls ?? []) {
+    if (!toolCalls.has(required.toolCallId)) issues.push(`missing tool-call coverage for ${required.toolCallId}`);
+  }
+  if (
+    options.tokensBefore !== undefined
+    && options.tokensAfter !== undefined
+    && options.tokensBefore >= 256
+    && options.tokensAfter > options.tokensBefore * (1 - (options.minimumReductionRatio ?? 0.1))
+  ) {
+    issues.push("checkpoint does not reduce the persisted context enough");
+  }
+  return issues.length === 0
+    ? { checkpoint, issues: [] }
+    : { checkpoint: null, issues };
 }
 
 export function emptySessionCheckpoint(
@@ -119,34 +173,34 @@ export function mergeSessionCheckpoints(
     ...segment,
     generatedAt: deterministic.generatedAt,
     goal: segment.goal || previous.goal,
-    successCriteria: unique([...previous.successCriteria, ...segment.successCriteria]),
-    constraints: unique([...previous.constraints, ...segment.constraints]),
-    standingInstructions: unique([...previous.standingInstructions, ...segment.standingInstructions]),
-    completedWork: unique([...previous.completedWork, ...segment.completedWork]),
+    successCriteria: boundedUnique([...previous.successCriteria, ...segment.successCriteria], 128),
+    constraints: boundedUnique([...previous.constraints, ...segment.constraints], 128),
+    standingInstructions: boundedUnique([...previous.standingInstructions, ...segment.standingInstructions], 128),
+    completedWork: boundedUnique([...previous.completedWork, ...segment.completedWork], 256),
     currentWork: segment.currentWork,
     blockers: segment.blockers,
     waitingState: segment.waitingState,
-    decisions: dedupeBy([...previous.decisions, ...segment.decisions], checkpointSourceKey),
+    decisions: boundedObjects(dedupeBy([...previous.decisions, ...segment.decisions], checkpointSourceKey), 128),
     unresolvedQuestions: segment.unresolvedQuestions,
     nextAction: segment.nextAction,
-    filesRead: unique([...previous.filesRead, ...segment.filesRead]),
-    filesModified: unique([...previous.filesModified, ...segment.filesModified]),
-    artifacts: dedupeBy([...previous.artifacts, ...segment.artifacts], (item) => item.id),
-    commands: dedupeBy(
+    filesRead: boundedUnique([...previous.filesRead, ...segment.filesRead], 256),
+    filesModified: boundedUnique([...previous.filesModified, ...segment.filesModified], 256),
+    artifacts: boundedObjects(dedupeBy([...previous.artifacts, ...segment.artifacts], (item) => item.id), 256),
+    commands: boundedObjects(dedupeBy(
       [...previous.commands, ...segment.commands],
       (item) => `${item.command}\0${item.status}\0${item.result}`,
-    ),
+    ), 128),
     toolCalls: mergeToolCalls(previous.toolCalls, segment.toolCalls),
-    approvals: dedupeBy([...previous.approvals, ...segment.approvals], (item) => item.approvalId),
+    approvals: boundedObjects(dedupeBy([...previous.approvals, ...segment.approvals], (item) => item.approvalId), 256),
     promptManifestHash: segment.promptManifestHash ?? previous.promptManifestHash,
-    retrievalSnapshotIds: unique([
+    retrievalSnapshotIds: boundedUnique([
       ...previous.retrievalSnapshotIds,
       ...segment.retrievalSnapshotIds,
-    ]),
+    ], 128),
     coveredEntryStart: previous.coveredEntryStart ?? segment.coveredEntryStart,
     coveredEntryEnd: segment.coveredEntryEnd,
     currentLeafId: segment.currentLeafId,
-    narrative: segment.narrative || previous.narrative,
+    narrative: (segment.narrative || previous.narrative).slice(-8_000),
   };
   return applyCheckpointDeterminism(merged, {
     ...deterministic,
@@ -206,7 +260,7 @@ function mergeToolCalls(
   const byId = new Map<string, SessionCheckpointV2["toolCalls"][number]>();
   for (const item of earlier) byId.set(item.toolCallId, item);
   for (const item of later) byId.set(item.toolCallId, item);
-  return [...byId.values()];
+  return boundedObjects([...byId.values()], 256);
 }
 
 function checkpointSourceKey(
@@ -219,6 +273,15 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
+function boundedUnique(values: readonly string[], limit: number): string[] {
+  const normalized = unique(values);
+  return normalized.length <= limit ? normalized : normalized.slice(-limit);
+}
+
+function boundedObjects<T>(values: readonly T[], limit: number): T[] {
+  return values.length <= limit ? [...values] : values.slice(-limit);
+}
+
 function dedupeBy<T>(values: readonly T[], key: (value: T) => string): T[] {
   const output = new Map<string, T>();
   for (const value of values) output.set(key(value), value);
@@ -227,4 +290,8 @@ function dedupeBy<T>(values: readonly T[], key: (value: T) => string): T[] {
 
 function stripJsonCodeFence(value: string): string {
   return value.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

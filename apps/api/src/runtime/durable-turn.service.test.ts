@@ -1236,5 +1236,40 @@ describe("DurableTurnService", () => {
     )).toBe(true);
     expect(executions.some(({ sql }) => sql.includes("'turn.resume'"))).toBe(true);
     expect(queries.some((sql) => sql.includes("FOR UPDATE OF r"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("tc.id=r.recovery_tool_call_id") && sql.includes("tc.step_id=r.recovery_step_id"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("LEFT JOIN LATERAL") && sql.includes("status='failed'"))).toBe(false);
+    expect(executions.some(({ sql, params }) =>
+      sql.includes("UPDATE tool_calls")
+      && sql.includes("id=$3::uuid")
+      && params.includes(questionId)
+    )).toBe(true);
+  });
+
+  it("fails closed when a recovery-required run has no exact tool reference", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_runs r JOIN tasks")) {
+          return [{
+            id: runId,
+            session_id: sessionId,
+            task_id: taskId,
+            tool_call_id: null,
+            tool_call_step_id: null,
+            tool_call_name: null,
+            tool_call_input: null,
+            version: 4,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.recover(tenantId, userId, runId, "retry"))
+      .rejects.toThrow("no exact failed tool reference");
+    expect(executions.filter(({ sql }) => !sql.startsWith("SELECT berry_set_tenant_id"))).toHaveLength(0);
   });
 });

@@ -1407,6 +1407,110 @@ Result:
                 "properties": {
                   "kind": {
                     "type": "string",
+                    "const": "provider.attempt"
+                  },
+                  "logicalStepId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "physicalAttempt": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "statusClass": {
+                    "type": "string",
+                    "enum": [
+                      "2xx",
+                      "3xx",
+                      "4xx",
+                      "5xx",
+                      "network",
+                      "unknown"
+                    ]
+                  },
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "success",
+                      "aborted",
+                      "connection",
+                      "permanent_client",
+                      "rate_limit",
+                      "server",
+                      "timeout",
+                      "unknown"
+                    ]
+                  },
+                  "retryDecision": {
+                    "type": "string",
+                    "enum": [
+                      "none",
+                      "retry",
+                      "fallback",
+                      "terminal",
+                      "cancelled"
+                    ]
+                  },
+                  "latencyMs": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "inputTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "outputTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cacheReadTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cacheWriteTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "finishReason": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 128
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "logicalStepId",
+                  "physicalAttempt",
+                  "model",
+                  "statusClass",
+                  "category",
+                  "retryDecision",
+                  "latencyMs",
+                  "inputTokens",
+                  "outputTokens",
+                  "cacheReadTokens",
+                  "cacheWriteTokens",
+                  "finishReason"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
                     "const": "finalization.start"
                   },
                   "runId": {

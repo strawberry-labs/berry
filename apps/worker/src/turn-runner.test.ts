@@ -434,13 +434,21 @@ describe("durable turn runner", () => {
         outcome: "failure",
         model: "provider/model",
         status: 503,
-        routerRequestId: "router_request_503",
-        providerResponseId: null,
+        statusClass: "5xx",
+        category: "server",
+        retryDecision: "retry",
+        physicalAttempt: 2,
         latencyMs: expect.any(Number),
-        errorCode: "upstream_unavailable",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        finishReason: null,
+        errorCode: "UPSTREAM_UNAVAILABLE",
       },
     });
     expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("sensitive upstream response body");
+    expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("router_request_503");
   });
 
   it("terminally fails provider HTTP 409 instead of releasing it for a BullMQ retry", async () => {
@@ -1284,6 +1292,7 @@ describe("durable turn runner", () => {
       "message.delta",
       "message.delta",
       "message.end",
+      "provider.attempt",
     ]);
     expect(repository.events
       .filter((event): event is Extract<AgentStreamEvent, { kind: "message.delta" }> => event.kind === "message.delta")
@@ -2314,7 +2323,7 @@ describe("durable turn runner", () => {
     });
   });
 
-  it("persists a successful router request id in model-step diagnostics", async () => {
+  it("persists sanitized provider attempt diagnostics in the model step", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),
       modelStep("pending", 1),
@@ -2338,11 +2347,29 @@ describe("durable turn runner", () => {
         providerDiagnostics: {
           outcome: "success",
           status: 200,
-          routerRequestId: "router-request-success",
-          providerResponseId: "completion-success",
+          statusClass: "2xx",
+          category: "success",
+          retryDecision: "none",
+          physicalAttempt: 2,
+          inputTokens: 2,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          finishReason: null,
           errorCode: null,
         },
       });
+    const stepOutput = repository.current.steps.find((step) => step.type === "model.call")?.output as Record<string, unknown>;
+    const diagnostics = stepOutput.providerDiagnostics as Record<string, unknown>;
+    expect(diagnostics).not.toHaveProperty("routerRequestId");
+    expect(diagnostics).not.toHaveProperty("providerResponseId");
+    expect(stepOutput).toMatchObject({ providerResponseId: "completion-success" });
+    expect(repository.events).toContainEqual(expect.objectContaining({
+      kind: "provider.attempt",
+      logicalStepId: expect.any(String),
+      category: "success",
+      retryDecision: "none",
+    }));
   });
 
   it("persists and replays interleaved reasoning with assistant tool calls", async () => {
@@ -2686,9 +2713,16 @@ describe("durable turn runner", () => {
       outcome: "failure",
       model: "provider/model",
       status: 503,
-      routerRequestId: "router_request_503",
-      providerResponseId: null,
+      statusClass: "5xx",
+      category: "server",
+      retryDecision: "retry",
+      physicalAttempt: 1,
       latencyMs: 42,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      finishReason: null,
       errorCode: "upstream_unavailable",
     };
 

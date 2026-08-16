@@ -24,14 +24,21 @@ export const TitleGenJobPayloadSchema = z.object({
 export type TitleGenJobPayload = z.infer<typeof TitleGenJobPayloadSchema>;
 
 export const CompactionJobPayloadSchema = z.object({
+  runId: z.string().uuid().optional(),
   tenantId: z.string().uuid(),
   taskId: z.string().min(1),
   sessionId: z.string().min(1),
   reason: z.enum(["manual", "token-threshold", "scheduled"]).default("token-threshold"),
   maxTokens: z.number().int().positive().optional(),
+  maxDurationMs: z.number().int().min(5_000).max(300_000).optional(),
+  algorithmVersion: z.string().trim().min(1).max(64).default("checkpoint-v2-bounded"),
   requestedByUserId: z.string().min(1).nullable().optional(),
 });
-export type CompactionJobPayload = z.infer<typeof CompactionJobPayloadSchema>;
+// Keep the wire schema's default while allowing existing producers and tests
+// to omit the field; consumers resolve it at the execution boundary.
+export type CompactionJobPayload = Omit<z.infer<typeof CompactionJobPayloadSchema>, "algorithmVersion"> & {
+  algorithmVersion?: string;
+};
 
 export const TurnExecuteJobPayloadSchema = z.object({
   outboxId: z.string().uuid().optional(),

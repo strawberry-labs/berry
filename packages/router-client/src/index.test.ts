@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ProviderAttemptReport } from "@berry/shared";
 import {
   AnthropicMessagesClient,
   BerryRouterAccountClient,
@@ -45,6 +46,71 @@ async function withServer(handler: (request: IncomingMessage, response: ServerRe
 }
 
 describe("router client", () => {
+  it("reports a bounded success attempt with normalized usage", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        id: "completion-1",
+        model: "served-model",
+        choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
+      }));
+    });
+    const reports: ProviderAttemptReport[] = [];
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "requested-model", kind: "openai-compatible", name: "Test provider" },
+      apiKey: "key",
+    });
+
+    await client.complete({
+      providerAttemptOrdinal: 2,
+      messages: [{ role: "user", content: "hello" }],
+      onProviderAttempt: (report) => reports.push(report),
+    });
+
+    expect(reports).toEqual([expect.objectContaining({
+      physicalAttempt: 2,
+      model: "served-model",
+      status: 200,
+      statusClass: "2xx",
+      category: "success",
+      retryDecision: "none",
+      inputTokens: 7,
+      outputTokens: 3,
+      finishReason: "stop",
+    })]);
+  });
+
+  it.each([
+    [409, "permanent_client", "terminal"],
+    [429, "rate_limit", "retry"],
+  ] as const)("reports HTTP %i as %s with a %s decision", async (status, category, retryDecision) => {
+    const baseUrl = await withServer((_request, response) => {
+      response.writeHead(status, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "provider body must not enter telemetry", code: "provider_error" } }));
+    });
+    const reports: ProviderAttemptReport[] = [];
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "m", kind: "openai-compatible", name: "Test provider" },
+      apiKey: "key",
+    });
+
+    await expect(client.complete({
+      messages: [{ role: "user", content: "hello" }],
+      onProviderAttempt: (report) => reports.push(report),
+    })).rejects.toMatchObject({ status });
+
+    expect(reports).toEqual([expect.objectContaining({
+      status,
+      statusClass: "4xx",
+      category,
+      retryDecision,
+      inputTokens: 0,
+      outputTokens: 0,
+    })]);
+    expect(JSON.stringify(reports)).not.toContain("provider body must not enter telemetry");
+  });
+
   it("cancels an SSE response body when the consumer stops early", async () => {
     let cancelled = false;
     const response = new Response(new ReadableStream<Uint8Array>({

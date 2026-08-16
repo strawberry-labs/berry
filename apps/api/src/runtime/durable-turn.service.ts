@@ -1577,13 +1577,14 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
         `
 SELECT r.id,r.session_id,r.task_id,tc.id AS tool_call_id,
        tc.step_id AS tool_call_step_id,tc.tool_name AS tool_call_name,
-       tc.input AS tool_call_input,r.version
+       tc.input AS tool_call_input,r.version,
+       r.recovery_step_id,r.recovery_tool_call_id
 FROM turn_runs r JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
-LEFT JOIN LATERAL (
-  SELECT id,step_id,tool_name,input FROM tool_calls
-  WHERE tenant_id=r.tenant_id AND run_id=r.id AND status='failed'
-  ORDER BY created_at DESC LIMIT 1
-) tc ON true
+LEFT JOIN tool_calls tc
+  ON tc.tenant_id=r.tenant_id AND tc.run_id=r.id
+ AND tc.id=r.recovery_tool_call_id
+ AND tc.step_id=r.recovery_step_id
+ AND tc.status='failed'
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid AND t.user_id=$3::uuid
   AND r.state='recovery_required'
 FOR UPDATE OF r
@@ -1594,7 +1595,7 @@ FOR UPDATE OF r
       if (!recovered) return false;
       if (action === "cancel") {
         await executor.execute(
-          "UPDATE turn_runs SET state='cancelled',cancelled_at=now(),completed_at=now(),updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+          "UPDATE turn_runs SET state='cancelled',recovery_step_id=NULL,recovery_tool_call_id=NULL,cancelled_at=now(),completed_at=now(),updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
           [tenantId, runId],
         );
         await executor.execute(
@@ -1607,9 +1608,12 @@ FOR UPDATE OF r
         ]);
         return true;
       }
+      if (!recovered.tool_call_id || !recovered.tool_call_step_id) {
+        throw new Error("Recovery-required run has no exact failed tool reference; operator confirmation cannot guess a tool");
+      }
       if (action === "mark-complete") {
-        if (!recovered.tool_call_id || !recovered.tool_call_step_id || !recovered.tool_call_name) {
-          throw new Error("Recovery-required run has no failed tool call to mark complete");
+        if (!recovered.tool_call_name) {
+          throw new Error("Recovery-required run has no exact failed tool reference to mark complete");
         }
         const entryId = randomUUID();
         const confirmation = {
@@ -1727,7 +1731,7 @@ INSERT INTO turn_steps (
           `
 UPDATE turn_runs
 SET state='calling_model',error=NULL,next_action='Continue after operator-confirmed tool completion',
-    completed_at=NULL,updated_at=now()
+    completed_at=NULL,recovery_step_id=NULL,recovery_tool_call_id=NULL,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
           `.trim(),
           [tenantId, runId],
@@ -1747,22 +1751,22 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
         await executor.execute(
           `
 UPDATE turn_steps SET state='pending',error=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND state='recovery_required'
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid AND state='recovery_required'
           `.trim(),
-          [tenantId, runId],
+          [tenantId, runId, recovered.tool_call_step_id],
         );
         await executor.execute(
           `
 UPDATE tool_calls SET status='pending',completed_at=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='failed'
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid AND step_id=$4::uuid AND status='failed'
           `.trim(),
-          [tenantId, runId],
+          [tenantId, runId, recovered.tool_call_id, recovered.tool_call_step_id],
         );
         await executor.execute(
           `
 UPDATE turn_runs
 SET state='executing_tool',error=NULL,next_action='Retry tool after explicit operator confirmation',
-    completed_at=NULL,version=version+1,updated_at=now()
+    completed_at=NULL,recovery_step_id=NULL,recovery_tool_call_id=NULL,version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
           `.trim(),
           [tenantId, runId],
@@ -1919,12 +1923,14 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
 UPDATE turn_runs
 SET state=CASE WHEN $3::boolean THEN 'recovery_required' ELSE 'cancelled' END,
     cancelled_at=now(),completed_at=now(),
+    recovery_step_id=CASE WHEN $3::boolean THEN $4::uuid ELSE NULL END,
+    recovery_tool_call_id=CASE WHEN $3::boolean THEN $5::uuid ELSE NULL END,
     human_wait_ms=human_wait_ms+CASE WHEN waiting_started_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint) END,
     waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
     version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
     `.trim(),
-    [tenantId, active.id, Boolean(ambiguous)],
+    [tenantId, active.id, Boolean(ambiguous), ambiguous?.step_id ?? null, ambiguous?.tool_call_id ?? null],
   );
   await transaction.execute(
     `
