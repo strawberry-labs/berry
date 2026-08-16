@@ -4,6 +4,7 @@ import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circula
 import { DataGrid, type Column } from "react-data-grid";
 import "react-data-grid/lib/styles.css";
 import type { SpreadsheetSheet, SpreadsheetWorkerRequest, SpreadsheetWorkerResponse } from "./spreadsheet-types";
+import { fileExtension, filePreviewDecision, PREVIEW_LIMITS } from "./file-preview-policy";
 
 type GridRow = {
   rowNumber: number;
@@ -22,37 +23,106 @@ export default function SpreadsheetDocumentViewer({ file }: { file: StoredFile }
   const [selection, setSelection] = React.useState<Selection>({ address: "A1", value: "" });
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
+  const requestTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelledRef = React.useRef(false);
+  const pendingSheetRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
-    const worker = new Worker(new URL("./spreadsheet-parser.worker.ts", import.meta.url), { type: "module" });
-    workerRef.current = worker;
+    const decision = filePreviewDecision(file);
+    cancelledRef.current = false;
+    pendingSheetRef.current = null;
+    if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+    requestTimeoutRef.current = null;
     setLoading(true);
     setError(null);
     setSheet(null);
     setSheetNames([]);
+    if (!decision.allowed || decision.kind !== "spreadsheet") {
+      setError(decision.reason ?? "This workbook cannot be previewed safely.");
+      setLoading(false);
+      return () => undefined;
+    }
+
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./spreadsheet-parser.worker.ts", import.meta.url), { type: "module" });
+    } catch {
+      setError("The spreadsheet preview could not be started safely.");
+      setLoading(false);
+      return () => undefined;
+    }
+    workerRef.current = worker;
+    let cancelled = false;
 
     worker.onmessage = (event: MessageEvent<SpreadsheetWorkerResponse>) => {
+      if (cancelled || cancelledRef.current) return;
       if (event.data.type === "error") {
+        cancelled = true;
+        cancelledRef.current = true;
+        pendingSheetRef.current = null;
+        if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+        requestTimeoutRef.current = null;
+        worker.terminate();
+        workerRef.current = null;
         setError(event.data.message);
         setLoading(false);
         return;
       }
       if (event.data.type === "ready") setSheetNames(event.data.sheetNames);
+      if (event.data.type === "sheet" && pendingSheetRef.current !== event.data.sheet.name) return;
+      pendingSheetRef.current = null;
+      if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+      requestTimeoutRef.current = null;
       setSheet(event.data.sheet);
       setSelection(firstSelection(event.data.sheet));
       setLoading(false);
     };
     worker.onerror = () => {
+      if (cancelled || cancelledRef.current) return;
+      cancelled = true;
+      cancelledRef.current = true;
+      pendingSheetRef.current = null;
+      if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+      requestTimeoutRef.current = null;
+      worker.terminate();
+      workerRef.current = null;
       setError("The spreadsheet preview could not be started.");
       setLoading(false);
     };
-    worker.postMessage({
-      type: "load",
-      url: file.previewUrl,
-      extension: file.name.split(".").at(-1)?.toLowerCase() ?? "xlsx",
-    } satisfies SpreadsheetWorkerRequest);
+    try {
+      worker.postMessage({
+        type: "load",
+        url: file.previewUrl,
+        extension: fileExtension(file.name) || "xlsx",
+        maxSourceBytes: decision.maxSourceBytes ?? PREVIEW_LIMITS.spreadsheetBytes,
+        maxSheets: PREVIEW_LIMITS.maxSpreadsheetSheets,
+      } satisfies SpreadsheetWorkerRequest);
+    } catch {
+      cancelled = true;
+      cancelledRef.current = true;
+      pendingSheetRef.current = null;
+      worker.terminate();
+      workerRef.current = null;
+      setError("The spreadsheet preview could not be started safely.");
+      setLoading(false);
+      return () => undefined;
+    }
+    requestTimeoutRef.current = setTimeout(() => {
+      cancelled = true;
+      cancelledRef.current = true;
+      pendingSheetRef.current = null;
+      worker.terminate();
+      workerRef.current = null;
+      setError("Spreadsheet preview inspection timed out. Download the workbook to open it safely.");
+      setLoading(false);
+    }, 15_000);
 
     return () => {
+      cancelled = true;
+      cancelledRef.current = true;
+      pendingSheetRef.current = null;
+      if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+      requestTimeoutRef.current = null;
       workerRef.current = null;
       worker.terminate();
     };
@@ -65,7 +135,7 @@ export default function SpreadsheetDocumentViewer({ file }: { file: StoredFile }
 
   const columns = React.useMemo<Column<GridRow>[]>(() => {
     if (!sheet) return [];
-    const visibleColumns = Math.max(1, Math.min(sheet.totalColumns, 500));
+    const visibleColumns = Math.max(1, Math.min(sheet.totalColumns, PREVIEW_LIMITS.maxSpreadsheetColumns));
     return [
       {
         key: "__rowNumber",
@@ -91,10 +161,28 @@ export default function SpreadsheetDocumentViewer({ file }: { file: StoredFile }
   }, [sheet]);
 
   const openSheet = React.useCallback((name: string) => {
-    if (!workerRef.current || name === sheet?.name) return;
+    if (!workerRef.current || cancelledRef.current || name === sheet?.name) return;
     setLoading(true);
     setError(null);
-    workerRef.current.postMessage({ type: "sheet", name } satisfies SpreadsheetWorkerRequest);
+    if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+    try {
+      pendingSheetRef.current = name;
+      workerRef.current.postMessage({ type: "sheet", name } satisfies SpreadsheetWorkerRequest);
+      requestTimeoutRef.current = setTimeout(() => {
+        cancelledRef.current = true;
+        pendingSheetRef.current = null;
+        workerRef.current?.terminate();
+        workerRef.current = null;
+        setError("This sheet took too long to prepare. Download the workbook to open it safely.");
+        setLoading(false);
+      }, 15_000);
+    } catch {
+      pendingSheetRef.current = null;
+      workerRef.current.terminate();
+      workerRef.current = null;
+      setError("The spreadsheet sheet could not be opened safely.");
+      setLoading(false);
+    }
   }, [sheet?.name]);
 
   if (error) throw new Error(error);

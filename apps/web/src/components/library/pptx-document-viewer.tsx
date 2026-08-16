@@ -2,14 +2,23 @@ import * as React from "react";
 import type { StoredFile } from "@berry/shared";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { PptxViewer, RECOMMENDED_ZIP_LIMITS } from "@aiden0z/pptx-renderer/browser";
+import { filePreviewDecision } from "./file-preview-policy";
+import { readResponseBytes } from "./preview-stream";
+import { useOfficePreviewBytes } from "./office-preview-gate";
 
 export default function PptxDocumentViewer({ file }: { file: StoredFile }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<Error | null>(null);
+  const previewBytes = useOfficePreviewBytes();
 
   React.useEffect(() => {
     const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      setError(new Error("Presentation preview timed out. Download the file to open it safely."));
+      setLoading(false);
+      controller.abort();
+    }, 15_000);
     const container = containerRef.current;
     if (!container) return;
 
@@ -26,11 +35,19 @@ export default function PptxDocumentViewer({ file }: { file: StoredFile }) {
       onRenderComplete: () => setLoading(false),
     });
 
-    void fetch(file.previewUrl, { signal: controller.signal })
-      .then((response) => {
+    const decision = filePreviewDecision(file);
+    if (!decision.allowed || decision.kind !== "pptx") {
+      setError(new Error(decision.reason ?? "This presentation cannot be previewed safely."));
+      setLoading(false);
+      return () => { clearTimeout(timeout); controller.abort(); viewer.destroy(); container.replaceChildren(); };
+    }
+    const bufferPromise = previewBytes
+      ? Promise.resolve(previewBytes)
+      : fetch(file.previewUrl, { credentials: "include", signal: controller.signal }).then((response) => {
         if (!response.ok) throw new Error(`File request failed (${response.status})`);
-        return response.arrayBuffer();
-      })
+        return readResponseBytes(response, decision.maxSourceBytes ?? 50 * 1024 * 1024);
+      });
+    void bufferPromise
       .then((buffer) => viewer.open(buffer, {
         renderMode: "list",
         signal: controller.signal,
@@ -45,6 +62,7 @@ export default function PptxDocumentViewer({ file }: { file: StoredFile }) {
         },
       }))
       .then(() => {
+        clearTimeout(timeout);
         if (!controller.signal.aborted) setLoading(false);
       })
       .catch((cause: unknown) => {
@@ -55,11 +73,12 @@ export default function PptxDocumentViewer({ file }: { file: StoredFile }) {
       });
 
     return () => {
+      clearTimeout(timeout);
       controller.abort();
       viewer.destroy();
       container.replaceChildren();
     };
-  }, [file.id, file.previewUrl]);
+  }, [file.id, file.previewUrl, previewBytes]);
 
   if (error) throw error;
 

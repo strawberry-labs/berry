@@ -52,6 +52,9 @@ import { ProjectSwitcher } from "./projects/project-switcher";
 import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
 import { ManagementRouteProvider } from "./management/management-route-context";
 import { armCompletionSound, notifyBackgroundProgress, notifyTaskCompleted } from "@/lib/task-notifications";
+import { assertImagePreviewBounds } from "./library/image-preview-bounds";
+import { PREVIEW_LIMITS } from "./library/file-preview-policy";
+import { readResponseBytes } from "./library/preview-stream";
 
 function generatedImageTitle(prompt: string): string {
   const title = prompt
@@ -61,6 +64,24 @@ function generatedImageTitle(prompt: string): string {
     .trim()
     .slice(0, 80);
   return title ? title.charAt(0).toUpperCase() + title.slice(1) : "Generated image";
+}
+
+function generatedFetchCredentials(url: string): RequestCredentials {
+  if (typeof window === "undefined") return "omit";
+  try {
+    return new URL(url, window.location.href).origin === window.location.origin ? "include" : "omit";
+  } catch {
+    return "omit";
+  }
+}
+
+function generatedImageExtension(mediaType: string): string {
+  const normalized = mediaType.trim().toLowerCase();
+  if (normalized === "image/jpeg" || normalized === "image/jpg") return "jpg";
+  if (normalized === "image/webp") return "webp";
+  if (normalized === "image/avif") return "avif";
+  if (normalized === "image/gif") return "gif";
+  return "png";
 }
 import { WebSidebar, WebWindowChrome, taskHasUnreadActivity, taskIsInProgress, type SettingsTab } from "./shell/web-sidebar";
 import type { ManagementKind } from "./management/management-navigation";
@@ -2748,7 +2769,8 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       let storedImage: Awaited<ReturnType<BerryApiClient["getFile"]>> | null = null;
       if (generated?.b64_json) {
         try {
-          const blob = await (await fetch(content)).blob();
+          const generatedBytes = await readGeneratedImageBytes(content, "image/png");
+          const blob = new Blob([new Uint8Array(generatedBytes)], { type: "image/png" });
           const stored = await client.uploadFile(new File([blob], `generated-${Date.now()}.png`, { type: "image/png" }), { taskId: task.id, sessionId, origin: "image_generation", associationRole: "output" });
           content = stored.previewUrl;
           storedImage = stored;
@@ -2798,14 +2820,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         fileId: stored.id,
         name: stored.name,
         mediaType: stored.mediaType,
+        declaredMediaType: stored.declaredMediaType,
+        detectedMediaType: stored.detectedMediaType,
         size: stored.size,
         sourceKind: "generated-image-reference",
       };
     }
-    const response = await fetch(image.src);
-    if (!response.ok) throw new Error("The source image could not be loaded");
-    const blob = await response.blob();
-    const stored = await client.uploadFile(new File([blob], `${image.title || "generated-image"}.png`, { type: image.mimeType }), {
+    const generatedBytes = await readGeneratedImageBytes(image.src, image.mimeType);
+    const blob = new Blob([new Uint8Array(generatedBytes)], { type: image.mimeType });
+    const stored = await client.uploadFile(new File([blob], `${image.title || "generated-image"}.${generatedImageExtension(image.mimeType)}`, { type: image.mimeType }), {
       taskId: task.id,
       ...(task.activeSessionId ? { sessionId: task.activeSessionId } : {}),
       origin: "image_generation",
@@ -2816,10 +2839,29 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       fileId: stored.id,
       name: stored.name,
       mediaType: stored.mediaType,
+      declaredMediaType: stored.declaredMediaType,
+      detectedMediaType: stored.detectedMediaType,
       size: stored.size,
       sourceKind: "generated-image-reference",
     };
   }, [client]);
+
+  async function readGeneratedImageBytes(url: string, mediaType: string): Promise<ArrayBuffer> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const response = await fetch(url, { credentials: generatedFetchCredentials(url), signal: controller.signal });
+      if (!response.ok) throw new Error("The source image could not be loaded");
+      const bytes = await readResponseBytes(response, PREVIEW_LIMITS.imageBytes);
+      assertImagePreviewBounds(new Uint8Array(bytes), mediaType);
+      return bytes;
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error("The source image request timed out");
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 
   const appendDemoGeneratedImageIteration = React.useCallback((
     task: Task,

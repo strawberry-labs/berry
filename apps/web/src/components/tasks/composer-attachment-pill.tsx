@@ -4,6 +4,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@berry
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { FileText } from "@berry/desktop-ui/lib/icons";
 import { isPassiveInlineImageFile } from "../library/file-preview-policy";
+import { useBoundedImageSource } from "../library/bounded-image";
 
 export function ComposerAttachmentPill({ attachment, presentation, onRemove, onShowInline, onOpenFile }: {
   attachment: AttachmentInput;
@@ -11,8 +12,10 @@ export function ComposerAttachmentPill({ attachment, presentation, onRemove, onS
   onRemove: () => void;
   onShowInline: () => void;
   onOpenFile: () => void;
-}) {
-  const imagePreview = isPassiveInlineImageFile(attachment) ? (attachment.previewUrl || attachment.dataUrl) : null;
+  }) {
+  const passiveImage = isPassiveInlineImageFile(attachment);
+  const safePreviewUrl = useBoundedImageSource({ src: attachment.previewUrl ?? attachment.dataUrl, mediaType: attachment.mediaType, enabled: passiveImage });
+  const imagePreview = passiveImage ? safePreviewUrl : null;
   const pill = (
     <Attachment size="sm" className="max-w-[360px] flex-nowrap rounded-[22px] border-0 bg-card shadow-[var(--berry-ring-subtle)]">
       {presentation?.mode === "file" ? <button type="button" className="absolute inset-0 z-10 rounded-[22px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label={`Open ${attachment.name}`} onClick={onOpenFile} /> : null}

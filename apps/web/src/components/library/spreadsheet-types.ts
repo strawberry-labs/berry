@@ -9,7 +9,7 @@ export type SpreadsheetSheet = {
 };
 
 export type SpreadsheetWorkerRequest =
-  | { type: "load"; url: string; extension: string }
+  | { type: "load"; url: string; extension: string; maxSourceBytes: number; maxSheets: number }
   | { type: "sheet"; name: string };
 
 export type SpreadsheetWorkerResponse =

@@ -27,10 +27,10 @@ describe("projectFilterWorkspaces", () => {
 describe("libraryItemsForTab", () => {
 	it("preserves the API order when images and documents share All", () => {
 		const files = [
-			{ id: "document", mediaType: "application/pdf" },
-			{ id: "image", mediaType: "image/png" },
-			{ id: "active-image", name: "active.svg", mediaType: "image/svg+xml" },
-			{ id: "sheet", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+			{ id: "document", name: "document.pdf", mediaType: "application/pdf", detectedMediaType: "application/pdf" },
+			{ id: "image", name: "image.png", mediaType: "image/png", detectedMediaType: "image/png" },
+			{ id: "active-image", name: "active.svg", mediaType: "image/svg+xml", detectedMediaType: "image/svg+xml" },
+			{ id: "sheet", name: "sheet.xlsx", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", detectedMediaType: "application/zip" },
 		] as StoredFile[];
 		expect(libraryItemsForTab(files, "all").map((file) => file.id)).toEqual(["document", "image", "active-image", "sheet"]);
 		expect(libraryItemsForTab(files, "images").map((file) => file.id)).toEqual(["image"]);

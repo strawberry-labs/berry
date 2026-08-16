@@ -265,7 +265,7 @@ export function TaskFileLibraryDialog({
                       aria-label={`${selectedIds.has(file.id) ? "Deselect" : "Select"} ${file.name}`}
                     />
                     <button type="button" className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={() => setSelected(file)}>
-                      {isImageFile(file) ? <FileThumbnail name={file.name} previewImageUrl={file.previewUrl} /> : <FileTypeIcon path={file.name} className="size-10" />}
+                      {isImageFile(file) ? <FileThumbnail name={file.name} previewImageUrl={file.previewUrl} mediaType={file.mediaType} /> : <FileTypeIcon path={file.name} className="size-10" />}
                       <span className="min-w-0 flex-1">
                         <strong className="block truncate text-sm font-medium" title={file.name}>{file.name}</strong>
                         <small className="block truncate text-xs text-muted-foreground">{fileTypeLabel(file)} · {formatBytes(file.size)} · {new Date(file.createdAt).toLocaleString()}</small>

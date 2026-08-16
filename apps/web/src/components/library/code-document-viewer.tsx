@@ -2,8 +2,8 @@ import * as React from "react";
 import type { StoredFile } from "@berry/shared";
 import { CircularActivitySpinner } from "@berry/desktop-ui/components/ui/circular-activity-spinner";
 import { MonacoCodeEditor, languageForPath } from "@/components/code-editor";
-
-const MAX_CODE_PREVIEW_BYTES = 2 * 1024 * 1024;
+import { filePreviewDecision } from "./file-preview-policy";
+import { readResponseText } from "./preview-stream";
 
 export default function CodeDocumentViewer({ file }: { file: StoredFile }) {
   const [content, setContent] = React.useState<string | null>(null);
@@ -11,27 +11,39 @@ export default function CodeDocumentViewer({ file }: { file: StoredFile }) {
 
   React.useEffect(() => {
     const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      setError(new Error("Code preview timed out. Download the file to open it safely."));
+      controller.abort();
+    }, 15_000);
     setContent(null);
     setError(null);
 
-    if (file.size > MAX_CODE_PREVIEW_BYTES) {
-      setError(new Error("This code file is too large to preview in the browser."));
-      return () => controller.abort();
+    const decision = filePreviewDecision(file);
+    if (!decision.allowed) {
+      setError(new Error(decision.reason ?? "This file cannot be previewed safely in the browser."));
+      return () => {
+        clearTimeout(timeout);
+        controller.abort();
+      };
     }
 
-    void fetch(file.previewUrl, { signal: controller.signal })
+    void fetch(file.previewUrl, { credentials: "include", signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error(`File request failed (${response.status})`);
-        return response.text();
+        return readResponseText(response, decision.maxSourceBytes ?? 2 * 1024 * 1024);
       })
       .then((next) => {
+        clearTimeout(timeout);
         if (!controller.signal.aborted) setContent(next);
       })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) setError(cause instanceof Error ? cause : new Error(String(cause)));
       });
 
-    return () => controller.abort();
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
   }, [file.id, file.previewUrl, file.size]);
 
   if (error) throw error;

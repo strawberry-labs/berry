@@ -33,12 +33,16 @@ export function strictQuestionAnswerAttachment(file: {
   id: string;
   name: string;
   mediaType: string;
+  declaredMediaType?: string | null | undefined;
+  detectedMediaType?: string | null | undefined;
   size: number;
 }): AttachmentInput & { fileId: string } {
   return {
     fileId: file.id,
     name: file.name,
     mediaType: file.mediaType,
+    ...(file.declaredMediaType !== undefined ? { declaredMediaType: file.declaredMediaType } : {}),
+    ...(file.detectedMediaType !== undefined ? { detectedMediaType: file.detectedMediaType } : {}),
     size: file.size,
     sourceKind: "object-storage",
   };

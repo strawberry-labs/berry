@@ -1753,6 +1753,7 @@ function fileDto(row: FileRow) {
     name: row.display_name,
     originalName: row.original_name,
     mediaType: row.detected_media_type ?? row.media_type,
+    declaredMediaType: row.media_type,
     detectedMediaType: row.detected_media_type,
     size: Number(row.size_bytes),
     sha256: row.sha256,
