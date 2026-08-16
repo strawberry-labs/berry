@@ -25,6 +25,7 @@ import {
   durableImageToolSelectionPrompt,
   durableBuiltInToolDefinitions,
   durableToolManifestMetrics,
+  queuedFollowUpRuntimeRequest,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -69,6 +70,28 @@ describe("durable turn runner", () => {
     expect(DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "create_image")?.function.description)
       .toContain("already published");
     expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
+  });
+
+  it("uses the queued prompt intent instead of inheriting its predecessor intent", () => {
+    const base = { providerId: "router", intent: "image_generation", attachments: [{ fileId: "old" }] };
+    const normal = queuedFollowUpRuntimeRequest(base, {
+      id: "queue-normal",
+      attempt_count: 1,
+      input: "Explain the result",
+      intent: null,
+      attachments: [],
+    });
+    const image = queuedFollowUpRuntimeRequest({ providerId: "router" }, {
+      id: "queue-image",
+      attempt_count: 2,
+      input: "Create a diagram",
+      intent: "image_generation",
+      attachments: [],
+    });
+
+    expect(normal).not.toHaveProperty("intent");
+    expect(normal).toMatchObject({ requestId: "queued:queue-normal:1", input: "Explain the result", attachments: [] });
+    expect(image).toMatchObject({ requestId: "queued:queue-image:2", intent: "image_generation", input: "Create a diagram" });
   });
 
   it("advertises Pi's seven coding tools", () => {

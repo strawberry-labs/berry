@@ -4653,15 +4653,8 @@ async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTur
 
   const requestMessageId = randomUUID();
   const runId = randomUUID();
-  const requestId = `queued:${queued.id}:${queued.attempt_count}`;
-  const runtime = {
-    ...record(queued.runtime_request),
-    requestId,
-    input: queued.input,
-    continueInterruptedTurn: false,
-    budgetReservationRequired: true,
-    attachments: Array.isArray(queued.attachments) ? queued.attachments : [],
-  };
+  const runtime = queuedFollowUpRuntimeRequest(queued.runtime_request, queued);
+  const requestId = String(runtime.requestId);
   const attachments = Array.isArray(queued.attachments) ? queued.attachments.map((value) => record(value)) : [];
   const messageParts = [
     { type: "text", content: queued.input },
@@ -4795,6 +4788,25 @@ async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTur
      WHERE tenant_id=$1::uuid AND id=$4::uuid`,
     [snapshot.tenantId, runId, requestMessageId, queued.session_id],
   );
+}
+
+export function queuedFollowUpRuntimeRequest(
+  previousRuntime: unknown,
+  queued: Pick<QueuedFollowUpRow, "id" | "attempt_count" | "input" | "intent" | "attachments">,
+): Record<string, unknown> {
+  // Runtime capabilities remain the admission snapshot captured when the row
+  // was queued, but turn intent belongs to this prompt. Never inherit the
+  // predecessor's image intent or drop an explicit queued image request.
+  const { intent: _previousIntent, ...runtime } = record(previousRuntime) ?? {};
+  return {
+    ...runtime,
+    requestId: `queued:${queued.id}:${queued.attempt_count}`,
+    input: queued.input,
+    ...(queued.intent ? { intent: queued.intent } : {}),
+    continueInterruptedTurn: false,
+    budgetReservationRequired: true,
+    attachments: Array.isArray(queued.attachments) ? queued.attachments : [],
+  };
 }
 
 async function insertAssistantProjection(
