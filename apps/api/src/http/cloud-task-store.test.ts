@@ -16,6 +16,19 @@ describe("cloud workspace identifiers", () => {
 });
 
 describe("task unread state", () => {
+  it("keeps legacy synthetic workspaces owner-scoped during task listing", async () => {
+    const store = new InMemoryCloudTaskStore();
+    const { task } = await store.createTask({ workspaceId: "workspace_cloud", ownerUserId: "user_1", title: "Legacy task" });
+
+    await expect(store.listTasks({ workspaceId: "workspace_cloud", ownerUserId: "user_1" })).resolves.toEqual([task]);
+    await expect(store.listTasks({ workspaceId: "workspace_cloud", ownerUserId: "user_2" })).resolves.toEqual([]);
+
+    await store.updateTask(task.id, { archived: true }, "user_1");
+    await expect(store.taskSummary("user_1")).resolves.toMatchObject({ active: 0, archived: 1, deleted: 0, total: 1 });
+    await expect(store.deleteArchivedTasks({}, "user_1")).resolves.toEqual({ deletedCount: 1 });
+    await expect(store.taskSummary("user_1")).resolves.toMatchObject({ active: 0, archived: 0, deleted: 1, total: 1 });
+  });
+
   it("normalizes legacy task kinds without persisting a web mode choice", async () => {
     const store = new InMemoryCloudTaskStore();
     const workspace = await store.createWorkspace({ name: "Project", ownerUserId: "user_1" });

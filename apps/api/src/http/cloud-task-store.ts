@@ -149,6 +149,13 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   readonly #messageHistoryDeletionRevisions = new Map<string, number>();
   readonly #taskOwners = new Map<string, string | null>();
 
+  #taskBelongsToOwner(task: Task, ownerUserId: string | null | undefined): boolean {
+    const workspace = this.#workspaces.get(task.workspaceId);
+    if (ownerUserId === undefined) return Boolean(workspace);
+    const taskOwner = this.#taskOwners.get(task.id);
+    return taskOwner === ownerUserId && (!workspace || workspace.ownerUserId === ownerUserId);
+  }
+
   constructor() {
     const now = nowIso();
     this.#workspaces.set(SELF_HOST_WORKSPACE_ID, WorkspaceSchema.parse({
@@ -312,9 +319,15 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       .filter((task) => (filter.workspaceId ? task.workspaceId === filter.workspaceId : true))
       .filter((task) => {
         const workspace = this.#workspaces.get(task.workspaceId);
-        if (!workspace) return false;
+        // Older in-memory callers may use a synthetic workspace id without
+        // seeding a workspace row. Keep those fixtures visible only to the
+        // task owner; the durable SQL store still requires a real workspace
+        // join, so this does not weaken production authorization.
+        if (!workspace) {
+          return !filter.workspaceKind && this.#taskBelongsToOwner(task, filter.ownerUserId);
+        }
         if (filter.workspaceKind && workspace?.workspaceKind !== filter.workspaceKind) return false;
-        return filter.ownerUserId === undefined || workspace.ownerUserId === filter.ownerUserId;
+        return this.#taskBelongsToOwner(task, filter.ownerUserId);
       })
       .filter((task) => filter.ownerUserId === undefined || this.#taskOwners.get(task.id) === filter.ownerUserId)
       .filter((task) => !filter.taskIds || filter.taskIds.includes(task.id))
@@ -332,12 +345,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   }
 
   async taskSummary(ownerUserId?: string | null): Promise<TaskCollectionSummary> {
-    const rows = [...this.#tasks.values()].filter((task) => {
-      const workspace = this.#workspaces.get(task.workspaceId);
-      if (!workspace) return false;
-      return (ownerUserId === undefined || this.#taskOwners.get(task.id) === ownerUserId)
-        && (ownerUserId === undefined || workspace.ownerUserId === ownerUserId);
-    });
+    const rows = [...this.#tasks.values()].filter((task) => this.#taskBelongsToOwner(task, ownerUserId));
     return {
       active: rows.filter((task) => !task.archived && task.deletedAt === null).length,
       archived: rows.filter((task) => task.archived && task.deletedAt === null).length,
@@ -350,11 +358,8 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     const now = nowIso();
     let deletedCount = 0;
     for (const [id, task] of this.#tasks) {
-      const workspace = this.#workspaces.get(task.workspaceId);
-      if (!workspace) continue;
       if (!task.archived || task.deletedAt !== null) continue;
-      if (ownerUserId !== undefined && this.#taskOwners.get(id) !== ownerUserId) continue;
-      if (ownerUserId !== undefined && workspace.ownerUserId !== ownerUserId) continue;
+      if (!this.#taskBelongsToOwner(task, ownerUserId)) continue;
       if (input.workspaceId && task.workspaceId !== input.workspaceId) continue;
       if (input.search && !task.title.toLocaleLowerCase().includes(input.search.trim().toLocaleLowerCase())) continue;
       this.#tasks.set(id, TaskSchema.parse({ ...task, deletedAt: now, updatedAt: now }));
