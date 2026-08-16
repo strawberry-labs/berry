@@ -1541,7 +1541,6 @@ export class AgentApiController {
         logTurnAdmission("replayed", preparing.runId, Date.now() - admissionStartedAt);
         return { turnId: preparing.runId, sessionId };
       }
-      await this.store.updateTask(task.id, { status: "running" }, userId);
     }
     if (request.continueInterruptedTurn) {
       await this.assertContinuableTurn(sessionId);
@@ -1930,6 +1929,12 @@ export class AgentApiController {
         return { turnId: admitted.runId, sessionId };
       } catch (error) {
         await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
+        await this.durableTurns.failAdmission({
+          tenantId,
+          sessionId,
+          requestId,
+          reasonCode: error instanceof Error ? error.name : "admission_failed",
+        }).catch(() => undefined);
         throw error;
       }
     }

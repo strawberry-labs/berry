@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  TurnExecuteReasonSchema,
+  TurnResumeReasonSchema,
+} from "@berry/shared";
 
 /**
  * The original shared queue remains available only as a deployment drain path.
@@ -33,12 +37,12 @@ export const TurnExecuteJobPayloadSchema = z.object({
   outboxId: z.string().uuid().optional(),
   tenantId: z.string().uuid(),
   runId: z.string().uuid(),
-  reason: z.enum(["admitted", "continue", "lease-recovery", "approval-resolved", "retry"]).default("continue"),
+  reason: TurnExecuteReasonSchema.default("continue"),
 });
 export type TurnExecuteJobPayload = z.infer<typeof TurnExecuteJobPayloadSchema>;
 
 export const TurnResumeJobPayloadSchema = TurnExecuteJobPayloadSchema.extend({
-  reason: z.enum(["approval-resolved", "user-input", "scheduled-retry", "operator-recovery"]),
+  reason: TurnResumeReasonSchema,
 });
 export type TurnResumeJobPayload = z.infer<typeof TurnResumeJobPayloadSchema>;
 

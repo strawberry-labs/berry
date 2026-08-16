@@ -61,7 +61,7 @@ export interface DurableTaskActivity {
   runId: string | null;
   runState: string | null;
   runCreatedAt: string | null;
-  admissionState: "preparing" | "admitted" | "cancelled" | null;
+  admissionState: "preparing" | "admitted" | "retryable" | "rejected" | "expired" | "cancelled" | null;
   admissionCreatedAt: string | null;
   admissionUpdatedAt: string | null;
 }
@@ -91,8 +91,9 @@ type AdmissionReplayRow = {
 type AdmissionIntentRow = {
   session_id: string;
   operation_fingerprint: string | null;
-  state: "preparing" | "admitted" | "cancelled";
+  state: "preparing" | "admitted" | "retryable" | "rejected" | "expired" | "cancelled";
   run_id: string | null;
+  preparation_lease_expires_at?: Date | string | null;
 };
 
 @Injectable()
@@ -118,8 +119,11 @@ export class DurableTurnService {
       await executor.execute(
         `
 INSERT INTO turn_admission_intents (
-  tenant_id,request_id,session_id,operation_fingerprint,state
-) VALUES ($1::uuid,$2,$3::uuid,$4,'preparing')
+  tenant_id,request_id,session_id,operation_fingerprint,state,
+  preparation_started_at,preparation_lease_expires_at,preparation_attempt
+) VALUES (
+  $1::uuid,$2,$3::uuid,$4,'preparing',now(),now() + interval '5 minutes',1
+)
 ON CONFLICT (tenant_id,request_id) DO NOTHING
         `.trim(),
         [input.tenantId, input.requestId, input.sessionId, input.operationFingerprint],
@@ -141,7 +145,74 @@ WHERE tenant_id=$1::uuid AND request_id=$2 AND operation_fingerprint IS NULL
       if (intent.state === "admitted" && intent.run_id) {
         return { runId: intent.run_id, sessionId: input.sessionId };
       }
+      const preparationExpired = intent.state === "preparing"
+        && intent.preparation_lease_expires_at !== null
+        && intent.preparation_lease_expires_at !== undefined
+        && new Date(intent.preparation_lease_expires_at).getTime() <= Date.now();
+      if (intent.state === "retryable" || intent.state === "rejected" || intent.state === "expired" || preparationExpired) {
+        await executor.execute(
+          `
+UPDATE turn_admission_intents
+SET state='preparing',
+    preparation_started_at=now(),
+    preparation_lease_expires_at=now() + interval '5 minutes',
+    preparation_attempt=preparation_attempt+1,
+    preparation_ms=NULL,
+    terminal_reason_code=NULL,
+    terminal_at=NULL,
+    cancelled_at=NULL,
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND request_id=$2
+          `.trim(),
+          [input.tenantId, input.requestId],
+        );
+      }
       return null;
+    });
+  }
+
+  async failAdmission(input: {
+    tenantId: string;
+    sessionId: string;
+    requestId: string;
+    reason?: "retryable" | "rejected" | "expired";
+    reasonCode?: string;
+  }): Promise<void> {
+    if (!this.enabled) return;
+    const reason = input.reason ?? "retryable";
+    await this.database.withTenant(input.tenantId, async (executor) => {
+      const intent = await lockAdmissionIntent(executor, input.tenantId, input.requestId);
+      if (!intent || intent.session_id !== input.sessionId || intent.state === "cancelled" || intent.state === "admitted") {
+        return;
+      }
+      await executor.execute(
+        `
+UPDATE turn_admission_intents
+SET state=$3,
+    preparation_lease_expires_at=NULL,
+    preparation_ms=COALESCE(
+      preparation_ms,
+      GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-COALESCE(preparation_started_at,created_at)))*1000)::integer)
+    ),
+    terminal_reason_code=COALESCE($4,terminal_reason_code),
+    terminal_at=COALESCE(terminal_at,now()),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND request_id=$2 AND state='preparing'
+        `.trim(),
+        [input.tenantId, input.requestId, reason, input.reasonCode ?? "admission_failed"],
+      );
+      await executor.execute(
+        `
+UPDATE tasks t
+SET status=$3::task_status,
+    updated_at=now()
+FROM sessions s
+WHERE s.tenant_id=$1::uuid AND s.id=$2::uuid
+  AND t.tenant_id=s.tenant_id AND t.id=s.task_id
+  AND t.status IN ('queued','running')
+        `.trim(),
+        [input.tenantId, input.sessionId, reason === "retryable" ? "queued" : "failed"],
+      );
     });
   }
 
@@ -322,6 +393,9 @@ WHERE tenant_id=$1::uuid AND id=$4::uuid
 UPDATE turn_admission_intents
 SET state='admitted',run_id=$3::uuid,admitted_at=now(),
     preparation_ms=GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-created_at))*1000)::integer),
+    preparation_lease_expires_at=NULL,
+    terminal_reason_code=NULL,
+    terminal_at=NULL,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND request_id=$2 AND state='preparing'
           `.trim(),
@@ -791,14 +865,24 @@ LIMIT $3
           await transaction.execute(
             `
 INSERT INTO turn_admission_intents (
-  tenant_id,request_id,session_id,state,cancelled_at
-) VALUES ($1::uuid,$2,$3::uuid,'cancelled',now())
+  tenant_id,request_id,session_id,state,cancelled_at,terminal_at,terminal_reason_code,
+  preparation_lease_expires_at
+) VALUES ($1::uuid,$2,$3::uuid,'cancelled',now(),now(),'cancelled_by_user',NULL)
 ON CONFLICT (tenant_id,request_id) DO UPDATE
 SET state=CASE
       WHEN turn_admission_intents.state='admitted' THEN 'admitted'
       ELSE 'cancelled'
     END,
     cancelled_at=COALESCE(turn_admission_intents.cancelled_at,now()),
+    terminal_at=CASE
+      WHEN turn_admission_intents.state='admitted' THEN turn_admission_intents.terminal_at
+      ELSE COALESCE(turn_admission_intents.terminal_at,now())
+    END,
+    terminal_reason_code=CASE
+      WHEN turn_admission_intents.state='admitted' THEN turn_admission_intents.terminal_reason_code
+      ELSE COALESCE(turn_admission_intents.terminal_reason_code,'cancelled_by_user')
+    END,
+    preparation_lease_expires_at=NULL,
     preparation_ms=COALESCE(
       turn_admission_intents.preparation_ms,
       GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-turn_admission_intents.created_at))*1000)::integer)
@@ -831,10 +915,25 @@ FOR UPDATE
           [tenantId, sessionId, requestId ?? null],
         );
         const active = rows[0];
-        if (!active) return {
-          runId: null,
-          result: requestId ? "pending_or_terminal" : "no_active_run",
-        };
+        if (!active) {
+          if (requestId) {
+            await transaction.execute(
+              `
+UPDATE tasks t
+SET status='cancelled',updated_at=now()
+FROM sessions s
+WHERE s.tenant_id=$1::uuid AND s.id=$2::uuid
+  AND t.tenant_id=s.tenant_id AND t.id=s.task_id
+  AND t.status IN ('queued','running')
+              `.trim(),
+              [tenantId, sessionId],
+            );
+          }
+          return {
+            runId: null,
+            result: requestId ? "pending_or_terminal" : "no_active_run",
+          };
+        }
         await cancelActiveDurableRun(transaction, tenantId, active);
         return { runId: active.id, result: "active_run" };
       };
@@ -1717,7 +1816,9 @@ async function cancelActiveDurableRun(
   await transaction.execute(
     `
 UPDATE turn_steps
-SET state='cancelled',completed_at=now(),updated_at=now()
+SET state='cancelled',completed_at=COALESCE(completed_at,now()),
+    closure_reason=COALESCE(closure_reason,'turn_cancelled'),
+    closed_at=COALESCE(closed_at,now()),updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   AND state IN ('pending','running','waiting')
     `.trim(),
@@ -1726,18 +1827,20 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   await transaction.execute(
     `
 UPDATE tool_calls
-SET status='cancelled',completed_at=now(),updated_at=now()
+SET status='cancelled',completed_at=COALESCE(completed_at,now()),
+    closure_reason=COALESCE(closure_reason,'turn_cancelled'),
+    closed_at=COALESCE(closed_at,now()),updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   AND status IN ('pending','waiting-for-approval','running')
     `.trim(),
     [tenantId, active.id],
   );
   await transaction.execute(
-    "UPDATE approvals SET status='expired',decided_at=now() WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
+    "UPDATE approvals SET status='expired',decided_at=now(),closure_reason=COALESCE(closure_reason,'turn_cancelled'),closed_at=COALESCE(closed_at,now()) WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
     [tenantId, active.id],
   );
   await transaction.execute(
-    "UPDATE turn_questions SET status='cancelled' WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
+    "UPDATE turn_questions SET status='cancelled',closure_reason=COALESCE(closure_reason,'turn_cancelled'),closed_at=COALESCE(closed_at,now()) WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'",
     [tenantId, active.id],
   );
   await appendDurableEvents(transaction, tenantId, active.id, active.session_id, [
@@ -2662,7 +2765,7 @@ async function reconcileTerminalUsage(
   executor: SqlExecutor,
   tenantId: string,
   runId: string,
-  status: "completed" | "failed" | "cancelled",
+  status: "completed" | "failed" | "cancelled" | "recovery_required",
 ): Promise<void> {
   const runs = await executor.query<{
     user_id: string;
@@ -2856,7 +2959,7 @@ async function lockAdmissionIntent(
 ): Promise<AdmissionIntentRow | null> {
   const rows = await executor.query<AdmissionIntentRow>(
     `
-SELECT session_id,operation_fingerprint,state,run_id
+SELECT session_id,operation_fingerprint,state,run_id,preparation_lease_expires_at
 FROM turn_admission_intents
 WHERE tenant_id=$1::uuid AND request_id=$2
 FOR UPDATE
@@ -2902,10 +3005,19 @@ async function appendDurableEvents(
     const parsed = AgentStreamEventSchema.parse(event);
     sequence += 1;
     await executor.execute(
-      `
+      parsed.kind === "turn.end"
+        ? `
+INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+SELECT $1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb
+WHERE NOT EXISTS (
+  SELECT 1 FROM turn_events
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='turn.end'
+)
+        `.trim()
+        : `
 INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
 VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb)
-      `.trim(),
+        `.trim(),
       [tenantId, runId, sessionId, sequence, parsed.kind, JSON.stringify(parsed)],
     );
   }

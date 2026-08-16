@@ -169,4 +169,21 @@ describe("processBerryWorkerJob", () => {
       `turn:${runId}`,
     ]);
   });
+
+  it("accepts the queued-follow-up reason emitted by the durable producer", async () => {
+    const dependencies = testDependencies();
+    const execute = vi.fn(async (payload: { runId: string }) => ({
+      runId: payload.runId,
+      state: "calling_model" as const,
+    }));
+    dependencies.turnRunner = { execute } as never;
+
+    await processBerryWorkerJob("turn.execute", {
+      tenantId,
+      runId: "00000000-0000-7000-8000-000000000012",
+      reason: "queued-follow-up",
+    }, dependencies);
+
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ reason: "queued-follow-up" }));
+  });
 });

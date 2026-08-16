@@ -60,6 +60,7 @@ export class RuntimeOutboxDispatcher {
       const tenantIds = await this.tenantIds();
       const runTerminalCleanup = this.terminalCleanupDue();
       for (const tenantId of tenantIds) {
+        await this.withTenant(tenantId, (executor) => this.recoverExpiredAdmissions(executor, tenantId));
         await this.withTenant(tenantId, (executor) => executor.execute(`
         INSERT INTO runtime_outbox (
           tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at
@@ -217,6 +218,118 @@ export class RuntimeOutboxDispatcher {
     });
   }
 
+  private async recoverExpiredAdmissions(executor: SqlExecutor, tenantId: string): Promise<void> {
+    const expired = await executor.query<{ request_id: string; session_id: string }>(
+      `
+WITH candidates AS (
+  SELECT tenant_id,request_id,session_id
+  FROM turn_admission_intents
+  WHERE tenant_id=$1::uuid
+    AND state='preparing'
+    AND preparation_lease_expires_at IS NOT NULL
+    AND preparation_lease_expires_at <= now()
+  ORDER BY preparation_lease_expires_at ASC,created_at ASC
+  FOR UPDATE SKIP LOCKED
+  LIMIT 100
+), transitioned AS (
+  UPDATE turn_admission_intents i
+  SET state='expired',
+      preparation_lease_expires_at=NULL,
+      preparation_ms=COALESCE(
+        preparation_ms,
+        GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-COALESCE(preparation_started_at,created_at)))*1000)::integer)
+      ),
+      terminal_reason_code='preparation_lease_expired',
+      terminal_at=COALESCE(terminal_at,now()),
+      updated_at=now()
+  FROM candidates c
+  WHERE i.tenant_id=c.tenant_id AND i.request_id=c.request_id
+    AND i.state='preparing'
+  RETURNING i.request_id,i.session_id
+)
+SELECT request_id,session_id FROM transitioned
+      `.trim(),
+      [tenantId],
+    );
+    if (expired.length === 0) return;
+    await executor.execute(
+      `
+UPDATE tasks t
+SET status='queued',updated_at=now()
+FROM sessions s
+JOIN turn_admission_intents i
+  ON i.tenant_id=s.tenant_id AND i.session_id=s.id AND i.state='expired'
+WHERE s.tenant_id=$1::uuid
+  AND t.tenant_id=s.tenant_id AND t.id=s.task_id
+  AND i.request_id = ANY($2::text[])
+  AND i.preparation_lease_expires_at IS NULL
+  AND i.terminal_reason_code='preparation_lease_expired'
+  AND t.status IN ('queued','running')
+  AND NOT EXISTS (
+    SELECT 1 FROM turn_runs r
+    WHERE r.tenant_id=t.tenant_id AND r.session_id=s.id
+      AND r.state NOT IN ('completed','failed','cancelled','recovery_required')
+  )
+      `.trim(),
+      [tenantId, expired.map((item) => item.request_id)],
+    );
+    for (const item of expired) {
+      const reservations = await executor.query<{
+        id: string;
+        user_id: string | null;
+        department_id: string | null;
+        reserved_micros: string;
+      }>(
+        `
+UPDATE budget_reservations
+SET actual_cost_micros=0,status='reconciled',
+    block_reason='admission_preparation_lease_expired',updated_at=now()
+WHERE tenant_id=$1::uuid AND request_id=$2 AND status='reserved'
+RETURNING id,user_id,department_id,reserved_micros::text
+        `.trim(),
+        [tenantId, item.request_id],
+      );
+      const reservation = reservations[0];
+      if (!reservation) continue;
+      const scopes = [
+        { type: "org", id: tenantId },
+        ...(reservation.department_id ? [{ type: "department", id: reservation.department_id }] : []),
+        ...(reservation.user_id ? [{ type: "user", id: reservation.user_id }] : []),
+      ];
+      for (const scope of scopes) {
+        const prior = await executor.query<{ total: string }>(
+          `
+SELECT COALESCE(SUM(amount_micros),0)::text AS total
+FROM credit_ledger_entries
+WHERE tenant_id=$1::uuid AND scope_type=$2 AND scope_id=$3
+          `.trim(),
+          [tenantId, scope.type, scope.id],
+        );
+        const adjustment = -safeBigInt(reservation.reserved_micros);
+        const balanceAfter = safeBigInt(prior[0]?.total) + adjustment;
+        await executor.execute(
+          `
+INSERT INTO credit_ledger_entries (
+  tenant_id,scope_type,scope_id,reservation_id,request_id,kind,
+  amount_micros,balance_after_micros,metadata
+) VALUES ($1::uuid,$2,$3,$4::uuid,$5,'reconcile',$6,$7,$8::jsonb)
+ON CONFLICT (tenant_id,request_id,scope_type,scope_id,kind) DO NOTHING
+          `.trim(),
+          [
+            tenantId,
+            scope.type,
+            scope.id,
+            reservation.id,
+            item.request_id,
+            adjustment.toString(),
+            balanceAfter.toString(),
+            JSON.stringify({ reason: "admission_preparation_lease_expired", sessionId: item.session_id }),
+          ],
+        );
+      }
+    }
+  }
+
   private async complete(row: OutboxRow): Promise<void> {
     await this.withTenant(row.tenant_id, async (executor) => {
       await executor.execute(`
@@ -356,4 +469,12 @@ function outboxJobPriority(name: BerryWorkerJobName): number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeBigInt(value: unknown): bigint {
+  try {
+    return BigInt(typeof value === "string" || typeof value === "number" ? value : 0);
+  } catch {
+    return 0n;
+  }
 }

@@ -116,6 +116,7 @@ export interface DurableTurnSnapshot {
   requestMessageId: string | null;
   state: TurnRunState;
   attempt: number;
+  ownershipGeneration?: number;
   version: number;
   leaseOwner: string;
   cancelledAt: string | null;
@@ -254,7 +255,7 @@ export interface DurableTurnMutation {
 
 export interface DurableTurnRepository {
   claim(input: TurnExecuteJobPayload | TurnResumeJobPayload, owner: string, leaseSeconds: number): Promise<DurableTurnSnapshot | null>;
-  heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number): Promise<boolean>;
+  heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number, ownershipGeneration?: number): Promise<boolean>;
   reserveNextModelCall?(snapshot: DurableTurnSnapshot, estimatedCostMicros: string): Promise<{ allowed: boolean; reason: string | null }>;
   appendEvents(snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void>;
   commit(snapshot: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void>;
@@ -751,6 +752,7 @@ export class DurableTurnRunner {
       snapshot.id,
       snapshot.leaseOwner,
       this.options.leaseSeconds ?? 90,
+      snapshot.ownershipGeneration,
     ));
     if (freshCancelled) throw new DurableTurnRetryableError("Turn lease was lost after the model request");
 
@@ -989,6 +991,7 @@ export class DurableTurnRunner {
       snapshot.id,
       snapshot.leaseOwner,
       this.options.leaseSeconds ?? 90,
+      snapshot.ownershipGeneration,
     );
     if (!retained) throw new DurableTurnRetryableError("Turn lease was lost after compaction");
     await this.commitAndWake(snapshot, {
@@ -1049,10 +1052,17 @@ export class DurableTurnRunner {
       const first = questions[0];
       if (!first) throw new DurableTurnTerminalError("ask_user_question requires at least one valid question");
       const questionId = randomUUID();
+      const supersededToolSteps = snapshot.steps
+        .filter((candidate) => candidate.id !== step.id && isRunnableToolStep(candidate))
+        .map((candidate) => ({
+          ...candidate,
+          state: "cancelled" as const,
+          error: "superseded_by_question",
+        }));
       await this.repository.commit(snapshot, {
         expectedState: "executing_tool",
         nextState: "waiting",
-        steps: [{ ...step, state: "waiting" }],
+        steps: [{ ...step, state: "waiting" }, ...supersededToolSteps],
         question: {
           id: questionId,
           stepId: step.id,
@@ -1879,6 +1889,7 @@ export class DurableTurnRunner {
           snapshot.id,
           snapshot.leaseOwner,
           leaseSeconds,
+          snapshot.ownershipGeneration,
         );
         if (!retained) {
           heartbeatFailure = new DurableTurnRetryableError("Turn lease was lost during a long-running operation");
@@ -2209,6 +2220,7 @@ SET lease_owner = $3,
     lease_expires_at = now() + ($4::text || ' seconds')::interval,
     heartbeat_at = now(),
     attempt = attempt + 1,
+    ownership_generation = ownership_generation + 1,
     updated_at = now()
 WHERE tenant_id = $1::uuid AND id = $2::uuid
   AND state NOT IN ('completed', 'failed', 'cancelled', 'recovery_required')
@@ -2219,7 +2231,8 @@ RETURNING *
     );
     const run = runs[0];
     if (!run) return null;
-    const [steps, entries, approvals, previousManifests, checkpoints, usageTotals] = await Promise.all([
+    try {
+      const [steps, entries, approvals, previousManifests, checkpoints, usageTotals] = await Promise.all([
       this.executor.query<StepRow>(
         "SELECT * FROM turn_steps WHERE tenant_id = $1::uuid AND run_id = $2::uuid ORDER BY sequence ASC",
         [input.tenantId, input.runId],
@@ -2297,11 +2310,25 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
         `.trim(),
         [input.tenantId, input.runId],
       ),
-    ]);
-    return mapSnapshot(run, owner, steps, entries, approvals, usageTotals[0], previousManifests[0], checkpoints[0]);
+      ]);
+      return mapSnapshot(run, owner, steps, entries, approvals, usageTotals[0], previousManifests[0], checkpoints[0]);
+    } catch (error) {
+      // A claim is not usable until hydration has completed. If any read fails,
+      // release this exact generation so another worker can retry it safely.
+      await this.executor.execute(
+        `
+UPDATE turn_runs
+SET lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+  AND lease_owner=$3 AND ownership_generation=$4
+        `.trim(),
+        [input.tenantId, input.runId, owner, run.ownership_generation],
+      ).catch(() => undefined);
+      throw error;
+    }
   }
 
-  async heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number): Promise<boolean> {
+  async heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number, ownershipGeneration?: number): Promise<boolean> {
     const rows = await this.executor.query<{ id: string }>(
       `
 UPDATE turn_runs
@@ -2310,9 +2337,10 @@ SET heartbeat_at = now(),
     updated_at = now()
 WHERE tenant_id = $1::uuid AND id = $2::uuid AND lease_owner = $3
   AND cancelled_at IS NULL
+  AND ($5::bigint IS NULL OR ownership_generation=$5::bigint)
 RETURNING id
       `.trim(),
-      [tenantId, runId, owner, leaseSeconds],
+      [tenantId, runId, owner, leaseSeconds, ownershipGeneration ?? null],
     );
     return Boolean(rows[0]);
   }
@@ -2325,9 +2353,10 @@ RETURNING id
 SELECT state,cancelled_at FROM turn_runs
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
   AND lease_expires_at > now()
+  AND ($4::bigint IS NULL OR ownership_generation=$4::bigint)
 FOR UPDATE
         `.trim(),
-        [snapshot.tenantId, snapshot.id, snapshot.leaseOwner],
+        [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, snapshot.ownershipGeneration ?? null],
       );
       if (!locked[0]) throw new DurableTurnRetryableError("Turn lease expired while streaming model output");
       if (locked[0].cancelled_at) throw new DurableTurnRetryableError("Turn was cancelled while streaming model output");
@@ -2347,9 +2376,10 @@ FOR UPDATE
 SELECT state,cancelled_at FROM turn_runs
 WHERE tenant_id = $1::uuid AND id = $2::uuid AND lease_owner = $3
   AND lease_expires_at > now()
+  AND ($4::bigint IS NULL OR ownership_generation=$4::bigint)
 FOR UPDATE
         `.trim(),
-        [snapshot.tenantId, snapshot.id, snapshot.leaseOwner],
+        [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, snapshot.ownershipGeneration ?? null],
       );
       if (!locked[0]) throw new DurableTurnRetryableError("Turn lease expired before state persistence");
       if (locked[0].state !== mutation.expectedState) {
@@ -2404,8 +2434,9 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
 UPDATE turn_runs
 SET sandbox_provider=$4,sandbox_id=$5,sandbox_state=$6,sandbox_heartbeat_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
+  AND ($7::bigint IS NULL OR ownership_generation=$7::bigint)
           `.trim(),
-          [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, mutation.sandbox.provider, mutation.sandbox.id, mutation.sandbox.state],
+          [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, mutation.sandbox.provider, mutation.sandbox.id, mutation.sandbox.state, snapshot.ownershipGeneration ?? null],
         );
       }
       await executor.execute(
@@ -2422,6 +2453,7 @@ SET state=$4,
     lease_expires_at=CASE WHEN $8::boolean THEN lease_expires_at ELSE NULL END,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
+  AND ($10::bigint IS NULL OR ownership_generation=$10::bigint)
         `.trim(),
         [
           snapshot.tenantId,
@@ -2433,8 +2465,12 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
           mutation.error ?? null,
           mutation.keepLease ?? false,
           mutation.promptManifest ? JSON.stringify(mutation.promptManifest) : null,
+          snapshot.ownershipGeneration ?? null,
         ],
       );
+      if (TERMINAL_STATES.has(mutation.nextState)) {
+        await closeTerminalChildren(executor, snapshot, mutation.nextState);
+      }
       if (mutation.taskStatus) {
         await executor.execute(
           `UPDATE tasks
@@ -2448,12 +2484,17 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
           [snapshot.tenantId, snapshot.taskId, mutation.taskStatus],
         );
       }
-      if (mutation.nextState === "completed" || mutation.nextState === "failed" || mutation.nextState === "cancelled") {
+      if (mutation.nextState === "completed"
+        || mutation.nextState === "failed"
+        || mutation.nextState === "cancelled"
+        || mutation.nextState === "recovery_required") {
         await finalizeUsageAndBudget(executor, snapshot, mutation.nextState);
       }
       if (mutation.nextState === "completed") {
         await promoteQueuedFollowUp(executor, snapshot);
-      } else if (mutation.nextState === "failed" || mutation.nextState === "cancelled") {
+      } else if (mutation.nextState === "failed"
+        || mutation.nextState === "cancelled"
+        || mutation.nextState === "recovery_required") {
         // A user-visible failure/cancellation pauses the queue. The next item
         // must never race an interrupted turn; the user can explicitly retry
         // or resume it from another tab/device.
@@ -2497,7 +2538,8 @@ WITH released AS (
   UPDATE turn_runs
   SET lease_owner=NULL,lease_expires_at=NULL,
       error=COALESCE($4,error),updated_at=now()
-  WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
+  AND ($7::bigint IS NULL OR ownership_generation=$7::bigint)
   RETURNING id
 )
 UPDATE turn_steps
@@ -2514,6 +2556,7 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$6::uuid
           error?.slice(0, 4_000) ?? null,
           JSON.stringify(retryDiagnostics.providerDiagnostics),
           retryDiagnostics.stepId,
+          snapshot.ownershipGeneration ?? null,
         ],
       );
       return;
@@ -2524,8 +2567,9 @@ UPDATE turn_runs
 SET lease_owner=NULL,lease_expires_at=NULL,
     error=COALESCE($4,error),updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
+  AND ($5::bigint IS NULL OR ownership_generation=$5::bigint)
       `.trim(),
-      [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, error?.slice(0, 4_000) ?? null],
+      [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, error?.slice(0, 4_000) ?? null, snapshot.ownershipGeneration ?? null],
     );
   }
 }
@@ -5013,7 +5057,16 @@ async function appendEvents(
     const event = AgentStreamEventSchema.parse(raw);
     sequence += 1;
     await executor.execute(
-      `
+      event.kind === "turn.end"
+        ? `
+INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+SELECT $1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb
+WHERE NOT EXISTS (
+  SELECT 1 FROM turn_events
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='turn.end'
+)
+        `.trim()
+        : `
 INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
 VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb)
 ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
@@ -5023,10 +5076,96 @@ ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
   }
 }
 
+async function closeTerminalChildren(
+  executor: SqlExecutor,
+  snapshot: DurableTurnSnapshot,
+  terminalState: TurnRunState,
+): Promise<void> {
+  const stepState = terminalState === "failed" || terminalState === "recovery_required" ? "failed" : "cancelled";
+  await executor.execute(
+    `
+UPDATE turn_steps
+SET state=CASE
+      WHEN $3='recovery_required' AND state='recovery_required' THEN state
+      ELSE $4
+    END,
+    error=CASE
+      WHEN error IS NOT NULL THEN error
+      ELSE CASE WHEN $3 IN ('failed','recovery_required') THEN 'Closed with terminal run' ELSE 'Cancelled with terminal run' END
+    END,
+    completed_at=COALESCE(completed_at,now()),
+    closure_reason=COALESCE(closure_reason,'terminal_run'),
+    closed_at=COALESCE(closed_at,now()),
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND state IN ('pending','running','waiting')
+    `.trim(),
+    [snapshot.tenantId, snapshot.id, terminalState, stepState],
+  );
+  await executor.execute(
+    `
+UPDATE tool_calls
+SET status=CASE
+      WHEN $3='recovery_required' AND status='running' THEN 'failed'::tool_call_status
+      WHEN status IN ('pending','waiting-for-approval','running') THEN $4::tool_call_status
+      ELSE status
+    END,
+    completed_at=CASE
+      WHEN status IN ('pending','waiting-for-approval','running') THEN COALESCE(completed_at,now())
+      ELSE completed_at
+    END,
+    closure_reason=CASE
+      WHEN status IN ('pending','waiting-for-approval','running') THEN COALESCE(closure_reason,'terminal_run')
+      ELSE closure_reason
+    END,
+    closed_at=CASE
+      WHEN status IN ('pending','waiting-for-approval','running') THEN COALESCE(closed_at,now())
+      ELSE closed_at
+    END,
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND status IN ('pending','waiting-for-approval','running')
+    `.trim(),
+    [snapshot.tenantId, snapshot.id, terminalState, terminalState === "failed" ? "failed" : "cancelled"],
+  );
+  await executor.execute(
+    `
+UPDATE approvals
+SET status='expired',
+    decided_at=COALESCE(decided_at,now()),
+    closure_reason=COALESCE(closure_reason,'terminal_run'),
+    closed_at=COALESCE(closed_at,now())
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'
+    `.trim(),
+    [snapshot.tenantId, snapshot.id],
+  );
+  await executor.execute(
+    `
+UPDATE turn_questions
+SET status='cancelled',
+    closure_reason=COALESCE(closure_reason,'terminal_run'),
+    closed_at=COALESCE(closed_at,now())
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'
+    `.trim(),
+    [snapshot.tenantId, snapshot.id],
+  );
+  await executor.execute(
+    `
+UPDATE runtime_outbox
+SET completed_at=COALESCE(completed_at,now()),
+    lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND aggregate_id=$2
+  AND event_type IN ('turn.execute','turn.resume')
+  AND completed_at IS NULL
+    `.trim(),
+    [snapshot.tenantId, snapshot.id],
+  );
+}
+
 async function finalizeUsageAndBudget(
   executor: SqlExecutor,
   snapshot: DurableTurnSnapshot,
-  status: "completed" | "failed" | "cancelled",
+  status: "completed" | "failed" | "cancelled" | "recovery_required",
 ): Promise<void> {
   const requestId = stringValue(snapshot.runtimeRequest.requestId) ?? `turn_${snapshot.id}`;
   const usage = await executor.query<{
@@ -5270,6 +5409,7 @@ function mapSnapshot(
     requestMessageId: run.request_message_id,
     state: run.state,
     attempt: run.attempt,
+    ownershipGeneration: Number(run.ownership_generation ?? 0),
     version: run.version ?? 0,
     leaseOwner: owner,
     cancelledAt: dateString(run.cancelled_at),
@@ -5450,6 +5590,7 @@ interface RunRow {
   request_message_id: string | null;
   state: TurnRunState;
   attempt: number;
+  ownership_generation: number | string;
   version: number | null;
   cancelled_at: Date | string | null;
   runtime_request: unknown;

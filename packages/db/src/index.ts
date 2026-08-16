@@ -835,6 +835,7 @@ export const turnRuns = pgTable("turn_runs", {
   requestMessageId: uuid("request_message_id").references(() => messages.id, { onDelete: "set null" }),
   state: text("state").notNull().default("queued"),
   attempt: integer("attempt").notNull().default(0),
+  ownershipGeneration: bigint("ownership_generation", { mode: "number" }).notNull().default(0),
   version: integer("version").notNull().default(0),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
@@ -906,6 +907,11 @@ export const turnAdmissionIntents = pgTable("turn_admission_intents", {
   state: text("state").notNull().default("preparing"),
   runId: uuid("run_id").references(() => turnRuns.id, { onDelete: "set null" }),
   preparationMs: integer("preparation_ms"),
+  preparationStartedAt: timestamp("preparation_started_at", { withTimezone: true }),
+  preparationLeaseExpiresAt: timestamp("preparation_lease_expires_at", { withTimezone: true }),
+  preparationAttempt: integer("preparation_attempt").notNull().default(0),
+  terminalReasonCode: text("terminal_reason_code"),
+  terminalAt: timestamp("terminal_at", { withTimezone: true }),
   admittedAt: timestamp("admitted_at", { withTimezone: true }),
   cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
   createdAt,
@@ -931,6 +937,8 @@ export const turnSteps = pgTable("turn_steps", {
   checkpointId: uuid("checkpoint_id"),
   attempt: integer("attempt").notNull().default(0),
   error: text("error"),
+  closureReason: text("closure_reason"),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   createdAt,
@@ -1033,6 +1041,8 @@ export const toolCalls = pgTable("tool_calls", {
   approvalId: uuid("approval_id"),
   retryClass: text("retry_class"),
   idempotencyKey: text("idempotency_key"),
+  closureReason: text("closure_reason"),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   createdAt,
@@ -1058,6 +1068,8 @@ export const approvals = pgTable("approvals", {
   createdAt,
   decidedAt: timestamp("decided_at", { withTimezone: true }),
   expiresAt: timestamp("expires_at", { withTimezone: true }),
+  closureReason: text("closure_reason"),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
 }, (table) => [
   index("approvals_tenant_status_created_idx").on(table.tenantId, table.status, table.createdAt),
   index("approvals_tenant_task_idx").on(table.tenantId, table.taskId),
@@ -1078,6 +1090,8 @@ export const turnQuestions = pgTable("turn_questions", {
   answer: jsonb("answer").$type<JsonValue>(),
   createdAt,
   answeredAt: timestamp("answered_at", { withTimezone: true }),
+  closureReason: text("closure_reason"),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
 }, (table) => [
   index("turn_questions_session_status_idx").on(table.tenantId, table.sessionId, table.status, table.createdAt),
   index("turn_questions_run_idx").on(table.tenantId, table.runId, table.createdAt),
@@ -4878,6 +4892,50 @@ CREATE INDEX IF NOT EXISTS queued_follow_up_task_idx
 ${tenantRlsSql("queued_follow_up_items")}
 `.trim();
 
+export const AGENT_HARNESS_CONVERGENCE_MIGRATION = `
+ALTER TABLE turn_admission_intents
+  ADD COLUMN IF NOT EXISTS preparation_started_at timestamptz,
+  ADD COLUMN IF NOT EXISTS preparation_lease_expires_at timestamptz,
+  ADD COLUMN IF NOT EXISTS preparation_attempt integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS terminal_reason_code text,
+  ADD COLUMN IF NOT EXISTS terminal_at timestamptz;
+
+ALTER TABLE turn_admission_intents
+  DROP CONSTRAINT IF EXISTS turn_admission_intents_state_check;
+ALTER TABLE turn_admission_intents
+  ADD CONSTRAINT turn_admission_intents_state_check
+  CHECK (state IN ('preparing','admitted','retryable','rejected','expired','cancelled'));
+
+UPDATE turn_admission_intents
+SET preparation_started_at = COALESCE(preparation_started_at, created_at),
+    preparation_lease_expires_at = COALESCE(
+      preparation_lease_expires_at,
+      created_at + interval '5 minutes'
+    )
+WHERE state = 'preparing';
+
+CREATE INDEX IF NOT EXISTS turn_admission_intents_preparation_expiry_idx
+  ON turn_admission_intents (tenant_id, state, preparation_lease_expires_at);
+
+ALTER TABLE turn_runs
+  ADD COLUMN IF NOT EXISTS ownership_generation bigint NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS turn_runs_ownership_generation_idx
+  ON turn_runs (tenant_id, id, ownership_generation);
+
+ALTER TABLE turn_steps
+  ADD COLUMN IF NOT EXISTS closure_reason text,
+  ADD COLUMN IF NOT EXISTS closed_at timestamptz;
+ALTER TABLE tool_calls
+  ADD COLUMN IF NOT EXISTS closure_reason text,
+  ADD COLUMN IF NOT EXISTS closed_at timestamptz;
+ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS closure_reason text,
+  ADD COLUMN IF NOT EXISTS closed_at timestamptz;
+ALTER TABLE turn_questions
+  ADD COLUMN IF NOT EXISTS closure_reason text,
+  ADD COLUMN IF NOT EXISTS closed_at timestamptz;
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5018,4 +5076,5 @@ export const cloudMigrations = [
     onlineSql: ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS,
   },
   { id: 57, name: "queued_follow_ups_server_owned_v1", sql: QUEUED_FOLLOW_UPS_MIGRATION },
+  { id: 58, name: "agent_harness_convergence_v1", sql: AGENT_HARNESS_CONVERGENCE_MIGRATION },
 ] as const;

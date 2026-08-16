@@ -7,6 +7,7 @@ export * from "./checkpoint.ts";
 export * from "./retrieval.ts";
 export * from "./memory.ts";
 export * from "./agent-skill-content.ts";
+export * from "./durable-job-contracts.ts";
 
 /**
  * Pre-1.0 host protocol version shared by desktop, host, CLI, and future

@@ -1631,9 +1631,21 @@ describe("durable turn runner", () => {
         approvalKind: "file-edit",
       },
     } satisfies DurableTurnStep;
+    const supersededStep = {
+      ...toolStep("pending", "read_only", false),
+      type: "tool.read",
+      input: {
+        toolCallId: "read_call_superseded",
+        toolName: "read",
+        arguments: { path: "notes.txt" },
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    } satisfies DurableTurnStep;
     const repository = new FakeTurnRepository(snapshot("executing_tool", [
       admittedStep(),
       questionStep,
+      supersededStep,
     ]));
     const runner = new DurableTurnRunner(repository, unusedModel(), noTools(), {
       owner: "worker-question",
@@ -1652,6 +1664,9 @@ describe("durable turn runner", () => {
       ],
     }));
     expect(repository.current.state).toBe("waiting");
+    expect(repository.mutations.at(-1)?.steps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: supersededStep.id, state: "cancelled", error: "superseded_by_question" }),
+    ]));
     expect(repository.outbox).toContainEqual(expect.objectContaining({
       eventType: "sandbox.snapshot",
     }));
@@ -2423,6 +2438,7 @@ describe("durable turn runner", () => {
       "Provider request failed with 503",
       JSON.stringify(diagnostics),
       modelCall.id,
+      null,
     ]);
   });
 });
