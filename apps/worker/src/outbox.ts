@@ -36,6 +36,8 @@ export class RuntimeOutboxDispatcher {
       terminalCleanupIntervalMs?: number;
       terminalCleanupBatchSize?: number;
       deliveryReceiptRetryMs?: number;
+      enableWaitExpiry?: boolean;
+      enableTerminalFinalization?: boolean;
     },
   ) {}
 
@@ -61,6 +63,12 @@ export class RuntimeOutboxDispatcher {
       const runTerminalCleanup = this.terminalCleanupDue();
       for (const tenantId of tenantIds) {
         await this.withTenant(tenantId, (executor) => this.recoverExpiredAdmissions(executor, tenantId));
+        if (this.options.enableWaitExpiry) {
+          await this.withTenant(tenantId, (executor) => this.superviseWaits(executor, tenantId));
+        }
+        if (this.options.enableTerminalFinalization) {
+          await this.withTenant(tenantId, (executor) => this.enqueuePendingFinalizations(executor, tenantId));
+        }
         await this.withTenant(tenantId, (executor) => executor.execute(`
         INSERT INTO runtime_outbox (
           tenant_id,event_type,aggregate_id,dedupe_key,payload,available_at
@@ -330,6 +338,78 @@ ON CONFLICT (tenant_id,request_id,scope_type,scope_id,kind) DO NOTHING
     }
   }
 
+  private async superviseWaits(executor: SqlExecutor, tenantId: string): Promise<void> {
+    const questionReminders = await executor.query<{ id: string; run_id: string; session_id: string; reminder_count: number | string }>(
+      `
+UPDATE turn_questions
+SET reminder_count=reminder_count+1,last_reminded_at=now(),
+    reminder_at=CASE WHEN reminder_count=0 THEN now()+interval '48 hours' ELSE NULL END,
+    updated_at=now()
+WHERE tenant_id=$1::uuid AND status='pending' AND reminder_at IS NOT NULL AND reminder_at<=now()
+RETURNING id,run_id,session_id,reminder_count
+      `.trim(),
+      [tenantId],
+    );
+    for (const reminder of questionReminders) {
+      await appendWaitEvent(executor, tenantId, reminder.run_id, reminder.session_id, {
+        kind: "question.reminded",
+        questionId: reminder.id,
+        reminderCount: Number(reminder.reminder_count),
+      });
+    }
+    const approvalReminders = await executor.query<{ id: string; run_id: string; session_id: string; reminder_count: number | string }>(
+      `
+UPDATE approvals
+SET reminder_count=reminder_count+1,last_reminded_at=now(),reminder_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND status='pending' AND reminder_at IS NOT NULL AND reminder_at<=now()
+RETURNING id,run_id,session_id,reminder_count
+      `.trim(),
+      [tenantId],
+    );
+    for (const reminder of approvalReminders) {
+      await appendWaitEvent(executor, tenantId, reminder.run_id, reminder.session_id, {
+        kind: "approval.reminded",
+        approvalId: reminder.id,
+        reminderCount: Number(reminder.reminder_count),
+      });
+    }
+  }
+
+  private async enqueuePendingFinalizations(executor: SqlExecutor, tenantId: string): Promise<void> {
+    await executor.execute(
+      `
+UPDATE turn_finalizations
+SET status='pending',lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND status='running' AND lease_expires_at<=now()
+      `.trim(),
+      [tenantId],
+    );
+    await executor.execute(
+      `
+INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+SELECT f.tenant_id,'sandbox.snapshot',f.run_id::text,
+       f.run_id::text || ':snapshot:finalization:' || (f.attempt+1)::text,
+       jsonb_build_object('tenantId',f.tenant_id::text,'runId',f.run_id::text,'reason','before-finalize')
+FROM turn_finalizations f
+JOIN turn_runs r ON r.tenant_id=f.tenant_id AND r.id=f.run_id
+WHERE f.tenant_id=$1::uuid AND f.status IN ('pending','failed','partial')
+  AND r.state IN ('completed','failed','cancelled','recovery_required')
+  AND r.sandbox_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM runtime_outbox pending
+    WHERE pending.tenant_id=f.tenant_id AND pending.aggregate_id=f.run_id::text
+      AND pending.event_type='sandbox.snapshot' AND pending.completed_at IS NULL
+      AND COALESCE(pending.payload->>'reason','interval')='before-finalize'
+  )
+ON CONFLICT (tenant_id,dedupe_key) DO UPDATE
+SET completed_at=NULL,available_at=now(),lease_owner=NULL,lease_expires_at=NULL,
+    last_error=NULL,updated_at=now()
+WHERE runtime_outbox.completed_at IS NOT NULL
+      `.trim(),
+      [tenantId],
+    );
+  }
+
   private async complete(row: OutboxRow): Promise<void> {
     await this.withTenant(row.tenant_id, async (executor) => {
       await executor.execute(`
@@ -477,4 +557,34 @@ function safeBigInt(value: unknown): bigint {
   } catch {
     return 0n;
   }
+}
+
+async function appendWaitEvent(
+  executor: SqlExecutor,
+  tenantId: string,
+  runId: string,
+  sessionId: string,
+  event: Record<string, unknown>,
+): Promise<void> {
+  const sequence = await executor.query<{ value: number | string }>(
+    "SELECT COALESCE(MAX(sequence),0)+1 AS value FROM turn_events WHERE tenant_id=$1::uuid AND run_id=$2::uuid",
+    [tenantId, runId],
+  );
+  const eventType = typeof event.kind === "string" ? event.kind : "error";
+  await executor.execute(
+    eventType === "turn.end"
+      ? `
+INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+SELECT $1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb
+WHERE NOT EXISTS (
+  SELECT 1 FROM turn_events WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='turn.end'
+)
+        `.trim()
+      : `
+INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb)
+ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
+        `.trim(),
+    [tenantId, runId, sessionId, Number(sequence[0]?.value ?? 1), eventType, JSON.stringify(event)],
+  );
 }

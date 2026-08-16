@@ -1329,6 +1329,177 @@ Result:
                 "properties": {
                   "kind": {
                     "type": "string",
+                    "const": "question.reminded"
+                  },
+                  "questionId": {
+                    "type": "string"
+                  },
+                  "reminderCount": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "required": [
+                  "kind",
+                  "questionId",
+                  "reminderCount"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "question.expired"
+                  },
+                  "questionId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "questionId"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "approval.reminded"
+                  },
+                  "approvalId": {
+                    "type": "string"
+                  },
+                  "reminderCount": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "required": [
+                  "kind",
+                  "approvalId",
+                  "reminderCount"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "approval.expired"
+                  },
+                  "approvalId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "approvalId"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "finalization.start"
+                  },
+                  "runId": {
+                    "type": "string"
+                  },
+                  "operationKey": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "runId",
+                  "operationKey"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "finalization.end"
+                  },
+                  "runId": {
+                    "type": "string"
+                  },
+                  "operationKey": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "complete",
+                      "partial",
+                      "skipped"
+                    ]
+                  },
+                  "itemCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "completedCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "failedCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "kind",
+                  "runId",
+                  "operationKey",
+                  "status",
+                  "itemCount",
+                  "completedCount",
+                  "failedCount"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "finalization.error"
+                  },
+                  "runId": {
+                    "type": "string"
+                  },
+                  "operationKey": {
+                    "type": "string"
+                  },
+                  "errorClass": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "kind",
+                  "runId",
+                  "operationKey",
+                  "errorClass"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
                     "const": "usage"
                   },
                   "inputTokens": {
@@ -1538,6 +1709,78 @@ Result:
                 "required": [
                   "kind",
                   "note"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "turn.progress"
+                  },
+                  "progressKind": {
+                    "type": "string",
+                    "enum": [
+                      "tool_progress",
+                      "result_repeated",
+                      "alternating_no_progress",
+                      "declared_polling",
+                      "repair_budget",
+                      "budget_exceeded"
+                    ]
+                  },
+                  "progressEpoch": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "consecutiveNoProgress": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "budgetReason": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "required": [
+                  "kind",
+                  "progressKind",
+                  "progressEpoch",
+                  "consecutiveNoProgress"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "phase.deadline_exceeded"
+                  },
+                  "phase": {
+                    "type": "string",
+                    "enum": [
+                      "tool",
+                      "model",
+                      "model_preparation",
+                      "compaction",
+                      "finalization",
+                      "generic"
+                    ]
+                  },
+                  "deadlineKind": {
+                    "type": "string",
+                    "enum": [
+                      "idle",
+                      "wall"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "phase",
+                  "deadlineKind"
                 ],
                 "additionalProperties": false
               },

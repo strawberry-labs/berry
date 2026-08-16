@@ -848,6 +848,8 @@ export const turnRuns = pgTable("turn_runs", {
   progressBudgetReason: text("progress_budget_reason"),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  waitingStartedAt: timestamp("waiting_started_at", { withTimezone: true }),
+  humanWaitMs: bigint("human_wait_ms", { mode: "number" }).notNull().default(0),
   nextAction: text("next_action"),
   waitingReason: text("waiting_reason"),
   heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
@@ -1084,6 +1086,11 @@ export const approvals = pgTable("approvals", {
   createdAt,
   decidedAt: timestamp("decided_at", { withTimezone: true }),
   expiresAt: timestamp("expires_at", { withTimezone: true }),
+  reminderAt: timestamp("reminder_at", { withTimezone: true }),
+  reminderCount: integer("reminder_count").notNull().default(0),
+  lastRemindedAt: timestamp("last_reminded_at", { withTimezone: true }),
+  expiredAt: timestamp("expired_at", { withTimezone: true }),
+  expiryPolicy: text("expiry_policy").notNull().default("approval-24h"),
   closureReason: text("closure_reason"),
   closedAt: timestamp("closed_at", { withTimezone: true }),
 }, (table) => [
@@ -1106,11 +1113,63 @@ export const turnQuestions = pgTable("turn_questions", {
   answer: jsonb("answer").$type<JsonValue>(),
   createdAt,
   answeredAt: timestamp("answered_at", { withTimezone: true }),
+  reminderAt: timestamp("reminder_at", { withTimezone: true }),
+  reminderCount: integer("reminder_count").notNull().default(0),
+  lastRemindedAt: timestamp("last_reminded_at", { withTimezone: true }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  expiredAt: timestamp("expired_at", { withTimezone: true }),
+  expiryPolicy: text("expiry_policy").notNull().default("question-7d"),
+  resumeCount: integer("resume_count").notNull().default(0),
   closureReason: text("closure_reason"),
   closedAt: timestamp("closed_at", { withTimezone: true }),
 }, (table) => [
   index("turn_questions_session_status_idx").on(table.tenantId, table.sessionId, table.status, table.createdAt),
   index("turn_questions_run_idx").on(table.tenantId, table.runId, table.createdAt),
+]);
+
+export const turnFinalizations = pgTable("turn_finalizations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => turnRuns.id, { onDelete: "cascade" }),
+  operationKey: text("operation_key").notNull(),
+  terminalState: text("terminal_state").notNull(),
+  status: text("status").notNull().default("pending"),
+  attempt: integer("attempt").notNull().default(0),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  manifest: jsonObject("manifest"),
+  itemCount: integer("item_count").notNull().default(0),
+  completedCount: integer("completed_count").notNull().default(0),
+  failedCount: integer("failed_count").notNull().default(0),
+  lastError: text("last_error"),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("turn_finalizations_run_unique").on(table.tenantId, table.runId),
+  uniqueIndex("turn_finalizations_operation_unique").on(table.tenantId, table.operationKey),
+  index("turn_finalizations_status_idx").on(table.tenantId, table.status, table.updatedAt),
+]);
+
+export const artifactOperations = pgTable("artifact_operations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().references(() => turnRuns.id, { onDelete: "cascade" }),
+  finalizationId: uuid("finalization_id").references(() => turnFinalizations.id, { onDelete: "cascade" }),
+  operationKey: text("operation_key").notNull(),
+  relativeKeyFingerprint: text("relative_key_fingerprint").notNull(),
+  sourcePath: text("source_path").notNull(),
+  status: text("status").notNull().default("pending"),
+  storageReceipt: jsonObject("storage_receipt"),
+  fileId: uuid("file_id").references(() => files.id, { onDelete: "set null" }),
+  verificationStatus: text("verification_status"),
+  errorClass: text("error_class"),
+  createdAt,
+  updatedAt,
+}, (table) => [
+  uniqueIndex("artifact_operations_key_unique").on(table.tenantId, table.runId, table.relativeKeyFingerprint),
+  index("artifact_operations_status_idx").on(table.tenantId, table.status, table.updatedAt),
 ]);
 
 export const usageEvents = pgTable("usage_events", {
@@ -1633,6 +1692,8 @@ export const cloudSchema = {
   toolCalls,
   approvals,
   turnQuestions,
+  turnFinalizations,
+  artifactOperations,
   usageEvents,
   usageRollups,
   budgetLimits,
@@ -1692,6 +1753,8 @@ export const CLOUD_SCHEMA_TABLES = [
   "tool_calls",
   "approvals",
   "turn_questions",
+  "turn_finalizations",
+  "artifact_operations",
   "usage_events",
   "usage_rollups",
   "audit_events",
@@ -4978,6 +5041,85 @@ CREATE INDEX IF NOT EXISTS turn_steps_result_fingerprint_idx
   WHERE result_fingerprint IS NOT NULL;
 `.trim();
 
+export const AGENT_HARNESS_WAIT_FINALIZATION_MIGRATION = `
+ALTER TABLE turn_runs
+  ADD COLUMN IF NOT EXISTS waiting_started_at timestamptz,
+  ADD COLUMN IF NOT EXISTS human_wait_ms bigint NOT NULL DEFAULT 0;
+UPDATE turn_runs
+SET waiting_started_at=COALESCE(waiting_started_at,updated_at)
+WHERE state='waiting' AND waiting_started_at IS NULL;
+
+ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS reminder_at timestamptz,
+  ADD COLUMN IF NOT EXISTS reminder_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_reminded_at timestamptz,
+  ADD COLUMN IF NOT EXISTS expired_at timestamptz,
+  ADD COLUMN IF NOT EXISTS expiry_policy text NOT NULL DEFAULT 'approval-24h';
+
+ALTER TABLE turn_questions
+  ADD COLUMN IF NOT EXISTS reminder_at timestamptz,
+  ADD COLUMN IF NOT EXISTS reminder_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_reminded_at timestamptz,
+  ADD COLUMN IF NOT EXISTS expires_at timestamptz,
+  ADD COLUMN IF NOT EXISTS expired_at timestamptz,
+  ADD COLUMN IF NOT EXISTS expiry_policy text NOT NULL DEFAULT 'question-7d',
+  ADD COLUMN IF NOT EXISTS resume_count integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS turn_questions_wait_due_idx
+  ON turn_questions (tenant_id, status, expires_at, reminder_at)
+  WHERE status='pending';
+CREATE INDEX IF NOT EXISTS approvals_wait_due_idx
+  ON approvals (tenant_id, status, expires_at, reminder_at)
+  WHERE status='pending';
+
+CREATE TABLE IF NOT EXISTS turn_finalizations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES turn_runs(id) ON DELETE CASCADE,
+  operation_key text NOT NULL,
+  terminal_state text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  attempt integer NOT NULL DEFAULT 0,
+  lease_owner text,
+  lease_expires_at timestamptz,
+  manifest jsonb,
+  item_count integer NOT NULL DEFAULT 0,
+  completed_count integer NOT NULL DEFAULT 0,
+  failed_count integer NOT NULL DEFAULT 0,
+  last_error text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, run_id),
+  UNIQUE (tenant_id, operation_key)
+);
+CREATE INDEX IF NOT EXISTS turn_finalizations_status_idx
+  ON turn_finalizations (tenant_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS artifact_operations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid NOT NULL REFERENCES turn_runs(id) ON DELETE CASCADE,
+  finalization_id uuid REFERENCES turn_finalizations(id) ON DELETE CASCADE,
+  operation_key text NOT NULL,
+  relative_key_fingerprint text NOT NULL,
+  source_path text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  storage_receipt jsonb,
+  file_id uuid REFERENCES files(id) ON DELETE SET NULL,
+  verification_status text,
+  error_class text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, run_id, relative_key_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS artifact_operations_status_idx
+  ON artifact_operations (tenant_id, status, updated_at);
+
+${tenantRlsSql("turn_finalizations")}
+${tenantRlsSql("artifact_operations")}
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5120,4 +5262,5 @@ export const cloudMigrations = [
   { id: 57, name: "queued_follow_ups_server_owned_v1", sql: QUEUED_FOLLOW_UPS_MIGRATION },
   { id: 58, name: "agent_harness_convergence_v1", sql: AGENT_HARNESS_CONVERGENCE_MIGRATION },
   { id: 59, name: "agent_harness_bounds_v1", sql: AGENT_HARNESS_BOUNDS_MIGRATION },
+  { id: 60, name: "agent_harness_wait_finalization_v1", sql: AGENT_HARNESS_WAIT_FINALIZATION_MIGRATION },
 ] as const;

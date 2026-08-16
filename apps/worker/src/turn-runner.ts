@@ -138,6 +138,8 @@ export interface DurableTurnSnapshot {
   version: number;
   leaseOwner: string;
   cancelledAt: string | null;
+  waitingStartedAt?: string | null;
+  humanWaitMs?: number;
   runtimeRequest: Record<string, unknown>;
   groundingContext: Record<string, unknown>;
   promptManifest: Record<string, unknown>;
@@ -722,7 +724,11 @@ export class DurableTurnRunner {
       );
     }
     const maxTurnDurationMs = Math.max(60_000, this.options.maxTurnDurationMs ?? 2 * 60 * 60 * 1_000);
-    if (Date.now() - Date.parse(snapshot.createdAt) > maxTurnDurationMs) {
+    const waitingMs = (snapshot.humanWaitMs ?? 0)
+      + (snapshot.waitingStartedAt && snapshot.state === "waiting"
+        ? Math.max(0, Date.now() - Date.parse(snapshot.waitingStartedAt))
+        : 0);
+    if (Date.now() - Date.parse(snapshot.createdAt) - waitingMs > maxTurnDurationMs) {
       const durationMinutes = Math.round(maxTurnDurationMs / 60_000);
       throw new DurableTurnTerminalError(
         `The task exceeded the ${durationMinutes}-minute execution safety limit. Berry stopped it to prevent an abandoned or looping task from blocking other work.`,
@@ -2917,6 +2923,15 @@ SET state=$4,
     waiting_reason=$6,
     error=$7,
     prompt_manifest=COALESCE($9::jsonb,prompt_manifest),
+    human_wait_ms=human_wait_ms+CASE
+      WHEN $4<>'waiting' AND waiting_started_at IS NOT NULL
+        THEN GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint)
+      ELSE 0
+    END,
+    waiting_started_at=CASE
+      WHEN $4='waiting' THEN COALESCE(waiting_started_at,now())
+      ELSE NULL
+    END,
     completed_at=CASE WHEN $4 IN ('completed','failed','cancelled','recovery_required') THEN now() ELSE NULL END,
     lease_owner=CASE WHEN $8::boolean THEN lease_owner ELSE NULL END,
     lease_expires_at=CASE WHEN $8::boolean THEN lease_expires_at ELSE NULL END,
@@ -2956,6 +2971,39 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
         ],
       );
       if (TERMINAL_STATES.has(mutation.nextState)) {
+        await executor.execute(
+          `
+INSERT INTO turn_finalizations (
+  tenant_id,run_id,operation_key,terminal_state,status,completed_at
+)
+SELECT tenant_id,id,id::text || ':finalization',$4,
+       CASE WHEN sandbox_id IS NULL THEN 'skipped' ELSE 'pending' END,
+       CASE WHEN sandbox_id IS NULL THEN now() ELSE NULL END
+FROM turn_runs
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+ON CONFLICT (tenant_id,run_id) DO UPDATE
+SET terminal_state=EXCLUDED.terminal_state,
+    updated_at=now()
+WHERE turn_finalizations.status IN ('pending','failed','partial')
+          `.trim(),
+          [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, mutation.nextState],
+        );
+        const finalizationOperationKey = `${snapshot.id}:finalization`;
+        const hasSandbox = Boolean(mutation.sandbox?.id ?? snapshot.sandboxId);
+        await appendEvents(executor, snapshot, [
+          { kind: "finalization.start", runId: snapshot.id, operationKey: finalizationOperationKey },
+          ...(!hasSandbox
+            ? [{
+                kind: "finalization.end" as const,
+                runId: snapshot.id,
+                operationKey: finalizationOperationKey,
+                status: "skipped" as const,
+                itemCount: 0,
+                completedCount: 0,
+                failedCount: 0,
+              }]
+            : []),
+        ]);
         await closeTerminalChildren(executor, snapshot, mutation.nextState);
       }
       if (mutation.taskStatus) {
@@ -5190,8 +5238,12 @@ async function insertApproval(
   await executor.execute(
     `
 INSERT INTO approvals (
-  id,tenant_id,task_id,session_id,run_id,step_id,tool_call_id,kind,status,request
-) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7::uuid,$8,'pending',$9::jsonb)
+  id,tenant_id,task_id,session_id,run_id,step_id,tool_call_id,kind,status,request,
+  reminder_at,expires_at,expiry_policy
+) VALUES (
+  $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7::uuid,$8,'pending',$9::jsonb,
+  now()+interval '1 hour',now()+interval '24 hours','approval-24h'
+)
 ON CONFLICT (id) DO NOTHING
     `.trim(),
     [
@@ -5225,10 +5277,10 @@ async function insertQuestion(
     `
 INSERT INTO turn_questions (
   id,tenant_id,run_id,session_id,step_id,tool_call_id,question,
-  options,questions,multi,status
+  options,questions,multi,status,reminder_at,expires_at,expiry_policy
 ) VALUES (
   $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,
-  $8::jsonb,$9::jsonb,$10,'pending'
+  $8::jsonb,$9::jsonb,$10,'pending',now()+interval '24 hours',now()+interval '7 days','question-7d'
 )
 ON CONFLICT (id) DO NOTHING
     `.trim(),
@@ -6086,6 +6138,8 @@ function mapSnapshot(
     version: run.version ?? 0,
     leaseOwner: owner,
     cancelledAt: dateString(run.cancelled_at),
+    waitingStartedAt: dateString(run.waiting_started_at),
+    humanWaitMs: Number(run.human_wait_ms ?? 0),
     runtimeRequest: record(run.runtime_request) ?? {},
     groundingContext: record(run.grounding_context) ?? {},
     promptManifest: record(run.prompt_manifest) ?? {},
@@ -6292,6 +6346,8 @@ interface RunRow {
   cumulative_active_compute_ms: number | string | null;
   progress_budget_reason: string | null;
   cancelled_at: Date | string | null;
+  waiting_started_at: Date | string | null;
+  human_wait_ms: number | string | null;
   runtime_request: unknown;
   grounding_context: unknown;
   prompt_manifest: unknown;

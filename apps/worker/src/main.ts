@@ -70,6 +70,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
       ttlSeconds: Math.min(positiveInteger(env.BERRY_SANDBOX_TTL_SECONDS) ?? 300, 300),
       maxInputBytes: durableConfig.sandboxInputMaxBytes,
+      enableTerminalFinalization: env.BERRY_TERMINAL_FINALIZATION_ENABLED?.trim().toLowerCase() === "true",
       ...(env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim() && env.BERRY_ROUTER_IMAGE_MODEL?.trim()
         ? {
             imageGeneration: {
@@ -225,6 +226,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
         ...(env.BERRY_TENANT_ID ? { tenantId: env.BERRY_TENANT_ID } : {}),
         workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
         pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 250,
+        enableWaitExpiry: env.BERRY_WAIT_EXPIRY_ENABLED?.trim().toLowerCase() === "true",
+        enableTerminalFinalization: env.BERRY_TERMINAL_FINALIZATION_ENABLED?.trim().toLowerCase() === "true",
       });
   await Promise.all([
     executor.query("SELECT 1"),

@@ -1504,6 +1504,10 @@ describe("SandboxContinuityManager", () => {
         sizeBytes: input.sizeBytes,
         objectKey: input.objectKey,
       })),
+      recordArtifactOperationStart: vi.fn(async (_input: { operationKey: string }) => undefined),
+      recordArtifactOperationStorage: vi.fn(async () => undefined),
+      completeArtifactOperation: vi.fn(async () => undefined),
+      failArtifactOperation: vi.fn(async () => undefined),
       persist: vi.fn(),
       recordSandbox: vi.fn(async () => undefined),
     } satisfies SandboxSnapshotRepository;
@@ -1590,6 +1594,10 @@ describe("SandboxContinuityManager", () => {
         sizeBytes: input.sizeBytes,
         objectKey: input.objectKey,
       })),
+      recordArtifactOperationStart: vi.fn(async (_input: { operationKey: string }) => undefined),
+      recordArtifactOperationStorage: vi.fn(async () => undefined),
+      completeArtifactOperation: vi.fn(async () => undefined),
+      failArtifactOperation: vi.fn(async () => undefined),
       persist: vi.fn(),
       recordSandbox: vi.fn(async () => undefined),
     } satisfies SandboxSnapshotRepository;
@@ -1631,6 +1639,72 @@ describe("SandboxContinuityManager", () => {
     expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({
       sourcePath: "/workspace/outputs/second/summary.txt",
     }));
+    expect(repository.recordArtifactOperationStart).toHaveBeenCalledTimes(2);
+    expect(repository.recordArtifactOperationStorage).toHaveBeenCalledTimes(2);
+    expect(repository.completeArtifactOperation).toHaveBeenCalledTimes(2);
+    expect(new Set(repository.recordArtifactOperationStart.mock.calls.map(([input]) => input.operationKey)).size).toBe(2);
+  });
+
+  it("surfaces terminal output listing failures and records finalization failure", async () => {
+    const base = snapshot();
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      exec: vi.fn(),
+      destroy: vi.fn(async () => ({ status: "stopped" })),
+      files: {
+        read: vi.fn(),
+        write: vi.fn(),
+        list: vi.fn(async (input: { path: string }) => {
+          if (input.path.endsWith("/outputs")) throw new Error("provider_listing_unavailable");
+          return { path: input.path, entries: [] };
+        }),
+      },
+    } as unknown as SandboxProvider;
+    const run = {
+      tenantId: base.tenantId,
+      userId: base.userId,
+      workspaceId: base.workspaceId,
+      runId: base.id,
+      sessionId: base.sessionId,
+      taskId: base.taskId,
+      sandboxProvider: "e2b",
+      sandboxId: "sandbox-terminal-finalizer",
+      sandboxState: "running",
+      runState: "failed",
+      sandboxClaimedByNewerRun: false,
+      sessionLeafId: null,
+    };
+    const repository = {
+      loadRun: vi.fn(async () => run),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      beginFinalization: vi.fn(async () => ({ id: "finalization-id", attempt: 1 })),
+      finishFinalization: vi.fn(async () => undefined),
+      failFinalization: vi.fn(async () => undefined),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      enableTerminalFinalization: true,
+    });
+
+    await expect(manager.snapshot({ tenantId: base.tenantId, runId: base.id, reason: "before-finalize" }))
+      .rejects.toThrow("provider_listing_unavailable");
+    expect(repository.failFinalization).toHaveBeenCalledWith(expect.objectContaining({
+      runId: base.id,
+      errorClass: "Error",
+    }));
+    expect(repository.finishFinalization).not.toHaveBeenCalled();
   });
 
   it("does not republish an unchanged output from an earlier turn", async () => {

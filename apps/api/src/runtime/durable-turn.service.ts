@@ -901,9 +901,10 @@ SET state=CASE
           task_id: string;
           session_id: string;
           request_message_id: string | null;
+          sandbox_id: string | null;
         }>(
           `
-SELECT id,task_id,session_id,request_message_id
+SELECT id,task_id,session_id,request_message_id,sandbox_id
 FROM turn_runs
 WHERE tenant_id=$1::uuid AND session_id=$2::uuid
   AND ($3::text IS NULL OR request_id=$3)
@@ -963,9 +964,10 @@ FOR UPDATE
           task_id: string;
           session_id: string;
           request_message_id: string | null;
+          sandbox_id: string | null;
         }>(
           `
-SELECT id,task_id,session_id,request_message_id
+SELECT id,task_id,session_id,request_message_id,sandbox_id
 FROM turn_runs
 WHERE tenant_id=$1::uuid AND task_id=$2::uuid
   AND state NOT IN ('completed','failed','cancelled','recovery_required')
@@ -1032,10 +1034,12 @@ ORDER BY a.created_at ASC
           step_id: string | null;
           tool_call_id: string | null;
           session_id: string;
+          task_id: string;
           status: string;
+          expires_at: Date | string | null;
         }>(
           `
-SELECT a.id,a.run_id,a.step_id,a.tool_call_id,r.session_id,a.status
+SELECT a.id,a.run_id,a.step_id,a.tool_call_id,r.session_id,a.task_id,a.status,a.expires_at
 FROM approvals a
 JOIN tasks t ON t.tenant_id=a.tenant_id AND t.id=a.task_id
 JOIN turn_runs r ON r.tenant_id=a.tenant_id AND r.id=a.run_id
@@ -1046,6 +1050,21 @@ FOR UPDATE OF a,r
         );
         const approval = rows[0];
         if (!approval || approval.status !== "pending") return false;
+        if (approval.expires_at && Date.parse(iso(approval.expires_at)) <= Date.now()) {
+          await transaction.execute(
+            `
+UPDATE approvals
+SET status='expired',expired_at=COALESCE(expired_at,now()),decided_at=COALESCE(decided_at,now()),
+    closure_reason=COALESCE(closure_reason,'approval_expired'),closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
+            `.trim(),
+            [tenantId, approvalId],
+          );
+          await appendDurableEvents(transaction, tenantId, approval.run_id, approval.session_id, [
+            { kind: "approval.expired", approvalId },
+          ]);
+          return false;
+        }
         const approved = !["denied", "deny", "abort"].includes(decision.decision);
         await transaction.execute(
           `
@@ -1069,10 +1088,19 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND run_id=$3::uuid
           `
 UPDATE turn_runs
 SET state='executing_tool',waiting_reason=NULL,next_action='Resume after approval',
-    lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+    human_wait_ms=human_wait_ms+CASE WHEN waiting_started_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint) END,
+    waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND state='waiting'
           `.trim(),
           [tenantId, approval.run_id],
+        );
+        await transaction.execute(
+          `
+UPDATE tasks
+SET status='running',updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+          `.trim(),
+          [tenantId, approval.task_id],
         );
         await appendDurableEvents(transaction, tenantId, approval.run_id, approval.session_id, [
           {
@@ -1173,10 +1201,11 @@ LIMIT 1
           run_state: string;
           task_id: string;
           created_at: Date | string;
+          expires_at: Date | string | null;
         }>(
           `
 SELECT q.id,q.run_id,q.session_id,q.step_id,q.tool_call_id,q.question,q.status,q.answer,
-       q.created_at,r.state AS run_state,r.task_id
+       q.created_at,q.expires_at,r.state AS run_state,r.task_id
 FROM turn_questions q
 JOIN turn_runs r ON r.tenant_id=q.tenant_id AND r.id=q.run_id
 JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
@@ -1206,6 +1235,17 @@ FOR UPDATE OF q,r
           return questionAnswersEquivalent(priorAnswer, submittedAnswer);
         }
         if (question.status !== "pending" || question.run_state !== "waiting" || !question.step_id) {
+          return false;
+        }
+        if (question.expires_at && Date.parse(iso(question.expires_at)) <= Date.now()) {
+          await expireQuestionTransaction(transaction, tenantId, {
+            id: question.id,
+            run_id: question.run_id,
+            session_id: question.session_id,
+            task_id: question.task_id,
+            step_id: question.step_id!,
+            tool_call_id: question.tool_call_id,
+          });
           return false;
         }
         const messageRows = await transaction.query<{ id: string }>(
@@ -1290,7 +1330,8 @@ VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'user','complete')
         await transaction.execute(
           `
 UPDATE turn_questions
-SET status='answered',answer=$3::jsonb,answered_at=now()
+SET status='answered',answer=$3::jsonb,answered_at=now(),closed_at=COALESCE(closed_at,now()),
+    resume_count=resume_count+1
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
           `.trim(),
           [tenantId, questionId, JSON.stringify(normalizedAnswer)],
@@ -1472,7 +1513,8 @@ INSERT INTO turn_steps (
           `
 UPDATE turn_runs
 SET state='calling_model',waiting_reason=NULL,next_action='Continue after user input',
-    lease_owner=NULL,lease_expires_at=NULL,version=version+1,updated_at=now()
+    human_wait_ms=human_wait_ms+CASE WHEN waiting_started_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint) END,
+    waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND state='waiting'
           `.trim(),
           [tenantId, question.run_id],
@@ -1809,7 +1851,7 @@ function validateAdmissionReplay(
 async function cancelActiveDurableRun(
   transaction: SqlExecutor,
   tenantId: string,
-  active: { id: string; task_id: string; session_id: string; request_message_id: string | null },
+  active: { id: string; task_id: string; session_id: string; request_message_id: string | null; sandbox_id: string | null },
 ): Promise<void> {
   const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
     `
@@ -1877,7 +1919,8 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
 UPDATE turn_runs
 SET state=CASE WHEN $3::boolean THEN 'recovery_required' ELSE 'cancelled' END,
     cancelled_at=now(),completed_at=now(),
-    lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
+    human_wait_ms=human_wait_ms+CASE WHEN waiting_started_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint) END,
+    waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,waiting_reason=NULL,next_action=NULL,
     version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
     `.trim(),
@@ -1895,6 +1938,45 @@ WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND completed_at IS NULL
     "UPDATE tasks SET status=$3::task_status,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
     [tenantId, active.task_id, ambiguous ? "failed" : "cancelled"],
   );
+  await transaction.execute(
+    `
+INSERT INTO turn_finalizations (tenant_id,run_id,operation_key,terminal_state,status,completed_at)
+VALUES ($1::uuid,$2::uuid,$2::text || ':finalization',$3,
+        CASE WHEN $4::boolean THEN 'pending' ELSE 'skipped' END,
+        CASE WHEN $4::boolean THEN NULL ELSE now() END)
+ON CONFLICT (tenant_id,run_id) DO NOTHING
+    `.trim(),
+    [tenantId, active.id, ambiguous ? "recovery_required" : "cancelled", Boolean(active.sandbox_id)],
+  );
+  if (active.sandbox_id) {
+    await transaction.execute(
+      `
+INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+VALUES ($1::uuid,'sandbox.snapshot',$2,$3,$4::jsonb)
+ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+      `.trim(),
+      [
+        tenantId,
+        active.id,
+        `${active.id}:snapshot:finalization`,
+        JSON.stringify({ tenantId, runId: active.id, reason: "before-finalize" }),
+      ],
+    );
+  }
+  await appendDurableEvents(transaction, tenantId, active.id, active.session_id, [
+    { kind: "finalization.start", runId: active.id, operationKey: `${active.id}:finalization` },
+    ...(!active.sandbox_id
+      ? [{
+          kind: "finalization.end" as const,
+          runId: active.id,
+          operationKey: `${active.id}:finalization`,
+          status: "skipped" as const,
+          itemCount: 0,
+          completedCount: 0,
+          failedCount: 0,
+        }]
+      : []),
+  ]);
   await reconcileTerminalUsage(transaction, tenantId, active.id, ambiguous ? "recovery_required" : "cancelled");
   await transaction.execute(
     `
@@ -1913,6 +1995,92 @@ WHERE tenant_id=$1::uuid AND id=$3::uuid
     `.trim(),
     [tenantId, active.id, active.session_id, Boolean(ambiguous)],
   );
+}
+
+async function expireQuestionTransaction(
+  transaction: SqlExecutor,
+  tenantId: string,
+  question: {
+    id: string;
+    run_id: string;
+    session_id: string;
+    task_id: string;
+    step_id: string;
+    tool_call_id: string | null;
+  },
+): Promise<void> {
+  const summary = "This question expired before it was answered. Start a follow-up turn if you still want to continue.";
+  const activeSiblings = await transaction.query<{ id: string }>(
+    `
+SELECT id
+FROM turn_steps
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id<>$3::uuid
+  AND state IN ('pending','running','waiting')
+LIMIT 1
+    `.trim(),
+    [tenantId, question.run_id, question.step_id],
+  );
+  await transaction.execute(
+    `
+UPDATE turn_questions
+SET status='expired',expired_at=COALESCE(expired_at,now()),closed_at=COALESCE(closed_at,now()),
+    closure_reason=COALESCE(closure_reason,'question_expired')
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
+    `.trim(),
+    [tenantId, question.id],
+  );
+  await transaction.execute(
+    `
+UPDATE turn_steps
+SET state='failed',error=COALESCE(error,$4),completed_at=COALESCE(completed_at,now()),
+    closure_reason=COALESCE(closure_reason,'question_expired'),closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
+    `.trim(),
+    [tenantId, question.run_id, question.step_id, summary],
+  );
+  if (question.tool_call_id) {
+    await transaction.execute(
+      `
+UPDATE tool_calls
+SET status='failed',completed_at=COALESCE(completed_at,now()),closure_reason=COALESCE(closure_reason,'question_expired'),
+    closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
+      `.trim(),
+      [tenantId, question.run_id, question.tool_call_id],
+    );
+  }
+  const nextState = activeSiblings.length > 0 ? "recovery_required" : "failed";
+  await projectTerminalAssistant(
+    transaction,
+    tenantId,
+    question.session_id,
+    question.task_id,
+    question.run_id,
+    "failed",
+    activeSiblings.length > 0
+      ? "The question expired while another durable operation was still active. Operator recovery is required."
+      : summary,
+  );
+  await appendDurableEvents(transaction, tenantId, question.run_id, question.session_id, [
+    { kind: "question.expired", questionId: question.id },
+    { kind: "error", message: summary },
+    { kind: "turn.end", turnId: question.run_id, status: "failed" },
+  ]);
+  await transaction.execute(
+    `
+UPDATE turn_runs
+SET state=$3,error=$4,next_action=NULL,waiting_reason=NULL,completed_at=COALESCE(completed_at,now()),
+    human_wait_ms=human_wait_ms+CASE WHEN waiting_started_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint) END,
+    waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,version=version+1,updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$2::uuid AND state='waiting'
+    `.trim(),
+    [tenantId, question.run_id, nextState, summary],
+  );
+  await transaction.execute(
+    "UPDATE tasks SET status='failed',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
+    [tenantId, question.task_id],
+  );
+  await reconcileTerminalUsage(transaction, tenantId, question.run_id, nextState);
 }
 
 export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentStreamEvent[] {

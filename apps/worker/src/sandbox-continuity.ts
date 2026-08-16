@@ -19,6 +19,7 @@ import type { ChatContentPart, ImageGenerationResult } from "@berry/router-clien
 import {
   DEFAULT_SANDBOX_INPUT_MAX_BYTES,
   ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
+  type AgentStreamEvent,
   type JsonValue,
 } from "@berry/shared";
 import { durableAttachmentPath } from "./durable-attachments.js";
@@ -264,6 +265,8 @@ interface SnapshotArchive {
 
 interface SnapshotRun {
   tenantId: string;
+  userId?: string;
+  workspaceId?: string;
   runId: string;
   sessionId: string;
   taskId: string;
@@ -315,6 +318,56 @@ export interface SandboxSnapshotRepository {
   continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null>;
   inputFiles(tenantId: string, runId: string, scope?: "turn" | "session"): Promise<readonly SandboxInputFile[]>;
   publishedOutputs?(tenantId: string, sessionId: string): Promise<readonly PublishedSandboxOutput[]>;
+  recordArtifactOperationStart?(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    relativeKeyFingerprint: string;
+    sourcePath: string;
+  }): Promise<void>;
+  recordArtifactOperationStorage?(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    storageReceipt: JsonValue;
+  }): Promise<void>;
+  completeArtifactOperation?(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    fileId: string;
+  }): Promise<void>;
+  failArtifactOperation?(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    errorClass: string;
+  }): Promise<void>;
+  beginFinalization?(input: {
+    tenantId: string;
+    runId: string;
+    owner: string;
+  }): Promise<{ id: string; attempt: number } | null>;
+  finishFinalization?(input: {
+    tenantId: string;
+    runId: string;
+    sessionId: string;
+    owner: string;
+    operationKey: string;
+    status: "complete" | "partial";
+    itemCount: number;
+    completedCount: number;
+    failedCount: number;
+    manifest: JsonValue;
+  }): Promise<void>;
+  failFinalization?(input: {
+    tenantId: string;
+    runId: string;
+    sessionId: string;
+    owner: string;
+    operationKey: string;
+    errorClass: string;
+  }): Promise<void>;
   persistOutput(input: {
     snapshot: DurableTurnSnapshot;
     fileId: string;
@@ -385,6 +438,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       intervalSnapshotTimeoutMs?: number;
       terminalSnapshotTimeoutMs?: number;
       terminalSuspendTimeoutMs?: number;
+      enableTerminalFinalization?: boolean;
       imageGeneration?: {
         endpoint: string;
         editsEndpoint: string;
@@ -1088,13 +1142,17 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     if (!snapshot.sandboxId || !this.objects) return [];
     const sandbox = await this.ensureSandbox(snapshot);
+    return this.finalizeSandboxOutputs(snapshot, sandbox);
+  }
+
+  private async finalizeSandboxOutputs(
+    snapshot: DurableTurnSnapshot,
+    sandbox: { provider: string; id: string; state: string },
+  ): Promise<readonly TurnToolResult[]> {
+    const objects = this.objects;
+    if (!objects) return [];
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    let listed;
-    try {
-      listed = await this.provider.files.list({ sandbox_id: sandbox.id, path: `${workspaceRoot}/outputs`, recursive: true });
-    } catch {
-      return [];
-    }
+    const listed = await this.provider.files.list({ sandbox_id: sandbox.id, path: `${workspaceRoot}/outputs`, recursive: true });
     const explicitlyPersisted = new Set(snapshot.steps.flatMap((step) => {
       if (step.state !== "completed") return [];
       const name = stringValue(step.input.toolName) ?? step.type.slice(5);
@@ -1124,25 +1182,104 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const mediaType = durableArtifactMediaType(name);
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       if (previouslyPublished.has(`${path}\0${sha256}`)) continue;
-      const fileId = randomUUID();
-      const stored = await this.objects.putArtifact(
-        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${fileId}/${sha256}/${name}`,
-        bytes,
-        mediaType,
-      );
-      const output = await this.repository.persistOutput({
-        snapshot, fileId, name, mediaType, sizeBytes: bytes.byteLength, sha256,
-        bucket: stored.bucket, objectKey: stored.key, etag: stored.etag,
-        ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
+      const relativeKey = path.slice(`${workspaceRoot}/`.length);
+      const relativeKeyFingerprint = createHash("sha256").update(relativeKey).digest("hex");
+      const operationKey = `${snapshot.id}:artifact:${relativeKeyFingerprint}`;
+      const fileId = stableArtifactUuid(`${snapshot.id}:${path}:${sha256}`);
+      await this.repository.recordArtifactOperationStart?.({
+        tenantId: snapshot.tenantId,
+        runId: snapshot.id,
+        operationKey,
+        relativeKeyFingerprint,
         sourcePath: path,
       });
-      results.push({
-        output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
-        summary: `Published ${name}`,
-        sandbox,
-      });
+      try {
+        const stored = await objects.putArtifact(
+          `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${fileId}/${sha256}/${name}`,
+          bytes,
+          mediaType,
+        );
+        await this.repository.recordArtifactOperationStorage?.({
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          operationKey,
+          storageReceipt: {
+            bucket: stored.bucket,
+            key: stored.key,
+            etag: stored.etag,
+            ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
+          },
+        });
+        const output = await this.repository.persistOutput({
+          snapshot, fileId, name, mediaType, sizeBytes: bytes.byteLength, sha256,
+          bucket: stored.bucket, objectKey: stored.key, etag: stored.etag,
+          ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
+          sourcePath: path,
+        });
+        await this.repository.completeArtifactOperation?.({
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          operationKey,
+          fileId: output.fileId,
+        });
+        results.push({
+          output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
+          summary: `Published ${name}`,
+          sandbox,
+        });
+      } catch (error) {
+        await this.repository.failArtifactOperation?.({
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          operationKey,
+          errorClass: error instanceof Error ? error.name : "artifact_operation_error",
+        });
+        throw error;
+      }
     }
     return results;
+  }
+
+  private async finalizeTerminalRun(run: SnapshotRun): Promise<{ noOp: boolean; completedCount?: number }> {
+    if (!run.sandboxId || !this.objects || !run.userId) return { noOp: true };
+    const owner = `terminal-finalizer:${process.pid}:${run.runId}`;
+    const lease = await this.repository.beginFinalization?.({
+      tenantId: run.tenantId,
+      runId: run.runId,
+      owner,
+    });
+    if (this.repository.beginFinalization && !lease) return { noOp: true };
+    const snapshot = terminalFinalizationSnapshot(run);
+    try {
+      const results = await this.finalizeSandboxOutputs(snapshot, {
+        provider: run.sandboxProvider ?? this.provider.kind,
+        id: run.sandboxId,
+        state: run.sandboxState ?? "running",
+      });
+      await this.repository.finishFinalization?.({
+        tenantId: run.tenantId,
+        runId: run.runId,
+        sessionId: run.sessionId,
+        owner,
+        operationKey: `${run.runId}:finalization`,
+        status: "complete",
+        itemCount: results.length,
+        completedCount: results.length,
+        failedCount: 0,
+        manifest: results.map((result) => result.output) as JsonValue,
+      });
+      return { noOp: false, completedCount: results.length };
+    } catch (error) {
+      await this.repository.failFinalization?.({
+        tenantId: run.tenantId,
+        runId: run.runId,
+        sessionId: run.sessionId,
+        owner,
+        operationKey: `${run.runId}:finalization`,
+        errorClass: error instanceof Error ? error.name : "finalization_error",
+      });
+      throw error;
+    }
   }
 
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
@@ -1169,6 +1306,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         ? this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS
         : this.options.intervalSnapshotTimeoutMs ?? DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS;
       const preserve = async () => {
+        if (terminal && this.options.enableTerminalFinalization) await this.finalizeTerminalRun(run);
         const archive = await this.capture(run.sandboxId!, Date.now() + snapshotTimeoutMs);
         const current = await repository.loadRun(payload.tenantId, payload.runId);
         if (!current.sandboxId || current.sandboxId !== run.sandboxId) {
@@ -1584,7 +1722,7 @@ export class SqlSandboxSnapshotRepository implements SandboxSnapshotRepository {
   async loadRun(tenantId: string, runId: string): Promise<SnapshotRun> {
     const rows = await this.executor.query<SnapshotRunRow>(
       `
-SELECT r.tenant_id,r.id AS run_id,r.session_id,r.task_id,r.state AS run_state,
+SELECT r.tenant_id,r.user_id,r.workspace_id,r.id AS run_id,r.session_id,r.task_id,r.state AS run_state,
        r.sandbox_provider,r.sandbox_id,r.sandbox_state,
        EXISTS (
          SELECT 1
@@ -1609,6 +1747,8 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
     if (!row) throw new Error("Turn run not found");
     return {
       tenantId: row.tenant_id,
+      userId: row.user_id,
+      workspaceId: row.workspace_id,
       runId: row.run_id,
       sessionId: row.session_id,
       taskId: row.task_id,
@@ -1844,6 +1984,189 @@ WHERE a.tenant_id=$1::uuid AND a.session_id=$2::uuid AND a.role='output'
       [tenantId, sessionId],
     );
     return rows.map((row) => ({ sourcePath: row.source_path, sha256: row.sha256 }));
+  }
+
+  async recordArtifactOperationStart(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    relativeKeyFingerprint: string;
+    sourcePath: string;
+  }): Promise<void> {
+    await this.executor.execute(
+      `
+INSERT INTO artifact_operations (
+  tenant_id,run_id,finalization_id,operation_key,relative_key_fingerprint,source_path,status,
+  storage_receipt,file_id,verification_status,error_class,updated_at
+)
+SELECT $1::uuid,$2::uuid,f.id,$3,$4,$5,'pending',NULL,NULL,'pending',NULL,now()
+FROM turn_finalizations f
+WHERE f.tenant_id=$1::uuid AND f.run_id=$2::uuid
+ON CONFLICT (tenant_id,run_id,relative_key_fingerprint) DO UPDATE
+SET operation_key=EXCLUDED.operation_key,source_path=EXCLUDED.source_path,status='pending',
+    storage_receipt=NULL,file_id=NULL,verification_status='pending',error_class=NULL,updated_at=now()
+      `.trim(),
+      [input.tenantId, input.runId, input.operationKey, input.relativeKeyFingerprint, input.sourcePath],
+    );
+  }
+
+  async recordArtifactOperationStorage(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    storageReceipt: JsonValue;
+  }): Promise<void> {
+    await this.executor.execute(
+      `
+UPDATE artifact_operations
+SET status='staged',storage_receipt=$4::jsonb,verification_status='pending',updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND operation_key=$3
+      `.trim(),
+      [input.tenantId, input.runId, input.operationKey, JSON.stringify(input.storageReceipt)],
+    );
+  }
+
+  async completeArtifactOperation(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    fileId: string;
+  }): Promise<void> {
+    await this.executor.execute(
+      `
+UPDATE artifact_operations
+SET status='complete',file_id=$4::uuid,verification_status=COALESCE(verification_status,'pending'),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND operation_key=$3
+      `.trim(),
+      [input.tenantId, input.runId, input.operationKey, input.fileId],
+    );
+  }
+
+  async failArtifactOperation(input: {
+    tenantId: string;
+    runId: string;
+    operationKey: string;
+    errorClass: string;
+  }): Promise<void> {
+    await this.executor.execute(
+      `
+UPDATE artifact_operations
+SET status='failed',verification_status='failed',error_class=$4,updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND operation_key=$3
+      `.trim(),
+      [input.tenantId, input.runId, input.operationKey, input.errorClass.slice(0, 128)],
+    );
+  }
+
+  async beginFinalization(input: {
+    tenantId: string;
+    runId: string;
+    owner: string;
+  }): Promise<{ id: string; attempt: number } | null> {
+    const rows = await this.executor.query<{ id: string; attempt: number | string }>(
+      `
+UPDATE turn_finalizations
+SET status='running',attempt=attempt+1,lease_owner=$3,lease_expires_at=now()+interval '5 minutes',
+    started_at=COALESCE(started_at,now()),last_error=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND status IN ('pending','failed','partial','running')
+  AND (lease_expires_at IS NULL OR lease_expires_at<=now() OR lease_owner=$3)
+RETURNING id,attempt
+      `.trim(),
+      [input.tenantId, input.runId, input.owner],
+    );
+    const row = rows[0];
+    return row ? { id: row.id, attempt: Number(row.attempt) } : null;
+  }
+
+  async finishFinalization(input: {
+    tenantId: string;
+    runId: string;
+    sessionId: string;
+    owner: string;
+    operationKey: string;
+    status: "complete" | "partial";
+    itemCount: number;
+    completedCount: number;
+    failedCount: number;
+    manifest: JsonValue;
+  }): Promise<void> {
+    const updated = await this.executor.query<{ id: string }>(
+      `
+UPDATE turn_finalizations
+SET status=$4,item_count=$5,completed_count=$6,failed_count=$7,manifest=$8::jsonb,
+    completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND lease_owner=$3
+RETURNING id
+      `.trim(),
+      [input.tenantId, input.runId, input.owner, input.status, input.itemCount, input.completedCount, input.failedCount, JSON.stringify(input.manifest)],
+    );
+    if (updated[0]) {
+      await this.appendFinalizationEvent(input.tenantId, input.runId, input.sessionId, input.operationKey, {
+        kind: "finalization.end",
+        runId: input.runId,
+        operationKey: input.operationKey,
+        status: input.status,
+        itemCount: input.itemCount,
+        completedCount: input.completedCount,
+        failedCount: input.failedCount,
+      });
+    }
+  }
+
+  async failFinalization(input: {
+    tenantId: string;
+    runId: string;
+    sessionId: string;
+    owner: string;
+    operationKey: string;
+    errorClass: string;
+  }): Promise<void> {
+    const updated = await this.executor.query<{ id: string }>(
+      `
+UPDATE turn_finalizations
+SET status='failed',last_error=$4,lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND lease_owner=$3
+RETURNING id
+      `.trim(),
+      [input.tenantId, input.runId, input.owner, input.errorClass.slice(0, 128)],
+    );
+    if (updated[0]) {
+      await this.appendFinalizationEvent(input.tenantId, input.runId, input.sessionId, input.operationKey, {
+        kind: "finalization.error",
+        runId: input.runId,
+        operationKey: input.operationKey,
+        errorClass: input.errorClass.slice(0, 128),
+      });
+    }
+  }
+
+  private async appendFinalizationEvent(
+    tenantId: string,
+    runId: string,
+    sessionId: string,
+    operationKey: string,
+    event: Extract<AgentStreamEvent, { kind: "finalization.end" | "finalization.error" }>,
+  ): Promise<void> {
+    await this.executor.execute(
+      `
+WITH next_sequence AS (
+  SELECT COALESCE(MAX(sequence),0)+1 AS sequence
+  FROM turn_events
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+)
+INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+SELECT $1::uuid,$2::uuid,$3::uuid,next_sequence.sequence,$4,$5::jsonb
+FROM next_sequence
+WHERE NOT EXISTS (
+  SELECT 1 FROM turn_events
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type=$4
+    AND payload->>'operationKey'=$6
+)
+ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
+      `.trim(),
+      [tenantId, runId, sessionId, event.kind, JSON.stringify(event), operationKey],
+    );
   }
 
   async latest(tenantId: string, runId: string): Promise<SnapshotRecord | null> {
@@ -2948,6 +3271,41 @@ function safeArtifactName(value: string): string {
     .slice(0, 180) || "artifact";
 }
 
+function stableArtifactUuid(value: string): string {
+  const hex = createHash("sha256").update(value).digest("hex").slice(0, 32).split("");
+  hex[12] = "5";
+  hex[16] = ((Number.parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20).join("")}`;
+}
+
+function terminalFinalizationSnapshot(run: SnapshotRun): DurableTurnSnapshot {
+  return {
+    id: run.runId,
+    createdAt: new Date().toISOString(),
+    tenantId: run.tenantId,
+    userId: run.userId!,
+    workspaceId: run.workspaceId ?? run.taskId,
+    taskId: run.taskId,
+    sessionId: run.sessionId,
+    requestMessageId: null,
+    state: run.runState as DurableTurnSnapshot["state"],
+    attempt: 0,
+    version: 0,
+    leaseOwner: "terminal-finalizer",
+    cancelledAt: null,
+    runtimeRequest: {},
+    groundingContext: {},
+    promptManifest: {},
+    sandboxProvider: run.sandboxProvider,
+    sandboxId: run.sandboxId,
+    sandboxState: run.sandboxState ?? null,
+    usageTotals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costMicros: "0" },
+    steps: [],
+    entries: [],
+    approvals: [],
+  };
+}
+
 function safeSandboxPath(
   value: string,
   workspaceRoot: string,
@@ -3150,6 +3508,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: strin
 
 interface SnapshotRunRow {
   tenant_id: string;
+  user_id: string;
+  workspace_id: string;
   run_id: string;
   session_id: string;
   task_id: string;

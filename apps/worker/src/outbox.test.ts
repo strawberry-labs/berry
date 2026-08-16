@@ -116,6 +116,43 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(statements.filter((sql) => sql.includes("snapshot:terminal-cleanup"))).toHaveLength(1);
   });
 
+  it("reminds pending questions and approvals exactly once per due reminder row", async () => {
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const queries: string[] = [];
+    const executor: SqlExecutor = {
+      execute: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+        statements.push({ sql, params });
+      }),
+      query: async <T>(sql: string): Promise<readonly T[]> => {
+        queries.push(sql);
+        if (sql.includes("UPDATE turn_questions")) {
+          return [{ id: "question-1", run_id: runId, session_id: "session-1", reminder_count: 1 }] as T[];
+        }
+        if (sql.includes("UPDATE approvals")) {
+          return [{ id: "approval-1", run_id: runId, session_id: "session-1", reminder_count: 1 }] as T[];
+        }
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 3 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: vi.fn() as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-wait-supervisor",
+      enableWaitExpiry: true,
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+
+    expect(statements.some(({ params }) => params.some((value) => String(value).includes('"kind":"question.reminded"')))).toBe(true);
+    expect(statements.some(({ params }) => params.some((value) => String(value).includes('"kind":"approval.reminded"')))).toBe(true);
+    expect(queries.some((sql) => sql.includes("reminder_at=CASE WHEN reminder_count=0"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("last_reminded_at=now()") && sql.includes("reminder_at=NULL"))).toBe(true);
+  });
+
   it("atomically marks terminal sandboxes as pause requested when dispatching their snapshot", async () => {
     const statements: string[] = [];
     let claimed = false;

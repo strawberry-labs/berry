@@ -318,6 +318,25 @@ describe("durable turn runner", () => {
       .toBe(true);
   });
 
+  it("does not spend the turn wall-clock budget on persisted human wait", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const humanWaitMs = 6 * 24 * 60 * 60 * 1_000;
+    current.createdAt = new Date(Date.now() - humanWaitMs).toISOString();
+    current.humanWaitMs = humanWaitMs;
+    const repository = new FakeTurnRepository(current);
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "Resumed.", inputTokens: 2, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools(), { owner: "worker-human-wait", maxTurnDurationMs: 60 * 60 * 1_000 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "user-input" }))
+      .resolves.toMatchObject({ state: "finalizing" });
+    expect(modelCalls).toBe(1);
+  });
+
   it("fails visibly when the empty-response recovery is also empty", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),

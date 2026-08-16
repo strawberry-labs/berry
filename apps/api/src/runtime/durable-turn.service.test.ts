@@ -932,6 +932,71 @@ describe("DurableTurnService", () => {
     });
   });
 
+  it("resolves an approval and projects task running state in one transaction", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM approvals a")) {
+          return [{
+            id: "00000000-0000-7000-8000-000000000010",
+            run_id: runId,
+            step_id: stepId,
+            tool_call_id: null,
+            session_id: sessionId,
+            task_id: taskId,
+            status: "pending",
+            expires_at: "2099-01-01T00:00:00.000Z",
+          }] as T[];
+        }
+        if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 0 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.decideApproval(tenantId, userId, "00000000-0000-7000-8000-000000000010", {
+      decision: "approve",
+    })).resolves.toBe(true);
+
+    expect(executions.some(({ sql }) => sql.includes("UPDATE tasks") && sql.includes("status='running'"))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("human_wait_ms") && sql.includes("version=version+1"))).toBe(true);
+  });
+
+  it("expires a late question answer without resuming the waiting run", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_questions q")) {
+          return [{
+            id: questionId,
+            run_id: runId,
+            session_id: sessionId,
+            step_id: stepId,
+            tool_call_id: null,
+            question: "Which environment?",
+            status: "pending",
+            run_state: "waiting",
+            task_id: taskId,
+            created_at: "2026-07-28T00:00:00.000Z",
+            expires_at: "2026-07-29T00:00:00.000Z",
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.answerQuestion(tenantId, userId, questionId, { answer: "Staging" }))
+      .resolves.toBe(false);
+    expect(executions.some(({ sql }) => sql.includes("status='expired'"))).toBe(true);
+    expect(executions.some(({ params }) => params.some((value) => String(value).includes('"kind":"question.expired"')))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("state=$3") && sql.includes("state='waiting'"))).toBe(true);
+  });
+
   it("associates question uploads and persists their message parts in the answer transaction", async () => {
     const fileId = "00000000-0000-7000-8000-000000000009";
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];

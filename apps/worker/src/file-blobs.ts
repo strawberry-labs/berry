@@ -102,6 +102,12 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
         WHERE tenant_id = $1::uuid AND id = $2::uuid
           AND verification_status = 'verifying'
       `, [payload.tenantId, payload.blobId, error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000)]));
+      await this.withTenant(payload.tenantId, (executor) => executor.execute(`
+        UPDATE artifact_operations
+        SET verification_status='failed',error_class='storage_verification_error',updated_at=now()
+        WHERE tenant_id=$1::uuid
+          AND file_id IN (SELECT id FROM files WHERE tenant_id=$1::uuid AND blob_id=$2::uuid)
+      `, [payload.tenantId, payload.blobId]));
       throw error;
     }
 
@@ -253,6 +259,12 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
           UPDATE files SET sha256 = $3, size_bytes = $4, updated_at = now()
           WHERE tenant_id = $1::uuid AND blob_id = $2::uuid
         `, [payload.tenantId, payload.blobId, digest, Number(blob.size_bytes)]);
+        await executor.execute(`
+          UPDATE artifact_operations
+          SET verification_status='verified',updated_at=now()
+          WHERE tenant_id=$1::uuid
+            AND file_id IN (SELECT id FROM files WHERE tenant_id=$1::uuid AND blob_id=$2::uuid)
+        `, [payload.tenantId, payload.blobId]);
         await completeVerificationWatchdog(executor, payload);
         return { status: "verified", sha256: digest };
       }
@@ -279,6 +291,12 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
           available_at = EXCLUDED.available_at, completed_at = NULL,
           last_error = NULL, updated_at = now()
       `, [payload.tenantId, payload.blobId, `file.delete-blob:${payload.blobId}`, JSON.stringify(payload), new Date(scheduled.delete_after).toISOString()]);
+      await executor.execute(`
+        UPDATE artifact_operations
+        SET verification_status='verified',updated_at=now()
+        WHERE tenant_id=$1::uuid
+          AND file_id IN (SELECT id FROM files WHERE tenant_id=$1::uuid AND blob_id=$2::uuid)
+      `, [payload.tenantId, winner.id]);
       await completeVerificationWatchdog(executor, payload);
       return { status: "deduplicated", sha256: digest };
     });

@@ -2328,6 +2328,38 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
   }),
   z.object({ kind: z.literal("question.answered"), questionId: z.string() }),
   z.object({
+    kind: z.literal("question.reminded"),
+    questionId: z.string(),
+    reminderCount: z.number().int().positive(),
+  }),
+  z.object({ kind: z.literal("question.expired"), questionId: z.string() }),
+  z.object({
+    kind: z.literal("approval.reminded"),
+    approvalId: z.string(),
+    reminderCount: z.number().int().positive(),
+  }),
+  z.object({ kind: z.literal("approval.expired"), approvalId: z.string() }),
+  z.object({
+    kind: z.literal("finalization.start"),
+    runId: z.string(),
+    operationKey: z.string(),
+  }),
+  z.object({
+    kind: z.literal("finalization.end"),
+    runId: z.string(),
+    operationKey: z.string(),
+    status: z.enum(["complete", "partial", "skipped"]),
+    itemCount: z.number().int().nonnegative(),
+    completedCount: z.number().int().nonnegative(),
+    failedCount: z.number().int().nonnegative(),
+  }),
+  z.object({
+    kind: z.literal("finalization.error"),
+    runId: z.string(),
+    operationKey: z.string(),
+    errorClass: z.string().min(1).max(128),
+  }),
+  z.object({
     kind: z.literal("usage"),
     inputTokens: z.number(),
     outputTokens: z.number(),
