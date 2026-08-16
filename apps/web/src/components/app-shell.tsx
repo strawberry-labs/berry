@@ -2,21 +2,14 @@ import * as React from "react";
 import { ArrowUp, CreditCard, Plus, Settings, Square, X } from "lucide-react";
 import { BerryApiClient, BerryApiError, type ImageGenerationCapabilityStatus, type StartTurnRequest } from "@berry/api-client";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type MessageHistoryPage, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
+import { IMAGE_ASPECT_RATIO_DIMENSIONS, MessageAttachmentContentSchema, PersonalizationProfileSchema, messageAttachmentContent, resolveModelCapabilities, type AllowanceBalance, type AttachmentInput, type ImageAspectRatio, type Message, type MessageHistoryPage, type MessagePart, type OrgMembership, type OrgPermission, type PermissionMode, type PersonalizationProfile, type ReasoningLevel, type Task, type TurnIntent, type TurnState, type Workspace } from "@berry/shared";
 import { toast } from "sonner";
 import { BerryShellFrame } from "@berry/desktop-ui/components/berry-shell";
 import { BerryTaskHeaderFrame } from "@berry/desktop-ui/components/berry-task-header";
-import { BerryComposerFrame } from "@berry/desktop-ui/components/berry-composer-frame";
 import { BerryWorkspaceHomeFrame } from "@berry/desktop-ui/components/berry-workspace-home";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@berry/desktop-ui/components/ui/attachment";
-import {
-  BerryThreadView,
-  BerryUserEditorFrame,
-  isContinuableAssistantTurn,
-  isImageMessagePart,
-  type BerryThreadAdapter,
-} from "@berry/desktop-ui/components/berry-thread-view";
 import { IDLE, reduceStream, type StreamState } from "@berry/desktop-ui/components/thread-stream";
+import { isContinuableAssistantTurn, isImageMessagePart } from "@berry/desktop-ui/components/thread-message-utils";
 import { Toaster } from "@berry/desktop-ui/components/ui/sonner";
 import type { ImageGenerationState } from "@berry/desktop-ui/components/image-generation";
 import type { GeneratedImageView, ImageEditAnnotation } from "@berry/desktop-ui/components/generated-image-gallery";
@@ -41,13 +34,9 @@ import { WebConfigSchema } from "@/lib/config";
 import type { ShellData } from "@/lib/shell-data";
 import { parseCloudShellLocation, type ArtifactLibraryTab, type UserSettingsTab } from "@/lib/cloud-shell-state";
 import { MentionMenu, useStaticMentions } from "./mention-menu";
-import { PromptEditor, type PromptEditorHandle } from "./prompt-editor";
+import type { PromptEditorHandle } from "./prompt-editor";
 import type { SignedInUser } from "./shell/auth-boundary";
 import { DeploymentBrandLogo } from "./shell/deployment-brand";
-import { TaskRouteState } from "./tasks/task-route-state";
-import { Composer } from "./tasks/web-composer";
-import { Thread } from "./tasks/web-task-view";
-import { planProgressFromConversation } from "./tasks/plan-progress-pill";
 import { ProjectSwitcher } from "./projects/project-switcher";
 import { applyDocumentTheme, watchSystemTheme } from "@/lib/theme";
 import { ManagementRouteProvider } from "./management/management-route-context";
@@ -83,6 +72,7 @@ function generatedImageExtension(mediaType: string): string {
   if (normalized === "image/gif") return "gif";
   return "png";
 }
+
 import { WebSidebar, WebWindowChrome, taskHasUnreadActivity, taskIsInProgress, type SettingsTab } from "./shell/web-sidebar";
 import type { ManagementKind } from "./management/management-navigation";
 import { WebCommandPalette } from "./shell/web-command-palette";
@@ -103,6 +93,18 @@ const ArtifactLibrary = React.lazy(async () => ({
 }));
 const TaskFileLibraryDialog = React.lazy(async () => ({
   default: (await import("./library/task-file-library-dialog")).TaskFileLibraryDialog,
+}));
+const Composer = React.lazy(async () => ({
+  default: (await import("./tasks/web-composer")).Composer,
+}));
+const Thread = React.lazy(async () => ({
+  default: (await import("./tasks/web-task-view")).Thread,
+}));
+const TaskRouteState = React.lazy(async () => ({
+  default: (await import("./tasks/task-route-state")).TaskRouteState,
+}));
+const MessageHistoryBenchmark = React.lazy(async () => ({
+  default: (await import("./message-history-benchmark")).MessageHistoryBenchmark,
 }));
 
 type StreamEvent = Parameters<typeof reduceStream>[1];
@@ -516,87 +518,8 @@ export function AppShell({ initial, user, onSignedOut }: {
       && new URLSearchParams(window.location.search).get("benchmark") === "message-history",
     );
   }, [initial.config.demoMode]);
-  if (benchmark) return <MessageHistoryBenchmark />;
+  if (benchmark) return <React.Suspense fallback={<LazySurfaceFallback label="Loading benchmark" />}><MessageHistoryBenchmark /></React.Suspense>;
   return <CloudShell initial={initial} user={user} onSignedOut={onSignedOut} />;
-}
-
-/**
- * A development-only route target for the history performance contract. It
- * deliberately exercises the real BerryThreadView with 10,000
- * persisted-shaped rows; the Playwright benchmark measures DOM, observer,
- * scroll, update, and heap budgets around this component rather than a
- * duplicate synthetic list.
- */
-function MessageHistoryBenchmark() {
-  const [revision, setRevision] = React.useState(0);
-  const [olderBatchLoaded, setOlderBatchLoaded] = React.useState(false);
-  const messages = React.useMemo<Message[]>(() => [...(olderBatchLoaded ? Array.from({ length: 50 }, (_, index) => ({
-    id: "benchmark-older-message-" + index,
-    sessionId: "benchmark-session",
-    role: index % 2 === 0 ? "user" : "assistant",
-    status: "complete",
-    parts: [{
-      id: "benchmark-older-part-" + index,
-      messageId: "benchmark-older-message-" + index,
-      kind: "text",
-      content: "Older benchmark row " + index,
-      position: 0,
-      createdAt: "2026-01-01T00:00:00.000Z",
-    }],
-    inputTokens: 0,
-    outputTokens: 0,
-    generationMs: 0,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-01T00:00:00.000Z",
-  } as Message)) : []), ...Array.from({ length: 10_000 }, (_, index) => {
-    const role = index % 2 === 0 ? "user" : "assistant";
-    return {
-      id: `benchmark-message-${index}`,
-      sessionId: "benchmark-session",
-      role,
-      status: "complete",
-      parts: [{
-        id: `benchmark-part-${index}`,
-        messageId: `benchmark-message-${index}`,
-        kind: "text",
-        content: role === "user" ? `Benchmark prompt ${index / 2}` : `Benchmark response ${index / 2}`,
-        position: 0,
-        createdAt: "2026-01-01T00:00:00.000Z",
-      }],
-      inputTokens: 0,
-      outputTokens: 0,
-      generationMs: 0,
-      createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z",
-    } as Message;
-  })], [olderBatchLoaded]);
-  const loadOlderMessages = React.useCallback(() => {
-    if (olderBatchLoaded) return false;
-    setOlderBatchLoaded(true);
-    return true;
-  }, [olderBatchLoaded]);
-  return (
-    <main data-testid="message-history-benchmark" data-benchmark-total-rows={messages.length} data-benchmark-older-loaded={olderBatchLoaded ? "true" : "false"} className="flex h-screen w-screen flex-col gap-2 bg-background p-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-sm font-medium">Message history benchmark</h1>
-        <button data-testid="benchmark-update" type="button" onClick={() => setRevision((value) => value + 1)}>
-          Update {revision}
-        </button>
-      </div>
-      <div className="flex min-h-0 flex-1">
-        <BerryThreadView
-          sessionId="benchmark-session"
-          stream={IDLE}
-          messages={messages}
-          autoScroll={false}
-          autoLoadOlderOnScroll={false}
-          hasOlderMessages={!olderBatchLoaded}
-          onLoadOlderMessages={loadOlderMessages}
-          liveContent={<span data-testid="benchmark-revision">{revision}</span>}
-        />
-      </div>
-    </main>
-  );
 }
 
 function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: SignedInUser | null; onSignedOut?: (() => void) | undefined }) {
@@ -3091,6 +3014,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         )}
       >
       <div ref={mainPanelRef} className="berry-web-main flex h-full min-h-0 flex-col">
+        <React.Suspense fallback={shouldMountTaskSurface(surface) ? <LazySurfaceFallback label="Loading task" /> : null}>
         <div className={shouldMountTaskSurface(surface) ? "contents" : "hidden"}>
         {shouldMountTaskSurface(surface) && activeTask && !activeTask.deletedAt ? (
         <>
@@ -3247,7 +3171,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onResumeFollowUps={resumeFollowUps}
               onEditingFollowUpChange={setEditingFollowUp}
               onSteerMessage={steerActiveTurn}
-              planProgress={planProgressFromConversation(messages, stream)}
               question={stream.question}
               streamSessionId={activeTask.activeSessionId}
               streamMessages={messages}
@@ -3356,6 +3279,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           />
         ) : null)}
         </div>
+        </React.Suspense>
         {surface === "settings" ? (
           <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
             <React.Suspense fallback={<LazySurfaceFallback label="Loading settings" />}>

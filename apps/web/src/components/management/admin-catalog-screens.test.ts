@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { saveNewTaskDefaultSafely } from "./admin-catalog-screens";
+import { saveNewTaskDefaultSafely } from "./admin-models-screen";
 
 describe("organization model defaults", () => {
   it("turns a rejected task default request into visible feedback", async () => {

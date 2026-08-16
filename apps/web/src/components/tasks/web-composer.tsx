@@ -15,7 +15,7 @@ import type { WebConfig } from "@/lib/config";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle, type PromptMentionConfig } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
-import { planProgressFromLiveStream, PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
+import { planProgressFromLiveStream, planProgressFromMessages, PlanProgressPill, type PlanProgress } from "./plan-progress-pill";
 import { COMPOSER_SEND_ARROW_SIZE, COMPOSER_SEND_BUTTON_CLASS, ComposerQuestionOverlay, questionAnswerTranscript, questionToolAnswer, stableQuestionAnswerMessageId, strictQuestionAnswerAttachment, type ComposerQuestionAnswer } from "./composer-question-overlay";
 import { QueuedMessageList } from "./queued-message-list";
 import { createQueuedFollowUp, type QueuedFollowUp } from "@/lib/queued-follow-ups";
@@ -202,9 +202,13 @@ export function Composer({
   // Once the per-session store exists, null is authoritative: a reset must
   // clear an old question rather than falling back to the shell's last prop.
   const effectiveQuestion = hasObservedStream ? observedStream.question : question;
+  const persistedPlanProgress = React.useMemo(
+    () => (streamMessages ? planProgressFromMessages(streamMessages) : null),
+    [streamMessages],
+  );
   const effectivePlanProgress = hasObservedStream && streamMessages
-    ? planProgressFromLiveStream(observedStream, planProgress)
-    : planProgress;
+    ? planProgressFromLiveStream(observedStream, planProgress ?? persistedPlanProgress)
+    : planProgress ?? persistedPlanProgress;
   const [text, setText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [continuing, setContinuing] = React.useState(false);

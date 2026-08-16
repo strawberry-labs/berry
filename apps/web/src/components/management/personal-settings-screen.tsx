@@ -1,18 +1,21 @@
 import * as React from "react";
 import type { ManagementScreenProps } from "./management-context";
-import { GeneralSettingsScreen } from "./general-settings-screen";
+
+const GeneralSettingsScreen = React.lazy(async () => ({
+  default: (await import("./general-settings-screen")).GeneralSettingsScreen,
+}));
 
 const AccountSettingsScreen = React.lazy(async () => ({
   default: (await import("./account-settings-screen")).AccountSettingsScreen,
 }));
 const PersonalSkillsScreen = React.lazy(async () => ({
-  default: (await import("./personal-capability-screens")).PersonalSkillsScreen,
+  default: (await import("./personal-skills-screen")).PersonalSkillsScreen,
 }));
 const PersonalMcpScreen = React.lazy(async () => ({
-  default: (await import("./personal-capability-screens")).PersonalMcpScreen,
+  default: (await import("./personal-mcp-screen")).PersonalMcpScreen,
 }));
 const PersonalConnectorsScreen = React.lazy(async () => ({
-  default: (await import("./connectors-screen")).PersonalConnectorsScreen,
+  default: (await import("./personal-connectors-screen")).PersonalConnectorsScreen,
 }));
 const PersonalizationSettingsScreen = React.lazy(async () => ({
   default: (await import("./personalization-settings-screen")).PersonalizationSettingsScreen,
@@ -25,13 +28,25 @@ const ArchivedTasksScreen = React.lazy(async () => ({
 }));
 
 export function PersonalSettingsScreen({ tab, ...props }: ManagementScreenProps & { tab: string }) {
-  if (tab === "general") return <GeneralSettingsScreen />;
-  if (tab === "account") return <AccountSettingsScreen {...props} />;
-  if (tab === "personalization") return <PersonalizationSettingsScreen {...props} />;
-  if (tab === "connectors") return <PersonalConnectorsScreen {...props} />;
-  if (tab === "skills") return <PersonalSkillsScreen {...props} />;
-  if (tab === "mcp") return <PersonalMcpScreen {...props} />;
-  if (tab === "usage") return <PersonalUsageScreen {...props} />;
-  if (tab === "archived") return <ArchivedTasksScreen {...props} />;
-  return <GeneralSettingsScreen />;
+  let screen: React.ReactNode;
+  if (tab === "general") screen = <GeneralSettingsScreen />;
+  else if (tab === "account") screen = <AccountSettingsScreen {...props} />;
+  else if (tab === "personalization") screen = <PersonalizationSettingsScreen {...props} />;
+  else if (tab === "connectors") screen = <PersonalConnectorsScreen {...props} />;
+  else if (tab === "skills") screen = <PersonalSkillsScreen {...props} />;
+  else if (tab === "mcp") screen = <PersonalMcpScreen {...props} />;
+  else if (tab === "usage") screen = <PersonalUsageScreen {...props} />;
+  else if (tab === "archived") screen = <ArchivedTasksScreen {...props} />;
+  else screen = <GeneralSettingsScreen />;
+  return (
+    <React.Suspense
+      fallback={
+        <div className="flex min-h-24 items-center justify-center text-sm text-muted-foreground" role="status" aria-live="polite">
+          Loading settings section…
+        </div>
+      }
+    >
+      {screen}
+    </React.Suspense>
+  );
 }

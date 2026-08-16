@@ -58,6 +58,8 @@ import {
   type GeneratedImageView,
   type ImageEditAnnotation,
 } from "@berry/desktop-ui/components/generated-image-gallery";
+import { isContinuableAssistantTurn, isImageMessagePart } from "@berry/desktop-ui/components/thread-message-utils";
+export { isContinuableAssistantTurn, isImageMessagePart } from "@berry/desktop-ui/components/thread-message-utils";
 
 export type ApprovalDecision = "approved_once" | "approved_for_session" | "approved_rule" | "denied" | "abort";
 
@@ -1356,11 +1358,6 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
   );
 });
 
-export function isContinuableAssistantTurn(messages: Message[]): boolean {
-  const latestAssistant = messages.at(-1);
-  return latestAssistant?.status === "failed" || latestAssistant?.status === "cancelled";
-}
-
 function summarizeActivity(segments: MessageSegment[]): string | undefined {
   const tools = segments.flatMap((segment) => segment.kind === "tools" ? segment.tools : []);
   const reads = tools.filter((tool) => tool.name === "read").length;
@@ -1945,14 +1942,6 @@ export function BerryMessagePartBody({ part, plain = false }: { part: MessagePar
   }
   if (plain) return <span className="whitespace-pre-wrap">{content}</span>;
   return <Markdown>{content}</Markdown>;
-}
-
-export function isImageMessagePart(part: MessagePart): boolean {
-  if (part.kind !== "image") return false;
-  if (typeof part.content === "string") {
-    return part.content.startsWith("data:") || part.content.startsWith("https://") || part.content.startsWith("http://") || part.content.startsWith("/");
-  }
-  return Boolean(part.content && typeof part.content === "object" && !Array.isArray(part.content) && typeof part.content.src === "string");
 }
 
 function toolStatusFromMeta(value: unknown): ToolEntry["status"] {

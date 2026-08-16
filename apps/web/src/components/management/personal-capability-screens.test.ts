@@ -7,7 +7,7 @@ import {
   skillControlHint,
   skillMarkdownBody,
   skillPackageTreeEntries,
-} from "./personal-capability-screens";
+} from "./personal-skills-screen";
 
 describe("personal capability screens", () => {
   it("keeps personal skills available when organization capability metadata is forbidden", async () => {

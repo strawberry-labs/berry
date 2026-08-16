@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { loadAdminConnectorData } from "./connectors-screen.tsx";
+import { loadAdminConnectorData } from "./admin-connectors-screen";
 
 describe("admin connector loading", () => {
   it("does not request protected Google configuration for an MCP-only administrator", async () => {
