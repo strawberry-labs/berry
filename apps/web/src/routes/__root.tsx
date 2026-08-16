@@ -5,6 +5,8 @@ import { AuthBoundary } from "@/components/shell/auth-boundary";
 import { loadWebBootstrap } from "@/lib/config.functions";
 import { loadFixtureShellData } from "@/lib/shell-data";
 import { BERRY_THEME_BOOTSTRAP_SCRIPT } from "@/lib/theme";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { webQueryClient } from "@/lib/query-client";
 import appCss from "../styles.css?url";
 
 const AppShell = React.lazy(() => import("@/components/app-shell").then((module) => ({ default: module.AppShell })));
@@ -63,7 +65,7 @@ function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
         <HeadContent />
       </head>
       <body>
-        {children}
+        <QueryClientProvider client={webQueryClient}>{children}</QueryClientProvider>
         <Scripts />
       </body>
     </html>

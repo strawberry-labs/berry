@@ -88,6 +88,8 @@ import {
   GoogleConnectorConfigurationSchema,
   GooglePickerSessionSchema,
   DepartmentSchema,
+  DepartmentListQuerySchema,
+  DepartmentPageSchema,
   EffectivePermissionsSchema,
   FeatureFlagSchema,
   HostPushEventSchema,
@@ -104,6 +106,8 @@ import {
   OrganizationSchema,
   OrgAuxiliaryModelDefaultSchema,
   OrgMembershipSchema,
+  MemberListQuerySchema,
+  MemberPageSchema,
   OrgModelDefaultSchema,
   OrgModelPolicySchema,
   OrgPermissionSchema,
@@ -115,6 +119,9 @@ import {
   SsoConnectionSchema,
   SessionSchema,
   TaskSchema,
+  TaskCollectionSummarySchema,
+  TaskPageSchema,
+  WorkspacePageSchema,
   normalizeTaskForWeb,
   TurnStateSchema,
   WorkspaceSchema,
@@ -204,6 +211,8 @@ import {
   type OrgCapability,
   type EffectiveCapability,
   type Department,
+  type DepartmentListQuery,
+  type DepartmentPage,
   type EffectivePermissions,
   type FeatureFlag,
   type HostPushEvent,
@@ -227,6 +236,8 @@ import {
   type OrgAiAccessRule,
   type OrgAiAccessRuleUpsert,
   type OrgMembership,
+  type MemberListQuery,
+  type MemberPage,
   type OrgMembershipUpdate,
   type PermissionMode,
   type ReasoningLevel,
@@ -236,9 +247,12 @@ import {
   type Session,
   type SsoConnection,
   type Task,
+  type TaskCollectionSummary,
+  type TaskPage,
   type TurnIntent,
   type TurnState,
   type Workspace,
+  type WorkspacePage,
   type AttachmentInput,
 } from "@berry/shared";
 import { z } from "zod";
@@ -588,8 +602,35 @@ export class BerryApiClient {
     });
   }
 
-  async listWorkspaces(options: { includeGeneral?: boolean } = {}): Promise<Workspace[]> {
-    return this.#request(`/v1/workspaces${options.includeGeneral ? "?includeGeneral=true" : ""}`, z.array(WorkspaceSchema));
+  async listWorkspacePage(options: { includeGeneral?: boolean | undefined; search?: string | undefined; cursor?: string | undefined; limit?: number | undefined } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<WorkspacePage> {
+    const params = new URLSearchParams();
+    if (options.includeGeneral) params.set("includeGeneral", "true");
+    if (options.search) params.set("search", options.search);
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return this.#request(`/v1/workspaces/page${suffix}`, WorkspacePageSchema, requestOptions);
+  }
+
+  async listProjectPage(options: { includeGeneral?: boolean | undefined; search?: string | undefined; cursor?: string | undefined; limit?: number | undefined } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<WorkspacePage> {
+    const params = new URLSearchParams();
+    if (options.includeGeneral) params.set("includeGeneral", "true");
+    if (options.search) params.set("search", options.search);
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return this.#request(`/v1/projects/page${suffix}`, WorkspacePageSchema, requestOptions);
+  }
+
+  async listWorkspaces(options: { includeGeneral?: boolean; search?: string } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<Workspace[]> {
+    const all: Workspace[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.listWorkspacePage({ ...options, cursor, limit: 100 }, requestOptions);
+      all.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return all;
   }
 
   async modelCatalog(): Promise<ManagedModelCatalog> {
@@ -669,16 +710,51 @@ export class BerryApiClient {
     });
   }
 
-  async listTasks(filter: { workspaceId?: string | undefined; workspaceKind?: "project" | "general" | undefined; includeDeleted?: boolean | undefined; limit?: number | undefined; offset?: number | undefined; taskIds?: readonly string[] | undefined } = {}): Promise<Task[]> {
+  async listTaskPage(filter: { workspaceId?: string | undefined; workspaceKind?: "project" | "general" | undefined; includeDeleted?: boolean | undefined; state?: "active" | "archived" | "deleted" | "all" | undefined; search?: string | undefined; cursor?: string | undefined; limit?: number | undefined; taskIds?: readonly string[] | undefined } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<TaskPage> {
     const params = new URLSearchParams();
     if (filter.workspaceId) params.set("workspaceId", filter.workspaceId);
     if (filter.workspaceKind) params.set("workspaceKind", filter.workspaceKind);
     if (filter.includeDeleted) params.set("includeDeleted", "true");
+    if (filter.state) params.set("state", filter.state);
+    if (filter.search) params.set("search", filter.search);
+    if (filter.cursor) params.set("cursor", filter.cursor);
     if (filter.limit !== undefined) params.set("limit", String(filter.limit));
-    if (filter.offset !== undefined) params.set("offset", String(filter.offset));
     if (filter.taskIds) params.set("taskIds", [...new Set(filter.taskIds)].join(","));
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
-    return this.#request(`/v1/tasks${suffix}`, z.array(TaskSchema.transform(normalizeTaskForWeb)));
+    const page = await this.#request(`/v1/tasks/page${suffix}`, TaskPageSchema, requestOptions);
+    return { ...page, items: page.items.map(normalizeTaskForWeb) };
+  }
+
+  async listArchivedTasksPage(filter: { workspaceId?: string | undefined; search?: string | undefined; state?: "archived" | "deleted" | "all" | undefined; cursor?: string | undefined; limit?: number | undefined } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<TaskPage> {
+    const params = new URLSearchParams();
+    if (filter.workspaceId) params.set("workspaceId", filter.workspaceId);
+    if (filter.search) params.set("search", filter.search);
+    if (filter.state) params.set("state", filter.state);
+    if (filter.cursor) params.set("cursor", filter.cursor);
+    if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    const page = await this.#request(`/v1/tasks/archive${suffix}`, TaskPageSchema, requestOptions);
+    return { ...page, items: page.items.map(normalizeTaskForWeb) };
+  }
+
+  async taskCollectionSummary(requestOptions: { signal?: AbortSignal } = {}): Promise<TaskCollectionSummary> {
+    return this.#request("/v1/tasks/summary", TaskCollectionSummarySchema, requestOptions);
+  }
+
+  async deleteAllArchivedTasks(input: { workspaceId?: string; search?: string } = {}): Promise<{ deletedCount: number }> {
+    return this.#request("/v1/tasks/archive/delete-all", z.object({ deletedCount: z.number().int().nonnegative() }), { method: "POST", body: input });
+  }
+
+  async listTasks(filter: { workspaceId?: string | undefined; workspaceKind?: "project" | "general" | undefined; includeDeleted?: boolean | undefined; state?: "active" | "archived" | "deleted" | "all" | undefined; search?: string | undefined; limit?: number | undefined; offset?: number | undefined; taskIds?: readonly string[] | undefined } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<Task[]> {
+    const all: Task[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.listTaskPage({ ...filter, state: filter.state ?? (filter.includeDeleted ? "all" : undefined), cursor, limit: 100 }, requestOptions);
+      all.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    const offset = Math.max(0, filter.offset ?? 0);
+    return filter.limit === undefined ? all.slice(offset) : all.slice(offset, offset + Math.max(1, filter.limit));
   }
 
   async getTask(taskId: string): Promise<Task> {
@@ -1209,8 +1285,29 @@ export class BerryApiClient {
     return this.#request("/v1/auth/config", BerryAuthConfigSchema);
   }
 
-  async listOrgMembers(tenantId: string): Promise<OrgMembership[]> {
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members`, z.array(OrgMembershipSchema));
+  async listOrgMembersPage(tenantId: string, query: Partial<MemberListQuery> = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<MemberPage> {
+    const params = new URLSearchParams();
+    if (query.search) params.set("search", query.search);
+    if (query.status) params.set("status", query.status);
+    if (query.role) params.set("role", query.role);
+    if (query.departmentId) params.set("departmentId", query.departmentId);
+    if (query.source) params.set("source", query.source);
+    if (query.cursor) params.set("cursor", query.cursor);
+    if (query.limit !== undefined) params.set("limit", String(query.limit));
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    const page = await this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/page${suffix}`, MemberPageSchema, requestOptions);
+    return { ...page, items: page.items.map((item) => OrgMembershipSchema.parse(item)) };
+  }
+
+  async listOrgMembers(tenantId: string, requestOptions: { signal?: AbortSignal } = {}): Promise<OrgMembership[]> {
+    const all: OrgMembership[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.listOrgMembersPage(tenantId, { limit: 100, ...(cursor ? { cursor } : {}) }, requestOptions);
+      all.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return all;
   }
 
   async createOrgMember(tenantId: string, input: CreateOrgMemberRequest): Promise<OrgMembership> {
@@ -1227,8 +1324,26 @@ export class BerryApiClient {
     });
   }
 
-  async listDepartments(tenantId: string): Promise<Department[]> {
-    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/departments`, z.array(DepartmentSchema));
+  async listDepartmentsPage(tenantId: string, query: Partial<DepartmentListQuery> = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<DepartmentPage> {
+    const params = new URLSearchParams();
+    if (query.search) params.set("search", query.search);
+    if (query.status) params.set("status", query.status);
+    if (query.parentId !== undefined) params.set("parentId", query.parentId ?? "null");
+    if (query.cursor) params.set("cursor", query.cursor);
+    if (query.limit !== undefined) params.set("limit", String(query.limit));
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/departments/page${suffix}`, DepartmentPageSchema, requestOptions);
+  }
+
+  async listDepartments(tenantId: string, requestOptions: { signal?: AbortSignal } = {}): Promise<Department[]> {
+    const all: Department[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.listDepartmentsPage(tenantId, { limit: 100, ...(cursor ? { cursor } : {}) }, requestOptions);
+      all.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return all;
   }
 
   async createDepartment(tenantId: string, input: CreateDepartmentRequest): Promise<Department> {

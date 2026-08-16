@@ -52,33 +52,48 @@ export class CloudDatabaseService {
           const applied = new Set(
             (await executor.query<{ id: number }>("SELECT id FROM schema_migrations")).map((row) => row.id),
           );
-          const indexName = "onlineIndexName" in migration ? migration.onlineIndexName : undefined;
-          if (!indexName) {
-            if (!applied.has(migration.id)) await executor.execute(migration.sql);
+          const indexNames: readonly string[] = "onlineIndexNames" in migration
+            ? (migration.onlineIndexNames as readonly string[])
+            : "onlineIndexName" in migration
+              ? [migration.onlineIndexName as string]
+              : [];
+          const statements: readonly string[] = "onlineSql" in migration
+            ? (migration.onlineSql as readonly string[])
+            : [migration.sql];
+          if (indexNames.length === 0) {
+            if (!applied.has(migration.id)) {
+              for (const statement of statements) await executor.execute(statement);
+            }
           } else {
-            const indexRows = await executor.query<{ indisvalid: boolean }>(
-              `SELECT c.relname AS index_name, i.indisvalid
-               FROM pg_class c
-               JOIN pg_index i ON i.indexrelid = c.oid
-               WHERE c.relname = '${indexName}'`,
-            );
-            const index = indexRows[0];
-            if (index && !index.indisvalid) {
-              // Only an invalid index object is removed; table/message data is
-              // never touched. A failed CONCURRENTLY build is safe to repair
-              // on the next startup before retrying the migration.
-              await executor.execute(`DROP INDEX CONCURRENTLY IF EXISTS ${indexName}`);
+            const indexStates = await Promise.all(indexNames.map(async (indexName) => {
+              const rows = await executor.query<{ indisvalid: boolean }>(
+                `SELECT i.indisvalid
+                 FROM pg_class c
+                 JOIN pg_index i ON i.indexrelid = c.oid
+                 WHERE c.relname = '${indexName}'`,
+              );
+              return { indexName, state: rows[0] };
+            }));
+            for (const { indexName, state } of indexStates) {
+              if (state && !state.indisvalid) {
+                // Only an invalid index object is removed; table/message data is
+                // never touched. A failed CONCURRENTLY build is safe to repair
+                // on the next startup before retrying the migration.
+                await executor.execute(`DROP INDEX CONCURRENTLY IF EXISTS ${indexName}`);
+              }
             }
-            if (!applied.has(migration.id) || !index || !index.indisvalid) {
-              await executor.execute(migration.sql);
+            if (!applied.has(migration.id) || indexStates.some(({ state }) => !state || !state.indisvalid)) {
+              for (const statement of statements) await executor.execute(statement);
             }
-            const [valid] = await executor.query<{ indisvalid: boolean }>(
-              `SELECT i.indisvalid
-               FROM pg_class c
-               JOIN pg_index i ON i.indexrelid = c.oid
-               WHERE c.relname = '${indexName}'`,
-            );
-            if (!valid || !valid.indisvalid) throw new Error(`${indexName} is missing or invalid after migration`);
+            for (const indexName of indexNames) {
+              const [valid] = await executor.query<{ indisvalid: boolean }>(
+                `SELECT i.indisvalid
+                 FROM pg_class c
+                 JOIN pg_index i ON i.indexrelid = c.oid
+                 WHERE c.relname = '${indexName}'`,
+              );
+              if (!valid || !valid.indisvalid) throw new Error(`${indexName} is missing or invalid after migration`);
+            }
           }
           await executor.execute(
             "INSERT INTO schema_migrations (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",

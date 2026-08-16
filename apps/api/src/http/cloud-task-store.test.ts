@@ -69,6 +69,36 @@ describe("task unread state", () => {
       .resolves.toEqual([second.task]);
     expect(first.task.id).not.toBe(second.task.id);
   });
+
+  it("paginates enterprise task collections with a stable cursor and bulk-deletes only matching archived tasks", async () => {
+    const store = new InMemoryCloudTaskStore();
+    const project = await store.createWorkspace({ name: "Project", ownerUserId: "user_1" });
+    const otherProject = await store.createWorkspace({ name: "Other", ownerUserId: "user_2" });
+    const tasks = await Promise.all([
+      store.createTask({ workspaceId: project.id, ownerUserId: "user_1", title: "Alpha" }),
+      store.createTask({ workspaceId: project.id, ownerUserId: "user_1", title: "Beta" }),
+      store.createTask({ workspaceId: project.id, ownerUserId: "user_1", title: "Gamma" }),
+      store.createTask({ workspaceId: otherProject.id, ownerUserId: "user_2", title: "Alpha other user" }),
+    ]);
+    await store.updateTask(tasks[0]!.task.id, { archived: true }, "user_1");
+    await store.updateTask(tasks[1]!.task.id, { archived: true }, "user_1");
+
+    const first = await store.listTaskPage({ ownerUserId: "user_1", state: "archived", limit: 1 });
+    expect(first.items).toHaveLength(1);
+    expect(first.hasMore).toBe(true);
+    const second = await store.listTaskPage({ ownerUserId: "user_1", state: "archived", limit: 1, cursor: first.nextCursor! });
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0]!.id).not.toBe(first.items[0]!.id);
+    expect(second.hasMore).toBe(false);
+
+    await expect(store.listTaskPage({ ownerUserId: "user_1", state: "archived", search: "beta", limit: 10 }))
+      .resolves.toMatchObject({ items: [expect.objectContaining({ id: tasks[1]!.task.id, title: "Beta", archived: true })] });
+    await expect(store.deleteArchivedTasks({ search: "alpha" }, "user_1")).resolves.toEqual({ deletedCount: 1 });
+    await expect(store.listTaskPage({ ownerUserId: "user_1", state: "deleted", limit: 10 }))
+      .resolves.toMatchObject({ items: [expect.objectContaining({ id: tasks[0]!.task.id })] });
+    await expect(store.listTaskPage({ ownerUserId: "user_2", state: "archived", limit: 10 }))
+      .resolves.toMatchObject({ items: [] });
+  });
 });
 
 describe("cloud message history pagination", () => {

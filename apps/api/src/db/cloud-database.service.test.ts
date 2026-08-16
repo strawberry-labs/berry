@@ -10,9 +10,12 @@ class FakeExecutor implements SqlExecutor {
   transactionCount = 0;
   sessionCount = 0;
   indexValid: boolean | undefined;
+  indexValidByName = new Map<string, boolean>();
 
   async execute(sql: string, params: readonly unknown[] = []): Promise<void> {
     this.calls.push({ sql, params });
+    for (const match of sql.matchAll(/CREATE INDEX CONCURRENTLY IF NOT EXISTS ([a-z0-9_]+)/g)) this.indexValidByName.set(match[1]!, true);
+    for (const match of sql.matchAll(/DROP INDEX CONCURRENTLY IF EXISTS ([a-z0-9_]+)/g)) this.indexValidByName.set(match[1]!, false);
     if (sql.includes("CREATE INDEX CONCURRENTLY")) this.indexValid = true;
     if (sql.includes("DROP INDEX CONCURRENTLY")) this.indexValid = false;
   }
@@ -22,8 +25,12 @@ class FakeExecutor implements SqlExecutor {
     if (sql.includes("SELECT id FROM schema_migrations")) {
       return this.appliedIds.map((id) => ({ id }) as T);
     }
-    if (sql.includes("FROM pg_class c") && sql.includes("message_parts_tenant_message_ordinal_idx")) {
-      return (this.indexValid === undefined ? [] : [{ index_name: "message_parts_tenant_message_ordinal_idx", indisvalid: this.indexValid }]) as T[];
+    if (sql.includes("FROM pg_class c")) {
+      const name = sql.match(/c\.relname = '([^']+)'/)?.[1];
+      const valid = name === "message_parts_tenant_message_ordinal_idx"
+        ? this.indexValid
+        : name ? this.indexValidByName.get(name) : undefined;
+      return (valid === undefined ? [] : [{ index_name: name, indisvalid: valid }]) as T[];
     }
     return [];
   }

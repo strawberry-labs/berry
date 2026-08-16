@@ -93,7 +93,7 @@ describe("BerryApiClient", () => {
     let receiver: unknown = "not-called";
     const fetchImpl = async function(this: unknown) {
       receiver = this;
-      return json([]);
+      return json({ items: [], nextCursor: null, hasMore: false });
     };
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
@@ -103,8 +103,8 @@ describe("BerryApiClient", () => {
   });
 
   it("normalizes legacy task list mode fields for the web task experience", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify([
-      {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      items: [{
         id: "task_1",
         workspaceId: "workspace_1",
         title: "Cloud task",
@@ -126,8 +126,7 @@ describe("BerryApiClient", () => {
         pullRequestNumber: null,
         createdAt: "2026-07-10T00:00:00.000Z",
         updatedAt: "2026-07-10T00:00:00.000Z",
-      },
-    ]), { headers: { "content-type": "application/json" } }));
+      }], nextCursor: null, hasMore: false }), { headers: { "content-type": "application/json" } }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test/", fetchImpl: fetchImpl as unknown as typeof fetch });
 
     const tasks = await client.listTasks({ workspaceId: "workspace_1" });
@@ -135,7 +134,7 @@ describe("BerryApiClient", () => {
     expect(tasks).toHaveLength(1);
     expect(tasks[0]?.title).toBe("Cloud task");
     expect(tasks[0]?.conversationKind).toBe("chat");
-    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/tasks?workspaceId=workspace_1", expect.objectContaining({ method: "GET" }));
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/tasks/page?workspaceId=workspace_1&limit=100", expect.objectContaining({ method: "GET" }));
   });
 
   it("creates one normal task and preserves stable task-list pagination", async () => {
@@ -147,7 +146,7 @@ describe("BerryApiClient", () => {
       worktreeBaseSha: null, pullRequestUrl: null, pullRequestNumber: null, createdAt, updatedAt: createdAt,
     };
     const session = { id: "session_1", taskId: "task_1", parentSessionId: null, status: "active", modelProviderId: null, model: null, permissionMode: "ask", createdAt, updatedAt: createdAt };
-    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => String(input).includes("/v1/tasks?") ? json([task]) : json({ task, session }));
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => String(input).includes("/v1/tasks/page?") ? json({ items: [task], nextCursor: null, hasMore: false }) : json({ task, session }));
     const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
 
     await client.createTask({ workspaceKind: "general", title: "General task" });
@@ -157,7 +156,22 @@ describe("BerryApiClient", () => {
       method: "POST",
       body: JSON.stringify({ workspaceKind: "general", title: "General task" }),
     }));
-    expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks?workspaceKind=general&limit=6&offset=0&taskIds=task_1%2Ctask_2", expect.objectContaining({ method: "GET" }));
+    expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks/page?workspaceKind=general&limit=100&taskIds=task_1%2Ctask_2", expect.objectContaining({ method: "GET" }));
+  });
+
+  it("supports cancellable cursor pages for enterprise management collections", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/members/page")) {
+        return json({ items: [], nextCursor: null, hasMore: false, total: 0 });
+      }
+      return json({ items: [], nextCursor: null, hasMore: false, total: 0 });
+    });
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const controller = new AbortController();
+    await client.listOrgMembersPage("tenant_1", { search: "Ada", limit: 25 }, { signal: controller.signal });
+    await client.listDepartmentsPage("tenant_1", { search: "Platform", parentId: null, limit: 25 }, { signal: controller.signal });
+    expect(fetchImpl).toHaveBeenNthCalledWith(1, "https://api.berry.test/v1/orgs/tenant_1/members/page?search=Ada&limit=25", expect.objectContaining({ signal: controller.signal }));
+    expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/orgs/tenant_1/departments/page?search=Platform&parentId=null&limit=25", expect.objectContaining({ signal: controller.signal }));
   });
 
   it("persists task title updates", async () => {

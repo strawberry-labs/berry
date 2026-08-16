@@ -1,9 +1,13 @@
 import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Inject, Optional, Param, Post, Put, Query, Req, ServiceUnavailableException } from "@nestjs/common";
 import {
   DepartmentSchema,
+  DepartmentListQuerySchema,
+  DepartmentPageSchema,
   EffectivePermissionsSchema,
   FeatureFlagSchema,
   OrgMembershipSchema,
+  MemberListQuerySchema,
+  MemberPageSchema,
   OrgMembershipUpdateSchema,
   OrgPermissionSchema,
   OrganizationSchema,
@@ -110,6 +114,12 @@ export class IdentityController {
     return z.array(OrgMembershipSchema).parse(await this.repository.listMemberships(tenantId));
   }
 
+  @Get("/:tenantId/members/page")
+  async listMemberPage(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
+    await this.requirePermission(request, tenantId, "members:read");
+    return MemberPageSchema.parse(await this.repository.listMembershipPage(tenantId, MemberListQuerySchema.parse(query ?? {})));
+  }
+
   @Post("/:tenantId/members")
   async createMember(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Body() body: unknown) {
     await this.requirePermission(request, tenantId, "members:write");
@@ -191,6 +201,16 @@ export class IdentityController {
   async listDepartments(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string) {
     await this.requirePermission(request, tenantId, "departments:read");
     return z.array(DepartmentSchema).parse(await this.repository.listDepartments(tenantId));
+  }
+
+  @Get("/:tenantId/departments/page")
+  async listDepartmentPage(@Req() request: AuthenticatedRequest, @Param("tenantId") tenantId: string, @Query() query: unknown) {
+    await this.requirePermission(request, tenantId, "departments:read");
+    const raw = query && typeof query === "object" && !Array.isArray(query) ? query as Record<string, unknown> : {};
+    return DepartmentPageSchema.parse(await this.repository.listDepartmentPage(tenantId, DepartmentListQuerySchema.parse({
+      ...raw,
+      ...(raw.parentId === "null" ? { parentId: null } : {}),
+    })));
   }
 
   @Post("/:tenantId/departments")

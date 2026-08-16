@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { hashPassword } from "better-auth/crypto";
+import { BadRequestException } from "@nestjs/common";
 import {
   SELF_HOST_TENANT_ID,
   SELF_HOST_TENANT_SLUG,
@@ -19,10 +20,14 @@ import {
   SsoConnectionSchema,
   sealConnectorSecret,
   type Department,
+  type DepartmentListQuery,
+  type DepartmentPage,
   type EffectivePermissions,
   type FeatureFlag,
   type JsonValue,
   type OrgMembership,
+  type MemberListQuery,
+  type MemberPage,
   type OrgMembershipUpdate,
   type OrgPermission,
   type Organization,
@@ -36,6 +41,33 @@ import {
 import type { CloudDatabaseService, SqlExecutor } from "../db/cloud-database.service.ts";
 
 export const ENTERPRISE_IDENTITY_REPOSITORY = Symbol("ENTERPRISE_IDENTITY_REPOSITORY");
+
+type IdentityCursor = { value: string; id: string };
+
+function encodeIdentityCursor(value: string, id: string): string {
+  return Buffer.from(JSON.stringify({ value, id }), "utf8").toString("base64url");
+}
+
+function parseIdentityCursor(cursor: string | undefined): IdentityCursor | null {
+  if (cursor === undefined) return null;
+  if (!/^[A-Za-z0-9_-]{1,512}$/.test(cursor)) throw new BadRequestException("Invalid identity collection cursor");
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<IdentityCursor>;
+    if (typeof value.value !== "string" || value.value.length > 512 || typeof value.id !== "string" || value.id.length < 1 || value.id.length > 128) throw new Error("invalid cursor");
+    return { value: value.value, id: value.id };
+  } catch {
+    throw new BadRequestException("Invalid identity collection cursor");
+  }
+}
+
+function boundedIdentityLimit(limit: number | undefined, fallback: number): number {
+  if (!Number.isFinite(limit)) return fallback;
+  return Math.max(1, Math.min(100, Math.floor(limit!)));
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
 
 const BASE_ROLE_PERMISSIONS: Record<string, OrgPermission[]> = {
   owner: ["org:read", "org:admin", "members:read", "members:write", "departments:read", "departments:write", "sso:read", "sso:write", "rbac:read", "rbac:write", "feature_flags:read", "feature_flags:write", "acl:read", "acl:write", "org_settings:read", "org_settings:write"],
@@ -139,6 +171,7 @@ export interface EnterpriseIdentityRepository {
   listOrganizations(userId: string, host?: string | undefined): Promise<Organization[]>;
   resolveOrganizationByHost(host: string): Promise<Organization | null>;
   listMemberships(tenantId: string): Promise<OrgMembership[]>;
+  listMembershipPage(tenantId: string, query: MemberListQuery): Promise<MemberPage>;
   createMembership(input: CreateOrgMemberInput): Promise<OrgMembership>;
   updateMembership(tenantId: string, userId: string, input: OrgMembershipUpdate): Promise<OrgMembership>;
   getMembership(tenantId: string, userId: string): Promise<OrgMembership | null>;
@@ -151,6 +184,7 @@ export interface EnterpriseIdentityRepository {
   listResourceAcls(tenantId: string, resource?: AuthorizationResource | undefined): Promise<ResourceAcl[]>;
   upsertResourceAcl(input: UpsertResourceAclInput): Promise<ResourceAcl>;
   listDepartments(tenantId: string): Promise<Department[]>;
+  listDepartmentPage(tenantId: string, query: DepartmentListQuery): Promise<DepartmentPage>;
   createDepartment(input: CreateDepartmentInput): Promise<Department>;
   listSsoConnections(tenantId: string): Promise<SsoConnection[]>;
   createSsoConnection(input: CreateSsoConnectionInput): Promise<SsoConnection>;
@@ -263,6 +297,35 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
     return [...this.#memberships.values()]
       .filter((membership) => membership.tenantId === tenantId)
       .sort((left, right) => left.email.localeCompare(right.email));
+  }
+
+  async listMembershipPage(tenantId: string, query: MemberListQuery): Promise<MemberPage> {
+    const cursor = parseIdentityCursor(query.cursor);
+    if (cursor && !isUuid(cursor.id)) throw new BadRequestException("Invalid identity collection cursor");
+    const search = query.search.trim().toLocaleLowerCase();
+    const filtered = [...this.#memberships.values()]
+      .filter((membership) => membership.tenantId === tenantId)
+      .filter((membership) => !search || `${membership.email} ${membership.name}`.toLocaleLowerCase().includes(search))
+      .filter((membership) => !query.status || membership.status === query.status)
+      .filter((membership) => !query.role || membership.role === query.role)
+      .filter((membership) => !query.source || membership.source === query.source)
+      .filter((membership) => !query.departmentId || membership.departmentIds.includes(query.departmentId))
+      .sort((left, right) => left.email.toLocaleLowerCase().localeCompare(right.email.toLocaleLowerCase()) || left.userId.localeCompare(right.userId));
+    const rows = filtered
+      .filter((membership) => {
+        if (!cursor) return true;
+        const value = membership.email.toLocaleLowerCase();
+        return value > cursor.value || (value === cursor.value && membership.userId > cursor.id);
+      });
+    const limit = boundedIdentityLimit(query.limit, 25);
+    const items = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    return {
+      items,
+      hasMore,
+      nextCursor: hasMore ? encodeIdentityCursor(items.at(-1)!.email.toLocaleLowerCase(), items.at(-1)!.userId) : null,
+      total: filtered.length,
+    };
   }
 
   async createMembership(input: CreateOrgMemberInput): Promise<OrgMembership> {
@@ -401,6 +464,32 @@ export class InMemoryEnterpriseIdentityRepository implements EnterpriseIdentityR
 
   async listDepartments(tenantId: string): Promise<Department[]> {
     return [...this.#departments.values()].filter((department) => department.tenantId === tenantId && department.status !== "deleted");
+  }
+
+  async listDepartmentPage(tenantId: string, query: DepartmentListQuery): Promise<DepartmentPage> {
+    const cursor = parseIdentityCursor(query.cursor);
+    if (cursor && !isUuid(cursor.id)) throw new BadRequestException("Invalid identity collection cursor");
+    const search = query.search.trim().toLocaleLowerCase();
+    const filtered = [...this.#departments.values()]
+      .filter((department) => department.tenantId === tenantId)
+      .filter((department) => query.status ? department.status === query.status : department.status !== "deleted")
+      .filter((department) => query.parentId === undefined || department.parentId === query.parentId)
+      .filter((department) => !search || `${department.name} ${department.slug}`.toLocaleLowerCase().includes(search))
+      .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+    const rows = filtered
+      .filter((department) => {
+        if (!cursor) return true;
+        return department.name > cursor.value || (department.name === cursor.value && department.id > cursor.id);
+      });
+    const limit = boundedIdentityLimit(query.limit, 50);
+    const items = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    return {
+      items,
+      hasMore,
+      nextCursor: hasMore ? encodeIdentityCursor(items.at(-1)!.name, items.at(-1)!.id) : null,
+      total: filtered.length,
+    };
   }
 
   async createDepartment(input: CreateDepartmentInput): Promise<Department> {
@@ -569,6 +658,38 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
       ORDER BY u.email ASC
     `, [tenantId]));
     return rows.map(membershipFromRow);
+  }
+
+  async listMembershipPage(tenantId: string, query: MemberListQuery): Promise<MemberPage> {
+    const cursor = parseIdentityCursor(query.cursor);
+    if (cursor && !isUuid(cursor.id)) throw new BadRequestException("Invalid identity collection cursor");
+    const limit = boundedIdentityLimit(query.limit, 25);
+    const rows = await this.database.withTenant(tenantId, (executor) => executor.query<MembershipRow & { total_count: string | number }>(`
+      SELECT tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.primary_department_id, tm.external_id, tm.source, tm.joined_at, tm.updated_at,
+        COALESCE(jsonb_agg(dm.department_id) FILTER (WHERE dm.department_id IS NOT NULL), '[]'::jsonb) AS department_ids,
+        count(*) OVER() AS total_count
+      FROM tenant_memberships tm
+      JOIN users u ON u.id = tm.user_id
+      LEFT JOIN department_memberships dm ON dm.tenant_id = tm.tenant_id AND dm.user_id = tm.user_id
+      WHERE tm.tenant_id = $1::uuid
+        AND ($2::text IS NULL OR strpos(lower(u.email), lower($2::text)) > 0 OR strpos(lower(COALESCE(u.name, '')), lower($2::text)) > 0)
+        AND ($3::text IS NULL OR tm.status = $3)
+        AND ($4::text IS NULL OR tm.role = $4)
+        AND ($5::uuid IS NULL OR EXISTS (SELECT 1 FROM department_memberships filter_dm WHERE filter_dm.tenant_id = tm.tenant_id AND filter_dm.user_id = tm.user_id AND filter_dm.department_id = $5::uuid))
+        AND ($6::text IS NULL OR tm.source = $6)
+        AND ($7::text IS NULL OR lower(u.email) > $7::text OR (lower(u.email) = $7::text AND tm.user_id > $8::uuid))
+      GROUP BY tm.tenant_id, tm.user_id, u.email, u.name, tm.status, tm.role, tm.primary_department_id, tm.external_id, tm.source, tm.joined_at, tm.updated_at
+      ORDER BY lower(u.email) ASC, tm.user_id ASC
+      LIMIT $9
+    `, [tenantId, query.search || null, query.status ?? null, query.role ?? null, query.departmentId ?? null, query.source ?? null, cursor?.value ?? null, cursor?.id ?? null, limit + 1]));
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(membershipFromRow);
+    return {
+      items,
+      hasMore,
+      nextCursor: hasMore ? encodeIdentityCursor(items.at(-1)!.email.toLocaleLowerCase(), items.at(-1)!.userId) : null,
+      total: rows[0] ? Number(rows[0].total_count) : 0,
+    };
   }
 
   async createMembership(input: CreateOrgMemberInput): Promise<OrgMembership> {
@@ -777,6 +898,32 @@ export class PostgresEnterpriseIdentityRepository implements EnterpriseIdentityR
       ORDER BY name ASC
     `));
     return rows.map(departmentFromRow);
+  }
+
+  async listDepartmentPage(tenantId: string, query: DepartmentListQuery): Promise<DepartmentPage> {
+    const cursor = parseIdentityCursor(query.cursor);
+    if (cursor && !isUuid(cursor.id)) throw new BadRequestException("Invalid identity collection cursor");
+    const limit = boundedIdentityLimit(query.limit, 50);
+    const rows = await this.database.withTenant(tenantId, (executor) => executor.query<DepartmentRow & { total_count: string | number }>(`
+      SELECT id, tenant_id, parent_id, name, slug, external_id, status, created_at, updated_at,
+        count(*) OVER() AS total_count
+      FROM departments
+      WHERE tenant_id = $1::uuid AND deleted_at IS NULL
+        AND ($2::text IS NULL OR strpos(lower(name), lower($2::text)) > 0 OR strpos(lower(slug), lower($2::text)) > 0)
+        AND ($3::text IS NULL OR status = $3)
+        AND ($4::boolean = true OR (($5::uuid IS NULL AND parent_id IS NULL) OR parent_id = $5::uuid))
+        AND ($6::text IS NULL OR name > $6::text OR (name = $6::text AND id > $7::uuid))
+      ORDER BY name ASC, id ASC
+      LIMIT $8
+    `, [tenantId, query.search || null, query.status ?? null, query.parentId === undefined, query.parentId ?? null, cursor?.value ?? null, cursor?.id ?? null, limit + 1]));
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(departmentFromRow);
+    return {
+      items,
+      hasMore,
+      nextCursor: hasMore ? encodeIdentityCursor(items.at(-1)!.name, items.at(-1)!.id) : null,
+      total: rows[0] ? Number(rows[0].total_count) : 0,
+    };
   }
 
   async createDepartment(input: CreateDepartmentInput): Promise<Department> {
@@ -1017,7 +1164,7 @@ type MembershipRow = {
   user_id: string;
   email: string;
   name: string;
-  status: "active" | "disabled" | "deprovisioned";
+  status: "pending" | "active" | "disabled" | "deprovisioned";
   role: string;
   primary_department_id: string | null;
   department_ids: unknown;

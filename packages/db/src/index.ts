@@ -2897,6 +2897,34 @@ AFTER UPDATE OR DELETE ON messages
 FOR EACH ROW EXECUTE FUNCTION berry_touch_session_message_history();
 `.trim();
 
+/** Keyset pagination and archive/search indexes for enterprise collections. */
+export const ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS = [
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS workspaces_tenant_owner_updated_id_idx
+     ON workspaces (tenant_id, owner_id, updated_at DESC, id ASC)
+     WHERE deleted_at IS NULL`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_tenant_user_updated_id_idx
+     ON tasks (tenant_id, user_id, updated_at DESC, id ASC)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_tenant_user_archive_updated_id_idx
+     ON tasks (tenant_id, user_id, archived, deleted_at, updated_at DESC, id ASC)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_tenant_workspace_archive_updated_id_idx
+     ON tasks (tenant_id, workspace_id, archived, deleted_at, updated_at DESC, id ASC)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_tenant_title_prefix_idx
+     ON tasks (tenant_id, lower(title) text_pattern_ops)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS tenant_memberships_tenant_updated_user_idx
+     ON tenant_memberships (tenant_id, updated_at DESC, user_id ASC)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS users_lower_email_idx
+     ON users (lower(email), id)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS department_memberships_tenant_user_department_idx
+     ON department_memberships (tenant_id, user_id, department_id)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS departments_tenant_updated_id_idx
+     ON departments (tenant_id, updated_at DESC, id ASC)
+     WHERE deleted_at IS NULL`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS departments_tenant_name_id_idx
+     ON departments (tenant_id, name ASC, id ASC)
+     WHERE deleted_at IS NULL`,
+] as const;
+export const ENTERPRISE_COLLECTION_PAGINATION_MIGRATION = ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS.join(";\n");
+
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -4894,4 +4922,23 @@ export const cloudMigrations = [
   },
   { id: 54, name: "message_history_revision_v1", sql: MESSAGE_HISTORY_REVISION_MIGRATION },
   { id: 55, name: "message_history_deletion_revision_v1", sql: MESSAGE_HISTORY_DELETION_REVISION_MIGRATION },
+  {
+    id: 56,
+    name: "enterprise_collection_pagination_v1",
+    sql: ENTERPRISE_COLLECTION_PAGINATION_MIGRATION,
+    transactional: false,
+    onlineIndexNames: [
+      "workspaces_tenant_owner_updated_id_idx",
+      "tasks_tenant_user_updated_id_idx",
+      "tasks_tenant_user_archive_updated_id_idx",
+      "tasks_tenant_workspace_archive_updated_id_idx",
+      "tasks_tenant_title_prefix_idx",
+      "tenant_memberships_tenant_updated_user_idx",
+      "users_lower_email_idx",
+      "department_memberships_tenant_user_department_idx",
+      "departments_tenant_updated_id_idx",
+      "departments_tenant_name_id_idx",
+    ],
+    onlineSql: ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS,
+  },
 ] as const;

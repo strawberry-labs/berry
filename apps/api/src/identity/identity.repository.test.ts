@@ -1,7 +1,7 @@
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import { ConnectorSecretEnvelopeSchema, openConnectorSecret } from "@berry/shared";
 import { describe, expect, it, vi } from "vitest";
-import { PostgresEnterpriseIdentityRepository } from "./identity.repository.ts";
+import { InMemoryEnterpriseIdentityRepository, PostgresEnterpriseIdentityRepository } from "./identity.repository.ts";
 
 describe("PostgresEnterpriseIdentityRepository SSO secrets", () => {
   it("binds encrypted Google credentials to the canonical upserted connection ID", async () => {
@@ -100,5 +100,26 @@ describe("PostgresEnterpriseIdentityRepository SSO secrets", () => {
       rootKey,
       `${SELF_HOST_TENANT_ID}:sso:${canonicalId}:client-secret`,
     )).resolves.toBe("GOCSPX-plaintext-must-not-survive");
+  });
+});
+
+describe("identity collection pagination", () => {
+  it("keeps member cursors stable and applies tenant-safe filters", async () => {
+    const repository = new InMemoryEnterpriseIdentityRepository(100);
+    const first = await repository.listMembershipPage(SELF_HOST_TENANT_ID, { search: "", limit: 1 });
+    expect(first.items).toHaveLength(1);
+    expect(first.hasMore).toBe(true);
+    const second = await repository.listMembershipPage(SELF_HOST_TENANT_ID, { search: "", limit: 1, cursor: first.nextCursor! });
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0]?.userId).not.toBe(first.items[0]?.userId);
+    await expect(repository.listMembershipPage("00000000-0000-7000-8000-000000000999", { search: "", limit: 10 }))
+      .resolves.toMatchObject({ items: [], hasMore: false });
+  });
+
+  it("paginates departments and preserves explicit root filtering", async () => {
+    const repository = new InMemoryEnterpriseIdentityRepository(100);
+    const page = await repository.listDepartmentPage(SELF_HOST_TENANT_ID, { search: "", parentId: null, limit: 10 });
+    expect(page.items.every((department) => department.parentId === null)).toBe(true);
+    expect(page.total).toBeGreaterThanOrEqual(page.items.length);
   });
 });

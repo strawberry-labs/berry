@@ -11,6 +11,10 @@ import {
   TaskSchema,
   normalizeTaskForWeb,
   type MessageHistoryPage,
+  type TaskCollectionState,
+  type TaskCollectionSummary,
+  type TaskPage,
+  type WorkspacePage,
   TaskStatusSchema,
   type JsonValue,
   type Message,
@@ -64,13 +68,29 @@ export interface UpdateTaskInput {
 }
 
 export interface ListTasksFilter {
-  workspaceId?: string;
-  workspaceKind?: "project" | "general";
-  ownerUserId?: string | null;
-  includeDeleted?: boolean;
-  limit?: number;
-  offset?: number;
-  taskIds?: readonly string[];
+  workspaceId?: string | undefined;
+  workspaceKind?: "project" | "general" | undefined;
+  ownerUserId?: string | null | undefined;
+  includeDeleted?: boolean | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
+  taskIds?: readonly string[] | undefined;
+  search?: string | undefined;
+  cursor?: string | undefined;
+  state?: TaskCollectionState | undefined;
+}
+
+export interface ListWorkspacesOptions {
+  ownerUserId?: string | null | undefined;
+  includeGeneral?: boolean | undefined;
+  search?: string | undefined;
+  cursor?: string | undefined;
+  limit?: number | undefined;
+}
+
+export interface DeleteArchivedTasksInput {
+  workspaceId?: string | undefined;
+  search?: string | undefined;
 }
 
 export interface AppendMessageInput {
@@ -88,9 +108,13 @@ export interface CloudTaskStore {
   updateWorkspace(id: string, input: { name?: string | undefined; pinned?: boolean | undefined }, ownerUserId?: string | null): Promise<Workspace>;
   removeWorkspace(id: string, ownerUserId?: string | null): Promise<{ removed: boolean }>;
   ensureGeneralWorkspace(ownerUserId: string): Promise<Workspace>;
-  listWorkspaces(filter?: { ownerUserId?: string | null; includeGeneral?: boolean }): Promise<Workspace[]>;
+  listWorkspaces(filter?: ListWorkspacesOptions): Promise<Workspace[]>;
+  listWorkspacePage(filter?: ListWorkspacesOptions): Promise<WorkspacePage>;
   createTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }>;
   listTasks(filter?: ListTasksFilter): Promise<Task[]>;
+  listTaskPage(filter?: ListTasksFilter): Promise<TaskPage>;
+  taskSummary(ownerUserId?: string | null): Promise<TaskCollectionSummary>;
+  deleteArchivedTasks(input: DeleteArchivedTasksInput, ownerUserId?: string | null): Promise<{ deletedCount: number }>;
   getTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
   updateTask(taskId: string, input: UpdateTaskInput, ownerUserId?: string | null): Promise<Task>;
   deleteTask(taskId: string, ownerUserId?: string | null): Promise<Task>;
@@ -197,11 +221,30 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
     return workspace;
   }
 
-  async listWorkspaces(filter: { ownerUserId?: string | null; includeGeneral?: boolean } = {}): Promise<Workspace[]> {
-    return [...this.#workspaces.values()]
-      .filter((workspace) => workspace.ownerUserId === filter.ownerUserId)
+  async listWorkspaces(filter: ListWorkspacesOptions = {}): Promise<Workspace[]> {
+    const page = await this.listWorkspacePage({ ...filter, limit: filter.limit ?? 100 });
+    const all = [...page.items];
+    let cursor = page.nextCursor;
+    while (cursor) {
+      const next = await this.listWorkspacePage({ ...filter, cursor, limit: filter.limit ?? 100 });
+      all.push(...next.items);
+      cursor = next.nextCursor;
+    }
+    return all;
+  }
+
+  async listWorkspacePage(filter: ListWorkspacesOptions = {}): Promise<WorkspacePage> {
+    const limit = boundedCollectionLimit(filter.limit);
+    const cursor = parseCollectionCursor(filter.cursor);
+    const rows = [...this.#workspaces.values()]
+      .filter((workspace) => workspace.ownerUserId === (filter.ownerUserId ?? null))
       .filter((workspace) => workspace.workspaceKind === "project" || filter.includeGeneral === true)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      .filter((workspace) => !filter.search || workspace.name.toLocaleLowerCase().includes(filter.search.trim().toLocaleLowerCase()))
+      .sort(collectionSort)
+      .filter((workspace) => !cursor || isAfterCollectionCursor(workspace.updatedAt, workspace.id, cursor));
+    const items = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    return { items, hasMore, nextCursor: hasMore ? encodeCollectionCursor(items.at(-1)!.updatedAt, items.at(-1)!.id) : null };
   }
 
   async createTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }> {
@@ -249,20 +292,75 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   }
 
   async listTasks(filter: ListTasksFilter = {}): Promise<Task[]> {
-    const limit = Math.max(1, Math.min(500, filter.limit ?? 500));
+    const page = await this.listTaskPage(filter);
+    const all = [...page.items];
+    let cursor = page.nextCursor;
+    while (cursor) {
+      const next = await this.listTaskPage({ ...filter, cursor });
+      all.push(...next.items);
+      cursor = next.nextCursor;
+    }
     const offset = Math.max(0, filter.offset ?? 0);
-    return [...this.#tasks.values()]
+    return all.slice(offset, filter.limit === undefined ? undefined : offset + Math.max(1, Math.min(100, filter.limit)));
+  }
+
+  async listTaskPage(filter: ListTasksFilter = {}): Promise<TaskPage> {
+    const limit = boundedCollectionLimit(filter.limit);
+    const cursor = parseCollectionCursor(filter.cursor);
+    const state = filter.state;
+    const rows = [...this.#tasks.values()]
       .filter((task) => (filter.workspaceId ? task.workspaceId === filter.workspaceId : true))
       .filter((task) => {
         const workspace = this.#workspaces.get(task.workspaceId);
+        if (!workspace) return false;
         if (filter.workspaceKind && workspace?.workspaceKind !== filter.workspaceKind) return false;
-        return workspace?.ownerUserId === undefined || workspace.ownerUserId === filter.ownerUserId;
+        return filter.ownerUserId === undefined || workspace.ownerUserId === filter.ownerUserId;
       })
       .filter((task) => filter.ownerUserId === undefined || this.#taskOwners.get(task.id) === filter.ownerUserId)
       .filter((task) => !filter.taskIds || filter.taskIds.includes(task.id))
-      .filter((task) => filter.includeDeleted === true || task.deletedAt === null)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
-      .slice(offset, offset + limit);
+      .filter((task) => state === "active" ? !task.archived && task.deletedAt === null
+        : state === "archived" ? task.archived && task.deletedAt === null
+          : state === "deleted" ? task.deletedAt !== null
+            : state === "all" ? true
+              : filter.includeDeleted === true || task.deletedAt === null)
+      .filter((task) => !filter.search || task.title.toLocaleLowerCase().includes(filter.search.trim().toLocaleLowerCase()))
+      .sort(collectionSort)
+      .filter((task) => !cursor || isAfterCollectionCursor(task.updatedAt, task.id, cursor));
+    const items = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    return { items, hasMore, nextCursor: hasMore ? encodeCollectionCursor(items.at(-1)!.updatedAt, items.at(-1)!.id) : null };
+  }
+
+  async taskSummary(ownerUserId?: string | null): Promise<TaskCollectionSummary> {
+    const rows = [...this.#tasks.values()].filter((task) => {
+      const workspace = this.#workspaces.get(task.workspaceId);
+      if (!workspace) return false;
+      return (ownerUserId === undefined || this.#taskOwners.get(task.id) === ownerUserId)
+        && (ownerUserId === undefined || workspace.ownerUserId === ownerUserId);
+    });
+    return {
+      active: rows.filter((task) => !task.archived && task.deletedAt === null).length,
+      archived: rows.filter((task) => task.archived && task.deletedAt === null).length,
+      deleted: rows.filter((task) => task.deletedAt !== null).length,
+      total: rows.length,
+    };
+  }
+
+  async deleteArchivedTasks(input: DeleteArchivedTasksInput, ownerUserId?: string | null): Promise<{ deletedCount: number }> {
+    const now = nowIso();
+    let deletedCount = 0;
+    for (const [id, task] of this.#tasks) {
+      const workspace = this.#workspaces.get(task.workspaceId);
+      if (!workspace) continue;
+      if (!task.archived || task.deletedAt !== null) continue;
+      if (ownerUserId !== undefined && this.#taskOwners.get(id) !== ownerUserId) continue;
+      if (ownerUserId !== undefined && workspace.ownerUserId !== ownerUserId) continue;
+      if (input.workspaceId && task.workspaceId !== input.workspaceId) continue;
+      if (input.search && !task.title.toLocaleLowerCase().includes(input.search.trim().toLocaleLowerCase())) continue;
+      this.#tasks.set(id, TaskSchema.parse({ ...task, deletedAt: now, updatedAt: now }));
+      deletedCount += 1;
+    }
+    return { deletedCount };
   }
 
   async getTask(taskId: string, ownerUserId?: string | null): Promise<Task> {
@@ -600,21 +698,42 @@ RETURNING id, owner_id, workspace_kind, name, trust_state, created_at, updated_a
     });
   }
 
-  async listWorkspaces(filter: { ownerUserId?: string | null; includeGeneral?: boolean } = {}): Promise<Workspace[]> {
+  async listWorkspaces(filter: ListWorkspacesOptions = {}): Promise<Workspace[]> {
+    const page = await this.listWorkspacePage({ ...filter, limit: filter.limit ?? 100 });
+    const all = [...page.items];
+    let cursor = page.nextCursor;
+    while (cursor) {
+      const next = await this.listWorkspacePage({ ...filter, cursor, limit: filter.limit ?? 100 });
+      all.push(...next.items);
+      cursor = next.nextCursor;
+    }
+    return all;
+  }
+
+  async listWorkspacePage(filter: ListWorkspacesOptions = {}): Promise<WorkspacePage> {
     return this.database.withTenant(this.tenantId, async (executor) => {
+      const cursor = parseCollectionCursor(filter.cursor);
+      if (cursor && !isUuid(cursor.id)) throw new ConflictException("Invalid collection cursor");
+      const limit = boundedCollectionLimit(filter.limit);
       const rows = await executor.query<WorkspaceRow>(
         `
 SELECT id, owner_id, workspace_kind, name, trust_state, created_at, updated_at,
        COALESCE((settings ->> 'pinned')::boolean, false) AS pinned
 FROM workspaces
 WHERE tenant_id = $1::uuid AND deleted_at IS NULL
-  AND owner_id = $3::uuid
-  AND (workspace_kind = 'project' OR $2::boolean = true)
-ORDER BY updated_at DESC
+  AND owner_id = $2::uuid
+  AND (workspace_kind = 'project' OR $3::boolean = true)
+  AND ($4::text IS NULL OR strpos(lower(name), lower($4::text)) > 0)
+  AND ($5::timestamptz IS NULL OR updated_at < $5::timestamptz
+       OR (updated_at = $5::timestamptz AND id > $6::uuid))
+ORDER BY updated_at DESC, id ASC
+LIMIT $7
         `.trim(),
-        [this.tenantId, filter.includeGeneral === true, filter.ownerUserId ?? null],
+        [this.tenantId, filter.ownerUserId ?? null, filter.includeGeneral === true, filter.search?.trim() || null, cursor?.updatedAt ?? null, cursor?.id ?? null, limit + 1],
       );
-      return rows.map(workspaceFromRow);
+      const hasMore = rows.length > limit;
+      const items = rows.slice(0, limit).map(workspaceFromRow);
+      return { items, hasMore, nextCursor: hasMore ? encodeCollectionCursor(items.at(-1)!.updatedAt, items.at(-1)!.id) : null };
     });
   }
 
@@ -655,8 +774,24 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_k
   }
 
   async listTasks(filter: ListTasksFilter = {}): Promise<Task[]> {
+    const page = await this.listTaskPage(filter);
+    const all = [...page.items];
+    let cursor = page.nextCursor;
+    while (cursor) {
+      const next = await this.listTaskPage({ ...filter, cursor });
+      all.push(...next.items);
+      cursor = next.nextCursor;
+    }
+    const offset = Math.max(0, filter.offset ?? 0);
+    return all.slice(offset, filter.limit === undefined ? undefined : offset + Math.max(1, Math.min(100, filter.limit)));
+  }
+
+  async listTaskPage(filter: ListTasksFilter = {}): Promise<TaskPage> {
     return this.database.withTenant(this.tenantId, async (executor) => {
       const workspaceId = filter.workspaceId ? normalizeWorkspaceId(filter.workspaceId) : null;
+      const cursor = parseCollectionCursor(filter.cursor);
+      if (cursor && !isUuid(cursor.id)) throw new ConflictException("Invalid collection cursor");
+      const limit = boundedCollectionLimit(filter.limit);
       const rows = await executor.query<TaskRow>(
         `
 SELECT t.id, t.workspace_id, t.title, t.status, t.active_session_id, t.conversation_kind,
@@ -666,17 +801,63 @@ FROM tasks t
 JOIN workspaces w ON w.id = t.workspace_id AND w.tenant_id = t.tenant_id
 WHERE t.tenant_id = $1::uuid
   AND ($2::uuid IS NULL OR t.workspace_id = $2::uuid)
-  AND ($3::boolean = true OR t.deleted_at IS NULL)
-  AND ($4::workspace_kind IS NULL OR w.workspace_kind = $4::workspace_kind)
-  AND w.owner_id = $5::uuid
-  AND t.user_id = $5::uuid
-  AND ($8::text[] IS NULL OR t.id::text = ANY($8::text[]))
+  AND ($3::workspace_kind IS NULL OR w.workspace_kind = $3::workspace_kind)
+  AND w.owner_id = $4::uuid
+  AND t.user_id = $4::uuid
+  AND ($5::text[] IS NULL OR t.id::text = ANY($5::text[]))
+  AND ($6::text IS NULL OR strpos(lower(t.title), lower($6::text)) > 0)
+  AND (
+    $7::text IS NULL AND ($8::boolean = true OR t.deleted_at IS NULL)
+    OR $7::text = 'active' AND t.archived = false AND t.deleted_at IS NULL
+    OR $7::text = 'archived' AND t.archived = true AND t.deleted_at IS NULL
+    OR $7::text = 'deleted' AND t.deleted_at IS NOT NULL
+    OR $7::text = 'all'
+  )
+  AND ($9::timestamptz IS NULL OR t.updated_at < $9::timestamptz
+       OR (t.updated_at = $9::timestamptz AND t.id > $10::uuid))
 ORDER BY t.updated_at DESC, t.id ASC
-LIMIT $6 OFFSET $7
+LIMIT $11
         `.trim(),
-        [this.tenantId, workspaceId, filter.includeDeleted === true, filter.workspaceKind ?? null, filter.ownerUserId ?? null, Math.max(1, Math.min(500, filter.limit ?? 500)), Math.max(0, filter.offset ?? 0), filter.taskIds ? [...new Set(filter.taskIds)] : null],
+        [this.tenantId, workspaceId, filter.workspaceKind ?? null, filter.ownerUserId ?? null, filter.taskIds ? [...new Set(filter.taskIds)] : null, filter.search?.trim() || null, filter.state ?? null, filter.includeDeleted === true, cursor?.updatedAt ?? null, cursor?.id ?? null, limit + 1],
       );
-      return rows.map(taskFromRow);
+      const hasMore = rows.length > limit;
+      const items = rows.slice(0, limit).map(taskFromRow);
+      return { items, hasMore, nextCursor: hasMore ? encodeCollectionCursor(items.at(-1)!.updatedAt, items.at(-1)!.id) : null };
+    });
+  }
+
+  async taskSummary(ownerUserId?: string | null): Promise<TaskCollectionSummary> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      const [row] = await executor.query<{ active: number | string; archived: number | string; deleted: number | string; total: number | string }>(
+        `SELECT
+          count(*) FILTER (WHERE t.archived = false AND t.deleted_at IS NULL) AS active,
+          count(*) FILTER (WHERE t.archived = true AND t.deleted_at IS NULL) AS archived,
+          count(*) FILTER (WHERE t.deleted_at IS NOT NULL) AS deleted,
+          count(*) AS total
+         FROM tasks t JOIN workspaces w ON w.id = t.workspace_id AND w.tenant_id = t.tenant_id
+         WHERE t.tenant_id = $1::uuid AND w.owner_id = $2::uuid AND t.user_id = $2::uuid`,
+        [this.tenantId, ownerUserId ?? null],
+      );
+      return { active: Number(row?.active ?? 0), archived: Number(row?.archived ?? 0), deleted: Number(row?.deleted ?? 0), total: Number(row?.total ?? 0) };
+    });
+  }
+
+  async deleteArchivedTasks(input: DeleteArchivedTasksInput, ownerUserId?: string | null): Promise<{ deletedCount: number }> {
+    return this.database.withTenant(this.tenantId, async (executor) => {
+      const workspaceId = input.workspaceId ? normalizeWorkspaceId(input.workspaceId) : null;
+      const rows = await executor.query<{ id: string }>(
+        `UPDATE tasks t
+         SET deleted_at = now(), updated_at = now()
+         FROM workspaces w
+         WHERE t.tenant_id = $1::uuid AND t.workspace_id = w.id AND w.tenant_id = t.tenant_id
+           AND w.owner_id = $2::uuid AND t.user_id = $2::uuid
+           AND t.archived = true AND t.deleted_at IS NULL
+           AND ($3::uuid IS NULL OR t.workspace_id = $3::uuid)
+           AND ($4::text IS NULL OR strpos(lower(t.title), lower($4::text)) > 0)
+         RETURNING t.id`,
+        [this.tenantId, ownerUserId ?? null, workspaceId, input.search?.trim() || null],
+      );
+      return { deletedCount: rows.length };
     });
   }
 
@@ -1129,6 +1310,40 @@ function boundedMessageLimit(limit: number | undefined): number {
   return Math.max(1, Math.min(MESSAGE_HISTORY_MAX_LIMIT, Math.floor(limit!)));
 }
 
+const COLLECTION_MAX_LIMIT = 100;
+type CollectionCursor = { updatedAt: string; id: string };
+
+function boundedCollectionLimit(limit: number | undefined): number {
+  if (!Number.isFinite(limit)) return 50;
+  return Math.max(1, Math.min(COLLECTION_MAX_LIMIT, Math.floor(limit!)));
+}
+
+function encodeCollectionCursor(updatedAt: string, id: string): string {
+  return Buffer.from(JSON.stringify({ updatedAt, id }), "utf8").toString("base64url");
+}
+
+function parseCollectionCursor(cursor: string | undefined): CollectionCursor | null {
+  if (cursor === undefined) return null;
+  if (!/^[A-Za-z0-9_-]{1,512}$/.test(cursor)) throw new ConflictException("Invalid collection cursor");
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<CollectionCursor>;
+    if (typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt)) || typeof value.id !== "string" || value.id.length < 1 || value.id.length > 128) {
+      throw new Error("invalid cursor payload");
+    }
+    return { updatedAt: new Date(value.updatedAt).toISOString(), id: value.id };
+  } catch {
+    throw new ConflictException("Invalid collection cursor");
+  }
+}
+
+function isAfterCollectionCursor(updatedAt: string, id: string, cursor: CollectionCursor): boolean {
+  return updatedAt < cursor.updatedAt || (updatedAt === cursor.updatedAt && id > cursor.id);
+}
+
+function collectionSort<T extends { updatedAt: string; id: string }>(left: T, right: T): number {
+  return right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id);
+}
+
 function parseMessageCursor(cursor: string | undefined): bigint | null {
   if (cursor === undefined) return null;
   if (!/^[1-9]\d*$/.test(cursor)) throw new ConflictException("Invalid message history cursor");
@@ -1271,6 +1486,7 @@ function workspaceFromRow(row: WorkspaceRow): Workspace {
     indexedAt: null,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
+    pinned: row.pinned ?? false,
   });
 }
 

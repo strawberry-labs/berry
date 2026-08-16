@@ -1,7 +1,9 @@
 import * as React from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { BerryApiClient } from "@berry/api-client";
 import type { OrgPermission, PersonalizationProfile, Task, Workspace } from "@berry/shared";
 import type { WebConfig } from "@/lib/config";
+import { managementQueryKeys } from "@/lib/management-query-keys";
 export type ManagementScreenProps = {
   client: BerryApiClient | null;
   config: WebConfig;
@@ -19,40 +21,28 @@ export type ManagementScreenProps = {
 };
 export function useResource<T>(
   key: string,
-  loader: () => Promise<T>,
+  loader: (signal?: AbortSignal) => Promise<T>,
   fallback: T,
 ) {
-  const [data, setData] = React.useState<T>(fallback),
-    [loading, setLoading] = React.useState(true),
-    [error, setError] = React.useState<string | null>(null),
-    [version, setVersion] = React.useState(0);
-  React.useEffect(() => {
-    let active = true;
-    setLoading(true);
-    setError(null);
-    void loader()
-      .then((value) => {
-        if (active) setData(value);
-      })
-      .catch((cause) => {
-        if (active)
-          setError(
-            cause instanceof Error ? cause.message : "Unable to load data",
-          );
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [key, version]);
+  const queryClient = useQueryClient();
+  const query = useQuery<T, Error, T, ReturnType<typeof managementQueryKeys.resource>>({
+    queryKey: managementQueryKeys.resource(key),
+    queryFn: ({ signal }) => loader(signal),
+  });
   return {
-    data,
-    loading,
-    error,
-    retry: () => setVersion((v) => v + 1),
-    setData,
+    data: query.data ?? fallback,
+    loading: query.isPending || (query.isFetching && query.dataUpdatedAt === 0),
+    error: query.error ? (query.error instanceof Error ? query.error.message : "Unable to load data") : null,
+    retry: () => { void query.refetch(); },
+    invalidate: () => {
+      void queryClient.invalidateQueries({ queryKey: managementQueryKeys.resource(key) });
+    },
+    setData: (next: T | ((current: T) => T)) => {
+      queryClient.setQueryData<T>(managementQueryKeys.resource(key), (current) => {
+        const value = current ?? fallback;
+        return typeof next === "function" ? (next as (current: T) => T)(value) : next;
+      });
+    },
   };
 }
 export function useLocalSetting(key: string, fallback: string) {

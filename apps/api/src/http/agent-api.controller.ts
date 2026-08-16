@@ -23,10 +23,15 @@ import {
   resolveModelCapabilities,
   sealDurableSecret,
   TaskStatusSchema,
+  TaskCollectionQuerySchema,
+  TaskCollectionSummarySchema,
+  TaskPageSchema,
   TurnIntentSchema,
   TurnStateSchema,
   VISION_ADAPTER_MAX_OUTPUT_TOKENS,
   WorkspaceKindSchema,
+  WorkspaceCollectionQuerySchema,
+  WorkspacePageSchema,
   type AgentStreamEvent,
   type ConversationKind,
   type DurableMcpServer,
@@ -118,6 +123,11 @@ const CreateWorkspaceRequestSchema = z.object({
 const UpdateWorkspaceRequestSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   pinned: z.boolean().optional(),
+}).strict();
+
+const DeleteArchivedTasksRequestSchema = z.object({
+  workspaceId: z.string().min(1).optional(),
+  search: z.string().trim().max(200).optional(),
 }).strict();
 
 const UpdateTaskRequestSchema = z.object({
@@ -967,6 +977,22 @@ export class AgentApiController {
     return this.store.listWorkspaces({ ownerUserId: httpRequest.auth?.user.id ?? null, includeGeneral: includeGeneral === "true" });
   }
 
+  /** Cursor endpoint used by the web project switcher and archive surfaces. */
+  @Get("/workspaces/page")
+  async listWorkspacePage(@Req() httpRequest: AuthenticatedRequest, @Query() query: unknown) {
+    const request = parseQuery(WorkspaceCollectionQuerySchema, query);
+    return WorkspacePageSchema.parse(await this.store.listWorkspacePage({
+      ...request,
+      ownerUserId: httpRequest.auth?.user.id ?? null,
+    }));
+  }
+
+  /** User-facing alias: projects are persisted as workspaces internally. */
+  @Get("/projects/page")
+  async listProjectPage(@Req() httpRequest: AuthenticatedRequest, @Query() query: unknown) {
+    return this.listWorkspacePage(httpRequest, query);
+  }
+
   @Patch("/workspaces/:workspaceId")
   async updateWorkspace(@Req() httpRequest: AuthenticatedRequest, @Param("workspaceId") workspaceId: string, @Body() body: unknown) {
     return this.store.updateWorkspace(workspaceId, parseBody(UpdateWorkspaceRequestSchema, body), httpRequest.auth?.user.id ?? null);
@@ -1110,6 +1136,40 @@ export class AgentApiController {
       // finished, so never infer success from a partial transcript.
       return this.store.updateTask(task.id, { status: "failed" }, httpRequest.auth?.user.id ?? null);
     }));
+  }
+
+  @Get("/tasks/page")
+  async listTaskPage(@Req() httpRequest: AuthenticatedRequest, @Query() query: unknown) {
+    await Promise.all(this.#projectionWrites.values());
+    const request = parseQuery(TaskCollectionQuerySchema, query);
+    const tasks = await this.store.listTaskPage({
+      ...request,
+      ...(request.taskIds ? { taskIds: request.taskIds } : {}),
+      ownerUserId: httpRequest.auth?.user.id ?? null,
+    });
+    return TaskPageSchema.parse(tasks);
+  }
+
+  @Get("/tasks/summary")
+  async taskSummary(@Req() httpRequest: AuthenticatedRequest) {
+    return TaskCollectionSummarySchema.parse(await this.store.taskSummary(httpRequest.auth?.user.id ?? null));
+  }
+
+  @Get("/tasks/archive")
+  async archivedTasks(@Req() httpRequest: AuthenticatedRequest, @Query() query: unknown) {
+    const raw = (query && typeof query === "object" && !Array.isArray(query)) ? query as Record<string, unknown> : {};
+    const request = parseQuery(TaskCollectionQuerySchema, { ...raw, state: raw.state ?? "archived" });
+    if (request.state === "active") throw new BadRequestException("Archive endpoint only accepts archived, deleted, or all state");
+    return TaskPageSchema.parse(await this.store.listTaskPage({
+      ...request,
+      ownerUserId: httpRequest.auth?.user.id ?? null,
+    }));
+  }
+
+  @Post("/tasks/archive/delete-all")
+  async deleteArchivedTasks(@Req() httpRequest: AuthenticatedRequest, @Body() body: unknown) {
+    const request = parseBody(DeleteArchivedTasksRequestSchema, body ?? {});
+    return this.store.deleteArchivedTasks(request, httpRequest.auth?.user.id ?? null);
   }
 
   @Get("/tasks/:taskId")

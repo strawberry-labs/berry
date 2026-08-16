@@ -1,10 +1,12 @@
 import * as React from "react";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { ArchiveRestore, Folder, Trash2 } from "lucide-react";
-import { ArchivedTasksSearchSchema, type Task } from "@berry/shared";
-import { Button, FormSelect, ManagementPage, SearchInput, StatusPill } from "./management-primitives";
+import { ArchivedTasksSearchSchema, type Task, type TaskPage } from "@berry/shared";
+import { managementQueryKeys } from "@/lib/management-query-keys";
+import { AsyncState, Button, FormSelect, ManagementPage, SearchInput, StatusPill } from "./management-primitives";
 import type { ManagementScreenProps } from "./management-context";
 
-export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDeleteTask, onRestoreTask }: ManagementScreenProps) {
+export function ArchivedTasksScreen({ client, tasks, workspaces, onArchiveTask, onDeleteTask, onRestoreTask }: ManagementScreenProps) {
   const initial = React.useMemo(() => ArchivedTasksSearchSchema.parse(typeof window === "undefined" ? {} : Object.fromEntries(new URLSearchParams(window.location.search))), []);
   const [filters, setFilters] = React.useState(initial);
   const [busyId, setBusyId] = React.useState<string | null>(null);
@@ -12,17 +14,38 @@ export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDelete
   const [status, setStatus] = React.useState("");
   const [confirmDeleteAll, setConfirmDeleteAll] = React.useState(false);
 
+  const archiveQuery = useInfiniteQuery({
+    queryKey: managementQueryKeys.archive(filters),
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam, signal }): Promise<TaskPage> => {
+      if (client) {
+        return client.listArchivedTasksPage({
+          workspaceId: filters.workspace === "all" ? undefined : filters.workspace,
+          search: filters.q,
+          state: filters.state,
+          cursor: pageParam,
+          limit: 50,
+        }, { signal });
+      }
+      const local = tasks.filter((task) => {
+        const matchesState = filters.state === "all"
+          ? task.archived || Boolean(task.deletedAt)
+          : filters.state === "archived"
+            ? task.archived && !task.deletedAt
+            : Boolean(task.deletedAt);
+        return matchesState
+          && (filters.workspace === "all" || task.workspaceId === filters.workspace)
+          && (!filters.q || task.title.toLocaleLowerCase().includes(filters.q.toLocaleLowerCase()));
+      });
+      return { items: local, hasMore: false, nextCursor: null };
+    },
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    staleTime: 15_000,
+    retry: 2,
+  });
+
   const workspaceById = React.useMemo(() => new Map(workspaces.map((workspace) => [workspace.id, workspace])), [workspaces]);
-  const matching = React.useMemo(() => tasks.filter((task) => {
-    const matchesState = filters.state === "all"
-      ? task.archived || Boolean(task.deletedAt)
-      : filters.state === "archived"
-        ? task.archived && !task.deletedAt
-        : Boolean(task.deletedAt);
-    const matchesWorkspace = filters.workspace === "all" || task.workspaceId === filters.workspace;
-    const matchesQuery = !filters.q || task.title.toLocaleLowerCase().includes(filters.q.toLocaleLowerCase());
-    return matchesState && matchesWorkspace && matchesQuery;
-  }), [filters, tasks]);
+  const matching = React.useMemo(() => archiveQuery.data?.pages.flatMap((page) => page.items) ?? [], [archiveQuery.data]);
 
   const groups = React.useMemo(() => {
     const grouped = new Map<string, Task[]>();
@@ -50,6 +73,7 @@ export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDelete
       if (action === "unarchive") await onArchiveTask(task, false);
       else if (action === "delete") await onDeleteTask(task);
       else await onRestoreTask(task);
+      await archiveQuery.refetch();
       setStatus(action === "unarchive" ? `Unarchived ${task.title}.` : action === "delete" ? `Moved ${task.title} to recently deleted.` : `Restored ${task.title}.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The task could not be updated.");
@@ -63,8 +87,14 @@ export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDelete
     setBusyId("all");
     setError("");
     try {
-      for (const task of archived) await onDeleteTask(task);
-      setStatus(`Moved ${archived.length} archived ${archived.length === 1 ? "task" : "tasks"} to recently deleted.`);
+      const result = client
+        ? await client.deleteAllArchivedTasks({
+            ...(filters.workspace !== "all" ? { workspaceId: filters.workspace } : {}),
+            ...(filters.q ? { search: filters.q } : {}),
+          })
+        : (await Promise.all(archived.map((task) => onDeleteTask(task))), { deletedCount: archived.length });
+      await archiveQuery.refetch();
+      setStatus(`Moved ${result.deletedCount} archived ${result.deletedCount === 1 ? "task" : "tasks"} to recently deleted.`);
       setConfirmDeleteAll(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The archived tasks could not be deleted.");
@@ -91,7 +121,8 @@ export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDelete
       {error ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
       {status ? <p className="rounded-lg border border-[var(--berry-success)]/25 bg-[var(--berry-success)]/5 px-3 py-2 text-xs text-[var(--berry-success)]" role="status">{status}</p> : null}
 
-      {groups.length === 0 ? <div className="flex min-h-44 flex-col items-center justify-center gap-2 rounded-xl border border-border bg-card px-6 py-8 text-center"><ArchiveRestore className="size-5 text-muted-foreground" aria-hidden /><h2 className="text-sm font-medium text-foreground">{filters.state === "deleted" ? "No recently deleted tasks" : "No archived tasks"}</h2><p className="text-xs text-muted-foreground">{filters.q ? "Try a different search or filter." : "Tasks you archive will appear here."}</p></div> : groups.map(({ workspace, items }) => (
+      <AsyncState loading={archiveQuery.isPending} error={archiveQuery.error instanceof Error ? archiveQuery.error.message : archiveQuery.error ? "Unable to load archived tasks" : null} onRetry={() => void archiveQuery.refetch()} empty={!archiveQuery.isPending && groups.length === 0} emptyTitle={filters.state === "deleted" ? "No recently deleted tasks" : "No archived tasks"} emptyText={filters.q ? "Try a different search or filter." : "Tasks you archive will appear here."}>
+      {groups.map(({ workspace, items }) => (
         <section className="grid gap-2" key={workspace?.id ?? items[0]?.workspaceId} aria-labelledby={`archive-group-${items[0]?.workspaceId}`}>
           <header className="flex items-center justify-between gap-4 px-1"><h2 className="flex items-center gap-2 text-sm font-medium text-foreground" id={`archive-group-${items[0]?.workspaceId}`}><Folder className="size-4 text-muted-foreground" aria-hidden />{workspace?.workspaceKind === "general" ? "Tasks" : workspace?.name ?? "Unknown project"}</h2><span className="text-xs text-muted-foreground">{items.length} {items.length === 1 ? "task" : "tasks"}</span></header>
           <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
@@ -104,6 +135,8 @@ export function ArchivedTasksScreen({ tasks, workspaces, onArchiveTask, onDelete
           </div>
         </section>
       ))}
+      {archiveQuery.hasNextPage ? <div className="flex justify-center"><Button variant="secondary" disabled={archiveQuery.isFetchingNextPage} onClick={() => void archiveQuery.fetchNextPage()}>{archiveQuery.isFetchingNextPage ? "Loading…" : "Load older tasks"}</Button></div> : null}
+      </AsyncState>
     </ManagementPage>
   );
 }

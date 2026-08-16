@@ -238,6 +238,14 @@ export const WorkspaceSchema = z.object({
 });
 export type Workspace = z.infer<typeof WorkspaceSchema>;
 
+/** Bounded keyset page for project/workspace collections. */
+export const WorkspacePageSchema = z.object({
+  items: z.array(WorkspaceSchema),
+  nextCursor: z.string().nullable(),
+  hasMore: z.boolean(),
+});
+export type WorkspacePage = z.infer<typeof WorkspacePageSchema>;
+
 const TaskFieldsSchema = z.object({
   id: z.string(),
   workspaceId: z.string(),
@@ -274,6 +282,44 @@ export const TaskSchema = z.preprocess((value) => {
   };
 }, TaskFieldsSchema);
 export type Task = z.infer<typeof TaskSchema>;
+
+/** Bounded keyset page for task and archive collections. */
+export const TaskPageSchema = z.object({
+  items: z.array(TaskSchema),
+  nextCursor: z.string().nullable(),
+  hasMore: z.boolean(),
+});
+export type TaskPage = z.infer<typeof TaskPageSchema>;
+
+export const TaskCollectionStateSchema = z.enum(["active", "archived", "deleted", "all"]);
+export type TaskCollectionState = z.infer<typeof TaskCollectionStateSchema>;
+export const TaskCollectionQuerySchema = z.object({
+  workspaceId: z.string().min(1).optional(),
+  workspaceKind: WorkspaceKindSchema.optional(),
+  search: z.string().trim().max(200).optional(),
+  state: TaskCollectionStateSchema.default("active"),
+  cursor: z.string().max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  taskIds: z.union([
+    z.array(z.string().trim().min(1).max(128)).max(100),
+    z.string().transform((value) => value.split(",").filter(Boolean)).pipe(z.array(z.string().trim().min(1).max(128)).max(100)),
+  ]).optional(),
+});
+export type TaskCollectionQuery = z.infer<typeof TaskCollectionQuerySchema>;
+export const WorkspaceCollectionQuerySchema = z.object({
+  includeGeneral: z.union([z.boolean(), z.string().transform((value) => value === "true")]).default(false),
+  search: z.string().trim().max(200).optional(),
+  cursor: z.string().max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+export type WorkspaceCollectionQuery = z.infer<typeof WorkspaceCollectionQuerySchema>;
+export const TaskCollectionSummarySchema = z.object({
+  active: z.number().int().nonnegative(),
+  archived: z.number().int().nonnegative(),
+  deleted: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+});
+export type TaskCollectionSummary = z.infer<typeof TaskCollectionSummarySchema>;
 
 /**
  * The web product has one task experience. Keep the persisted conversation
@@ -3379,7 +3425,9 @@ export const DepartmentListQuerySchema = z.object({
   search: z.string().trim().max(200).default(""), status: z.string().optional(), parentId: z.string().nullable().optional(),
   cursor: z.string().optional(), limit: z.coerce.number().int().min(1).max(100).default(50),
 });
+export type DepartmentListQuery = z.infer<typeof DepartmentListQuerySchema>;
 export const DepartmentPageSchema = CursorPageSchema.extend({ items: z.array(DepartmentSchema), total: z.number().int().nonnegative().optional() });
+export type DepartmentPage = z.infer<typeof DepartmentPageSchema>;
 
 export const UsageAnalyticsQueryFieldsSchema = z.object({
   from: ISODateSchema, to: ISODateSchema, compareFrom: ISODateSchema.optional(), compareTo: ISODateSchema.optional(),

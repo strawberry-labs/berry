@@ -107,6 +107,23 @@ describe("Enterprise identity API", () => {
         expect(body).toHaveLength(3);
         expect(body.map((member: { email: string }) => member.email)).toContain("new.user@example.test");
       });
+    await request(app.getHttpServer())
+      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/members/page?search=new&limit=1`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.items).toHaveLength(1);
+        expect(body.items[0].email).toBe("new.user@example.test");
+        expect(body.total).toBe(1);
+      });
+    await request(app.getHttpServer())
+      .get(`/v1/orgs/${SELF_HOST_TENANT_ID}/departments/page?search=research&limit=1`)
+      .set(authHeader())
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.items).toHaveLength(1);
+        expect(body.items[0].name).toBe("Research");
+      });
 
     await request(app.getHttpServer())
       .post(`/v1/orgs/${SELF_HOST_TENANT_ID}/members`)
