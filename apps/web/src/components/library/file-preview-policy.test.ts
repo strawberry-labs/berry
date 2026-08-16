@@ -179,6 +179,26 @@ describe("office archive preview limits", () => {
     }, entries)).resolves.toMatchObject({ entries: entries.length });
   });
 
+  it("rejects central-directory entries hidden behind a forged EOCD count", async () => {
+    const zip = new JSZip();
+    zip.file("[Content_Types].xml", "<Types/>");
+    zip.file("xl/workbook.xml", "<workbook/>");
+    const bytes = await zip.generateAsync({ type: "uint8array" });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let eocd = -1;
+    for (let offset = bytes.byteLength - 22; offset >= 0; offset -= 1) {
+      if (view.getUint32(offset, true) === 0x06054b50) {
+        eocd = offset;
+        break;
+      }
+    }
+    expect(eocd).toBeGreaterThanOrEqual(0);
+    view.setUint16(eocd + 8, 1, true);
+    view.setUint16(eocd + 10, 1, true);
+
+    expect(() => readZipEntries(bytes)).toThrow(/directory/i);
+  });
+
   it("rejects actual deflate output that exceeds the compression ratio budget", async () => {
     const zip = new JSZip();
     zip.file("xl/workbook.xml", "x".repeat(20_000), { compression: "DEFLATE", compressionOptions: { level: 9 } });

@@ -33,12 +33,18 @@ export function readZipEntries(bytes: Uint8Array, maxEntryCount = 5_000): ZipPre
     if (offset >= 0 && view.getUint32(offset, true) === EOCD_SIGNATURE) { eocd = offset; break; }
   }
   if (eocd < 0) throw new Error("The workbook archive is invalid or uses unsupported ZIP64 metadata.");
+  const diskNumber = view.getUint16(eocd + 4, true);
+  const centralDiskNumber = view.getUint16(eocd + 6, true);
+  const countOnDisk = view.getUint16(eocd + 8, true);
   const count = view.getUint16(eocd + 10, true);
   const centralSize = view.getUint32(eocd + 12, true);
   const centralOffset = view.getUint32(eocd + 16, true);
+  const commentLength = view.getUint16(eocd + 20, true);
+  if (diskNumber !== 0 || centralDiskNumber !== 0 || countOnDisk !== count) throw new Error("Multi-disk workbooks are not supported for browser preview.");
+  if (eocd + 22 + commentLength !== bytes.byteLength) throw new Error("The workbook archive directory is invalid.");
   if (count === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) throw new Error("ZIP64 workbooks are not supported for browser preview.");
   if (count > maxEntryCount) throw new Error("The archive contains too many entries to preview safely.");
-  if (centralOffset + centralSize > bytes.byteLength) throw new Error("The workbook archive directory is invalid.");
+  if (centralOffset + centralSize !== eocd) throw new Error("The workbook archive directory is invalid.");
   const centralEnd = centralOffset + centralSize;
 
   const entries: ZipPreviewEntry[] = [];
@@ -71,6 +77,10 @@ export function readZipEntries(bytes: Uint8Array, maxEntryCount = 5_000): ZipPre
     if (nextOffset > centralEnd) throw new Error("The workbook archive directory is invalid.");
     offset = nextOffset;
   }
+  // Downstream OOXML parsers scan consecutive central-directory records and
+  // do not consistently trust the EOCD count. Require the declared count to
+  // cover the complete directory so hidden entries cannot bypass our budgets.
+  if (offset !== centralEnd) throw new Error("The workbook archive directory is invalid.");
   return entries;
 }
 

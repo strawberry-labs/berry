@@ -17294,6 +17294,18 @@ Params:
               "mediaType": {
                 "type": "string"
               },
+              "declaredMediaType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "detectedMediaType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "size": {
                 "type": "integer",
                 "minimum": 0
