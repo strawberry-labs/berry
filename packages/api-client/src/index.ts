@@ -121,6 +121,8 @@ import {
   TaskSchema,
   TaskCollectionSummarySchema,
   TaskPageSchema,
+  QueuedFollowUpPageSchema,
+  ServerQueuedFollowUpSchema,
   WorkspacePageSchema,
   normalizeTaskForWeb,
   TurnStateSchema,
@@ -254,6 +256,10 @@ import {
   type Workspace,
   type WorkspacePage,
   type AttachmentInput,
+  type QueuedFollowUpPage,
+  type ServerQueuedFollowUp,
+  type QueuedFollowUpCreate,
+  type QueuedFollowUpUpdate,
 } from "@berry/shared";
 import { z } from "zod";
 
@@ -1194,6 +1200,34 @@ export class BerryApiClient {
       method: "POST",
       body: input,
       ...options,
+    });
+  }
+
+  async listQueuedFollowUps(sessionId: string, input: { cursor?: string; limit?: number } = {}): Promise<QueuedFollowUpPage> {
+    const params = new URLSearchParams();
+    if (input.cursor) params.set("cursor", input.cursor);
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups${suffix}`, QueuedFollowUpPageSchema);
+  }
+
+  async enqueueQueuedFollowUp(sessionId: string, input: QueuedFollowUpCreate): Promise<ServerQueuedFollowUp> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/follow-ups`, ServerQueuedFollowUpSchema, {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  async updateQueuedFollowUp(followUpId: string, input: QueuedFollowUpUpdate): Promise<ServerQueuedFollowUp> {
+    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}`, ServerQueuedFollowUpSchema, {
+      method: "PATCH",
+      body: input,
+    });
+  }
+
+  async cancelQueuedFollowUp(followUpId: string): Promise<ServerQueuedFollowUp> {
+    return this.#request(`/v1/follow-ups/${encodeURIComponent(followUpId)}`, ServerQueuedFollowUpSchema, {
+      method: "DELETE",
     });
   }
 

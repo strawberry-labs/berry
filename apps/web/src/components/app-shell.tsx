@@ -84,6 +84,8 @@ import {
   nextQueuedFollowUp,
   readQueuedFollowUps,
   reconcileInterruptedQueuedFollowUps,
+  serverQueuedFollowUpToClient,
+  writeQueuedFollowUps,
   type QueuedFollowUp,
 } from "@/lib/queued-follow-ups";
 import { sessionStreamStore } from "@/lib/session-stream-store";
@@ -539,6 +541,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const tasksRef = React.useRef(tasks);
   React.useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   const [followUpsBySession, setFollowUpsBySession] = React.useState<Record<string, QueuedFollowUp[]>>({});
+  const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
+    ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
+    : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
   const [threadScrollRequest, setThreadScrollRequest] = React.useState<{ sessionId: string; id: number } | null>(null);
   const followUpsBySessionRef = React.useRef(followUpsBySession);
   const queuePersistenceErrorShownRef = React.useRef(false);
@@ -547,6 +552,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     sessionId: string,
     update: (current: QueuedFollowUp[]) => QueuedFollowUp[],
   ) => {
+    if (client) {
+      const current = followUpsBySessionRef.current[sessionId] ?? [];
+      const followUps = update(current);
+      followUpsBySessionRef.current = { ...followUpsBySessionRef.current, [sessionId]: followUps };
+      setFollowUpsBySession((state) => ({ ...state, [sessionId]: followUps }));
+      return;
+    }
     const { followUps, persisted } = commitQueuedFollowUps(
       followUpsBySessionRef.current,
       sessionId,
@@ -559,7 +571,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       queuePersistenceErrorShownRef.current = false;
     }
     setFollowUpsBySession((current) => ({ ...current, [sessionId]: followUps }));
-  }, []);
+  }, [client]);
   const requestThreadBottom = React.useCallback((sessionId: string) => {
     setThreadScrollRequest((current) => ({ sessionId, id: (current?.id ?? 0) + 1 }));
   }, []);
@@ -686,9 +698,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [activeTask?.activeSessionId, applyModelSelection]);
   const [editingTitle, setEditingTitle] = React.useState(false);
   const titleInputRef = React.useRef<HTMLInputElement>(null);
-  const client = React.useMemo(() => initial.config.apiBaseUrl && !initial.config.demoMode
-    ? new BerryApiClient({ baseUrl: initial.config.apiBaseUrl })
-    : null, [initial.config.apiBaseUrl, initial.config.demoMode]);
   const findPersistedMessage = React.useCallback(async (sessionId: string, messageId: string): Promise<Message | undefined> => {
     if (!client) return undefined;
     return findPersistedMessageById(client, sessionId, messageId);
@@ -938,15 +947,51 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   React.useEffect(() => {
     const sessionId = activeTask?.activeSessionId;
     if (!sessionId) return;
-    setFollowUpsBySession((current) => {
-      if (sessionId in current) return current;
-      const result = { ...current, [sessionId]: readQueuedFollowUps(sessionId) };
-      followUpsBySessionRef.current = result;
-      return result;
-    });
-  }, [activeTask?.activeSessionId]);
+    let cancelled = false;
+    if (!client) {
+      setFollowUpsBySession((current) => {
+        if (sessionId in current) return current;
+        const result = { ...current, [sessionId]: readQueuedFollowUps(sessionId) };
+        followUpsBySessionRef.current = result;
+        return result;
+      });
+      return () => { cancelled = true; };
+    }
+    const legacy = readQueuedFollowUps(sessionId);
+    void (async () => {
+      const migrated: string[] = [];
+      for (const item of legacy) {
+        if (item.attachments.some((attachment) => !attachment.fileId)) continue;
+        try {
+          await client.enqueueQueuedFollowUp(sessionId, {
+            taskId: item.taskId,
+            workspaceId: activeTask.workspaceId,
+            input: item.input,
+            ...(item.intent ? { intent: item.intent } : {}),
+            attachments: item.attachments,
+            idempotencyKey: item.id,
+          });
+          migrated.push(item.id);
+        } catch {
+          // Keep only eligible, bounded legacy rows for a later retry. The
+          // server remains authoritative once migration succeeds.
+        }
+      }
+      if (migrated.length > 0) {
+        const remaining = legacy.filter((item) => !migrated.includes(item.id));
+        writeQueuedFollowUps(sessionId, remaining);
+      }
+      const page = await client.listQueuedFollowUps(sessionId, { limit: 100 });
+      if (cancelled) return;
+      const next = { ...followUpsBySessionRef.current, [sessionId]: page.items.map(serverQueuedFollowUpToClient) };
+      followUpsBySessionRef.current = next;
+      setFollowUpsBySession(next);
+    })().catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [activeTask?.activeSessionId, activeTask?.workspaceId, client]);
 
   React.useEffect(() => {
+    if (client) return;
     const onStorage = (event: StorageEvent) => {
       if (!event.key?.startsWith(QUEUED_FOLLOW_UP_STORAGE_PREFIX)) return;
       const sessionId = event.key.slice(QUEUED_FOLLOW_UP_STORAGE_PREFIX.length);
@@ -960,7 +1005,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+  }, [client]);
 
   React.useEffect(() => {
     const openSearch = () => {
@@ -2406,8 +2451,9 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   const removeFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
     const current = (followUpsBySessionRef.current[followUp.sessionId] ?? []).find((item) => item.id === followUp.id);
     if (current?.status === "sending") return;
+    if (client) await client.cancelQueuedFollowUp(followUp.id);
     updateSessionFollowUps(followUp.sessionId, (current) => current.filter((item) => item.id !== followUp.id));
-  }, [updateSessionFollowUps]);
+  }, [client, updateSessionFollowUps]);
 
   const rememberFollowUp = React.useCallback((followUp: QueuedFollowUp) => {
     updateSessionFollowUps(followUp.sessionId, (current) => [
@@ -2416,7 +2462,57 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     ].sort((left, right) => left.ordinal - right.ordinal));
   }, [updateSessionFollowUps]);
 
+  const enqueueFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
+    if (!client) {
+      rememberFollowUp(followUp);
+      return;
+    }
+    const task = tasks.find((item) => item.id === followUp.taskId);
+    if (!task) throw new Error("This queued prompt no longer belongs to an available task.");
+    const persisted = await client.enqueueQueuedFollowUp(followUp.sessionId, {
+      taskId: task.id,
+      workspaceId: task.workspaceId,
+      input: followUp.input,
+      ...(followUp.intent ? { intent: followUp.intent } : {}),
+      attachments: followUp.attachments,
+      idempotencyKey: followUp.id,
+    });
+    const mapped = serverQueuedFollowUpToClient(persisted);
+    const next = {
+      ...followUpsBySessionRef.current,
+      [followUp.sessionId]: [
+        ...(followUpsBySessionRef.current[followUp.sessionId] ?? []).filter((item) => item.id !== mapped.id),
+        mapped,
+      ].sort((left, right) => left.ordinal - right.ordinal),
+    };
+    followUpsBySessionRef.current = next;
+    setFollowUpsBySession(next);
+  }, [client, rememberFollowUp, tasks]);
+
+  const refreshQueuedFollowUps = React.useCallback(async (sessionId: string) => {
+    if (!client) return [];
+    try {
+      const page = await client.listQueuedFollowUps(sessionId, { limit: 100 });
+      const mapped = page.items.map(serverQueuedFollowUpToClient);
+      const next = { ...followUpsBySessionRef.current, [sessionId]: mapped };
+      followUpsBySessionRef.current = next;
+      setFollowUpsBySession(next);
+      return mapped;
+    } catch (cause) {
+      if (cause instanceof BerryApiError && [401, 403, 404].includes(cause.status)) {
+        const next = { ...followUpsBySessionRef.current, [sessionId]: [] };
+        followUpsBySessionRef.current = next;
+        setFollowUpsBySession(next);
+      }
+      throw cause;
+    }
+  }, [client]);
+
   const reorderFollowUps = React.useCallback((sessionId: string, orderedIds: string[]) => {
+    if (client) {
+      const lastId = orderedIds.at(-1);
+      if (lastId) void client.updateQueuedFollowUp(lastId, { orderedIds }).catch(() => undefined);
+    }
     updateSessionFollowUps(sessionId, (current) => {
       const byId = new Map(current.map((followUp) => [followUp.id, followUp]));
       const ordered = orderedIds.flatMap((id) => {
@@ -2427,9 +2523,20 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       });
       return [...ordered, ...byId.values()];
     });
-  }, [updateSessionFollowUps]);
+  }, [client, updateSessionFollowUps]);
 
   const updateFollowUp = React.useCallback(async (followUp: QueuedFollowUp, update: Pick<QueuedFollowUp, "input" | "intent" | "attachments">) => {
+    if (client) {
+      const persisted = await client.updateQueuedFollowUp(followUp.id, {
+        input: update.input,
+        intent: update.intent ?? null,
+        attachments: update.attachments,
+        ...(followUp.status === "failed" ? { status: "queued" as const } : {}),
+      });
+      const mapped = serverQueuedFollowUpToClient(persisted);
+      updateSessionFollowUps(followUp.sessionId, (current) => [...current.filter((item) => item.id !== mapped.id), mapped].sort((left, right) => left.ordinal - right.ordinal));
+      return;
+    }
     rememberFollowUp({
       ...followUp,
       ...update,
@@ -2439,14 +2546,23 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       error: null,
       updatedAt: new Date().toISOString(),
     });
-  }, [rememberFollowUp]);
+  }, [client, rememberFollowUp, updateSessionFollowUps]);
 
   const resumeFollowUps = React.useCallback(async (sessionId: string) => {
+    if (client) {
+      const current = followUpsBySessionRef.current[sessionId] ?? [];
+      await Promise.all(current.filter((item) => item.status === "paused").map((item) => client.updateQueuedFollowUp(item.id, { status: "queued" })));
+      const page = await client.listQueuedFollowUps(sessionId, { limit: 100 });
+      const mapped = page.items.map(serverQueuedFollowUpToClient);
+      followUpsBySessionRef.current = { ...followUpsBySessionRef.current, [sessionId]: mapped };
+      setFollowUpsBySession((state) => ({ ...state, [sessionId]: mapped }));
+      return;
+    }
     updateSessionFollowUps(sessionId, (current) => current.map((followUp) => followUp.status === "paused"
       ? { ...followUp, status: "queued", pausedReason: null, error: null, updatedAt: new Date().toISOString() }
       : followUp));
     window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
-  }, [updateSessionFollowUps]);
+  }, [client, updateSessionFollowUps]);
 
   /**
    * A steer is an interruption, not an inline instruction to the old turn.
@@ -2593,6 +2709,17 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [client, findPersistedMessage, interruptAndStartTurn, rememberFollowUp, replaceSessionMessages, runTurn, tasks, updateSessionFollowUps]);
 
   const sendFollowUpNow = React.useCallback(async (requestedFollowUp: QueuedFollowUp) => {
+    // In a connected session delivery is a server/worker concern.  The
+    // browser only changes the durable queue state; the worker promotes the
+    // next item in the same transaction that completes the active turn.
+    if (client) {
+      const persisted = await client.updateQueuedFollowUp(requestedFollowUp.id, { status: "queued" });
+      updateSessionFollowUps(requestedFollowUp.sessionId, (current) => [
+        ...current.filter((item) => item.id !== persisted.id),
+        serverQueuedFollowUpToClient(persisted),
+      ].sort((left, right) => left.ordinal - right.ordinal));
+      return;
+    }
     const deliverCurrent = async () => {
       const cached = followUpsBySessionRef.current[requestedFollowUp.sessionId] ?? readQueuedFollowUps(requestedFollowUp.sessionId);
       const stored = readQueuedFollowUps(requestedFollowUp.sessionId);
@@ -2612,7 +2739,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       return;
     }
     await locks.request(`berry.web.queueDelivery:${requestedFollowUp.sessionId}`, { mode: "exclusive" }, deliverCurrent);
-  }, [deliverFollowUp, updateSessionFollowUps]);
+  }, [client, deliverFollowUp, updateSessionFollowUps]);
 
   const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
     const queued = { ...followUp, status: "queued" as const, error: null, pausedReason: null, updatedAt: new Date().toISOString() };
@@ -2621,16 +2748,25 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [rememberFollowUp, sendFollowUpNow]);
 
   const sendNextQueuedFollowUp = React.useCallback((sessionId: string) => {
+    if (client) {
+      void refreshQueuedFollowUps(sessionId).catch(() => undefined);
+      return;
+    }
     const queue = followUpsBySessionRef.current[sessionId] ?? readQueuedFollowUps(sessionId);
     const next = nextQueuedFollowUp(queue, editingFollowUpIdsRef.current.get(sessionId) ?? null);
     if (!next) return;
     void sendFollowUpNow(next).catch(() => undefined);
-  }, [sendFollowUpNow]);
+  }, [client, refreshQueuedFollowUps, sendFollowUpNow]);
   sendNextQueuedFollowUpRef.current = sendNextQueuedFollowUp;
 
   handleQueueTurnEndRef.current = (sessionId, status) => {
     if (status === "completed") {
-      window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
+      if (client) void refreshQueuedFollowUps(sessionId).catch(() => undefined);
+      else window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
+      return;
+    }
+    if (client) {
+      void refreshQueuedFollowUps(sessionId).catch(() => undefined);
       return;
     }
     const pausedReason = status === "cancelled"
@@ -2642,6 +2778,10 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   };
 
   reconcileQueueWithTurnStateRef.current = (sessionId, active, messages) => {
+    if (client) {
+      if (!active) void refreshQueuedFollowUps(sessionId).catch(() => undefined);
+      return;
+    }
     const persistedMessageIds = new Set(messages.map((message) => message.id));
     updateSessionFollowUps(sessionId, (current) => reconcileInterruptedQueuedFollowUps(current, active, persistedMessageIds));
     if (!active) window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
@@ -3162,7 +3302,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onReasoningChange={updateReasoning}
               onCommand={runSlashCommand}
               queuedFollowUps={activeTask.activeSessionId ? followUpsBySession[activeTask.activeSessionId] ?? [] : []}
-              onQueuedFollowUp={rememberFollowUp}
+              onQueuedFollowUp={enqueueFollowUp}
               onRemoveFollowUp={removeFollowUp}
               onRetryFollowUp={retryFollowUp}
               onReorderFollowUps={reorderFollowUps}
@@ -3248,7 +3388,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 onReasoningChange={updateReasoning}
                 onCommand={runSlashCommand}
                 queuedFollowUps={[]}
-                onQueuedFollowUp={rememberFollowUp}
+                onQueuedFollowUp={enqueueFollowUp}
                 onRemoveFollowUp={removeFollowUp}
                 onRetryFollowUp={retryFollowUp}
                 onReorderFollowUps={reorderFollowUps}

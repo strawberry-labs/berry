@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { PromptManifestSchema } from "./durable-context.ts";
+import { PromptManifestSchema, TurnIntentSchema } from "./durable-context.ts";
 
 export { BUILT_IN_COMMANDS, builtInCommandManifests, parseSlashCommand, type BuiltInCommandDefinition } from "./commands.ts";
 export * from "./durable-context.ts";
@@ -290,6 +290,7 @@ export const TaskPageSchema = z.object({
   hasMore: z.boolean(),
 });
 export type TaskPage = z.infer<typeof TaskPageSchema>;
+
 
 export const TaskCollectionStateSchema = z.enum(["active", "archived", "deleted", "all"]);
 export type TaskCollectionState = z.infer<typeof TaskCollectionStateSchema>;
@@ -2629,6 +2630,72 @@ export const AttachmentInputSchema = z.object({
   sourceKind: z.string().nullable().optional(),
 });
 export type AttachmentInput = z.infer<typeof AttachmentInputSchema>;
+
+export const QueuedFollowUpStatusSchema = z.enum([
+  "queued",
+  "delivering",
+  "delivered",
+  "paused",
+  "failed",
+  "cancelled",
+  "expired",
+]);
+export type QueuedFollowUpStatus = z.infer<typeof QueuedFollowUpStatusSchema>;
+
+/**
+ * A server-owned follow-up. Browser-only fields (data URLs, local paths and
+ * previews) are intentionally not part of this contract; durable delivery
+ * only accepts uploaded file references.
+ */
+export const ServerQueuedFollowUpSchema = z.object({
+  id: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+  taskId: z.string().uuid(),
+  sessionId: z.string().uuid(),
+  creatorUserId: z.string().uuid(),
+  ownerUserId: z.string().uuid(),
+  ordinal: z.number().int().nonnegative(),
+  input: z.string().min(1).max(100_000),
+  intent: TurnIntentSchema.optional(),
+  attachments: z.array(AttachmentInputSchema).max(100),
+  status: QueuedFollowUpStatusSchema,
+  idempotencyKey: z.string().min(1).max(200),
+  deliveryKey: z.string().nullable(),
+  attemptCount: z.number().int().nonnegative(),
+  error: z.string().nullable(),
+  expiresAt: ISODateSchema,
+  createdAt: ISODateSchema,
+  updatedAt: ISODateSchema,
+  deliveredAt: ISODateSchema.nullable(),
+});
+export type ServerQueuedFollowUp = z.infer<typeof ServerQueuedFollowUpSchema>;
+
+export const QueuedFollowUpPageSchema = z.object({
+  items: z.array(ServerQueuedFollowUpSchema),
+  nextCursor: z.string().nullable(),
+  hasMore: z.boolean(),
+});
+export type QueuedFollowUpPage = z.infer<typeof QueuedFollowUpPageSchema>;
+
+export const QueuedFollowUpCreateSchema = z.object({
+  taskId: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+  input: z.string().trim().min(1).max(100_000),
+  intent: TurnIntentSchema.optional(),
+  attachments: z.array(AttachmentInputSchema).max(100).default([]),
+  idempotencyKey: z.string().trim().min(1).max(200),
+  ttlSeconds: z.number().int().positive().max(7 * 24 * 60 * 60).optional(),
+});
+export type QueuedFollowUpCreate = z.infer<typeof QueuedFollowUpCreateSchema>;
+
+export const QueuedFollowUpUpdateSchema = z.object({
+  input: z.string().trim().min(1).max(100_000).optional(),
+  intent: TurnIntentSchema.nullable().optional(),
+  attachments: z.array(AttachmentInputSchema).max(100).optional(),
+  status: z.enum(["queued", "paused", "cancelled"]).optional(),
+  orderedIds: z.array(z.string().uuid()).max(100).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, "At least one update is required");
+export type QueuedFollowUpUpdate = z.infer<typeof QueuedFollowUpUpdateSchema>;
 
 export const MessageAttachmentContentSchema = z.object({
   id: z.string().optional(),

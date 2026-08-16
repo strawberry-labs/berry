@@ -11,6 +11,7 @@ import {
 } from "./queued-follow-ups.ts";
 
 function followUp(id: string, sessionId = "session-1", ordinal = 0): QueuedFollowUp {
+  const now = new Date().toISOString();
   return {
     id,
     taskId: "task-1",
@@ -23,8 +24,8 @@ function followUp(id: string, sessionId = "session-1", ordinal = 0): QueuedFollo
     pausedReason: null,
     messageId: null,
     deliveryMode: null,
-    createdAt: "2026-07-23T00:00:00.000Z",
-    updatedAt: "2026-07-23T00:00:00.000Z",
+    createdAt: now,
+    updatedAt: now,
   };
 }
 
@@ -84,6 +85,18 @@ describe("queued follow-up local storage", () => {
     ]), "session-1")).toEqual([
       expect.objectContaining({ id: "kept" }),
     ]);
+  });
+
+  it("drops stale migration rows instead of reviving an old browser queue", () => {
+    const stale = { ...followUp("stale"), updatedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString() };
+    expect(parseQueuedFollowUps(JSON.stringify([stale]), "session-1")).toEqual([]);
+  });
+
+  it("refuses to persist a queue larger than the migration buffer", () => {
+    const storage = memoryStorage();
+    const oversized = { ...followUp("large"), input: "x".repeat(70 * 1024) };
+    expect(writeQueuedFollowUps("session-1", [oversized], storage)).toBe(false);
+    expect(storage.getItem(queuedFollowUpStorageKey("session-1"))).toBeNull();
   });
 
   it("removes the storage key when the queue becomes empty", () => {

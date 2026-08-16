@@ -864,6 +864,40 @@ export const turnRuns = pgTable("turn_runs", {
       AND COALESCE(${table.sandboxState},'running') NOT IN ('paused','missing','stopped','destroyed','pause_requested')`),
 ]);
 
+export const queuedFollowUpItems = pgTable("queued_follow_up_items", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  creatorUserId: uuid("creator_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  ordinal: integer("ordinal").notNull(),
+  input: text("input").notNull(),
+  intent: text("intent"),
+  attachments: jsonArray("attachments"),
+  runtimeRequest: jsonObject("runtime_request"),
+  groundingContext: jsonObject("grounding_context"),
+  promptManifest: jsonObject("prompt_manifest"),
+  status: text("status").notNull().default("queued"),
+  idempotencyKey: text("idempotency_key").notNull(),
+  deliveryKey: text("delivery_key"),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  lastError: text("last_error"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt,
+  updatedAt,
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("queued_follow_up_idempotency_unique").on(table.tenantId, table.idempotencyKey),
+  uniqueIndex("queued_follow_up_session_ordinal_unique").on(table.tenantId, table.sessionId, table.ordinal),
+  index("queued_follow_up_session_idx").on(table.tenantId, table.sessionId, table.status, table.ordinal, table.createdAt),
+  index("queued_follow_up_expiry_idx").on(table.tenantId, table.status, table.expiresAt, table.nextAttemptAt),
+  index("queued_follow_up_task_idx").on(table.tenantId, table.taskId, table.createdAt),
+]);
+
 export const turnAdmissionIntents = pgTable("turn_admission_intents", {
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   requestId: text("request_id").notNull(),
@@ -4802,6 +4836,48 @@ ${tenantRlsSql("model_auxiliary_defaults")}
 ${tenantRlsSql("vision_observation_cache")}
 `.trim();
 
+export const QUEUED_FOLLOW_UPS_MIGRATION = `
+CREATE TABLE IF NOT EXISTS queued_follow_up_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  creator_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ordinal integer NOT NULL CHECK (ordinal >= 0),
+  input text NOT NULL CHECK (char_length(input) BETWEEN 1 AND 100000),
+  intent text CHECK (intent IS NULL OR intent IN ('image_generation')),
+  attachments jsonb NOT NULL DEFAULT '[]'::jsonb,
+  runtime_request jsonb NOT NULL DEFAULT '{}'::jsonb,
+  grounding_context jsonb NOT NULL DEFAULT '{}'::jsonb,
+  prompt_manifest jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued','delivering','delivered','paused','failed','cancelled','expired')),
+  idempotency_key text NOT NULL,
+  delivery_key text,
+  attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_error text,
+  expires_at timestamptz NOT NULL,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  delivered_at timestamptz,
+  cancelled_at timestamptz,
+  UNIQUE (tenant_id, idempotency_key),
+  UNIQUE (tenant_id, session_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS queued_follow_up_session_idx
+  ON queued_follow_up_items (tenant_id, session_id, status, ordinal, created_at)
+  WHERE status IN ('queued','delivering','paused','failed');
+CREATE INDEX IF NOT EXISTS queued_follow_up_expiry_idx
+  ON queued_follow_up_items (tenant_id, status, expires_at, next_attempt_at);
+CREATE INDEX IF NOT EXISTS queued_follow_up_task_idx
+  ON queued_follow_up_items (tenant_id, task_id, created_at DESC);
+
+${tenantRlsSql("queued_follow_up_items")}
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -4941,4 +5017,5 @@ export const cloudMigrations = [
     ],
     onlineSql: ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS,
   },
+  { id: 57, name: "queued_follow_ups_server_owned_v1", sql: QUEUED_FOLLOW_UPS_MIGRATION },
 ] as const;

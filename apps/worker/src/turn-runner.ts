@@ -2451,6 +2451,22 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
       if (mutation.nextState === "completed" || mutation.nextState === "failed" || mutation.nextState === "cancelled") {
         await finalizeUsageAndBudget(executor, snapshot, mutation.nextState);
       }
+      if (mutation.nextState === "completed") {
+        await promoteQueuedFollowUp(executor, snapshot);
+      } else if (mutation.nextState === "failed" || mutation.nextState === "cancelled") {
+        // A user-visible failure/cancellation pauses the queue. The next item
+        // must never race an interrupted turn; the user can explicitly retry
+        // or resume it from another tab/device.
+        await executor.execute(
+          `UPDATE queued_follow_up_items
+           SET status='paused',last_error=$3,updated_at=now()
+           WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+             AND status IN ('queued','delivering') AND expires_at>now()`,
+          [snapshot.tenantId, snapshot.sessionId, mutation.nextState === "cancelled"
+            ? "Queue paused because the active turn was cancelled"
+            : "Queue paused because the active turn failed"],
+        );
+      }
       if (appendedEntries.length > 0) {
         await executor.execute(
           `
@@ -4568,6 +4584,219 @@ RETURNING entry_id
   return appended;
 }
 
+/**
+ * Promote exactly one server-owned follow-up in the same transaction that
+ * settles its predecessor. The queue row, user projection, journal entry,
+ * turn admission and outbox wake-up therefore either all commit or all roll
+ * back. A worker crash cannot lose a prompt between "delivered" and the new
+ * durable run, and a duplicate terminal event cannot deliver it twice.
+ */
+async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTurnSnapshot): Promise<void> {
+  // A worker can be restarted after a queue row is claimed but before the
+  // terminal transaction finishes. Recover old leases and make access changes
+  // fail closed instead of leaving a prompt stuck forever.
+  await executor.execute(
+    `UPDATE queued_follow_up_items
+     SET status=CASE WHEN attempt_count>=5 THEN 'failed' ELSE 'queued' END,
+         last_error=CASE WHEN attempt_count>=5 THEN 'Delivery retry limit reached' ELSE 'Delivery lease recovered after worker restart' END,
+         next_attempt_at=now(),updated_at=now()
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND status='delivering'
+       AND updated_at < now() - interval '5 minutes'`,
+    [snapshot.tenantId, snapshot.sessionId],
+  );
+  await executor.execute(
+    `UPDATE queued_follow_up_items q
+     SET status='cancelled',last_error='Task access was removed',cancelled_at=now(),updated_at=now()
+     FROM tasks t
+     WHERE q.tenant_id=$1::uuid AND q.session_id=$2::uuid AND t.tenant_id=q.tenant_id AND t.id=q.task_id
+       AND q.status IN ('queued','delivering','paused','failed')
+       AND (t.deleted_at IS NOT NULL OR t.user_id IS DISTINCT FROM q.owner_user_id)`,
+    [snapshot.tenantId, snapshot.sessionId],
+  );
+  const rows = await executor.query<QueuedFollowUpRow>(
+    `WITH candidate AS (
+       SELECT q.id
+       FROM queued_follow_up_items q
+       JOIN tasks t ON t.tenant_id=q.tenant_id AND t.id=q.task_id
+       WHERE q.tenant_id=$1::uuid AND q.session_id=$2::uuid
+         AND q.status='queued' AND q.next_attempt_at<=now() AND q.expires_at>now()
+         AND t.deleted_at IS NULL AND t.user_id=$3::uuid
+         AND NOT EXISTS (
+           SELECT 1 FROM turn_runs active
+           WHERE active.tenant_id=q.tenant_id AND active.session_id=q.session_id
+             AND active.id<>$4::uuid
+             AND active.state NOT IN ('completed','failed','cancelled','recovery_required')
+         )
+       ORDER BY q.ordinal ASC,q.id ASC
+       FOR UPDATE SKIP LOCKED
+       LIMIT 1
+     )
+     UPDATE queued_follow_up_items q
+     SET status='delivering',attempt_count=q.attempt_count+1,
+         delivery_key=q.id::text || ':' || (q.attempt_count+1)::text,updated_at=now()
+     FROM candidate
+     WHERE q.tenant_id=$1::uuid AND q.id=candidate.id
+     RETURNING q.id,q.workspace_id,q.task_id,q.session_id,q.owner_user_id,q.ordinal,q.input,q.intent,
+               q.attachments,q.runtime_request,q.grounding_context,q.prompt_manifest,q.attempt_count,q.delivery_key`,
+    [snapshot.tenantId, snapshot.sessionId, snapshot.userId, snapshot.id],
+  );
+  const queued = rows[0];
+  if (!queued) {
+    await executor.execute(
+      `UPDATE queued_follow_up_items
+       SET status='expired',last_error='This queued follow-up expired',updated_at=now()
+       WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND status='queued' AND expires_at<=now()`,
+      [snapshot.tenantId, snapshot.sessionId],
+    );
+    return;
+  }
+
+  const requestMessageId = randomUUID();
+  const runId = randomUUID();
+  const requestId = `queued:${queued.id}:${queued.attempt_count}`;
+  const runtime = {
+    ...record(queued.runtime_request),
+    requestId,
+    input: queued.input,
+    continueInterruptedTurn: false,
+    budgetReservationRequired: true,
+    attachments: Array.isArray(queued.attachments) ? queued.attachments : [],
+  };
+  const attachments = Array.isArray(queued.attachments) ? queued.attachments.map((value) => record(value)) : [];
+  const messageParts = [
+    { type: "text", content: queued.input },
+    ...attachments.filter((attachment): attachment is Record<string, unknown> => Boolean(attachment)).map((attachment) => ({
+      type: "attachment",
+      content: {
+        ...(typeof attachment.id === "string" ? { id: attachment.id } : {}),
+        ...(typeof attachment.fileId === "string" ? { fileId: attachment.fileId } : {}),
+        name: String(attachment.name ?? "attachment"),
+        mediaType: String(attachment.mediaType ?? "application/octet-stream"),
+        size: Number(attachment.size ?? 0),
+        ...(attachment.sourceKind !== undefined ? { sourceKind: attachment.sourceKind } : {}),
+      },
+    })),
+  ];
+  await executor.execute(
+    `INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+     VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'user','complete')
+     ON CONFLICT (id) DO NOTHING`,
+    [requestMessageId, snapshot.tenantId, queued.session_id, queued.task_id],
+  );
+  for (const [ordinal, part] of messageParts.entries()) {
+    await executor.execute(
+      `INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+       VALUES ($1::uuid,$2::uuid,$3::message_part_kind,$4::jsonb,$5)
+       ON CONFLICT (message_id,ordinal) DO NOTHING`,
+      [snapshot.tenantId, requestMessageId, part.type, JSON.stringify(part.content), ordinal],
+    );
+  }
+  for (const attachment of attachments) {
+    const fileId = attachment?.fileId;
+    if (typeof fileId !== "string") continue;
+    await executor.execute(
+      `INSERT INTO file_associations (tenant_id,file_id,task_id,session_id,message_id,role,created_by_user_id)
+       VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,'input',$6::uuid)
+       ON CONFLICT DO NOTHING`,
+      [snapshot.tenantId, fileId, queued.task_id, queued.session_id, requestMessageId, queued.owner_user_id],
+    );
+  }
+
+  const leaf = await executor.query<{ entry_id: string | null }>(
+    `SELECT entry_id FROM session_entries
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+     ORDER BY sequence DESC LIMIT 1 FOR UPDATE`,
+    [snapshot.tenantId, queued.session_id],
+  );
+  const sequence = await executor.query<{ value: number | string }>(
+    `SELECT COALESCE(MAX(sequence),0)+1 AS value FROM session_entries
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid`,
+    [snapshot.tenantId, queued.session_id],
+  );
+  await executor.execute(
+    `UPDATE session_entries SET is_leaf_marker=false
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true`,
+    [snapshot.tenantId, queued.session_id],
+  );
+  await executor.execute(
+    `INSERT INTO session_entries (
+       tenant_id,session_id,entry_id,parent_entry_id,entry_type,sequence,payload,is_leaf_marker,run_id
+     ) VALUES ($1::uuid,$2::uuid,$3,$4,'message',$5,$6::jsonb,true,$7::uuid)
+     ON CONFLICT (tenant_id,session_id,entry_id) DO NOTHING`,
+    [
+      snapshot.tenantId,
+      queued.session_id,
+      requestMessageId,
+      leaf[0]?.entry_id ?? null,
+      Number(sequence[0]?.value ?? 1),
+      JSON.stringify({
+        type: "message",
+        id: requestMessageId,
+        parentId: leaf[0]?.entry_id ?? null,
+        timestamp: new Date().toISOString(),
+        message: { role: "user", content: messageParts.map((part) => part.type === "text" ? { type: "text", text: part.content } : { type: "attachment", ...record(part.content) }), timestamp: Date.now() },
+      }),
+      runId,
+    ],
+  );
+
+  await executor.execute(
+    `INSERT INTO turn_runs (
+       id,tenant_id,user_id,workspace_id,task_id,session_id,request_id,request_message_id,
+       state,next_action,runtime_request,grounding_context,prompt_manifest
+     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8::uuid,
+       'queued','Assemble durable context',$9::jsonb,$10::jsonb,$11::jsonb)`,
+    [
+      runId,
+      snapshot.tenantId,
+      queued.owner_user_id,
+      queued.workspace_id,
+      queued.task_id,
+      queued.session_id,
+      requestId,
+      requestMessageId,
+      JSON.stringify(runtime),
+      JSON.stringify(queued.grounding_context ?? {}),
+      JSON.stringify(queued.prompt_manifest ?? {}),
+    ],
+  );
+  await executor.execute(
+    `INSERT INTO turn_steps (
+       id,tenant_id,run_id,sequence,step_type,state,input,output,retry_class,idempotency_key,attempt,started_at,completed_at
+     ) VALUES ($1::uuid,$2::uuid,$3::uuid,0,'turn.admitted','completed',$4::jsonb,$5::jsonb,'idempotent_with_key',$6,1,now(),now())`,
+    [randomUUID(), snapshot.tenantId, runId, JSON.stringify({ requestMessageId, requestId, queuedFollowUpId: queued.id }), JSON.stringify({ accepted: true }), `${runId}:admitted`],
+  );
+  await executor.execute(
+    `INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+     VALUES ($1::uuid,$2::uuid,$3::uuid,1,'turn.start',$4::jsonb)`,
+    [snapshot.tenantId, runId, queued.session_id, JSON.stringify({ kind: "turn.start", turnId: runId, queuedFollowUpId: queued.id })],
+  );
+  await executor.execute(
+    `INSERT INTO runtime_outbox (tenant_id,event_type,aggregate_id,dedupe_key,payload)
+     VALUES ($1::uuid,'turn.execute',$2,$3,$4::jsonb)
+     ON CONFLICT (tenant_id,dedupe_key) DO NOTHING`,
+    [snapshot.tenantId, runId, `${runId}:wake:queued-follow-up:${queued.id}`, JSON.stringify({ tenantId: snapshot.tenantId, runId, reason: "queued-follow-up", queuedFollowUpId: queued.id })],
+  );
+  await executor.execute(
+    `UPDATE queued_follow_up_items
+     SET status='delivered',delivered_at=now(),updated_at=now()
+     WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='delivering' AND delivery_key=$3`,
+    [snapshot.tenantId, queued.id, queued.delivery_key],
+  );
+  await executor.execute(
+    `UPDATE tasks SET status='running',updated_at=now()
+     WHERE tenant_id=$1::uuid AND id=$2::uuid`,
+    [snapshot.tenantId, queued.task_id],
+  );
+  await executor.execute(
+    `UPDATE sessions SET runtime_metadata=runtime_metadata || jsonb_build_object(
+       'activeRunId',$2::text,'lastRunState','queued','leafId',$3::text
+     ),updated_at=now()
+     WHERE tenant_id=$1::uuid AND id=$4::uuid`,
+    [snapshot.tenantId, runId, requestMessageId, queued.session_id],
+  );
+}
+
 async function insertAssistantProjection(
   executor: SqlExecutor,
   snapshot: DurableTurnSnapshot,
@@ -5179,6 +5408,23 @@ interface BudgetLimitGuardRow {
   scope_id: string;
   period: "day" | "month";
   hard_limit_micros: string;
+}
+
+interface QueuedFollowUpRow {
+  id: string;
+  workspace_id: string;
+  task_id: string;
+  session_id: string;
+  owner_user_id: string;
+  ordinal: number | string;
+  input: string;
+  intent: string | null;
+  attachments: unknown;
+  runtime_request: unknown;
+  grounding_context: unknown;
+  prompt_manifest: unknown;
+  attempt_count: number | string;
+  delivery_key: string | null;
 }
 
 interface RunRow {

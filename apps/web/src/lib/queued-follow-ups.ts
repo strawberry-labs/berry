@@ -1,7 +1,9 @@
-import { AttachmentInputSchema, TurnIntentSchema, type AttachmentInput, type TurnIntent } from "@berry/shared";
+import { AttachmentInputSchema, TurnIntentSchema, type AttachmentInput, type ServerQueuedFollowUp, type TurnIntent } from "@berry/shared";
 import { z } from "zod";
 
 export const QUEUED_FOLLOW_UP_STORAGE_PREFIX = "berry.web.queuedFollowUps.v1:";
+export const QUEUED_FOLLOW_UP_MIGRATION_TTL_MS = 10 * 60 * 1000;
+export const QUEUED_FOLLOW_UP_STORAGE_MAX_BYTES = 64 * 1024;
 
 export const QueuedFollowUpSchema = z.object({
   id: z.string().min(1),
@@ -22,6 +24,26 @@ export const QueuedFollowUpSchema = z.object({
 
 export type QueuedFollowUp = z.infer<typeof QueuedFollowUpSchema>;
 export type QueuedFollowUpsBySession = Record<string, QueuedFollowUp[]>;
+
+/** Convert the durable API row into the UI's legacy-compatible shape. */
+export function serverQueuedFollowUpToClient(item: ServerQueuedFollowUp): QueuedFollowUp {
+  return {
+    id: item.id,
+    taskId: item.taskId,
+    sessionId: item.sessionId,
+    ordinal: item.ordinal,
+    input: item.input,
+    ...(item.intent ? { intent: item.intent } : {}),
+    attachments: item.attachments,
+    status: item.status === "delivering" ? "sending" : item.status === "paused" ? "paused" : item.status === "failed" ? "failed" : "queued",
+    error: item.error,
+    pausedReason: item.status === "paused" ? item.error : null,
+    messageId: null,
+    deliveryMode: null,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  };
+}
 
 export function queuedFollowUpStorageKey(sessionId: string): string {
   return `${QUEUED_FOLLOW_UP_STORAGE_PREFIX}${sessionId}`;
@@ -65,7 +87,8 @@ export function parseQueuedFollowUps(value: string | null, sessionId: string): Q
   try {
     const parsed = z.array(QueuedFollowUpSchema).safeParse(JSON.parse(value));
     if (!parsed.success) return [];
-    return reindexQueuedFollowUps(parsed.data.filter((followUp) => followUp.sessionId === sessionId));
+    const cutoff = Date.now() - QUEUED_FOLLOW_UP_MIGRATION_TTL_MS;
+    return reindexQueuedFollowUps(parsed.data.filter((followUp) => followUp.sessionId === sessionId && Date.parse(followUp.updatedAt) >= cutoff));
   } catch {
     return [];
   }
@@ -90,7 +113,9 @@ export function writeQueuedFollowUps(
       storage.removeItem(queuedFollowUpStorageKey(sessionId));
       return true;
     }
-    storage.setItem(queuedFollowUpStorageKey(sessionId), JSON.stringify(ordered));
+    const serialized = JSON.stringify(ordered);
+    if (serialized.length > QUEUED_FOLLOW_UP_STORAGE_MAX_BYTES) return false;
+    storage.setItem(queuedFollowUpStorageKey(sessionId), serialized);
     return true;
   } catch {
     return false;

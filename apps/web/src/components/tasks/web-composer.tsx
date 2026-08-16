@@ -178,7 +178,7 @@ export function Composer({
   onReasoningChange: (level: ReasoningLevel) => void;
   onCommand: (name: string, args: string[]) => Promise<void>;
   queuedFollowUps: QueuedFollowUp[];
-  onQueuedFollowUp: (followUp: QueuedFollowUp) => void;
+  onQueuedFollowUp: (followUp: QueuedFollowUp) => void | Promise<void>;
   onRemoveFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onRetryFollowUp: (followUp: QueuedFollowUp) => Promise<void>;
   onReorderFollowUps: (sessionId: string, orderedIds: string[]) => void;
@@ -534,7 +534,7 @@ export function Composer({
     }
     if (working && activeTask?.activeSessionId) {
       if (submitIntent === "queue") {
-        onQueuedFollowUp(createQueuedFollowUp({
+        await onQueuedFollowUp(createQueuedFollowUp({
           taskId: activeTask.id,
           sessionId: activeTask.activeSessionId,
           ordinal: queuedFollowUps.length,

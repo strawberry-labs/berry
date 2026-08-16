@@ -36,6 +36,7 @@ import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.
 import { ConnectorsController, OrganizationConnectorsController } from "../connectors/connectors.controller.ts";
 import { SetupModule } from "../setup/setup.module.ts";
 import type { SetupService } from "../setup/setup.service.ts";
+import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.js";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -110,6 +111,7 @@ export class AgentApiModule {
         options.organizationCapabilities ? { provide: ORGANIZATION_CAPABILITIES, useValue: options.organizationCapabilities.useValue } : { provide: ORGANIZATION_CAPABILITIES, inject: [PERSONAL_CAPABILITIES], useFactory: (personal: PersonalCapabilitiesService) => new OrganizationCapabilitiesService(personal) },
         { provide: DURABLE_TURN_RUNNER_ENABLED, useValue: options.durableRunnerEnabled ?? false },
         TurnCancellationPublisher,
+        QueuedFollowUpService,
         ...(durableContextEnabled
           ? [DurableTurnService]
           : [
@@ -155,7 +157,7 @@ export class AgentApiModule {
             new CloudRuntimeConfigService(process.env, organizationProviders),
         },
       ],
-      exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, CONNECTORS, DurableTurnService, ApiEventStreamService, CompanionPushService],
+      exports: [CLOUD_TASK_STORE, MOBILE_DEVICE_REGISTRY, CONNECTORS, DurableTurnService, ApiEventStreamService, CompanionPushService, QueuedFollowUpService],
     };
   }
 }

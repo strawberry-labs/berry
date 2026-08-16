@@ -26,6 +26,9 @@ import {
   TaskCollectionQuerySchema,
   TaskCollectionSummarySchema,
   TaskPageSchema,
+  QueuedFollowUpCreateSchema,
+  QueuedFollowUpPageSchema,
+  QueuedFollowUpUpdateSchema,
   TurnIntentSchema,
   TurnStateSchema,
   VISION_ADAPTER_MAX_OUTPUT_TOKENS,
@@ -74,6 +77,7 @@ import {
   type EnterpriseIdentityRepository,
 } from "../identity/identity.repository.ts";
 import { CONNECTORS, ConnectorsService } from "../connectors/connectors.service.ts";
+import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.js";
 
 export const PROMPT_IMPROVEMENT_MODEL = "canopywave/deepseek/deepseek-v4-flash";
 
@@ -194,6 +198,11 @@ const ContextStatsRequestSchema = z.object({
   model: z.string().trim().min(1).nullable().optional(),
   pendingInput: z.string().optional(),
   attachments: z.array(AttachmentInputSchema).max(100).optional(),
+}).strict();
+
+const FollowUpListQuerySchema = z.object({
+  cursor: z.string().max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(100),
 }).strict();
 
 // Keep context reporting aligned with the runtime turn path when a provider
@@ -519,6 +528,7 @@ export class AgentApiController {
     @Inject(MemoryService) private readonly memory: MemoryService,
     @Inject(ContextAssemblyService) private readonly contextAssembly: ContextAssemblyService,
     @Inject(DurableTurnService) private readonly durableTurns: DurableTurnService,
+    @Inject(QueuedFollowUpService) private readonly queuedFollowUps: QueuedFollowUpService,
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
     @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
   ) {}
@@ -1426,6 +1436,59 @@ export class AgentApiController {
       }
     }
     return message;
+  }
+
+  @Get("/sessions/:sessionId/follow-ups")
+  async listQueuedFollowUps(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Query() query: unknown) {
+    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    await this.ownedSession(request, sessionId);
+    const parsed = FollowUpListQuerySchema.parse(query ?? {});
+    return QueuedFollowUpPageSchema.parse(await this.queuedFollowUps.list(
+      tenantIdFromRequest(request),
+      request.auth!.user.id,
+      sessionId,
+      parsed.cursor,
+      parsed.limit,
+    ));
+  }
+
+  @Post("/sessions/:sessionId/follow-ups")
+  async enqueueQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("sessionId") sessionId: string, @Body() body: unknown) {
+    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    const { session, task } = await this.ownedSession(request, sessionId);
+    const raw = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const parsed = QueuedFollowUpCreateSchema.parse({
+      ...raw,
+      taskId: raw.taskId ?? task.id,
+      workspaceId: raw.workspaceId ?? task.workspaceId,
+    });
+    if (parsed.taskId !== task.id || parsed.workspaceId !== task.workspaceId) throw new ConflictException("Follow-up task scope does not match the session");
+    const attachments = parsed.attachments.length > 0
+      ? await this.files.runtimeAttachments(tenantIdFromRequest(request), request.auth!.user.id, parsed.attachments, { taskId: task.id, sessionId })
+      : [];
+    return this.queuedFollowUps.enqueue(tenantIdFromRequest(request), request.auth!.user.id, sessionId, { ...parsed, attachments });
+  }
+
+  @Patch("/follow-ups/:followUpId")
+  async updateQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("followUpId") followUpId: string, @Body() body: unknown) {
+    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    const parsed = QueuedFollowUpUpdateSchema.parse(body ?? {});
+    const scope = parsed.attachments
+      ? await this.queuedFollowUps.scope(tenantIdFromRequest(request), request.auth!.user.id, followUpId)
+      : undefined;
+    const attachments = parsed.attachments
+      ? await this.files.runtimeAttachments(tenantIdFromRequest(request), request.auth!.user.id, parsed.attachments, scope!)
+      : undefined;
+    return this.queuedFollowUps.update(tenantIdFromRequest(request), request.auth!.user.id, followUpId, {
+      ...parsed,
+      ...(attachments ? { attachments } : {}),
+    });
+  }
+
+  @Delete("/follow-ups/:followUpId")
+  async cancelQueuedFollowUp(@Req() request: AuthenticatedRequest, @Param("followUpId") followUpId: string) {
+    if (!this.durableTurns.enabled) throw new NotFoundException("Server-owned follow-ups require the durable runner");
+    return this.queuedFollowUps.cancel(tenantIdFromRequest(request), request.auth!.user.id, followUpId);
   }
 
   @Post("/sessions/:sessionId/turns")
