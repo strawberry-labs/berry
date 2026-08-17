@@ -1645,6 +1645,49 @@ describe("SandboxContinuityManager", () => {
     expect(new Set(repository.recordArtifactOperationStart.mock.calls.map(([input]) => input.operationKey)).size).toBe(2);
   });
 
+  it("treats an absent optional output directory as an empty finalization", async () => {
+    const missing = new Error("[not_found] path not found: no such file or directory");
+    missing.name = "FileNotFoundError";
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(),
+        write: vi.fn(),
+        list: vi.fn(async (input: { path: string }) => {
+          if (input.path.endsWith("/outputs")) throw missing;
+          return { path: input.path, entries: [] };
+        }),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-no-outputs";
+    current.sandboxProvider = "e2b";
+    current.sandboxState = "running";
+    current.steps = [];
+
+    await expect(manager.finalize(current)).resolves.toEqual([]);
+    expect(objects.putArtifact).not.toHaveBeenCalled();
+    expect(repository.persistOutput).not.toHaveBeenCalled();
+  });
+
   it("surfaces terminal output listing failures and records finalization failure", async () => {
     const base = snapshot();
     const provider = {

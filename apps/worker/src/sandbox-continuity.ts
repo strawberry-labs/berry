@@ -1152,7 +1152,21 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const objects = this.objects;
     if (!objects) return [];
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    const listed = await this.provider.files.list({ sandbox_id: sandbox.id, path: `${workspaceRoot}/outputs`, recursive: true });
+    let listed: Awaited<ReturnType<SandboxProvider["files"]["list"]>>;
+    try {
+      listed = await this.provider.files.list({
+        sandbox_id: sandbox.id,
+        path: `${workspaceRoot}/outputs`,
+        recursive: true,
+      });
+    } catch (error) {
+      // The outputs directory is optional. E2B reports an absent directory as
+      // FileNotFoundError, while local providers generally surface ENOENT.
+      // Both mean there is simply nothing to publish; availability and other
+      // listing failures must still fail finalization visibly.
+      if (isMissingSandboxPath(error)) return [];
+      throw error;
+    }
     const explicitlyPersisted = new Set(snapshot.steps.flatMap((step) => {
       if (step.state !== "completed") return [];
       const name = stringValue(step.input.toolName) ?? step.type.slice(5);
@@ -2803,6 +2817,13 @@ function safeWorkspaceRoot(value: string): string {
     throw new Error("Sandbox workspace root must be an absolute path without traversal segments");
   }
   return `/${parts.join("/")}`;
+}
+
+function isMissingSandboxPath(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === "FileNotFoundError"
+    || /^\[not_found\]\s+path not found:/i.test(error.message)
+    || /\bno such file or directory\b/i.test(error.message);
 }
 
 interface PiTruncation {
