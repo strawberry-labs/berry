@@ -3182,6 +3182,21 @@ FROM turn_runs
 WHERE tenant_id=$1::uuid AND id=$2::uuid
 ON CONFLICT (tenant_id,run_id) DO UPDATE
 SET terminal_state=EXCLUDED.terminal_state,
+    status=CASE
+      WHEN EXCLUDED.status='skipped' THEN 'skipped'
+      ELSE turn_finalizations.status
+    END,
+    completed_at=CASE
+      WHEN EXCLUDED.status='skipped' THEN EXCLUDED.completed_at
+      ELSE turn_finalizations.completed_at
+    END,
+    lease_owner=CASE WHEN EXCLUDED.status='skipped' THEN NULL ELSE turn_finalizations.lease_owner END,
+    lease_expires_at=CASE WHEN EXCLUDED.status='skipped' THEN NULL ELSE turn_finalizations.lease_expires_at END,
+    manifest=CASE WHEN EXCLUDED.status='skipped' THEN NULL ELSE turn_finalizations.manifest END,
+    item_count=CASE WHEN EXCLUDED.status='skipped' THEN 0 ELSE turn_finalizations.item_count END,
+    completed_count=CASE WHEN EXCLUDED.status='skipped' THEN 0 ELSE turn_finalizations.completed_count END,
+    failed_count=CASE WHEN EXCLUDED.status='skipped' THEN 0 ELSE turn_finalizations.failed_count END,
+    last_error=CASE WHEN EXCLUDED.status='skipped' THEN NULL ELSE turn_finalizations.last_error END,
     updated_at=now()
 WHERE turn_finalizations.status IN ('pending','failed','partial')
           `.trim(),

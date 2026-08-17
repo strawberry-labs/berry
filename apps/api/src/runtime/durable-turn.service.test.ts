@@ -53,6 +53,123 @@ describe("DurableTurnService", () => {
     expect(activity.get(secondSessionId)).toMatchObject({ runId: null, admissionState: "preparing" });
   });
 
+  it("returns only generations persisted by overlapping admission preparation", async () => {
+    const intent = {
+      session_id: sessionId,
+      operation_fingerprint: operationFingerprint,
+      state: "preparing" as const,
+      run_id: null,
+      preparation_lease_expires_at: "2099-01-01T00:00:00.000Z",
+      preparation_attempt: 0,
+    };
+    let initialReads = 0;
+    let releaseInitialReads!: () => void;
+    const bothInitialReads = new Promise<void>((resolve) => {
+      releaseInitialReads = resolve;
+    });
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params = []) => {
+        if (sql.includes("preparation_attempt=preparation_attempt+1")) {
+          const expectedGeneration = Number(params[4]);
+          const expectedState = params[5];
+          if (intent.preparation_attempt !== expectedGeneration || intent.state !== expectedState) {
+            return [] as T[];
+          }
+          intent.preparation_attempt += 1;
+          return [{ preparation_attempt: intent.preparation_attempt }] as T[];
+        }
+        if (sql.includes("FROM turn_admission_intents")) {
+          if (initialReads < 2) {
+            initialReads += 1;
+            if (initialReads === 2) releaseInitialReads();
+            await bothInitialReads;
+            return [{ ...intent, preparation_attempt: 0 }] as T[];
+          }
+          return [{ ...intent }] as T[];
+        }
+        return [] as T[];
+      },
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+    const admissionIntent = {
+      tenantId,
+      sessionId,
+      requestId: "model_overlapping_preparation",
+      operationFingerprint,
+    };
+
+    const results = await Promise.all([
+      service.beginAdmission(admissionIntent),
+      service.beginAdmission(admissionIntent),
+    ]);
+
+    expect(results.map((result) => result?.attemptGeneration).sort()).toEqual([1, 2]);
+    expect(intent.preparation_attempt).toBe(2);
+  });
+
+  it("rejects a stale admission generation before creating a run", async () => {
+    const executions: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { executions.push(sql); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_admission_intents")) {
+          return [{
+            session_id: sessionId,
+            operation_fingerprint: operationFingerprint,
+            state: "preparing",
+            run_id: null,
+            preparation_attempt: 2,
+          }] as T[];
+        }
+        throw new Error(`Stale admission continued: ${sql}`);
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.admit({
+      tenantId,
+      userId,
+      workspaceId,
+      taskId,
+      sessionId,
+      requestId: "model_overlapping_preparation",
+      operationFingerprint,
+      attemptGeneration: 1,
+      budgetReservationRequired: false,
+      input: "Do the stale work",
+      runtimeRequest: {},
+      groundingContext: {},
+    })).rejects.toMatchObject({ status: 409 });
+
+    expect(executions).not.toContainEqual(expect.stringContaining("INSERT INTO turn_runs"));
+  });
+
+  it("compare-and-sets failed admission and protects an active run task projection", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>() => [] as T[],
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await service.failAdmission({
+      tenantId,
+      sessionId,
+      requestId: "model_overlapping_preparation",
+      attemptGeneration: 1,
+      reasonCode: "stale_attempt_failed",
+    });
+
+    const failure = executions.find(({ sql }) => sql.includes("failed_intent AS"));
+    expect(failure?.sql).toContain("preparation_attempt=$6");
+    expect(failure?.sql).toContain("active.task_id=t.id");
+    expect(failure?.sql).toContain("active.state NOT IN ('completed','failed','cancelled','recovery_required')");
+    expect(failure?.params).toContain(1);
+  });
+
   it("rejects admission after the matching pending submission was cancelled", async () => {
     const executions: string[] = [];
     const executor: SqlExecutor = {
@@ -159,6 +276,15 @@ describe("DurableTurnService", () => {
     const executor: SqlExecutor = {
       execute: async (sql) => { executions.push(sql); },
       query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_admission_intents")) {
+          return [{
+            session_id: sessionId,
+            operation_fingerprint: operationFingerprint,
+            state: "admitted",
+            run_id: runId,
+            preparation_attempt: 2,
+          }] as T[];
+        }
         if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
         if (sql.includes("WHERE tenant_id=$1::uuid AND request_id=$2")) {
           return [{
@@ -184,6 +310,7 @@ describe("DurableTurnService", () => {
       sessionId,
       requestId: "model_operation_1",
       operationFingerprint,
+      attemptGeneration: 1,
       budgetReservationRequired: false,
       requestMessageId: userId,
       input: "Do the work",
@@ -932,6 +1059,68 @@ describe("DurableTurnService", () => {
     });
   });
 
+  it("persists a synthetic error result for every tool superseded by a question", async () => {
+    const firstSiblingStepId = "00000000-0000-7000-8000-000000000011";
+    const firstSiblingCallId = "00000000-0000-7000-8000-000000000012";
+    const secondSiblingStepId = "00000000-0000-7000-8000-000000000013";
+    const secondSiblingCallId = "00000000-0000-7000-8000-000000000014";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_questions q")) {
+          return [{
+            id: questionId,
+            run_id: runId,
+            session_id: sessionId,
+            step_id: stepId,
+            tool_call_id: questionId,
+            question: "Which environment?",
+            status: "pending",
+            run_state: "waiting",
+            task_id: taskId,
+            created_at: "2026-07-28T00:00:00.000Z",
+          }] as T[];
+        }
+        if (sql.includes("superseded_by_question") && sql.includes("FROM turn_steps s")) {
+          return [
+            { step_id: firstSiblingStepId, tool_call_id: firstSiblingCallId, tool_name: "read", input: { path: "a.txt" } },
+            { step_id: secondSiblingStepId, tool_call_id: secondSiblingCallId, tool_name: "grep", input: { pattern: "berry" } },
+          ] as T[];
+        }
+        if (sql.includes("FROM session_entries") && sql.includes("is_leaf_marker=true")) {
+          return [{ entry_id: userId, entry_type: "message", payload: { message: { role: "assistant" } } }] as T[];
+        }
+        if (sql.includes("COALESCE(MAX(sequence),0)+1 AS value")) return [{ value: 10 }] as T[];
+        if (sql.includes("COUNT(*) FILTER")) return [{ sequence: 13, iteration: 2 }] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 20 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.answerQuestion(tenantId, userId, questionId, { answer: "Staging" }))
+      .resolves.toBe(true);
+
+    const providerResults = executions
+      .filter(({ sql }) => sql.startsWith("INSERT INTO session_entries"))
+      .map(({ params }) => JSON.parse(String(params[5])))
+      .filter((payload) => payload.message?.role === "toolResult");
+    expect(providerResults.map((payload) => payload.message.toolCallId)).toEqual([
+      firstSiblingCallId,
+      secondSiblingCallId,
+      questionId,
+    ]);
+    expect(providerResults.slice(0, 2)).toEqual([
+      expect.objectContaining({ message: expect.objectContaining({ isError: true }) }),
+      expect.objectContaining({ message: expect.objectContaining({ isError: true }) }),
+    ]);
+    expect(executions.filter(({ sql }) =>
+      sql.includes("UPDATE turn_steps") && sql.includes("session_entry_id=COALESCE")
+    )).toHaveLength(2);
+  });
+
   it("resolves an approval and projects task running state in one transaction", async () => {
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
@@ -946,7 +1135,9 @@ describe("DurableTurnService", () => {
             session_id: sessionId,
             task_id: taskId,
             status: "pending",
+            run_state: "waiting",
             expires_at: "2099-01-01T00:00:00.000Z",
+            sandbox_id: null,
           }] as T[];
         }
         if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 0 }] as T[];
@@ -962,6 +1153,56 @@ describe("DurableTurnService", () => {
 
     expect(executions.some(({ sql }) => sql.includes("UPDATE tasks") && sql.includes("status='running'"))).toBe(true);
     expect(executions.some(({ sql }) => sql.includes("human_wait_ms") && sql.includes("version=version+1"))).toBe(true);
+  });
+
+  it("expires an approval by closing the wait and converging the run projection", async () => {
+    const approvalId = "00000000-0000-7000-8000-000000000010";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM approvals a")) {
+          return [{
+            id: approvalId,
+            run_id: runId,
+            step_id: stepId,
+            tool_call_id: questionId,
+            session_id: sessionId,
+            task_id: taskId,
+            status: "pending",
+            run_state: "waiting",
+            expires_at: "2026-07-29T00:00:00.000Z",
+            sandbox_id: null,
+          }] as T[];
+        }
+        if (sql.includes("retry_class='non_idempotent_manual'")) return [] as T[];
+        if (sql.includes("FROM turn_events") && sql.includes("ORDER BY sequence ASC")) return [] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 0 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.decideApproval(tenantId, userId, approvalId, { decision: "approve" }))
+      .resolves.toBe(false);
+
+    expect(executions.some(({ sql, params }) =>
+      sql.includes("UPDATE turn_steps") && params.includes("approval_expired")
+    )).toBe(true);
+    expect(executions.some(({ sql, params }) =>
+      sql.includes("UPDATE tool_calls") && params.includes("approval_expired")
+    )).toBe(true);
+    expect(executions.some(({ sql, params }) =>
+      sql.startsWith("UPDATE turn_runs") && params.includes("failed") && params.includes(null)
+    )).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("UPDATE tasks") && sql.includes("status='failed'"))).toBe(true);
+    expect(executions.find(({ sql }) => sql.includes("UPDATE tasks t"))?.sql)
+      .toContain("active.task_id=t.id");
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO turn_finalizations"))).toBe(true);
+    expect(executions.some(({ sql }) =>
+      sql.startsWith("INSERT INTO runtime_outbox") && sql.includes("'turn.resume'")
+    )).toBe(false);
   });
 
   it("expires a late question answer without resuming the waiting run", async () => {
@@ -994,7 +1235,58 @@ describe("DurableTurnService", () => {
       .resolves.toBe(false);
     expect(executions.some(({ sql }) => sql.includes("status='expired'"))).toBe(true);
     expect(executions.some(({ params }) => params.some((value) => String(value).includes('"kind":"question.expired"')))).toBe(true);
-    expect(executions.some(({ sql }) => sql.includes("state=$3") && sql.includes("state='waiting'"))).toBe(true);
+    expect(executions.some(({ sql, params }) =>
+      sql.startsWith("UPDATE turn_runs")
+      && params.includes("failed")
+      && params.filter((value) => value === null).length >= 2
+    )).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("state='recovery_required'") && !sql.includes("recovery_step_id")))
+      .toBe(false);
+  });
+
+  it("uses exact recovery references when question expiry finds an ambiguous sibling", async () => {
+    const recoveryStepId = "00000000-0000-7000-8000-000000000011";
+    const recoveryToolCallId = "00000000-0000-7000-8000-000000000012";
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => { executions.push({ sql, params }); },
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM turn_questions q")) {
+          return [{
+            id: questionId,
+            run_id: runId,
+            session_id: sessionId,
+            step_id: stepId,
+            tool_call_id: questionId,
+            question: "Which environment?",
+            status: "pending",
+            run_state: "waiting",
+            task_id: taskId,
+            created_at: "2026-07-28T00:00:00.000Z",
+            expires_at: "2026-07-29T00:00:00.000Z",
+            sandbox_id: "sandbox_1",
+          }] as T[];
+        }
+        if (sql.includes("retry_class='non_idempotent_manual'")) {
+          return [{ step_id: recoveryStepId, tool_call_id: recoveryToolCallId }] as T[];
+        }
+        if (sql.includes("FROM turn_events") && sql.includes("ORDER BY sequence ASC")) return [] as T[];
+        if (sql.includes("COALESCE(MAX(sequence),0) AS sequence")) return [{ sequence: 0 }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const service = new DurableTurnService(new CloudDatabaseService(executor), true);
+
+    await expect(service.answerQuestion(tenantId, userId, questionId, { answer: "Staging" }))
+      .resolves.toBe(false);
+
+    expect(executions.some(({ sql, params }) =>
+      sql.startsWith("UPDATE turn_runs")
+      && params.includes("recovery_required")
+      && params.includes(recoveryStepId)
+      && params.includes(recoveryToolCallId)
+    )).toBe(true);
   });
 
   it("associates question uploads and persists their message parts in the answer transaction", async () => {
@@ -1204,6 +1496,8 @@ describe("DurableTurnService", () => {
             tool_call_step_id: stepId,
             tool_call_name: "mcp__BerryCrawl__search",
             tool_call_input: { query: "today's AI news" },
+            sandbox_id: "sandbox_1",
+            completed_at: "2026-08-01T00:00:00.000Z",
             version: 3,
           }] as T[];
         }
@@ -1233,6 +1527,15 @@ describe("DurableTurnService", () => {
     )).toBe(true);
     expect(executions.some(({ sql }) =>
       sql.startsWith("UPDATE turn_runs") && sql.includes("state='calling_model'")
+    )).toBe(true);
+    expect(executions.some(({ sql }) =>
+      sql.startsWith("UPDATE turn_runs") && sql.includes("human_wait_ms=human_wait_ms+")
+    )).toBe(true);
+    expect(executions.some(({ sql }) =>
+      sql.startsWith("UPDATE turn_finalizations") && sql.includes("status='pending'")
+    )).toBe(true);
+    expect(executions.some(({ sql }) =>
+      sql.startsWith("UPDATE turn_events") && sql.includes("'turn.recovery_checkpoint'")
     )).toBe(true);
     expect(executions.some(({ sql }) => sql.includes("'turn.resume'"))).toBe(true);
     expect(queries.some((sql) => sql.includes("FOR UPDATE OF r"))).toBe(true);

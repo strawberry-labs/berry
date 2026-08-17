@@ -30,6 +30,7 @@ export interface DurableTurnAdmission {
   sessionId: string;
   requestId: string;
   operationFingerprint: string;
+  attemptGeneration?: number;
   budgetReservationRequired: boolean;
   requestMessageId?: string;
   replaceFromMessageId?: string;
@@ -58,6 +59,10 @@ export interface DurableTurnAdmissionIntent {
   requestId: string;
   operationFingerprint: string;
 }
+
+export type DurableTurnAdmissionPreparation =
+  | { runId: string; sessionId: string; attemptGeneration: null }
+  | { runId: null; sessionId: string; attemptGeneration: number };
 
 export interface DurableTaskActivity {
   sessionId: string;
@@ -97,6 +102,7 @@ type AdmissionIntentRow = {
   state: "preparing" | "admitted" | "retryable" | "rejected" | "expired" | "cancelled";
   run_id: string | null;
   preparation_lease_expires_at?: Date | string | null;
+  preparation_attempt: number | string;
 };
 
 @Injectable()
@@ -116,7 +122,7 @@ export class DurableTurnService {
     });
   }
 
-  async beginAdmission(input: DurableTurnAdmissionIntent): Promise<{ runId: string; sessionId: string } | null> {
+  async beginAdmission(input: DurableTurnAdmissionIntent): Promise<DurableTurnAdmissionPreparation | null> {
     if (!this.enabled) return null;
     return this.database.withTenant(input.tenantId, async (executor) => {
       await executor.execute(
@@ -125,38 +131,32 @@ INSERT INTO turn_admission_intents (
   tenant_id,request_id,session_id,operation_fingerprint,state,
   preparation_started_at,preparation_lease_expires_at,preparation_attempt
 ) VALUES (
-  $1::uuid,$2,$3::uuid,$4,'preparing',now(),now() + interval '5 minutes',1
+  $1::uuid,$2,$3::uuid,$4,'preparing',now(),now() + interval '5 minutes',0
 )
 ON CONFLICT (tenant_id,request_id) DO NOTHING
         `.trim(),
         [input.tenantId, input.requestId, input.sessionId, input.operationFingerprint],
       );
-      const intent = await lockAdmissionIntent(executor, input.tenantId, input.requestId);
-      if (!intent) throw new Error("Unable to persist the durable turn admission intent");
-      validateAdmissionIntent(intent, input);
-      if (!intent.operation_fingerprint) {
-        await executor.execute(
-          `
-UPDATE turn_admission_intents
-SET operation_fingerprint=$3,updated_at=now()
-WHERE tenant_id=$1::uuid AND request_id=$2 AND operation_fingerprint IS NULL
-          `.trim(),
-          [input.tenantId, input.requestId, input.operationFingerprint],
-        );
-      }
-      if (intent.state === "cancelled") throw cancelledAdmissionConflict();
-      if (intent.state === "admitted" && intent.run_id) {
-        return { runId: intent.run_id, sessionId: input.sessionId };
-      }
-      const preparationExpired = intent.state === "preparing"
-        && intent.preparation_lease_expires_at !== null
-        && intent.preparation_lease_expires_at !== undefined
-        && new Date(intent.preparation_lease_expires_at).getTime() <= Date.now();
-      if (intent.state === "retryable" || intent.state === "rejected" || intent.state === "expired" || preparationExpired) {
-        await executor.execute(
+      for (let retry = 0; retry < 8; retry += 1) {
+        const intent = await lockAdmissionIntent(executor, input.tenantId, input.requestId);
+        if (!intent) throw new Error("Unable to persist the durable turn admission intent");
+        validateAdmissionIntent(intent, input);
+        if (intent.state === "cancelled") throw cancelledAdmissionConflict();
+        if (intent.state === "admitted" && intent.run_id) {
+          return { runId: intent.run_id, sessionId: input.sessionId, attemptGeneration: null };
+        }
+        if (intent.state === "admitted") {
+          throw new Error("Admitted durable turn intent has no run reference");
+        }
+        const attemptGeneration = Number(intent.preparation_attempt) + 1;
+        if (!Number.isSafeInteger(attemptGeneration) || attemptGeneration <= 0) {
+          throw new Error("Durable turn admission attempt generation is invalid");
+        }
+        const advanced = await executor.query<{ preparation_attempt: number | string }>(
           `
 UPDATE turn_admission_intents
 SET state='preparing',
+    operation_fingerprint=COALESCE(operation_fingerprint,$4),
     preparation_started_at=now(),
     preparation_lease_expires_at=now() + interval '5 minutes',
     preparation_attempt=preparation_attempt+1,
@@ -166,11 +166,26 @@ SET state='preparing',
     cancelled_at=NULL,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND request_id=$2
+  AND session_id=$3::uuid AND preparation_attempt=$5 AND state=$6
+RETURNING preparation_attempt
           `.trim(),
-          [input.tenantId, input.requestId],
+          [
+            input.tenantId,
+            input.requestId,
+            input.sessionId,
+            input.operationFingerprint,
+            attemptGeneration - 1,
+            intent.state,
+          ],
         );
+        if (!advanced[0]) continue;
+        const persistedGeneration = Number(advanced[0].preparation_attempt);
+        if (persistedGeneration !== attemptGeneration) {
+          throw new Error("Durable turn admission attempt generation was not persisted atomically");
+        }
+        return { runId: null, sessionId: input.sessionId, attemptGeneration: persistedGeneration };
       }
-      return null;
+      throw supersededAdmissionConflict();
     });
   }
 
@@ -178,43 +193,53 @@ WHERE tenant_id=$1::uuid AND request_id=$2
     tenantId: string;
     sessionId: string;
     requestId: string;
+    attemptGeneration?: number;
     reason?: "retryable" | "rejected" | "expired";
     reasonCode?: string;
   }): Promise<void> {
     if (!this.enabled) return;
+    if (!Number.isSafeInteger(input.attemptGeneration) || Number(input.attemptGeneration) <= 0) return;
     const reason = input.reason ?? "retryable";
     await this.database.withTenant(input.tenantId, async (executor) => {
-      const intent = await lockAdmissionIntent(executor, input.tenantId, input.requestId);
-      if (!intent || intent.session_id !== input.sessionId || intent.state === "cancelled" || intent.state === "admitted") {
-        return;
-      }
       await executor.execute(
         `
+WITH failed_intent AS (
 UPDATE turn_admission_intents
-SET state=$3,
+SET state=$4,
     preparation_lease_expires_at=NULL,
     preparation_ms=COALESCE(
       preparation_ms,
       GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-COALESCE(preparation_started_at,created_at)))*1000)::integer)
     ),
-    terminal_reason_code=COALESCE($4,terminal_reason_code),
+    terminal_reason_code=COALESCE($5,terminal_reason_code),
     terminal_at=COALESCE(terminal_at,now()),
     updated_at=now()
-WHERE tenant_id=$1::uuid AND request_id=$2 AND state='preparing'
-        `.trim(),
-        [input.tenantId, input.requestId, reason, input.reasonCode ?? "admission_failed"],
-      );
-      await executor.execute(
-        `
+WHERE tenant_id=$1::uuid AND request_id=$2 AND session_id=$3::uuid
+  AND state='preparing' AND preparation_attempt=$6
+RETURNING session_id
+)
 UPDATE tasks t
-SET status=$3::task_status,
+SET status=$7::task_status,
     updated_at=now()
-FROM sessions s
-WHERE s.tenant_id=$1::uuid AND s.id=$2::uuid
+FROM sessions s,failed_intent failed
+WHERE s.tenant_id=$1::uuid AND s.id=failed.session_id
   AND t.tenant_id=s.tenant_id AND t.id=s.task_id
   AND t.status IN ('queued','running')
+  AND NOT EXISTS (
+    SELECT 1 FROM turn_runs active
+    WHERE active.tenant_id=t.tenant_id AND active.task_id=t.id
+      AND active.state NOT IN ('completed','failed','cancelled','recovery_required')
+  )
         `.trim(),
-        [input.tenantId, input.sessionId, reason === "retryable" ? "queued" : "failed"],
+        [
+          input.tenantId,
+          input.requestId,
+          input.sessionId,
+          reason,
+          input.reasonCode ?? "admission_failed",
+          input.attemptGeneration,
+          reason === "retryable" ? "queued" : "failed",
+        ],
       );
     });
   }
@@ -228,6 +253,13 @@ WHERE s.tenant_id=$1::uuid AND s.id=$2::uuid
         if (admissionIntent.state === "cancelled") throw cancelledAdmissionConflict();
         if (admissionIntent.state === "admitted" && admissionIntent.run_id) {
           return { runId: admissionIntent.run_id, sessionId: input.sessionId };
+        }
+        if (
+          admissionIntent.state !== "preparing"
+          || !Number.isSafeInteger(input.attemptGeneration)
+          || Number(admissionIntent.preparation_attempt) !== input.attemptGeneration
+        ) {
+          throw supersededAdmissionConflict();
         }
       }
       const owned = await executor.query<{ session_id: string }>(
@@ -452,8 +484,9 @@ SET state='admitted',run_id=$3::uuid,admitted_at=now(),
     terminal_at=NULL,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND request_id=$2 AND state='preparing'
+  AND preparation_attempt=$4
           `.trim(),
-          [input.tenantId, input.requestId, runId],
+          [input.tenantId, input.requestId, runId, input.attemptGeneration],
         );
       }
       return { runId, sessionId: input.sessionId };
@@ -1091,9 +1124,12 @@ ORDER BY a.created_at ASC
           task_id: string;
           status: string;
           expires_at: Date | string | null;
+          run_state: string;
+          sandbox_id: string | null;
         }>(
           `
-SELECT a.id,a.run_id,a.step_id,a.tool_call_id,r.session_id,a.task_id,a.status,a.expires_at
+SELECT a.id,a.run_id,a.step_id,a.tool_call_id,r.session_id,a.task_id,a.status,a.expires_at,
+       r.state AS run_state,r.sandbox_id
 FROM approvals a
 JOIN tasks t ON t.tenant_id=a.tenant_id AND t.id=a.task_id
 JOIN turn_runs r ON r.tenant_id=a.tenant_id AND r.id=a.run_id
@@ -1114,11 +1150,22 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
             `.trim(),
             [tenantId, approvalId],
           );
-          await appendDurableEvents(transaction, tenantId, approval.run_id, approval.session_id, [
-            { kind: "approval.expired", approvalId },
-          ]);
+          if (approval.run_state === "waiting") {
+            await expireWaitTransaction(transaction, tenantId, {
+              runId: approval.run_id,
+              sessionId: approval.session_id,
+              taskId: approval.task_id,
+              stepId: approval.step_id,
+              toolCallId: approval.tool_call_id,
+              sandboxId: approval.sandbox_id,
+              closureReason: "approval_expired",
+              summary: "This approval expired before a decision was recorded.",
+              event: { kind: "approval.expired", approvalId },
+            });
+          }
           return false;
         }
+        if (approval.run_state !== "waiting") return false;
         const approved = !["denied", "deny", "abort"].includes(decision.decision);
         await transaction.execute(
           `
@@ -1256,10 +1303,11 @@ LIMIT 1
           task_id: string;
           created_at: Date | string;
           expires_at: Date | string | null;
+          sandbox_id: string | null;
         }>(
           `
 SELECT q.id,q.run_id,q.session_id,q.step_id,q.tool_call_id,q.question,q.status,q.answer,
-       q.created_at,q.expires_at,r.state AS run_state,r.task_id
+       q.created_at,q.expires_at,r.state AS run_state,r.task_id,r.sandbox_id
 FROM turn_questions q
 JOIN turn_runs r ON r.tenant_id=q.tenant_id AND r.id=q.run_id
 JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
@@ -1299,6 +1347,7 @@ FOR UPDATE OF q,r
             task_id: question.task_id,
             step_id: question.step_id!,
             tool_call_id: question.tool_call_id,
+            sandbox_id: question.sandbox_id,
           });
           return false;
         }
@@ -1410,6 +1459,30 @@ VALUES ($1::uuid,$2::uuid,'attachment',$3::jsonb,$4)
           }
         }
 
+        const supersededTools = await transaction.query<{
+          step_id: string;
+          tool_call_id: string;
+          tool_name: string;
+          input: unknown;
+        }>(
+          `
+SELECT s.id AS step_id,tc.id AS tool_call_id,tc.tool_name,tc.input
+FROM turn_steps s
+JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.run_id=s.run_id AND tc.step_id=s.id
+WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid AND s.id<>$3::uuid
+  AND s.state='cancelled' AND s.error='superseded_by_question'
+  AND NOT EXISTS (
+    SELECT 1 FROM session_entries result_entry
+    WHERE result_entry.tenant_id=s.tenant_id AND result_entry.session_id=$4::uuid
+      AND result_entry.run_id=s.run_id
+      AND result_entry.payload->'message'->>'role'='toolResult'
+      AND result_entry.payload->'message'->>'toolCallId'=tc.id::text
+  )
+ORDER BY s.sequence ASC,s.id ASC
+FOR UPDATE OF s,tc
+          `.trim(),
+          [tenantId, question.run_id, question.step_id, question.session_id],
+        );
         const entryId = randomUUID();
         const leaf = await transaction.query<{ entry_id: string; entry_type: string; payload: unknown }>(
           `
@@ -1422,7 +1495,7 @@ FOR UPDATE
           `.trim(),
           [tenantId, question.session_id],
         );
-        const parentId = activeLeafId(leaf[0]);
+        let parentId = activeLeafId(leaf[0]);
         const sequence = await transaction.query<{ value: number | string }>(
           `
 SELECT COALESCE(MAX(sequence),0)+1 AS value
@@ -1435,6 +1508,95 @@ WHERE tenant_id=$1::uuid AND session_id=$2::uuid
           "UPDATE session_entries SET is_leaf_marker=false WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true",
           [tenantId, question.session_id],
         );
+        let entrySequence = Number(sequence[0]?.value ?? 1);
+        const supersededSummary = "Cancelled because ask_user_question superseded this sibling tool call.";
+        for (const tool of supersededTools) {
+          const resultEntryId = randomUUID();
+          const details = {
+            cancelled: true,
+            synthetic: true,
+            reason: "superseded_by_question",
+          };
+          const resultPayload = {
+            type: "message",
+            id: resultEntryId,
+            parentId,
+            timestamp: new Date().toISOString(),
+            message: {
+              role: "toolResult",
+              toolCallId: tool.tool_call_id,
+              toolName: tool.tool_name,
+              content: [{ type: "text", text: supersededSummary }],
+              isError: true,
+              timestamp: Date.now(),
+              details,
+            },
+          };
+          await transaction.execute(
+            `
+INSERT INTO session_entries (
+  tenant_id,session_id,entry_id,parent_entry_id,entry_type,sequence,payload,
+  is_leaf_marker,run_id,step_id
+) VALUES ($1::uuid,$2::uuid,$3,$4,'message',$5,$6::jsonb,false,$7::uuid,$8::uuid)
+            `.trim(),
+            [
+              tenantId,
+              question.session_id,
+              resultEntryId,
+              parentId,
+              entrySequence,
+              JSON.stringify(resultPayload),
+              question.run_id,
+              tool.step_id,
+            ],
+          );
+          await transaction.execute(
+            `
+UPDATE turn_steps
+SET session_entry_id=COALESCE(session_entry_id,$4),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
+            `.trim(),
+            [tenantId, question.run_id, tool.step_id, resultEntryId],
+          );
+          await transaction.execute(
+            `
+UPDATE tool_calls
+SET output=COALESCE(output,$4::jsonb),closure_reason=COALESCE(closure_reason,'superseded_by_question'),
+    closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
+            `.trim(),
+            [tenantId, question.run_id, tool.tool_call_id, JSON.stringify(details)],
+          );
+          await transaction.execute(
+            `
+INSERT INTO messages (id,tenant_id,session_id,task_id,role,status)
+VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'assistant','complete')
+ON CONFLICT (id) DO NOTHING
+            `.trim(),
+            [resultEntryId, tenantId, question.session_id, question.task_id],
+          );
+          await transaction.execute(
+            `
+INSERT INTO message_parts (tenant_id,message_id,type,content,ordinal)
+VALUES ($1::uuid,$2::uuid,'tool-result',$3::jsonb,0)
+ON CONFLICT (message_id,ordinal) DO NOTHING
+            `.trim(),
+            [
+              tenantId,
+              resultEntryId,
+              JSON.stringify({
+                toolCallId: tool.tool_call_id,
+                name: tool.tool_name,
+                arguments: tool.input,
+                status: "cancelled",
+                output: details,
+                summary: supersededSummary,
+              }),
+            ],
+          );
+          parentId = resultEntryId;
+          entrySequence += 1;
+        }
         const artifacts = (governedAnswers ?? []).flatMap((item) => (item.attachments ?? []).map((attachment) => ({
           fileId: attachment.fileId,
           name: attachment.name,
@@ -1476,7 +1638,7 @@ INSERT INTO session_entries (
             question.session_id,
             entryId,
             parentId,
-            Number(sequence[0]?.value ?? 1),
+            entrySequence,
             JSON.stringify(payload),
             question.run_id,
             question.step_id,
@@ -1555,6 +1717,12 @@ INSERT INTO turn_steps (
           ],
         );
         await appendDurableEvents(transaction, tenantId, question.run_id, question.session_id, [
+          ...supersededTools.map((tool) => ({
+            kind: "tool.end" as const,
+            toolCallId: tool.tool_call_id,
+            status: "failed" as const,
+            summary: supersededSummary,
+          })),
           { kind: "question.answered", questionId },
           {
             kind: "tool.end",
@@ -1626,12 +1794,14 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
         tool_call_step_id: string | null;
         tool_call_name: string | null;
         tool_call_input: unknown;
+        sandbox_id: string | null;
+        completed_at: Date | string | null;
         version: number | string;
       }>(
         `
 SELECT r.id,r.session_id,r.task_id,tc.id AS tool_call_id,
        tc.step_id AS tool_call_step_id,tc.tool_name AS tool_call_name,
-       tc.input AS tool_call_input,r.version,
+       tc.input AS tool_call_input,r.sandbox_id,r.completed_at,r.version,
        r.recovery_step_id,r.recovery_tool_call_id
 FROM turn_runs r JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
 LEFT JOIN tool_calls tc
@@ -1665,10 +1835,11 @@ FOR UPDATE OF r
       if (!recovered.tool_call_id || !recovered.tool_call_step_id) {
         throw new Error("Recovery-required run has no exact failed tool reference; operator confirmation cannot guess a tool");
       }
+      if (action === "mark-complete" && !recovered.tool_call_name) {
+        throw new Error("Recovery-required run has no exact failed tool reference to mark complete");
+      }
+      await reopenRecoveryLifecycle(executor, tenantId, runId, recovered.sandbox_id);
       if (action === "mark-complete") {
-        if (!recovered.tool_call_name) {
-          throw new Error("Recovery-required run has no exact failed tool reference to mark complete");
-        }
         const entryId = randomUUID();
         const confirmation = {
           confirmedByOperator: true,
@@ -1728,7 +1899,7 @@ INSERT INTO session_entries (
           `
 UPDATE turn_steps
 SET state='completed',output=$4::jsonb,session_entry_id=$5,
-    completed_at=now(),error=NULL,updated_at=now()
+    completed_at=now(),error=NULL,closure_reason=NULL,closed_at=NULL,updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
           `.trim(),
           [tenantId, runId, recovered.tool_call_step_id, JSON.stringify(confirmation), entryId],
@@ -1736,7 +1907,8 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
         await executor.execute(
           `
 UPDATE tool_calls
-SET status='completed',output=$4::jsonb,completed_at=now(),updated_at=now()
+SET status='completed',output=$4::jsonb,completed_at=now(),
+    closure_reason=NULL,closed_at=NULL,updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
           `.trim(),
           [tenantId, runId, recovered.tool_call_id, JSON.stringify(confirmation)],
@@ -1785,7 +1957,9 @@ INSERT INTO turn_steps (
           `
 UPDATE turn_runs
 SET state='calling_model',error=NULL,next_action='Continue after operator-confirmed tool completion',
-    completed_at=NULL,recovery_step_id=NULL,recovery_tool_call_id=NULL,updated_at=now()
+    human_wait_ms=human_wait_ms+CASE WHEN completed_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-completed_at))*1000)::bigint) END,
+    completed_at=NULL,cancelled_at=NULL,recovery_step_id=NULL,recovery_tool_call_id=NULL,
+    version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
           `.trim(),
           [tenantId, runId],
@@ -1804,14 +1978,16 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
       } else {
         await executor.execute(
           `
-UPDATE turn_steps SET state='pending',error=NULL,updated_at=now()
+UPDATE turn_steps
+SET state='pending',error=NULL,completed_at=NULL,closure_reason=NULL,closed_at=NULL,updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid AND state='recovery_required'
           `.trim(),
           [tenantId, runId, recovered.tool_call_step_id],
         );
         await executor.execute(
           `
-UPDATE tool_calls SET status='pending',completed_at=NULL,updated_at=now()
+UPDATE tool_calls
+SET status='pending',completed_at=NULL,closure_reason=NULL,closed_at=NULL,updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid AND step_id=$4::uuid AND status='failed'
           `.trim(),
           [tenantId, runId, recovered.tool_call_id, recovered.tool_call_step_id],
@@ -1820,7 +1996,9 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid AND step_id=$4::uui
           `
 UPDATE turn_runs
 SET state='executing_tool',error=NULL,next_action='Retry tool after explicit operator confirmation',
-    completed_at=NULL,recovery_step_id=NULL,recovery_tool_call_id=NULL,version=version+1,updated_at=now()
+    human_wait_ms=human_wait_ms+CASE WHEN completed_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-completed_at))*1000)::bigint) END,
+    completed_at=NULL,cancelled_at=NULL,recovery_step_id=NULL,recovery_tool_call_id=NULL,
+    version=version+1,updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
           `.trim(),
           [tenantId, runId],
@@ -1870,6 +2048,62 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       return true;
     });
   }
+}
+
+async function reopenRecoveryLifecycle(
+  executor: SqlExecutor,
+  tenantId: string,
+  runId: string,
+  _sandboxId: string | null,
+): Promise<void> {
+  await executor.execute(
+    `
+UPDATE runtime_outbox
+SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,
+    last_error=COALESCE(last_error,'Superseded by operator recovery'),updated_at=now()
+WHERE tenant_id=$1::uuid AND aggregate_id=$2 AND event_type='sandbox.snapshot'
+  AND COALESCE(payload->>'reason','interval')='before-finalize' AND completed_at IS NULL
+    `.trim(),
+    [tenantId, runId],
+  );
+  await executor.execute(
+    `
+INSERT INTO agent_operational_events (
+  tenant_id,run_id,session_id,event_type,dedupe_key,worker_role,source_revision,payload
+)
+SELECT r.tenant_id,r.id,r.session_id,'recovery.lifecycle-reopened',
+       r.id::text || ':recovery:lifecycle:' || r.version::text,
+       COALESCE(r.worker_role,'unknown'),COALESCE(r.source_revision,'unknown'),
+       jsonb_build_object('priorTerminalEvent',terminal.payload,'runVersion',r.version)
+FROM turn_runs r
+JOIN LATERAL (
+  SELECT payload FROM turn_events
+  WHERE tenant_id=r.tenant_id AND run_id=r.id AND event_type='turn.end'
+  ORDER BY sequence DESC LIMIT 1
+) terminal ON true
+WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
+ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+    `.trim(),
+    [tenantId, runId],
+  );
+  await executor.execute(
+    `
+UPDATE turn_events
+SET event_type='turn.recovery_checkpoint'
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='turn.end'
+    `.trim(),
+    [tenantId, runId],
+  );
+  await executor.execute(
+    `
+UPDATE turn_finalizations
+SET terminal_state='reopened',status='pending',lease_owner=NULL,lease_expires_at=NULL,
+    manifest=NULL,item_count=0,completed_count=0,failed_count=0,last_error=NULL,
+    started_at=NULL,completed_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+    `.trim(),
+    [tenantId, runId],
+  );
 }
 
 async function loadAdmissionReplay(
@@ -2067,19 +2301,10 @@ async function expireQuestionTransaction(
     task_id: string;
     step_id: string;
     tool_call_id: string | null;
+    sandbox_id?: string | null;
   },
 ): Promise<void> {
   const summary = "This question expired before it was answered. Start a follow-up turn if you still want to continue.";
-  const activeSiblings = await transaction.query<{ id: string }>(
-    `
-SELECT id
-FROM turn_steps
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id<>$3::uuid
-  AND state IN ('pending','running','waiting')
-LIMIT 1
-    `.trim(),
-    [tenantId, question.run_id, question.step_id],
-  );
   await transaction.execute(
     `
 UPDATE turn_questions
@@ -2089,58 +2314,207 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND status='pending'
     `.trim(),
     [tenantId, question.id],
   );
+  await expireWaitTransaction(transaction, tenantId, {
+    runId: question.run_id,
+    sessionId: question.session_id,
+    taskId: question.task_id,
+    stepId: question.step_id,
+    toolCallId: question.tool_call_id,
+    sandboxId: question.sandbox_id ?? null,
+    closureReason: "question_expired",
+    summary,
+    event: { kind: "question.expired", questionId: question.id },
+  });
+}
+
+async function expireWaitTransaction(
+  transaction: SqlExecutor,
+  tenantId: string,
+  wait: {
+    runId: string;
+    sessionId: string;
+    taskId: string;
+    stepId: string | null;
+    toolCallId: string | null;
+    sandboxId: string | null;
+    closureReason: "approval_expired" | "question_expired";
+    summary: string;
+    event: Extract<AgentStreamEvent, { kind: "approval.expired" | "question.expired" }>;
+  },
+): Promise<void> {
+  const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
+    `
+SELECT s.id AS step_id,tc.id AS tool_call_id
+FROM turn_steps s
+JOIN tool_calls tc ON tc.tenant_id=s.tenant_id AND tc.run_id=s.run_id AND tc.step_id=s.id
+WHERE s.tenant_id=$1::uuid AND s.run_id=$2::uuid
+  AND ($3::uuid IS NULL OR s.id<>$3::uuid)
+  AND s.state='running' AND s.retry_class='non_idempotent_manual'
+  AND tc.status='running'
+ORDER BY s.sequence DESC,s.id DESC
+LIMIT 1
+FOR UPDATE OF s,tc
+    `.trim(),
+    [tenantId, wait.runId, wait.stepId],
+  );
+  const ambiguous = ambiguousRows[0] ?? null;
+  const nextState = ambiguous ? "recovery_required" : "failed";
+  const terminalSummary = ambiguous
+    ? `${wait.summary} Another non-idempotent tool has an uncertain outcome and requires operator recovery.`
+    : wait.summary;
+
   await transaction.execute(
     `
 UPDATE turn_steps
-SET state='failed',error=COALESCE(error,$4),completed_at=COALESCE(completed_at,now()),
-    closure_reason=COALESCE(closure_reason,'question_expired'),closed_at=COALESCE(closed_at,now()),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
-    `.trim(),
-    [tenantId, question.run_id, question.step_id, summary],
-  );
-  if (question.tool_call_id) {
-    await transaction.execute(
-      `
-UPDATE tool_calls
-SET status='failed',completed_at=COALESCE(completed_at,now()),closure_reason=COALESCE(closure_reason,'question_expired'),
+SET state=CASE
+      WHEN $3::uuid IS NOT NULL AND id=$3::uuid THEN 'failed'
+      WHEN $4::uuid IS NOT NULL AND id=$4::uuid THEN 'recovery_required'
+      ELSE 'cancelled'
+    END,
+    error=COALESCE(error,CASE
+      WHEN $4::uuid IS NOT NULL AND id=$4::uuid THEN 'Ambiguous external operation discovered while an interactive wait expired'
+      ELSE $6
+    END),
+    completed_at=COALESCE(completed_at,now()),closure_reason=COALESCE(closure_reason,$5),
     closed_at=COALESCE(closed_at,now()),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid
-      `.trim(),
-      [tenantId, question.run_id, question.tool_call_id],
-    );
-  }
-  const nextState = activeSiblings.length > 0 ? "recovery_required" : "failed";
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND state IN ('pending','running','waiting')
+    `.trim(),
+    [tenantId, wait.runId, wait.stepId, ambiguous?.step_id ?? null, wait.closureReason, wait.summary],
+  );
+  await transaction.execute(
+    `
+UPDATE tool_calls
+SET status=CASE
+      WHEN $3::uuid IS NOT NULL AND id=$3::uuid THEN 'failed'::tool_call_status
+      WHEN $4::uuid IS NOT NULL AND id=$4::uuid THEN 'failed'::tool_call_status
+      ELSE 'cancelled'::tool_call_status
+    END,
+    output=COALESCE(output,CASE
+      WHEN $4::uuid IS NOT NULL AND id=$4::uuid THEN jsonb_build_object('error','Ambiguous external operation discovered while an interactive wait expired')
+      ELSE jsonb_build_object('error',$6::text)
+    END),
+    completed_at=COALESCE(completed_at,now()),closure_reason=COALESCE(closure_reason,$5),
+    closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+  AND status IN ('pending','waiting-for-approval','running')
+    `.trim(),
+    [tenantId, wait.runId, wait.toolCallId, ambiguous?.tool_call_id ?? null, wait.closureReason, wait.summary],
+  );
+  await transaction.execute(
+    `
+UPDATE approvals
+SET status='expired',expired_at=COALESCE(expired_at,now()),decided_at=COALESCE(decided_at,now()),
+    closure_reason=COALESCE(closure_reason,$3),closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'
+    `.trim(),
+    [tenantId, wait.runId, wait.closureReason],
+  );
+  await transaction.execute(
+    `
+UPDATE turn_questions
+SET status='cancelled',closure_reason=COALESCE(closure_reason,$3),
+    closed_at=COALESCE(closed_at,now()),updated_at=now()
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND status='pending'
+    `.trim(),
+    [tenantId, wait.runId, wait.closureReason],
+  );
   await projectTerminalAssistant(
     transaction,
     tenantId,
-    question.session_id,
-    question.task_id,
-    question.run_id,
+    wait.sessionId,
+    wait.taskId,
+    wait.runId,
     "failed",
-    activeSiblings.length > 0
-      ? "The question expired while another durable operation was still active. Operator recovery is required."
-      : summary,
+    terminalSummary,
   );
-  await appendDurableEvents(transaction, tenantId, question.run_id, question.session_id, [
-    { kind: "question.expired", questionId: question.id },
-    { kind: "error", message: summary },
-    { kind: "turn.end", turnId: question.run_id, status: "failed" },
-  ]);
   await transaction.execute(
     `
 UPDATE turn_runs
 SET state=$3,error=$4,next_action=NULL,waiting_reason=NULL,completed_at=COALESCE(completed_at,now()),
+    recovery_step_id=$5::uuid,recovery_tool_call_id=$6::uuid,
     human_wait_ms=human_wait_ms+CASE WHEN waiting_started_at IS NULL THEN 0 ELSE GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (now()-waiting_started_at))*1000)::bigint) END,
     waiting_started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,version=version+1,updated_at=now()
-WHERE tenant_id=$1::uuid AND id=$2::uuid AND state='waiting'
+WHERE tenant_id=$1::uuid AND id=$2::uuid
+  AND state NOT IN ('completed','failed','cancelled','recovery_required')
     `.trim(),
-    [tenantId, question.run_id, nextState, summary],
+    [tenantId, wait.runId, nextState, terminalSummary, ambiguous?.step_id ?? null, ambiguous?.tool_call_id ?? null],
   );
   await transaction.execute(
-    "UPDATE tasks SET status='failed',updated_at=now() WHERE tenant_id=$1::uuid AND id=$2::uuid",
-    [tenantId, question.task_id],
+    `
+UPDATE runtime_outbox
+SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+WHERE tenant_id=$1::uuid AND aggregate_id=$2
+  AND event_type IN ('turn.execute','turn.resume') AND completed_at IS NULL
+    `.trim(),
+    [tenantId, wait.runId],
   );
-  await reconcileTerminalUsage(transaction, tenantId, question.run_id, nextState);
+  await transaction.execute(
+    `
+UPDATE tasks t
+SET status='failed',status_source_run_id=$3::uuid,
+    status_source_sequence=GREATEST(COALESCE(status_source_sequence,0),COALESCE((
+      SELECT version FROM turn_runs WHERE tenant_id=$1::uuid AND id=$3::uuid
+    ),0)),
+    status_source_state_at=COALESCE((
+      SELECT created_at FROM turn_runs WHERE tenant_id=$1::uuid AND id=$3::uuid
+    ),now()),updated_at=now()
+WHERE t.tenant_id=$1::uuid AND t.id=$2::uuid
+  AND (
+    t.status_source_run_id IS NULL OR t.status_source_run_id=$3::uuid OR NOT EXISTS (
+      SELECT 1 FROM turn_runs active
+      WHERE active.tenant_id=t.tenant_id AND active.id=t.status_source_run_id
+        AND active.state NOT IN ('completed','failed','cancelled','recovery_required')
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM turn_runs active
+    WHERE active.tenant_id=t.tenant_id AND active.task_id=t.id
+      AND active.state NOT IN ('completed','failed','cancelled','recovery_required')
+  )
+    `.trim(),
+    [tenantId, wait.taskId, wait.runId],
+  );
+  await transaction.execute(
+    `
+INSERT INTO turn_finalizations (tenant_id,run_id,operation_key,terminal_state,status,completed_at)
+VALUES ($1::uuid,$2::uuid,$2::text || ':finalization',$3,
+        CASE WHEN $4::boolean THEN 'pending' ELSE 'skipped' END,
+        CASE WHEN $4::boolean THEN NULL ELSE now() END)
+ON CONFLICT (tenant_id,run_id) DO UPDATE
+SET terminal_state=EXCLUDED.terminal_state,updated_at=now()
+WHERE turn_finalizations.status IN ('pending','failed','partial')
+    `.trim(),
+    [tenantId, wait.runId, nextState, Boolean(wait.sandboxId)],
+  );
+  await appendDurableEvents(transaction, tenantId, wait.runId, wait.sessionId, [
+    wait.event,
+    { kind: "error", message: terminalSummary },
+    { kind: "turn.end", turnId: wait.runId, status: "failed" },
+    { kind: "finalization.start", runId: wait.runId, operationKey: `${wait.runId}:finalization` },
+    ...(!wait.sandboxId
+      ? [{
+          kind: "finalization.end" as const,
+          runId: wait.runId,
+          operationKey: `${wait.runId}:finalization`,
+          status: "skipped" as const,
+          itemCount: 0,
+          completedCount: 0,
+          failedCount: 0,
+        }]
+      : []),
+  ]);
+  await reconcileTerminalUsage(transaction, tenantId, wait.runId, nextState);
+  await transaction.execute(
+    `
+UPDATE sessions
+SET runtime_metadata=runtime_metadata || jsonb_build_object(
+      'activeRunId',$2::text,'lastRunState',$3::text
+    ),updated_at=now()
+WHERE tenant_id=$1::uuid AND id=$4::uuid
+    `.trim(),
+    [tenantId, wait.runId, nextState, wait.sessionId],
+  );
 }
 
 export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentStreamEvent[] {
@@ -3214,7 +3588,7 @@ async function lockAdmissionIntent(
 ): Promise<AdmissionIntentRow | null> {
   const rows = await executor.query<AdmissionIntentRow>(
     `
-SELECT session_id,operation_fingerprint,state,run_id,preparation_lease_expires_at
+SELECT session_id,operation_fingerprint,state,run_id,preparation_lease_expires_at,preparation_attempt
 FROM turn_admission_intents
 WHERE tenant_id=$1::uuid AND request_id=$2
 FOR UPDATE
@@ -3240,6 +3614,13 @@ function cancelledAdmissionConflict(): ConflictException {
   return new ConflictException({
     code: "turn_submission_cancelled",
     message: "This turn submission was cancelled before admission.",
+  });
+}
+
+function supersededAdmissionConflict(): ConflictException {
+  return new ConflictException({
+    code: "turn_admission_superseded",
+    message: "A newer attempt owns this turn admission preparation.",
   });
 }
 

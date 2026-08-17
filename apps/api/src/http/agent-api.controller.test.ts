@@ -204,6 +204,11 @@ describe("AgentApiController", () => {
       runId: "turn_bounded_preparation",
       sessionId: input.sessionId,
     }));
+    const beginAdmission = vi.fn(async (input: Parameters<DurableTurnService["beginAdmission"]>[0]) => ({
+      runId: null,
+      sessionId: input.sessionId,
+      attemptGeneration: 7,
+    }));
     const repository = new InMemoryModelGovernanceRepository(false);
     await repository.upsertPolicy({
       tenantId: SELF_HOST_TENANT_ID,
@@ -217,7 +222,7 @@ describe("AgentApiController", () => {
       contextAssembly,
       modelGovernance: new ModelGovernanceService(repository),
       runtimeConfig: chatRuntimeConfig(),
-      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+      durableTurns: { enabled: true, replayAdmission: async () => null, beginAdmission, admit },
     });
     const created = await request(app.getHttpServer())
       .post("/v1/tasks")
@@ -240,6 +245,7 @@ describe("AgentApiController", () => {
     expect(contextAssembly.assemble).toHaveBeenCalledOnce();
     expect(contextAssembly.portableCheckpoint).toHaveBeenCalledOnce();
     expect(admit).toHaveBeenCalledWith(expect.objectContaining({
+      attemptGeneration: 7,
       groundingContext: expect.objectContaining({
         retrieval: expect.objectContaining({ degradedReason: "context_timeout" }),
       }),
@@ -249,6 +255,67 @@ describe("AgentApiController", () => {
       }),
     }));
     expect(admit.mock.calls[0]?.[0].runtimeRequest).not.toHaveProperty("portableCheckpoint");
+  });
+
+  it("does not settle the winning budget reservation when an admission generation is superseded", async () => {
+    const budget = new BudgetService({
+      repository: new InMemoryBudgetRepository(),
+      hotCounters: new InMemoryBudgetHotCounters(),
+      enabled: true,
+    });
+    const reserve = vi.spyOn(budget, "reserve");
+    const reconcile = vi.spyOn(budget, "reconcile");
+    const failAdmission = vi.fn(async () => undefined);
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    app = await createApp(fakeSessionHost(), {
+      budget,
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: chatRuntimeConfig(),
+      durableTurns: {
+        enabled: true,
+        replayAdmission: async () => null,
+        beginAdmission: async (input) => ({
+          runId: null,
+          sessionId: input.sessionId,
+          attemptGeneration: 7,
+        }),
+        admit: async () => {
+          throw new ConflictException({
+            code: "turn_admission_superseded",
+            message: "A newer admission attempt owns this request.",
+          });
+        },
+        failAdmission,
+      },
+    });
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Superseded admission" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({ input: "Run once", workspacePath: "/workspace" })
+      .expect(409)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({ code: "turn_admission_superseded" });
+      });
+
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(failAdmission).toHaveBeenCalledWith(expect.objectContaining({
+      attemptGeneration: 7,
+    }));
   });
 
   it("observes concurrent admission failures immediately and records the failed attempt", async () => {
@@ -1899,6 +1966,7 @@ type CreateAppOptions = {
     replayAdmission: (input: DurableTurnAdmissionReplay) => Promise<{ runId: string; sessionId: string } | null>;
     beginAdmission?: DurableTurnService["beginAdmission"];
     admit: (input: DurableTurnAdmission) => Promise<{ runId: string; sessionId: string }>;
+    failAdmission?: DurableTurnService["failAdmission"];
     cancel?: DurableTurnService["cancel"];
     state?: DurableTurnService["state"];
     taskActivity?: DurableTurnService["taskActivity"];

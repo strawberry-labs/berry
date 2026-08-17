@@ -107,6 +107,33 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(claim?.sql).toContain("OR attempts < LEAST(100,GREATEST(1,COALESCE($6::integer,max_attempts,8)))");
   });
 
+  it("does not reset a task projection when another session still has an active run", async () => {
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { statements.push(sql); },
+      query: async <T>(sql: string) => {
+        statements.push(sql);
+        if (sql.includes("SELECT request_id,session_id FROM transitioned")) {
+          return [{ request_id: "model_expired", session_id: runId }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: vi.fn() as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, { tenantId, workerId: "worker-test" });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+
+    const projection = statements.find((sql) =>
+      sql.includes("UPDATE tasks t") && sql.includes("preparation_lease_expired")
+    );
+    expect(projection).toContain("r.task_id=t.id");
+    expect(projection).not.toContain("r.session_id=s.id");
+  });
+
   it("does not requeue terminal finalization while artifact verification is pending or failed", async () => {
     const statements: string[] = [];
     const executor: SqlExecutor = {

@@ -453,6 +453,15 @@ function logTurnAdmission(
   })));
 }
 
+function isSupersededAdmission(error: unknown): boolean {
+  if (!(error instanceof HttpException)) return false;
+  const response = error.getResponse();
+  return response !== null
+    && typeof response === "object"
+    && "code" in response
+    && response.code === "turn_admission_superseded";
+}
+
 const SteerTurnRequestSchema = z.object({
   messageId: z.string().uuid(),
   input: z.string().trim().min(1),
@@ -1525,6 +1534,7 @@ export class AgentApiController {
     const userId = httpRequest.auth!.user.id;
     const requestId = `model_${request.operationId ?? request.requestMessageId ?? randomUUID()}`;
     const operationFingerprint = turnAdmissionFingerprint(request);
+    let admissionAttemptGeneration: number | undefined;
     if (this.durableTurns.enabled) {
       const replayed = await this.durableTurns.replayAdmission({
         tenantId,
@@ -1545,10 +1555,11 @@ export class AgentApiController {
         requestId,
         operationFingerprint,
       });
-      if (preparing) {
+      if (preparing?.runId) {
         logTurnAdmission("replayed", preparing.runId, Date.now() - admissionStartedAt);
         return { turnId: preparing.runId, sessionId };
       }
+      admissionAttemptGeneration = preparing?.runId === null ? preparing.attemptGeneration : undefined;
     }
     if (request.continueInterruptedTurn) {
       await this.assertContinuableTurn(sessionId);
@@ -1931,6 +1942,7 @@ export class AgentApiController {
           sessionId,
           requestId,
           operationFingerprint,
+          ...(admissionAttemptGeneration !== undefined ? { attemptGeneration: admissionAttemptGeneration } : {}),
           budgetReservationRequired,
           ...(request.requestMessageId ? { requestMessageId: request.requestMessageId } : {}),
           ...(request.replaceFromMessageId ? { replaceFromMessageId: request.replaceFromMessageId } : {}),
@@ -1944,11 +1956,17 @@ export class AgentApiController {
         logTurnAdmission("admitted", admitted.runId, Date.now() - admissionStartedAt);
         return { turnId: admitted.runId, sessionId };
       } catch (error) {
-        await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
+        // Admission retries share one idempotent budget reservation. A stale
+        // generation must not settle the reservation that the current attempt
+        // may still need to consume.
+        if (!isSupersededAdmission(error)) {
+          await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
+        }
         await this.durableTurns.failAdmission?.({
           tenantId,
           sessionId,
           requestId,
+          ...(admissionAttemptGeneration !== undefined ? { attemptGeneration: admissionAttemptGeneration } : {}),
           reasonCode: error instanceof Error ? error.name : "admission_failed",
         }).catch(() => undefined);
         throw error;

@@ -347,7 +347,7 @@ WHERE s.tenant_id=$1::uuid
   AND t.status IN ('queued','running')
   AND NOT EXISTS (
     SELECT 1 FROM turn_runs r
-    WHERE r.tenant_id=t.tenant_id AND r.session_id=s.id
+    WHERE r.tenant_id=t.tenant_id AND r.task_id=t.id
       AND r.state NOT IN ('completed','failed','cancelled','recovery_required')
   )
       `.trim(),

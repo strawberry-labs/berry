@@ -2917,6 +2917,57 @@ describe("durable turn runner", () => {
     expect(sessionProjection?.params[5]).toBe(4);
   });
 
+  it("settles a reopened sandboxless finalization as skipped on the next terminal commit", async () => {
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+          return [{ state: "calling_model", cancelled_at: null }] as T[];
+        }
+        if (sql.includes("SELECT COALESCE(MAX(sequence),0) AS sequence FROM turn_events")) {
+          return [{ sequence: 0 }] as T[];
+        }
+        if (sql.includes("COUNT(*) FILTER (WHERE event_type='usage') AS usage_event_count")) {
+          return [{
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_creation_tokens_1h: 0,
+            cache_creation_tokens_5m: 0,
+            usage_event_count: 0,
+            priced_event_count: 0,
+            estimated_pricing_count: 0,
+            exact_cost_micros: "0",
+          }] as T[];
+        }
+        if (sql.includes("FROM turn_events") && sql.includes("event_type='usage'")) return [] as T[];
+        if (sql.includes("budget_reservations")) return [] as T[];
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql: string) => {
+        statements.push(sql);
+      },
+    };
+    const current = snapshot("calling_model", [admittedStep()]);
+    current.leaseOwner = "worker-sandboxless-recovery";
+    current.sandboxId = null;
+
+    await new SqlDurableTurnRepository(executor).commit(current, {
+      expectedState: "calling_model",
+      nextState: "failed",
+      nextAction: null,
+      error: "terminal failure",
+      taskStatus: "failed",
+    });
+
+    const finalization = statements.find((sql) => sql.startsWith("INSERT INTO turn_finalizations"));
+    expect(finalization).toContain("WHEN EXCLUDED.status='skipped' THEN 'skipped'");
+    expect(finalization).toContain("WHEN EXCLUDED.status='skipped' THEN EXCLUDED.completed_at");
+    expect(finalization).toContain("manifest=CASE WHEN EXCLUDED.status='skipped' THEN NULL");
+    expect(finalization).toContain("item_count=CASE WHEN EXCLUDED.status='skipped' THEN 0");
+  });
+
   it("treats a duplicate step idempotency key as a replay instead of failing the turn", async () => {
     const persistedId = randomUUID();
     const replayId = randomUUID();
