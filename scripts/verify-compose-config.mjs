@@ -183,6 +183,7 @@ assertContains("deploy/server-deploy.sh", serverDeploy, [
   "BERRY_DEPLOY_EXPECTED_DOMAIN",
   'export BERRY_BUILD_REVISION="$target_ref"',
   "not reachable from origin/main",
+  'git -c "safe.directory=$repo_dir" "$@"',
 ]);
 assertContains("deploy/aws/deploy-application.sh", ssmApplicationDeploy, [
   "BERRY_AWS_DOMAIN",
@@ -193,7 +194,7 @@ assertContains("deploy/aws/deploy-application.sh", ssmApplicationDeploy, [
   "describe-instance-information",
   "dig +short A",
   "BERRY_DEPLOY_EXPECTED_DOMAIN",
-  "git merge-base --is-ancestor",
+  "git -c safe.directory=/opt/berry merge-base --is-ancestor",
   "AWS-RunShellScript",
 ]);
 assertContains("deploy/server-deploy.sh", serverDeploy, [

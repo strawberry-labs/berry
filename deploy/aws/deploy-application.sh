@@ -99,12 +99,12 @@ parameters="$(jq -cn --arg domain "$domain" --arg commit "$commit" '{commands: [
   "test \"$(stat -c %a /opt/berry/deploy/.env.production)\" = 600",
   ("test \"$(sed -n " + ("s/^BERRY_DOMAIN=//p" | @sh) + " /opt/berry/deploy/.env.production | tail -n 1)\" = " + ($domain | @sh)),
   "cd /opt/berry",
-  "git fetch --prune origin main",
-  ("git cat-file -e " + (($commit + "^{commit}") | @sh)),
-  ("git merge-base --is-ancestor " + ($commit | @sh) + " origin/main"),
+  "git -c safe.directory=/opt/berry fetch --prune origin main",
+  ("git -c safe.directory=/opt/berry cat-file -e " + (($commit + "^{commit}") | @sh)),
+  ("git -c safe.directory=/opt/berry merge-base --is-ancestor " + ($commit | @sh) + " origin/main"),
   "launcher=$(mktemp)",
   "trap \"rm -f -- $launcher\" EXIT INT TERM",
-  ("git show " + (($commit + ":deploy/server-deploy.sh") | @sh) + " > \"$launcher\""),
+  ("git -c safe.directory=/opt/berry show " + (($commit + ":deploy/server-deploy.sh") | @sh) + " > \"$launcher\""),
   "chmod 700 \"$launcher\"",
   ("BERRY_DEPLOY_REPO_DIR=/opt/berry BERRY_DEPLOY_EXPECTED_DOMAIN=" + ($domain | @sh) + " \"$launcher\" " + ($commit | @sh))
 ]}')"

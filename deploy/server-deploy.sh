@@ -49,9 +49,13 @@ fi
 cd "$repo_dir"
 started_at="$(date +%s)"
 
-git fetch --prune origin main
+git_repo() {
+  git -c "safe.directory=$repo_dir" "$@"
+}
+
+git_repo fetch --prune origin main
 if [ "$requested_ref" = "origin/main" ]; then
-  target_ref="$(git rev-parse origin/main)"
+  target_ref="$(git_repo rev-parse origin/main)"
 else
   case "$requested_ref" in
     *[!0-9a-f]*|'')
@@ -64,16 +68,16 @@ else
     exit 1
   fi
   target_ref="$requested_ref"
-  git cat-file -e "$target_ref^{commit}"
+  git_repo cat-file -e "$target_ref^{commit}"
 fi
-if ! git merge-base --is-ancestor "$target_ref" origin/main; then
+if ! git_repo merge-base --is-ancestor "$target_ref" origin/main; then
   echo "Refusing to deploy a commit that is not reachable from origin/main." >&2
   exit 1
 fi
 
 deployed_ref="$(sed -n '1p' .deployment-commit 2>/dev/null || true)"
 case "$deployed_ref" in
-  *[!0-9a-f]*|'') deployed_ref="$(git rev-parse HEAD)" ;;
+  *[!0-9a-f]*|'') deployed_ref="$(git_repo rev-parse HEAD)" ;;
 esac
 
 if [ "$deployed_ref" = "$target_ref" ]; then
@@ -81,13 +85,13 @@ if [ "$deployed_ref" = "$target_ref" ]; then
   exit 0
 fi
 
-if ! git merge-base --is-ancestor "$deployed_ref" "$target_ref"; then
+if ! git_repo merge-base --is-ancestor "$deployed_ref" "$target_ref"; then
   echo "Refusing a non-fast-forward production deployment." >&2
   exit 1
 fi
 
-changed_files="$(git diff --name-only "$deployed_ref" "$target_ref")"
-git reset --hard "$target_ref"
+changed_files="$(git_repo diff --name-only "$deployed_ref" "$target_ref")"
+git_repo reset --hard "$target_ref"
 export BERRY_BUILD_REVISION="$target_ref"
 
 storage_mode="$(sed -n 's/^BERRY_OBJECT_STORAGE_MODE=//p' "$env_file" | tail -n 1)"
