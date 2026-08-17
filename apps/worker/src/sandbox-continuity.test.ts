@@ -2088,6 +2088,106 @@ describe("SandboxContinuityManager", () => {
     expect(versions).toEqual([undefined, undefined, "version-7"]);
   });
 
+  it("selects an archived snapshot only from the target run's proven prior branch", async () => {
+    let continuitySql = "";
+    const repository = new SqlSandboxSnapshotRepository({
+      execute: vi.fn(),
+      query: vi.fn(async (sql: string) => {
+        continuitySql = sql;
+        return [{
+          sandbox_provider: null,
+          sandbox_id: null,
+          snapshot_id: "00000000-0000-7000-8000-000000000030",
+          object_key: "sandbox-snapshots/tenant/prior.json",
+          content_hash: "snapshot-digest",
+          sequence: 4,
+          snapshot_created_at: "2026-08-17T09:59:59.000Z",
+          snapshot_session_leaf_id: "prior-request-entry",
+          snapshot_branch_compatible: true,
+          target_created_at: "2026-08-17T10:00:00.000Z",
+        }];
+      }),
+    } as never);
+
+    await expect(repository.continuity(
+      "00000000-0000-7000-8000-000000000002",
+      "00000000-0000-7000-8000-000000000001",
+    )).resolves.toMatchObject({
+      sandboxId: null,
+      snapshot: {
+        id: "00000000-0000-7000-8000-000000000030",
+        sequence: 4,
+      },
+    });
+
+    expect(continuitySql).toContain("WITH RECURSIVE current_run");
+    expect(continuitySql).toContain("entry.entry_id=current_run_row.request_message_id::text");
+    expect(continuitySql).toContain("s.created_at<current_run_row.created_at");
+    expect(continuitySql).toContain("s.session_leaf_id IS NOT NULL");
+    expect(continuitySql).toContain("branch_entry.entry_id=s.session_leaf_id");
+  });
+
+  it.each([
+    ["a sibling branch", { prior_created_at: "2026-08-17T09:59:59.000Z", prior_branch_compatible: false }],
+    ["the same timestamp", { prior_created_at: "2026-08-17T10:00:00.000Z", prior_branch_compatible: true }],
+  ])("does not reuse a live sandbox from %s", async (_reason, prior) => {
+    let continuitySql = "";
+    const repository = new SqlSandboxSnapshotRepository({
+      execute: vi.fn(),
+      query: vi.fn(async (sql: string) => {
+        continuitySql = sql;
+        return [{
+          sandbox_provider: "e2b",
+          sandbox_id: "sandbox-from-unproven-run",
+          ...prior,
+          snapshot_id: null,
+          object_key: null,
+          content_hash: null,
+          sequence: null,
+          snapshot_created_at: null,
+          snapshot_session_leaf_id: null,
+          snapshot_branch_compatible: null,
+          target_created_at: "2026-08-17T10:00:00.000Z",
+        }];
+      }),
+    } as never);
+
+    await expect(repository.continuity(
+      "00000000-0000-7000-8000-000000000002",
+      "00000000-0000-7000-8000-000000000001",
+    )).resolves.toBeNull();
+
+    expect(continuitySql).toContain("r.created_at<current_run_row.created_at");
+    expect(continuitySql).toContain("branch_entry.run_id=r.id");
+  });
+
+  it.each([
+    ["branch membership is unproven", { snapshot_branch_compatible: false }],
+    ["the snapshot is not strictly older", { snapshot_created_at: "2026-08-17T10:00:00.000Z" }],
+  ])("fails closed when %s", async (_reason, override) => {
+    const repository = new SqlSandboxSnapshotRepository({
+      execute: vi.fn(),
+      query: vi.fn(async () => [{
+        sandbox_provider: null,
+        sandbox_id: null,
+        snapshot_id: "00000000-0000-7000-8000-000000000030",
+        object_key: "sandbox-snapshots/tenant/prior.json",
+        content_hash: "snapshot-digest",
+        sequence: 4,
+        snapshot_created_at: "2026-08-17T09:59:59.000Z",
+        snapshot_session_leaf_id: "prior-request-entry",
+        snapshot_branch_compatible: true,
+        target_created_at: "2026-08-17T10:00:00.000Z",
+        ...override,
+      }]),
+    } as never);
+
+    await expect(repository.continuity(
+      "00000000-0000-7000-8000-000000000002",
+      "00000000-0000-7000-8000-000000000001",
+    )).resolves.toBeNull();
+  });
+
   it("stages completed uploads and storage-ready generated files", async () => {
     let query = "";
     const repository = new SqlSandboxSnapshotRepository({
@@ -2108,6 +2208,7 @@ describe("SandboxContinuityManager", () => {
     expect(query).toContain("a.turn_id=r.id::text");
     expect(query).toContain("f.origin IN ('sandbox_output','image_generation','browser_capture','legacy_artifact','connector_import')");
     expect(query).toContain("f.origin='connector_import' AND f.status='processing'");
+    expect(query).toContain("blob.verification_status='verified'");
   });
 
   it("loads previously published output paths and hashes for session deduplication", async () => {
@@ -2127,6 +2228,73 @@ describe("SandboxContinuityManager", () => {
     expect(query).toContain("a.session_id=$2::uuid");
     expect(query).toContain("f.metadata->>'sourcePath'");
     expect(query).toContain("COALESCE(blob.sha256, f.sha256) IS NOT NULL");
+  });
+
+  it("keeps an artifact operation staged until its backing blob is verified", async () => {
+    const execute = vi.fn(async (_sql: string, _params: readonly unknown[] = []) => undefined);
+    const repository = new SqlSandboxSnapshotRepository({
+      query: vi.fn(async () => []),
+      execute,
+    } as never);
+
+    await repository.completeArtifactOperation({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      operationKey: "run:artifact:path",
+      fileId: "00000000-0000-7000-8000-000000000020",
+    });
+
+    const [sql] = execute.mock.calls[0] ?? [];
+    expect(sql).toContain("WHEN blob.verification_status='verified' THEN 'complete'");
+    expect(sql).toContain("ELSE 'staged'");
+    expect(sql).toContain("WHEN blob.verification_status='failed' THEN 'failed'");
+    expect(sql).toContain("ELSE 'pending'");
+  });
+
+  it("records partial finalization while any artifact verification remains unsettled", async () => {
+    const queries: string[] = [];
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const repository = new SqlSandboxSnapshotRepository({
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        return [{
+          id: "00000000-0000-7000-8000-000000000040",
+          status: "partial",
+          item_count: 1,
+          completed_count: 0,
+          failed_count: 0,
+          last_error: null,
+        }];
+      }),
+      execute: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+        executions.push({ sql, params });
+      }),
+    } as never);
+
+    await repository.finishFinalization({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      sessionId: "00000000-0000-7000-8000-000000000004",
+      owner: "terminal-finalizer:test",
+      operationKey: "run:finalization",
+      status: "complete",
+      itemCount: 1,
+      completedCount: 1,
+      failedCount: 0,
+      manifest: [],
+    });
+
+    expect(queries[0]).toContain("operation.status='complete' AND operation.verification_status='verified'");
+    expect(queries[0]).toContain("ELSE 'partial'");
+    expect(queries[0]).toContain("completed_count+counts.failed_count>=counts.item_count");
+    const finalizationEvent = executions.find(({ sql }) => sql.includes("INSERT INTO turn_events"));
+    expect(JSON.parse(String(finalizationEvent?.params[4]))).toMatchObject({
+      kind: "finalization.end",
+      status: "partial",
+      itemCount: 1,
+      completedCount: 0,
+      failedCount: 0,
+    });
   });
 
   it("fails closed when a stable sandbox object key belongs to another user", async () => {

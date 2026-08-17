@@ -82,6 +82,44 @@ describe("SqlFileBlobProcessor verification", () => {
     expect(winnerLookup?.sql).toContain("WHERE tenant_id = $1::uuid");
   });
 
+  it("quarantines same-size digest mismatch and converges its partial finalization to an error event", async () => {
+    const expectedBody = Buffer.from("berry-good");
+    const alteredBody = Buffer.from("berry-evil");
+    expect(alteredBody).toHaveLength(expectedBody.length);
+    const expectedSha256 = createHash("sha256").update(expectedBody).digest("hex");
+    const observedSha256 = createHash("sha256").update(alteredBody).digest("hex");
+    const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor = testExecutor(async <T>(sql: string) => sql.includes("SELECT * FROM file_blobs")
+      ? [blob({
+          size_bytes: alteredBody.length,
+          metadata: { expectedSha256, source: "durable-sandbox" },
+        })] as T[]
+      : [] as T[], calls);
+    const processor = new SqlFileBlobProcessor(executor, {
+      send: vi.fn(async () => ({ Body: asyncBody(alteredBody) })),
+    } as never);
+
+    await expect(processor.verify({ tenantId, blobId })).rejects.toThrow(
+      `SHA-256 mismatch: expected ${expectedSha256}, received ${observedSha256}`,
+    );
+
+    expect(calls.some((call) => call.sql.includes("SET sha256 = $3, verification_status = 'verified'"))).toBe(false);
+    expect(calls.some((call) => call.sql.includes("SET status = 'quarantined'")
+      && call.params[3] === observedSha256)).toBe(true);
+    const failedOperation = calls.find((call) => call.sql.includes("UPDATE artifact_operations operation"));
+    expect(failedOperation?.params).toEqual([tenantId, blobId, "failed", "FileBlobIntegrityError"]);
+    const reconciledFinalization = calls.find((call) => call.sql.includes("UPDATE turn_finalizations finalization"));
+    expect(reconciledFinalization?.sql).toContain("WHEN counts.failed_count");
+    expect(reconciledFinalization?.sql).toContain("ELSE 'partial'");
+    const finalizationError = calls.find((call) => call.sql.includes("'finalization.error'")
+      && call.sql.includes("INSERT INTO turn_events"));
+    expect(finalizationError?.params).toEqual([tenantId, blobId, "FileBlobIntegrityError"]);
+    expect(finalizationError?.sql).toContain("finalization.status='failed'");
+    expect(finalizationError?.sql).toContain("event.payload->>'operationKey'=failed.operation_key");
+    expect(calls.some((call) => call.sql.includes("file.verification_failed")
+      && call.params.includes(true))).toBe(true);
+  });
+
   it("marks verification failed when streamed bytes do not match the stored size", async () => {
     const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor = testExecutor(async <T>(sql: string) => sql.includes("SELECT * FROM file_blobs")

@@ -65,6 +65,71 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(statements.some((sql) => sql.includes("dead_lettered_at") && sql.includes("completed_at = COALESCE"))).toBe(false);
   });
 
+  it("dead-letters an expired delivery receipt at max attempts before it can be reclaimed", async () => {
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    let deadLettered = false;
+    const exhausted = {
+      id: outboxId,
+      tenant_id: tenantId,
+      event_type: "file.verify-blob",
+      payload: { tenantId, blobId: runId },
+      attempts: 3,
+      max_attempts: 3,
+      lease_epoch: 3,
+    };
+    const executor: SqlExecutor = {
+      execute: async (sql, params = []) => {
+        statements.push({ sql, params });
+        if (sql.includes("Worker delivery receipt expired after max attempts")) deadLettered = true;
+      },
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        statements.push({ sql, params });
+        if (sql.includes("RETURNING outbox.id") && !deadLettered) return [exhausted] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const enqueue = vi.fn();
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: enqueue as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, { tenantId, workerId: "worker-test" });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+
+    expect(deadLettered).toBe(true);
+    expect(enqueue).not.toHaveBeenCalled();
+    const deadLetter = statements.find(({ sql }) => sql.includes("Worker delivery receipt expired after max attempts"));
+    expect(deadLetter?.params).toEqual([tenantId, null]);
+    expect(deadLetter?.sql).toContain("dead_lettered_at=COALESCE(dead_lettered_at,now())");
+    expect(deadLetter?.sql).toContain("attempts>=LEAST(100,GREATEST(1,COALESCE($2::integer,max_attempts,8)))");
+    const claim = statements.find(({ sql }) => sql.includes("RETURNING outbox.id"));
+    expect(claim?.sql).toContain("OR attempts < LEAST(100,GREATEST(1,COALESCE($6::integer,max_attempts,8)))");
+  });
+
+  it("does not requeue terminal finalization while artifact verification is pending or failed", async () => {
+    const statements: string[] = [];
+    const executor: SqlExecutor = {
+      execute: async (sql) => { statements.push(sql); },
+      query: async <T>(): Promise<readonly T[]> => [],
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: vi.fn() as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-test",
+      enableTerminalFinalization: true,
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(0);
+
+    const finalization = statements.find((sql) => sql.includes(":snapshot:finalization:"));
+    expect(finalization).toContain("FROM artifact_operations operation");
+    expect(finalization).toContain("operation.verification_status IN ('pending','failed')");
+  });
+
   it("propagates worker role/revision and immutable lifecycle timestamps into dispatch telemetry", async () => {
     const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executions: Array<{ sql: string; params: readonly unknown[] }> = [];

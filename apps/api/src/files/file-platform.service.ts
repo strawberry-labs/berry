@@ -81,6 +81,7 @@ type FileRow = {
   resolved_sha256?: string | null;
   resolved_etag?: string | null;
   resolved_object_version_id?: string | null;
+  resolved_verification_status?: "unverified" | "verifying" | "verified" | "failed" | "pending_delete" | "deleted" | null;
   task_ids?: string[] | null;
   roles?: Array<"input" | "output" | "reference"> | null;
   workspace_id?: string | null;
@@ -97,7 +98,8 @@ const FILE_PHYSICAL_COLUMNS = `
   CASE WHEN f.blob_id IS NOT NULL THEN blob.size_bytes ELSE f.size_bytes END AS resolved_size_bytes,
   CASE WHEN f.blob_id IS NOT NULL THEN blob.sha256 ELSE f.sha256 END AS resolved_sha256,
   CASE WHEN f.blob_id IS NOT NULL THEN blob.etag ELSE f.etag END AS resolved_etag,
-  CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END AS resolved_object_version_id
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.object_version_id ELSE f.object_version_id END AS resolved_object_version_id,
+  CASE WHEN f.blob_id IS NOT NULL THEN blob.verification_status::text ELSE NULL END AS resolved_verification_status
 `;
 
 type UploadRow = {
@@ -229,7 +231,8 @@ export class FilePlatformService {
         LIMIT 1
       `, [tenantId, objectKey]);
       if (!registered) return false;
-      await this.requireAccessibleFile(executor, tenantId, userId, registered.id);
+      const file = await this.requireAccessibleFile(executor, tenantId, userId, registered.id);
+      requireVerifiedStorage(file, "File content is unavailable");
       return true;
     });
   }
@@ -244,6 +247,7 @@ export class FilePlatformService {
     const config = this.requireConfig();
     const file = await this.get(tenantId, userId, fileId);
     if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
+    requireVerifiedStorage(file, "File is not available");
     const declaredBytes = Number(file.size_bytes);
     if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0 || declaredBytes > maxBytes) {
       throw new BadRequestException(`File exceeds the ${maxBytes} byte limit`);
@@ -759,6 +763,7 @@ export class FilePlatformService {
       }
       const file = await this.get(tenantId, userId, fileId);
       if (file.status !== "available" && file.status !== "processing") throw new BadRequestException(`File ${file.display_name} is not available`);
+      if (!hasVerifiedStorage(file)) throw new BadRequestException(`File ${file.display_name} is still being verified`);
       const remoteUrl = await getSignedUrl(config.presignClient, new GetObjectCommand({
         Bucket: file.bucket,
         Key: file.object_key,
@@ -1087,6 +1092,7 @@ export class FilePlatformService {
     const config = this.requireConfig();
     const file = await this.get(tenantId, userId, fileId);
     if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
+    requireVerifiedStorage(file, "File is not available");
     const etag = contentEntityTag(file);
     response.setHeader("ETag", etag);
     response.setHeader("Vary", "Authorization, Cookie");
@@ -1173,7 +1179,9 @@ export class FilePlatformService {
         LIMIT 1
       `, [tenantId, fileId]);
       if (!row || (row.status !== "available" && row.status !== "processing")) throw new NotFoundException("Branding asset not found");
-      return resolvePhysicalFile(row);
+      const file = resolvePhysicalFile(row);
+      requireVerifiedStorage(file, "Branding asset not found");
+      return file;
     });
     assertPublicBrandingFile(file, kind);
     const etag = contentEntityTag(file);
@@ -1836,6 +1844,14 @@ function setPublicBrandingHeaders(response: ServerResponse, etag: string): void 
   response.setHeader("Cache-Control", PUBLIC_IMMUTABLE_FILE_CACHE_CONTROL);
   response.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   response.setHeader("X-Content-Type-Options", "nosniff");
+}
+
+function hasVerifiedStorage(file: FileRow): boolean {
+  return !file.blob_id || file.resolved_verification_status === "verified";
+}
+
+function requireVerifiedStorage(file: FileRow, message: string): void {
+  if (!hasVerifiedStorage(file)) throw new NotFoundException(message);
 }
 
 function resolvePhysicalFile(row: FileRow): FileRow {

@@ -31,6 +31,13 @@ type BlobDeleteClaim = {
   cancelled?: boolean;
 };
 
+class FileBlobIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FileBlobIntegrityError";
+  }
+}
+
 export interface FileBlobProcessor {
   verify(payload: FileBlobJobPayload): Promise<{ status: "verified" | "deduplicated" | "skipped"; sha256?: string }>;
   delete(payload: FileDeleteBlobJobPayload): Promise<{ deleted: number; cancelled?: boolean }>;
@@ -84,7 +91,7 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
     });
     if (!claimed) return { status: "skipped" };
 
-    let digest: string;
+    let digest: string | undefined;
     let byteCount = 0;
     try {
       const object = await this.client.send(new GetObjectCommand({
@@ -101,38 +108,21 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
       }
       digest = hash.digest("hex");
       if (byteCount !== Number(claimed.size_bytes)) {
-        throw new Error(`Stored file blob size mismatch: expected ${claimed.size_bytes}, received ${byteCount}`);
+        throw new FileBlobIntegrityError(`Stored file blob size mismatch: expected ${claimed.size_bytes}, received ${byteCount}`);
+      }
+      const expectedSha256 = immutableExpectedSha256(claimed);
+      if (expectedSha256 && digest !== expectedSha256) {
+        throw new FileBlobIntegrityError(`Stored file blob SHA-256 mismatch: expected ${expectedSha256}, received ${digest}`);
+      }
+      try {
+        return await this.finalizeVerification(payload, digest, expectedSha256);
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        return await this.finalizeVerification(payload, digest, expectedSha256, true);
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000);
-      await this.withTenant(payload.tenantId, async (executor) => {
-        await executor.execute(`
-          UPDATE file_blobs
-          SET verification_status = 'failed',
-              metadata = metadata || jsonb_build_object('verificationError', $3::text),
-              updated_at = now()
-          WHERE tenant_id = $1::uuid AND id = $2::uuid
-            AND verification_status = 'verifying'
-        `, [payload.tenantId, payload.blobId, errorMessage]);
-        await executor.execute(`
-          INSERT INTO file_lifecycle_events (
-            tenant_id,blob_id,event_type,dedupe_key,payload
-          ) VALUES (
-            $1::uuid,$2::uuid,'file.verification_failed',
-            'file.verification_failed:' || $2::text,
-            jsonb_build_object('blobId',$2::text,'error',$3::text)
-          )
-          ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
-        `, [payload.tenantId, payload.blobId, errorMessage]);
-      });
+      await this.recordVerificationFailure(payload, error, digest);
       throw error;
-    }
-
-    try {
-      return await this.finalizeVerification(payload, digest);
-    } catch (error) {
-      if (!isUniqueViolation(error)) throw error;
-      return this.finalizeVerification(payload, digest, true);
     }
   }
 
@@ -290,6 +280,7 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
   private async finalizeVerification(
     payload: FileBlobJobPayload,
     digest: string,
+    expectedSha256: string | null,
     afterConflict = false,
   ): Promise<{ status: "verified" | "deduplicated"; sha256: string }> {
     return this.withTenant(payload.tenantId, async (executor) => {
@@ -308,6 +299,13 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
       if (blob.verification_status === "pending_delete" || blob.verification_status === "deleted") {
         await completeVerificationWatchdog(executor, payload);
         return { status: "deduplicated", sha256: digest };
+      }
+      const currentExpectedSha256 = immutableExpectedSha256(blob);
+      if (currentExpectedSha256 !== expectedSha256) {
+        throw new FileBlobIntegrityError("Stored file blob expected SHA-256 changed during verification");
+      }
+      if (currentExpectedSha256 && digest !== currentExpectedSha256) {
+        throw new FileBlobIntegrityError(`Stored file blob SHA-256 mismatch: expected ${currentExpectedSha256}, received ${digest}`);
       }
       const winners = await executor.query<BlobRow>(`
         SELECT * FROM file_blobs
@@ -328,22 +326,50 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
           WHERE tenant_id = $1::uuid AND id = $2::uuid
         `, [payload.tenantId, payload.blobId, digest]);
         await executor.execute(`
-          UPDATE files SET sha256 = $3, size_bytes = $4, updated_at = now()
+          UPDATE files
+          SET sha256 = COALESCE(sha256, $3), size_bytes = $4,
+              status = CASE
+                WHEN status='quarantined' AND metadata->>'verificationBlobId'=$2::text THEN
+                  CASE metadata->>'verificationPreviousStatus'
+                    WHEN 'scanning' THEN 'scanning'::file_status
+                    WHEN 'processing' THEN 'processing'::file_status
+                    ELSE 'available'::file_status
+                  END
+                ELSE status
+              END,
+              metadata = CASE
+                WHEN metadata->>'verificationBlobId'=$2::text
+                  THEN metadata - 'verificationBlobId' - 'verificationError'
+                    - 'verificationPreviousStatus' - 'verificationObservedSha256'
+                ELSE metadata
+              END,
+              updated_at = now()
           WHERE tenant_id = $1::uuid AND blob_id = $2::uuid
         `, [payload.tenantId, payload.blobId, digest, Number(blob.size_bytes)]);
-        await executor.execute(`
-          UPDATE artifact_operations
-          SET verification_status='verified',updated_at=now()
-          WHERE tenant_id=$1::uuid
-            AND file_id IN (SELECT id FROM files WHERE tenant_id=$1::uuid AND blob_id=$2::uuid)
-        `, [payload.tenantId, payload.blobId]);
+        await settleArtifactVerification(executor, payload.tenantId, payload.blobId, "verified", null);
         await completeVerificationWatchdog(executor, payload);
         return { status: "verified", sha256: digest };
       }
 
       await executor.execute(`
         UPDATE files
-        SET blob_id = $3::uuid, sha256 = $4, size_bytes = $5, updated_at = now()
+        SET blob_id = $3::uuid, sha256 = COALESCE(sha256, $4), size_bytes = $5,
+            status = CASE
+              WHEN status='quarantined' AND metadata->>'verificationBlobId'=$2::text THEN
+                CASE metadata->>'verificationPreviousStatus'
+                  WHEN 'scanning' THEN 'scanning'::file_status
+                  WHEN 'processing' THEN 'processing'::file_status
+                  ELSE 'available'::file_status
+                END
+              ELSE status
+            END,
+            metadata = CASE
+              WHEN metadata->>'verificationBlobId'=$2::text
+                THEN metadata - 'verificationBlobId' - 'verificationError'
+                  - 'verificationPreviousStatus' - 'verificationObservedSha256'
+              ELSE metadata
+            END,
+            updated_at = now()
         WHERE tenant_id = $1::uuid AND blob_id = $2::uuid
       `, [payload.tenantId, payload.blobId, winner.id, digest, Number(winner.size_bytes)]);
       const [scheduled] = await executor.query<{ delete_after: Date | string }>(`
@@ -364,14 +390,61 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
           receipt_due_at = NULL, dead_lettered_at = NULL, error_category = NULL,
           last_error = NULL, updated_at = now()
       `, [payload.tenantId, payload.blobId, `file.delete-blob:${payload.blobId}`, JSON.stringify(payload), new Date(scheduled.delete_after).toISOString()]);
-      await executor.execute(`
-        UPDATE artifact_operations
-        SET verification_status='verified',updated_at=now()
-        WHERE tenant_id=$1::uuid
-          AND file_id IN (SELECT id FROM files WHERE tenant_id=$1::uuid AND blob_id=$2::uuid)
-      `, [payload.tenantId, winner.id]);
+      await settleArtifactVerification(executor, payload.tenantId, payload.blobId, "verified", null);
       await completeVerificationWatchdog(executor, payload);
       return { status: "deduplicated", sha256: digest };
+    });
+  }
+
+  private async recordVerificationFailure(
+    payload: FileBlobJobPayload,
+    error: unknown,
+    observedSha256?: string,
+  ): Promise<void> {
+    const errorMessage = error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000);
+    const errorClass = error instanceof Error ? error.name.slice(0, 128) : "blob_verification_error";
+    const quarantine = error instanceof FileBlobIntegrityError;
+    await this.withTenant(payload.tenantId, async (executor) => {
+      await executor.execute(`
+        UPDATE file_blobs
+        SET verification_status = 'failed',
+            metadata = metadata || jsonb_strip_nulls(jsonb_build_object(
+              'verificationError', $3::text,
+              'verificationObservedSha256', $4::text
+            )),
+            updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND verification_status = 'verifying'
+      `, [payload.tenantId, payload.blobId, errorMessage, observedSha256 ?? null]);
+      if (quarantine) {
+        await executor.execute(`
+          UPDATE files
+          SET status = 'quarantined',
+              metadata = metadata || jsonb_build_object(
+                'verificationBlobId', $2::text,
+                'verificationError', $3::text,
+                'verificationPreviousStatus', COALESCE(metadata->>'verificationPreviousStatus', status::text)
+              ) || jsonb_strip_nulls(jsonb_build_object('verificationObservedSha256', $4::text)),
+              updated_at = now()
+          WHERE tenant_id = $1::uuid AND blob_id = $2::uuid
+            AND deleted_at IS NULL
+            AND status IN ('scanning','processing','available')
+        `, [payload.tenantId, payload.blobId, errorMessage, observedSha256 ?? null]);
+      }
+      await settleArtifactVerification(executor, payload.tenantId, payload.blobId, "failed", errorClass);
+      await executor.execute(`
+        INSERT INTO file_lifecycle_events (
+          tenant_id,blob_id,event_type,dedupe_key,payload
+        ) VALUES (
+          $1::uuid,$2::uuid,'file.verification_failed',
+          'file.verification_failed:' || $2::text,
+          jsonb_strip_nulls(jsonb_build_object(
+            'blobId',$2::text,'error',$3::text,'errorClass',$4::text,
+            'observedSha256',$5::text,'quarantined',$6::boolean
+          ))
+        )
+        ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+      `, [payload.tenantId, payload.blobId, errorMessage, errorClass, observedSha256 ?? null, quarantine]);
     });
   }
 
@@ -381,6 +454,215 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
       return callback(executor);
     };
     return this.executor.transaction ? this.executor.transaction(run) : run(this.executor);
+  }
+}
+
+function immutableExpectedSha256(blob: BlobRow): string | null {
+  const metadataExpected = blob.metadata?.expectedSha256;
+  const candidate = metadataExpected ?? blob.sha256;
+  if (candidate === null || candidate === undefined) return null;
+  if (typeof candidate !== "string" || !/^[0-9a-f]{64}$/i.test(candidate)) {
+    throw new FileBlobIntegrityError("Stored file blob expected SHA-256 is invalid");
+  }
+  return candidate.toLowerCase();
+}
+
+async function settleArtifactVerification(
+  executor: SqlExecutor,
+  tenantId: string,
+  blobId: string,
+  verificationStatus: "verified" | "failed",
+  errorClass: string | null,
+): Promise<void> {
+  await executor.execute(`
+    WITH target_blob AS (
+      SELECT id,bucket,object_key
+      FROM file_blobs
+      WHERE tenant_id=$1::uuid AND id=$2::uuid
+    ), target_files AS (
+      SELECT id FROM files
+      WHERE tenant_id=$1::uuid AND blob_id IN (SELECT id FROM target_blob)
+    )
+    UPDATE artifact_operations operation
+    SET status=CASE WHEN $3::text='verified' THEN 'complete' ELSE 'failed' END,
+        verification_status=$3,
+        error_class=CASE WHEN $3::text='verified' THEN NULL ELSE $4 END,
+        updated_at=now()
+    WHERE operation.tenant_id=$1::uuid
+      AND (
+        operation.file_id IN (SELECT id FROM target_files)
+        OR EXISTS (
+          SELECT 1 FROM target_blob blob
+          WHERE operation.storage_receipt->>'bucket'=blob.bucket
+            AND operation.storage_receipt->>'key'=blob.object_key
+        )
+      )
+  `, [tenantId, blobId, verificationStatus, errorClass]);
+  await executor.execute(`
+    WITH target_blob AS (
+      SELECT id,bucket,object_key
+      FROM file_blobs
+      WHERE tenant_id=$1::uuid AND id=$2::uuid
+    ), target_files AS (
+      SELECT id FROM files
+      WHERE tenant_id=$1::uuid AND blob_id IN (SELECT id FROM target_blob)
+    ), affected AS (
+      SELECT DISTINCT operation.finalization_id
+      FROM artifact_operations operation
+      WHERE operation.tenant_id=$1::uuid
+        AND operation.finalization_id IS NOT NULL
+        AND (
+          operation.file_id IN (SELECT id FROM target_files)
+          OR EXISTS (
+            SELECT 1 FROM target_blob blob
+            WHERE operation.storage_receipt->>'bucket'=blob.bucket
+              AND operation.storage_receipt->>'key'=blob.object_key
+          )
+        )
+    ), counts AS (
+      SELECT operation.finalization_id,
+             COUNT(*)::integer AS item_count,
+             COUNT(*) FILTER (
+               WHERE operation.status='complete' AND operation.verification_status='verified'
+             )::integer AS completed_count,
+             COUNT(*) FILTER (
+               WHERE operation.status='failed' OR operation.verification_status='failed'
+             )::integer AS failed_count
+      FROM artifact_operations operation
+      JOIN affected ON affected.finalization_id=operation.finalization_id
+      WHERE operation.tenant_id=$1::uuid
+      GROUP BY operation.finalization_id
+    )
+    UPDATE turn_finalizations finalization
+    SET item_count=GREATEST(finalization.item_count,counts.item_count),
+        completed_count=counts.completed_count,
+        failed_count=counts.failed_count,
+        status=CASE
+          WHEN finalization.status='running' THEN 'running'
+          WHEN counts.completed_count=GREATEST(finalization.item_count,counts.item_count) THEN 'complete'
+          WHEN counts.failed_count=GREATEST(finalization.item_count,counts.item_count) THEN 'failed'
+          ELSE 'partial'
+        END,
+        last_error=CASE
+          WHEN counts.failed_count>0 THEN COALESCE($3::text,finalization.last_error,'artifact_verification_failed')
+          ELSE NULL
+        END,
+        completed_at=CASE
+          WHEN finalization.status='running' THEN NULL
+          WHEN counts.completed_count+counts.failed_count>=GREATEST(finalization.item_count,counts.item_count) THEN now()
+          ELSE NULL
+        END,
+        lease_owner=CASE WHEN finalization.status='running' THEN finalization.lease_owner ELSE NULL END,
+        lease_expires_at=CASE WHEN finalization.status='running' THEN finalization.lease_expires_at ELSE NULL END,
+        updated_at=now()
+    FROM counts
+    WHERE finalization.tenant_id=$1::uuid AND finalization.id=counts.finalization_id
+  `, [tenantId, blobId, errorClass]);
+  if (verificationStatus === "verified") {
+    await executor.execute(`
+      WITH target_blob AS (
+        SELECT id,bucket,object_key
+        FROM file_blobs
+        WHERE tenant_id=$1::uuid AND id=$2::uuid
+      ), target_files AS (
+        SELECT id FROM files
+        WHERE tenant_id=$1::uuid AND blob_id IN (SELECT id FROM target_blob)
+      ), affected AS (
+        SELECT DISTINCT operation.finalization_id
+        FROM artifact_operations operation
+        WHERE operation.tenant_id=$1::uuid
+          AND operation.finalization_id IS NOT NULL
+          AND (
+            operation.file_id IN (SELECT id FROM target_files)
+            OR EXISTS (
+              SELECT 1 FROM target_blob blob
+              WHERE operation.storage_receipt->>'bucket'=blob.bucket
+                AND operation.storage_receipt->>'key'=blob.object_key
+            )
+          )
+      ), completed AS (
+        SELECT finalization.run_id,run.session_id,finalization.operation_key,
+               finalization.item_count,finalization.completed_count,finalization.failed_count
+        FROM turn_finalizations finalization
+        JOIN affected ON affected.finalization_id=finalization.id
+        JOIN turn_runs run
+          ON run.tenant_id=finalization.tenant_id AND run.id=finalization.run_id
+        WHERE finalization.tenant_id=$1::uuid AND finalization.status='complete'
+      )
+      INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+      SELECT $1::uuid,completed.run_id,completed.session_id,
+             (SELECT COALESCE(MAX(event.sequence),0)+1
+              FROM turn_events event
+              WHERE event.tenant_id=$1::uuid AND event.run_id=completed.run_id),
+             'finalization.end',
+             jsonb_build_object(
+               'kind','finalization.end','runId',completed.run_id::text,
+               'operationKey',completed.operation_key,'status','complete',
+               'itemCount',completed.item_count,
+               'completedCount',completed.completed_count,
+               'failedCount',completed.failed_count
+             )
+      FROM completed
+      WHERE NOT EXISTS (
+        SELECT 1 FROM turn_events event
+        WHERE event.tenant_id=$1::uuid AND event.run_id=completed.run_id
+          AND event.event_type='finalization.end'
+          AND event.payload->>'operationKey'=completed.operation_key
+          AND event.payload->>'status'='complete'
+      )
+      ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
+    `, [tenantId, blobId]);
+  } else {
+    await executor.execute(`
+      WITH target_blob AS (
+        SELECT id,bucket,object_key
+        FROM file_blobs
+        WHERE tenant_id=$1::uuid AND id=$2::uuid
+      ), target_files AS (
+        SELECT id FROM files
+        WHERE tenant_id=$1::uuid AND blob_id IN (SELECT id FROM target_blob)
+      ), affected AS (
+        SELECT DISTINCT operation.finalization_id
+        FROM artifact_operations operation
+        WHERE operation.tenant_id=$1::uuid
+          AND operation.finalization_id IS NOT NULL
+          AND (
+            operation.file_id IN (SELECT id FROM target_files)
+            OR EXISTS (
+              SELECT 1 FROM target_blob blob
+              WHERE operation.storage_receipt->>'bucket'=blob.bucket
+                AND operation.storage_receipt->>'key'=blob.object_key
+            )
+          )
+      ), failed AS (
+        SELECT finalization.run_id,run.session_id,finalization.operation_key,
+               COALESCE(finalization.last_error,$3::text,'artifact_verification_failed') AS error_class
+        FROM turn_finalizations finalization
+        JOIN affected ON affected.finalization_id=finalization.id
+        JOIN turn_runs run
+          ON run.tenant_id=finalization.tenant_id AND run.id=finalization.run_id
+        WHERE finalization.tenant_id=$1::uuid AND finalization.status='failed'
+      )
+      INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+      SELECT $1::uuid,failed.run_id,failed.session_id,
+             (SELECT COALESCE(MAX(event.sequence),0)+1
+              FROM turn_events event
+              WHERE event.tenant_id=$1::uuid AND event.run_id=failed.run_id),
+             'finalization.error',
+             jsonb_build_object(
+               'kind','finalization.error','runId',failed.run_id::text,
+               'operationKey',failed.operation_key,
+               'errorClass',LEFT(failed.error_class,128)
+             )
+      FROM failed
+      WHERE NOT EXISTS (
+        SELECT 1 FROM turn_events event
+        WHERE event.tenant_id=$1::uuid AND event.run_id=failed.run_id
+          AND event.event_type='finalization.error'
+          AND event.payload->>'operationKey'=failed.operation_key
+      )
+      ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
+    `, [tenantId, blobId, errorClass]);
   }
 }
 

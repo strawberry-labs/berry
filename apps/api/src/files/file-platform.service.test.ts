@@ -224,6 +224,7 @@ describe("FilePlatformService.streamContent", () => {
         resolved_sha256: "digest",
         resolved_etag: "etag",
         resolved_object_version_id: "version-7",
+        resolved_verification_status: "verified",
         origin: "image_generation",
         status: "available",
         created_at: new Date(),
@@ -265,6 +266,67 @@ describe("FilePlatformService.streamContent", () => {
     expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "image/png");
     expect(response.setHeader).toHaveBeenCalledWith("Content-Disposition", expect.stringMatching(/^inline;/));
     expect(response.end).toHaveBeenCalledOnce();
+  });
+
+  it("does not serve blob-backed content before storage verification succeeds", async () => {
+    const fileId = "00000000-0000-7000-8000-000000000204";
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => sql.includes("SELECT f.*") ? [{
+        id: fileId,
+        owner_user_id: USER_ID,
+        blob_id: "00000000-0000-7000-8000-000000000205",
+        original_name: "pending.pdf",
+        display_name: "pending.pdf",
+        media_type: "application/pdf",
+        detected_media_type: null,
+        size_bytes: 12,
+        sha256: "immutable-expected-digest",
+        bucket: "berry-test",
+        object_key: "objects/pending.pdf",
+        etag: "etag",
+        object_version_id: "version-1",
+        resolved_bucket: "berry-test",
+        resolved_object_key: "objects/pending.pdf",
+        resolved_size_bytes: 12,
+        resolved_sha256: null,
+        resolved_etag: "etag",
+        resolved_object_version_id: "version-1",
+        resolved_verification_status: "verifying",
+        origin: "sandbox_output",
+        status: "available",
+        created_at: new Date(),
+        updated_at: new Date(),
+        task_ids: [TASK_ID],
+        roles: ["output"],
+      }] as T[] : [] as T[],
+    };
+    const database = {
+      withTenant: async (_tenantId: string, callback: (tenantExecutor: SqlExecutor) => Promise<unknown>) => callback(executor),
+    };
+    const client = { send: vi.fn() };
+    const response = {
+      statusCode: 0,
+      setHeader: vi.fn(),
+      write: vi.fn(() => true),
+      end: vi.fn(),
+    };
+    const service = new FilePlatformService(database as never, {
+      client,
+      presignClient: client,
+      bucket: "berry-test",
+      prefix: "artifacts",
+      maxUploadBytes: 1024,
+      partSize: 5 * 1024 * 1024,
+      presignSeconds: 900,
+    } as never);
+
+    await expect(service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never))
+      .rejects.toThrow("File is not available");
+
+    expect(client.send).not.toHaveBeenCalled();
+    expect(response.write).not.toHaveBeenCalled();
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
   });
 
   it("reauthorizes a protected file after access is revoked", async () => {

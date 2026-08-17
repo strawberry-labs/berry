@@ -148,6 +148,7 @@ export class RuntimeOutboxDispatcher {
         FROM candidates
         ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       `, [tenantId, this.options.terminalCleanupBatchSize ?? 25]));
+        await this.withTenant(tenantId, (executor) => this.deadLetterExhaustedReceipts(executor, tenantId));
         const remaining = (this.options.batchSize ?? 50) - rows.length;
         if (remaining <= 0) break;
         const fairShare = tenantIds.length > 1
@@ -163,6 +164,13 @@ export class RuntimeOutboxDispatcher {
             AND dead_lettered_at IS NULL
             AND COALESCE(receipt_due_at, available_at) <= now()
             AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+            AND (
+              event_type NOT IN (
+                'turn.execute','turn.resume','sandbox.snapshot',
+                'file.delete-object','file.delete-blob','file.verify-blob'
+              )
+              OR attempts < LEAST(100,GREATEST(1,COALESCE($6::integer,max_attempts,8)))
+            )
           ORDER BY CASE priority_class
                      WHEN 'interactive' THEN 0
                      WHEN 'post_turn' THEN 1
@@ -196,6 +204,7 @@ export class RuntimeOutboxDispatcher {
         this.options.workerRole ?? "unknown",
         this.options.sourceRevision ?? "unknown",
         claimLimit,
+        configuredMaxAttempts(this.options.maxAttempts),
       ]));
         rows.push(...claimed);
       }
@@ -459,6 +468,12 @@ WHERE f.tenant_id=$1::uuid AND f.status IN ('pending','failed','partial')
   AND r.state IN ('completed','failed','cancelled','recovery_required')
   AND r.sandbox_id IS NOT NULL
   AND NOT EXISTS (
+    SELECT 1 FROM artifact_operations operation
+    WHERE operation.tenant_id=f.tenant_id
+      AND operation.finalization_id=f.id
+      AND operation.verification_status IN ('pending','failed')
+  )
+  AND NOT EXISTS (
     SELECT 1 FROM runtime_outbox pending
     WHERE pending.tenant_id=f.tenant_id AND pending.aggregate_id=f.run_id::text
       AND pending.event_type='sandbox.snapshot' AND pending.completed_at IS NULL
@@ -470,6 +485,36 @@ SET completed_at=NULL,available_at=now(),lease_owner=NULL,lease_expires_at=NULL,
 WHERE runtime_outbox.completed_at IS NOT NULL
       `.trim(),
       [tenantId],
+    );
+  }
+
+  private async deadLetterExhaustedReceipts(executor: SqlExecutor, tenantId: string): Promise<void> {
+    await executor.execute(
+      `
+UPDATE runtime_outbox
+SET completed_at=COALESCE(completed_at,now()),
+    dead_lettered_at=COALESCE(dead_lettered_at,now()),
+    receipt_due_at=NULL,lease_owner=NULL,lease_expires_at=NULL,
+    error_category=CASE
+      WHEN receipt_due_at IS NOT NULL THEN 'delivery_receipt_expired'
+      ELSE 'max_attempts_exhausted'
+    END,
+    last_error=CASE
+      WHEN receipt_due_at IS NOT NULL THEN 'Worker delivery receipt expired after max attempts'
+      ELSE 'Outbox max attempts exhausted before delivery receipt'
+    END,
+    updated_at=now()
+WHERE tenant_id=$1::uuid
+  AND event_type IN (
+    'turn.execute','turn.resume','sandbox.snapshot',
+    'file.delete-object','file.delete-blob','file.verify-blob'
+  )
+  AND completed_at IS NULL AND dead_lettered_at IS NULL
+  AND COALESCE(receipt_due_at,available_at)<=now()
+  AND (lease_expires_at IS NULL OR lease_expires_at<=now())
+  AND attempts>=LEAST(100,GREATEST(1,COALESCE($2::integer,max_attempts,8)))
+      `.trim(),
+      [tenantId, configuredMaxAttempts(this.options.maxAttempts)],
     );
   }
 
@@ -719,6 +764,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function leaseEpoch(row: Pick<OutboxRow, "lease_epoch">): number {
   const value = Number(row.lease_epoch);
   return Number.isSafeInteger(value) && value >= 0 ? value : 1;
+}
+
+function configuredMaxAttempts(value: number | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.max(1, Math.min(100, Math.trunc(value)));
 }
 
 function safeBigInt(value: unknown): bigint {

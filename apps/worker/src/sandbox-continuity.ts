@@ -1764,31 +1764,69 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
   async continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null> {
     const rows = await this.executor.query<SessionContinuityRow>(
       `
-WITH current_run AS (
-  SELECT tenant_id,id,session_id,created_at
+WITH RECURSIVE current_run AS (
+  SELECT tenant_id,id,session_id,request_message_id,created_at
   FROM turn_runs
   WHERE tenant_id=$1::uuid AND id=$2::uuid
+), target_branch AS (
+  SELECT entry.tenant_id,entry.session_id,entry.entry_id,entry.parent_entry_id,entry.run_id
+  FROM current_run current_run_row
+  JOIN session_entries entry
+    ON entry.tenant_id=current_run_row.tenant_id
+   AND entry.session_id=current_run_row.session_id
+   AND entry.entry_id=current_run_row.request_message_id::text
+  UNION ALL
+  SELECT parent.tenant_id,parent.session_id,parent.entry_id,parent.parent_entry_id,parent.run_id
+  FROM session_entries parent
+  JOIN target_branch child
+    ON child.tenant_id=parent.tenant_id
+   AND child.session_id=parent.session_id
+   AND child.parent_entry_id=parent.entry_id
 )
 SELECT prior.sandbox_provider,prior.sandbox_id,
-       archived.id AS snapshot_id,archived.object_key,archived.content_hash,archived.sequence
+       prior.created_at AS prior_created_at,
+       prior.branch_compatible AS prior_branch_compatible,
+       archived.id AS snapshot_id,archived.object_key,archived.content_hash,archived.sequence,
+       archived.created_at AS snapshot_created_at,
+       archived.session_leaf_id AS snapshot_session_leaf_id,
+       archived.branch_compatible AS snapshot_branch_compatible,
+       current_run_row.created_at AS target_created_at
 FROM current_run current_run_row
 LEFT JOIN LATERAL (
-  SELECT r.sandbox_provider,r.sandbox_id
+  SELECT r.sandbox_provider,r.sandbox_id,r.created_at,
+         EXISTS (
+           SELECT 1 FROM target_branch branch_entry
+           WHERE branch_entry.run_id=r.id
+         ) AS branch_compatible
   FROM turn_runs r
   WHERE r.tenant_id=current_run_row.tenant_id
     AND r.session_id=current_run_row.session_id
     AND r.id<>current_run_row.id
-    AND r.created_at<=current_run_row.created_at
+    AND r.created_at<current_run_row.created_at
     AND r.sandbox_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM target_branch branch_entry
+      WHERE branch_entry.run_id=r.id
+    )
   ORDER BY r.created_at DESC,r.id DESC
   LIMIT 1
 ) prior ON true
 LEFT JOIN LATERAL (
-  SELECT s.id,s.object_key,s.content_hash,s.sequence
+  SELECT s.id,s.object_key,s.content_hash,s.sequence,s.created_at,s.session_leaf_id,
+         EXISTS (
+           SELECT 1 FROM target_branch branch_entry
+           WHERE branch_entry.entry_id=s.session_leaf_id
+         ) AS branch_compatible
   FROM sandbox_snapshots s
   WHERE s.tenant_id=current_run_row.tenant_id
     AND s.session_id=current_run_row.session_id
     AND s.status='complete'
+    AND s.created_at<current_run_row.created_at
+    AND s.session_leaf_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM target_branch branch_entry
+      WHERE branch_entry.entry_id=s.session_leaf_id
+    )
   ORDER BY s.completed_at DESC NULLS LAST,s.sequence DESC
   LIMIT 1
 ) archived ON true
@@ -1797,15 +1835,26 @@ LEFT JOIN LATERAL (
     );
     const row = rows[0];
     if (!row || (!row.sandbox_id && !row.snapshot_id)) return null;
+    const compatibleSandbox = row.sandbox_id
+      && row.prior_branch_compatible === true
+      && isTimestampStrictlyBefore(row.prior_created_at, row.target_created_at);
+    const compatibleSnapshot = row.snapshot_id
+      && row.object_key
+      && row.content_hash
+      && row.sequence !== null
+      && row.snapshot_session_leaf_id
+      && row.snapshot_branch_compatible === true
+      && isTimestampStrictlyBefore(row.snapshot_created_at, row.target_created_at);
+    if (!compatibleSandbox && !compatibleSnapshot) return null;
     return {
-      provider: row.sandbox_provider,
-      sandboxId: row.sandbox_id,
-      snapshot: row.snapshot_id && row.object_key && row.content_hash && row.sequence !== null
+      provider: compatibleSandbox ? row.sandbox_provider : null,
+      sandboxId: compatibleSandbox ? row.sandbox_id : null,
+      snapshot: compatibleSnapshot
         ? mapSnapshot({
-          id: row.snapshot_id,
-          object_key: row.object_key,
-          content_hash: row.content_hash,
-          sequence: row.sequence,
+          id: row.snapshot_id!,
+          object_key: row.object_key!,
+          content_hash: row.content_hash!,
+          sequence: row.sequence!,
         })
         : null,
     };
@@ -2042,9 +2091,29 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND operation_key=$3
   }): Promise<void> {
     await this.executor.execute(
       `
-UPDATE artifact_operations
-SET status='complete',file_id=$4::uuid,verification_status=COALESCE(verification_status,'pending'),updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND operation_key=$3
+UPDATE artifact_operations operation
+SET status=CASE
+      WHEN blob.verification_status='verified' THEN 'complete'
+      WHEN blob.verification_status='failed' THEN 'failed'
+      ELSE 'staged'
+    END,
+    file_id=$4::uuid,
+    verification_status=CASE
+      WHEN blob.verification_status='verified' THEN 'verified'
+      WHEN blob.verification_status='failed' THEN 'failed'
+      ELSE 'pending'
+    END,
+    error_class=CASE
+      WHEN blob.verification_status='failed' THEN COALESCE(operation.error_class,'blob_verification_failed')
+      ELSE NULL
+    END,
+    updated_at=now()
+FROM files file
+LEFT JOIN file_blobs blob
+  ON blob.tenant_id=file.tenant_id AND blob.id=file.blob_id
+WHERE operation.tenant_id=$1::uuid AND operation.run_id=$2::uuid
+  AND operation.operation_key=$3
+  AND file.tenant_id=operation.tenant_id AND file.id=$4::uuid
       `.trim(),
       [input.tenantId, input.runId, input.operationKey, input.fileId],
     );
@@ -2099,25 +2168,78 @@ RETURNING id,attempt
     failedCount: number;
     manifest: JsonValue;
   }): Promise<void> {
-    const updated = await this.executor.query<{ id: string }>(
+    const updated = await this.executor.query<{
+      id: string;
+      status: "complete" | "partial" | "failed";
+      item_count: number | string;
+      completed_count: number | string;
+      failed_count: number | string;
+      last_error: string | null;
+    }>(
       `
-UPDATE turn_finalizations
-SET status=$4,item_count=$5,completed_count=$6,failed_count=$7,manifest=$8::jsonb,
-    completed_at=now(),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND lease_owner=$3
-RETURNING id
+WITH counts AS (
+  SELECT finalization.id,
+         GREATEST($5::integer,COUNT(operation.id)::integer) AS item_count,
+         COUNT(operation.id) FILTER (
+           WHERE operation.status='complete' AND operation.verification_status='verified'
+         )::integer AS completed_count,
+         COUNT(operation.id) FILTER (
+           WHERE operation.status='failed' OR operation.verification_status='failed'
+         )::integer AS failed_count,
+         MAX(operation.error_class) FILTER (
+           WHERE operation.status='failed' OR operation.verification_status='failed'
+         ) AS operation_error
+  FROM turn_finalizations finalization
+  LEFT JOIN artifact_operations operation
+    ON operation.tenant_id=finalization.tenant_id
+   AND operation.finalization_id=finalization.id
+  WHERE finalization.tenant_id=$1::uuid AND finalization.run_id=$2::uuid
+    AND finalization.lease_owner=$3
+  GROUP BY finalization.id
+)
+UPDATE turn_finalizations finalization
+SET status=CASE
+      WHEN counts.item_count=0 THEN $4
+      WHEN counts.completed_count=counts.item_count THEN 'complete'
+      WHEN counts.failed_count=counts.item_count THEN 'failed'
+      ELSE 'partial'
+    END,
+    item_count=counts.item_count,
+    completed_count=counts.completed_count,
+    failed_count=counts.failed_count,
+    manifest=$6::jsonb,
+    last_error=CASE WHEN counts.failed_count>0
+      THEN COALESCE(counts.operation_error,finalization.last_error,'artifact_verification_failed')
+      ELSE NULL END,
+    completed_at=CASE
+      WHEN counts.item_count=0 OR counts.completed_count+counts.failed_count>=counts.item_count THEN now()
+      ELSE NULL
+    END,
+    lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+FROM counts
+WHERE finalization.tenant_id=$1::uuid AND finalization.id=counts.id
+RETURNING finalization.id,finalization.status,finalization.item_count,
+          finalization.completed_count,finalization.failed_count,finalization.last_error
       `.trim(),
-      [input.tenantId, input.runId, input.owner, input.status, input.itemCount, input.completedCount, input.failedCount, JSON.stringify(input.manifest)],
+      [input.tenantId, input.runId, input.owner, input.status, input.itemCount, JSON.stringify(input.manifest)],
     );
-    if (updated[0]) {
+    const result = updated[0];
+    if (result?.status === "failed") {
+      await this.appendFinalizationEvent(input.tenantId, input.runId, input.sessionId, input.operationKey, {
+        kind: "finalization.error",
+        runId: input.runId,
+        operationKey: input.operationKey,
+        errorClass: (result.last_error ?? "artifact_verification_failed").slice(0, 128),
+      });
+    } else if (result) {
       await this.appendFinalizationEvent(input.tenantId, input.runId, input.sessionId, input.operationKey, {
         kind: "finalization.end",
         runId: input.runId,
         operationKey: input.operationKey,
-        status: input.status,
-        itemCount: input.itemCount,
-        completedCount: input.completedCount,
-        failedCount: input.failedCount,
+        status: result.status,
+        itemCount: Number(result.item_count),
+        completedCount: Number(result.completed_count),
+        failedCount: Number(result.failed_count),
       });
     }
   }
@@ -2170,6 +2292,10 @@ WHERE NOT EXISTS (
   SELECT 1 FROM turn_events
   WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type=$4
     AND payload->>'operationKey'=$6
+    AND (
+      $4<>'finalization.end'
+      OR payload->>'status'=COALESCE($5::jsonb->>'status','')
+    )
 )
 ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
       `.trim(),
@@ -3497,6 +3623,16 @@ function mapSnapshot(row: SnapshotRow): SnapshotRecord {
   };
 }
 
+function isTimestampStrictlyBefore(
+  candidate: Date | string | null,
+  target: Date | string | null,
+): boolean {
+  if (!candidate || !target) return false;
+  const candidateMs = candidate instanceof Date ? candidate.getTime() : Date.parse(candidate);
+  const targetMs = target instanceof Date ? target.getTime() : Date.parse(target);
+  return Number.isFinite(candidateMs) && Number.isFinite(targetMs) && candidateMs < targetMs;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
@@ -3539,10 +3675,16 @@ interface SnapshotRow {
 interface SessionContinuityRow {
   sandbox_provider: string | null;
   sandbox_id: string | null;
+  prior_created_at: Date | string | null;
+  prior_branch_compatible: boolean | null;
   snapshot_id: string | null;
   object_key: string | null;
   content_hash: string | null;
   sequence: number | string | null;
+  snapshot_created_at: Date | string | null;
+  snapshot_session_leaf_id: string | null;
+  snapshot_branch_compatible: boolean | null;
+  target_created_at: Date | string | null;
 }
 
 interface SandboxInputFileRow {
