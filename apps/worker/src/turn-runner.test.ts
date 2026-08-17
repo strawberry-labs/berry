@@ -83,7 +83,7 @@ describe("durable turn runner", () => {
     expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
   });
 
-  it("narrows admitted built-ins while retaining user-control tools", () => {
+  it("preserves admitted built-ins when workflow routing is advisory", () => {
     const current = providerSnapshot("openai-responses");
     current.runtimeRequest = {
       ...current.runtimeRequest,
@@ -93,7 +93,10 @@ describe("durable turn runner", () => {
     };
 
     const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
-    expect(names).toEqual(["read", "grep", "find", "ls", "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill"]);
+    expect(names).toEqual([
+      "read", "bash", "edit", "write", "grep", "find", "ls",
+      "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill",
+    ]);
   });
 
   it("uses the queued prompt intent instead of inheriting its predecessor intent", () => {
@@ -359,6 +362,25 @@ describe("durable turn runner", () => {
     expect(modelCalls).toBe(1);
   });
 
+  it("releases per-run tool resources while waiting without finalizing artifacts", async () => {
+    const current = snapshot("waiting", [admittedStep()]);
+    const repository = new FakeTurnRepository(current);
+    const release = vi.fn(async () => undefined);
+    const finalize = vi.fn(async () => []);
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      ...noTools(),
+      release,
+      finalize,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "waiting", noOp: true });
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(current);
+    expect(finalize).not.toHaveBeenCalled();
+  });
+
   it("fails visibly when the empty-response recovery is also empty", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),
@@ -471,6 +493,9 @@ describe("durable turn runner", () => {
     });
     expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("sensitive upstream response body");
     expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("router_request_503");
+    expect(repository.releasedError).toBe(
+      "The model provider returned a server error (HTTP 503). Berry will retry it.",
+    );
   });
 
   it("terminally fails provider HTTP 409 instead of releasing it for a BullMQ retry", async () => {
@@ -478,7 +503,7 @@ describe("durable turn runner", () => {
     const repository = new FakeTurnRepository(current);
     const runner = new DurableTurnRunner(repository, {
       call: async () => {
-        throw new RouterClientError("Provider rejected a conflicting request", 409, "sensitive body", {
+        throw new RouterClientError("Upstream tenant secret for request router_request_409", 409, "sensitive body", {
           code: "conflict",
           requestId: "router_request_409",
         });
@@ -489,11 +514,26 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
 
     expect(repository.current.state).toBe("failed");
+    expect(repository.current.error).toBe(
+      "The model provider rejected the request (HTTP 409). Check the selected model and provider configuration before retrying.",
+    );
     expect(repository.releasedRetryDiagnostics).toBeUndefined();
     expect(repository.events).toContainEqual(expect.objectContaining({
       kind: "turn.end",
       status: "failed",
     }));
+    expect(repository.events).toContainEqual({
+      kind: "error",
+      message: "The model provider rejected the request (HTTP 409). Check the selected model and provider configuration before retrying.",
+    });
+    const persistedSurface = JSON.stringify({
+      error: repository.current.error,
+      events: repository.events,
+      mutations: repository.mutations,
+    });
+    expect(persistedSurface).not.toContain("Upstream tenant secret");
+    expect(persistedSurface).not.toContain("router_request_409");
+    expect(persistedSurface).not.toContain("sensitive body");
   });
 
   it("stops a sustained exact reasoning loop before it can consume the full model allowance", async () => {
@@ -648,9 +688,9 @@ describe("durable turn runner", () => {
     expect(receivedMaxTokens).toBeLessThanOrEqual(49_000);
   });
 
-  it("bounds accumulated tool results and leaves a durable-result reference", () => {
+  it("hard-bounds aggregate context across more than twenty-four tool results", () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
-    for (let index = 0; index < 4; index += 1) {
+    for (let index = 0; index < 30; index += 1) {
       current.entries.push({
         entryId: `tool-entry-${index}`,
         parentEntryId: current.entries.at(-1)?.entryId ?? null,
@@ -663,19 +703,23 @@ describe("durable turn runner", () => {
             role: "toolResult",
             toolCallId: `tool-call-${index}`,
             toolName: "read",
-            content: [{ type: "text", text: `${"unchanged-result ".repeat(20_000)}-${index}` }],
+            content: [{ type: "text", text: `${"unchanged-result ".repeat(400)}-${index}` }],
           },
         },
       });
     }
 
     const toolMessages = modelMessages(current).messages.filter((message) => message.role === "tool");
-    expect(toolMessages).toHaveLength(4);
+    expect(toolMessages).toHaveLength(30);
+    let remainingBudget = 48_000;
     for (const message of toolMessages) {
-      expect(String(message.content).length).toBeLessThanOrEqual(2_000);
+      const length = String(message.content).length;
+      expect(length).toBeLessThanOrEqual(Math.min(2_000, remainingBudget));
+      remainingBudget -= length;
     }
     expect(toolMessages.reduce((total, message) => total + String(message.content).length, 0)).toBeLessThanOrEqual(48_000);
     expect(String(toolMessages[0]?.content)).toContain("[durable-result:tool-entry-0]");
+    expect(String(toolMessages[24]?.content)).toBe("");
   });
 
   it("reclaims an expired lease from the persisted pending model step", async () => {
@@ -1741,6 +1785,52 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("treats distinct successful mutations with generic acknowledgements as progress", async () => {
+    const prior = Array.from({ length: 4 }, (_, index) => ({
+      ...toolStep("completed", "idempotent", false),
+      id: randomUUID(),
+      sequence: index + 1,
+      input: {
+        ...toolStep("completed", "idempotent", false).input,
+        arguments: { path: `/workspace/result-${index}.txt`, content: `result ${index}` },
+      },
+      output: { acknowledged: true } as const,
+    }));
+    const pending = {
+      ...toolStep("pending", "idempotent", false),
+      id: randomUUID(),
+      sequence: 5,
+      input: {
+        ...toolStep("pending", "idempotent", false).input,
+        arguments: { path: "/workspace/result-4.txt", content: "result 4" },
+      },
+    };
+    const current = snapshot("executing_tool", [admittedStep(), ...prior, pending]);
+    current.progress = {
+      progressEpoch: 4,
+      progressKind: "result_repeated",
+      consecutiveNoProgress: 4,
+      physicalModelAttempt: 0,
+      logicalModelIteration: 0,
+      toolRepairAttempts: 0,
+      cumulativeToolMs: 0,
+      cumulativeActiveComputeMs: 0,
+      budgetReason: null,
+    };
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => ({ output: { acknowledged: true }, summary: "mutation accepted" }),
+    }, { noProgressHardThreshold: 5 });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(repository.current.progress).toMatchObject({
+      consecutiveNoProgress: 0,
+      progressKind: "tool_progress",
+      budgetReason: null,
+    });
+  });
+
   it("detects same-output progress loss after read arguments change", async () => {
     const first = { ...readOnlyToolStep("read", 1, "/workspace/old-a.txt", "completed"), output: { content: "same" } as const };
     const second = { ...readOnlyToolStep("read", 2, "/workspace/old-b.txt", "completed"), output: { content: "same" } as const };
@@ -2420,6 +2510,107 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("counts reported provider fallback attempts from persisted progress without double-counting", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.progress = {
+      progressEpoch: 2,
+      progressKind: null,
+      consecutiveNoProgress: 0,
+      physicalModelAttempt: 4,
+      logicalModelIteration: 1,
+      toolRepairAttempts: 0,
+      cumulativeToolMs: 0,
+      cumulativeActiveComputeMs: 900,
+      budgetReason: null,
+    };
+    const repository = new FakeTurnRepository(current);
+    let clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const runner = new DurableTurnRunner(repository, {
+      call: async (_snapshot, _step, context) => {
+        context.onProviderAttempt?.({
+          physicalAttempt: 1,
+          model: "primary-model",
+          status: 503,
+          statusClass: "5xx",
+          category: "server",
+          retryDecision: "retry",
+          latencyMs: 40,
+        });
+        context.onProviderAttemptDecision?.(1, "fallback");
+        clock += 125;
+        context.onProviderAttempt?.({
+          physicalAttempt: 2,
+          model: "fallback-model",
+          status: 200,
+          statusClass: "2xx",
+          category: "success",
+          retryDecision: "none",
+          latencyMs: 85,
+        });
+        return { text: "Done.", inputTokens: 2, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools());
+
+    try {
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "finalizing" });
+      expect(repository.current.progress).toMatchObject({
+        physicalModelAttempt: 6,
+        cumulativeActiveComputeMs: 1_025,
+      });
+      expect(repository.events.filter((event) => event.kind === "provider.attempt"))
+        .toEqual([
+          expect.objectContaining({ physicalAttempt: 1, retryDecision: "fallback" }),
+          expect.objectContaining({ physicalAttempt: 2, retryDecision: "none" }),
+        ]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("adds failed model-call elapsed time without double-counting its reserved attempt", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.model = "provider/model";
+    current.progress = {
+      progressEpoch: 3,
+      progressKind: null,
+      consecutiveNoProgress: 0,
+      physicalModelAttempt: 7,
+      logicalModelIteration: 1,
+      toolRepairAttempts: 0,
+      cumulativeToolMs: 0,
+      cumulativeActiveComputeMs: 400,
+      budgetReason: null,
+    };
+    const repository = new FakeTurnRepository(current);
+    let clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        clock += 275;
+        throw new RouterClientError("raw provider failure", 503, "raw provider body", {
+          code: "upstream_unavailable",
+          requestId: "raw_request_id",
+        });
+      },
+    }, noTools());
+
+    try {
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .rejects.toBeInstanceOf(DurableTurnRetryableError);
+      expect(repository.current.progress).toMatchObject({
+        physicalModelAttempt: 8,
+        cumulativeActiveComputeMs: 675,
+      });
+      expect(repository.releasedError).toBe(
+        "The model provider returned a server error (HTTP 503). Berry will retry it.",
+      );
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("persists and replays interleaved reasoning with assistant tool calls", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),
@@ -2904,6 +3095,7 @@ class FakeTurnRepository implements DurableTurnRepository {
   mutations: DurableTurnMutation[] = [];
   budgetDecision = { allowed: true, reason: null as string | null };
   lastBudgetEstimate = "0";
+  releasedError: string | undefined;
   releasedRetryDiagnostics: DurableTurnRetryDiagnostics | undefined;
 
   constructor(public current: MutableSnapshot) {}
@@ -3004,9 +3196,10 @@ class FakeTurnRepository implements DurableTurnRepository {
 
   async release(
     _snapshot: DurableTurnSnapshot,
-    _error?: string,
+    error?: string,
     retryDiagnostics?: DurableTurnRetryDiagnostics,
   ): Promise<void> {
+    this.releasedError = error;
     this.releasedRetryDiagnostics = retryDiagnostics;
     this.current.leaseOwner = "";
   }

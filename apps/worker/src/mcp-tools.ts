@@ -71,15 +71,19 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return this.base.modelContent?.(snapshot) ?? [];
   }
 
+  async release(snapshot: DurableTurnSnapshot): Promise<void> {
+    try {
+      await this.base.release?.(snapshot);
+    } finally {
+      await this.#releaseTurnContext(snapshot.id);
+    }
+  }
+
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     try {
       return await (this.base.finalize?.(snapshot) ?? []);
     } finally {
-      const context = this.#turnContexts.get(snapshot.id);
-      if (context) {
-        this.#turnContexts.delete(snapshot.id);
-        await context.source.close();
-      }
+      await this.#releaseTurnContext(snapshot.id);
     }
   }
 
@@ -164,8 +168,19 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   }
 
   async close(): Promise<void> {
-    await this.#source.close();
-    await Promise.all([...this.#turnContexts.values()].map((context) => context.source.close()));
+    const contexts = [...this.#turnContexts.values()];
+    this.#turnContexts.clear();
+    await Promise.all([
+      this.#source.close(),
+      ...contexts.map((context) => context.source.close()),
+    ]);
+  }
+
+  async #releaseTurnContext(runId: string): Promise<void> {
+    const context = this.#turnContexts.get(runId);
+    if (!context) return;
+    this.#turnContexts.delete(runId);
+    await context.source.close();
   }
 
   async #context(snapshot: DurableTurnSnapshot): Promise<DurableMcpTurnContext> {

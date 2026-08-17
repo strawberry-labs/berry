@@ -402,6 +402,51 @@ describe("durable MCP tool exposure", () => {
 
     await tools.close();
   });
+
+  it("releases admitted per-turn connector contexts without finalizing artifacts", async () => {
+    const release = vi.fn(async () => undefined);
+    const finalize = vi.fn(async () => []);
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+      release,
+      finalize,
+    }, [], undefined);
+    const snapshot = mcpSnapshot("Search my workspace");
+    const firstDrive = connectorServer(
+      "first-drive",
+      "First Drive",
+      true,
+      "search_first",
+      "Search the first drive",
+    );
+    firstDrive.defaultTools = ["search_first"];
+    snapshot.runtimeRequest = admittedRuntimeRequest(
+      snapshot,
+      firstDrive,
+    );
+
+    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
+      .toContain("mcp__First_Drive__search_first");
+
+    await tools.release(snapshot);
+    expect(release).toHaveBeenCalledOnce();
+    expect(finalize).not.toHaveBeenCalled();
+
+    const secondDrive = connectorServer(
+      "second-drive",
+      "Second Drive",
+      true,
+      "search_second",
+      "Search the second drive",
+    );
+    secondDrive.defaultTools = ["search_second"];
+    snapshot.runtimeRequest = admittedRuntimeRequest(snapshot, secondDrive);
+    const refreshed = (await tools.definitions(snapshot)).map((definition) => definition.function.name);
+    expect(refreshed).toContain("mcp__Second_Drive__search_second");
+    expect(refreshed).not.toContain("mcp__First_Drive__search_first");
+
+    await tools.close();
+  });
 });
 
 describe("durable MCP journal serialization", () => {
@@ -581,4 +626,39 @@ function mcpSnapshot(input: string): DurableTurnSnapshot & { steps: DurableTurnS
     }],
     approvals: [],
   } as unknown as DurableTurnSnapshot & { steps: DurableTurnStep[] };
+}
+
+function admittedRuntimeRequest(
+  snapshot: DurableTurnSnapshot,
+  server: McpServerSpec,
+): DurableTurnSnapshot["runtimeRequest"] {
+  return {
+    capabilityVersion: 1,
+    input: "Search my workspace",
+    providerId: "router",
+    provider: {
+      id: "router",
+      name: "Berry Router",
+      kind: "berry-router",
+      baseUrl: "https://router.example.test/v1",
+      defaultModel: "test-model",
+      apiType: "openai-chat-completions",
+      authType: "none",
+      models: [],
+    },
+    model: "test-model",
+    conversationKind: "chat",
+    workspacePath: "/workspace",
+    workspaceId: snapshot.workspaceId ?? "workspace-1",
+    permissionMode: "ask",
+    reasoning: "off",
+    maxTokens: 1_000,
+    contextWindowTokens: 16_000,
+    modelAcceptsImages: false,
+    modelPricing: {},
+    builtInTools: [],
+    mcpServers: [server],
+    extraSkills: [],
+    attachments: [],
+  } as DurableTurnSnapshot["runtimeRequest"];
 }

@@ -443,6 +443,8 @@ export interface DurableTurnToolExecutor {
     /** Sandbox generation that physically contains the staged files. */
     stagingSandboxId: string;
   }>;
+  /** Release per-run clients or credentials without finalizing artifacts. */
+  release?(snapshot: DurableTurnSnapshot): Promise<void>;
   finalize?(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]>;
 }
 
@@ -595,7 +597,12 @@ export class DurableTurnRunner {
         }
         return { runId: snapshot.id, state: "cancelled" };
       }
-      const message = error instanceof Error ? error.message : String(error);
+      const providerFailure = error instanceof ProviderAttemptError
+        ? classifyProviderFailure(error)
+        : null;
+      const message = providerFailure
+        ? publicProviderFailureMessage(providerFailure)
+        : error instanceof Error ? error.message : String(error);
       if (hasAmbiguousNonIdempotentTool(snapshot)) {
         try {
           await this.transitionAmbiguousToolToRecovery(snapshot, message);
@@ -604,9 +611,6 @@ export class DurableTurnRunner {
           if (persistenceError instanceof DurableTurnRetryableError) throw persistenceError;
         }
       }
-      const providerFailure = error instanceof ProviderAttemptError
-        ? classifyProviderFailure(error)
-        : null;
       if (error instanceof DurableTurnRetryableError
         || error instanceof CompactionRetryableError
         || providerFailure?.retryable === true) {
@@ -629,6 +633,17 @@ export class DurableTurnRunner {
         await this.repository.release(snapshot, message);
         if (persistenceError instanceof DurableTurnRetryableError) throw persistenceError;
         throw new DurableTurnTerminalError(message, error);
+      }
+    } finally {
+      try {
+        await this.tools.release?.(snapshot);
+      } catch {
+        emitWorkerOperationalEvent(
+          "phase.transition",
+          this.options.workerRole ?? snapshot.workerRole ?? "unknown",
+          this.options.sourceRevision ?? snapshot.sourceRevision ?? "unknown",
+          { runId: snapshot.id, phase: "tool_executor_release", outcome: "failed" },
+        );
       }
     }
   }
@@ -784,7 +799,6 @@ export class DurableTurnRunner {
       nextState: "calling_model",
       steps: [{ ...step, state: "running", incrementAttempt: true }],
       progress: {
-        physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
         logicalModelIteration: modelIteration(snapshot.steps),
       },
       nextAction: "Preparing tools and files for the model request",
@@ -891,6 +905,10 @@ export class DurableTurnRunner {
         output: { streamMessageId: messageId },
         startedAt: new Date(modelStartedAt).toISOString(),
       }],
+      progress: {
+        physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
+        logicalModelIteration: modelIteration(snapshot.steps),
+      },
       nextAction: "Model request in progress",
       keepLease: true,
     });
@@ -943,6 +961,11 @@ export class DurableTurnRunner {
       });
     } catch (error) {
       const diagnostics = providerFailureDiagnostics(snapshot, error, modelStartedAt);
+      const failedModelProgress = reconcileModelCallProgress(
+        modelProgress,
+        providerAttempts,
+        Math.max(0, Date.now() - modelStartedAt),
+      );
       workerRuntimeMetrics.providerRequest(diagnostics);
       const activeModelStep = latestStep(snapshot.steps, "model.call") ?? step;
       activeModelStep.output = {
@@ -964,8 +987,35 @@ export class DurableTurnRunner {
         outputTokens: diagnostics.outputTokens,
         retryDecision: diagnostics.retryDecision,
       });
+      if (!(error instanceof DurableTurnCancellationError)) {
+        await this.repository.commit(snapshot, {
+          expectedState: "calling_model",
+          nextState: "calling_model",
+          progress: {
+            ...failedModelProgress,
+            logicalModelIteration: modelIteration(snapshot.steps),
+          },
+          nextAction: "Release the failed model request for retry or terminal handling",
+          keepLease: true,
+        });
+      }
       throw error;
     }
+    const completedModelProgress = reconcileModelCallProgress(
+      modelProgress,
+      providerAttempts,
+      Math.max(0, Date.now() - modelStartedAt),
+    );
+    await this.repository.commit(snapshot, {
+      expectedState: "calling_model",
+      nextState: "calling_model",
+      progress: {
+        ...completedModelProgress,
+        logicalModelIteration: modelIteration(snapshot.steps),
+      },
+      nextAction: "Validate and persist the completed model response",
+      keepLease: true,
+    });
     const providerDiagnostics = successfulProviderDiagnostics(snapshot, result, modelStartedAt);
     workerRuntimeMetrics.providerRequest(providerDiagnostics);
     const freshCancelled = !(await this.repository.heartbeat(
@@ -1078,10 +1128,8 @@ export class DurableTurnRunner {
         ],
         events: emptyEvents,
         progress: {
-          ...modelProgress,
-          physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
+          ...completedModelProgress,
           logicalModelIteration: modelIteration(snapshot.steps),
-          cumulativeActiveComputeMs: modelProgress.cumulativeActiveComputeMs + Math.max(0, Date.now() - modelStartedAt),
         },
         ...(result.promptManifest ? { promptManifest: result.promptManifest } : {}),
         nextAction: "Retry the model once because it returned no text or tool call",
@@ -1171,10 +1219,8 @@ export class DurableTurnRunner {
       ],
       events: messageEvents,
       progress: {
-        ...modelProgress,
-        physicalModelAttempt: modelProgress.physicalModelAttempt + 1,
+        ...completedModelProgress,
         logicalModelIteration: modelIteration(snapshot.steps),
-        cumulativeActiveComputeMs: modelProgress.cumulativeActiveComputeMs + Math.max(0, Date.now() - modelStartedAt),
       },
       entries,
       assistantMessage: {
@@ -3970,6 +4016,25 @@ function providerFailureDiagnostics(
   };
 }
 
+function publicProviderFailureMessage(
+  failure: ReturnType<typeof classifyProviderFailure>,
+): string {
+  const base = {
+    aborted: "The model provider request was aborted",
+    connection: "Berry could not connect to the model provider",
+    permanent_client: "The model provider rejected the request",
+    rate_limit: "The model provider rate-limited the request",
+    server: "The model provider returned a server error",
+    timeout: "The model provider request timed out",
+    unknown: "The model provider request failed",
+  }[failure.category];
+  const status = failure.status === undefined ? "" : ` (HTTP ${failure.status})`;
+  const action = failure.retryable
+    ? " Berry will retry it."
+    : " Check the selected model and provider configuration before retrying.";
+  return `${base}${status}.${action}`;
+}
+
 function providerAttemptEvent(
   logicalStepId: string,
   diagnostics: Record<string, JsonValue>,
@@ -4101,14 +4166,26 @@ function declaredPolling(step: DurableTurnStep): boolean {
   return argumentsValue?.progressPolicy === "polling" || argumentsValue?.allowNoProgress === true;
 }
 
+const NON_OBSERVATIONAL_READ_ONLY_TOOLS = new Set([
+  "activate_skill",
+  "ask_user_question",
+  "compose_message",
+]);
+
+function supportsResultOnlyNoProgress(step: DurableTurnStep): boolean {
+  return step.retryClass === "read_only"
+    && !NON_OBSERVATIONAL_READ_ONLY_TOOLS.has(toolNameForStep(step));
+}
+
 function assessToolProgress(
   snapshot: DurableTurnSnapshot,
   step: DurableTurnStep,
   fingerprint: string,
 ): { noProgress: boolean; kind: "tool_progress" | "result_repeated" | "alternating_no_progress" | "declared_polling" } {
   if (declaredPolling(step)) return { noProgress: false, kind: "declared_polling" };
+  if (!supportsResultOnlyNoProgress(step)) return { noProgress: false, kind: "tool_progress" };
   const completed = snapshot.steps
-    .filter((candidate) => candidate.state === "completed" && candidate.type.startsWith("tool."))
+    .filter((candidate) => candidate.state === "completed" && supportsResultOnlyNoProgress(candidate))
     .slice(-8);
   const fingerprints = completed
     .map((candidate) => candidate.resultFingerprint ?? (
@@ -4149,6 +4226,25 @@ function nextProgress(
     cumulativeToolMs: current.cumulativeToolMs + Math.max(0, Math.round(update.toolMs ?? 0)),
     cumulativeActiveComputeMs: current.cumulativeActiveComputeMs + Math.max(0, Math.round(update.activeComputeMs ?? 0)),
     budgetReason: update.budgetReason === undefined ? current.budgetReason : update.budgetReason,
+  };
+}
+
+function reconcileModelCallProgress(
+  baseline: DurableTurnProgress,
+  providerAttempts: readonly ProviderAttemptReport[],
+  elapsedMs: number,
+): DurableTurnProgress {
+  const highestReportedOrdinal = providerAttempts.reduce((highest, attempt) => {
+    const ordinal = attempt.physicalAttempt;
+    return typeof ordinal === "number" && Number.isFinite(ordinal) && ordinal > 0
+      ? Math.max(highest, Math.floor(ordinal))
+      : highest;
+  }, 0);
+  const physicalAttempts = Math.max(1, providerAttempts.length, highestReportedOrdinal);
+  return {
+    ...baseline,
+    physicalModelAttempt: baseline.physicalModelAttempt + physicalAttempts,
+    cumulativeActiveComputeMs: baseline.cumulativeActiveComputeMs + Math.max(0, Math.round(elapsedMs)),
   };
 }
 
@@ -4914,15 +5010,17 @@ function durableToolResultText(output: JsonValue): string {
 
 function boundedToolResultContext(entryId: string, content: string, remainingBudget: number): string {
   const reference = `[durable-result:${entryId}] The complete tool result is persisted; rerun the tool with a narrower scope if more detail is needed.`;
-  if (!content) return reference;
-  const budget = Math.min(MAX_TOOL_RESULT_CONTEXT_CHARS, remainingBudget);
-  if (budget <= reference.length) return reference;
+  const budget = Math.max(0, Math.min(MAX_TOOL_RESULT_CONTEXT_CHARS, Math.floor(remainingBudget)));
+  if (budget === 0) return "";
+  if (!content) return reference.slice(0, budget);
+  if (budget <= reference.length) return reference.slice(0, budget);
   if (content.length <= budget) return content;
-  const available = budget - reference.length - 32;
-  if (available <= 0) return reference;
+  const marker = "\n…[result content bounded]…\n";
+  const available = budget - reference.length - 1 - marker.length;
+  if (available <= 0) return reference.slice(0, budget);
   const head = Math.ceil(available * 0.7);
   const tail = Math.max(0, available - head);
-  return `${reference}\n${content.slice(0, head)}\n…[result content bounded]…\n${tail > 0 ? content.slice(-tail) : ""}`;
+  return `${reference}\n${content.slice(0, head)}${marker}${tail > 0 ? content.slice(-tail) : ""}`;
 }
 
 function automaticDurableAttachmentSkill(
