@@ -15,6 +15,7 @@ const dedicatedRunbook = readFileSync(resolve(root, "deploy/dedicated-instance-r
 const productionRunbook = readFileSync(resolve(root, "deploy/PRODUCTION.md"), "utf8");
 const deploymentLauncher = readFileSync(resolve(root, "deploy/up.sh"), "utf8");
 const serverDeploy = readFileSync(resolve(root, "deploy/server-deploy.sh"), "utf8");
+const ssmApplicationDeploy = readFileSync(resolve(root, "deploy/aws/deploy-application.sh"), "utf8");
 const deploymentImpact = readFileSync(resolve(root, "deploy/deployment-impact.sh"), "utf8");
 const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
 const productionEnv = readFileSync(resolve(root, "deploy/.env.production.example"), "utf8");
@@ -182,6 +183,18 @@ assertContains("deploy/server-deploy.sh", serverDeploy, [
   "BERRY_DEPLOY_EXPECTED_DOMAIN",
   'export BERRY_BUILD_REVISION="$target_ref"',
   "not reachable from origin/main",
+]);
+assertContains("deploy/aws/deploy-application.sh", ssmApplicationDeploy, [
+  "BERRY_AWS_DOMAIN",
+  "BERRY_DEPLOY_COMMIT",
+  "DomainName",
+  "berry:role",
+  "aws:cloudformation:stack-name",
+  "describe-instance-information",
+  "dig +short A",
+  "BERRY_DEPLOY_EXPECTED_DOMAIN",
+  "git merge-base --is-ancestor",
+  "AWS-RunShellScript",
 ]);
 assertContains("deploy/server-deploy.sh", serverDeploy, [
   "deployment-impact.sh",

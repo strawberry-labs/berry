@@ -68,7 +68,22 @@ After the stack completes:
    the temporary secret and IAM permission when it finishes. Do not place the
    environment in S3, Parameter Store, command history, user data, or
    CloudFormation parameters.
-5. Deploy a pinned Git commit and run `./deploy/production-up.sh` on EC2.
+5. Push the reviewed commit to the deployment branch, then deploy it through
+   the domain-attested SSM helper. The helper resolves exactly one healthy
+   CloudFormation stack by `DomainName`, verifies stack/instance tags, SSM
+   status, and DNS-to-EIP ownership, then asks the target host to verify its
+   non-secret `BERRY_DOMAIN` before changing the checkout:
+
+   ```sh
+   export BERRY_AWS_PROFILE=customer-production
+   export BERRY_AWS_REGION=eu-west-1
+   export BERRY_AWS_DOMAIN=ai.example.com
+   export BERRY_DEPLOY_COMMIT=0123456789abcdef0123456789abcdef01234567
+   ./deploy/aws/deploy-application.sh
+   ```
+
+   The exact commit must be reachable from `origin/main`. The helper never
+   uploads, replaces, or prints `deploy/.env.production`.
 
 The RDS instance and both S3 buckets retain data if the stack is removed. EC2
 termination protection and RDS deletion protection are enabled. Disable those
