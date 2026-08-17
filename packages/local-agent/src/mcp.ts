@@ -307,6 +307,24 @@ export class McpToolSource {
     void this.connect();
   }
 
+  /**
+   * Lazily list tools for trusted servers that were admitted without a cached
+   * catalog. This keeps startup non-blocking while ensuring tool_search can
+   * bootstrap a newly connected service instead of disappearing forever.
+   */
+  async discoverTools(serverIds?: readonly string[]): Promise<AgentTool[]> {
+    const selected = serverIds ? new Set(serverIds) : null;
+    await Promise.all(this.#options.servers.map(async (spec) => {
+      if (!spec.enabled || !spec.trusted || (selected && !selected.has(spec.id))) return;
+      try {
+        await this.#ensureConnected(spec);
+      } catch {
+        // One unavailable connector must not hide healthy authorized servers.
+      }
+    }));
+    return this.listTools();
+  }
+
   async #ensureConnected(spec: McpServerSpec): Promise<ConnectedServer> {
     const existing = this.#servers.get(spec.id);
     if (existing) return existing;

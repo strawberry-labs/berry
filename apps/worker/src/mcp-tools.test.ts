@@ -361,6 +361,47 @@ describe("durable MCP tool exposure", () => {
     });
     await tools.close();
   });
+
+  it("keeps tool_search available and bootstraps a connector without cached schemas", async () => {
+    const fixturePath = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../packages/local-agent/test/fixtures/mcp-echo-server.mjs",
+    );
+    const server: McpServerSpec = {
+      id: "echo-live",
+      name: "Live Echo",
+      transport: "stdio",
+      command: process.execPath,
+      args: [fixturePath],
+      url: null,
+      env: {},
+      enabled: true,
+      trusted: true,
+    };
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, [server], undefined);
+    const snapshot = mcpSnapshot("Find an echo capability");
+
+    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
+      .toEqual(["tool_search"]);
+    await expect(tools.execute(snapshot, {
+      id: "search-live-echo",
+      type: "tool.tool_search",
+      input: {
+        toolCallName: "tool_search",
+        toolName: "tool_search",
+        arguments: { query: "echo message", connector: "echo-live" },
+      },
+    } as never)).resolves.toMatchObject({
+      output: {
+        connector: "echo-live",
+        activatedTools: expect.arrayContaining(["mcp__Live_Echo__echo"]),
+      },
+    });
+
+    await tools.close();
+  });
 });
 
 describe("durable MCP journal serialization", () => {

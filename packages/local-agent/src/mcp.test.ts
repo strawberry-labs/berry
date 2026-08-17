@@ -41,6 +41,20 @@ describe("McpToolSource", () => {
     await source.close();
   });
 
+  it("lazily discovers tools for an authorized server without cached schemas", async () => {
+    const source = new McpToolSource({ servers: [stdioServer()] });
+
+    expect(source.listTools()).toEqual([]);
+    await expect(source.discoverTools(["mcp_echo"])).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "mcp__echo__echo" }),
+        expect.objectContaining({ name: "mcp__echo__fail" }),
+      ]),
+    );
+
+    await source.close();
+  });
+
   it("skips disabled servers and survives startup failures", async () => {
     const logs: string[] = [];
     const source = new McpToolSource({

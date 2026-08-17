@@ -60,7 +60,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       }));
     return [
       ...inherited,
-      ...(context.source.listTools().length > 0
+      ...(context.servers.length > 0
         ? [durableToolSearchDefinition(context.servers)]
         : []),
       ...mcpTools,
@@ -250,6 +250,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       ? input.limit
       : 8;
     const limit = Math.max(1, Math.min(20, limitValue));
+    const uncachedServerIds = (connector ? [connector] : context.servers)
+      .filter((server) => (server.cachedTools?.length ?? 0) === 0)
+      .map((server) => server.id);
+    if (uncachedServerIds.length > 0) {
+      await context.source.discoverTools(uncachedServerIds);
+    }
     let matches: ReturnType<McpToolSource["listTools"]> = [];
     if (connector) {
       const connectorTools = context.source.listTools().filter((tool) =>
