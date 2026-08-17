@@ -200,9 +200,25 @@ if [ "$worker_scale_reconciled" = false ]; then
     $worker_scale_args worker worker-foreground
 fi
 
+berry_runtime_revisions_match() {
+  for service in api mem0 web worker worker-foreground; do
+    container_ids="$(compose ps --status running -q "$service")"
+    if [ -z "$container_ids" ]; then
+      return 1
+    fi
+    for container_id in $container_ids; do
+      if ! docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" \
+        | grep -Fqx "BERRY_BUILD_REVISION=$target_ref"; then
+        return 1
+      fi
+    done
+  done
+}
+
 attempt=1
 while [ "$attempt" -le 18 ]; do
-  if curl -fsS "https://$domain/healthz" >/dev/null 2>&1 \
+  if berry_runtime_revisions_match \
+    && curl -fsS "https://$domain/healthz" >/dev/null 2>&1 \
     && curl -fsS "https://$domain/" >/dev/null 2>&1; then
     printf '%s\n' "$target_ref" > .deployment-commit
     elapsed="$(( $(date +%s) - started_at ))"

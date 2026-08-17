@@ -24,6 +24,8 @@ const caddyfile = readFileSync(resolve(root, "deploy/Caddyfile"), "utf8");
 const storageCaddyfile = readFileSync(resolve(root, "deploy/Caddyfile.storage"), "utf8");
 const composeApi = compose.split("\n  api:")[1]?.split("\n  worker:")[0] ?? "";
 const composeWorker = compose.split("\n  worker:")[1]?.split("\n  web:")[0] ?? "";
+const composeMem0 = compose.split("\n  mem0:")[1]?.split("\n  tika:")[0] ?? "";
+const composeWeb = compose.split("\n  web:")[1]?.split("\nvolumes:")[0] ?? "";
 
 describe("self-host compose deployment", () => {
   it("runs api, web, and worker with local MinIO or IAM-backed S3", () => {
@@ -38,6 +40,9 @@ describe("self-host compose deployment", () => {
     expect(compose).toContain("berry_worker:");
     expect(compose).toContain("berry_platform:");
     expect(compose).toContain("BERRY_RUN_MIGRATIONS: \"false\"");
+    for (const runtime of [composeApi, composeWorker, composeMem0, composeWeb]) {
+      expect(runtime).toContain("BERRY_BUILD_REVISION: ${BERRY_BUILD_REVISION:-unknown}");
+    }
     expect(compose).toContain('command: ["node", "apps/api/dist/configure-service-roles.js"]');
     expect(compose).toContain("BERRY_REDIS_URL:");
     expect(composeWorker).toContain("BERRY_MODEL_IDLE_TIMEOUT_MS: ${BERRY_MODEL_IDLE_TIMEOUT_MS:-240000}");

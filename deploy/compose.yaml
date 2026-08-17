@@ -113,6 +113,7 @@ services:
         condition: service_started
     environment:
       NODE_ENV: production
+      BERRY_BUILD_REVISION: ${BERRY_BUILD_REVISION:-unknown}
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       BERRY_MEM0_PORT: 8010
       BERRY_MEM0_DATABASE_URL: postgres://${BERRY_MEM0_POSTGRES_USER:-mem0}:${BERRY_MEM0_POSTGRES_PASSWORD:-berry-dev-mem0-postgres-password}@mem0-postgres:5432/${BERRY_MEM0_POSTGRES_DB:-mem0}
@@ -554,6 +555,7 @@ services:
         condition: service_started
     environment:
       NODE_ENV: production
+      BERRY_BUILD_REVISION: ${BERRY_BUILD_REVISION:-unknown}
       PORT: 3108
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-self-hosted}
       BERRY_WEB_API_BASE_URL: ${BERRY_WEB_API_BASE_URL:-https://ai.aesg.com}

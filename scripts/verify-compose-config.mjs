@@ -166,6 +166,7 @@ const requiredHelmTemplateSnippets = [
 ];
 
 assertContains("deploy/compose.yaml", compose, requiredComposeSnippets);
+assertOccurrences("deploy/compose.yaml", compose, "BERRY_BUILD_REVISION:", 4);
 assertContains("Dockerfile", dockerfile, requiredDockerfileSnippets);
 assertOccurrences("Dockerfile", dockerfile, "USER node", 4);
 assertContains("deploy/.env.example", envExample, requiredEnvSnippets);
@@ -184,6 +185,7 @@ assertContains("deploy/server-deploy.sh", serverDeploy, [
   'export BERRY_BUILD_REVISION="$target_ref"',
   "not reachable from origin/main",
   'git -c "safe.directory=$repo_dir" "$@"',
+  "berry_runtime_revisions_match",
 ]);
 assertContains("deploy/aws/deploy-application.sh", ssmApplicationDeploy, [
   "BERRY_AWS_DOMAIN",
