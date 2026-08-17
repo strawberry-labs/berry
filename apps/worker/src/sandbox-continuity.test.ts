@@ -225,6 +225,7 @@ describe("SandboxContinuityManager", () => {
   it("does not reopen a terminal sandbox that is already paused", async () => {
     const suspend = vi.fn();
     const list = vi.fn();
+    const skipFinalization = vi.fn(async () => undefined);
     const provider = {
       kind: "e2b",
       suspend,
@@ -248,9 +249,11 @@ describe("SandboxContinuityManager", () => {
       persistOutput: vi.fn(),
       persist: vi.fn(),
       recordSandbox: vi.fn(),
+      skipFinalization,
     } satisfies SandboxSnapshotRepository;
     const manager = new SandboxContinuityManager(provider, repository, null, {
       image: "berry-sandbox",
+      enableTerminalFinalization: true,
     });
 
     await expect(manager.snapshot({
@@ -260,6 +263,9 @@ describe("SandboxContinuityManager", () => {
     })).resolves.toEqual({ noOp: true });
     expect(list).not.toHaveBeenCalled();
     expect(suspend).not.toHaveBeenCalled();
+    expect(skipFinalization).toHaveBeenCalledWith(expect.objectContaining({
+      reason: "sandbox_paused",
+    }));
   });
 
   it("pauses a terminal sandbox even when its final snapshot exceeds the deadline", async () => {
@@ -582,6 +588,7 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("does not let an older terminal cleanup pause a sandbox claimed by a follow-up run", async () => {
+    const skipFinalization = vi.fn(async () => undefined);
     const provider = {
       kind: "e2b",
       suspend: vi.fn(),
@@ -607,8 +614,12 @@ describe("SandboxContinuityManager", () => {
       persistOutput: vi.fn(),
       persist: vi.fn(),
       recordSandbox: vi.fn(),
+      skipFinalization,
     } satisfies SandboxSnapshotRepository;
-    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+    const manager = new SandboxContinuityManager(provider, repository, null, {
+      image: "berry-sandbox",
+      enableTerminalFinalization: true,
+    });
 
     await expect(manager.snapshot({
       tenantId: "00000000-0000-7000-8000-000000000002",
@@ -617,6 +628,9 @@ describe("SandboxContinuityManager", () => {
     })).resolves.toEqual({ noOp: true });
     expect(provider.files.list).not.toHaveBeenCalled();
     expect(provider.suspend).not.toHaveBeenCalled();
+    expect(skipFinalization).toHaveBeenCalledWith(expect.objectContaining({
+      reason: "sandbox_claimed_by_newer_run",
+    }));
   });
 
   it("destroys terminal compute when the provider cannot pause", async () => {
@@ -2335,6 +2349,43 @@ describe("SandboxContinuityManager", () => {
       kind: "finalization.end",
       status: "partial",
       itemCount: 1,
+      completedCount: 0,
+      failedCount: 0,
+    });
+  });
+
+  it("settles an unavailable sandbox finalization as skipped exactly once", async () => {
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const repository = new SqlSandboxSnapshotRepository({
+      query: vi.fn(async () => []),
+      execute: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+        executions.push({ sql, params });
+      }),
+    } as never);
+
+    await repository.skipFinalization({
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      sessionId: "00000000-0000-7000-8000-000000000004",
+      operationKey: "run:finalization",
+      reason: "sandbox_paused",
+    });
+
+    expect(executions[0]?.sql).toContain("WITH settled AS");
+    expect(executions[0]?.sql).toContain("SET status='skipped'");
+    expect(executions[0]?.sql).toContain("status<>'running' OR lease_expires_at IS NULL OR lease_expires_at<=now()");
+    expect(executions[0]?.sql).toContain("INSERT INTO turn_events");
+    expect(executions[0]?.params.slice(0, 4)).toEqual([
+      "00000000-0000-7000-8000-000000000002",
+      "00000000-0000-7000-8000-000000000001",
+      "sandbox_paused",
+      "00000000-0000-7000-8000-000000000004",
+    ]);
+    const finalizationEvent = executions[0];
+    expect(JSON.parse(String(finalizationEvent?.params[4]))).toMatchObject({
+      kind: "finalization.end",
+      status: "skipped",
+      itemCount: 0,
       completedCount: 0,
       failedCount: 0,
     });

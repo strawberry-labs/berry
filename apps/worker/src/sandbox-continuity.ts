@@ -368,6 +368,13 @@ export interface SandboxSnapshotRepository {
     operationKey: string;
     errorClass: string;
   }): Promise<void>;
+  skipFinalization?(input: {
+    tenantId: string;
+    runId: string;
+    sessionId: string;
+    operationKey: string;
+    reason: string;
+  }): Promise<void>;
   persistOutput(input: {
     snapshot: DurableTurnSnapshot;
     fileId: string;
@@ -1298,12 +1305,34 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 
   async snapshot(payload: SandboxSnapshotJobPayload): Promise<{ noOp: boolean; snapshotId?: string }> {
     const candidate = await this.repository.loadRun(payload.tenantId, payload.runId);
-    if (!candidate.sandboxId) return { noOp: true };
+    if (!candidate.sandboxId) {
+      if (
+        payload.reason === "before-finalize"
+        && this.options.enableTerminalFinalization
+        && TERMINAL_RUN_STATES.has(candidate.runState)
+      ) {
+        await this.skipTerminalFinalization(candidate, "sandbox_unavailable");
+      }
+      return { noOp: true };
+    }
     const preserveWithLock = async (repository: SandboxSnapshotRepository) => {
       const run = await repository.loadRun(payload.tenantId, payload.runId);
       if (!run.sandboxId || run.sandboxId !== candidate.sandboxId) return { noOp: true };
       const terminal = payload.reason === "before-finalize";
       const beforeWait = payload.reason === "before-wait";
+      const terminalSkipReason = terminal && TERMINAL_RUN_STATES.has(run.runState)
+        ? run.sandboxClaimedByNewerRun === true
+          ? "sandbox_claimed_by_newer_run"
+          : run.sandboxState && INACTIVE_SANDBOX_STATES.has(run.sandboxState)
+            ? `sandbox_${run.sandboxState}`
+            : null
+        : null;
+      if (terminalSkipReason) {
+        if (this.options.enableTerminalFinalization) {
+          await this.skipTerminalFinalization(run, terminalSkipReason, repository);
+        }
+        return { noOp: true };
+      }
       if (
         (run.sandboxState && INACTIVE_SANDBOX_STATES.has(run.sandboxState))
         || (run.sandboxState === "pause_requested" && !terminal)
@@ -1406,6 +1435,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       ) ?? { noOp: true };
     }
     return this.withSandboxLifecycleLock(payload.tenantId, candidate.sandboxId, preserveWithLock);
+  }
+
+  private async skipTerminalFinalization(
+    run: SnapshotRun,
+    reason: string,
+    repository: SandboxSnapshotRepository = this.repository,
+  ): Promise<void> {
+    await repository.skipFinalization?.({
+      tenantId: run.tenantId,
+      runId: run.runId,
+      sessionId: run.sessionId,
+      operationKey: `${run.runId}:finalization`,
+      reason,
+    });
   }
 
   private async ensureSandbox(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
@@ -2283,6 +2326,53 @@ RETURNING id
         errorClass: input.errorClass.slice(0, 128),
       });
     }
+  }
+
+  async skipFinalization(input: {
+    tenantId: string;
+    runId: string;
+    sessionId: string;
+    operationKey: string;
+    reason: string;
+  }): Promise<void> {
+    const reason = input.reason.slice(0, 128);
+    const event: Extract<AgentStreamEvent, { kind: "finalization.end" }> = {
+      kind: "finalization.end",
+      runId: input.runId,
+      operationKey: input.operationKey,
+      status: "skipped",
+      itemCount: 0,
+      completedCount: 0,
+      failedCount: 0,
+    };
+    await this.executor.execute(
+      `
+WITH settled AS (
+  UPDATE turn_finalizations
+  SET status='skipped',item_count=0,completed_count=0,failed_count=0,
+      manifest=NULL,last_error=$3::text,started_at=COALESCE(started_at,now()),
+      completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,updated_at=now()
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+    AND status IN ('pending','failed','partial','running')
+    AND (status<>'running' OR lease_expires_at IS NULL OR lease_expires_at<=now())
+  RETURNING id
+), next_sequence AS (
+  SELECT COALESCE(MAX(sequence),0)+1 AS sequence
+  FROM turn_events
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+)
+INSERT INTO turn_events (tenant_id,run_id,session_id,sequence,event_type,payload)
+SELECT $1::uuid,$2::uuid,$4::uuid,next_sequence.sequence,'finalization.end',$5::jsonb
+FROM settled CROSS JOIN next_sequence
+WHERE NOT EXISTS (
+  SELECT 1 FROM turn_events
+  WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='finalization.end'
+    AND payload->>'operationKey'=$6::text AND payload->>'status'='skipped'
+)
+ON CONFLICT (tenant_id,run_id,sequence) DO NOTHING
+      `.trim(),
+      [input.tenantId, input.runId, reason, input.sessionId, JSON.stringify(event), input.operationKey],
+    );
   }
 
   private async appendFinalizationEvent(
