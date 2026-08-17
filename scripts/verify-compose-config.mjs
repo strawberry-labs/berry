@@ -185,6 +185,8 @@ assertContains("deploy/server-deploy.sh", serverDeploy, [
   'export BERRY_BUILD_REVISION="$target_ref"',
   "not reachable from origin/main",
   'git -c "safe.directory=$repo_dir" "$@"',
+  "berry_runtime_revision_is_compatible",
+  "berry_revision_impacts_service",
   "berry_runtime_revisions_match",
 ]);
 assertContains("deploy/aws/deploy-application.sh", ssmApplicationDeploy, [

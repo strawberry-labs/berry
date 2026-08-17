@@ -200,6 +200,37 @@ if [ "$worker_scale_reconciled" = false ]; then
     $worker_scale_args worker worker-foreground
 fi
 
+berry_revision_impacts_service() (
+  service="$1"
+  revision="$2"
+  berry_impact_reset
+  changed_since_revision="$(git_repo diff --name-only "$revision" "$target_ref")"
+  prior_ifs="$IFS"
+  IFS='
+'
+  for file in $changed_since_revision; do
+    berry_impact_add_file "$file"
+  done
+  IFS="$prior_ifs"
+  case " $berry_restart_services " in
+    *" $service "*) exit 0 ;;
+    *) exit 1 ;;
+  esac
+)
+
+berry_runtime_revision_is_compatible() {
+  service="$1"
+  revision="$2"
+  case "$revision" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#revision}" -eq 40 ] || return 1
+  git_repo cat-file -e "$revision^{commit}" >/dev/null 2>&1 || return 1
+  git_repo merge-base --is-ancestor "$revision" "$target_ref" || return 1
+  [ "$revision" = "$target_ref" ] && return 0
+  ! berry_revision_impacts_service "$service" "$revision"
+}
+
 berry_runtime_revisions_match() {
   for service in api mem0 web worker worker-foreground; do
     container_ids="$(compose ps --status running -q "$service")"
@@ -207,8 +238,12 @@ berry_runtime_revisions_match() {
       return 1
     fi
     for container_id in $container_ids; do
-      if ! docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" \
-        | grep -Fqx "BERRY_BUILD_REVISION=$target_ref"; then
+      runtime_revision="$(
+        docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" \
+          | sed -n 's/^BERRY_BUILD_REVISION=//p' \
+          | tail -n 1
+      )"
+      if ! berry_runtime_revision_is_compatible "$service" "$runtime_revision"; then
         return 1
       fi
     done
