@@ -67,8 +67,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     ];
   }
 
-  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
-    return this.base.modelContent?.(snapshot) ?? [];
+  async modelContent(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]> {
+    return this.base.modelContent?.(snapshot, signal, reportProgress) ?? [];
   }
 
   async release(snapshot: DurableTurnSnapshot): Promise<void> {
@@ -117,6 +121,16 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return durableMcpToolPolicy(server, hints, permissionMode);
   }
 
+  supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName === "tool_search") return false;
+    // Connector setup, lazy discovery, and artifact staging can still await
+    // work that has no AbortSignal contract. Keep the whole MCP path
+    // non-abortable until every one of those seams is signal-aware.
+    if (toolName.startsWith("mcp__")) return false;
+    return this.base.supportsAbort?.(snapshot, step) === true;
+  }
+
   async execute(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
@@ -148,7 +162,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     ).join("\n").slice(0, 120_000);
     const artifact = connectorArtifact(result.details);
     const staged = artifact && this.base.stageAssociatedInputFiles
-      ? await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId])
+      ? await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId], {
+          ...(signal ? { signal } : {}),
+          ...(reportProgress ? { reportProgress } : {}),
+        })
       : [];
     if (artifact) {
       const stagedArtifact = staged.find((item) => item.fileId === artifact.fileId);

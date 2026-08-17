@@ -101,10 +101,14 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     return this.base.definitions?.(snapshot) ?? Promise.resolve([]);
   }
 
-  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
+  async modelContent(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]> {
     const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
     if (!runtime.success || runtime.data.modelAcceptsImages) {
-      return this.base.modelContent?.(snapshot) ?? [];
+      return this.base.modelContent?.(snapshot, signal, reportProgress) ?? [];
     }
     const imageCount = inspectableImageCount(snapshot, runtime.data.attachments, runtime.data.workspacePath);
     if (imageCount === 0) return [];
@@ -118,8 +122,12 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     ];
   }
 
-  stageAssociatedInputFiles(snapshot: DurableTurnSnapshot, fileIds: readonly string[]) {
-    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds) ?? Promise.resolve([]);
+  stageAssociatedInputFiles(
+    snapshot: DurableTurnSnapshot,
+    fileIds: readonly string[],
+    options?: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined },
+  ) {
+    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds, options) ?? Promise.resolve([]);
   }
 
   readSkillPackage(snapshot: DurableTurnSnapshot, path: string) {
@@ -148,6 +156,15 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     return this.base.policy?.(snapshot, toolName, permissionMode);
   }
 
+  supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    // Vision still awaits cache/object-store work without an AbortSignal. The
+    // provider request observes the signal, but the complete inspection path
+    // is not abort-aware until those storage seams are bounded too.
+    if (toolName === "inspect_images") return false;
+    return this.base.supportsAbort?.(snapshot, step) === true;
+  }
+
   async execute(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
@@ -160,6 +177,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         ? this.base.execute(snapshot, step, signal, reportProgress)
         : this.base.execute(snapshot, step);
     }
+    signal?.throwIfAborted();
     const priorFailure = latestUnresolvedVisionFailure(snapshot, step);
     if (priorFailure) {
       throw new Error(
@@ -182,7 +200,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         ? existingSteps.map((candidate) => candidate.id === step.id ? { ...candidate, state: "running" } : candidate)
         : [...existingSteps, { ...step, state: "running" }],
     };
-    const images = (await (this.base.modelContent?.(inspectionSnapshot) ?? []))
+    const images = (await (this.base.modelContent?.(inspectionSnapshot, signal, reportProgress) ?? []))
       .flatMap((part) => part.type === "image_url" ? [part] : []);
     if (images.length === 0) throw new Error("No inspectable images are available in this turn");
 
@@ -227,6 +245,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     for (let attempt = 1; attempt <= VISION_ADAPTER_MAX_ATTEMPTS; attempt += 1) {
       let result: ChatCompletionResult;
       try {
+        signal?.throwIfAborted();
         result = await client.complete({
           model: runtime.vision.model,
           temperature: 0,
@@ -249,8 +268,10 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
             { role: "user", content },
           ],
           metadata: { "Idempotency-Key": `${idempotencyKey}:vision-${attempt}` },
+          ...(signal ? { signal } : {}),
         });
       } catch (error) {
+        if (signal?.aborted) throw signal.reason;
         if (results.length === 0) throw error;
         throw new DurableToolExecutionError(
           `Vision retry failed after ${results.length} completed provider attempt${results.length === 1 ? "" : "s"}: ${providerFailureMessage(error)}`,

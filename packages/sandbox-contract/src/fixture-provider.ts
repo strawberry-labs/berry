@@ -28,7 +28,7 @@ import {
   type SandboxFileWriteResult,
   type SandboxHandle,
 } from "./schemas.js";
-import type { SandboxFileApi, SandboxProvider } from "./provider.js";
+import type { SandboxFileApi, SandboxOperationOptions, SandboxProvider } from "./provider.js";
 
 export class FixtureSandboxProvider implements SandboxProvider {
   readonly kind = "fixture" as const;
@@ -36,13 +36,14 @@ export class FixtureSandboxProvider implements SandboxProvider {
   readonly #files = new Map<string, Map<string, { content: string; encoding: "utf8" | "base64"; mtime: string }>>();
 
   readonly files: SandboxFileApi = {
-    read: async (input) => this.readFile(input),
-    write: async (input) => this.writeFile(input),
-    list: async (input) => this.listFiles(input),
+    read: async (input, options) => this.readFile(input, options),
+    write: async (input, options) => this.writeFile(input, options),
+    list: async (input, options) => this.listFiles(input, options),
   };
 
-  async create(input: SandboxCreateInput): Promise<SandboxHandle> {
+  async create(input: SandboxCreateInput, options: SandboxOperationOptions = {}): Promise<SandboxHandle> {
     const parsed = SandboxCreateInputSchema.parse(input);
+    options.signal?.throwIfAborted();
     const createdAt = new Date();
     const expiresAt = new Date(createdAt.getTime() + parsed.ttl_seconds * 1000);
     const sandbox = SandboxHandleSchema.parse({
@@ -108,8 +109,9 @@ export class FixtureSandboxProvider implements SandboxProvider {
     this.#files.clear();
   }
 
-  async readFile(input: SandboxFileReadInput): Promise<SandboxFileReadResult> {
+  async readFile(input: SandboxFileReadInput, options: SandboxOperationOptions = {}): Promise<SandboxFileReadResult> {
     const parsed = SandboxFileReadInputSchema.parse(input);
+    options.signal?.throwIfAborted();
     const files = this.#requireFiles(parsed.sandbox_id);
     const file = files.get(parsed.path);
     if (!file) throw new Error(`File not found in sandbox ${parsed.sandbox_id}: ${parsed.path}`);
@@ -123,8 +125,9 @@ export class FixtureSandboxProvider implements SandboxProvider {
     });
   }
 
-  async writeFile(input: SandboxFileWriteInput): Promise<SandboxFileWriteResult> {
+  async writeFile(input: SandboxFileWriteInput, options: SandboxOperationOptions = {}): Promise<SandboxFileWriteResult> {
     const parsed = SandboxFileWriteInputSchema.parse(input);
+    options.signal?.throwIfAborted();
     const files = this.#requireFiles(parsed.sandbox_id);
     const mtime = new Date().toISOString();
     files.set(parsed.path, { content: parsed.content, encoding: parsed.encoding, mtime });
@@ -135,8 +138,9 @@ export class FixtureSandboxProvider implements SandboxProvider {
     });
   }
 
-  async listFiles(input: SandboxFileListInput): Promise<SandboxFileListResult> {
+  async listFiles(input: SandboxFileListInput, options: SandboxOperationOptions = {}): Promise<SandboxFileListResult> {
     const parsed = SandboxFileListInputSchema.parse(input);
+    options.signal?.throwIfAborted();
     const files = this.#requireFiles(parsed.sandbox_id);
     const prefix = parsed.path.replace(/\/$/, "");
     const entries = [...files.entries()]

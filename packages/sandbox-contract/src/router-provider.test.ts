@@ -11,7 +11,7 @@ import { collectSandboxExecEvents, exerciseSandboxProviderContract } from "./pro
 const tenantId = "00000000-0000-7000-8000-000000000001";
 
 class FakeRouter {
-  readonly requests: Array<{ method: string; path: string; auth: string | null; provider: string | null; body: unknown }> = [];
+  readonly requests: Array<{ method: string; path: string; auth: string | null; provider: string | null; body: unknown; signal?: AbortSignal | undefined }> = [];
   readonly fetch: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
     const headers = new Headers(init?.headers);
@@ -22,6 +22,7 @@ class FakeRouter {
       auth: headers.get("authorization"),
       provider: headers.get("x-berry-sandbox-provider"),
       body: rawBody,
+      signal: init?.signal ?? undefined,
     });
 
     if (url.pathname === "/v1/sandboxes" && init?.method === "POST") {
@@ -137,6 +138,22 @@ describe("RouterSandboxProvider", () => {
       status: 401,
       body: "Bearer [redacted] denied",
     } satisfies Partial<RouterSandboxProviderError>);
+  });
+
+  it("forwards the operation signal to Router creation and file fetches", async () => {
+    const router = new FakeRouter();
+    const provider = new RouterSandboxProvider(providerOptions(router));
+    const controller = new AbortController();
+
+    await provider.create({
+      request_id: "req-signal",
+      tenant_id: tenantId,
+      image: "berry/python:3.12",
+    }, { signal: controller.signal });
+    expect(router.requests.at(-1)?.signal).toBe(controller.signal);
+    await provider.files.read({ sandbox_id: "sbx_123", path: "/workspace/result.txt" }, { signal: controller.signal });
+
+    expect(router.requests.at(-1)?.signal).toBe(controller.signal);
   });
 
   it("selects the commercial Router provider from environment config", () => {

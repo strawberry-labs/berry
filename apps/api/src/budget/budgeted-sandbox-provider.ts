@@ -14,6 +14,7 @@ import type {
   SandboxFileWriteInput,
   SandboxFileWriteResult,
   SandboxHandle,
+  SandboxOperationOptions,
   SandboxProvider,
   SandboxResumeInput,
   SandboxUsageEvent,
@@ -62,18 +63,18 @@ export class BudgetedSandboxProvider implements SandboxProvider {
       portMicros: options.estimates?.portMicros ?? 5,
     };
     this.files = {
-      read: (input) => this.#budgetFile("sandbox.file.read", input.sandbox_id, input, () => this.#provider.files.read(input)),
-      write: (input) => this.#budgetFile("sandbox.file.write", input.sandbox_id, input, () => this.#provider.files.write(input)),
+      read: (input, operationOptions) => this.#budgetFile("sandbox.file.read", input.sandbox_id, input, () => this.#provider.files.read(input, operationOptions)),
+      write: (input, operationOptions) => this.#budgetFile("sandbox.file.write", input.sandbox_id, input, () => this.#provider.files.write(input, operationOptions)),
       ...(this.#provider.files.writeBytes ? {
-        writeBytes: (input) => this.#budgetFile(
+        writeBytes: (input, operationOptions) => this.#budgetFile(
           "sandbox.file.write",
           input.sandbox_id,
           { ...input, content: undefined, sizeBytes: input.content.byteLength },
-          () => this.#provider.files.writeBytes!(input),
+          () => this.#provider.files.writeBytes!(input, operationOptions),
         ),
       } : {}),
       ...(this.#provider.files.writeManyBytes ? {
-        writeManyBytes: (input) => this.#budgetFile(
+        writeManyBytes: (input, operationOptions) => this.#budgetFile(
           "sandbox.file.write",
           input.sandbox_id,
           {
@@ -81,14 +82,15 @@ export class BudgetedSandboxProvider implements SandboxProvider {
             fileCount: input.files.length,
             sizeBytes: input.files.reduce((total, file) => total + file.content.byteLength, 0),
           },
-          () => this.#provider.files.writeManyBytes!(input),
+          () => this.#provider.files.writeManyBytes!(input, operationOptions),
         ),
       } : {}),
-      list: (input) => this.#budgetFile("sandbox.file.list", input.sandbox_id, input, () => this.#provider.files.list(input)),
+      list: (input, operationOptions) => this.#budgetFile("sandbox.file.list", input.sandbox_id, input, () => this.#provider.files.list(input, operationOptions)),
     };
   }
 
-  async create(input: SandboxCreateInput): Promise<SandboxHandle> {
+  async create(input: SandboxCreateInput, operationOptions: SandboxOperationOptions = {}): Promise<SandboxHandle> {
+    operationOptions.signal?.throwIfAborted();
     const requestId = `sandbox_create_${input.request_id}`;
     const estimatedCostMicros = toMicros(this.#estimates.createMicros);
     await this.#budgets.reserve({
@@ -106,7 +108,8 @@ export class BudgetedSandboxProvider implements SandboxProvider {
       metadata: { image: input.image, ttlSeconds: input.ttl_seconds ?? null },
     });
     try {
-      const sandbox = await this.#provider.create(input);
+      operationOptions.signal?.throwIfAborted();
+      const sandbox = await this.#provider.create(input, operationOptions);
       this.#sandboxes.set(sandbox.sandbox_id, {
         tenantId: sandbox.tenant_id,
         taskId: input.task_id ?? null,
@@ -180,17 +183,18 @@ export class BudgetedSandboxProvider implements SandboxProvider {
     }
   }
 
-  async resume(input: SandboxResumeInput): Promise<SandboxHandle> {
+  async resume(input: SandboxResumeInput, operationOptions: SandboxOperationOptions = {}): Promise<SandboxHandle> {
     if (!this.supportsResume) throw new Error(`Sandbox provider ${this.kind} does not support resume`);
-    return this.#resume(input);
+    return this.#resume(input, operationOptions);
   }
 
   async dispose(): Promise<void> {
     await this.#provider.dispose?.();
   }
 
-  async #resume(input: SandboxResumeInput): Promise<SandboxHandle> {
-    const sandbox = await this.#provider.resume!(input);
+  async #resume(input: SandboxResumeInput, operationOptions: SandboxOperationOptions): Promise<SandboxHandle> {
+    operationOptions.signal?.throwIfAborted();
+    const sandbox = await this.#provider.resume!(input, operationOptions);
     this.#sandboxes.set(sandbox.sandbox_id, {
       tenantId: sandbox.tenant_id,
       taskId: null,

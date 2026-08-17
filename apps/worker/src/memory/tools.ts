@@ -104,12 +104,20 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
       : inherited;
   }
 
-  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
-    return this.base.modelContent?.(snapshot) ?? [];
+  async modelContent(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]> {
+    return this.base.modelContent?.(snapshot, signal, reportProgress) ?? [];
   }
 
-  async stageAssociatedInputFiles(snapshot: DurableTurnSnapshot, fileIds: readonly string[]) {
-    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds) ?? [];
+  async stageAssociatedInputFiles(
+    snapshot: DurableTurnSnapshot,
+    fileIds: readonly string[],
+    options?: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined },
+  ) {
+    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds, options) ?? [];
   }
 
   readSkillPackage(snapshot: DurableTurnSnapshot, path: string) {
@@ -144,6 +152,12 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
       };
     }
     return this.base.policy?.(snapshot, toolName, permissionMode);
+  }
+
+  supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName === "remember_memory" || toolName === "forget_memory") return false;
+    return this.base.supportsAbort?.(snapshot, step) === true;
   }
 
   async execute(

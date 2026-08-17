@@ -30,7 +30,7 @@ import {
   type SandboxHandle,
   type SandboxProviderKind,
 } from "./schemas.js";
-import type { SandboxFileApi, SandboxProvider } from "./provider.js";
+import type { SandboxFileApi, SandboxOperationOptions, SandboxProvider } from "./provider.js";
 
 export interface RouterSandboxProviderOptions {
   baseUrl: string;
@@ -63,9 +63,9 @@ export class RouterSandboxProvider implements SandboxProvider {
   readonly #headers: Record<string, string>;
 
   readonly files: SandboxFileApi = {
-    read: async (input) => this.readFile(input),
-    write: async (input) => this.writeFile(input),
-    list: async (input) => this.listFiles(input),
+    read: async (input, options) => this.readFile(input, options),
+    write: async (input, options) => this.writeFile(input, options),
+    list: async (input, options) => this.listFiles(input, options),
   };
 
   constructor(options: RouterSandboxProviderOptions) {
@@ -82,8 +82,9 @@ export class RouterSandboxProvider implements SandboxProvider {
     this.#headers = options.headers ?? {};
   }
 
-  async create(input: SandboxCreateInput): Promise<SandboxHandle> {
+  async create(input: SandboxCreateInput, options: SandboxOperationOptions = {}): Promise<SandboxHandle> {
     const parsed = SandboxCreateInputSchema.parse(input);
+    options.signal?.throwIfAborted();
     const payload = await this.#jsonRequest("/sandboxes", {
       method: "POST",
       body: {
@@ -91,6 +92,7 @@ export class RouterSandboxProvider implements SandboxProvider {
         provider_hint: this.#providerHint,
         contract_version: this.#contractVersion,
       },
+      signal: options.signal,
     });
     const rawSandbox = unwrapRecord(payload, "sandbox");
     return SandboxHandleSchema.parse({
@@ -159,10 +161,11 @@ export class RouterSandboxProvider implements SandboxProvider {
     });
   }
 
-  async readFile(input: SandboxFileReadInput): Promise<SandboxFileReadResult> {
+  async readFile(input: SandboxFileReadInput, options: SandboxOperationOptions = {}): Promise<SandboxFileReadResult> {
     const parsed = SandboxFileReadInputSchema.parse(input);
     const payload = await this.#jsonRequest(filePath(parsed.sandbox_id, parsed.path, { encoding: parsed.encoding }), {
       method: "GET",
+      signal: options.signal,
     });
     const rawFile = unwrapRecord(payload, "file");
     const content = stringField(rawFile, "content") ?? "";
@@ -176,7 +179,7 @@ export class RouterSandboxProvider implements SandboxProvider {
     });
   }
 
-  async writeFile(input: SandboxFileWriteInput): Promise<SandboxFileWriteResult> {
+  async writeFile(input: SandboxFileWriteInput, options: SandboxOperationOptions = {}): Promise<SandboxFileWriteResult> {
     const parsed = SandboxFileWriteInputSchema.parse(input);
     const payload = await this.#jsonRequest(filePath(parsed.sandbox_id, parsed.path), {
       method: "PUT",
@@ -185,6 +188,7 @@ export class RouterSandboxProvider implements SandboxProvider {
         content: parsed.content,
         mode: parsed.mode,
       },
+      signal: options.signal,
     });
     const rawFile = unwrapRecord(payload, "file");
     return SandboxFileWriteResultSchema.parse({
@@ -195,10 +199,11 @@ export class RouterSandboxProvider implements SandboxProvider {
     });
   }
 
-  async listFiles(input: SandboxFileListInput): Promise<SandboxFileListResult> {
+  async listFiles(input: SandboxFileListInput, options: SandboxOperationOptions = {}): Promise<SandboxFileListResult> {
     const parsed = SandboxFileListInputSchema.parse(input);
     const payload = await this.#jsonRequest(filePath(parsed.sandbox_id, parsed.path, { list: "true", recursive: String(parsed.recursive) }), {
       method: "GET",
+      signal: options.signal,
     });
     const rawList = unwrapRecord(payload, "list");
     return SandboxFileListResultSchema.parse({

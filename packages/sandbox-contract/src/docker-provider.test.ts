@@ -11,21 +11,24 @@ import { collectSandboxExecEvents } from "./provider.js";
 const tenantId = "00000000-0000-7000-8000-000000000001";
 
 class FakeDockerExecutor implements DockerCommandExecutor {
-  readonly runs: Array<{ args: readonly string[]; stdin?: string | Buffer | undefined }> = [];
-  readonly streams: Array<{ args: readonly string[]; stdin?: string | Buffer | undefined }> = [];
+  readonly runs: Array<{ args: readonly string[]; stdin?: string | Buffer | undefined; signal?: AbortSignal | undefined }> = [];
+  readonly streams: Array<{ args: readonly string[]; stdin?: string | Buffer | undefined; signal?: AbortSignal | undefined }> = [];
   nextRun: DockerCommandResult[] = [];
   nextStream: DockerStreamEvent[] = [
     { stream: "stdout", data: "ok\n" },
     { stream: "exit", exitCode: 0 },
   ];
+  onRun: ((args: readonly string[]) => void | Promise<void>) | undefined;
 
-  async run(args: readonly string[], options: { stdin?: string | Buffer | undefined } = {}): Promise<DockerCommandResult> {
-    this.runs.push({ args, stdin: options.stdin });
-    return this.nextRun.shift() ?? { stdout: "", stderr: "", exitCode: 0 };
+  async run(args: readonly string[], options: { stdin?: string | Buffer | undefined; signal?: AbortSignal | undefined } = {}): Promise<DockerCommandResult> {
+    this.runs.push({ args, stdin: options.stdin, signal: options.signal });
+    const result = this.nextRun.shift() ?? { stdout: "", stderr: "", exitCode: 0 };
+    await this.onRun?.(args);
+    return result;
   }
 
-  async *stream(args: readonly string[], options: { stdin?: string | Buffer | undefined } = {}): AsyncIterable<DockerStreamEvent> {
-    this.streams.push({ args, stdin: options.stdin });
+  async *stream(args: readonly string[], options: { stdin?: string | Buffer | undefined; signal?: AbortSignal | undefined } = {}): AsyncIterable<DockerStreamEvent> {
+    this.streams.push({ args, stdin: options.stdin, signal: options.signal });
     for (const event of this.nextStream) yield event;
   }
 }
@@ -202,5 +205,92 @@ describe("DockerSandboxProvider", () => {
       "--",
       "/workspace/binary.pdf",
     ]);
+  });
+
+  it("forwards the operation signal to Docker creation and file commands", async () => {
+    const executor = new FakeDockerExecutor();
+    executor.nextRun = [
+      { stdout: "container_signal\n", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "hello", stderr: "", exitCode: 0 },
+    ];
+    const provider = new DockerSandboxProvider({ executor, imageAllowlist: ["berry/python:*"] });
+    const controller = new AbortController();
+    const sandbox = await provider.create(
+      { request_id: "req_signal", tenant_id: tenantId, image: "berry/python:3.12" },
+      { signal: controller.signal },
+    );
+
+    await provider.files.read({ sandbox_id: sandbox.sandbox_id, path: "/workspace/a.txt" }, { signal: controller.signal });
+
+    expect(executor.runs[0]?.signal).toBe(controller.signal);
+    expect(executor.runs[1]?.signal).toBe(controller.signal);
+    expect(executor.runs[2]?.signal).toBe(controller.signal);
+  });
+
+  it("removes a created container when cancellation arrives before start", async () => {
+    const executor = new FakeDockerExecutor();
+    executor.nextRun = [
+      { stdout: "container_cancelled\n", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ];
+    const controller = new AbortController();
+    executor.onRun = (args) => {
+      if (args[0] === "create") controller.abort(new Error("cancel creation"));
+    };
+    const provider = new DockerSandboxProvider({ executor, imageAllowlist: ["berry/python:*"] });
+
+    await expect(provider.create(
+      { request_id: "req_cancel", tenant_id: tenantId, image: "berry/python:3.12" },
+      { signal: controller.signal },
+    )).rejects.toThrow("cancel creation");
+
+    expect(executor.runs.map(({ args }) => args)).toEqual([
+      expect.arrayContaining(["create", "--name", "berry-sandbox-req_cancel"]),
+      ["rm", "-f", "berry-sandbox-req_cancel"],
+    ]);
+    expect(executor.runs[1]?.signal).toBeUndefined();
+  });
+
+  it("does not delete a pre-existing container when cancellation rejects an ambiguous create", async () => {
+    const executor = new FakeDockerExecutor();
+    executor.nextRun = [{
+      stdout: "",
+      stderr: "Conflict: the container name berry-sandbox-req_in_flight_cancel is already in use",
+      exitCode: 1,
+    }];
+    const controller = new AbortController();
+    executor.onRun = (args) => {
+      if (args[0] !== "create") return;
+      controller.abort(new Error("cancel in-flight creation"));
+    };
+    const provider = new DockerSandboxProvider({ executor, imageAllowlist: ["berry/python:*"] });
+
+    await expect(provider.create(
+      { request_id: "req_in_flight_cancel", tenant_id: tenantId, image: "berry/python:3.12" },
+      { signal: controller.signal },
+    )).rejects.toThrow("already in use");
+
+    expect(executor.runs.map(({ args }) => args)).toEqual([
+      expect.arrayContaining(["create", "--name", "berry-sandbox-req_in_flight_cancel"]),
+    ]);
+  });
+
+  it("removes a created container when start fails", async () => {
+    const executor = new FakeDockerExecutor();
+    executor.nextRun = [
+      { stdout: "container_failed_start\n", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "start failed", exitCode: 1 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ];
+    const provider = new DockerSandboxProvider({ executor, imageAllowlist: ["berry/python:*"] });
+
+    await expect(provider.create({
+      request_id: "req_start_failure",
+      tenant_id: tenantId,
+      image: "berry/python:3.12",
+    })).rejects.toThrow("start failed");
+
+    expect(executor.runs[2]?.args).toEqual(["rm", "-f", "berry-sandbox-req_start_failure"]);
   });
 });

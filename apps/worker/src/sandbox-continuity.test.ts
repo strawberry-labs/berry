@@ -18,6 +18,121 @@ import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 describe("SandboxContinuityManager", () => {
+  it("keeps core reads non-abortable while repository and object-store seams lack signals", () => {
+    const manager = new SandboxContinuityManager({ kind: "e2b" } as SandboxProvider, {} as SandboxSnapshotRepository, null, { image: "berry-sandbox" });
+
+    expect(manager.supportsAbort(snapshot(), lsStep())).toBe(false);
+    expect(manager.supportsAbort(snapshot(), toolStep("grep", { path: "/workspace", pattern: "result" }))).toBe(false);
+    expect(manager.supportsAbort(snapshot(), toolStep("write", { path: "/workspace/file.txt", content: "x" }))).toBe(false);
+    expect(manager.supportsAbort(snapshot(), toolStep("bash", { command: "sleep 1" }))).toBe(false);
+  });
+
+  it("does not claim settlement while a repository read remains blocked after abort", async () => {
+    let releaseLatest!: () => void;
+    const latest = vi.fn(() => new Promise<null>((resolve) => {
+      releaseLatest = () => resolve(null);
+    }));
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async (_input: unknown, options?: { signal?: AbortSignal | undefined }) => {
+        options?.signal?.throwIfAborted();
+        return { sandbox_id: "sandbox-repository-blocked", provider: "e2b", status: "running" as const };
+      }),
+      files: {
+        list: vi.fn(),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest,
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+    const controller = new AbortController();
+    let settled = false;
+    const execution = manager.execute(snapshot(), lsStep(), controller.signal);
+    void execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(1));
+
+    controller.abort(new Error("cancel blocked repository read"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    releaseLatest();
+    await expect(execution).rejects.toThrow("cancel blocked repository read");
+  });
+
+  it("does not claim settlement while snapshot-object loading remains blocked after abort", async () => {
+    let releaseObject!: () => void;
+    const get = vi.fn(() => new Promise<Uint8Array>((resolve) => {
+      releaseObject = () => resolve(Buffer.from(JSON.stringify({
+        version: 1,
+        createdAt: new Date().toISOString(),
+        files: [],
+      })));
+    }));
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({
+        sandbox_id: "sandbox-object-blocked",
+        provider: "e2b",
+        status: "running" as const,
+      })),
+      files: {
+        list: vi.fn(),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => ({
+        id: "snapshot-object-blocked",
+        objectKey: "snapshot-object-blocked.json",
+        contentHash: "hash",
+        sequence: 1,
+      })),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get,
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const controller = new AbortController();
+    let settled = false;
+    const execution = manager.execute(snapshot(), lsStep(), controller.signal);
+    void execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+
+    controller.abort(new Error("cancel blocked object read"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    releaseObject();
+    await expect(execution).rejects.toThrow("cancel blocked object read");
+  });
+
   it("creates one sandbox when independent first-use reads start concurrently", async () => {
     let releaseCreate!: () => void;
     const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
@@ -52,6 +167,42 @@ describe("SandboxContinuityManager", () => {
 
     await expect(Promise.all([first, second])).resolves.toHaveLength(2);
     expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards cancellation to first-use sandbox creation", async () => {
+    const create = vi.fn(async (
+      _input: unknown,
+      options?: { signal?: AbortSignal | undefined },
+    ) => new Promise<never>((_resolve, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+    }));
+    const provider = {
+      kind: "e2b",
+      create,
+      files: {
+        list: vi.fn(),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+    const controller = new AbortController();
+    const execution = manager.execute(snapshot(), lsStep(), controller.signal);
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+
+    controller.abort(new Error("cancel first-use creation"));
+
+    await expect(execution).rejects.toThrow("cancel first-use creation");
+    expect(create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal });
   });
 
   it("pauses a terminal E2B sandbox after preserving its durable snapshot", async () => {
@@ -2572,7 +2723,7 @@ describe("SandboxContinuityManager", () => {
     expect(cached).toEqual(second);
     expect(first.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
     expect(second.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
-    expect(write).toHaveBeenCalledTimes(5);
+    expect(write).toHaveBeenCalledTimes(3);
   });
 
   it("writes large organization skill resources as bytes without base64 or shell-command amplification", async () => {
@@ -2600,10 +2751,38 @@ describe("SandboxContinuityManager", () => {
 
     expect(writeBytes).toHaveBeenCalledTimes(2);
     expect(writeBytes.mock.calls[1]?.[0].content).toBe(large);
-    expect(write).toHaveBeenCalledTimes(1);
-    expect(write.mock.calls[0]?.[0].path).toMatch(/\.berry-staged-files\.json$/);
+    expect(write).not.toHaveBeenCalled();
     expect(staged.filePath).toMatch(/^\/workspace\/runtime-skills\//);
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("stages a fresh explicit resource with SKILL.md in one batch and no probes", async () => {
+    const read = vi.fn(async () => { throw new Error("read probe should not run"); });
+    const writeManyBytes = vi.fn(async (input: { files: Array<{ path: string; content: Uint8Array }> }) => (
+      input.files.map((file) => ({ path: file.path, size_bytes: file.content.byteLength, mtime: null }))
+    ));
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read,
+      write: vi.fn(),
+      writeManyBytes,
+    });
+    const files = [
+      { path: "SKILL.md", contentBytes: Buffer.from("---\nname: fresh\ndescription: Fresh\n---\n") },
+      { path: "references/guide.md", contentBytes: Buffer.from("guide") },
+    ];
+
+    const staged = await manager.stageSkillPackage(snapshot(), "fresh", files, {
+      resourcePaths: ["references/guide.md"],
+    });
+
+    expect(staged.stagedResources).toEqual([expect.stringMatching(/references\/guide\.md$/)]);
+    expect(writeManyBytes).toHaveBeenCalledTimes(1);
+    expect(writeManyBytes.mock.calls[0]?.[0].files.map((file) => file.path)).toEqual([
+      expect.stringMatching(/SKILL\.md$/),
+      expect.stringMatching(/references\/guide\.md$/),
+    ]);
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("does not load database-backed resource bytes again on a follow-up run in the same sandbox", async () => {
@@ -2635,9 +2814,10 @@ describe("SandboxContinuityManager", () => {
     const second = await managerWithProvider(fileApi).stageSkillPackage(snapshot(), "cached", files);
 
     expect(second).toEqual(first);
-    expect(loadContentBytes).toHaveBeenCalledTimes(1);
-    expect(writeBytes).toHaveBeenCalledTimes(2);
-    expect(write).toHaveBeenCalledTimes(1);
+    expect(loadContentBytes).toHaveBeenCalledTimes(2);
+    expect(writeBytes).toHaveBeenCalledTimes(4);
+    expect(write).not.toHaveBeenCalled();
+    expect(fileApi.read).not.toHaveBeenCalled();
   });
 
   it("restages package files when durable activation state belongs to a replaced sandbox", async () => {
@@ -2739,7 +2919,7 @@ describe("SandboxContinuityManager", () => {
     ]);
     expect(loadContentBytes).toHaveBeenNthCalledWith(1, ["scripts/build.py"]);
     expect(loadContentBytes).toHaveBeenNthCalledWith(2, ["assets/template.docx"]);
-    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).not.toHaveBeenCalled();
     expect(writeManyBytes).toHaveBeenCalledTimes(3);
     expect(writeManyBytes.mock.calls[0]?.[0].files).toHaveLength(1);
     expect(writeManyBytes.mock.calls[1]?.[0].files).toHaveLength(1);

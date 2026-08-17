@@ -39,12 +39,20 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     return this.base.definitions?.(snapshot) ?? [];
   }
 
-  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
-    return this.base.modelContent?.(snapshot) ?? [];
+  async modelContent(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]> {
+    return this.base.modelContent?.(snapshot, signal, reportProgress) ?? [];
   }
 
-  async stageAssociatedInputFiles(snapshot: DurableTurnSnapshot, fileIds: readonly string[]) {
-    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds) ?? [];
+  async stageAssociatedInputFiles(
+    snapshot: DurableTurnSnapshot,
+    fileIds: readonly string[],
+    options?: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined },
+  ) {
+    return this.base.stageAssociatedInputFiles?.(snapshot, fileIds, options) ?? [];
   }
 
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
@@ -66,6 +74,13 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     return this.base.policy?.(snapshot, toolName, permissionMode);
   }
 
+  supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    if (toolName === "activate_skill") return true;
+    if (toolName === "save_personal_skill") return false;
+    return this.base.supportsAbort?.(snapshot, step) === true;
+  }
+
   async execute(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
@@ -73,9 +88,9 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     reportProgress?: () => void,
   ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (toolName === "activate_skill") return this.activateSkill(snapshot, step);
+    if (toolName === "activate_skill") return this.activateSkill(snapshot, step, { signal, reportProgress });
     if (DIRECT_FILE_TOOLS.has(toolName)) {
-      await this.materializeKnownResourceForDirectFileTool(snapshot, step);
+      this.rejectKnownDeferredResourceForDirectFileTool(snapshot, step);
     }
     if (toolName !== "save_personal_skill") {
       return signal || reportProgress
@@ -205,7 +220,11 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     return [{ path: "SKILL.md", contentBase64: Buffer.from(content, "utf8").toString("base64"), mode: 0o644 }];
   }
 
-  private async activateSkill(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
+  private async activateSkill(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined } = {},
+  ): Promise<TurnToolResult> {
     const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
     const parsedInput = ActivateStoredSkillInputSchema.safeParse(step.input.arguments ?? {});
     if (!parsedInput.success) {
@@ -215,16 +234,30 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const requestedResources = [...new Set(parsedInput.data.resources ?? [])];
     const skill = runtime.extraSkills.find((candidate) => candidate.name === requestedName);
     if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}`);
-    const alreadyActive = snapshot.steps.some((candidate) => candidate.id !== step.id
+    const previousActivation = [...snapshot.steps].reverse().find((candidate) => candidate.id !== step.id
       && candidate.state === "completed"
       && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill"
       && stringValue((candidate.input.arguments as Record<string, unknown> | undefined)?.name) === skill.name);
 
+    const alreadyActive = previousActivation !== undefined;
+    if (requestedResources.length === 0) {
+      const prior = reusableActivationState(previousActivation?.output, skill, snapshot.sandboxId);
+      if (prior) {
+        return renderActivationResult(skill, {
+          ...prior,
+          alreadyActive: true,
+          requestedResources,
+        });
+      }
+    }
+
     const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
+    options.signal?.throwIfAborted();
     const rows = await this.inTenant(snapshot.tenantId, (executor) => personalId
       ? executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path", [personalId])
       : executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM organization_skill_files WHERE organization_capability_id=$1 ORDER BY path", [organizationId]));
+    options.signal?.throwIfAborted();
     const packageRecordId = personalId ?? organizationId!;
     const packageTable = personalId ? "personal_skill_files" : "organization_skill_files";
     const packageForeignKey = personalId ? "skill_id" : "organization_capability_id";
@@ -233,6 +266,18 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     if (unknownResources.length > 0) {
       throw new Error(`Unknown ${skill.name} resource${unknownResources.length === 1 ? "" : "s"}: ${unknownResources.join(", ")}`);
     }
+    if (requestedResources.length === 0) {
+      return renderActivationResult(skill, {
+        alreadyActive,
+        requestedResources,
+        location: skill.filePath,
+        availableResources,
+        deferredResources: availableResources,
+        stagedRelativeResources: [],
+        stagedResourcePaths: [],
+      });
+    }
+
     const files: DurableSkillPackageFile[] = [
       { path: "SKILL.md", contentBytes: Buffer.from(skill.content, "utf8"), mode: 0o644 },
       ...rows.map((row) => ({
@@ -249,6 +294,7 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
         `SELECT path,content FROM ${packageTable} WHERE ${packageForeignKey}=$1 AND path=ANY($2::text[])`,
         [packageRecordId, [...paths]],
       ));
+      options.signal?.throwIfAborted();
       const byPath = new Map<string, Uint8Array>(loaded.map((row) => [row.path, row.content]));
       const missing = paths.filter((path) => !byPath.has(path));
       if (missing.length > 0) throw new Error(`Stored skill resource is missing: ${missing.join(", ")}`);
@@ -258,9 +304,13 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       snapshot,
       personalId ?? organizationId ?? skill.name,
       files,
-      { resourcePaths: requestedResources, loadContentBytes },
+      {
+        resourcePaths: requestedResources,
+        loadContentBytes,
+        signal: options.signal,
+        reportProgress: options.reportProgress,
+      },
     );
-    const activeSkill = { ...skill, filePath: staged.filePath, resources: availableResources };
     const skillDirectory = staged.filePath.slice(0, -"/SKILL.md".length);
     const stagedResourcePaths = staged.stagedResources;
     const stagedPathSet = new Set(stagedResourcePaths);
@@ -269,69 +319,32 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     );
     const stagedRelativeSet = new Set(stagedRelativeResources);
     const deferredResources = availableResources.filter((path) => !stagedRelativeSet.has(path));
-    const resourceState = formatSkillResourceState({
-      name: skill.name,
+    return renderActivationResult(skill, {
+      alreadyActive,
+      requestedResources,
       location: staged.filePath,
-      directory: skillDirectory,
+      availableResources,
+      deferredResources,
       stagedRelativeResources,
       stagedResourcePaths,
-      deferredResources,
+      stagingSandboxId: staged.stagingSandboxId,
     });
-    const invocation = alreadyActive
-      ? `<skill_already_active name=${JSON.stringify(skill.name)} />`
-      : formatSkillInvocation(activeSkill, requestedResources.length > 0
-          ? `The requested resource files are materialized under ${skillDirectory}. Use only the exact paths needed for this task.`
-          : "Load only resources required for the current task.");
-    const content = `${invocation}\n${resourceState}\n${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
-    const summary = requestedResources.length > 0
-      ? `Loaded ${requestedResources.length} ${skill.name} resource file${requestedResources.length === 1 ? "" : "s"}`
-      : `Activated ${skill.name}; ${availableResources.length} resource file${availableResources.length === 1 ? "" : "s"} available on demand`;
-    return {
-      output: {
-        skill: skill.name,
-        alreadyActive,
-        location: staged.filePath,
-        directory: skillDirectory,
-        availableResources,
-        deferredResources,
-        stagedRelativeResources,
-        stagedResources: stagedResourcePaths,
-        stagedResourcePaths,
-        stagingSandboxId: staged.stagingSandboxId,
-        content,
-      },
-      summary,
-    };
   }
 
-  private async materializeKnownResourceForDirectFileTool(
+  private rejectKnownDeferredResourceForDirectFileTool(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
-  ): Promise<void> {
+  ): void {
     const input = step.input.arguments as Record<string, unknown> | undefined;
     const requestedPath = stringValue(input?.path);
     if (!requestedPath) return;
     const known = knownDeferredSkillResource(snapshot, requestedPath);
     if (!known) return;
-    if (!this.base.stageSkillPackage) {
-      throw new ResourceNotStagedError(known.skill, known.relativePath, "skill package workspace access is unavailable");
-    }
-    try {
-      await this.activateSkill(snapshot, {
-        ...step,
-        id: `${step.id}:materialize:${createHash("sha256").update(known.relativePath).digest("hex").slice(0, 12)}`,
-        type: "tool.activate_skill",
-        input: {
-          ...step.input,
-          toolName: "activate_skill",
-          arguments: { name: known.skill, resources: [known.relativePath] },
-        },
-      });
-    } catch (error) {
-      if (error instanceof ResourceNotStagedError) throw error;
-      const message = error instanceof Error ? error.message : String(error);
-      throw new ResourceNotStagedError(known.skill, known.relativePath, message);
-    }
+    throw new ResourceNotStagedError(
+      known.skill,
+      known.relativePath,
+      `Call activate_skill with ${JSON.stringify({ name: known.skill, resources: [known.relativePath] })} before reading this deferred resource`,
+    );
   }
 
   private async inTenant<T>(tenantId: string, operation: (executor: SqlExecutor) => Promise<T>): Promise<T> {
@@ -349,6 +362,135 @@ export class ResourceNotStagedError extends Error {
   }
 }
 
+interface SkillActivationState {
+  alreadyActive: boolean;
+  requestedResources: readonly string[];
+  location: string;
+  availableResources: string[];
+  deferredResources: string[];
+  stagedRelativeResources: string[];
+  stagedResourcePaths: string[];
+  stagingSandboxId?: string | undefined;
+}
+
+function renderActivationResult(skill: {
+  name: string;
+  description: string;
+  content: string;
+  filePath: string;
+  resources?: string[];
+}, state: SkillActivationState): TurnToolResult {
+  const directory = skillDirectoryFromLocation(state.location);
+  if (!directory) throw new Error(`Stored skill activation has an invalid location: ${state.location}`);
+  const activeSkill = { ...skill, filePath: state.location, resources: state.availableResources };
+  const resourceState = formatSkillResourceState({
+    name: skill.name,
+    location: state.location,
+    directory,
+    stagedRelativeResources: state.stagedRelativeResources,
+    stagedResourcePaths: state.stagedResourcePaths,
+    deferredResources: state.deferredResources,
+  });
+  const invocation = state.alreadyActive
+    ? `<skill_already_active name=${JSON.stringify(skill.name)} />`
+    : formatSkillInvocation(activeSkill, state.requestedResources.length > 0
+        ? `The requested resource files are materialized under ${directory}. Use only the exact paths needed for this task.`
+        : "Load only resources required for the current task.");
+  const content = `${invocation}\n${resourceState}\n${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
+  const summary = state.requestedResources.length > 0
+    ? `Loaded ${state.requestedResources.length} ${skill.name} resource file${state.requestedResources.length === 1 ? "" : "s"}`
+    : `Activated ${skill.name}; ${state.availableResources.length} resource file${state.availableResources.length === 1 ? "" : "s"} available on demand`;
+  return {
+    output: {
+      skill: skill.name,
+      alreadyActive: state.alreadyActive,
+      location: state.location,
+      directory,
+      availableResources: state.availableResources,
+      deferredResources: state.deferredResources,
+      stagedRelativeResources: state.stagedRelativeResources,
+      stagedResources: state.stagedResourcePaths,
+      stagedResourcePaths: state.stagedResourcePaths,
+      ...(state.stagingSandboxId === undefined ? {} : { stagingSandboxId: state.stagingSandboxId }),
+      content,
+    },
+    summary,
+  };
+}
+
+function reusableActivationState(
+  output: unknown,
+  skill: { name: string; filePath: string; resources?: string[] },
+  currentSandboxId: string | null | undefined,
+): Omit<SkillActivationState, "alreadyActive" | "requestedResources"> | null {
+  const value = record(output);
+  if (!value || stringValue(value.skill) !== skill.name) return null;
+  const availableResources = stringArray(value.availableResources);
+  const runtimeResources = relativeRuntimeSkillResources(skill);
+  if (!runtimeResources || !sameStringSet(availableResources, runtimeResources)) return null;
+  const stagingSandboxId = stringValue(value.stagingSandboxId) ?? undefined;
+  if (stagingSandboxId !== undefined && stagingSandboxId !== currentSandboxId) {
+    return {
+      location: skill.filePath,
+      availableResources,
+      deferredResources: availableResources,
+      stagedRelativeResources: [],
+      stagedResourcePaths: [],
+      stagingSandboxId: undefined,
+    };
+  }
+  const location = stringValue(value.location);
+  const directory = skillDirectoryFromLocation(location);
+  if (!location || !directory || !trustedSkillLocation(location, skill.filePath)) return null;
+  const deferredResources = stringArray(value.deferredResources);
+  const stagedRelativeResources = stringArray(value.stagedRelativeResources);
+  const stagedResourcePaths = stringArray(value.stagedResourcePaths ?? value.stagedResources);
+  if (stagingSandboxId === undefined && (stagedRelativeResources.length > 0 || stagedResourcePaths.length > 0)) return null;
+  if (deferredResources.some((path) => !availableResources.includes(path))) return null;
+  if (stagedRelativeResources.some((path) => !availableResources.includes(path))) return null;
+  if (stagedResourcePaths.some((path) => !stagedRelativeResources.includes(path.slice(directory.length + 1)) || path !== `${directory}/${path.slice(directory.length + 1)}`)) return null;
+  return {
+    location,
+    availableResources,
+    deferredResources,
+    stagedRelativeResources,
+    stagedResourcePaths,
+    stagingSandboxId,
+  };
+}
+
+function trustedSkillLocation(location: string, storedLocation: string): boolean {
+  if (location === storedLocation) return true;
+  const directory = skillDirectoryFromLocation(location);
+  return directory !== null && /^\/(?:[^/]+\/)*runtime-skills\/[A-Za-z0-9._-]+-[a-f0-9]{16}$/.test(directory);
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  const normalize = (values: readonly string[]) => [...new Set(values)].sort();
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
+}
+
+function relativeRuntimeSkillResources(skill: { filePath: string; resources?: string[] }): string[] | null {
+  const directory = skillDirectoryFromLocation(skill.filePath);
+  if (!directory) return null;
+  const prefix = `${directory}/`;
+  const relativeResources: string[] = [];
+  for (const absolutePath of skill.resources ?? []) {
+    if (!absolutePath.startsWith(prefix)) return null;
+    const relativePath = absolutePath.slice(prefix.length);
+    const parts = relativePath.split("/");
+    if (
+      !relativePath
+      || relativePath.length > 512
+      || relativePath.includes("\\")
+      || relativePath.includes("\0")
+      || parts.some((part) => !part || part === "." || part === "..")
+    ) return null;
+    relativeResources.push(relativePath);
+  }
+  return relativeResources;
+}
+
 function knownDeferredSkillResource(
   snapshot: DurableTurnSnapshot,
   requestedPath: string,
@@ -364,10 +506,12 @@ function knownDeferredSkillResource(
       ?? skillDirectoryFromLocation(stringValue(output?.location));
     const availableResources = stringArray(output?.availableResources);
     if (!skill || !directory || availableResources.length === 0) continue;
-    const stagedResources = new Set([
+    const stagingSandboxId = stringValue(output?.stagingSandboxId);
+    const stagingStateIsCurrent = stagingSandboxId !== null && stagingSandboxId === snapshot.sandboxId;
+    const stagedResources = new Set(stagingStateIsCurrent ? [
       ...stringArray(output?.stagedResources),
       ...stringArray(output?.stagedResourcePaths),
-    ]);
+    ] : []);
     for (const relativePath of availableResources) {
       const absolutePath = `${directory}/${relativePath}`;
       if (requestedPath === absolutePath) {

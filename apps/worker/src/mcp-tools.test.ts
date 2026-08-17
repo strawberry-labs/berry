@@ -12,6 +12,29 @@ import {
 } from "./mcp-tools.js";
 
 describe("durable MCP tool exposure", () => {
+  it("declares connector abort support, keeps discovery non-abortable, and delegates core tools", () => {
+    const baseSupportsAbort = vi.fn(() => true);
+    const tools = new DurableMcpToolExecutor({
+      supportsAbort: baseSupportsAbort,
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+    }, connectorServers(), undefined);
+    const snapshot = mcpSnapshot("List my calendar events");
+
+    expect(tools.supportsAbort(snapshot, {
+      type: "tool.mcp__Google_Calendar__list_events",
+      input: { toolName: "mcp__Google_Calendar__list_events", arguments: {} },
+    } as never)).toBe(false);
+    expect(tools.supportsAbort(snapshot, {
+      type: "tool.tool_search",
+      input: { toolName: "tool_search", arguments: { query: "calendar" } },
+    } as never)).toBe(false);
+    expect(tools.supportsAbort(snapshot, {
+      type: "tool.read",
+      input: { toolName: "read", arguments: { path: "/workspace/file.txt" } },
+    } as never)).toBe(true);
+    expect(baseSupportsAbort).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes only the relevant calendar connector plus core and lazy discovery tools", async () => {
     const inherited: ChatToolDefinition = {
       type: "function",

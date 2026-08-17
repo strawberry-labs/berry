@@ -29,7 +29,7 @@ import {
   type SandboxFileWriteResult,
   type SandboxHandle,
 } from "./schemas.js";
-import type { SandboxFileApi, SandboxFileWriteBytesInput, SandboxProvider } from "./provider.js";
+import type { SandboxFileApi, SandboxFileWriteBytesInput, SandboxOperationOptions, SandboxProvider } from "./provider.js";
 
 export interface DockerCommandResult {
   stdout: string;
@@ -62,10 +62,10 @@ export class DockerSandboxProvider implements SandboxProvider {
   readonly #containers = new Map<string, SandboxHandle>();
 
   readonly files: SandboxFileApi = {
-    read: async (input) => this.readFile(input),
-    write: async (input) => this.writeFile(input),
-    writeBytes: async (input) => this.writeFileBytes(input),
-    list: async (input) => this.listFiles(input),
+    read: async (input, options) => this.readFile(input, options),
+    write: async (input, options) => this.writeFile(input, options),
+    writeBytes: async (input, options) => this.writeFileBytes(input, options),
+    list: async (input, options) => this.listFiles(input, options),
   };
 
   constructor(options: DockerSandboxProviderOptions) {
@@ -76,8 +76,9 @@ export class DockerSandboxProvider implements SandboxProvider {
     this.#now = options.now ?? (() => new Date());
   }
 
-  async create(input: SandboxCreateInput): Promise<SandboxHandle> {
+  async create(input: SandboxCreateInput, options: SandboxOperationOptions = {}): Promise<SandboxHandle> {
     const parsed = SandboxCreateInputSchema.parse(input);
+    options.signal?.throwIfAborted();
     if (!imageAllowed(parsed.image, this.#imageAllowlist)) {
       throw new Error(`Docker image is not allowlisted: ${parsed.image}`);
     }
@@ -103,28 +104,38 @@ export class DockerSandboxProvider implements SandboxProvider {
       "sleep",
       "infinity",
     ];
-    const create = await this.#executor.run(args);
-    assertDockerOk(create, "create sandbox");
-    await assertDockerOk(await this.#executor.run(["start", containerName]), "start sandbox");
-    const sandbox = SandboxHandleSchema.parse({
-      sandbox_id: create.stdout.trim() || containerName,
-      request_id: parsed.request_id,
-      tenant_id: parsed.tenant_id,
-      provider: "docker",
-      provider_kind: "docker",
-      status: "running",
-      image: parsed.image,
-      cwd: parsed.cwd,
-      created_at: createdAt.toISOString(),
-      expires_at: new Date(createdAt.getTime() + parsed.ttl_seconds * 1000).toISOString(),
-      metadata: {
-        containerName,
-        writable_roots: parsed.writable_roots,
-        network_policy: parsed.network_policy,
-      },
-    });
-    this.#containers.set(sandbox.sandbox_id, sandbox);
-    return sandbox;
+    let containerCreated = false;
+    try {
+      const create = await this.#executor.run(args, options);
+      assertDockerOk(create, "create sandbox");
+      containerCreated = true;
+      options.signal?.throwIfAborted();
+      await assertDockerOk(await this.#executor.run(["start", containerName], options), "start sandbox");
+      const sandbox = SandboxHandleSchema.parse({
+        sandbox_id: create.stdout.trim() || containerName,
+        request_id: parsed.request_id,
+        tenant_id: parsed.tenant_id,
+        provider: "docker",
+        provider_kind: "docker",
+        status: "running",
+        image: parsed.image,
+        cwd: parsed.cwd,
+        created_at: createdAt.toISOString(),
+        expires_at: new Date(createdAt.getTime() + parsed.ttl_seconds * 1000).toISOString(),
+        metadata: {
+          containerName,
+          writable_roots: parsed.writable_roots,
+          network_policy: parsed.network_policy,
+        },
+      });
+      this.#containers.set(sandbox.sandbox_id, sandbox);
+      return sandbox;
+    } catch (error) {
+      if (containerCreated) {
+        await this.#executor.run(["rm", "-f", containerName]).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   async *exec(input: SandboxExecInput, options: { signal?: AbortSignal | undefined } = {}): AsyncIterable<SandboxExecEvent> {
@@ -190,11 +201,11 @@ export class DockerSandboxProvider implements SandboxProvider {
     }
   }
 
-  async readFile(input: SandboxFileReadInput): Promise<SandboxFileReadResult> {
+  async readFile(input: SandboxFileReadInput, options: SandboxOperationOptions = {}): Promise<SandboxFileReadResult> {
     const parsed = SandboxFileReadInputSchema.parse(input);
     const result = await this.#executor.run(parsed.encoding === "base64"
       ? ["exec", this.#containerName(parsed.sandbox_id), "base64", "-w", "0", "--", parsed.path]
-      : ["exec", this.#containerName(parsed.sandbox_id), "cat", parsed.path]);
+      : ["exec", this.#containerName(parsed.sandbox_id), "cat", parsed.path], options);
     assertDockerOk(result, "read sandbox file");
     const content = result.stdout;
     return SandboxFileReadResultSchema.parse({
@@ -206,7 +217,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     });
   }
 
-  async writeFile(input: SandboxFileWriteInput): Promise<SandboxFileWriteResult> {
+  async writeFile(input: SandboxFileWriteInput, options: SandboxOperationOptions = {}): Promise<SandboxFileWriteResult> {
     const parsed = SandboxFileWriteInputSchema.parse(input);
     const content = parsed.encoding === "base64" ? Buffer.from(parsed.content, "base64") : parsed.content;
     const result = await this.#executor.run([
@@ -218,7 +229,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"",
       "berry-write",
       parsed.path,
-    ], { stdin: content });
+    ], { stdin: content, signal: options.signal });
     assertDockerOk(result, "write sandbox file");
     return SandboxFileWriteResultSchema.parse({
       path: parsed.path,
@@ -227,7 +238,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     });
   }
 
-  async writeFileBytes(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult> {
+  async writeFileBytes(input: SandboxFileWriteBytesInput, options: SandboxOperationOptions = {}): Promise<SandboxFileWriteResult> {
     const { content: _content, encoding: _encoding, ...parsed } = SandboxFileWriteInputSchema.parse({
       ...input,
       content: "",
@@ -239,10 +250,10 @@ export class DockerSandboxProvider implements SandboxProvider {
     const result = await this.#executor.run([
       "exec", "-i", this.#containerName(parsed.sandbox_id), "sh", "-lc",
       "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "berry-write", parsed.path,
-    ], { stdin: content });
+    ], { stdin: content, signal: options.signal });
     assertDockerOk(result, "write sandbox file");
     if (parsed.mode !== undefined) {
-      assertDockerOk(await this.#executor.run(["exec", this.#containerName(parsed.sandbox_id), "chmod", parsed.mode.toString(8), "--", parsed.path]), "set sandbox file mode");
+      assertDockerOk(await this.#executor.run(["exec", this.#containerName(parsed.sandbox_id), "chmod", parsed.mode.toString(8), "--", parsed.path], options), "set sandbox file mode");
     }
     return SandboxFileWriteResultSchema.parse({
       path: parsed.path,
@@ -251,7 +262,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     });
   }
 
-  async listFiles(input: SandboxFileListInput): Promise<SandboxFileListResult> {
+  async listFiles(input: SandboxFileListInput, options: SandboxOperationOptions = {}): Promise<SandboxFileListResult> {
     const parsed = SandboxFileListInputSchema.parse(input);
     const maxDepthArgs = parsed.recursive ? [] : ["-maxdepth", "1"];
     const result = await this.#executor.run([
@@ -262,7 +273,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       ...maxDepthArgs,
       "-printf",
       "%y\t%s\t%T@\t%p\n",
-    ]);
+    ], options);
     assertDockerOk(result, "list sandbox files");
     return SandboxFileListResultSchema.parse({
       path: parsed.path,

@@ -38,25 +38,29 @@ export interface SandboxFileWriteManyBytesInput {
   files: readonly Omit<SandboxFileWriteBytesInput, "sandbox_id">[];
 }
 
+export interface SandboxOperationOptions {
+  signal?: AbortSignal | undefined;
+}
+
 export interface SandboxFileApi {
-  read(input: SandboxFileReadInput, options?: { signal?: AbortSignal }): Promise<SandboxFileReadResult>;
-  write(input: SandboxFileWriteInput, options?: { signal?: AbortSignal }): Promise<SandboxFileWriteResult>;
+  read(input: SandboxFileReadInput, options?: SandboxOperationOptions): Promise<SandboxFileReadResult>;
+  write(input: SandboxFileWriteInput, options?: SandboxOperationOptions): Promise<SandboxFileWriteResult>;
   /**
    * Write binary content without first expanding it into a base64 string.
    * Providers that cannot transport bytes directly may omit this method; callers
    * must retain the base64 `write` fallback for contract compatibility.
    */
-  writeBytes?(input: SandboxFileWriteBytesInput): Promise<SandboxFileWriteResult>;
+  writeBytes?(input: SandboxFileWriteBytesInput, options?: SandboxOperationOptions): Promise<SandboxFileWriteResult>;
   /** Write several binary files in one provider operation when supported. */
-  writeManyBytes?(input: SandboxFileWriteManyBytesInput): Promise<SandboxFileWriteResult[]>;
-  list(input: SandboxFileListInput, options?: { signal?: AbortSignal }): Promise<SandboxFileListResult>;
+  writeManyBytes?(input: SandboxFileWriteManyBytesInput, options?: SandboxOperationOptions): Promise<SandboxFileWriteResult[]>;
+  list(input: SandboxFileListInput, options?: SandboxOperationOptions): Promise<SandboxFileListResult>;
 }
 
 export interface SandboxProvider {
   readonly kind: SandboxProviderKind;
   readonly supportsPause?: boolean;
   readonly supportsResume?: boolean;
-  create(input: SandboxCreateInput): Promise<SandboxHandle>;
+  create(input: SandboxCreateInput, options?: SandboxOperationOptions): Promise<SandboxHandle>;
   exec(input: SandboxExecInput, options?: { signal?: AbortSignal | undefined }): AsyncIterable<SandboxExecEvent>;
   readonly files: SandboxFileApi;
   exposePort(input: SandboxExposePortInput): Promise<SandboxExposePortResult>;
@@ -69,7 +73,7 @@ export interface SandboxProvider {
    * Explicitly resume a paused sandbox. Ordinary file, exec, and port calls
    * must not be used as implicit lifecycle transitions.
    */
-  resume?(input: SandboxResumeInput): Promise<SandboxHandle>;
+  resume?(input: SandboxResumeInput, options?: SandboxOperationOptions): Promise<SandboxHandle>;
   destroy(input: SandboxDestroyInput): Promise<SandboxDestroyResult>;
   dispose?(): Promise<void>;
 }

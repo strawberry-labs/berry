@@ -4,6 +4,9 @@ Berry treats sandbox activation as an explicit lifecycle transition. Reading
 state, polling jobs, compaction, memory extraction, and other maintenance work
 must not start or resume compute.
 
+Metadata-only `activate_skill` calls are also non-lifecycle operations; only an
+explicit resource request can trigger skill-package staging in a sandbox.
+
 | Turn condition | Sandbox action |
 | --- | --- |
 | No sandbox-backed tool has run | No sandbox exists; creation is lazy |

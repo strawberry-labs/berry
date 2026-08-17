@@ -31,8 +31,8 @@ enterprise-ready application surface.
 | 003 | Build the member and administrator Apps web experience | P1 | L | 002 | TODO |
 | 004 | Ship examples, end-to-end coverage, documentation, and deployment checks | P2 | M | 003 | TODO |
 
-Status values: `TODO`, `IN PROGRESS`, `DONE`, `BLOCKED (<reason>)`, or
-`REJECTED (<reason>)`.
+Status values: `TODO`, `IN PROGRESS`, `IN REVIEW`, `DONE`,
+`BLOCKED (<reason>)`, or `REJECTED (<reason>)`.
 
 ## Independent reliability stream
 
@@ -54,6 +54,48 @@ Plan 006 is self-contained in
 Plan 007 is self-contained in
 [`007-google-workspace-sso.md`](./007-google-workspace-sso.md).
 
+## E2B skill-activation regression stream
+
+These plans repair the production regression first introduced by dynamic skill
+staging and later exposed as exact 135-second tool failures. Execute them in
+order. They deliberately preserve dynamic database-backed organization skills;
+they do not bake tenant content into the E2B image.
+
+### Issue summary
+
+| Serial number | Issue | Layman | Explanation | Suggested solution |
+|---|---|---|---|---|
+| 1 | Dynamic skill activation became remote staging | Merely opening a skill can wait on a remote computer. | `d366c59` made every stored-skill activation call `stageSkillPackage`, including requests with no resources. | Return instructions and resource metadata from the database; touch E2B only for an explicit non-empty resource list. |
+| 2 | E2B file calls are not bounded correctly | A remote file read or write can get stuck until the outer watchdog fires. | Berry drops the turn signal and configured request timeout before E2B `getInfo`, `read`, `write`, `list`, and chmod operations. | Forward one operation signal and E2B's native request timeout through every provider file call; add no custom race. |
+| 3 | Cancellation stops at wrapper boundaries | Berry says stop, but the inner activation/upload keeps running. | `execute` receives a signal, while `activateSkill`, resource materialization, and `stageSkillPackage` omit it. | Thread the same signal through the personal-skill executor and staging options to the provider. |
+| 4 | The 135-second timeout is two stacked waits | A 120-second timeout appears to take 135 seconds. | The runner waits 120 seconds for idle timeout, then always allows up to 15 seconds for a promise that may not observe abort. | Make the file operation abort natively and reduce the post-abort settlement grace to a named 2-second default. |
+| 5 | Direct file tools hide staging side effects | A simple PDF/read action can secretly upload skill files first. | `read`, `grep`, `find`, and `ls` call automatic deferred-resource materialization added in `825c605`. | Remove hidden materialization; return `RESOURCE_NOT_STAGED` with the exact explicit activation call required. |
+| 6 | Abort acknowledgment is inferred, not observed | Logs can say a tool stopped when it is still running. | The runner uses `execute.length >= 3` as capability and persists that boolean as `abortAcknowledged`. | Add explicit per-tool abort capability and set acknowledgment only when the original promise actually settles. |
+| 7 | Failure-path regression coverage is incomplete | The happy path passed while hangs and ignored cancellation reached production. | Tests do not prove native signal/timeout forwarding, zero-call activation, or settled-versus-unsettled abort behavior. | Add deterministic deferred-promise tests at provider, skill, staging, decorator, and runner layers. |
+
+| Plan | Title | Priority | Effort | Depends on | Status |
+|------|-------|----------|--------|------------|--------|
+| 008 | Bound sandbox file operations with native cancellation | P1 | M | — | IN REVIEW |
+| 009 | Make skill activation metadata-only until resources are requested | P1 | M | 008 | IN REVIEW |
+| 010 | Make tool timeout and abort settlement truthful | P1 | M | 008, 009 | IN REVIEW |
+
+Plan 008 is self-contained in
+[`008-bound-sandbox-file-operations.md`](./008-bound-sandbox-file-operations.md).
+
+Plan 009 is self-contained in
+[`009-simplify-dynamic-skill-activation.md`](./009-simplify-dynamic-skill-activation.md).
+
+Plan 010 is self-contained in
+[`010-truthful-tool-timeout-settlement.md`](./010-truthful-tool-timeout-settlement.md).
+
+### Mandatory review gate for Plans 008–010
+
+- Executors must not commit, push, deploy, or open a PR.
+- Leave the verified changes in the working tree and request a code review.
+- A reviewer must inspect cancellation propagation, confirm that instructions-
+  only activation makes zero sandbox calls, and rerun every verification command.
+- Commit only after the operator explicitly approves the reviewed diff.
+
 ## Dependency notes
 
 - Plan 002 requires Plan 001 because app execution must use the extracted
@@ -63,6 +105,10 @@ Plan 007 is self-contained in
   the final shared schemas and API response types.
 - Plan 004 requires Plan 003 because it verifies the complete administrator
   import/publish flow and the member run/results flow.
+- Plan 009 requires Plan 008 so the remaining explicit resource upload is
+  bounded by E2B's native request timeout and the turn's `AbortSignal`.
+- Plan 010 requires Plans 008 and 009 so it declares abort support only after
+  every skill-staging file call actually observes the signal.
 
 ## Formal feature definition
 

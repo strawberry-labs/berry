@@ -42,11 +42,15 @@ not rewrite or remove its package files.
 
 The execution image contains interpreters, document libraries, fonts, and
 other generic dependencies only. It does not contain organization skills.
-When the agent calls `activate_skill`, the worker reads that package from
-organization storage and stages the same directory tree into a
-content-addressed task workspace. Relative references such as
+When the agent calls `activate_skill` without a `resources` list, the worker
+returns the stored `SKILL.md` instructions and resource metadata without
+creating or touching a sandbox. E2B is used only when the call explicitly
+names one or more resources; that request stages `SKILL.md` and the named
+files in one idempotent, content-addressed batch. Relative references such as
 `scripts/render.py`, `references/policy.md`, and `assets/template.docx` are
-resolved against that staged directory.
+resolved against that staged directory. `read`, `grep`, `find`, and `ls` never
+stage deferred files; they return `RESOURCE_NOT_STAGED` with the exact
+`activate_skill` call required.
 
 This keeps organization skills dynamic: installing or updating a package does
 not require rebuilding an execution image. The organization Skills viewer
@@ -74,7 +78,7 @@ Invalid folders appear as diagnostics in Settings but are not exposed to the age
 
 ## Use a skill
 
-At session start, Berry gives the model only each enabled skill's name and description. When a request matches, the model calls `activate_skill` to load the full `SKILL.md`. Referenced files are listed but loaded individually only when needed. Activated instructions remain available after conversation compaction, and repeated activation is suppressed.
+At session start, Berry gives the model only each enabled skill's name and description. When a request matches, the model calls `activate_skill` to load the full `SKILL.md`. Referenced files are listed but materialized only when an explicit `resources` list is supplied. Activated instructions remain available after conversation compaction, and repeated activation is suppressed.
 
 To force a skill for one request, start the message with its name:
 

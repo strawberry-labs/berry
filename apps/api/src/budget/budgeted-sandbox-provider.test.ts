@@ -9,11 +9,14 @@ import type {
   SandboxFileReadResult,
   SandboxFileWriteResult,
   SandboxHandle,
+  SandboxOperationOptions,
   SandboxProvider,
 } from "@berry/sandbox-contract";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BudgetService, InMemoryBudgetHotCounters, InMemoryBudgetRepository } from "./budget.service.ts";
 import { BudgetedSandboxProvider } from "./budgeted-sandbox-provider.ts";
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("BudgetedSandboxProvider", () => {
   it("blocks sandbox creation before provider spend when the hard limit is exceeded", async () => {
@@ -90,6 +93,46 @@ describe("BudgetedSandboxProvider", () => {
       feature: "sandbox.file.write",
       metadata: { sandbox_id: sandbox.sandbox_id, fileCount: 2, sizeBytes: 7 },
     }));
+  });
+
+  it("forwards operation options through lifecycle and file wrappers", async () => {
+    let now = Date.parse("2026-07-10T00:00:00.000Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now++);
+    const operationOptions: SandboxOperationOptions = { signal: new AbortController().signal };
+    const create = vi.fn(async () => handle());
+    const resume = vi.fn(async () => handle());
+    const underlying = fakeProvider({ create, resume, supportsResume: true });
+    const read = vi.spyOn(underlying.files, "read");
+    const write = vi.spyOn(underlying.files, "write");
+    const list = vi.spyOn(underlying.files, "list");
+    const writeBytes = vi.fn(async () => ({ path: "/workspace/a.bin", size_bytes: 1, mtime: "2026-07-10T00:00:00.000Z" }));
+    const writeManyBytes = vi.fn(async () => [{ path: "/workspace/a.bin", size_bytes: 1, mtime: "2026-07-10T00:00:00.000Z" }]);
+    underlying.files.writeBytes = writeBytes;
+    underlying.files.writeManyBytes = writeManyBytes;
+    const provider = new BudgetedSandboxProvider({
+      provider: underlying,
+      budgets: new BudgetService({
+        repository: new InMemoryBudgetRepository([limit("1000")]),
+        hotCounters: new InMemoryBudgetHotCounters(),
+        enabled: true,
+      }),
+    });
+
+    const sandbox = await provider.create(createInput(), operationOptions);
+    await provider.resume!({ sandbox_id: sandbox.sandbox_id, reason: "test" }, operationOptions);
+    await provider.files.read({ sandbox_id: sandbox.sandbox_id, path: "/workspace/a.txt" }, operationOptions);
+    await provider.files.write({ sandbox_id: sandbox.sandbox_id, path: "/workspace/a.txt", content: "ok" }, operationOptions);
+    await provider.files.writeBytes!({ sandbox_id: sandbox.sandbox_id, path: "/workspace/a.bin", content: Buffer.from("a") }, operationOptions);
+    await provider.files.writeManyBytes!({ sandbox_id: sandbox.sandbox_id, files: [{ path: "/workspace/a.bin", content: Buffer.from("a") }] }, operationOptions);
+    await provider.files.list({ sandbox_id: sandbox.sandbox_id, path: "/workspace", recursive: false }, operationOptions);
+
+    expect(create).toHaveBeenCalledWith(createInput(), operationOptions);
+    expect(resume).toHaveBeenCalledWith({ sandbox_id: sandbox.sandbox_id, reason: "test" }, operationOptions);
+    expect(read).toHaveBeenCalledWith(expect.anything(), operationOptions);
+    expect(write).toHaveBeenCalledWith(expect.anything(), operationOptions);
+    expect(writeBytes).toHaveBeenCalledWith(expect.anything(), operationOptions);
+    expect(writeManyBytes).toHaveBeenCalledWith(expect.anything(), operationOptions);
+    expect(list).toHaveBeenCalledWith(expect.anything(), operationOptions);
   });
 });
 

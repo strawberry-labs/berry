@@ -50,8 +50,6 @@ const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
 const MAX_SNAPSHOT_FILES = 5_000;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
-const SKILL_STAGE_MANIFEST_NAME = ".berry-staged-files.json";
-const SKILL_STAGE_MANIFEST_VERSION = 1;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
 
@@ -456,10 +454,16 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     },
   ) {}
 
-  async modelContent(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]> {
+  async modelContent(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]> {
+    signal?.throwIfAborted();
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn"))
       .filter((file) => file.mediaType.startsWith("image/"));
+    signal?.throwIfAborted();
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
     const requestedSandboxImages = (explicitPaths ?? exposedSandboxImagePaths(snapshot, workspaceRoot))
@@ -499,15 +503,16 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 
     const loadSandboxSources = async (paths: readonly string[]) => {
       if (paths.length === 0) return [];
-      const sandbox = await this.ensureSandbox(snapshot);
+      const sandbox = await this.ensureSandbox(snapshot, signal);
       return Promise.all(paths.slice(0, MAX_MODEL_IMAGES).map(async (path) => {
+        signal?.throwIfAborted();
         const mediaType = binaryMediaType(path);
         if (!mediaType?.startsWith("image/")) throw new Error(`inspect_images only accepts image paths: ${path}`);
-        const source = await this.provider.files.read({
-          sandbox_id: sandbox.id,
-          path,
-          encoding: "base64",
-        });
+        const readInput = { sandbox_id: sandbox.id, path, encoding: "base64" } as const;
+        const source = await (signal
+          ? this.provider.files.read(readInput, { signal })
+          : this.provider.files.read(readInput));
+        reportProgress?.();
         return { path, mediaType, bytes: Buffer.from(source.content, "base64") };
       }));
     };
@@ -516,7 +521,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const objects = this.objects;
       if (!objects) throw new Error("Input image object storage is not configured");
       return Promise.all(files.map(async (file) => {
+        signal?.throwIfAborted();
         const bytes = await objects.getSource(file.objectKey, file.objectVersionId);
+        signal?.throwIfAborted();
+        reportProgress?.();
         if (bytes.byteLength !== file.sizeBytes) {
           throw new Error(`Input image ${file.name} is incomplete`);
         }
@@ -576,18 +584,23 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     return parts;
   }
 
-  async stageAssociatedInputFiles(snapshot: DurableTurnSnapshot, fileIds: readonly string[]): Promise<readonly {
+  async stageAssociatedInputFiles(
+    snapshot: DurableTurnSnapshot,
+    fileIds: readonly string[],
+    options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined } = {},
+  ): Promise<readonly {
     fileId: string;
     name: string;
     mediaType: string;
     path: string;
   }[]> {
-    const sandbox = await this.ensureSandbox(snapshot);
+    const sandbox = await this.ensureSandbox(snapshot, options.signal);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const selected = new Set(fileIds);
     const files = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
       .filter((file) => selected.has(file.fileId));
-    await this.stageInputFiles(snapshot, sandbox.id, this.repository, selected);
+    options.signal?.throwIfAborted();
+    await this.stageInputFiles(snapshot, sandbox.id, this.repository, selected, options.signal, options.reportProgress);
     return files.map((file) => ({
       fileId: file.fileId,
       name: file.name,
@@ -631,7 +644,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     files: readonly DurableSkillPackageFile[],
     options: DurableSkillPackageStageOptions = {},
   ): Promise<{ filePath: string; resources: string[]; stagedResources: string[]; stagingSandboxId: string }> {
-    const sandbox = await this.ensureSandbox(snapshot);
+    const sandbox = await this.ensureSandbox(snapshot, options.signal);
+    options.signal?.throwIfAborted();
+    options.reportProgress?.();
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const safeId = packageId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 160) || "skill";
     if (files.length === 0 || files.length > 501) throw new Error("Skill package must contain SKILL.md and at most 500 resource files");
@@ -663,7 +678,6 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     // into a later activation of the same skill.
     const revision = packageRevision.digest("hex");
     const root = `${workspaceRoot}/runtime-skills/${safeId}-${revision.slice(0, 16)}`;
-    const manifestPath = `${root}/${SKILL_STAGE_MANIFEST_NAME}`;
     const selectedResourcePaths = options.resourcePaths === undefined
       ? normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => file.path)
       : [...new Set(options.resourcePaths.map(safeRelativeSkillPackagePath))];
@@ -673,21 +687,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
     const targetPaths = new Set(["SKILL.md", ...selectedResourcePaths]);
     const stagedPaths = durablyStagedSkillPackagePaths(snapshot, root, sandbox.id);
-    if (stagedPaths.size === 0) {
-      const persistedPaths = await readSkillStageManifest(
-        this.provider,
-        sandbox.id,
-        manifestPath,
-        revision,
-        seen,
-      );
-      for (const path of persistedPaths) stagedPaths.add(path);
-    }
     const missingFiles = normalizedFiles.filter((file) => targetPaths.has(file.path) && !stagedPaths.has(file.path));
     const lazyPaths = missingFiles.filter((file) => !file.bytes).map((file) => file.path);
     const loaded = lazyPaths.length > 0 && options.loadContentBytes
       ? await options.loadContentBytes(lazyPaths)
       : new Map<string, Uint8Array>();
+    options.reportProgress?.();
+    options.signal?.throwIfAborted();
     const prepared = await mapWithConcurrency(missingFiles, 4, async (file) => {
       const loadedBytes = loaded.get(file.path);
       const bytes = file.bytes ?? (loadedBytes
@@ -708,28 +714,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         await this.provider.files.writeManyBytes({
           sandbox_id: sandbox.id,
           files: prepared.map(({ path, content, mode }) => ({ path, content, mode })),
-        });
+        }, { signal: options.signal });
       } else {
         await mapWithConcurrency(prepared, 4, async ({ path, content, mode }) => {
+          options.signal?.throwIfAborted();
           if (this.provider.files.writeBytes) {
-            await this.provider.files.writeBytes({ sandbox_id: sandbox.id, path, content, mode });
+            await this.provider.files.writeBytes({ sandbox_id: sandbox.id, path, content, mode }, { signal: options.signal });
           } else {
-            await this.provider.files.write({ sandbox_id: sandbox.id, path, content: content.toString("base64"), encoding: "base64", mode });
+            await this.provider.files.write({ sandbox_id: sandbox.id, path, content: content.toString("base64"), encoding: "base64", mode }, { signal: options.signal });
           }
         });
       }
+      options.signal?.throwIfAborted();
+      options.reportProgress?.();
       for (const file of prepared) stagedPaths.add(file.relativePath);
-      await this.provider.files.write({
-        sandbox_id: sandbox.id,
-        path: manifestPath,
-        content: JSON.stringify({
-          version: SKILL_STAGE_MANIFEST_VERSION,
-          sandboxId: sandbox.id,
-          revision,
-          stagedPaths: [...stagedPaths].sort(),
-        }),
-        encoding: "utf8",
-      });
     }
     return {
       filePath: `${root}/SKILL.md`,
@@ -739,6 +737,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         .map((file) => `${root}/${file.path}`),
       stagingSandboxId: sandbox.id,
     };
+  }
+
+  supportsAbort(_snapshot: DurableTurnSnapshot, _step: DurableTurnStep): boolean {
+    // Sandbox reads still await repository, lifecycle-lock, and object-store
+    // operations without an AbortSignal contract. Keep them non-abortable so
+    // the turn runner retains its lease until the complete operation settles.
+    return false;
   }
 
   async execute(
@@ -754,7 +759,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const inputRepairDetails = prepared.repairs.length > 0
       ? { inputRepairs: prepared.repairs }
       : {};
-    const sandbox = await this.ensureSandbox(snapshot);
+    const sandbox = await this.ensureSandbox(snapshot, signal);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
@@ -1451,36 +1456,45 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     });
   }
 
-  private async ensureSandbox(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
+  private async ensureSandbox(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+  ): Promise<{ provider: string; id: string; state: string }> {
     const key = `${snapshot.tenantId}:${snapshot.id}`;
     const existing = this.#sandboxStarts.get(key);
     if (existing) return existing;
-    const started = this.ensureSandboxUncached(snapshot).finally(() => {
+    const started = this.ensureSandboxUncached(snapshot, signal).finally(() => {
       if (this.#sandboxStarts.get(key) === started) this.#sandboxStarts.delete(key);
     });
     this.#sandboxStarts.set(key, started);
     return started;
   }
 
-  private async ensureSandboxUncached(snapshot: DurableTurnSnapshot): Promise<{ provider: string; id: string; state: string }> {
+  private async ensureSandboxUncached(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+  ): Promise<{ provider: string; id: string; state: string }> {
+    signal?.throwIfAborted();
     if (snapshot.sandboxId) {
       try {
         return await this.withSandboxLifecycleLock(snapshot.tenantId, snapshot.sandboxId, async (repository) => {
           if (this.provider.supportsResume !== false) {
-            await this.provider.resume?.({
+            const resumeInput = {
               sandbox_id: snapshot.sandboxId!,
               reason: "Durable turn requested sandbox access",
-            });
+            } as const;
+            if (signal) await this.provider.resume?.(resumeInput, { signal });
+            else await this.provider.resume?.(resumeInput);
           }
           await this.provider.files.list({
             sandbox_id: snapshot.sandboxId!,
             path: this.options.cwd ?? "/workspace",
             recursive: false,
-          });
+          }, { signal });
           // The in-memory staged-file set is intentionally process-local. On
           // worker restart or lease handoff, re-stage the run's durable input
           // associations before a tool is allowed to execute.
-          await this.stageInputFiles(snapshot, snapshot.sandboxId!, repository);
+          await this.stageInputFiles(snapshot, snapshot.sandboxId!, repository, undefined, signal);
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
@@ -1490,7 +1504,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           });
           return { provider: snapshot.sandboxProvider ?? this.provider.kind, id: snapshot.sandboxId!, state: "running" };
         });
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) throw error;
         // Restore from the newest complete archive below.
       }
     }
@@ -1510,17 +1525,19 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             state: "resume_requested",
           });
           if (this.provider.supportsResume !== false) {
-            await this.provider.resume?.({
+            const resumeInput = {
               sandbox_id: continuity.sandboxId!,
               reason: "Follow-up turn requested the prior sandbox",
-            });
+            } as const;
+            if (signal) await this.provider.resume?.(resumeInput, { signal });
+            else await this.provider.resume?.(resumeInput);
           }
           await this.provider.files.list({
             sandbox_id: continuity.sandboxId!,
             path: this.options.cwd ?? "/workspace",
             recursive: false,
-          });
-          await this.stageInputFiles(snapshot, continuity.sandboxId!, repository);
+          }, { signal });
+          await this.stageInputFiles(snapshot, continuity.sandboxId!, repository, undefined, signal);
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
@@ -1534,7 +1551,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             state: "running",
           };
         });
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) throw error;
         // The previous turn's sandbox expired. Restore its durable archive below.
       }
     }
@@ -1549,7 +1567,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy),
       writable_roots: [this.options.cwd ?? "/workspace"],
       metadata: { runId: snapshot.id },
-    });
+    }, { signal });
     const restorePoint = latest ?? continuity?.snapshot ?? null;
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (restorePoint && this.objects) {
@@ -1561,10 +1579,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           content: file.content,
           encoding: "base64",
           ...(file.mode !== undefined ? { mode: file.mode } : {}),
-        });
+        }, { signal });
       }
     }
-    await this.stageInputFiles(snapshot, handle.sandbox_id);
+    await this.stageInputFiles(snapshot, handle.sandbox_id, this.repository, undefined, signal);
     await this.repository.recordSandbox({
       tenantId: snapshot.tenantId,
       runId: snapshot.id,
@@ -1590,11 +1608,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     sandboxId: string,
     repository: SandboxSnapshotRepository = this.repository,
     selectedFileIds?: ReadonlySet<string>,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
   ): Promise<void> {
+    signal?.throwIfAborted();
     const staged = this.#stagedInputFileIds.get(sandboxId) ?? new Set<string>();
     this.#stagedInputFileIds.set(sandboxId, staged);
     const files = (await repository.inputFiles(snapshot.tenantId, snapshot.id))
       .filter((file) => (!selectedFileIds || selectedFileIds.has(file.fileId)) && !staged.has(file.fileId));
+    signal?.throwIfAborted();
     if (files.length === 0) return;
     if (!this.objects) throw new Error("Input file object storage is not configured");
     for (const file of files) {
@@ -1602,11 +1624,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
       const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
       const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
-      await this.prepareSandboxDirectory(snapshot.id, sandboxId, path, file.name, workspaceRoot);
-      await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name);
+      await this.prepareSandboxDirectory(snapshot.id, sandboxId, path, file.name, workspaceRoot, signal);
+      await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name, signal);
       const source = this.objects.streamSource
         ? this.objects.streamSource(file.objectKey, maxInputBytes, file.objectVersionId)
         : singleChunk(await this.objects.getSource(file.objectKey, file.objectVersionId));
+      signal?.throwIfAborted();
       let written = 0;
       for await (const sourceChunk of source) {
         for (let offset = 0; offset < sourceChunk.byteLength; offset += 256 * 1024) {
@@ -1615,11 +1638,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           if (written > maxInputBytes || written > file.sizeBytes) {
             throw new Error(`Input file ${file.name} exceeds its validated size`);
           }
-          await this.appendSandboxChunk(snapshot.id, sandboxId, path, file.name, chunk, written);
+          signal?.throwIfAborted();
+          await this.appendSandboxChunk(snapshot.id, sandboxId, path, file.name, chunk, written, signal);
         }
       }
       if (written !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
       staged.add(file.fileId);
+      reportProgress?.();
     }
   }
 
@@ -1628,13 +1653,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     sandboxId: string,
     path: string,
     name: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     for await (const event of this.provider.exec({
       sandbox_id: sandboxId,
       request_id: `${runId}:stage:truncate:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
       command: ["sh", "-c", ': > "$1"', "berry-stage", path],
       timeout_ms: 30_000,
-    })) {
+    }, { signal })) {
       if (event.kind === "error") throw new Error(event.message);
       if (event.kind === "exit" && event.exit_code !== 0) {
         throw new Error(`Unable to initialize the sandbox file for ${name}`);
@@ -1648,6 +1674,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     path: string,
     name: string,
     cwd?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     const directoryOutput: string[] = [];
     for await (const event of this.provider.exec({
@@ -1656,7 +1683,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       command: ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))],
       ...(cwd ? { cwd } : {}),
       timeout_ms: 30_000,
-    })) {
+    }, { signal })) {
       if (event.kind === "stdout" || event.kind === "stderr") directoryOutput.push(event.data);
       if (event.kind === "error") throw new Error(event.message);
       if (event.kind === "exit" && event.exit_code !== 0) {
@@ -1666,13 +1693,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
   }
 
-  private async setSandboxFileMode(runId: string, sandboxId: string, path: string, name: string, mode: number): Promise<void> {
+  private async setSandboxFileMode(
+    runId: string,
+    sandboxId: string,
+    path: string,
+    name: string,
+    mode: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     for await (const event of this.provider.exec({
       sandbox_id: sandboxId,
       request_id: `${runId}:stage:chmod:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
       command: ["chmod", mode.toString(8), "--", path],
       timeout_ms: 30_000,
-    })) {
+    }, { signal })) {
       if (event.kind === "error") throw new Error(event.message);
       if (event.kind === "exit" && event.exit_code !== 0) throw new Error(`Unable to set permissions for ${name}`);
     }
@@ -1685,6 +1719,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     name: string,
     chunk: Uint8Array,
     written: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     for await (const event of this.provider.exec({
       sandbox_id: sandboxId,
@@ -1701,7 +1736,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       // from starting the staging process at all.
       stdin: Buffer.from(chunk).toString("base64"),
       timeout_ms: 30_000,
-    })) {
+    }, { signal })) {
       if (event.kind === "error") throw new Error(event.message);
       if (event.kind === "exit" && event.exit_code !== 0) {
         throw new Error(`Unable to stream ${name} into the sandbox`);
@@ -3412,44 +3447,6 @@ function durablyStagedSkillPackagePaths(
     }
   }
   return staged;
-}
-
-async function readSkillStageManifest(
-  provider: SandboxProvider,
-  sandboxId: string,
-  manifestPath: string,
-  revision: string,
-  packagePaths: ReadonlySet<string>,
-): Promise<Set<string>> {
-  try {
-    const source = await provider.files.read({
-      sandbox_id: sandboxId,
-      path: manifestPath,
-      encoding: "utf8",
-    });
-    const manifest = objectValue(JSON.parse(source.content));
-    if (
-      manifest.version !== SKILL_STAGE_MANIFEST_VERSION
-      || stringValue(manifest.sandboxId) !== sandboxId
-      || stringValue(manifest.revision) !== revision
-      || !Array.isArray(manifest.stagedPaths)
-    ) {
-      return new Set();
-    }
-    const staged = new Set<string>();
-    for (const value of manifest.stagedPaths) {
-      if (typeof value !== "string") continue;
-      try {
-        const path = safeRelativeSkillPackagePath(value);
-        if (packagePaths.has(path)) staged.add(path);
-      } catch {
-        // A malformed cache entry is a miss; it is never a trusted path.
-      }
-    }
-    return staged;
-  } catch {
-    return new Set();
-  }
 }
 
 async function mapWithConcurrency<T, TResult>(

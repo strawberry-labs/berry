@@ -585,6 +585,7 @@ describe("durable turn runner", () => {
     const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
     let aborted = false;
     const runner = new DurableTurnRunner(repository, unusedModel(), {
+      supportsAbort: () => true,
       execute: async (_snapshot, _step, signal) => new Promise<never>((_resolve, reject) => {
         signal?.addEventListener("abort", () => {
           aborted = true;
@@ -605,12 +606,142 @@ describe("durable turn runner", () => {
       state: "failed",
       timedOut: true,
       outcomeCertainty: "known",
+      abortAcknowledged: true,
     });
     expect(repository.events).toContainEqual(expect.objectContaining({
       kind: "phase.deadline_exceeded",
       phase: "tool",
       deadlineKind: "idle",
     }));
+  });
+
+  it("records a false abort acknowledgment when an explicitly abort-aware read ignores its signal", async () => {
+    const tool = readOnlyToolStep("read", 1, "/workspace/ignored.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      supportsAbort: () => true,
+      execute: async () => new Promise<never>(() => undefined),
+    }, {
+      owner: "worker-ignored-read",
+      toolIdleTimeoutMs: 5,
+      toolMaxDurationMs: 1_000,
+      abortCleanupTimeoutMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "failed",
+      timedOut: true,
+      outcomeCertainty: "known",
+      abortAcknowledged: false,
+    });
+  });
+
+  it("does not infer abort support from an executor's parameter count", async () => {
+    const tool = readOnlyToolStep("read", 1, "/workspace/arity.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    let aborted = false;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, _step, signal) => new Promise<TurnToolResult>((resolve) => {
+        signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+        setTimeout(() => resolve({ output: { content: "settled" }, summary: "settled" }), 20);
+      }),
+    }, {
+      owner: "worker-arity-without-capability",
+      toolIdleTimeoutMs: 5,
+      toolMaxDurationMs: 1_000,
+      abortCleanupTimeoutMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(aborted).toBe(false);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      timedOut: true,
+      abortAcknowledged: false,
+    });
+  });
+
+  it("uses an explicit abort capability even when the executor has no declared parameters", async () => {
+    const tool = readOnlyToolStep("read", 1, "/workspace/explicit-capability.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    let aborted = false;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      supportsAbort: () => true,
+      execute: async function () {
+        const signal = arguments[2] as AbortSignal;
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        });
+      },
+    }, {
+      owner: "worker-explicit-capability",
+      toolIdleTimeoutMs: 5,
+      toolMaxDurationMs: 1_000,
+      abortCleanupTimeoutMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(aborted).toBe(true);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      timedOut: true,
+      abortAcknowledged: true,
+    });
+  });
+
+  it("aborts a parallel read-only batch only when every step declares support", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/first.txt");
+    const second = readOnlyToolStep("grep", 2, "/workspace/second.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    let aborted = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      supportsAbort: () => true,
+      execute: async (_snapshot, _step, signal) => new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted += 1;
+          reject(signal.reason);
+        }, { once: true });
+      }),
+    }, {
+      owner: "worker-parallel-capability",
+      toolIdleTimeoutMs: 5,
+      toolMaxDurationMs: 1_000,
+      abortCleanupTimeoutMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Parallel read-only tool batch stalled");
+    expect(aborted).toBe(2);
+    expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")))
+      .toEqual([expect.objectContaining({ id: first.id, state: "running" }), expect.objectContaining({ id: second.id, state: "running" })]);
+  });
+
+  it("does not abort a parallel read-only batch when one step lacks support", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/first.txt");
+    const second = readOnlyToolStep("grep", 2, "/workspace/second.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    let aborted = false;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      supportsAbort: (_snapshot, step) => toolNameFromTestStep(step) === "read",
+      execute: async (_snapshot, _step, signal) => new Promise<TurnToolResult>((resolve) => {
+        signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+        setTimeout(() => resolve({ output: { content: "settled" }, summary: "settled" }), 20);
+      }),
+    }, {
+      owner: "worker-parallel-mixed-capability",
+      toolIdleTimeoutMs: 5,
+      toolMaxDurationMs: 1_000,
+      abortCleanupTimeoutMs: 10,
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .rejects.toThrow("Parallel read-only tool batch stalled");
+    expect(aborted).toBe(false);
   });
 
   it("cancels a read-only adapter that observes its signal", async () => {
@@ -811,19 +942,23 @@ describe("durable turn runner", () => {
     expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);
   });
 
-  it("bounds model input preparation before the provider request starts", async () => {
+  it("keeps the lease while non-abortable model preparation settles after its deadline", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),
       modelStep("pending", 1),
     ]));
     let modelCalls = 0;
+    let releaseDefinitions!: () => void;
+    const definitions = new Promise<readonly []>((resolve) => {
+      releaseDefinitions = () => resolve([]);
+    });
     const runner = new DurableTurnRunner(repository, {
       call: async () => {
         modelCalls += 1;
         return { text: "unexpected", inputTokens: 0, outputTokens: 0, toolCalls: [] };
       },
     }, {
-      definitions: async () => new Promise<never>(() => undefined),
+      definitions: async () => definitions,
       execute: async () => ({ output: {}, summary: "unused" }),
     }, {
       owner: "worker-preparation-timeout",
@@ -831,7 +966,20 @@ describe("durable turn runner", () => {
       abortCleanupTimeoutMs: 5,
     });
 
-    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+    let settled = false;
+    const execution = runner.execute({ tenantId, runId, reason: "continue" });
+    void execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(settled).toBe(false);
+    expect(repository.current.leaseOwner).toMatch(/^worker-preparation-timeout:/);
+    expect(modelCalls).toBe(0);
+
+    releaseDefinitions();
+    await expect(execution)
       .rejects.toThrow("Model input preparation exceeded its maximum duration");
     expect(modelCalls).toBe(0);
     expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);

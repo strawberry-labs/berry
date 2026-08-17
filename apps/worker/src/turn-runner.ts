@@ -360,7 +360,7 @@ export interface DurableModelCallContext {
   messageId: string;
   tools: readonly ChatToolDefinition[];
   additionalUserContent?: readonly ChatContentPart[];
-  signal?: AbortSignal;
+  signal?: AbortSignal | undefined;
   reportProgress?(): void;
   onProviderAttempt?: (report: ProviderAttemptReport) => void;
   onProviderAttemptDecision?: (physicalAttempt: number, decision: "none" | "retry" | "fallback" | "terminal" | "cancelled") => void;
@@ -412,19 +412,35 @@ export interface DurableSkillPackageStageOptions {
   resourcePaths?: readonly string[];
   /** Load all requested database-backed resources in one round trip. */
   loadContentBytes?: (paths: readonly string[]) => Promise<ReadonlyMap<string, Uint8Array>>;
+  /** Abort the activation and every provider operation it starts. */
+  signal?: AbortSignal | undefined;
+  /** Report progress only after a staging unit has completed. */
+  reportProgress?: (() => void) | undefined;
 }
 
 export interface DurableTurnToolExecutor {
   definitions?(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]>;
-  modelContent?(snapshot: DurableTurnSnapshot): Promise<readonly ChatContentPart[]>;
+  modelContent?(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
+  /** Return true only when every awaited part of this tool observes the signal. */
+  supportsAbort?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean;
+  /** Return true only when every awaited model-preparation seam observes the signal. */
+  supportsModelPreparationAbort?(snapshot: DurableTurnSnapshot): boolean;
   execute(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
     signal?: AbortSignal,
     reportProgress?: () => void,
   ): Promise<TurnToolResult>;
-  stageAssociatedInputFiles?(snapshot: DurableTurnSnapshot, fileIds: readonly string[]): Promise<readonly {
+  stageAssociatedInputFiles?(
+    snapshot: DurableTurnSnapshot,
+    fileIds: readonly string[],
+    options?: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined },
+  ): Promise<readonly {
     fileId: string;
     name: string;
     mediaType: string;
@@ -461,6 +477,7 @@ const DEFAULT_NO_PROGRESS_WARNING_THRESHOLD = 3;
 const DEFAULT_NO_PROGRESS_HARD_THRESHOLD = 5;
 const DEFAULT_CUMULATIVE_TOOL_TIME_MS = 30 * 60_000;
 const DEFAULT_ACTIVE_COMPUTE_MS = 2 * 60 * 60_000;
+const DEFAULT_ABORT_CLEANUP_TIMEOUT_MS = 2_000;
 const TOOL_CONTEXT_CHARACTERS_PER_TOKEN = 4;
 const MAX_TOOL_CONTEXT_ENVELOPE_CHARS = 4 * 1024 * 1024;
 const DEFAULT_TOOL_LIMITS: Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit> = {
@@ -813,17 +830,20 @@ export class DurableTurnRunner {
         return fileId ? [fileId] : [];
       });
     });
-    const [extensionTools, additionalUserContent] = await this.withHeartbeat(snapshot, async () => {
+    const [extensionTools, additionalUserContent] = await this.withHeartbeat(snapshot, async ({ signal, reportProgress }) => {
       if (stagedArtifactFileIds.length > 0) {
-        await this.tools.stageAssociatedInputFiles?.(snapshot, [...new Set(stagedArtifactFileIds)]);
+        await this.tools.stageAssociatedInputFiles?.(snapshot, [...new Set(stagedArtifactFileIds)], {
+          signal,
+          reportProgress,
+        });
       }
       return Promise.all([
         this.tools.definitions?.(snapshot) ?? Promise.resolve([]),
-        this.tools.modelContent?.(snapshot) ?? Promise.resolve([]),
+        this.tools.modelContent?.(snapshot, signal, reportProgress) ?? Promise.resolve([]),
       ]);
     }, {
       label: "Model input preparation",
-      abortable: true,
+      abortable: this.tools.supportsModelPreparationAbort?.(snapshot) === true,
       operation: "model_preparation",
       maxDurationMs: this.options.modelPreparationTimeoutMs ?? 120_000,
     });
@@ -1604,11 +1624,12 @@ export class DurableTurnRunner {
     step.idleDeadlineAt = idleDeadlineAt;
     const toolOperation = ({ signal, reportProgress }: { signal: AbortSignal; reportProgress(): void }) =>
       this.tools.execute(snapshot, step, signal, reportProgress);
-    // Legacy adapters may ignore extra arguments. Passing the signal is safe,
-    // but racing their promise is only safe when the adapter declares that it
-    // can observe the signal; otherwise a read may still be settling while a
+    // Passing the signal is safe for every adapter, but racing its promise is
+    // only safe when the executor explicitly declares that the complete tool
+    // path observes the signal; otherwise a read may still be settling while a
     // recovery worker receives the lease.
-    const toolAbortable = step.retryClass === "read_only" && this.tools.execute.length >= 3;
+    const toolAbortable = step.retryClass === "read_only"
+      && this.tools.supportsAbort?.(snapshot, step) === true;
     let result: TurnToolResult;
     try {
       if (toolName === "create_image") {
@@ -1692,7 +1713,9 @@ export class DurableTurnRunner {
             ...(timedOut ? {
               timedOut: true,
               outcomeCertainty: "known" as const,
-              abortAcknowledged: toolAbortable,
+              abortAcknowledged: error instanceof DurableToolTimeoutError
+                ? error.abortAcknowledged
+                : false,
             } : {}),
           },
           ...(!remaining ? [{
@@ -1931,7 +1954,10 @@ export class DurableTurnRunner {
       ),
       {
         label: "Parallel read-only tool batch",
-        abortable: this.tools.execute.length >= 3,
+        abortable: steps.every((step) =>
+          step.retryClass === "read_only"
+          && this.tools.supportsAbort?.(snapshot, step) === true
+        ),
         operation: "tool",
         idleTimeoutMs: toolLimits.idleTimeoutMs,
         maxDurationMs: toolLimits.maxDurationMs,
@@ -2562,11 +2588,16 @@ export class DurableTurnRunner {
         }
       } catch (error) {
         if (limits.abortable && controller.signal.aborted) {
-          await waitForPromiseSettlement(
+          const abortAcknowledged = await waitForPromiseSettlement(
             operationPromise,
-            this.options.abortCleanupTimeoutMs ?? 15_000,
+            this.options.abortCleanupTimeoutMs ?? DEFAULT_ABORT_CLEANUP_TIMEOUT_MS,
           );
-          throw longOperationAbortError(timeoutFailure, heartbeatFailure, controller.signal.reason);
+          throw longOperationAbortError(
+            timeoutFailure,
+            heartbeatFailure,
+            controller.signal.reason,
+            abortAcknowledged,
+          );
         }
         if (timeoutFailure || heartbeatFailure) {
           throw longOperationAbortError(timeoutFailure, heartbeatFailure);
@@ -2597,7 +2628,16 @@ function longOperationAbortError(
   timeoutFailure: DurableTurnRetryableError | null,
   heartbeatFailure: unknown,
   abortReason?: unknown,
+  abortAcknowledged = false,
 ): Error {
+  if (timeoutFailure instanceof DurableToolTimeoutError) {
+    return new DurableToolTimeoutError(
+      timeoutFailure.message,
+      timeoutFailure.phase,
+      timeoutFailure.operation,
+      abortAcknowledged,
+    );
+  }
   if (timeoutFailure) return timeoutFailure;
   if (heartbeatFailure instanceof DurableTurnRetryableError) return heartbeatFailure;
   if (heartbeatFailure) {
@@ -2610,13 +2650,13 @@ function longOperationAbortError(
   return new DurableTurnRetryableError("Long-running operation was aborted");
 }
 
-async function waitForPromiseSettlement(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+async function waitForPromiseSettlement(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | null = null;
   try {
-    await Promise.race([
-      promise.then(() => undefined, () => undefined),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, Math.max(1, timeoutMs));
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(1, timeoutMs));
         timer.unref?.();
       }),
     ]);
@@ -3921,6 +3961,7 @@ export class DurableToolTimeoutError extends DurableTurnRetryableError {
     message: string,
     readonly phase: "idle" | "wall",
     readonly operation: "tool" | "model" | "model_preparation" | "compaction" | "finalization" | "generic" = "generic",
+    readonly abortAcknowledged = false,
   ) {
     super(message);
     this.name = "DurableToolTimeoutError";

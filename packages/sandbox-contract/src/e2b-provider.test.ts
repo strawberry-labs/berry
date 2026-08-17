@@ -4,6 +4,7 @@ import {
   type E2BCommandHandleLike,
   type E2BCommandResultLike,
   type E2BFileInfoLike,
+  type E2BRequestOptions,
   type E2BSandboxClient,
   type E2BSandboxInfoLike,
   type E2BSandboxLike,
@@ -69,6 +70,121 @@ describe("E2BSandboxProvider", () => {
     expect(sandbox.foregroundCommands.filter((command) => command.startsWith("chmod "))).toEqual([
       "chmod 644 -- '/workspace/SKILL.md' && chmod 755 -- '/workspace/scripts/build.py'",
     ]);
+  });
+
+  it("forwards the operation signal and configured request timeout to file reads", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 45_000 });
+    const handle = await provider.create({ request_id: "read-options", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+    await provider.files.write({ sandbox_id: handle.sandbox_id, path: "/workspace/read.txt", content: "ok", encoding: "utf8" });
+    const controller = new AbortController();
+
+    await provider.files.read({ sandbox_id: handle.sandbox_id, path: "/workspace/read.txt", encoding: "utf8" }, { signal: controller.signal });
+
+    expect(sandbox.lastGetInfoOptions).toEqual({ requestTimeoutMs: 45_000, signal: controller.signal });
+    expect(sandbox.lastReadOptions).toEqual({ format: "text", requestTimeoutMs: 45_000, signal: controller.signal });
+  });
+
+  it("forwards native cancellation through creation, refresh, and reconnect", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 24_000 });
+    const createController = new AbortController();
+    const handle = await provider.create({
+      request_id: "lifecycle-options",
+      tenant_id: TENANT_ID,
+      image: "base",
+      ttl_seconds: 300,
+    }, { signal: createController.signal });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+
+    expect(client.lastCreate?.options).toMatchObject({
+      requestTimeoutMs: 24_000,
+      signal: createController.signal,
+    });
+    expect(client.lastFindOptions).toMatchObject({
+      requestTimeoutMs: 24_000,
+      signal: createController.signal,
+    });
+    expect(sandbox.foregroundOptions.at(-1)).toEqual({
+      requestTimeoutMs: 24_000,
+      signal: createController.signal,
+      background: false,
+    });
+
+    const refreshController = new AbortController();
+    await provider.resume({ sandbox_id: handle.sandbox_id, reason: "refresh active sandbox" }, { signal: refreshController.signal });
+    expect(sandbox.lastTimeoutOptions).toEqual({ requestTimeoutMs: 24_000, signal: refreshController.signal });
+
+    await provider.suspend({ sandbox_id: handle.sandbox_id, reason: "prepare reconnect" });
+    const reconnectController = new AbortController();
+    await provider.resume({ sandbox_id: handle.sandbox_id, reason: "reconnect paused sandbox" }, { signal: reconnectController.signal });
+    expect(client.lastGetInfoOptions).toMatchObject({ requestTimeoutMs: 24_000, signal: reconnectController.signal });
+    expect(client.lastConnectOptions).toMatchObject({ requestTimeoutMs: 24_000, signal: reconnectController.signal });
+  });
+
+  it("forwards native cancellation to a batch write and its chmod command", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 12_000 });
+    const handle = await provider.create({ request_id: "batch-options", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+    const controller = new AbortController();
+
+    await provider.files.writeManyBytes!({
+      sandbox_id: handle.sandbox_id,
+      files: [{ path: "/workspace/script.sh", content: Buffer.from("echo ok\n"), mode: 0o755 }],
+    }, { signal: controller.signal });
+
+    expect(sandbox.lastBatchWriteOptions).toEqual({ requestTimeoutMs: 12_000, signal: controller.signal });
+    expect(sandbox.foregroundOptions.at(-1)).toEqual({ requestTimeoutMs: 12_000, signal: controller.signal, background: false });
+  });
+
+  it("rejects a blocked native read when its signal aborts", async () => {
+    const client = new FakeE2BClient();
+    client.blockFileReads = true;
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const handle = await provider.create({ request_id: "read-abort", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+    sandbox.filesByPath.set("/workspace/blocked.txt", { content: Buffer.from("blocked"), modifiedTime: new Date() });
+    const controller = new AbortController();
+    const read = provider.files.read({ sandbox_id: handle.sandbox_id, path: "/workspace/blocked.txt", encoding: "utf8" }, { signal: controller.signal });
+
+    controller.abort();
+
+    await expect(read).rejects.toThrow("aborted");
+  });
+
+  it("rejects a blocked reuse lookup when sandbox creation aborts", async () => {
+    const client = new FakeE2BClient();
+    client.blockFind = true;
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const controller = new AbortController();
+    const creation = provider.create({
+      request_id: "find-abort",
+      tenant_id: TENANT_ID,
+      image: "base",
+    }, { signal: controller.signal });
+
+    controller.abort();
+
+    await expect(creation).rejects.toThrow("aborted");
+    expect(client.lastCreate).toBeUndefined();
+  });
+
+  it("rejects a blocked native batch write when its signal aborts", async () => {
+    const client = new FakeE2BClient();
+    client.blockFileWrites = true;
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const handle = await provider.create({ request_id: "batch-abort", tenant_id: TENANT_ID, image: "base" });
+    const controller = new AbortController();
+    const write = provider.files.writeManyBytes!({
+      sandbox_id: handle.sandbox_id,
+      files: [{ path: "/workspace/blocked.bin", content: Buffer.from([1, 2, 3]) }],
+    }, { signal: controller.signal });
+
+    controller.abort();
+
+    await expect(write).rejects.toThrow("aborted");
   });
 
   it("bounds chmod command size when uploading a full skill package with long paths", async () => {
@@ -246,11 +362,11 @@ describe("E2BSandboxProvider", () => {
     for (let attempt = 0; attempt < 30 && (activeSandbox?.timeoutUpdates.length ?? 0) < 2; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    const refreshesBeforeAbort = activeSandbox?.timeoutUpdates.length ?? 0;
     abort.abort();
     await eventsPromise;
 
-    expect(activeSandbox?.timeoutUpdates.length).toBeGreaterThanOrEqual(3);
-    expect(activeSandbox?.timeoutUpdates.at(-1)).toBe(1_000);
+    expect(activeSandbox?.timeoutUpdates).toHaveLength(refreshesBeforeAbort);
   });
 
   it("streams large command input through stdin instead of argv", async () => {
@@ -318,13 +434,19 @@ type StoredSandbox = {
 class FakeE2BClient implements E2BSandboxClient {
   readonly sandboxes = new Map<string, StoredSandbox>();
   lastCreate: Parameters<E2BSandboxClient["create"]>[0] | undefined;
+  lastConnectOptions: Parameters<E2BSandboxClient["connect"]>[1] | undefined;
+  lastFindOptions: Parameters<E2BSandboxClient["find"]>[1] | undefined;
+  lastGetInfoOptions: Parameters<E2BSandboxClient["getInfo"]>[1] | undefined;
   connectCount = 0;
   blockCommands = false;
+  blockFind = false;
+  blockFileReads = false;
+  blockFileWrites = false;
 
   async create(input: Parameters<E2BSandboxClient["create"]>[0]): Promise<E2BSandboxLike> {
     this.lastCreate = input;
     const id = `e2b_${this.sandboxes.size + 1}`;
-    const sandbox = new FakeSandbox(id, () => this.blockCommands);
+    const sandbox = new FakeSandbox(id, () => this.blockCommands, () => this.blockFileReads, () => this.blockFileWrites);
     const now = new Date("2026-07-16T00:00:00.000Z");
     const info: E2BSandboxInfoLike = {
       sandboxId: id,
@@ -341,20 +463,31 @@ class FakeE2BClient implements E2BSandboxClient {
     return sandbox;
   }
 
-  async connect(sandboxId: string): Promise<E2BSandboxLike> {
+  async connect(sandboxId: string, options: Parameters<E2BSandboxClient["connect"]>[1]): Promise<E2BSandboxLike> {
     this.connectCount += 1;
+    this.lastConnectOptions = options;
     const stored = this.require(sandboxId);
     stored.info.state = "running";
     return stored.sandbox;
   }
 
-  async find(metadata: Record<string, string>): Promise<E2BSandboxInfoLike | undefined> {
+  async find(
+    metadata: Record<string, string>,
+    options: Parameters<E2BSandboxClient["find"]>[1],
+  ): Promise<E2BSandboxInfoLike | undefined> {
+    this.lastFindOptions = options;
+    if (this.blockFind) {
+      return new Promise<never>((_, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
     return [...this.sandboxes.values()].find(({ info }) => (
       info.state === "running" || info.state === "paused"
     ) && Object.entries(metadata).every(([key, value]) => info.metadata[key] === value))?.info;
   }
 
-  async getInfo(sandboxId: string): Promise<E2BSandboxInfoLike> {
+  async getInfo(sandboxId: string, options: Parameters<E2BSandboxClient["getInfo"]>[1]): Promise<E2BSandboxInfoLike> {
+    this.lastGetInfoOptions = options;
     return this.require(sandboxId).info;
   }
 
@@ -379,23 +512,50 @@ class FakeE2BClient implements E2BSandboxClient {
 class FakeSandbox implements E2BSandboxLike {
   readonly filesByPath = new Map<string, { content: Uint8Array; modifiedTime: Date }>();
   readonly timeoutUpdates: number[] = [];
+  readonly timeoutOptions: E2BRequestOptions[] = [];
   readonly foregroundCommands: string[] = [];
+  readonly foregroundOptions: Array<E2BRequestOptions & { background: false }> = [];
   getInfoCount = 0;
+  lastGetInfoOptions: E2BRequestOptions | undefined;
+  lastReadOptions: E2BRequestOptions | undefined;
+  lastBatchWriteOptions: E2BRequestOptions | undefined;
+  lastTimeoutOptions: E2BRequestOptions | undefined;
   onPause: (() => void) | undefined;
   lastCommandHandle: FakeCommandHandle | undefined;
   readonly files: E2BSandboxLike["files"];
   readonly commands: E2BSandboxLike["commands"];
 
-  constructor(readonly sandboxId: string, private readonly blockCommands: () => boolean) {
+  constructor(
+    readonly sandboxId: string,
+    private readonly blockCommands: () => boolean,
+    private readonly blockFileReads: () => boolean,
+    private readonly blockFileWrites: () => boolean,
+  ) {
     this.files = {
       read: async (path, options) => {
+        this.lastReadOptions = options;
+        if (this.blockFileReads()) {
+          return new Promise<never>((_, reject) => {
+            options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          });
+        }
         const file = this.requireFile(path);
         return options.format === "bytes" ? file.content : Buffer.from(file.content).toString("utf8");
       },
       write: (async (
         pathOrFiles: string | Array<{ path: string; data: string | ArrayBuffer }>,
         data?: string | ArrayBuffer,
+        options?: E2BRequestOptions,
       ) => {
+        if (Array.isArray(pathOrFiles)) {
+          const batchOptions = options ?? (typeof data === "object" && data !== null ? data as E2BRequestOptions : undefined);
+          this.lastBatchWriteOptions = batchOptions;
+          if (this.blockFileWrites()) {
+            return new Promise<never>((_, reject) => {
+              batchOptions?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+            });
+          }
+        }
         const writeOne = (path: string, value: string | ArrayBuffer) => {
           const content = typeof value === "string" ? Buffer.from(value) : new Uint8Array(value);
           const modifiedTime = new Date("2026-07-16T00:00:01.000Z");
@@ -411,8 +571,9 @@ class FakeSandbox implements E2BSandboxLike {
       list: async (path) => [...this.filesByPath.entries()]
         .filter(([candidate]) => candidate.startsWith(`${path.replace(/\/$/, "")}/`))
         .map(([candidate, file]) => fileInfo(candidate, file.content.byteLength, file.modifiedTime)),
-      getInfo: async (path) => {
+      getInfo: async (path, options) => {
         this.getInfoCount += 1;
+        this.lastGetInfoOptions = options;
         const file = this.requireFile(path);
         return fileInfo(path, file.content.byteLength, file.modifiedTime);
       },
@@ -424,6 +585,11 @@ class FakeSandbox implements E2BSandboxLike {
           return this.lastCommandHandle;
         }
         this.foregroundCommands.push(command);
+        this.foregroundOptions.push({
+          ...(options?.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: options.requestTimeoutMs }),
+          ...(options?.signal === undefined ? {} : { signal: options.signal }),
+          background: false,
+        });
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     };
@@ -433,8 +599,10 @@ class FakeSandbox implements E2BSandboxLike {
     return `${port}-${this.sandboxId}.e2b.test`;
   }
 
-  async setTimeout(timeoutMs: number): Promise<void> {
+  async setTimeout(timeoutMs: number, options: E2BRequestOptions = {}): Promise<void> {
     this.timeoutUpdates.push(timeoutMs);
+    this.timeoutOptions.push(options);
+    this.lastTimeoutOptions = options;
   }
 
   async pause(): Promise<boolean> {

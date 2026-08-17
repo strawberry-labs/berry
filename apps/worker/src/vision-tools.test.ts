@@ -12,6 +12,20 @@ import { DurableVisionToolExecutor, type VisionObservationCache } from "./vision
 afterEach(() => vi.unstubAllGlobals());
 
 describe("DurableVisionToolExecutor", () => {
+  it("declares inspection abort support and delegates inherited tools", () => {
+    const executor = new DurableVisionToolExecutor({
+      supportsAbort: () => true,
+      execute: async () => ({ output: {}, summary: "base" }),
+    }, new MemoryVisionCache());
+    const snapshot = visionSnapshot();
+
+    expect(executor.supportsAbort(snapshot, visionStep())).toBe(false);
+    expect(executor.supportsAbort(snapshot, {
+      type: "tool.read",
+      input: { toolName: "read", arguments: { path: "/workspace/file.txt" } },
+    } as never)).toBe(true);
+  });
+
   it("withholds images from a text-only model when no approved adapter is available", async () => {
     const base: DurableTurnToolExecutor = {
       modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],

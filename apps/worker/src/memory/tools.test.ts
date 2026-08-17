@@ -9,6 +9,23 @@ import type { SqlWorkerMemoryRepository } from "./repository.js";
 import { DurablePersonalMemoryToolExecutor } from "./tools.js";
 
 describe("DurablePersonalMemoryToolExecutor", () => {
+  it("keeps memory mutations non-abortable and delegates inherited capability", () => {
+    const baseSupportsAbort = () => true;
+    const executor = new DurablePersonalMemoryToolExecutor({
+      supportsAbort: baseSupportsAbort,
+      execute: async () => ({ output: {}, summary: "base" }),
+    }, repository({ memoryEnabled: true, implicitMemoryEnabled: true }), personalMemory());
+
+    expect(executor.supportsAbort(snapshot(), memoryStep("remember_memory", {
+      kind: "profile",
+      content: "A fact",
+    }))).toBe(false);
+    expect(executor.supportsAbort(snapshot(), {
+      type: "tool.read",
+      input: { toolName: "read", arguments: { path: "/workspace/file.txt" } },
+    } as never)).toBe(true);
+  });
+
   it("adds personal memory tools while preserving inherited tool definitions", async () => {
     const executor = new DurablePersonalMemoryToolExecutor(
       baseTools(),
