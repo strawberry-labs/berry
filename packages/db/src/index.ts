@@ -405,6 +405,10 @@ export const tasks = pgTable("tasks", {
   userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
   title: text("title").notNull(),
   status: taskStatusEnum("status").notNull().default("queued"),
+  projectionSequence: bigint("projection_sequence", { mode: "number" }).notNull().default(0),
+  statusSourceRunId: uuid("status_source_run_id"),
+  statusSourceSequence: bigint("status_source_sequence", { mode: "number" }),
+  statusSourceStateAt: timestamp("status_source_state_at", { withTimezone: true }),
   activeSessionId: uuid("active_session_id"),
   conversationKind: conversationKindEnum("conversation_kind").notNull().default("chat"),
   uiMode: uiModeEnum("ui_mode"),
@@ -439,6 +443,9 @@ export const sessions = pgTable("sessions", {
   model: text("model"),
   permissionMode: permissionModeEnum("permission_mode").notNull().default("full-access"),
   runtimeMetadata: jsonObject("runtime_metadata"),
+  projectionSourceRunId: uuid("projection_source_run_id"),
+  projectionSourceSequence: bigint("projection_source_sequence", { mode: "number" }),
+  projectionSourceStateAt: timestamp("projection_source_state_at", { withTimezone: true }),
   messageHistoryRevision: bigint("message_history_revision", { mode: "bigint" }).notNull().default(0n),
   messageHistoryDeletionRevision: bigint("message_history_deletion_revision", { mode: "bigint" }).notNull().default(0n),
   createdAt,
@@ -846,6 +853,7 @@ export const turnRuns = pgTable("turn_runs", {
   state: text("state").notNull().default("queued"),
   attempt: integer("attempt").notNull().default(0),
   ownershipGeneration: bigint("ownership_generation", { mode: "number" }).notNull().default(0),
+  phaseClaimCount: integer("phase_claim_count").notNull().default(0),
   version: integer("version").notNull().default(0),
   progressEpoch: integer("progress_epoch").notNull().default(0),
   progressKind: text("progress_kind"),
@@ -856,6 +864,14 @@ export const turnRuns = pgTable("turn_runs", {
   cumulativeToolMs: bigint("cumulative_tool_ms", { mode: "number" }).notNull().default(0),
   cumulativeActiveComputeMs: bigint("cumulative_active_compute_ms", { mode: "number" }).notNull().default(0),
   progressBudgetReason: text("progress_budget_reason"),
+  workflowCategory: text("workflow_category").notNull().default("unknown"),
+  workflowCategoryVersion: text("workflow_category_version").notNull().default("workflow-v1"),
+  workerRole: text("worker_role").notNull().default("unknown"),
+  sourceRevision: text("source_revision").notNull().default("unknown"),
+  firstClaimedAt: timestamp("first_claimed_at", { withTimezone: true }),
+  lastClaimedAt: timestamp("last_claimed_at", { withTimezone: true }),
+  firstModelStartedAt: timestamp("first_model_started_at", { withTimezone: true }),
+  lastModelCompletedAt: timestamp("last_model_completed_at", { withTimezone: true }),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   waitingStartedAt: timestamp("waiting_started_at", { withTimezone: true }),
@@ -959,6 +975,9 @@ export const turnSteps = pgTable("turn_steps", {
   sessionEntryId: text("session_entry_id"),
   checkpointId: uuid("checkpoint_id"),
   attempt: integer("attempt").notNull().default(0),
+  phaseClaimCount: integer("phase_claim_count").notNull().default(0),
+  workerRole: text("worker_role").notNull().default("unknown"),
+  sourceRevision: text("source_revision").notNull().default("unknown"),
   error: text("error"),
   resultFingerprint: text("result_fingerprint"),
   cancellationAcknowledgedAt: timestamp("cancellation_acknowledged_at", { withTimezone: true }),
@@ -994,6 +1013,25 @@ export const turnEvents = pgTable("turn_events", {
   index("turn_events_retention_idx").on(table.tenantId, table.createdAt),
 ]);
 
+export const agentOperationalEvents = pgTable("agent_operational_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => turnRuns.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+  eventType: text("event_type").notNull(),
+  dedupeKey: text("dedupe_key").notNull(),
+  claimEpoch: bigint("claim_epoch", { mode: "number" }),
+  phaseClaimCount: integer("phase_claim_count"),
+  workerRole: text("worker_role").notNull().default("unknown"),
+  sourceRevision: text("source_revision").notNull().default("unknown"),
+  payload: jsonb("payload").$type<JsonValue>().notNull().default(sql`'{}'::jsonb`),
+  createdAt,
+}, (table) => [
+  uniqueIndex("agent_operational_events_dedupe_unique").on(table.tenantId, table.dedupeKey),
+  index("agent_operational_events_run_created_idx").on(table.tenantId, table.runId, table.createdAt),
+  index("agent_operational_events_type_created_idx").on(table.tenantId, table.eventType, table.createdAt),
+]);
+
 export const runtimeOutbox = pgTable("runtime_outbox", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
@@ -1015,6 +1053,8 @@ export const runtimeOutbox = pgTable("runtime_outbox", {
   maxAttempts: integer("max_attempts").notNull().default(8),
   deadLetteredAt: timestamp("dead_lettered_at", { withTimezone: true }),
   errorCategory: text("error_category"),
+  workerRole: text("worker_role").notNull().default("unknown"),
+  sourceRevision: text("source_revision").notNull().default("unknown"),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   lastError: text("last_error"),
   createdAt,
@@ -1725,6 +1765,7 @@ export const cloudSchema = {
   turnRuns,
   turnSteps,
   turnEvents,
+  agentOperationalEvents,
   runtimeOutbox,
   sandboxSnapshots,
   maintenanceRuns,
@@ -1787,6 +1828,7 @@ export const CLOUD_SCHEMA_TABLES = [
   "turn_runs",
   "turn_steps",
   "turn_events",
+  "agent_operational_events",
   "runtime_outbox",
   "sandbox_snapshots",
   "maintenance_runs",
@@ -1834,6 +1876,7 @@ export const TENANT_SCOPED_TABLES = [
   ...DURABLE_CONTEXT_TABLES,
   "turn_admission_intents",
   "session_compaction_leases",
+  "agent_operational_events",
   "maintenance_runs",
   "tool_calls",
   "approvals",
@@ -5267,6 +5310,69 @@ CREATE INDEX IF NOT EXISTS file_lifecycle_events_file_created_idx
 ${tenantRlsSql("file_lifecycle_events")}
 `.trim();
 
+export const AGENT_HARNESS_OPERATIONAL_TELEMETRY_MIGRATION = `
+ALTER TABLE tasks
+  ADD COLUMN IF NOT EXISTS projection_sequence bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS status_source_run_id uuid,
+  ADD COLUMN IF NOT EXISTS status_source_sequence bigint,
+  ADD COLUMN IF NOT EXISTS status_source_state_at timestamptz;
+
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS projection_source_run_id uuid,
+  ADD COLUMN IF NOT EXISTS projection_source_sequence bigint,
+  ADD COLUMN IF NOT EXISTS projection_source_state_at timestamptz;
+
+ALTER TABLE turn_runs
+  ADD COLUMN IF NOT EXISTS phase_claim_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS workflow_category text NOT NULL DEFAULT 'unknown',
+  ADD COLUMN IF NOT EXISTS workflow_category_version text NOT NULL DEFAULT 'workflow-v1',
+  ADD COLUMN IF NOT EXISTS worker_role text NOT NULL DEFAULT 'unknown',
+  ADD COLUMN IF NOT EXISTS source_revision text NOT NULL DEFAULT 'unknown',
+  ADD COLUMN IF NOT EXISTS first_claimed_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_claimed_at timestamptz,
+  ADD COLUMN IF NOT EXISTS first_model_started_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_model_completed_at timestamptz;
+
+ALTER TABLE turn_steps
+  ADD COLUMN IF NOT EXISTS phase_claim_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS worker_role text NOT NULL DEFAULT 'unknown',
+  ADD COLUMN IF NOT EXISTS source_revision text NOT NULL DEFAULT 'unknown';
+
+ALTER TABLE runtime_outbox
+  ADD COLUMN IF NOT EXISTS worker_role text NOT NULL DEFAULT 'unknown',
+  ADD COLUMN IF NOT EXISTS source_revision text NOT NULL DEFAULT 'unknown';
+
+CREATE INDEX IF NOT EXISTS turn_runs_claim_observability_idx
+  ON turn_runs (tenant_id, last_claimed_at, worker_role, source_revision);
+CREATE INDEX IF NOT EXISTS turn_steps_phase_claim_idx
+  ON turn_steps (tenant_id, run_id, phase_claim_count);
+CREATE INDEX IF NOT EXISTS tasks_projection_sequence_idx
+  ON tasks (tenant_id, projection_sequence);
+CREATE INDEX IF NOT EXISTS sessions_projection_source_idx
+  ON sessions (tenant_id, projection_source_state_at, projection_source_sequence);
+
+CREATE TABLE IF NOT EXISTS agent_operational_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  run_id uuid REFERENCES turn_runs(id) ON DELETE CASCADE,
+  session_id uuid REFERENCES sessions(id) ON DELETE CASCADE,
+  event_type text NOT NULL,
+  dedupe_key text NOT NULL,
+  claim_epoch bigint,
+  phase_claim_count integer,
+  worker_role text NOT NULL DEFAULT 'unknown',
+  source_revision text NOT NULL DEFAULT 'unknown',
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS agent_operational_events_run_created_idx
+  ON agent_operational_events (tenant_id, run_id, created_at);
+CREATE INDEX IF NOT EXISTS agent_operational_events_type_created_idx
+  ON agent_operational_events (tenant_id, event_type, created_at);
+${tenantRlsSql("agent_operational_events")}
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5413,4 +5519,5 @@ export const cloudMigrations = [
   { id: 61, name: "agent_harness_provider_recovery_v1", sql: AGENT_HARNESS_PROVIDER_RECOVERY_MIGRATION },
   { id: 62, name: "agent_harness_compaction_v1", sql: AGENT_HARNESS_COMPACTION_MIGRATION },
   { id: 63, name: "agent_harness_outbox_file_lifecycle_v1", sql: AGENT_HARNESS_OUTBOX_FILE_LIFECYCLE_MIGRATION },
+  { id: 64, name: "agent_harness_operational_telemetry_v1", sql: AGENT_HARNESS_OPERATIONAL_TELEMETRY_MIGRATION },
 ] as const;

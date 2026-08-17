@@ -65,6 +65,70 @@ describe("RuntimeOutboxDispatcher", () => {
     expect(statements.some((sql) => sql.includes("dead_lettered_at") && sql.includes("completed_at = COALESCE"))).toBe(false);
   });
 
+  it("propagates worker role/revision and immutable lifecycle timestamps into dispatch telemetry", async () => {
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+    let claimed = false;
+    const firstAvailableAt = "2026-08-17T00:00:00.000Z";
+    const claimedAt = "2026-08-17T00:00:01.000Z";
+    const executor: SqlExecutor = {
+      execute: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+        executions.push({ sql, params });
+      }),
+      query: async <T>(sql: string, params: readonly unknown[] = []): Promise<readonly T[]> => {
+        queries.push({ sql, params });
+        if (!claimed && sql.includes("RETURNING outbox.id")) {
+          claimed = true;
+          return [{
+            id: outboxId,
+            tenant_id: tenantId,
+            event_type: "turn.execute",
+            payload: { tenantId, runId, reason: "continue" },
+            attempts: 1,
+            first_available_at: firstAvailableAt,
+            claimed_at: claimedAt,
+            delivered_at: null,
+            receipt_at: null,
+            lease_epoch: 3,
+            priority_class: "interactive",
+            worker_role: "foreground",
+            source_revision: "release/2026.08",
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const dispatcher = new RuntimeOutboxDispatcher(executor, {
+      enqueue: vi.fn(async () => ({ id: "queued", name: "turn.execute" as const })) as BerryQueueClient["enqueue"],
+      close: async () => undefined,
+    }, {
+      tenantId,
+      workerId: "worker-test",
+      workerRole: "foreground",
+      sourceRevision: "release/2026.08",
+    });
+
+    await expect(dispatcher.dispatchDue()).resolves.toBe(1);
+
+    const claim = queries.find(({ sql }) => sql.includes("RETURNING outbox.id"));
+    expect(claim?.sql).toContain("outbox.claimed_at");
+    expect(claim?.sql).toContain("outbox.delivered_at");
+    expect(claim?.sql).toContain("outbox.receipt_at");
+    expect(claim?.params.slice(1, 4)).toEqual(["worker-test", "foreground", "release/2026.08"]);
+    const telemetry = executions.find(({ sql }) => sql.includes("INSERT INTO agent_operational_events"));
+    expect(telemetry?.params[7]).toBe("foreground");
+    expect(telemetry?.params[8]).toBe("release/2026.08");
+    expect(JSON.parse(String(telemetry?.params[9]))).toMatchObject({
+      outboxId,
+      claimEpoch: 3,
+      firstAvailableAt,
+      claimedAt,
+      deliveredAt: expect.any(String),
+      receiptAt: null,
+    });
+  });
+
   it("ignores pending maintenance work when deciding whether a run needs recovery", async () => {
     const statements: string[] = [];
     const executor: SqlExecutor = {

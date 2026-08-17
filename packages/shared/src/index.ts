@@ -10,6 +10,8 @@ export * from "./memory.ts";
 export * from "./agent-skill-content.ts";
 export * from "./durable-job-contracts.ts";
 export * from "./provider-errors.ts";
+export * from "./workflow-routing.ts";
+export * from "./operational-telemetry.ts";
 
 /**
  * Pre-1.0 host protocol version shared by desktop, host, CLI, and future

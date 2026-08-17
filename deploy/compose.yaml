@@ -206,6 +206,11 @@ services:
       dockerfile: Dockerfile
       target: api
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "${BERRY_LOG_MAX_SIZE:-10m}"
+        max-file: "${BERRY_LOG_MAX_FILES:-5}"
     command: ["node", "apps/api/dist/main.js"]
     depends_on:
       postgres-roles:
@@ -366,6 +371,11 @@ services:
       dockerfile: Dockerfile
       target: worker
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "${BERRY_LOG_MAX_SIZE:-10m}"
+        max-file: "${BERRY_LOG_MAX_FILES:-5}"
     deploy:
       replicas: ${BERRY_BACKGROUND_WORKER_REPLICAS:-1}
     command: ["node", "apps/worker/dist/main.js"]
@@ -383,6 +393,9 @@ services:
       BERRY_DATABASE_URL: postgres://berry_worker:${BERRY_WORKER_DATABASE_PASSWORD:-berry-worker-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
       BERRY_REDIS_URL: redis://redis:6379
       BERRY_WORKER_ROLE: background
+      BERRY_LOG_RETENTION_DAYS: ${BERRY_LOG_RETENTION_DAYS:-14}
+      BERRY_LOG_MAX_BYTES: ${BERRY_LOG_MAX_BYTES:-10485760}
+      BERRY_LOG_MAX_FILES: ${BERRY_LOG_MAX_FILES:-5}
       BERRY_OUTBOX_DISPATCH_ENABLED: ${BERRY_OUTBOX_DISPATCH_ENABLED:-true}
       BERRY_WORKER_CONCURRENCY: ${BERRY_WORKER_CONCURRENCY:-4}
       BERRY_BACKGROUND_WORKER_CONCURRENCY: ${BERRY_BACKGROUND_WORKER_CONCURRENCY:-4}

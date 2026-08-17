@@ -9,9 +9,11 @@ import {
   type BerryWorkerQueueKind,
   workerQueueKind,
 } from "./jobs.js";
+import { normalizeWorkerRole, sourceRevisionFromEnv } from "@berry/shared";
 import type { BerryWorkerDependencies } from "./processor.js";
 import { processBerryWorkerJob } from "./processor.js";
 import { classifyProviderFailure } from "./provider-retry.js";
+import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 
 export interface BerryQueueClient {
   enqueue<Name extends BerryWorkerJobName>(
@@ -206,15 +208,18 @@ export function createBerryWorker(
 export function workerFailureForRetryPolicy(jobName: string, error: unknown): unknown {
   const failure = classifyProviderFailure(error);
   if (failure.retryable) return error;
-  const diagnostics = {
-    event: "berry.worker.provider_failure",
-    jobName,
-    retryable: false,
-    category: failure.category,
-    status: failure.status ?? null,
-    code: failure.code ?? null,
-  };
-  console.warn(JSON.stringify(diagnostics));
+  emitWorkerOperationalEvent(
+    "provider.attempt",
+    normalizeWorkerRole(process.env.BERRY_WORKER_ROLE),
+    sourceRevisionFromEnv(process.env),
+    {
+      phase: "worker_job",
+      category: failure.category,
+      statusClass: failure.status === undefined ? "unknown" : String(failure.status),
+      retryDecision: "not_retryable",
+      outcome: "failed",
+    },
+  );
   return new UnrecoverableError([
     `Non-retryable ${jobName} provider failure`,
     failure.status ? `status=${failure.status}` : null,

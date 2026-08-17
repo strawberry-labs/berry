@@ -1,5 +1,5 @@
 import { Injectable, type OnModuleDestroy } from "@nestjs/common";
-import { TURN_CANCELLATION_CHANNEL } from "@berry/shared";
+import { safeOperationalLog, sourceRevisionFromEnv, TURN_CANCELLATION_CHANNEL } from "@berry/shared";
 import { Redis } from "ioredis";
 import { apiRuntimeMetrics } from "./runtime-metrics.js";
 
@@ -17,10 +17,12 @@ export class TurnCancellationPublisher implements OnModuleDestroy {
         })
       : null;
     this.#redis?.on("error", (error) => {
-      console.warn(JSON.stringify({
-        event: "berry.turn_cancellation.publisher_error",
-        code: errorCode(error),
-      }));
+      console.warn(JSON.stringify(safeOperationalLog("wait.transition", {
+        workerRole: "unknown",
+        sourceRevision: sourceRevisionFromEnv(process.env),
+        outcome: "cancellation_publisher_error",
+        category: errorCode(error) ?? "unknown",
+      })));
     });
   }
 
@@ -36,11 +38,13 @@ export class TurnCancellationPublisher implements OnModuleDestroy {
     } catch (error) {
       // The durable database marker remains authoritative. Pub/sub only
       // shortens provider abort latency, so Redis failure must fail open.
-      console.warn(JSON.stringify({
-        event: "berry.turn_cancellation.publish_failed",
+      console.warn(JSON.stringify(safeOperationalLog("wait.transition", {
+        workerRole: "unknown",
+        sourceRevision: sourceRevisionFromEnv(process.env),
+        outcome: "cancellation_publish_failed",
         runId,
-        code: errorCode(error),
-      }));
+        category: errorCode(error) ?? "unknown",
+      })));
       apiRuntimeMetrics.turnCancellationSignal("failed");
     }
   }

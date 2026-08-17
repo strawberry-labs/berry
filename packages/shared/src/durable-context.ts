@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { WorkflowCategorySchema, WORKFLOW_CATEGORY_VERSION } from "./workflow-routing.ts";
 
 const DateTimeSchema = z.string().datetime({ offset: true });
 const NonEmptyIdSchema = z.string().min(1);
@@ -629,6 +630,8 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   budgetReservationRequired: z.boolean().default(false),
   input: z.string().default(""),
   intent: TurnIntentSchema.optional(),
+  workflowCategory: WorkflowCategorySchema.default("unknown"),
+  workflowCategoryVersion: z.string().min(1).max(64).default(WORKFLOW_CATEGORY_VERSION),
   providerId: z.string().min(1),
   provider: DurableProviderTransportSchema,
   model: z.string().min(1).nullable(),

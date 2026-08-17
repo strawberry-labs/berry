@@ -1,6 +1,8 @@
 import { TURN_CANCELLATION_CHANNEL } from "@berry/shared";
+import { normalizeWorkerRole, sourceRevisionFromEnv } from "@berry/shared";
 import { Redis } from "ioredis";
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
+import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 
 const RECENT_CANCELLATION_TTL_MS = 5 * 60_000;
 
@@ -68,23 +70,23 @@ export class TurnCancellationSubscriber {
         if (typeof parsed.runId !== "string" || !parsed.runId) return;
         const abortedRequests = this.registry.cancel(parsed.runId);
         workerRuntimeMetrics.cancellationSignal("received", abortedRequests);
-        console.info(JSON.stringify({
-          event: "berry.turn_cancellation.received",
+        emitWorkerOperationalEvent("wait.transition", normalizeWorkerRole(process.env.BERRY_WORKER_ROLE), sourceRevisionFromEnv(process.env), {
           runId: parsed.runId,
           abortedRequests,
-        }));
+          outcome: "cancellation_received",
+        });
       } catch {
         workerRuntimeMetrics.cancellationSignal("invalid_payload");
-        console.warn(JSON.stringify({ event: "berry.turn_cancellation.invalid_payload" }));
+        emitWorkerOperationalEvent("wait.transition", normalizeWorkerRole(process.env.BERRY_WORKER_ROLE), sourceRevisionFromEnv(process.env), {
+          outcome: "cancellation_invalid_payload",
+        });
       }
     });
-    this.#redis.on("error", (error) => {
+    this.#redis.on("error", (_error) => {
       workerRuntimeMetrics.cancellationSignal("subscriber_error");
-      const code = (error as Error & { code?: unknown }).code;
-      console.warn(JSON.stringify({
-        event: "berry.turn_cancellation.subscriber_error",
-        code: typeof code === "string" ? code.slice(0, 128) : null,
-      }));
+      emitWorkerOperationalEvent("wait.transition", normalizeWorkerRole(process.env.BERRY_WORKER_ROLE), sourceRevisionFromEnv(process.env), {
+        outcome: "cancellation_subscriber_error",
+      });
     });
   }
 

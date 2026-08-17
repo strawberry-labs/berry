@@ -6,7 +6,9 @@ import {
 import {
   DurableTurnRuntimeRequestSchema,
   NetworkPolicySchema,
+  normalizeWorkerRole,
   openDurableSecret,
+  sourceRevisionFromEnv,
   type JsonValue,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
@@ -17,6 +19,7 @@ import type {
   DurableTurnToolExecutor,
   TurnToolResult,
 } from "./turn-runner.js";
+import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 
 export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   readonly #source: McpToolSource;
@@ -35,11 +38,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       servers: [...servers],
       ...(networkPolicy ? { networkPolicy } : {}),
       connectTimeoutMs,
-      log: (level, message) => {
-        const output = `[durable-mcp] ${message}`;
-        if (level === "error") console.error(output);
-        else if (level === "warn") console.warn(output);
-        else console.info(output);
+      log: (level, _message) => {
+        emitMcpLog(level);
       },
     });
   }
@@ -210,11 +210,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       servers: [...servers],
       ...(policy.success ? { networkPolicy: policy.data } : {}),
       connectTimeoutMs: this.connectTimeoutMs,
-      log: (level, message) => {
-        const output = `[durable-mcp:${snapshot.id}] ${message}`;
-        if (level === "error") console.error(output);
-        else if (level === "warn") console.warn(output);
-        else console.info(output);
+      log: (level, _message) => {
+        emitMcpLog(level, snapshot.id);
       },
     });
     // Cached, administrator-reviewed schemas are enough for model preparation.
@@ -339,6 +336,20 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   #serverForTool(toolName: string, candidates: readonly McpServerSpec[]): McpServerSpec | undefined {
     return candidates.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
   }
+}
+
+function emitMcpLog(level: "debug" | "info" | "warn" | "error", runId?: string): void {
+  emitWorkerOperationalEvent(
+    "phase.transition",
+    normalizeWorkerRole(process.env.BERRY_WORKER_ROLE),
+    sourceRevisionFromEnv(process.env),
+    {
+      ...(runId ? { runId } : {}),
+      phase: "mcp",
+      outcome: `connector_${level}`,
+      toolFamily: "mcp",
+    },
+  );
 }
 
 type DurableMcpTurnContext = {

@@ -6,6 +6,7 @@ import {
   RetentionCleanupJobPayloadSchema,
 } from "./jobs.js";
 import { PgSqlExecutor } from "./pg-executor.js";
+import { normalizeWorkerRole, safeOperationalLog, sourceRevisionFromEnv } from "@berry/shared";
 
 const UuidSchema = z.string().uuid();
 
@@ -112,8 +113,13 @@ function numberArg(value: string | undefined, fallback: number): number {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runMaintenanceCli(process.argv.slice(2)).catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
+  runMaintenanceCli(process.argv.slice(2)).catch(() => {
+    console.error(JSON.stringify(safeOperationalLog("phase.transition", {
+      workerRole: normalizeWorkerRole(process.env.BERRY_WORKER_ROLE),
+      sourceRevision: sourceRevisionFromEnv(process.env),
+      phase: "maintenance_cli",
+      outcome: "failed",
+    })));
     process.exitCode = 1;
   });
 }

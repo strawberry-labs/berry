@@ -6,6 +6,9 @@ import {
   messageAttachmentContent,
   PromptManifestSchema,
   TurnStateSchema,
+  classifyWorkflowCategory,
+  WorkflowCategorySchema,
+  WORKFLOW_CATEGORY_VERSION,
   type AttachmentInput,
   type AgentStreamEvent,
   type JsonValue,
@@ -288,14 +291,30 @@ FOR UPDATE
       }
       const runId = randomUUID();
       const admittedStepId = randomUUID();
+      const existingCategory = WorkflowCategorySchema.safeParse(input.runtimeRequest.workflowCategory);
+      const classifiedWorkflow = classifyWorkflowCategory({
+        input: input.input,
+        intent: typeof input.runtimeRequest.intent === "string" ? input.runtimeRequest.intent : null,
+        conversationKind: typeof input.runtimeRequest.conversationKind === "string" ? input.runtimeRequest.conversationKind : null,
+        attachments: input.attachments,
+      });
+      const workflowCategory = existingCategory.success ? existingCategory.data : classifiedWorkflow.category;
+      const workflowCategoryVersion = typeof input.runtimeRequest.workflowCategoryVersion === "string"
+        ? input.runtimeRequest.workflowCategoryVersion
+        : WORKFLOW_CATEGORY_VERSION;
+      const runtimeRequest = {
+        ...input.runtimeRequest,
+        workflowCategory,
+        workflowCategoryVersion,
+      };
       await executor.execute(
         `
 INSERT INTO turn_runs (
   id,tenant_id,user_id,workspace_id,task_id,session_id,request_id,request_message_id,
-  state,next_action,runtime_request,grounding_context,prompt_manifest
+  state,next_action,runtime_request,grounding_context,prompt_manifest,workflow_category,workflow_category_version
 ) VALUES (
   $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8::uuid,
-  'queued','Assemble durable context',$9::jsonb,$10::jsonb,$11::jsonb
+  'queued','Assemble durable context',$9::jsonb,$10::jsonb,$11::jsonb,$12,$13
 )
         `.trim(),
         [
@@ -308,7 +327,7 @@ INSERT INTO turn_runs (
           input.requestId,
           requestMessageId,
           JSON.stringify({
-            ...input.runtimeRequest,
+            ...runtimeRequest,
             requestId: input.requestId,
             admissionFingerprint: input.operationFingerprint,
             budgetReservationRequired: input.budgetReservationRequired,
@@ -317,6 +336,8 @@ INSERT INTO turn_runs (
           }),
           JSON.stringify(input.groundingContext),
           JSON.stringify(input.promptManifest ?? {}),
+          workflowCategory,
+          workflowCategoryVersion,
         ],
       );
       await executor.execute(
@@ -357,6 +378,26 @@ INSERT INTO turn_events (
       );
       await executor.execute(
         `
+INSERT INTO agent_operational_events (
+  tenant_id,run_id,session_id,event_type,dedupe_key,worker_role,source_revision,payload
+) VALUES ($1::uuid,$2::uuid,$3::uuid,'admission.transition',$4,'unknown','unknown',$5::jsonb)
+ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        `.trim(),
+        [
+          input.tenantId,
+          runId,
+          input.sessionId,
+          `${runId}:admission:admitted`,
+          JSON.stringify({
+            previousState: "preparing",
+            newState: "admitted",
+            workflowCategory,
+            workflowCategoryVersion,
+          }),
+        ],
+      );
+      await executor.execute(
+        `
 INSERT INTO runtime_outbox (
   tenant_id,event_type,aggregate_id,dedupe_key,payload
 ) VALUES ($1::uuid,'turn.execute',$2,$3,$4::jsonb)
@@ -371,17 +412,30 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
       );
       await executor.execute(
         `
-UPDATE tasks SET status='running',updated_at=now()
+UPDATE tasks SET status='running',
+    projection_sequence=GREATEST(projection_sequence,1),
+    status_source_run_id=$3::uuid,
+    status_source_sequence=1,
+    status_source_state_at=now(),
+    updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
+  AND (
+    status_source_run_id IS NULL
+    OR COALESCE(status_source_state_at,'-infinity'::timestamptz)<=now()
+  )
         `.trim(),
-        [input.tenantId, input.taskId],
+        [input.tenantId, input.taskId, runId],
       );
       await executor.execute(
         `
 UPDATE sessions
 SET runtime_metadata=runtime_metadata || jsonb_build_object(
-      'activeRunId',$2::text,'lastRunState','queued','leafId',$3::text
+      'activeRunId',$2::text,'lastRunState','queued','leafId',$3::text,
+      'sourceRunId',$2::text,'sourceRunSequence',0
     ),
+    projection_source_run_id=$2::uuid,
+    projection_source_sequence=0,
+    projection_source_state_at=now(),
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$4::uuid
         `.trim(),

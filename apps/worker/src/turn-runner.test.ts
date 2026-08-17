@@ -74,6 +74,19 @@ describe("durable turn runner", () => {
     expect(durableImageToolSelectionPrompt(DURABLE_BASE_BUILT_IN_TOOLS)).toBe("");
   });
 
+  it("narrows admitted built-ins while retaining user-control tools", () => {
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = {
+      ...current.runtimeRequest,
+      workflowCategory: "communications",
+      workflowCategoryVersion: "workflow-v1",
+      builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS, "ask_user_question", "compose_message", "persist_artifact"],
+    };
+
+    const names = durableBuiltInToolDefinitions(current).map((tool) => tool.function.name);
+    expect(names).toEqual(["read", "grep", "find", "ls", "ask_user_question", "compose_message", "persist_artifact", "save_personal_skill"]);
+  });
+
   it("uses the queued prompt intent instead of inheriting its predecessor intent", () => {
     const base = { providerId: "router", intent: "image_generation", attachments: [{ fileId: "old" }] };
     const normal = queuedFollowUpRuntimeRequest(base, {
@@ -2530,6 +2543,71 @@ describe("durable turn runner", () => {
     expect(statements.some((sql) => sql.includes("'citation'"))).toBe(false);
   });
 
+  it("separates phase claims from ownership generations", async () => {
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string, params: readonly unknown[] = []) => {
+        queries.push({ sql, params });
+        if (sql.startsWith("UPDATE turn_runs")) {
+          return [{
+            id: runId,
+            created_at: new Date().toISOString(),
+            tenant_id: tenantId,
+            user_id: "00000000-0000-7000-8000-000000000003",
+            workspace_id: "00000000-0000-7000-8000-000000000004",
+            task_id: "00000000-0000-7000-8000-000000000005",
+            session_id: "00000000-0000-7000-8000-000000000006",
+            request_message_id: null,
+            state: "calling_model",
+            attempt: 4,
+            ownership_generation: 9,
+            phase_claim_count: 12,
+            worker_role: "foreground",
+            source_revision: "release/2026.08",
+            version: 2,
+            progress_epoch: 0,
+            progress_kind: null,
+            consecutive_no_progress: 0,
+            physical_model_attempt: 0,
+            logical_model_iteration: 0,
+            tool_repair_attempts: 0,
+            cumulative_tool_ms: 0,
+            cumulative_active_compute_ms: 0,
+            progress_budget_reason: null,
+            cancelled_at: null,
+            waiting_started_at: null,
+            human_wait_ms: 0,
+            runtime_request: {},
+            grounding_context: {},
+            prompt_manifest: {},
+            updated_at: new Date().toISOString(),
+            sandbox_provider: null,
+            sandbox_id: null,
+            sandbox_state: null,
+          }] as T[];
+        }
+        return [] as T[];
+      },
+      execute: async () => undefined,
+    };
+
+    await expect(new SqlDurableTurnRepository(executor, {
+      workerRole: "foreground",
+      sourceRevision: "release/2026.08",
+    }).claim({ tenantId, runId, reason: "continue" }, "worker-owner", 30)).resolves.toMatchObject({
+      ownershipGeneration: 9,
+      phaseClaimCount: 12,
+      workerRole: "foreground",
+      sourceRevision: "release/2026.08",
+    });
+
+    const claim = queries.find(({ sql }) => sql.startsWith("UPDATE turn_runs"));
+    expect(claim?.sql).toContain("attempt = attempt + 1");
+    expect(claim?.sql).toContain("ownership_generation = ownership_generation + 1");
+    expect(claim?.sql).toContain("phase_claim_count = phase_claim_count + 1");
+    expect(claim?.params.slice(4, 6)).toEqual(["foreground", "release/2026.08"]);
+  });
+
   it("updates an existing durable step with contiguous PostgreSQL parameters", async () => {
     const step = modelStep("running", 1);
     const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
@@ -2574,6 +2652,43 @@ describe("durable turn runner", () => {
     expect(update?.params).toHaveLength(18);
     expect(update?.params[3]).toBe("running");
     expect(update?.params[8]).toBe(true);
+  });
+
+  it("guards task and session projections by source sequence even without a new session entry", async () => {
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
+          return [{ state: "calling_model", cancelled_at: null }] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql, params = []) => {
+        statements.push({ sql, params });
+      },
+    };
+    const current = snapshot("calling_model", [admittedStep()]);
+    current.leaseOwner = "worker-projection-order";
+    current.version = 10;
+
+    await new SqlDurableTurnRepository(executor).commit(current, {
+      expectedState: "calling_model",
+      nextState: "calling_model",
+      taskStatus: "running",
+      projectionSourceSequence: 4,
+      keepLease: true,
+    });
+
+    const taskProjection = statements.find(({ sql }) => sql.includes("status_source_sequence=$5"));
+    expect(taskProjection?.sql).toContain("projection_sequence=GREATEST(projection_sequence,$5::bigint)");
+    expect(taskProjection?.sql).toContain("status_source_run_id=$4::uuid");
+    expect(taskProjection?.sql).toContain("COALESCE(status_source_sequence,-1)<$5::bigint");
+    expect(taskProjection?.params[4]).toBe(4);
+    const sessionProjection = statements.find(({ sql }) => sql.includes("projection_source_sequence=$6::bigint"));
+    expect(sessionProjection?.sql).toContain("runtime_metadata=runtime_metadata || jsonb_build_object");
+    expect(sessionProjection?.sql).toContain("projection_source_run_id=$5::uuid");
+    expect(sessionProjection?.sql).toContain("projection_source_state_at=$8::timestamptz");
+    expect(sessionProjection?.params[5]).toBe(4);
   });
 
   it("treats a duplicate step idempotency key as a replay instead of failing the turn", async () => {

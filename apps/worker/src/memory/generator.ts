@@ -1,8 +1,16 @@
-import { MemoryOperationSchema, type JsonValue, type MemoryOperation, type MemoryScope } from "@berry/shared";
+import {
+  MemoryOperationSchema,
+  normalizeWorkerRole,
+  sourceRevisionFromEnv,
+  type JsonValue,
+  type MemoryOperation,
+  type MemoryScope,
+} from "@berry/shared";
 import { OpenAIChatCompletionsClient } from "@berry/router-client";
 import { z } from "zod";
 import type { MemoryExtractJobPayload } from "../jobs.js";
 import { classifyProviderFailure } from "../provider-retry.js";
+import { emitWorkerOperationalEvent } from "../operational-telemetry.js";
 import { workerRuntimeMetrics, type WorkerRuntimeMetrics } from "../runtime-metrics.js";
 
 export const ExtractedMemoryOperationSchema = MemoryOperationSchema.extend({
@@ -105,18 +113,23 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
       return call?.function.arguments ?? result.content;
     } catch (error) {
       const failure = classifyProviderFailure(error);
+      const latencyMs = Math.max(0, this.now() - startedAt);
       const diagnostics = {
-        event: "berry.memory.provider_failure",
-        jobName: "memory.extract",
         model: this.model,
         outcome: "failure",
         status: failure.status ?? null,
-        code: failure.code ?? null,
-        requestId: failure.requestId ?? null,
-        latencyMs: Math.max(0, this.now() - startedAt),
+        latencyMs,
       };
       this.metrics.providerRequest(diagnostics);
-      console.warn(JSON.stringify(diagnostics));
+      emitWorkerOperationalEvent("provider.attempt", normalizeWorkerRole(process.env.BERRY_WORKER_ROLE), sourceRevisionFromEnv(process.env), {
+        phase: "memory_extract",
+        model: this.model,
+        outcome: "failed",
+        statusClass: failure.status === undefined ? "unknown" : String(failure.status),
+        category: failure.category,
+        durationMs: latencyMs,
+        retryDecision: "not_retryable",
+      });
       throw error;
     }
   }

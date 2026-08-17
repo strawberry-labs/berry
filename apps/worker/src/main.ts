@@ -2,13 +2,19 @@ import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { createPersonalMemoryProviderFromEnv } from "@berry/personal-memory";
 import { createBerryQueueRouter, createBerryWorker } from "./bullmq.ts";
-import { durableContextConfigFromEnv } from "@berry/shared";
+import {
+  durableContextConfigFromEnv,
+  normalizeWorkerRole,
+  operationalLogPolicyFromEnv,
+  sourceRevisionFromEnv,
+} from "@berry/shared";
 import { PgSqlExecutor } from "./pg-executor.ts";
 import { SqlManagementJobRepository, SqlTaskTitleRepository, SqlUsageRollupRepository } from "./sql-repositories.ts";
 import { KnowledgeProcessor } from "./knowledge/processor.ts";
 import { SqlKnowledgeRepository } from "./knowledge/repository.ts";
 import { DocumentExtractor, KnowledgeChunker, S3KnowledgeObjectStore, createEmbeddingProviderFromEnv, type KnowledgeObjectStore } from "./knowledge/services.ts";
 import { RuntimeOutboxDispatcher, SqlRuntimeOutboxDeliveryReceipts } from "./outbox.ts";
+import { emitWorkerOperationalEvent } from "./operational-telemetry.ts";
 import { createMemoryOperationGenerator } from "./memory/generator.ts";
 import { MemoryProcessor } from "./memory/processor.ts";
 import { SqlWorkerMemoryRepository } from "./memory/repository.ts";
@@ -47,6 +53,11 @@ import {
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const processConfig = workerProcessConfigFromEnv(env);
+  const workerRole = normalizeWorkerRole(processConfig.role);
+  const sourceRevision = sourceRevisionFromEnv(env);
+  // The container/runtime owns rotation; parsing the same bounded policy here
+  // makes the retention contract explicit for non-Compose deployments too.
+  operationalLogPolicyFromEnv(env);
   const durableConfig = durableContextConfigFromEnv(env);
   const databaseUrl = env.BERRY_DATABASE_URL ?? env.DATABASE_URL;
   if (!databaseUrl) throw new Error("BERRY_DATABASE_URL or DATABASE_URL is required");
@@ -145,7 +156,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     ),
     compactor,
     turnRunner: new DurableTurnRunner(
-      new SqlDurableTurnRepository(executor),
+      new SqlDurableTurnRepository(executor, { workerRole, sourceRevision }),
       createDurableTurnModel(env),
       durableTools,
       {
@@ -174,13 +185,15 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
         ),
         compactor,
         cancellations: turnCancellations,
+        workerRole,
+        sourceRevision,
       },
     ),
     snapshotter: sandboxContinuity,
     maintenance: new SqlMaintenanceRunner(executor),
     ...(fileDeleter ? { fileDeleter } : {}),
     ...(fileBlobs ? { fileBlobs } : {}),
-    outboxReceipts: new SqlRuntimeOutboxDeliveryReceipts(executor),
+    outboxReceipts: new SqlRuntimeOutboxDeliveryReceipts(executor, { workerRole, sourceRevision }),
     tenantContext: {
       run: (tenantId, callback) => executor.runWithTenant(tenantId, callback),
     },
@@ -225,6 +238,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     : new RuntimeOutboxDispatcher(executor, queue, {
         ...(env.BERRY_TENANT_ID ? { tenantId: env.BERRY_TENANT_ID } : {}),
         workerId: `${hostname()}:${process.pid}:${randomUUID()}`,
+        workerRole,
+        sourceRevision,
         pollMs: positiveInteger(env.BERRY_OUTBOX_POLL_MS) ?? 250,
         enableWaitExpiry: env.BERRY_WAIT_EXPIRY_ENABLED?.trim().toLowerCase() === "true",
         enableTerminalFinalization: env.BERRY_TERMINAL_FINALIZATION_ENABLED?.trim().toLowerCase() === "true",
@@ -323,8 +338,13 @@ function joinRouterUrl(baseUrl: string, path: string): string {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  bootstrap().catch((error) => {
-    console.error(error);
+  bootstrap().catch(() => {
+    emitWorkerOperationalEvent(
+      "phase.transition",
+      normalizeWorkerRole(process.env.BERRY_WORKER_ROLE),
+      sourceRevisionFromEnv(process.env),
+      { phase: "bootstrap", outcome: "failed" },
+    );
     process.exitCode = 1;
   });
 }

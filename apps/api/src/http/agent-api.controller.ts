@@ -8,6 +8,7 @@ import {
   AttachmentInputSchema,
   ContextStatsSchema,
   ConversationKindSchema,
+  classifyWorkflowCategory,
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
   IMAGE_ASPECT_RATIO_DIMENSIONS,
@@ -21,7 +22,9 @@ import {
   PromptImprovementRequestSchema,
   ReasoningLevelSchema,
   resolveModelCapabilities,
+  safeOperationalLog,
   sealDurableSecret,
+  sourceRevisionFromEnv,
   TaskStatusSchema,
   TaskCollectionQuerySchema,
   TaskCollectionSummarySchema,
@@ -415,11 +418,13 @@ function logAdmissionPreparationDegraded(
   label: string,
   outcome: "timeout" | "unavailable",
 ): void {
-  console.info(JSON.stringify({
-    event: "berry.turn.admission_preparation",
-    outcome,
-    dependency: label.slice(0, 128),
-  }));
+  console.info(JSON.stringify(safeOperationalLog("admission.transition", {
+    workerRole: "unknown",
+    sourceRevision: sourceRevisionFromEnv(process.env),
+    phase: "preparation",
+    outcome: `dependency_${outcome}`,
+    category: label.slice(0, 128),
+  })));
 }
 
 function logTurnAdmission(
@@ -435,14 +440,17 @@ function logTurnAdmission(
     ? response.code.slice(0, 128)
     : null;
   apiRuntimeMetrics.turnAdmission(outcome, durationMs, status);
-  console.info(JSON.stringify({
-    event: "berry.turn.admission",
+  console.info(JSON.stringify(safeOperationalLog("admission.transition", {
+    workerRole: "unknown",
+    sourceRevision: sourceRevisionFromEnv(process.env),
+    previousState: "preparing",
+    newState: outcome,
     outcome,
     runId,
     durationMs: Math.max(0, Math.floor(durationMs)),
-    status,
-    code,
-  }));
+    statusClass: status === null ? "unknown" : String(status),
+    category: code ?? "unknown",
+  })));
 }
 
 const SteerTurnRequestSchema = z.object({
@@ -1862,6 +1870,12 @@ export class AgentApiController {
             ? ["activate_skill" as const]
             : []),
         ];
+        const workflow = classifyWorkflowCategory({
+          input: request.continueInterruptedTurn ? "" : request.input ?? "",
+          intent: request.intent,
+          conversationKind: mode,
+          attachments: request.attachments,
+        });
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
           admissionFingerprint: operationFingerprint,
@@ -1870,6 +1884,8 @@ export class AgentApiController {
           provider,
           model: governedRequest.model ?? null,
           conversationKind: mode,
+          workflowCategory: workflow.category,
+          workflowCategoryVersion: workflow.version,
           // The sandbox root is deployment infrastructure, not a client
           // preference. Keep model-visible paths aligned with the provider's
           // actual writable root for new and resumed durable runs.
@@ -1929,7 +1945,7 @@ export class AgentApiController {
         return { turnId: admitted.runId, sessionId };
       } catch (error) {
         await this.budgets.reconcile({ tenantId, requestId, actualCostMicros: 0n, usage });
-        await this.durableTurns.failAdmission({
+        await this.durableTurns.failAdmission?.({
           tenantId,
           sessionId,
           requestId,

@@ -9,20 +9,33 @@ import { ZodError } from "zod";
 import type { BerryQueueClient } from "./bullmq.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
+import {
+  emitWorkerOperationalEvent,
+  persistWorkerOperationalEvent,
+} from "./operational-telemetry.js";
+import { normalizeWorkerRole, type OperationalWorkerRole } from "@berry/shared";
 
 type OutboxRow = {
   id: string;
   tenant_id: string;
   event_type: string;
+  aggregate_id?: string;
   payload: unknown;
   attempts: number | string;
   created_at?: Date | string;
   available_at?: Date | string;
   first_available_at?: Date | string;
+  claimed_at?: Date | string | null;
+  delivered_at?: Date | string | null;
+  receipt_at?: Date | string | null;
   lease_epoch?: number | string;
   priority_class?: string;
   max_attempts?: number | string;
+  worker_role?: string;
+  source_revision?: string;
 };
+
+type OutboxLifecycleRow = Pick<OutboxRow, "id" | "attempts" | "first_available_at" | "claimed_at" | "delivered_at" | "receipt_at" | "lease_epoch" | "priority_class">;
 
 export class RuntimeOutboxDispatcher {
   #timer: NodeJS.Timeout | null = null;
@@ -43,6 +56,8 @@ export class RuntimeOutboxDispatcher {
       maxAttempts?: number;
       enableWaitExpiry?: boolean;
       enableTerminalFinalization?: boolean;
+      workerRole?: OperationalWorkerRole;
+      sourceRevision?: string;
     },
   ) {}
 
@@ -159,10 +174,11 @@ export class RuntimeOutboxDispatcher {
                    first_available_at ASC,
                    created_at ASC
           FOR UPDATE SKIP LOCKED
-          LIMIT $3
+          LIMIT $5
         )
         UPDATE runtime_outbox outbox
-        SET lease_owner = $2, lease_expires_at = now() + interval '30 seconds',
+        SET lease_owner = $2, worker_role = $3, source_revision = $4,
+            lease_expires_at = now() + interval '30 seconds',
             lease_epoch = outbox.lease_epoch + 1,
             claimed_at = COALESCE(outbox.claimed_at, now()),
             receipt_due_at = NULL,
@@ -170,10 +186,17 @@ export class RuntimeOutboxDispatcher {
         FROM due
         WHERE outbox.id = due.id
         RETURNING outbox.id, outbox.tenant_id, outbox.event_type,
-                  outbox.payload, outbox.attempts, outbox.created_at, outbox.available_at,
-                  outbox.first_available_at, outbox.lease_epoch, outbox.priority_class,
-                  outbox.max_attempts
-      `, [tenantId, this.options.workerId, claimLimit]));
+            outbox.payload, outbox.attempts, outbox.created_at, outbox.available_at,
+                  outbox.first_available_at, outbox.claimed_at, outbox.delivered_at,
+                  outbox.receipt_at, outbox.lease_epoch, outbox.priority_class,
+                  outbox.max_attempts, outbox.worker_role, outbox.source_revision
+      `, [
+        tenantId,
+        this.options.workerId,
+        this.options.workerRole ?? "unknown",
+        this.options.sourceRevision ?? "unknown",
+        claimLimit,
+      ]));
         rows.push(...claimed);
       }
       let dispatched = 0;
@@ -203,9 +226,26 @@ export class RuntimeOutboxDispatcher {
               priority: outboxJobPriority(name),
             },
           );
-          logOutboxDispatch(row, name);
+          const deliveredAt = new Date();
+          await this.withTenant(row.tenant_id, (executor) => persistWorkerOperationalEvent(executor, {
+            tenantId: row.tenant_id,
+            runId: row.event_type.startsWith("turn.") ? row.aggregate_id ?? null : null,
+            eventType: "outbox.transition",
+            dedupeKey: `${row.id}:dispatch:${leaseEpoch(row)}`,
+            claimEpoch: leaseEpoch(row),
+            workerRole: normalizeWorkerRole(row.worker_role ?? this.options.workerRole ?? "unknown"),
+            sourceRevision: row.source_revision ?? this.options.sourceRevision ?? "unknown",
+            fields: outboxTransitionFields(row, deliveredAt),
+          })).catch(() => undefined);
           if (requiresDeliveryReceipt(name)) await this.deferForDeliveryReceipt(row);
           else await this.complete(row);
+          logOutboxDispatch(
+            row,
+            name,
+            normalizeWorkerRole(row.worker_role ?? this.options.workerRole ?? "unknown"),
+            row.source_revision ?? this.options.sourceRevision ?? "unknown",
+            deliveredAt,
+          );
           dispatched += 1;
         } catch (error) {
           const malformed = error instanceof ZodError;
@@ -529,13 +569,21 @@ WHERE runtime_outbox.completed_at IS NOT NULL
   }
 
   #dispatchSafely(): void {
-    void this.dispatchDue().catch((error) => {
-      console.error("[runtime-outbox] Dispatch cycle failed; the next poll will retry.", error);
+    void this.dispatchDue().catch(() => {
+      emitWorkerOperationalEvent("outbox.transition", this.options.workerRole ?? "unknown", this.options.sourceRevision ?? "unknown", {
+        outcome: "dispatch_cycle_failed",
+      });
     });
   }
 }
 
-function logOutboxDispatch(row: OutboxRow, name: BerryWorkerJobName): void {
+function logOutboxDispatch(
+  row: OutboxRow,
+  name: BerryWorkerJobName,
+  workerRole: OperationalWorkerRole,
+  sourceRevision: string,
+  deliveredAt: Date,
+): void {
   const createdAt = row.created_at instanceof Date
     ? row.created_at.getTime()
     : typeof row.created_at === "string"
@@ -543,13 +591,44 @@ function logOutboxDispatch(row: OutboxRow, name: BerryWorkerJobName): void {
       : Number.NaN;
   const latencyMs = Number.isFinite(createdAt) ? Math.max(0, Date.now() - createdAt) : null;
   workerRuntimeMetrics.outboxDispatch(name, latencyMs);
-  console.info(JSON.stringify({
-    event: "berry.outbox.dispatch",
+  emitWorkerOperationalEvent("outbox.transition", workerRole, sourceRevision, {
+    ...outboxTransitionFields(row, deliveredAt),
+  });
+}
+
+function outboxTransitionFields(row: OutboxLifecycleRow, deliveredAt: Date): Record<string, unknown> {
+  const claimedAt = row.claimed_at ?? deliveredAt;
+  const recordedDeliveredAt = row.delivered_at ?? deliveredAt;
+  return {
     outboxId: row.id,
-    jobName: name,
+    claimEpoch: leaseEpoch(row),
     attempt: row.attempts,
-    latencyMs,
-  }));
+    priority: row.priority_class,
+    firstAvailableAt: toIsoString(row.first_available_at),
+    claimedAt: toIsoString(row.claimed_at),
+    deliveredAt: toIsoString(row.delivered_at) ?? deliveredAt.toISOString(),
+    receiptAt: toIsoString(row.receipt_at),
+    queueWaitMs: durationBetween(row.first_available_at, claimedAt),
+    deliveryLatencyMs: durationBetween(claimedAt, recordedDeliveredAt),
+    receiptLatencyMs: durationBetween(recordedDeliveredAt, row.receipt_at),
+  };
+}
+
+function durationBetween(start: Date | string | null | undefined, end: Date | string | null | undefined): number | null {
+  const startMs = timestampMs(start);
+  const endMs = timestampMs(end);
+  return startMs === null || endMs === null ? null : Math.max(0, endMs - startMs);
+}
+
+function timestampMs(value: Date | string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const timestamp = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function toIsoString(value: Date | string | null | undefined): string | null {
+  const timestamp = value instanceof Date ? value : typeof value === "string" ? new Date(value) : null;
+  return timestamp && !Number.isNaN(timestamp.getTime()) ? timestamp.toISOString() : null;
 }
 
 export function outboxJobId(name: BerryWorkerJobName, outboxId: string, attempt = 1): string {
@@ -564,7 +643,13 @@ export interface RuntimeOutboxDeliveryReceipts {
 }
 
 export class SqlRuntimeOutboxDeliveryReceipts implements RuntimeOutboxDeliveryReceipts {
-  constructor(private readonly executor: SqlExecutor) {}
+  constructor(
+    private readonly executor: SqlExecutor,
+    private readonly telemetry: {
+      workerRole?: OperationalWorkerRole;
+      sourceRevision?: string;
+    } = {},
+  ) {}
 
   async acknowledge(tenantId: string, outboxId: string, aggregateId?: string, leaseEpochValue?: number): Promise<void> {
     await this.executor.execute(`
@@ -579,11 +664,32 @@ WITH acknowledged AS (
     AND dead_lettered_at IS NULL AND lease_epoch=$4::bigint
   RETURNING id
 )
-UPDATE turn_runs
+    UPDATE turn_runs
 SET updated_at=now()
-WHERE tenant_id=$1::uuid AND id=$3::uuid
+  WHERE tenant_id=$1::uuid AND id=$3::uuid
   AND EXISTS (SELECT 1 FROM acknowledged)
     `.trim(), [tenantId, outboxId, aggregateId ?? null, leaseEpochValue ?? 1]);
+    const rows = await this.executor.query<OutboxLifecycleRow>(`
+      SELECT id,attempts,first_available_at,claimed_at,delivered_at,receipt_at,lease_epoch,priority_class
+      FROM runtime_outbox
+      WHERE tenant_id=$1::uuid AND id=$2::uuid
+    `, [tenantId, outboxId]).catch(() => [] as readonly OutboxLifecycleRow[]);
+    const row = rows[0];
+    if (row && Number(row.lease_epoch) === (leaseEpochValue ?? 1) && row.receipt_at) {
+      await persistWorkerOperationalEvent(this.executor, {
+        tenantId,
+        runId: aggregateId ?? null,
+        eventType: "outbox.transition",
+        dedupeKey: `${outboxId}:receipt:${leaseEpochValue ?? 1}`,
+        claimEpoch: leaseEpochValue ?? 1,
+        workerRole: this.telemetry.workerRole ?? "unknown",
+        sourceRevision: this.telemetry.sourceRevision ?? "unknown",
+        fields: {
+          ...outboxTransitionFields(row, row.delivered_at instanceof Date ? row.delivered_at : new Date()),
+          outcome: "receipt_recorded",
+        },
+      }).catch(() => undefined);
+    }
   }
 }
 
@@ -610,7 +716,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function leaseEpoch(row: OutboxRow): number {
+function leaseEpoch(row: Pick<OutboxRow, "lease_epoch">): number {
   const value = Number(row.lease_epoch);
   return Number.isSafeInteger(value) && value >= 0 ? value : 1;
 }

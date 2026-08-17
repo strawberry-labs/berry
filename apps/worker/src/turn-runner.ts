@@ -21,6 +21,8 @@ import {
   classifyProviderFailure,
   DURABLE_BASE_BUILT_IN_TOOLS,
   DurableTurnRuntimeRequestSchema,
+  normalizeWorkerRole,
+  routedBuiltInToolNames,
   VISION_ADAPTER_MAX_ATTEMPTS,
   openDurableSecret,
   providerAttemptStatusClass,
@@ -34,6 +36,7 @@ import {
   type DurableSkill,
   type DurableTurnRuntimeRequest,
   type JsonValue,
+  type OperationalWorkerRole,
   type PromptCachingCapabilities,
   type PromptManifest,
   ProviderAttemptError,
@@ -70,6 +73,10 @@ import {
   type ActiveTurnCancellationRegistry,
 } from "./turn-cancellation.js";
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
+import {
+  emitWorkerOperationalEvent,
+  persistWorkerOperationalEvent,
+} from "./operational-telemetry.js";
 
 const TERMINAL_STATES = new Set<TurnRunState>([
   "completed",
@@ -89,6 +96,9 @@ export interface DurableTurnStep {
   retryClass: ToolRetryClass | null;
   idempotencyKey: string | null;
   attempt: number;
+  phaseClaimCount?: number;
+  workerRole?: OperationalWorkerRole;
+  sourceRevision?: string;
   error: string | null;
   resultFingerprint?: string | null;
   deadlineAt?: string | null;
@@ -96,6 +106,8 @@ export interface DurableTurnStep {
   timedOut?: boolean;
   abortAcknowledged?: boolean;
   outcomeCertainty?: "known" | "unknown" | "not_applicable" | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
 }
 
 export interface DurableTurnProgress {
@@ -163,6 +175,9 @@ export interface DurableTurnSnapshot {
   steps: readonly DurableTurnStep[];
   entries: readonly DurableSessionEntry[];
   approvals: readonly DurableApproval[];
+  phaseClaimCount?: number;
+  workerRole?: OperationalWorkerRole;
+  sourceRevision?: string;
 }
 
 export interface DurableStepMutation {
@@ -175,6 +190,7 @@ export interface DurableStepMutation {
   retryClass?: ToolRetryClass | null;
   idempotencyKey?: string | null;
   incrementAttempt?: boolean;
+  phaseClaimCount?: number;
   error?: string | null;
   sessionEntryId?: string | null;
   resultFingerprint?: string | null;
@@ -184,6 +200,8 @@ export interface DurableStepMutation {
   timedOut?: boolean;
   abortAcknowledged?: boolean;
   outcomeCertainty?: "known" | "unknown" | "not_applicable" | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
 }
 
 export interface DurableTurnMutation {
@@ -282,6 +300,7 @@ export interface DurableTurnMutation {
   keepLease?: boolean;
   promptManifest?: PromptManifest;
   progress?: Partial<DurableTurnProgress>;
+  projectionSourceSequence?: number;
   recoveryReference?: {
     stepId: string;
     toolCallId: string;
@@ -516,6 +535,8 @@ export class DurableTurnRunner {
       abortCleanupTimeoutMs?: number;
       compactor?: SessionCompactionRunner;
       cancellations?: ActiveTurnCancellationRegistry;
+      workerRole?: OperationalWorkerRole;
+      sourceRevision?: string;
     } = {},
   ) {}
 
@@ -794,11 +815,12 @@ export class DurableTurnRunner {
     });
     const definitions = [...durableBuiltInToolDefinitions(snapshot), ...extensionTools];
     const toolManifest = durableToolManifestMetrics(definitions);
-    console.info(JSON.stringify({
-      event: "berry.turn.tool_manifest",
+    emitWorkerOperationalEvent("tool.manifest", this.options.workerRole ?? "unknown", this.options.sourceRevision ?? "unknown", {
       runId: snapshot.id,
       ...toolManifest,
-    }));
+      workflowCategory: stringValue(snapshot.runtimeRequest.workflowCategory) ?? "unknown",
+      workflowCategoryVersion: stringValue(snapshot.runtimeRequest.workflowCategoryVersion) ?? "workflow-v1",
+    });
     const activeContextTokens = estimateActiveContextTokensForDecision(
       snapshot,
       definitions,
@@ -867,6 +889,7 @@ export class DurableTurnRunner {
         ...step,
         state: "running",
         output: { streamMessageId: messageId },
+        startedAt: new Date(modelStartedAt).toISOString(),
       }],
       nextAction: "Model request in progress",
       keepLease: true,
@@ -930,7 +953,17 @@ export class DurableTurnRunner {
         ? providerAttempts.map((attempt) => providerAttemptEventFromReport(step.id, attempt))
         : [providerAttemptEvent(step.id, diagnostics)];
       await this.repository.appendEvents(snapshot, failureEvents).catch(() => undefined);
-      console.warn(JSON.stringify({ event: "berry.turn.provider_failure", runId: snapshot.id, ...diagnostics }));
+      emitWorkerOperationalEvent("provider.attempt", this.options.workerRole ?? snapshot.workerRole ?? "unknown", this.options.sourceRevision ?? snapshot.sourceRevision ?? "unknown", {
+        runId: snapshot.id,
+        stepId: step.id,
+        model: diagnostics.model,
+        statusClass: diagnostics.statusClass,
+        category: diagnostics.category,
+        durationMs: diagnostics.latencyMs,
+        inputTokens: diagnostics.inputTokens,
+        outputTokens: diagnostics.outputTokens,
+        retryDecision: diagnostics.retryDecision,
+      });
       throw error;
     }
     const providerDiagnostics = successfulProviderDiagnostics(snapshot, result, modelStartedAt);
@@ -1031,6 +1064,7 @@ export class DurableTurnRunner {
             ...step,
             state: "completed",
             output: emptyOutput,
+            completedAt: new Date().toISOString(),
           },
           {
             id: randomUUID(),
@@ -1131,6 +1165,7 @@ export class DurableTurnRunner {
             providerDiagnostics,
           },
           sessionEntryId: messageId,
+          completedAt: new Date().toISOString(),
         },
         ...toolSteps,
       ],
@@ -2641,7 +2676,13 @@ class DurableMessageEventWriter {
 }
 
 export class SqlDurableTurnRepository implements DurableTurnRepository {
-  constructor(private readonly executor: SqlExecutor) {}
+  constructor(
+    private readonly executor: SqlExecutor,
+    private readonly telemetry: {
+      workerRole?: OperationalWorkerRole;
+      sourceRevision?: string;
+    } = {},
+  ) {}
 
   async reserveNextModelCall(
     snapshot: DurableTurnSnapshot,
@@ -2756,16 +2797,29 @@ SET lease_owner = $3,
     heartbeat_at = now(),
     attempt = attempt + 1,
     ownership_generation = ownership_generation + 1,
+    phase_claim_count = phase_claim_count + 1,
+    worker_role = $5,
+    source_revision = $6,
+    first_claimed_at = COALESCE(first_claimed_at, now()),
+    last_claimed_at = now(),
     updated_at = now()
 WHERE tenant_id = $1::uuid AND id = $2::uuid
   AND state NOT IN ('completed', 'failed', 'cancelled', 'recovery_required')
   AND (lease_expires_at IS NULL OR lease_expires_at <= now() OR lease_owner = $3)
 RETURNING *
       `.trim(),
-      [input.tenantId, input.runId, owner, leaseSeconds],
+      [
+        input.tenantId,
+        input.runId,
+        owner,
+        leaseSeconds,
+        this.telemetry.workerRole ?? "unknown",
+        this.telemetry.sourceRevision ?? "unknown",
+      ],
     );
     const run = runs[0];
     if (!run) return null;
+    const hydrationStartedAt = Date.now();
     try {
       const [steps, entries, approvals, previousManifests, checkpoints, usageTotals] = await Promise.all([
       this.executor.query<StepRow>(
@@ -2846,7 +2900,26 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
         [input.tenantId, input.runId],
       ),
       ]);
-      return mapSnapshot(run, owner, steps, entries, approvals, usageTotals[0], previousManifests[0], checkpoints[0]);
+      const snapshot = mapSnapshot(run, owner, steps, entries, approvals, usageTotals[0], previousManifests[0], checkpoints[0]);
+      await persistWorkerOperationalEvent(this.executor, {
+        tenantId: input.tenantId,
+        runId: run.id,
+        sessionId: run.session_id,
+        eventType: "run.claim",
+        dedupeKey: `${run.id}:claim:${run.ownership_generation}`,
+        claimEpoch: Number(run.ownership_generation ?? 0),
+        phaseClaimCount: Number(run.phase_claim_count ?? 0),
+        workerRole: this.telemetry.workerRole ?? "unknown",
+        sourceRevision: this.telemetry.sourceRevision ?? "unknown",
+        fields: {
+          runId: run.id,
+          claimEpoch: Number(run.ownership_generation ?? 0),
+          phaseClaimCount: Number(run.phase_claim_count ?? 0),
+          queueWaitMs: Math.max(0, Date.now() - (dateString(run.created_at) ? Date.parse(dateString(run.created_at)!) : Date.now())),
+          hydrationMs: Math.max(0, Date.now() - hydrationStartedAt),
+        },
+      }).catch(() => undefined);
+      return snapshot;
     } catch (error) {
       // A claim is not usable until hydration has completed. If any read fails,
       // release this exact generation so another worker can retry it safely.
@@ -2992,7 +3065,7 @@ SET state=$4,
       WHEN $4='waiting' THEN COALESCE(waiting_started_at,now())
       ELSE NULL
     END,
-    completed_at=CASE WHEN $4 IN ('completed','failed','cancelled','recovery_required') THEN now() ELSE NULL END,
+    completed_at=CASE WHEN $4 IN ('completed','failed','cancelled','recovery_required') THEN COALESCE(completed_at,now()) ELSE NULL END,
     lease_owner=CASE WHEN $8::boolean THEN lease_owner ELSE NULL END,
     lease_expires_at=CASE WHEN $8::boolean THEN lease_expires_at ELSE NULL END,
     progress_epoch=COALESCE($10::integer,progress_epoch),
@@ -3011,6 +3084,14 @@ SET state=$4,
     recovery_tool_call_id=CASE
       WHEN $4='recovery_required' THEN $21::uuid
       ELSE NULL
+    END,
+    first_model_started_at=CASE
+      WHEN $22::boolean THEN COALESCE(first_model_started_at,now())
+      ELSE first_model_started_at
+    END,
+    last_model_completed_at=CASE
+      WHEN $23::boolean THEN now()
+      ELSE last_model_completed_at
     END,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
@@ -3038,6 +3119,8 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
           snapshot.ownershipGeneration ?? null,
           mutation.recoveryReference?.stepId ?? null,
           mutation.recoveryReference?.toolCallId ?? null,
+          (mutation.steps ?? []).some((step) => step.type === "model.call" && step.state === "running"),
+          (mutation.steps ?? []).some((step) => step.type === "model.call" && ["completed", "failed", "cancelled", "recovery_required"].includes(step.state)),
         ],
       );
       if (TERMINAL_STATES.has(mutation.nextState)) {
@@ -3077,16 +3160,26 @@ WHERE turn_finalizations.status IN ('pending','failed','partial')
         await closeTerminalChildren(executor, snapshot, mutation.nextState);
       }
       if (mutation.taskStatus) {
+        const projectionSourceSequence = mutation.projectionSourceSequence ?? snapshot.version + 1;
         await executor.execute(
           `UPDATE tasks
            SET status=$3,
+               projection_sequence=GREATEST(projection_sequence,$5::bigint),
+               status_source_run_id=$4::uuid,
+               status_source_sequence=$5::bigint,
+               status_source_state_at=$6::timestamptz,
                unread_at=CASE
                  WHEN $3::task_status IN ('completed','failed') AND status IS DISTINCT FROM $3::task_status THEN date_trunc('milliseconds',now())
                  ELSE unread_at
-               END,
+                 END,
                updated_at=now()
-           WHERE tenant_id=$1::uuid AND id=$2::uuid`,
-          [snapshot.tenantId, snapshot.taskId, mutation.taskStatus],
+           WHERE tenant_id=$1::uuid AND id=$2::uuid
+             AND (
+               status_source_run_id IS NULL
+               OR (status_source_run_id=$4::uuid AND COALESCE(status_source_sequence,-1)<$5::bigint)
+               OR (status_source_run_id<>$4::uuid AND COALESCE(status_source_state_at,'-infinity'::timestamptz)<=$6::timestamptz)
+             )`,
+          [snapshot.tenantId, snapshot.taskId, mutation.taskStatus, snapshot.id, projectionSourceSequence, snapshot.createdAt],
         );
       }
       if (mutation.nextState === "completed"
@@ -3113,18 +3206,104 @@ WHERE turn_finalizations.status IN ('pending','failed','partial')
             : "Queue paused because the active turn failed"],
         );
       }
-      if (appendedEntries.length > 0) {
+      {
+        const projectionSourceSequence = mutation.projectionSourceSequence ?? snapshot.version + 1;
+        const leafId = appendedEntries.at(-1);
         await executor.execute(
           `
 UPDATE sessions
 SET runtime_metadata=runtime_metadata || jsonb_build_object(
-      'leafId',$3::text,'activeRunId',$4::text,'lastRunState',$5::text
-    ),
+      'activeRunId',$3::text,'lastRunState',$4::text,
+      'sourceRunId',$5::text,'sourceRunSequence',$6::bigint
+    ) || CASE WHEN $7::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('leafId',$7::text) END,
+    projection_source_run_id=$5::uuid,
+    projection_source_sequence=$6::bigint,
+    projection_source_state_at=$8::timestamptz,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$2::uuid
+  AND (
+    projection_source_run_id IS NULL
+    OR (projection_source_run_id=$5::uuid AND COALESCE(projection_source_sequence,-1)<$6::bigint)
+    OR (projection_source_run_id<>$5::uuid AND COALESCE(projection_source_state_at,'-infinity'::timestamptz)<=$8::timestamptz)
+  )
           `.trim(),
-          [snapshot.tenantId, snapshot.sessionId, appendedEntries.at(-1), snapshot.id, mutation.nextState],
+          [snapshot.tenantId, snapshot.sessionId, snapshot.id, mutation.nextState, snapshot.id, projectionSourceSequence, leafId ?? null, snapshot.createdAt],
         );
+      }
+      for (const step of mutation.steps ?? []) {
+        const eventType = step.type.startsWith("tool.") ? "tool.attempt" : "phase.transition";
+        await persistWorkerOperationalEvent(executor, {
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          sessionId: snapshot.sessionId,
+          eventType,
+          dedupeKey: `${snapshot.id}:phase:${snapshot.version + 1}:${step.id}:${step.state}`,
+          phaseClaimCount: step.phaseClaimCount ?? null,
+          workerRole: snapshot.workerRole ?? this.telemetry.workerRole ?? "unknown",
+          sourceRevision: snapshot.sourceRevision ?? this.telemetry.sourceRevision ?? "unknown",
+          fields: {
+            runId: snapshot.id,
+            stepId: step.id,
+            phase: step.type.startsWith("tool.") ? "tool" : step.type,
+            attempt: step.incrementAttempt ? 1 : 0,
+            phaseClaimCount: step.phaseClaimCount ?? 0,
+            outcome: step.state,
+            ...(step.type.startsWith("tool.") ? { toolFamily: stableToolFamily(step.type.slice(5)) } : {}),
+          },
+        });
+      }
+      if (mutation.progress) {
+        await persistWorkerOperationalEvent(executor, {
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          sessionId: snapshot.sessionId,
+          eventType: "turn.progress",
+          dedupeKey: `${snapshot.id}:progress:${mutation.progress.progressEpoch ?? snapshot.version + 1}`,
+          workerRole: snapshot.workerRole ?? this.telemetry.workerRole ?? "unknown",
+          sourceRevision: snapshot.sourceRevision ?? this.telemetry.sourceRevision ?? "unknown",
+          fields: {
+            runId: snapshot.id,
+            progressKind: mutation.progress.progressKind,
+            consecutiveNoProgress: mutation.progress.consecutiveNoProgress,
+            budgetRemaining: mutation.progress.budgetReason,
+          },
+        });
+      }
+      if (mutation.nextState === "waiting" || snapshot.state === "waiting") {
+        await persistWorkerOperationalEvent(executor, {
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          sessionId: snapshot.sessionId,
+          eventType: "wait.transition",
+          dedupeKey: `${snapshot.id}:wait:${snapshot.version + 1}:${mutation.nextState}`,
+          workerRole: snapshot.workerRole ?? this.telemetry.workerRole ?? "unknown",
+          sourceRevision: snapshot.sourceRevision ?? this.telemetry.sourceRevision ?? "unknown",
+          fields: { runId: snapshot.id, outcome: mutation.nextState },
+        });
+      }
+      if (TERMINAL_STATES.has(mutation.nextState)) {
+        const role = snapshot.workerRole ?? this.telemetry.workerRole ?? "unknown";
+        const revision = snapshot.sourceRevision ?? this.telemetry.sourceRevision ?? "unknown";
+        await persistWorkerOperationalEvent(executor, {
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          sessionId: snapshot.sessionId,
+          eventType: "finalization.transition",
+          dedupeKey: `${snapshot.id}:finalization:telemetry:${mutation.nextState}`,
+          workerRole: role,
+          sourceRevision: revision,
+          fields: { runId: snapshot.id, outcome: mutation.nextState },
+        });
+        await persistWorkerOperationalEvent(executor, {
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          sessionId: snapshot.sessionId,
+          eventType: "usage.settlement",
+          dedupeKey: `${snapshot.id}:usage:settlement:${mutation.nextState}`,
+          workerRole: role,
+          sourceRevision: revision,
+          fields: { runId: snapshot.id, outcome: mutation.nextState },
+        });
       }
     };
     if (this.executor.transaction) await this.executor.transaction(run);
@@ -4060,6 +4239,17 @@ function safeBigInt(value: unknown): bigint {
   }
 }
 
+function stableToolFamily(name: string): string {
+  const normalized = name.trim().toLowerCase();
+  if (normalized.startsWith("mcp__")) return "mcp";
+  if (["read", "grep", "find", "ls"].includes(normalized)) return "read_only";
+  if (["bash", "edit", "write"].includes(normalized)) return "workspace_mutation";
+  if (["ask_user_question", "compose_message"].includes(normalized)) return "user_interaction";
+  if (["persist_artifact", "create_image", "inspect_images"].includes(normalized)) return "artifact";
+  if (normalized === "activate_skill") return "skill";
+  return "extension";
+}
+
 function shouldCompactSnapshot(
   snapshot: DurableTurnSnapshot,
   options: { contextWindowTokens?: number },
@@ -4768,11 +4958,12 @@ function automaticDurableAttachmentSkill(
 export function durableBuiltInToolDefinitions(snapshot: DurableTurnSnapshot): ChatToolDefinition[] {
   const runtime = durableRuntimeRequest(snapshot);
   const enabled = new Set<DurableBuiltInToolName>(
-    runtime?.builtInTools
-      ?? [
-        ...DURABLE_BASE_BUILT_IN_TOOLS,
-        ...(durableSkills(snapshot).length > 0 ? ["activate_skill" as const] : []),
-      ],
+    runtime
+      ? routedBuiltInToolNames(runtime.workflowCategory, runtime.builtInTools)
+      : [
+          ...DURABLE_BASE_BUILT_IN_TOOLS,
+          ...(durableSkills(snapshot).length > 0 ? ["activate_skill" as const] : []),
+        ],
   );
   const definitionsByName = new Map(
     DURABLE_TOOL_DEFINITIONS.map((definition) => [definition.function.name, definition]),
@@ -5189,6 +5380,7 @@ RETURNING id
     parameters,
   );
   let persistedStepId = inserted[0]?.id;
+  let isIdempotentReplay = false;
   if (!persistedStepId) {
     const existing = await executor.query<{
       id: string;
@@ -5209,7 +5401,7 @@ LIMIT 1
     if (!persisted) {
       throw new DurableTurnRetryableError(`Step ${step.sequence} conflicted but its persisted row could not be resolved`);
     }
-    const isIdempotentReplay = Boolean(
+    isIdempotentReplay = Boolean(
       step.idempotencyKey
       && persisted.idempotency_key === step.idempotencyKey
       && persisted.id !== step.id,
@@ -5267,7 +5459,7 @@ SET state=$4,
     END,
     outcome_certainty=COALESCE($18,outcome_certainty),
     started_at=COALESCE(started_at,CASE WHEN $4='running' THEN now() ELSE NULL END),
-    completed_at=CASE WHEN $4 IN ('completed','failed','recovery_required','cancelled') THEN now() ELSE NULL END,
+    completed_at=CASE WHEN $4 IN ('completed','failed','recovery_required','cancelled') THEN COALESCE(completed_at,now()) ELSE completed_at END,
     updated_at=now()
 WHERE tenant_id=$2::uuid AND run_id=$3::uuid AND id=$1::uuid
         `.trim(),
@@ -5275,6 +5467,31 @@ WHERE tenant_id=$2::uuid AND run_id=$3::uuid AND id=$1::uuid
       );
     }
   }
+  if (!isIdempotentReplay) await executor.execute(
+    `
+UPDATE turn_steps
+SET phase_claim_count=phase_claim_count + CASE WHEN state='running' THEN 1 ELSE 0 END,
+    worker_role=$2,
+    source_revision=$3,
+    started_at=COALESCE(started_at,$4::timestamptz,CASE WHEN state='running' THEN now() ELSE NULL END),
+    completed_at=CASE
+      WHEN state IN ('completed','failed','recovery_required','cancelled')
+        THEN COALESCE(completed_at,$5::timestamptz,now())
+      ELSE completed_at
+    END,
+    updated_at=now()
+WHERE tenant_id=$6::uuid AND run_id=$7::uuid AND id=$1::uuid
+    `.trim(),
+    [
+      persistedStepId,
+      snapshot.workerRole ?? "unknown",
+      snapshot.sourceRevision ?? "unknown",
+      step.startedAt ?? null,
+      step.completedAt ?? null,
+      snapshot.tenantId,
+      snapshot.id,
+    ],
+  );
   if (step.type.startsWith("tool.")) {
     const toolStatus = step.state === "running"
       ? "running"
@@ -5295,7 +5512,7 @@ UPDATE tool_calls
 SET status=$4::tool_call_status,
     output=COALESCE($5::jsonb,output),
     started_at=CASE WHEN $4::tool_call_status='running' THEN COALESCE(started_at,now()) ELSE started_at END,
-    completed_at=CASE WHEN $4::tool_call_status IN ('completed','failed','cancelled','denied') THEN now() ELSE completed_at END,
+    completed_at=CASE WHEN $4::tool_call_status IN ('completed','failed','cancelled','denied') THEN COALESCE(completed_at,now()) ELSE completed_at END,
     updated_at=now()
 WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND step_id=$3::uuid
       `.trim(),
@@ -6233,6 +6450,9 @@ function mapSnapshot(
     state: run.state,
     attempt: run.attempt,
     ownershipGeneration: Number(run.ownership_generation ?? 0),
+    phaseClaimCount: Number(run.phase_claim_count ?? 0),
+    workerRole: normalizeWorkerRole(run.worker_role),
+    sourceRevision: run.source_revision ?? "unknown",
     version: run.version ?? 0,
     leaseOwner: owner,
     cancelledAt: dateString(run.cancelled_at),
@@ -6276,6 +6496,9 @@ function mapSnapshot(
       retryClass: step.retry_class,
       idempotencyKey: step.idempotency_key,
       attempt: step.attempt,
+      phaseClaimCount: Number(step.phase_claim_count ?? 0),
+      workerRole: normalizeWorkerRole(step.worker_role),
+      sourceRevision: step.source_revision ?? "unknown",
       error: step.error,
       resultFingerprint: step.result_fingerprint,
       deadlineAt: dateString(step.deadline_at),
@@ -6283,6 +6506,8 @@ function mapSnapshot(
       timedOut: Boolean(step.timed_out_at),
       abortAcknowledged: Boolean(step.abort_acknowledged_at),
       outcomeCertainty: step.outcome_certainty,
+      startedAt: dateString(step.started_at),
+      completedAt: dateString(step.completed_at),
     })),
     entries: entries.map((entry) => ({
       entryId: entry.entry_id,
@@ -6433,6 +6658,9 @@ interface RunRow {
   state: TurnRunState;
   attempt: number;
   ownership_generation: number | string;
+  phase_claim_count: number | string | null;
+  worker_role: string | null;
+  source_revision: string | null;
   version: number | null;
   progress_epoch: number | string | null;
   progress_kind: string | null;
@@ -6472,6 +6700,9 @@ interface StepRow {
   retry_class: ToolRetryClass | null;
   idempotency_key: string | null;
   attempt: number;
+  phase_claim_count: number | string | null;
+  worker_role: string | null;
+  source_revision: string | null;
   error: string | null;
   result_fingerprint: string | null;
   deadline_at: Date | string | null;
@@ -6479,6 +6710,8 @@ interface StepRow {
   timed_out_at: Date | string | null;
   abort_acknowledged_at: Date | string | null;
   outcome_certainty: "known" | "unknown" | "not_applicable" | null;
+  started_at: Date | string | null;
+  completed_at: Date | string | null;
 }
 
 interface EntryRow {
