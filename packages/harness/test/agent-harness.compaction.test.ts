@@ -4,6 +4,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
+	type Message,
 	type Model,
 	type Models,
 	type SimpleStreamOptions,
@@ -14,12 +15,17 @@ import { describe, expect, it } from "vitest";
 import type { SessionCheckpointV2 } from "@berry/shared";
 import type { AgentTool } from "../src/types.ts";
 import { AgentHarness } from "../src/harness/agent-harness.ts";
-import { findCutPoint } from "../src/harness/compaction/compaction.ts";
+import {
+	DEFAULT_COMPACTION_SETTINGS,
+	findCutPoint,
+	shouldCompact,
+} from "../src/harness/compaction/compaction.ts";
 import { generatePortableCheckpoint } from "../src/harness/compaction/checkpoint.ts";
 import { NodeExecutionEnv } from "../src/harness/env/nodejs.ts";
 import { InMemorySessionRepo } from "../src/harness/session/memory-repo.ts";
 import { buildSessionContext } from "../src/harness/session/session.ts";
 import type { SessionTreeEntry } from "../src/harness/types.ts";
+import { serializeConversation } from "../src/harness/compaction/utils.ts";
 
 function testModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
 	return {
@@ -83,6 +89,32 @@ function modelsFor(
 }
 
 describe("AgentHarness compaction", () => {
+	it("uses Pi's reserved response headroom as the default trigger", () => {
+		const contextWindow = 128_000;
+		const reserveThreshold = contextWindow - DEFAULT_COMPACTION_SETTINGS.reserveTokens;
+
+		expect(DEFAULT_COMPACTION_SETTINGS.triggerRatio).toBe(1);
+		expect(shouldCompact(reserveThreshold, contextWindow, DEFAULT_COMPACTION_SETTINGS)).toBe(false);
+		expect(shouldCompact(reserveThreshold + 1, contextWindow, DEFAULT_COMPACTION_SETTINGS)).toBe(true);
+	});
+
+	it("limits each tool result in the compaction summary input to Pi's 2,000-character budget", () => {
+		const message: Message = {
+			role: "toolResult",
+			toolCallId: "call_1",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(2_500) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const serialized = serializeConversation([message]);
+
+		expect(serialized).toContain("[Tool result]: ");
+		expect(serialized).toContain("[... 500 more characters truncated]");
+		expect(serialized).not.toContain("x".repeat(2_001));
+	});
+
 	it("cuts before the last valid entry when a huge trailing tool result exceeds the recent budget", () => {
 		const entries: SessionTreeEntry[] = [
 			{

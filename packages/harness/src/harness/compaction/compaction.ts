@@ -155,7 +155,11 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
-	triggerRatio: 0.85,
+	// Pi triggers from the reserved response headroom rather than a fixed
+	// percentage: contextTokens > contextWindow - reserveTokens. Keeping this
+	// at 1 makes the reserve threshold win for the default configuration while
+	// preserving an explicit lower ratio for callers that need one.
+	triggerRatio: 1,
 	maxSummarizationInputTokens: 96000,
 };
 
@@ -247,7 +251,7 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 	const reserveThreshold = contextWindow - settings.reserveTokens;
 	const ratioThreshold = Math.floor(contextWindow * settings.triggerRatio);
 	const threshold = Math.max(1, Math.min(reserveThreshold, ratioThreshold));
-	return contextTokens >= threshold;
+	return contextTokens > threshold;
 }
 
 const ESTIMATED_IMAGE_CHARS = 4800;

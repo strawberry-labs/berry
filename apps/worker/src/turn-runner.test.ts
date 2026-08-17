@@ -63,6 +63,15 @@ describe("durable turn runner", () => {
     expect(metrics.approximateTokens).toBe(Math.ceil(metrics.serializedBytes / 4));
   });
 
+  it("routes connected-service requests through deferred discovery and keeps path domains explicit", () => {
+    const prompt = modelMessages(providerSnapshot("openai-responses"));
+
+    expect(prompt.stableSystemPrompt).toContain("Google Drive");
+    expect(prompt.stableSystemPrompt).toContain("tool_search");
+    expect(prompt.stableSystemPrompt).toContain("remote file id");
+    expect(prompt.stableSystemPrompt).toContain("outputs directory");
+  });
+
   it("guides ordinary image-edit turns toward the admitted image tool", () => {
     expect(durableImageToolSelectionPrompt([...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"]))
       .toBe(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
@@ -662,6 +671,9 @@ describe("durable turn runner", () => {
 
     const toolMessages = modelMessages(current).messages.filter((message) => message.role === "tool");
     expect(toolMessages).toHaveLength(4);
+    for (const message of toolMessages) {
+      expect(String(message.content).length).toBeLessThanOrEqual(2_000);
+    }
     expect(toolMessages.reduce((total, message) => total + String(message.content).length, 0)).toBeLessThanOrEqual(48_000);
     expect(String(toolMessages[0]?.content)).toContain("[durable-result:tool-entry-0]");
   });
@@ -1639,6 +1651,29 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
     expect(modelCalls).toBe(0);
     expect(repository.current.error).toContain("80-step model safety limit");
+    expect(repository.current.error).toContain("Continue/Play button");
+    expect(repository.current.error).not.toContain("prevent an agent loop");
+  });
+
+  it("defaults the model iteration safety limit to 200 steps", async () => {
+    const steps = Array.from({ length: 201 }, (_, index) => ({
+      ...modelStep(index === 200 ? "pending" : "completed", index + 1),
+      id: randomUUID(),
+      idempotencyKey: `${runId}:model:${index + 1}`,
+    }));
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), ...steps]));
+    let modelCalls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        modelCalls += 1;
+        return { text: "unexpected", inputTokens: 0, outputTokens: 0, toolCalls: [] };
+      },
+    }, noTools());
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(modelCalls).toBe(0);
+    expect(repository.current.error).toContain("200-step model safety limit");
   });
 
   it("allows the 79th and 80th model steps but denies the 81st before the provider call", async () => {

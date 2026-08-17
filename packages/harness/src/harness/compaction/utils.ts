@@ -75,7 +75,7 @@ const USER_MESSAGE_MAX_CHARS = 80_000;
 const ASSISTANT_TEXT_MAX_CHARS = 40_000;
 const ASSISTANT_THINKING_MAX_CHARS = 16_000;
 const TOOL_CALL_ARGS_MAX_CHARS = 12_000;
-const TOOL_RESULT_MAX_CHARS = 12_000;
+const TOOL_RESULT_MAX_CHARS = 2_000;
 
 function safeJsonStringify(value: unknown): string {
 	try {

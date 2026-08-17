@@ -172,7 +172,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
           1_800_000,
         ),
         maxModelIterations: Math.min(
-          positiveInteger(env.BERRY_MAX_MODEL_ITERATIONS) ?? 80,
+          positiveInteger(env.BERRY_MAX_MODEL_ITERATIONS) ?? 200,
           200,
         ),
         maxTurnDurationMs: Math.min(
