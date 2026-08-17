@@ -48,7 +48,10 @@ export async function processBerryWorkerJob(
   if (acknowledgeDeliveryAtStart(jobName) && dependencies.outboxReceipts) {
     const outboxId = "outboxId" in payload ? payload.outboxId : undefined;
     const runId = "runId" in payload ? payload.runId : undefined;
-    if (outboxId) await dependencies.outboxReceipts.acknowledge(payload.tenantId, outboxId, runId);
+    const leaseEpoch = "leaseEpoch" in payload && typeof payload.leaseEpoch === "number"
+      ? payload.leaseEpoch
+      : undefined;
+    if (outboxId) await dependencies.outboxReceipts.acknowledge(payload.tenantId, outboxId, runId, leaseEpoch);
   }
   if (jobName === "title.generate") {
     const payload = TitleGenJobPayloadSchema.parse(data);

@@ -1828,8 +1828,12 @@ LEFT JOIN file_blobs blob
   ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
 WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
   AND (a.created_at<=r.created_at OR a.turn_id=r.id::text OR f.origin='connector_import')
-  AND f.status IN ('processing', 'available', 'failed')
+  AND f.status IN ('processing', 'available')
   AND f.deleted_at IS NULL
+  AND (
+    f.blob_id IS NULL
+    OR (blob.verification_status='verified' AND blob.deleted_at IS NULL)
+  )
   AND (
     EXISTS (
       SELECT 1
@@ -1978,6 +1982,10 @@ JOIN files f ON f.tenant_id=a.tenant_id AND f.id=a.file_id
 LEFT JOIN file_blobs blob ON blob.tenant_id=f.tenant_id AND blob.id=f.blob_id
 WHERE a.tenant_id=$1::uuid AND a.session_id=$2::uuid AND a.role='output'
   AND f.status='available' AND f.deleted_at IS NULL
+  AND (
+    f.blob_id IS NULL
+    OR (blob.verification_status='verified' AND blob.deleted_at IS NULL)
+  )
   AND f.metadata->>'sourcePath' IS NOT NULL
   AND COALESCE(blob.sha256, f.sha256) IS NOT NULL
       `.trim(),

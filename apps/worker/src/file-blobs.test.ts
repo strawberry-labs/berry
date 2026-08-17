@@ -91,6 +91,7 @@ describe("SqlFileBlobProcessor verification", () => {
 
     await expect(processor.verify({ tenantId, blobId })).rejects.toThrow("size mismatch");
     expect(calls.some((call) => call.sql.includes("verification_status = 'failed'"))).toBe(true);
+    expect(calls.some((call) => call.sql.includes("file.verification_failed"))).toBe(true);
   });
 
   it("records a retryable failure when the backend object cannot be read", async () => {
@@ -187,6 +188,7 @@ describe("SqlFileBlobProcessor deletion", () => {
       calls.push({ sql, params: [] });
       if (sql.includes("SELECT id, deleted_at FROM files")) return [{ id: "file", deleted_at: null }] as T[];
       if (sql.includes("SELECT * FROM file_blobs")) return [blob({ verification_status: "pending_delete", delete_after: new Date(Date.now() - 1_000) })] as T[];
+      if (sql.includes("SET verification_status='deleted'")) return [{ id: blobId }] as T[];
       if (sql.includes("SELECT id FROM runtime_outbox")) return [{ id: outboxId }] as T[];
       if (sql.includes("UPDATE runtime_outbox")) return [{ id: outboxId }] as T[];
       return [] as T[];
@@ -224,6 +226,7 @@ describe("SqlFileBlobProcessor deletion", () => {
       calls.push({ sql, params: [] });
       if (sql.includes("SELECT id, deleted_at FROM files")) return [] as T[];
       if (sql.includes("SELECT * FROM file_blobs")) return [blob({ verification_status: "pending_delete", delete_after: new Date(Date.now() - 1_000) })] as T[];
+      if (sql.includes("SET verification_status='deleted'")) return [{ id: blobId }] as T[];
       if (sql.includes("SELECT id FROM runtime_outbox")) return [{ id: outboxId }] as T[];
       if (sql.includes("UPDATE runtime_outbox")) return [{ id: outboxId }] as T[];
       return [] as T[];
@@ -234,9 +237,46 @@ describe("SqlFileBlobProcessor deletion", () => {
     const processor = new SqlFileBlobProcessor(executor, client as never);
 
     await expect(processor.delete({ tenantId, blobId, outboxId })).resolves.toEqual({ deleted: 1 });
-    expect(client.send).toHaveBeenCalledTimes(2);
-    expect(calls.some((call) => call.sql.includes("verification_status = 'deleted'"))).toBe(true);
+    expect(client.send).toHaveBeenCalledTimes(1);
+    expect((client.send.mock.calls[0]?.[0] as { input?: Record<string, unknown> }).input).toMatchObject({
+      Bucket: "berry-test",
+      Key: "objects/berry.bin",
+      VersionId: "v1",
+    });
+    expect(calls.some((call) => call.sql.includes("verification_status='deleted'"))).toBe(true);
     expect(calls.some((call) => call.sql.includes("event_type = 'file.delete-blob'"))).toBe(true);
+  });
+
+  it("performs storage deletion after the claim transaction releases database locks", async () => {
+    let transactionActive = false;
+    let remoteCallDuringTransaction = false;
+    const executor = testExecutor(async <T>(sql: string) => {
+      if (sql.includes("SELECT id, deleted_at FROM files")) return [] as T[];
+      if (sql.includes("SELECT * FROM file_blobs")) return [blob({ verification_status: "pending_delete", delete_after: new Date(Date.now() - 1_000) })] as T[];
+      if (sql.includes("SELECT id FROM runtime_outbox")) return [{ id: outboxId }] as T[];
+      if (sql.includes("SET verification_status='deleted'")) return [{ id: blobId }] as T[];
+      if (sql.includes("UPDATE runtime_outbox")) return [{ id: outboxId }] as T[];
+      return [] as T[];
+    }, []);
+    executor.transaction = async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => {
+      transactionActive = true;
+      try {
+        return await callback(executor);
+      } finally {
+        transactionActive = false;
+      }
+    };
+    const client = {
+      send: vi.fn(async () => {
+        if (transactionActive) remoteCallDuringTransaction = true;
+        return {};
+      }),
+    };
+
+    await expect(new SqlFileBlobProcessor(executor, client as never).delete({ tenantId, blobId, outboxId }))
+      .resolves.toEqual({ deleted: 1 });
+    expect(client.send).toHaveBeenCalledOnce();
+    expect(remoteCallDuringTransaction).toBe(false);
   });
 });
 

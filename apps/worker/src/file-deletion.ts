@@ -1,4 +1,4 @@
-import { DeleteObjectsCommand, HeadObjectCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, DeleteObjectsCommand, HeadObjectCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
 import type { FileDeleteObjectJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
@@ -40,14 +40,27 @@ export class SqlFileDeletionReceiptStore implements FileDeletionReceiptStore {
 
   async acknowledge(payload: FileDeleteObjectJobPayload): Promise<void> {
     const rows = await this.executor.query<{ id: string }>(`
+      WITH acknowledged AS (
       UPDATE runtime_outbox
       SET completed_at = COALESCE(completed_at, now()),
           lease_owner = NULL, lease_expires_at = NULL,
           last_error = NULL, updated_at = now()
       WHERE tenant_id = $1::uuid AND id = $2::uuid
         AND event_type = 'file.delete-object' AND aggregate_id = $3
+        AND completed_at IS NULL AND dead_lettered_at IS NULL
+        AND lease_epoch = $4::bigint
       RETURNING id
-    `, [payload.tenantId, payload.outboxId, payload.fileId]);
+      ), already_acknowledged AS (
+        SELECT id FROM runtime_outbox
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND event_type = 'file.delete-object' AND aggregate_id = $3
+          AND completed_at IS NOT NULL AND dead_lettered_at IS NULL
+      )
+      SELECT id FROM acknowledged
+      UNION ALL
+      SELECT id FROM already_acknowledged
+      LIMIT 1
+    `, [payload.tenantId, payload.outboxId, payload.fileId, payload.leaseEpoch ?? 1]);
     if (!rows[0]) throw new Error("Object-deletion outbox receipt could not be recorded");
   }
 }
@@ -100,6 +113,30 @@ export async function deleteEveryObjectVersion(
     if (response.Errors?.length) {
       throw new Error(`Object storage rejected ${response.Errors.length} file deletion${response.Errors.length === 1 ? "" : "s"}`);
     }
+  }
+}
+
+/** Delete exactly the object-store version captured by the durable blob row. */
+export async function deleteCapturedObjectVersion(
+  client: Pick<S3Client, "send">,
+  bucket: string,
+  key: string,
+  versionId: string | null,
+): Promise<void> {
+  if (!versionId) {
+    await deleteEveryObjectVersion(client, bucket, [key]);
+    return;
+  }
+  try {
+    const response = await client.send(new DeleteObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      VersionId: versionId,
+    }));
+    if (response.$metadata?.httpStatusCode === 404) return;
+  } catch (error) {
+    if (isMissingObject(error)) return;
+    throw error;
   }
 }
 

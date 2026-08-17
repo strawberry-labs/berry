@@ -16,6 +16,7 @@ export class WorkerRuntimeMetrics {
   readonly #providers = new Map<string, ProviderSeries>();
   readonly #outbox = new Map<string, OutboxSeries>();
   readonly #cancellationSignals = new Map<WorkerCancellationSignalResult, number>();
+  readonly #outboxFenceMisses = new Map<string, number>();
   #providerRequestsAborted = 0;
 
   providerRequest(input: Record<string, unknown>): void {
@@ -47,6 +48,10 @@ export class WorkerRuntimeMetrics {
       observe(series.histogram, Math.max(0, latencyMs) / 1_000, OUTBOX_BUCKETS_SECONDS);
     }
     this.#outbox.set(normalizedName, series);
+  }
+
+  outboxFenceMiss(operation: "complete" | "defer" | "fail"): void {
+    this.#outboxFenceMisses.set(operation, (this.#outboxFenceMisses.get(operation) ?? 0) + 1);
   }
 
   cancellationSignal(result: WorkerCancellationSignalResult, abortedRequests = 0): void {
@@ -96,6 +101,13 @@ export class WorkerRuntimeMetrics {
       "# TYPE berry_worker_provider_requests_aborted_total counter",
       `berry_worker_provider_requests_aborted_total ${this.#providerRequestsAborted}`,
     );
+    lines.push(
+      "# HELP berry_worker_outbox_fence_misses_total Outbox mutations rejected because the lease owner or epoch was stale.",
+      "# TYPE berry_worker_outbox_fence_misses_total counter",
+    );
+    for (const [operation, count] of sortedEntries(this.#outboxFenceMisses)) {
+      lines.push(`berry_worker_outbox_fence_misses_total{operation="${escapeLabel(operation)}"} ${count}`);
+    }
     return `${lines.join("\n")}\n`;
   }
 }

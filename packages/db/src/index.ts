@@ -496,6 +496,8 @@ export const fileBlobs = pgTable("file_blobs", {
   verificationStatus: fileBlobVerificationStatusEnum("verification_status").notNull().default("unverified"),
   verifiedAt: timestamp("verified_at", { withTimezone: true }),
   deleteAfter: timestamp("delete_after", { withTimezone: true }),
+  deletionClaimId: text("deletion_claim_id"),
+  deletionClaimedAt: timestamp("deletion_claimed_at", { withTimezone: true }),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   metadata: jsonObject("metadata"),
   createdAt,
@@ -1003,6 +1005,16 @@ export const runtimeOutbox = pgTable("runtime_outbox", {
   attempts: integer("attempts").notNull().default(0),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  firstAvailableAt: timestamp("first_available_at", { withTimezone: true }).notNull().defaultNow(),
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  receiptAt: timestamp("receipt_at", { withTimezone: true }),
+  receiptDueAt: timestamp("receipt_due_at", { withTimezone: true }),
+  leaseEpoch: bigint("lease_epoch", { mode: "number" }).notNull().default(0),
+  priorityClass: text("priority_class").notNull().default("normal"),
+  maxAttempts: integer("max_attempts").notNull().default(8),
+  deadLetteredAt: timestamp("dead_lettered_at", { withTimezone: true }),
+  errorCategory: text("error_category"),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   lastError: text("last_error"),
   createdAt,
@@ -1010,6 +1022,22 @@ export const runtimeOutbox = pgTable("runtime_outbox", {
 }, (table) => [
   uniqueIndex("runtime_outbox_dedupe_unique").on(table.tenantId, table.dedupeKey),
   index("runtime_outbox_due_idx").on(table.tenantId, table.completedAt, table.availableAt, table.leaseExpiresAt),
+  index("runtime_outbox_priority_due_idx").on(table.tenantId, table.completedAt, table.priorityClass, table.receiptDueAt, table.availableAt),
+  index("runtime_outbox_dead_letter_idx").on(table.tenantId, table.deadLetteredAt, table.createdAt),
+]);
+
+export const fileLifecycleEvents = pgTable("file_lifecycle_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  fileId: uuid("file_id").references(() => files.id, { onDelete: "cascade" }),
+  blobId: uuid("blob_id").references(() => fileBlobs.id, { onDelete: "cascade" }),
+  eventType: text("event_type").notNull(),
+  dedupeKey: text("dedupe_key").notNull(),
+  payload: jsonb("payload").$type<JsonValue>().notNull().default(sql`'{}'::jsonb`),
+  createdAt,
+}, (table) => [
+  uniqueIndex("file_lifecycle_events_dedupe_unique").on(table.tenantId, table.dedupeKey),
+  index("file_lifecycle_events_file_created_idx").on(table.tenantId, table.fileId, table.createdAt),
 ]);
 
 export const sandboxSnapshots = pgTable("sandbox_snapshots", {
@@ -1678,6 +1706,7 @@ export const cloudSchema = {
   messageParts,
   fileBlobs,
   files,
+  fileLifecycleEvents,
   fileLibraryEntries,
   fileAssociations,
   fileUploads,
@@ -1739,6 +1768,7 @@ export const CLOUD_SCHEMA_TABLES = [
   "message_parts",
   "file_blobs",
   "files",
+  "file_lifecycle_events",
   "file_library_entries",
   "file_associations",
   "file_uploads",
@@ -1796,6 +1826,7 @@ export const TENANT_SCOPED_TABLES = [
   "message_parts",
   "file_blobs",
   "files",
+  "file_lifecycle_events",
   "file_library_entries",
   "file_associations",
   "file_uploads",
@@ -5158,6 +5189,84 @@ CREATE INDEX IF NOT EXISTS session_checkpoints_coverage_idx
   ON session_checkpoints (tenant_id,session_id,covered_sequence,created_at);
 `.trim();
 
+export const AGENT_HARNESS_OUTBOX_FILE_LIFECYCLE_MIGRATION = `
+ALTER TABLE runtime_outbox
+  ADD COLUMN IF NOT EXISTS first_available_at timestamptz,
+  ADD COLUMN IF NOT EXISTS claimed_at timestamptz,
+  ADD COLUMN IF NOT EXISTS delivered_at timestamptz,
+  ADD COLUMN IF NOT EXISTS receipt_at timestamptz,
+  ADD COLUMN IF NOT EXISTS receipt_due_at timestamptz,
+  ADD COLUMN IF NOT EXISTS lease_epoch bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS priority_class text NOT NULL DEFAULT 'normal',
+  ADD COLUMN IF NOT EXISTS max_attempts integer NOT NULL DEFAULT 8,
+  ADD COLUMN IF NOT EXISTS dead_lettered_at timestamptz,
+  ADD COLUMN IF NOT EXISTS error_category text;
+
+UPDATE runtime_outbox
+SET first_available_at=COALESCE(first_available_at,available_at,created_at,now()),
+    priority_class=CASE
+      WHEN event_type IN ('turn.execute','turn.resume') THEN 'interactive'
+      WHEN event_type IN ('title.generate','session.compact','sandbox.snapshot') THEN 'post_turn'
+      WHEN event_type IN ('context.backfill','context.cleanup','file.delete-object','file.delete-blob','file.verify-blob') THEN 'cleanup'
+      ELSE COALESCE(NULLIF(priority_class,'normal'),'normal')
+    END
+WHERE first_available_at IS NULL OR priority_class='normal';
+
+ALTER TABLE runtime_outbox
+  ALTER COLUMN first_available_at SET DEFAULT now(),
+  ALTER COLUMN first_available_at SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS runtime_outbox_priority_due_idx
+  ON runtime_outbox (tenant_id,completed_at,priority_class,receipt_due_at,available_at);
+CREATE INDEX IF NOT EXISTS runtime_outbox_dead_letter_idx
+  ON runtime_outbox (tenant_id,dead_lettered_at,created_at);
+
+CREATE OR REPLACE FUNCTION berry_runtime_outbox_defaults()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $runtime_outbox_defaults$
+BEGIN
+  NEW.first_available_at := COALESCE(NEW.first_available_at, NEW.available_at, now());
+  IF NEW.priority_class IS NULL OR NEW.priority_class='normal' THEN
+    NEW.priority_class := CASE
+      WHEN NEW.event_type IN ('turn.execute','turn.resume') THEN 'interactive'
+      WHEN NEW.event_type IN ('title.generate','session.compact','sandbox.snapshot') THEN 'post_turn'
+      WHEN NEW.event_type IN ('context.backfill','context.cleanup','file.delete-object','file.delete-blob','file.verify-blob') THEN 'cleanup'
+      ELSE 'normal'
+    END;
+  END IF;
+  RETURN NEW;
+END;
+$runtime_outbox_defaults$;
+DO $$ BEGIN
+  CREATE TRIGGER runtime_outbox_defaults_trigger
+  BEFORE INSERT ON runtime_outbox
+  FOR EACH ROW EXECUTE FUNCTION berry_runtime_outbox_defaults();
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+ALTER TABLE file_blobs
+  ADD COLUMN IF NOT EXISTS deletion_claim_id text,
+  ADD COLUMN IF NOT EXISTS deletion_claimed_at timestamptz;
+CREATE INDEX IF NOT EXISTS file_blobs_deletion_claim_idx
+  ON file_blobs (tenant_id,deletion_claim_id,deletion_claimed_at)
+  WHERE verification_status='pending_delete' AND deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS file_lifecycle_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  file_id uuid REFERENCES files(id) ON DELETE CASCADE,
+  blob_id uuid REFERENCES file_blobs(id) ON DELETE CASCADE,
+  event_type text NOT NULL,
+  dedupe_key text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id,dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS file_lifecycle_events_file_created_idx
+  ON file_lifecycle_events (tenant_id,file_id,created_at);
+${tenantRlsSql("file_lifecycle_events")}
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5303,4 +5412,5 @@ export const cloudMigrations = [
   { id: 60, name: "agent_harness_wait_finalization_v1", sql: AGENT_HARNESS_WAIT_FINALIZATION_MIGRATION },
   { id: 61, name: "agent_harness_provider_recovery_v1", sql: AGENT_HARNESS_PROVIDER_RECOVERY_MIGRATION },
   { id: 62, name: "agent_harness_compaction_v1", sql: AGENT_HARNESS_COMPACTION_MIGRATION },
+  { id: 63, name: "agent_harness_outbox_file_lifecycle_v1", sql: AGENT_HARNESS_OUTBOX_FILE_LIFECYCLE_MIGRATION },
 ] as const;

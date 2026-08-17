@@ -1,7 +1,7 @@
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { createHash } from "node:crypto";
 import type { FileBlobJobPayload, FileDeleteBlobJobPayload } from "./jobs.js";
-import { deleteEveryObjectVersion } from "./file-deletion.js";
+import { deleteCapturedObjectVersion } from "./file-deletion.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
 
@@ -18,8 +18,17 @@ type BlobRow = {
   object_version_id: string | null;
   verification_status: "unverified" | "verifying" | "verified" | "failed" | "pending_delete" | "deleted";
   delete_after: Date | string | null;
+  deletion_claim_id?: string | null;
+  deletion_claimed_at?: Date | string | null;
   deleted_at: Date | string | null;
+  metadata?: Record<string, unknown>;
   updated_at: Date | string;
+};
+
+type BlobDeleteClaim = {
+  blob: BlobRow;
+  alreadyDeleted?: boolean;
+  cancelled?: boolean;
 };
 
 export interface FileBlobProcessor {
@@ -68,7 +77,8 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
         )
         ON CONFLICT (tenant_id,dedupe_key) DO UPDATE SET
           completed_at=NULL,available_at=EXCLUDED.available_at,
-          lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now()
+          lease_owner=NULL,lease_expires_at=NULL,receipt_due_at=NULL,
+          dead_lettered_at=NULL,error_category=NULL,last_error=NULL,updated_at=now()
       `, [payload.tenantId, payload.blobId, `file.verify-blob:${payload.blobId}`, JSON.stringify(payload)]);
       return blob;
     });
@@ -94,20 +104,27 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
         throw new Error(`Stored file blob size mismatch: expected ${claimed.size_bytes}, received ${byteCount}`);
       }
     } catch (error) {
-      await this.withTenant(payload.tenantId, (executor) => executor.execute(`
-        UPDATE file_blobs
-        SET verification_status = 'failed',
-            metadata = metadata || jsonb_build_object('verificationError', $3::text),
-            updated_at = now()
-        WHERE tenant_id = $1::uuid AND id = $2::uuid
-          AND verification_status = 'verifying'
-      `, [payload.tenantId, payload.blobId, error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000)]));
-      await this.withTenant(payload.tenantId, (executor) => executor.execute(`
-        UPDATE artifact_operations
-        SET verification_status='failed',error_class='storage_verification_error',updated_at=now()
-        WHERE tenant_id=$1::uuid
-          AND file_id IN (SELECT id FROM files WHERE tenant_id=$1::uuid AND blob_id=$2::uuid)
-      `, [payload.tenantId, payload.blobId]));
+      const errorMessage = error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000);
+      await this.withTenant(payload.tenantId, async (executor) => {
+        await executor.execute(`
+          UPDATE file_blobs
+          SET verification_status = 'failed',
+              metadata = metadata || jsonb_build_object('verificationError', $3::text),
+              updated_at = now()
+          WHERE tenant_id = $1::uuid AND id = $2::uuid
+            AND verification_status = 'verifying'
+        `, [payload.tenantId, payload.blobId, errorMessage]);
+        await executor.execute(`
+          INSERT INTO file_lifecycle_events (
+            tenant_id,blob_id,event_type,dedupe_key,payload
+          ) VALUES (
+            $1::uuid,$2::uuid,'file.verification_failed',
+            'file.verification_failed:' || $2::text,
+            jsonb_build_object('blobId',$2::text,'error',$3::text)
+          )
+          ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        `, [payload.tenantId, payload.blobId, errorMessage]);
+      });
       throw error;
     }
 
@@ -120,6 +137,24 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
   }
 
   async delete(payload: FileDeleteBlobJobPayload): Promise<{ deleted: number; cancelled?: boolean }> {
+    const claim = await this.claimDeletion(payload);
+    if (claim.cancelled) return { deleted: 0, cancelled: true };
+    if (claim.alreadyDeleted) return { deleted: 0 };
+    try {
+      await deleteCapturedObjectVersion(
+        this.client,
+        claim.blob.bucket,
+        claim.blob.object_key,
+        claim.blob.object_version_id,
+      );
+    } catch (error) {
+      await this.releaseDeletionClaim(payload);
+      throw error;
+    }
+    return this.completeDeletion(payload);
+  }
+
+  private async claimDeletion(payload: FileDeleteBlobJobPayload): Promise<BlobDeleteClaim> {
     return this.withTenant(payload.tenantId, async (executor) => {
       const [locationGuard] = await executor.query<{ guard_name: string | null }>(`
         SELECT to_regclass('file_blobs_physical_location_unique')::text AS guard_name
@@ -148,7 +183,7 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
       if (!outbox) throw new Error("Blob-deletion outbox receipt could not be recorded");
       if (blob.verification_status === "deleted" || blob.deleted_at) {
         await acknowledgeBlobOutbox(executor, payload, null);
-        return { deleted: 0 };
+        return { blob, alreadyDeleted: true };
       }
       const liveFile = lockedFiles.find((file) => !file.deleted_at);
       const [liveReferences] = liveFile ? [{ reference_exists: true }] : await executor.query<{ reference_exists: boolean }>(`
@@ -199,19 +234,56 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
           WHERE tenant_id = $1::uuid AND id = $2::uuid
         `, [payload.tenantId, payload.blobId]);
         await acknowledgeBlobOutbox(executor, payload, "Cancelled because a live file reference exists");
-        return { deleted: 0, cancelled: true };
+        return { blob, cancelled: true };
       }
       if (blob.verification_status !== "pending_delete" || !blob.delete_after || new Date(blob.delete_after).getTime() > Date.now()) {
         throw new Error("File blob is not eligible for physical deletion");
       }
-      await deleteEveryObjectVersion(this.client, blob.bucket, [blob.object_key]);
+      if (blob.deletion_claim_id
+        && blob.deletion_claim_id !== payload.outboxId
+        && blob.deletion_claimed_at
+        && new Date(blob.deletion_claimed_at).getTime() > Date.now() - 15 * 60 * 1_000) {
+        throw new Error("File blob deletion is already claimed by another delivery");
+      }
       await executor.execute(`
         UPDATE file_blobs
-        SET verification_status = 'deleted', deleted_at = COALESCE(deleted_at, now()), updated_at = now()
-        WHERE tenant_id = $1::uuid AND id = $2::uuid
-      `, [payload.tenantId, payload.blobId]);
+        SET deletion_claim_id=$3,deletion_claimed_at=now(),updated_at=now()
+        WHERE tenant_id=$1::uuid AND id=$2::uuid
+          AND verification_status='pending_delete' AND deleted_at IS NULL
+      `, [payload.tenantId, payload.blobId, payload.outboxId]);
+      return { blob };
+    });
+  }
+
+  private async releaseDeletionClaim(payload: FileDeleteBlobJobPayload): Promise<void> {
+    await this.withTenant(payload.tenantId, (executor) => executor.execute(`
+      UPDATE file_blobs
+      SET deletion_claim_id=NULL,deletion_claimed_at=NULL,updated_at=now()
+      WHERE tenant_id=$1::uuid AND id=$2::uuid AND deletion_claim_id=$3
+    `, [payload.tenantId, payload.blobId, payload.outboxId]));
+  }
+
+  private async completeDeletion(payload: FileDeleteBlobJobPayload): Promise<{ deleted: number }> {
+    return this.withTenant(payload.tenantId, async (executor) => {
+      const rows = await executor.query<{ id: string }>(`
+        UPDATE file_blobs
+        SET verification_status='deleted',deleted_at=COALESCE(deleted_at,now()),
+            deletion_claim_id=NULL,deletion_claimed_at=NULL,updated_at=now()
+        WHERE tenant_id=$1::uuid AND id=$2::uuid
+          AND deletion_claim_id=$3 AND verification_status='pending_delete'
+        RETURNING id
+      `, [payload.tenantId, payload.blobId, payload.outboxId]);
+      if (!rows[0]) {
+        const [current] = await executor.query<{ verification_status: string; deleted_at: Date | string | null }>(`
+          SELECT verification_status,deleted_at FROM file_blobs
+          WHERE tenant_id=$1::uuid AND id=$2::uuid
+        `, [payload.tenantId, payload.blobId]);
+        if (current?.verification_status !== "deleted" && !current?.deleted_at) {
+          throw new Error("File blob deletion claim was lost before receipt");
+        }
+      }
       await acknowledgeBlobOutbox(executor, payload, null);
-      return { deleted: 1 };
+      return { deleted: rows[0] ? 1 : 0 };
     });
   }
 
@@ -289,6 +361,7 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
         ) VALUES ($1::uuid, 'file.delete-blob', $2, $3, $4::jsonb, $5::timestamptz)
         ON CONFLICT (tenant_id, dedupe_key) DO UPDATE SET
           available_at = EXCLUDED.available_at, completed_at = NULL,
+          receipt_due_at = NULL, dead_lettered_at = NULL, error_category = NULL,
           last_error = NULL, updated_at = now()
       `, [payload.tenantId, payload.blobId, `file.delete-blob:${payload.blobId}`, JSON.stringify(payload), new Date(scheduled.delete_after).toISOString()]);
       await executor.execute(`
@@ -314,11 +387,16 @@ export class SqlFileBlobProcessor implements FileBlobProcessor {
 async function completeVerificationWatchdog(executor: SqlExecutor, payload: FileBlobJobPayload): Promise<void> {
   await executor.execute(`
     UPDATE runtime_outbox
-    SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,
-        lease_expires_at=NULL,last_error=NULL,updated_at=now()
+    SET completed_at=COALESCE(completed_at,now()),
+        delivered_at=COALESCE(delivered_at,now()),receipt_at=COALESCE(receipt_at,now()),
+        receipt_due_at=NULL,lease_owner=NULL,lease_expires_at=NULL,
+        last_error=NULL,error_category=NULL,updated_at=now()
     WHERE tenant_id=$1::uuid AND event_type='file.verify-blob'
       AND aggregate_id=$2 AND dedupe_key=$3
-  `, [payload.tenantId, payload.blobId, `file.verify-blob:${payload.blobId}`]);
+      AND ($4::uuid IS NULL OR id=$4::uuid)
+      AND completed_at IS NULL AND dead_lettered_at IS NULL
+      AND ($5::bigint IS NULL OR lease_epoch=$5::bigint)
+  `, [payload.tenantId, payload.blobId, `file.verify-blob:${payload.blobId}`, payload.outboxId ?? null, payload.leaseEpoch ?? null]);
 }
 
 async function acknowledgeBlobOutbox(
@@ -327,14 +405,29 @@ async function acknowledgeBlobOutbox(
   note: string | null,
 ): Promise<void> {
   const rows = await executor.query<{ id: string }>(`
+    WITH acknowledged AS (
     UPDATE runtime_outbox
     SET completed_at = COALESCE(completed_at, now()),
+        delivered_at = COALESCE(delivered_at, now()),
+        receipt_at = COALESCE(receipt_at, now()), receipt_due_at = NULL,
         lease_owner = NULL, lease_expires_at = NULL,
-        last_error = $4, updated_at = now()
+        last_error = $4, error_category = CASE WHEN $4 IS NULL THEN NULL ELSE 'cancelled' END, updated_at = now()
     WHERE tenant_id = $1::uuid AND id = $2::uuid
       AND event_type = 'file.delete-blob' AND aggregate_id = $3
+      AND completed_at IS NULL AND dead_lettered_at IS NULL
+      AND lease_epoch = $5::bigint
     RETURNING id
-  `, [payload.tenantId, payload.outboxId, payload.blobId, note]);
+    ), already_acknowledged AS (
+      SELECT id FROM runtime_outbox
+      WHERE tenant_id = $1::uuid AND id = $2::uuid
+        AND event_type = 'file.delete-blob' AND aggregate_id = $3
+        AND completed_at IS NOT NULL AND dead_lettered_at IS NULL
+    )
+    SELECT id FROM acknowledged
+    UNION ALL
+    SELECT id FROM already_acknowledged
+    LIMIT 1
+  `, [payload.tenantId, payload.outboxId, payload.blobId, note, payload.leaseEpoch ?? 1]);
   if (!rows[0]) throw new Error("Blob-deletion outbox receipt could not be recorded");
 }
 

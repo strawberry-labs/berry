@@ -42,6 +42,7 @@ export type CompactionJobPayload = Omit<z.infer<typeof CompactionJobPayloadSchem
 
 export const TurnExecuteJobPayloadSchema = z.object({
   outboxId: z.string().uuid().optional(),
+  leaseEpoch: z.number().int().nonnegative().optional(),
   tenantId: z.string().uuid(),
   runId: z.string().uuid(),
   reason: TurnExecuteReasonSchema.default("continue"),
@@ -55,6 +56,7 @@ export type TurnResumeJobPayload = z.infer<typeof TurnResumeJobPayloadSchema>;
 
 export const SandboxSnapshotJobPayloadSchema = z.object({
   outboxId: z.string().uuid().optional(),
+  leaseEpoch: z.number().int().nonnegative().optional(),
   tenantId: z.string().uuid(),
   runId: z.string().uuid(),
   reason: z.enum(["interval", "before-wait", "before-finalize", "manual"]).default("interval"),
@@ -90,6 +92,7 @@ export type KnowledgeIndexTaskJobPayload = z.infer<typeof KnowledgeIndexTaskJobP
 
 export const FileDeleteObjectJobPayloadSchema = z.object({
   outboxId: z.string().uuid(),
+  leaseEpoch: z.number().int().nonnegative().optional(),
   tenantId: z.string().uuid(),
   fileId: z.string().uuid(),
   bucket: z.string().min(1).max(255),
@@ -98,6 +101,8 @@ export const FileDeleteObjectJobPayloadSchema = z.object({
 export type FileDeleteObjectJobPayload = z.infer<typeof FileDeleteObjectJobPayloadSchema>;
 
 export const FileBlobJobPayloadSchema = z.object({
+  outboxId: z.string().uuid().optional(),
+  leaseEpoch: z.number().int().nonnegative().optional(),
   tenantId: z.string().uuid(),
   blobId: z.string().uuid(),
 });

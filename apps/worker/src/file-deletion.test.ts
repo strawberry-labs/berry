@@ -261,7 +261,7 @@ describe("SqlFileDeletionReceiptStore", () => {
 
     expect(calls[0]?.sql).toContain("event_type = 'file.delete-object' AND aggregate_id = $3");
     expect(calls[0]?.sql).toContain("completed_at = COALESCE(completed_at, now())");
-    expect(calls[0]?.params).toEqual([tenantId, outboxId, fileId]);
+    expect(calls[0]?.params).toEqual([tenantId, outboxId, fileId, 1]);
   });
 
   it("rejects a receipt that cannot find its durable outbox row", async () => {

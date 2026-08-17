@@ -1,11 +1,11 @@
 import {
   BerryWorkerJobNameSchema,
-  FileDeleteBlobJobPayloadSchema,
-  FileDeleteObjectJobPayloadSchema,
   SandboxSnapshotJobPayloadSchema,
+  parseWorkerJob,
   type BerryWorkerJobMap,
   type BerryWorkerJobName,
 } from "./jobs.js";
+import { ZodError } from "zod";
 import type { BerryQueueClient } from "./bullmq.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
@@ -15,9 +15,13 @@ type OutboxRow = {
   tenant_id: string;
   event_type: string;
   payload: unknown;
-  attempts: number;
+  attempts: number | string;
   created_at?: Date | string;
   available_at?: Date | string;
+  first_available_at?: Date | string;
+  lease_epoch?: number | string;
+  priority_class?: string;
+  max_attempts?: number | string;
 };
 
 export class RuntimeOutboxDispatcher {
@@ -36,6 +40,7 @@ export class RuntimeOutboxDispatcher {
       terminalCleanupIntervalMs?: number;
       terminalCleanupBatchSize?: number;
       deliveryReceiptRetryMs?: number;
+      maxAttempts?: number;
       enableWaitExpiry?: boolean;
       enableTerminalFinalization?: boolean;
     },
@@ -130,59 +135,71 @@ export class RuntimeOutboxDispatcher {
       `, [tenantId, this.options.terminalCleanupBatchSize ?? 25]));
         const remaining = (this.options.batchSize ?? 50) - rows.length;
         if (remaining <= 0) break;
+        const fairShare = tenantIds.length > 1
+          ? Math.max(1, Math.ceil((this.options.batchSize ?? 50) / tenantIds.length))
+          : remaining;
+        const claimLimit = Math.min(remaining, fairShare);
         const claimed = await this.withTenant(tenantId, async (executor) => executor.query<OutboxRow>(`
         WITH due AS (
           SELECT id
           FROM runtime_outbox
           WHERE tenant_id = $1::uuid
             AND completed_at IS NULL
-            AND available_at <= now()
+            AND dead_lettered_at IS NULL
+            AND COALESCE(receipt_due_at, available_at) <= now()
             AND (lease_expires_at IS NULL OR lease_expires_at <= now())
-          ORDER BY available_at ASC, created_at ASC
+          ORDER BY CASE priority_class
+                     WHEN 'interactive' THEN 0
+                     WHEN 'post_turn' THEN 1
+                     WHEN 'normal' THEN 2
+                     WHEN 'cleanup' THEN 3
+                     ELSE 4
+                   END,
+                   COALESCE(receipt_due_at, available_at) ASC,
+                   first_available_at ASC,
+                   created_at ASC
           FOR UPDATE SKIP LOCKED
           LIMIT $3
         )
         UPDATE runtime_outbox outbox
         SET lease_owner = $2, lease_expires_at = now() + interval '30 seconds',
+            lease_epoch = outbox.lease_epoch + 1,
+            claimed_at = COALESCE(outbox.claimed_at, now()),
+            receipt_due_at = NULL,
             attempts = outbox.attempts + 1, updated_at = now()
         FROM due
         WHERE outbox.id = due.id
         RETURNING outbox.id, outbox.tenant_id, outbox.event_type,
-                  outbox.payload, outbox.attempts, outbox.created_at, outbox.available_at
-      `, [tenantId, this.options.workerId, remaining]));
+                  outbox.payload, outbox.attempts, outbox.created_at, outbox.available_at,
+                  outbox.first_available_at, outbox.lease_epoch, outbox.priority_class,
+                  outbox.max_attempts
+      `, [tenantId, this.options.workerId, claimLimit]));
         rows.push(...claimed);
       }
       let dispatched = 0;
       for (const row of rows) {
         const parsedName = BerryWorkerJobNameSchema.safeParse(row.event_type);
         if (!parsedName.success) {
-          await this.fail(row, `Unsupported outbox event type: ${row.event_type}`, true);
+          await this.fail(row, `Unsupported outbox event type: ${row.event_type}`, true, "unsupported_event");
           continue;
         }
         try {
           const name = parsedName.data;
           await this.prepare(row, name);
-          const payload = name === "file.delete-object"
-            ? FileDeleteObjectJobPayloadSchema.parse({
-                ...(isRecord(row.payload) ? row.payload : {}),
-                outboxId: row.id,
-              })
-            : name === "file.delete-blob"
-              ? FileDeleteBlobJobPayloadSchema.parse({
-                  ...(isRecord(row.payload) ? row.payload : {}),
+          const payload = parseWorkerJob(name, {
+            ...(isRecord(row.payload) ? row.payload : {}),
+            ...(requiresDeliveryReceipt(name)
+              ? {
                   outboxId: row.id,
-                })
-              : requiresDeliveryReceipt(name)
-                ? {
-                    ...(isRecord(row.payload) ? row.payload : {}),
-                    outboxId: row.id,
-                  } as BerryWorkerJobMap[typeof name]
-                : row.payload as BerryWorkerJobMap[typeof name];
+                  ...(row.lease_epoch === undefined ? {} : { leaseEpoch: Number(row.lease_epoch) }),
+                }
+              : {}),
+          });
           await this.queue.enqueue(
             name,
             payload as BerryWorkerJobMap[typeof name],
             {
-              jobId: outboxJobId(name, row.id, row.attempts),
+              jobId: outboxJobId(name, row.id, Number(row.attempts) || 1),
               priority: outboxJobPriority(name),
             },
           );
@@ -191,7 +208,13 @@ export class RuntimeOutboxDispatcher {
           else await this.complete(row);
           dispatched += 1;
         } catch (error) {
-          await this.fail(row, error instanceof Error ? error.message : String(error), false);
+          const malformed = error instanceof ZodError;
+          await this.fail(
+            row,
+            error instanceof Error ? error.message : String(error),
+            malformed,
+            malformed ? "malformed_payload" : "dispatch_error",
+          );
         }
       }
       return dispatched;
@@ -403,7 +426,7 @@ WHERE f.tenant_id=$1::uuid AND f.status IN ('pending','failed','partial')
   )
 ON CONFLICT (tenant_id,dedupe_key) DO UPDATE
 SET completed_at=NULL,available_at=now(),lease_owner=NULL,lease_expires_at=NULL,
-    last_error=NULL,updated_at=now()
+    receipt_due_at=NULL,dead_lettered_at=NULL,error_category=NULL,last_error=NULL,updated_at=now()
 WHERE runtime_outbox.completed_at IS NOT NULL
       `.trim(),
       [tenantId],
@@ -412,26 +435,38 @@ WHERE runtime_outbox.completed_at IS NOT NULL
 
   private async complete(row: OutboxRow): Promise<void> {
     await this.withTenant(row.tenant_id, async (executor) => {
-      await executor.execute(`
+      const rows = await executor.query<{ id: string }>(`
         UPDATE runtime_outbox
-        SET completed_at = now(), lease_owner = NULL, lease_expires_at = NULL,
-            last_error = NULL, updated_at = now()
-        WHERE tenant_id = $1::uuid AND id = $2::uuid AND lease_owner = $3
-      `, [row.tenant_id, row.id, this.options.workerId]);
+        SET completed_at = COALESCE(completed_at, now()),
+            delivered_at = COALESCE(delivered_at, now()),
+            receipt_at = COALESCE(receipt_at, now()),
+            receipt_due_at = NULL,
+            lease_owner = NULL, lease_expires_at = NULL,
+            last_error = NULL, error_category = NULL, updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND lease_owner = $3 AND lease_epoch = $4::bigint
+          AND completed_at IS NULL AND dead_lettered_at IS NULL
+        RETURNING id
+      `, [row.tenant_id, row.id, this.options.workerId, leaseEpoch(row)]);
+      if (!rows[0]) workerRuntimeMetrics.outboxFenceMiss("complete");
     });
   }
 
   private async deferForDeliveryReceipt(row: OutboxRow): Promise<void> {
     const retryMs = Math.max(30_000, this.options.deliveryReceiptRetryMs ?? 900_000);
     await this.withTenant(row.tenant_id, async (executor) => {
-      await executor.execute(`
+      const rows = await executor.query<{ id: string }>(`
         UPDATE runtime_outbox
-        SET lease_owner = NULL, lease_expires_at = NULL,
-            available_at = now() + ($4::bigint * interval '1 millisecond'),
-            last_error = 'Awaiting worker delivery receipt', updated_at = now()
+        SET delivered_at = COALESCE(delivered_at, now()),
+            receipt_due_at = now() + ($4::bigint * interval '1 millisecond'),
+            lease_owner = NULL, lease_expires_at = NULL,
+            last_error = 'Awaiting worker delivery receipt', error_category = 'delivery_receipt_pending', updated_at = now()
         WHERE tenant_id = $1::uuid AND id = $2::uuid
-          AND lease_owner = $3 AND completed_at IS NULL
-      `, [row.tenant_id, row.id, this.options.workerId, retryMs]);
+          AND lease_owner = $3 AND lease_epoch = $5::bigint
+          AND completed_at IS NULL AND dead_lettered_at IS NULL
+        RETURNING id
+      `, [row.tenant_id, row.id, this.options.workerId, retryMs, leaseEpoch(row)]);
+      if (!rows[0]) workerRuntimeMetrics.outboxFenceMiss("defer");
     });
   }
 
@@ -445,16 +480,36 @@ WHERE runtime_outbox.completed_at IS NOT NULL
     return true;
   }
 
-  private async fail(row: OutboxRow, reason: string, terminal: boolean): Promise<void> {
-    const delaySeconds = Math.min(300, 2 ** Math.min(row.attempts, 8));
-    await this.withTenant(row.tenant_id, (executor) => executor.execute(`
-      UPDATE runtime_outbox
-      SET lease_owner = NULL, lease_expires_at = NULL,
-          available_at = CASE WHEN $4::boolean THEN available_at ELSE now() + ($5 || ' seconds')::interval END,
-          completed_at = CASE WHEN $4::boolean THEN now() ELSE NULL END,
-          last_error = $3, updated_at = now()
-      WHERE tenant_id = $1::uuid AND id = $2::uuid
-    `, [row.tenant_id, row.id, reason.slice(0, 2_000), terminal, delaySeconds]));
+  private async fail(row: OutboxRow, reason: string, terminal: boolean, category = "dispatch_error"): Promise<void> {
+    const attempts = Number(row.attempts) || 0;
+    const configuredMax = this.options.maxAttempts ?? Number(row.max_attempts ?? 8);
+    const maxAttempts = Math.max(1, Math.min(100, Number.isFinite(configuredMax) ? configuredMax : 8));
+    const deadLetter = terminal || attempts >= maxAttempts;
+    const delaySeconds = Math.min(300, 2 ** Math.min(attempts, 8));
+    await this.withTenant(row.tenant_id, async (executor) => {
+      const rows = await executor.query<{ id: string }>(`
+        UPDATE runtime_outbox
+        SET lease_owner = NULL, lease_expires_at = NULL, receipt_due_at = NULL,
+            available_at = CASE WHEN $4::boolean THEN available_at ELSE now() + ($5 || ' seconds')::interval END,
+            completed_at = CASE WHEN $4::boolean THEN COALESCE(completed_at, now()) ELSE NULL END,
+            dead_lettered_at = CASE WHEN $4::boolean THEN COALESCE(dead_lettered_at, now()) ELSE NULL END,
+            error_category = $6, last_error = $3, updated_at = now()
+        WHERE tenant_id = $1::uuid AND id = $2::uuid
+          AND lease_owner = $7 AND lease_epoch = $8::bigint
+          AND completed_at IS NULL AND dead_lettered_at IS NULL
+        RETURNING id
+      `, [
+        row.tenant_id,
+        row.id,
+        reason.slice(0, 2_000),
+        deadLetter,
+        delaySeconds,
+        category,
+        this.options.workerId,
+        leaseEpoch(row),
+      ]);
+      if (!rows[0]) workerRuntimeMetrics.outboxFenceMiss("fail");
+    });
   }
 
   private async tenantIds(): Promise<string[]> {
@@ -505,26 +560,30 @@ export function outboxJobId(name: BerryWorkerJobName, outboxId: string, attempt 
 }
 
 export interface RuntimeOutboxDeliveryReceipts {
-  acknowledge(tenantId: string, outboxId: string, aggregateId?: string): Promise<void>;
+  acknowledge(tenantId: string, outboxId: string, aggregateId?: string, leaseEpoch?: number): Promise<void>;
 }
 
 export class SqlRuntimeOutboxDeliveryReceipts implements RuntimeOutboxDeliveryReceipts {
   constructor(private readonly executor: SqlExecutor) {}
 
-  async acknowledge(tenantId: string, outboxId: string, aggregateId?: string): Promise<void> {
+  async acknowledge(tenantId: string, outboxId: string, aggregateId?: string, leaseEpochValue?: number): Promise<void> {
     await this.executor.execute(`
 WITH acknowledged AS (
   UPDATE runtime_outbox
-  SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL,
-      last_error=NULL,updated_at=now()
+  SET completed_at=COALESCE(completed_at,now()),
+      delivered_at=COALESCE(delivered_at,now()),
+      receipt_at=COALESCE(receipt_at,now()),receipt_due_at=NULL,
+      lease_owner=NULL,lease_expires_at=NULL,
+      last_error=NULL,error_category=NULL,updated_at=now()
   WHERE tenant_id=$1::uuid AND id=$2::uuid AND completed_at IS NULL
+    AND dead_lettered_at IS NULL AND lease_epoch=$4::bigint
   RETURNING id
 )
 UPDATE turn_runs
 SET updated_at=now()
 WHERE tenant_id=$1::uuid AND id=$3::uuid
   AND EXISTS (SELECT 1 FROM acknowledged)
-    `.trim(), [tenantId, outboxId, aggregateId ?? null]);
+    `.trim(), [tenantId, outboxId, aggregateId ?? null, leaseEpochValue ?? 1]);
   }
 }
 
@@ -549,6 +608,11 @@ function outboxJobPriority(name: BerryWorkerJobName): number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function leaseEpoch(row: OutboxRow): number {
+  const value = Number(row.lease_epoch);
+  return Number.isSafeInteger(value) && value >= 0 ? value : 1;
 }
 
 function safeBigInt(value: unknown): bigint {
