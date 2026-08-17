@@ -25,6 +25,11 @@ export interface CheckpointParseResult {
 export const SESSION_CHECKPOINT_MAX_BYTES = 64 * 1024;
 export const SESSION_CHECKPOINT_MAX_ITEMS = 256;
 
+export interface SessionCheckpointMetrics {
+  serializedBytes: number;
+  tokenEstimate: number;
+}
+
 export interface CheckpointValidationOptions {
   maxBytes?: number;
   maxItems?: number;
@@ -62,8 +67,8 @@ export function validateSessionCheckpoint(
   const maxBytes = Math.max(1, options.maxBytes ?? SESSION_CHECKPOINT_MAX_BYTES);
   const maxItems = Math.max(1, options.maxItems ?? SESSION_CHECKPOINT_MAX_ITEMS);
   const issues: string[] = [];
-  const serialized = JSON.stringify(checkpoint);
-  if (utf8ByteLength(serialized) > maxBytes) {
+  const metrics = sessionCheckpointMetrics(checkpoint);
+  if (metrics.serializedBytes > maxBytes) {
     issues.push(`checkpoint exceeds ${maxBytes} bytes`);
   }
   for (const [field, value] of Object.entries(checkpoint)) {
@@ -168,7 +173,13 @@ export function mergeSessionCheckpoints(
   segment: SessionCheckpointV2,
   deterministic: CheckpointDeterministicFields,
 ): SessionCheckpointV2 {
-  if (!previous) return applyCheckpointDeterminism(segment, deterministic);
+  if (!previous) {
+    return boundSessionCheckpoint(
+      applyCheckpointDeterminism(segment, deterministic),
+      segment,
+      deterministic,
+    );
+  }
   const merged: SessionCheckpointV2 = {
     ...segment,
     generatedAt: deterministic.generatedAt,
@@ -202,10 +213,15 @@ export function mergeSessionCheckpoints(
     currentLeafId: segment.currentLeafId,
     narrative: (segment.narrative || previous.narrative).slice(-8_000),
   };
-  return applyCheckpointDeterminism(merged, {
+  const rollingDeterministic = {
     ...deterministic,
     coveredEntryStart: previous.coveredEntryStart ?? deterministic.coveredEntryStart,
-  });
+  };
+  return boundSessionCheckpoint(
+    applyCheckpointDeterminism(merged, rollingDeterministic),
+    segment,
+    rollingDeterministic,
+  );
 }
 
 export function rebaseSessionCheckpoint(
@@ -228,10 +244,115 @@ export function rebaseSessionCheckpoint(
       retrievalSnapshotIds: [],
     });
   }
-  return applyCheckpointDeterminism(
-    rolling ?? emptySessionCheckpoint(deterministic),
+  const latest = segments.at(-1) ?? emptySessionCheckpoint(deterministic);
+  return boundSessionCheckpoint(
+    applyCheckpointDeterminism(
+      rolling ?? latest,
+      deterministic,
+    ),
+    latest,
     deterministic,
   );
+}
+
+/** Measure the exact UTF-8 serialization persisted for a checkpoint. */
+export function sessionCheckpointMetrics(checkpoint: SessionCheckpointV2): SessionCheckpointMetrics {
+  const serializedBytes = utf8ByteLength(JSON.stringify(checkpoint));
+  return {
+    serializedBytes,
+    tokenEstimate: Math.ceil(serializedBytes / 4),
+  };
+}
+
+/**
+ * Remove oldest accumulated facts until a rolling checkpoint fits the durable
+ * byte limit. Facts from the newest immutable segment and deterministic
+ * evidence are never selected for removal; callers still validate the result
+ * in case that protected evidence alone is too large.
+ */
+export function boundSessionCheckpoint(
+  checkpoint: SessionCheckpointV2,
+  latestSegment: SessionCheckpointV2,
+  deterministic: CheckpointDeterministicFields,
+  maxBytes = SESSION_CHECKPOINT_MAX_BYTES,
+): SessionCheckpointV2 {
+  const bounded = cloneCheckpoint(checkpoint);
+  const byteLimit = Math.max(1, Math.floor(maxBytes));
+  if (sessionCheckpointMetrics(bounded).serializedBytes <= byteLimit) return bounded;
+
+  const shrinkers: Array<() => boolean> = [
+    () => removeOldestUnprotected(
+      bounded.retrievalSnapshotIds,
+      protectedStringKeys(latestSegment.retrievalSnapshotIds, deterministic.retrievalSnapshotIds),
+      (value) => value,
+    ),
+    () => removeOldestUnprotected(
+      bounded.filesRead,
+      protectedStringKeys(latestSegment.filesRead, deterministic.filesRead),
+      (value) => value,
+    ),
+    () => removeOldestUnprotected(
+      bounded.commands,
+      protectedObjectKeys(latestSegment.commands, deterministic.commands, commandKey),
+      commandKey,
+    ),
+    () => removeOldestUnprotected(
+      bounded.approvals,
+      protectedObjectKeys(latestSegment.approvals, deterministic.approvals, (value) => value.approvalId),
+      (value) => value.approvalId,
+    ),
+    () => removeOldestUnprotected(
+      bounded.artifacts,
+      protectedObjectKeys(latestSegment.artifacts, undefined, (value) => value.id),
+      (value) => value.id,
+    ),
+    () => removeOldestUnprotected(
+      bounded.toolCalls,
+      protectedObjectKeys(latestSegment.toolCalls, deterministic.toolCalls, (value) => value.toolCallId),
+      (value) => value.toolCallId,
+    ),
+    () => removeOldestUnprotected(
+      bounded.filesModified,
+      protectedStringKeys(latestSegment.filesModified, deterministic.filesModified),
+      (value) => value,
+    ),
+    () => removeOldestUnprotected(
+      bounded.completedWork,
+      protectedStringKeys(latestSegment.completedWork),
+      (value) => value,
+    ),
+    () => removeOldestUnprotected(
+      bounded.decisions,
+      protectedObjectKeys(latestSegment.decisions, undefined, checkpointSourceKey),
+      checkpointSourceKey,
+    ),
+    () => removeOldestUnprotected(
+      bounded.successCriteria,
+      protectedStringKeys(latestSegment.successCriteria),
+      (value) => value,
+    ),
+    () => removeOldestUnprotected(
+      bounded.standingInstructions,
+      protectedStringKeys(latestSegment.standingInstructions),
+      (value) => value,
+    ),
+    () => removeOldestUnprotected(
+      bounded.constraints,
+      protectedStringKeys(latestSegment.constraints),
+      (value) => value,
+    ),
+  ];
+
+  for (const shrink of shrinkers) {
+    while (shrink()) {
+      if (sessionCheckpointMetrics(bounded).serializedBytes <= byteLimit) return bounded;
+    }
+  }
+
+  if (bounded.goal !== latestSegment.goal) bounded.goal = latestSegment.goal;
+  if (sessionCheckpointMetrics(bounded).serializedBytes <= byteLimit) return bounded;
+  if (bounded.narrative !== latestSegment.narrative) bounded.narrative = latestSegment.narrative;
+  return bounded;
 }
 
 export function checkpointFallback(
@@ -261,6 +382,57 @@ function mergeToolCalls(
   for (const item of earlier) byId.set(item.toolCallId, item);
   for (const item of later) byId.set(item.toolCallId, item);
   return boundedObjects([...byId.values()], 256);
+}
+
+function cloneCheckpoint(checkpoint: SessionCheckpointV2): SessionCheckpointV2 {
+  return {
+    ...checkpoint,
+    successCriteria: [...checkpoint.successCriteria],
+    constraints: [...checkpoint.constraints],
+    standingInstructions: [...checkpoint.standingInstructions],
+    completedWork: [...checkpoint.completedWork],
+    currentWork: [...checkpoint.currentWork],
+    blockers: [...checkpoint.blockers],
+    decisions: checkpoint.decisions.map((value) => ({ ...value })),
+    unresolvedQuestions: [...checkpoint.unresolvedQuestions],
+    filesRead: [...checkpoint.filesRead],
+    filesModified: [...checkpoint.filesModified],
+    artifacts: checkpoint.artifacts.map((value) => ({ ...value })),
+    commands: checkpoint.commands.map((value) => ({ ...value })),
+    toolCalls: checkpoint.toolCalls.map((value) => ({ ...value })),
+    approvals: checkpoint.approvals.map((value) => ({ ...value })),
+    retrievalSnapshotIds: [...checkpoint.retrievalSnapshotIds],
+  };
+}
+
+function protectedStringKeys(
+  primary: readonly string[],
+  secondary: readonly string[] = [],
+): Set<string> {
+  return new Set([...primary, ...secondary]);
+}
+
+function protectedObjectKeys<T>(
+  primary: readonly T[],
+  secondary: readonly T[] | undefined,
+  key: (value: T) => string,
+): Set<string> {
+  return new Set([...primary, ...(secondary ?? [])].map(key));
+}
+
+function removeOldestUnprotected<T>(
+  values: T[],
+  protectedKeys: ReadonlySet<string>,
+  key: (value: T) => string,
+): boolean {
+  const index = values.findIndex((value) => !protectedKeys.has(key(value)));
+  if (index < 0) return false;
+  values.splice(index, 1);
+  return true;
+}
+
+function commandKey(value: SessionCheckpointV2["commands"][number]): string {
+  return `${value.command}\0${value.status}\0${value.result}`;
 }
 
 function checkpointSourceKey(

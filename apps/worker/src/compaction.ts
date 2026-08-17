@@ -7,11 +7,16 @@ import {
   mergeSessionCheckpoints,
   parseSessionCheckpoint,
   rebaseSessionCheckpoint,
+  RemoteModelSchema,
+  resolveModelCapabilities,
   SESSION_CHECKPOINT_MAX_ITEMS,
+  sessionCheckpointMetrics,
   validateSessionCheckpoint,
   type ProviderAttemptReport,
   type CheckpointDeterministicFields,
   type JsonValue,
+  type ModelCostHints,
+  type ProviderFailureCategory,
   type SessionCheckpointV2,
 } from "@berry/shared";
 import {
@@ -25,6 +30,57 @@ export const WORKER_CHECKPOINT_REBASE_INTERVAL = 5;
 export const DEFAULT_COMPACTION_ALGORITHM_VERSION = "checkpoint-v2-bounded";
 export const DEFAULT_COMPACTION_MAX_DURATION_MS = 180_000;
 export const MAX_COMPACTION_PHYSICAL_ATTEMPTS = 2;
+
+export type CompactionFailureCategory =
+  | "already_running"
+  | "checkpoint_identity_mismatch"
+  | "checkpoint_invalid"
+  | "deadline_exceeded"
+  | "governance_denied"
+  | "lease_lost"
+  | "pricing_unavailable"
+  | "provider_aborted"
+  | "provider_connection"
+  | "provider_permanent_client"
+  | "provider_rate_limit"
+  | "provider_server"
+  | "provider_timeout"
+  | "provider_unknown"
+  | "session_not_found"
+  | "usage_persistence_failed";
+
+export interface CompactionFailureState {
+  category: CompactionFailureCategory;
+  status: number | null;
+  publicMessage: string;
+}
+
+export interface CheckpointPersistenceMetrics {
+  tokensBefore: number;
+  tokensAfter: number;
+  serializedBytes: number;
+}
+
+export type CompactionPricingCatalog = Readonly<Record<string, ModelCostHints>>;
+
+const COMPACTION_FAILURE_MESSAGES: Record<CompactionFailureCategory, string> = {
+  already_running: "This session is already being compacted.",
+  checkpoint_identity_mismatch: "Checkpoint state did not match the requested compaction algorithm.",
+  checkpoint_invalid: "Compaction could not create a valid bounded checkpoint.",
+  deadline_exceeded: "Compaction exceeded its execution deadline.",
+  governance_denied: "The selected compaction model is not allowed for this tenant.",
+  lease_lost: "Compaction lost its persistence lease and must be retried.",
+  pricing_unavailable: "Compaction model pricing is unavailable; Berry used no paid model call.",
+  provider_aborted: "The compaction provider request was cancelled.",
+  provider_connection: "The compaction provider could not be reached.",
+  provider_permanent_client: "The compaction provider rejected the request.",
+  provider_rate_limit: "The compaction provider is rate limited.",
+  provider_server: "The compaction provider is temporarily unavailable.",
+  provider_timeout: "The compaction provider timed out.",
+  provider_unknown: "The compaction provider request failed.",
+  session_not_found: "The requested session is not available for compaction.",
+  usage_persistence_failed: "Compaction usage accounting could not be persisted.",
+};
 
 export interface CompactionUsage {
   provider: string;
@@ -77,6 +133,7 @@ export interface CompactionSessionState {
   modelProviderId: string | null;
   model: string | null;
   modelAllowed: boolean;
+  algorithmVersion: string;
   entries: readonly CompactionEntryRecord[];
   previousRolling: SessionCheckpointV2 | null;
   priorSegments: readonly SessionCheckpointV2[];
@@ -89,7 +146,7 @@ export interface SessionCompactionRepository {
   heartbeat?(input: CompactionJobPayload, leaseOwner: string, leaseSeconds: number): Promise<boolean>;
   load(
     input: CompactionJobPayload,
-    selection: { provider: string; model: string },
+    selection: { provider: string; model: string; algorithmVersion: string },
   ): Promise<CompactionSessionState>;
   persist(input: {
     state: CompactionSessionState;
@@ -101,8 +158,8 @@ export interface SessionCompactionRepository {
     model: string;
     rebased: boolean;
     algorithmVersion: string;
-    tokensBefore: number;
-    tokensAfter: number;
+    segmentMetrics: CheckpointPersistenceMetrics;
+    rollingMetrics: CheckpointPersistenceMetrics;
     physicalAttempts: number;
     fallbackReason: string | null;
     usage: CompactionUsage | null;
@@ -159,7 +216,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
     const leaseOwner = `${this.options.leaseOwner ?? `compactor:${process.pid}`}:${randomUUID()}`;
     const leaseSeconds = this.options.leaseSeconds ?? 120;
     const claimed = await this.repository.claim(input, leaseOwner, leaseSeconds);
-    if (!claimed) throw new CompactionRetryableError(`Session ${input.sessionId} is already being compacted`);
+    if (!claimed) throw new CompactionRetryableError("already_running");
 
     try {
       const provider = this.generator?.provider ?? this.options.fallbackProvider ?? "deterministic";
@@ -171,9 +228,12 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         MAX_COMPACTION_PHYSICAL_ATTEMPTS,
         Math.max(1, this.options.maxPhysicalAttempts ?? MAX_COMPACTION_PHYSICAL_ATTEMPTS),
       );
-      const state = await this.repository.load(input, { provider, model });
+      const state = await this.repository.load(input, { provider, model, algorithmVersion });
+      if (state.algorithmVersion !== algorithmVersion) {
+        throw new CompactionTerminalError("checkpoint_identity_mismatch");
+      }
       if (!state.modelAllowed) {
-        throw new CompactionTerminalError(`Model ${provider}/${model} is denied by tenant governance`);
+        throw new CompactionTerminalError("governance_denied");
       }
       if (!state.sourceLeafId || state.entries.length === 0) {
         await this.repository.release(input, leaseOwner);
@@ -199,7 +259,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
           sessionId: input.sessionId,
           summary: state.previousRolling?.narrative || "Checkpoint already covers the current leaf.",
           tokensBefore: estimateTokens(pendingEntries),
-          tokensAfter: (state.previousRolling ? estimateCheckpointTokens(state.previousRolling) : 0)
+          tokensAfter: (state.previousRolling ? sessionCheckpointMetrics(state.previousRolling).tokenEstimate : 0)
             + estimateTokens(selection.retained),
           noOp: true,
         };
@@ -223,17 +283,21 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
           }), input.maxDurationMs ?? this.options.maxDurationMs ?? DEFAULT_COMPACTION_MAX_DURATION_MS)
         : { checkpoint: null, validationStatus: "fallback" as const, attempts: 0, fallbackReason: "generator_unavailable" };
       if (generated.attempts > maxPhysicalAttempts) {
-        throw new CompactionTerminalError(`Compaction exceeded the ${maxPhysicalAttempts}-attempt physical safety limit`);
+        throw new CompactionTerminalError("checkpoint_invalid");
       }
       const fallbackContext = inferFallbackContext(segmentEntries);
       let segment = generated.checkpoint
         ? applyCheckpointDeterminism(generated.checkpoint, deterministic)
         : checkpointFallback(null, deterministic, fallbackContext);
       let validationStatus = generated.validationStatus;
-      let fallbackReason = generated.fallbackReason ?? null;
+      let fallbackReason = safeFallbackReason(generated.fallbackReason);
+      if (!generated.checkpoint && !fallbackReason) {
+        fallbackReason = this.generator ? "checkpoint_generation_failed" : "generator_unavailable";
+      }
+      let segmentCheckpointMetrics = sessionCheckpointMetrics(segment);
       const validatedSegment = validateSessionCheckpoint(segment, deterministic, {
         tokensBefore: segmentTokensBefore,
-        tokensAfter: estimateCheckpointTokens(segment),
+        tokensAfter: segmentCheckpointMetrics.tokenEstimate,
       });
       if (!validatedSegment.checkpoint) {
         const boundedFallback = {
@@ -243,30 +307,43 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
           currentWork: fallbackContext.currentWork.map((item) => item.slice(0, 512)),
         };
         segment = checkpointFallback(null, deterministic, boundedFallback);
+        segmentCheckpointMetrics = sessionCheckpointMetrics(segment);
         const fallbackValidation = validateSessionCheckpoint(segment, deterministic, {
           tokensBefore: segmentTokensBefore,
-          tokensAfter: estimateCheckpointTokens(segment),
+          tokensAfter: segmentCheckpointMetrics.tokenEstimate,
         });
         if (!fallbackValidation.checkpoint) {
-          throw new CompactionTerminalError(
-            `Deterministic compaction fallback failed validation: ${fallbackValidation.issues.join("; ").slice(0, 2_000)}`,
-          );
+          throw new CompactionTerminalError("checkpoint_invalid");
         }
         validationStatus = "fallback";
-        fallbackReason = fallbackReason ?? validatedSegment.issues.join("; ").slice(0, 2_000);
+        fallbackReason = fallbackReason ?? "checkpoint_validation_failed";
       }
       const allSegments = [...state.priorSegments, segment];
       const rebased = allSegments.length > 1
         && allSegments.length % WORKER_CHECKPOINT_REBASE_INTERVAL === 0;
-      const rolling = rebased
+      const rollingDeterministic = {
+        ...deterministic,
+        coveredEntryStart: rebased
+          ? allSegments[0]?.coveredEntryStart ?? deterministic.coveredEntryStart
+          : state.previousRolling?.coveredEntryStart ?? deterministic.coveredEntryStart,
+      };
+      const rollingCandidate = rebased
         ? rebaseSessionCheckpoint(allSegments, {
-            ...deterministic,
-            coveredEntryStart: allSegments[0]?.coveredEntryStart ?? deterministic.coveredEntryStart,
+            ...rollingDeterministic,
           })
         : mergeSessionCheckpoints(state.previousRolling, segment, {
-            ...deterministic,
-            coveredEntryStart: state.previousRolling?.coveredEntryStart ?? deterministic.coveredEntryStart,
+            ...rollingDeterministic,
           });
+      const rollingCheckpointMetrics = sessionCheckpointMetrics(rollingCandidate);
+      const rollingTokensBefore = estimateCheckpointCoverageTokens(state.entries, rollingCandidate);
+      const validatedRolling = validateSessionCheckpoint(rollingCandidate, rollingDeterministic, {
+        tokensBefore: rollingTokensBefore,
+        tokensAfter: rollingCheckpointMetrics.tokenEstimate,
+      });
+      if (!validatedRolling.checkpoint) {
+        throw new CompactionTerminalError("checkpoint_invalid");
+      }
+      const rolling = validatedRolling.checkpoint;
       const persisted = await this.repository.persist({
         state,
         leaseOwner,
@@ -277,8 +354,16 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         model,
         rebased,
         algorithmVersion,
-        tokensBefore: segmentTokensBefore,
-        tokensAfter: estimateCheckpointTokens(segment),
+        segmentMetrics: {
+          tokensBefore: segmentTokensBefore,
+          tokensAfter: segmentCheckpointMetrics.tokenEstimate,
+          serializedBytes: segmentCheckpointMetrics.serializedBytes,
+        },
+        rollingMetrics: {
+          tokensBefore: rollingTokensBefore,
+          tokensAfter: rollingCheckpointMetrics.tokenEstimate,
+          serializedBytes: rollingCheckpointMetrics.serializedBytes,
+        },
         physicalAttempts: generated.attempts,
         fallbackReason,
         usage: generated.usage ?? null,
@@ -288,7 +373,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         sessionId: input.sessionId,
         summary: rolling.narrative || rolling.nextAction || "Portable checkpoint created.",
         tokensBefore: estimateTokens(pendingEntries),
-        tokensAfter: estimateCheckpointTokens(rolling) + estimateTokens(selection.retained),
+        tokensAfter: rollingCheckpointMetrics.tokenEstimate + estimateTokens(selection.retained),
         validationStatus,
         segmentCheckpointId: persisted.segmentCheckpointId,
         rollingCheckpointId: persisted.rollingCheckpointId,
@@ -300,22 +385,19 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
         ...(providerAttempts.length > 0 ? { providerAttempts } : {}),
       };
     } catch (error) {
+      const failure = compactionFailureState(error);
       await this.repository.release(
         input,
         leaseOwner,
-        error instanceof Error ? error.message.slice(0, 4_000) : String(error).slice(0, 4_000),
+        JSON.stringify(failure),
       );
       if (error instanceof CompactionTerminalError || error instanceof CompactionRetryableError) throw error;
-      if (classifyProviderFailure(error).retryable) {
-        throw new CompactionRetryableError(
-          error instanceof Error ? error.message : String(error),
-          error,
-        );
+      const providerFailure = classifyProviderFailure(error);
+      const category = providerCompactionFailureCategory(providerFailure.category);
+      if (providerFailure.retryable) {
+        throw new CompactionRetryableError(category, providerFailure.status ?? null);
       }
-      throw new CompactionTerminalError(
-        error instanceof Error ? error.message : String(error),
-        error,
-      );
+      throw new CompactionTerminalError(category, providerFailure.status ?? null);
     }
   }
 
@@ -344,7 +426,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
     timer.unref?.();
     try {
       const result = await operation();
-      if (leaseLost) throw new CompactionRetryableError("Compaction lease was lost during checkpoint generation");
+      if (leaseLost) throw new CompactionRetryableError("lease_lost");
       return result;
     } finally {
       stopped = true;
@@ -372,7 +454,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
-        reject(new CompactionRetryableError("Compaction exceeded its wall-clock deadline"));
+        reject(new CompactionRetryableError("deadline_exceeded"));
       }, boundedDurationMs);
       timer.unref?.();
     });
@@ -431,7 +513,7 @@ RETURNING lease_owner
 
   async load(
     input: CompactionJobPayload,
-    selection: { provider: string; model: string },
+    selection: { provider: string; model: string; algorithmVersion: string },
   ): Promise<CompactionSessionState> {
     const sessionRows = await this.executor.query<SessionRow>(
       `
@@ -455,7 +537,7 @@ WHERE s.tenant_id = $1::uuid AND s.id = $2::uuid AND s.task_id = $3::uuid
       [input.tenantId, input.sessionId, input.taskId, selection.provider, selection.model],
     );
     const session = sessionRows[0];
-    if (!session) throw new CompactionTerminalError("Session does not exist or does not belong to the requested task");
+    if (!session) throw new CompactionTerminalError("session_not_found");
     const entries = await this.executor.query<EntryRow>(
       `
 WITH RECURSIVE leaf AS (
@@ -492,10 +574,11 @@ WITH RECURSIVE leaf AS (
 SELECT id, kind, source_leaf_id, covered_entry_start, covered_entry_end, checkpoint, created_at
 FROM session_checkpoints
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND schema_version = 2
+  AND algorithm_version = $3
   AND (source_leaf_id IS NULL OR source_leaf_id IN (SELECT entry_id FROM active_entries))
 ORDER BY created_at ASC, id ASC
       `.trim(),
-      [input.tenantId, input.sessionId],
+      [input.tenantId, input.sessionId, selection.algorithmVersion],
     );
     const segments = checkpoints
       .filter((row) => row.kind === "segment")
@@ -520,6 +603,7 @@ ORDER BY created_at ASC, id ASC
       modelProviderId: session.model_provider_id,
       model: session.model,
       modelAllowed: session.model_allowed,
+      algorithmVersion: selection.algorithmVersion,
       entries: entries.map(mapEntry),
       previousRolling,
       priorSegments: segments,
@@ -538,8 +622,8 @@ ORDER BY created_at ASC, id ASC
     model: string;
     rebased: boolean;
     algorithmVersion: string;
-    tokensBefore: number;
-    tokensAfter: number;
+    segmentMetrics: CheckpointPersistenceMetrics;
+    rollingMetrics: CheckpointPersistenceMetrics;
     physicalAttempts: number;
     fallbackReason: string | null;
     usage: CompactionUsage | null;
@@ -554,8 +638,8 @@ FOR UPDATE
         `.trim(),
         [input.state.tenantId, input.state.sessionId, input.leaseOwner],
       );
-      if (!lease[0]) throw new CompactionRetryableError("Compaction lease expired before checkpoint persistence");
-      const usageEventId = input.usage
+      if (!lease[0]) throw new CompactionRetryableError("lease_lost");
+      const usageEventId = input.usage && !input.state.runId
         ? await insertCompactionUsage(executor, {
             state: input.state,
             segment: input.segment,
@@ -563,6 +647,8 @@ FOR UPDATE
             physicalAttempts: input.physicalAttempts,
             fallbackReason: input.fallbackReason,
             usage: input.usage,
+            segmentMetrics: input.segmentMetrics,
+            rollingMetrics: input.rollingMetrics,
           })
         : null;
       const segmentRows = await executor.query<{ id: string }>(
@@ -615,6 +701,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     private readonly client: OpenAIChatCompletionsClient,
     readonly provider: string,
     readonly model: string,
+    readonly pricingByModel: CompactionPricingCatalog = {},
   ) {}
 
   async generate(input: {
@@ -628,6 +715,9 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     onProviderAttempt?: (report: ProviderAttemptReport) => void;
     signal?: AbortSignal;
   }): Promise<GeneratedCheckpoint> {
+    if (!hasCompleteCompactionPricing(this.pricingByModel[this.model])) {
+      throw new CompactionTerminalError("pricing_unavailable");
+    }
     const messages = checkpointMessages(input);
     const maxPhysicalAttempts = Math.min(
       MAX_COMPACTION_PHYSICAL_ATTEMPTS,
@@ -638,7 +728,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     let validation = parsed.checkpoint
       ? validateSessionCheckpoint(parsed.checkpoint, input.deterministic, {
           tokensBefore: input.tokensBefore,
-          tokensAfter: estimateCheckpointTokens(parsed.checkpoint),
+          tokensAfter: sessionCheckpointMetrics(parsed.checkpoint).tokenEstimate,
         })
       : { checkpoint: null, issues: parsed.issues };
     if (validation.checkpoint) {
@@ -646,7 +736,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
         checkpoint: validation.checkpoint,
         validationStatus: "valid",
         attempts: 1,
-        usage: compactUsage(this.provider, this.model, [first]),
+        usage: compactUsage(this.provider, this.model, [first], this.pricingByModel),
       };
     }
     if (maxPhysicalAttempts < 2) {
@@ -654,8 +744,8 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
         checkpoint: null,
         validationStatus: "fallback",
         attempts: 1,
-        fallbackReason: `checkpoint_validation_failed:${validation.issues.join("; ").slice(0, 1_800)}`,
-        usage: compactUsage(this.provider, this.model, [first]),
+        fallbackReason: "checkpoint_validation_failed",
+        usage: compactUsage(this.provider, this.model, [first], this.pricingByModel),
       };
     }
     const repaired = await this.complete([
@@ -673,17 +763,17 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     validation = parsed.checkpoint
       ? validateSessionCheckpoint(parsed.checkpoint, input.deterministic, {
           tokensBefore: input.tokensBefore,
-          tokensAfter: estimateCheckpointTokens(parsed.checkpoint),
+          tokensAfter: sessionCheckpointMetrics(parsed.checkpoint).tokenEstimate,
         })
       : { checkpoint: null, issues: parsed.issues };
-    const usage = compactUsage(this.provider, this.model, [first, repaired]);
+    const usage = compactUsage(this.provider, this.model, [first, repaired], this.pricingByModel);
     return validation.checkpoint
       ? { checkpoint: validation.checkpoint, validationStatus: "repaired", attempts: 2, usage }
       : {
           checkpoint: null,
           validationStatus: "fallback",
           attempts: 2,
-          fallbackReason: `checkpoint_validation_failed:${validation.issues.join("; ").slice(0, 1_800)}`,
+          fallbackReason: "checkpoint_validation_failed",
           usage,
         };
   }
@@ -694,7 +784,7 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
     signal: AbortSignal | undefined,
     physicalAttempt: number,
     onProviderAttempt: ((report: ProviderAttemptReport) => void) | undefined,
-  ): Promise<{ text: string; usage?: ChatCompletionUsage; model: string }> {
+  ): Promise<{ text: string; usage: ChatCompletionUsage; usageEstimated: boolean; model: string }> {
     const result = await this.client.complete({
       model: this.model,
       messages,
@@ -714,9 +804,17 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       toolChoice: { type: "function", function: { name: "checkpoint_v2" } },
     });
     const call = result.toolCalls?.find((candidate) => candidate.function.name === "checkpoint_v2");
+    const text = call?.function.arguments ?? result.content;
+    const estimatedInputTokens = Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(messages), "utf8") / 4));
+    const estimatedOutputTokens = Math.max(1, Math.ceil(Buffer.byteLength(text, "utf8") / 4));
     return {
-      text: call?.function.arguments ?? result.content,
-      ...(result.usage ? { usage: result.usage } : {}),
+      text,
+      usage: result.usage ?? {
+        inputTokens: estimatedInputTokens,
+        outputTokens: estimatedOutputTokens,
+        totalTokens: estimatedInputTokens + estimatedOutputTokens,
+      },
+      usageEstimated: !result.usage,
       model: result.model,
     };
   }
@@ -725,22 +823,56 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
 function compactUsage(
   provider: string,
   model: string,
-  calls: ReadonlyArray<{ usage?: ChatCompletionUsage; model: string }>,
+  calls: ReadonlyArray<{ usage?: ChatCompletionUsage; usageEstimated?: boolean; model: string }>,
+  pricingByModel: CompactionPricingCatalog,
 ): CompactionUsage | undefined {
-  const measured = calls.filter((call) => call.usage);
-  if (measured.length === 0) return undefined;
+  if (calls.length === 0 || calls.some((call) => !call.usage)) return undefined;
+  const measured = calls as ReadonlyArray<{ usage: ChatCompletionUsage; usageEstimated?: boolean; model: string }>;
+  const priced = compactionUsageCostMicros(measured, pricingByModel, model);
+  if (!priced) return undefined;
   return {
     provider,
     model: calls.at(-1)?.model || model,
-    inputTokens: measured.reduce((sum, call) => sum + (call.usage?.inputTokens ?? 0), 0),
-    outputTokens: measured.reduce((sum, call) => sum + (call.usage?.outputTokens ?? 0), 0),
-    cacheReadTokens: measured.reduce((sum, call) => sum + (call.usage?.cacheReadTokens ?? 0), 0),
-    cacheWriteTokens: measured.reduce((sum, call) => sum + (call.usage?.cacheWriteTokens ?? 0), 0),
-    // The compaction lane does not receive a pricing table from the job. Keep
-    // the receipt explicit and conservative instead of silently billing zero
-    // as a measured price.
-    costRawMicros: "0",
-    pricingSource: "estimated",
+    inputTokens: measured.reduce((sum, call) => sum + call.usage.inputTokens, 0),
+    outputTokens: measured.reduce((sum, call) => sum + call.usage.outputTokens, 0),
+    cacheReadTokens: measured.reduce((sum, call) => sum + (call.usage.cacheReadTokens ?? 0), 0),
+    cacheWriteTokens: measured.reduce((sum, call) => sum + (call.usage.cacheWriteTokens ?? 0), 0),
+    costRawMicros: priced.costRawMicros.toString(),
+    pricingSource: measured.some((call) => call.usageEstimated) || priced.usedConfiguredModelFallback
+      ? "estimated"
+      : "measured",
+  };
+}
+
+function compactionUsageCostMicros(
+  calls: ReadonlyArray<{ usage: ChatCompletionUsage; model: string }>,
+  pricingByModel: CompactionPricingCatalog,
+  configuredModel: string,
+): { costRawMicros: bigint; usedConfiguredModelFallback: boolean } | null {
+  let rawMicros = 0;
+  let usedConfiguredModelFallback = false;
+  for (const call of calls) {
+    const directPricing = pricingByModel[call.model];
+    const pricing = directPricing ?? pricingByModel[configuredModel];
+    if (!pricing) return null;
+    usedConfiguredModelFallback ||= !directPricing;
+    const inputPrice = nonnegativePrice(pricing.input);
+    const outputPrice = nonnegativePrice(pricing.output);
+    const cacheReadPrice = nonnegativePrice(pricing.cacheRead) ?? inputPrice;
+    const cacheWritePrice = nonnegativePrice(pricing.cacheWrite) ?? 0;
+    const cacheReadTokens = Math.min(call.usage.inputTokens, call.usage.cacheReadTokens ?? 0);
+    const regularInputTokens = Math.max(0, call.usage.inputTokens - cacheReadTokens);
+    if (regularInputTokens > 0 && inputPrice === null) return null;
+    if (cacheReadTokens > 0 && cacheReadPrice === null) return null;
+    if (call.usage.outputTokens > 0 && outputPrice === null) return null;
+    rawMicros += regularInputTokens * (inputPrice ?? 0)
+      + cacheReadTokens * (cacheReadPrice ?? 0)
+      + (call.usage.cacheWriteTokens ?? 0) * cacheWritePrice
+      + call.usage.outputTokens * (outputPrice ?? 0);
+  }
+  return {
+    costRawMicros: BigInt(Math.max(0, Math.ceil(rawMicros))),
+    usedConfiguredModelFallback,
   };
 }
 
@@ -756,6 +888,8 @@ export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGen
   const provider = env.BERRY_COMPACTION_PROVIDER?.trim()
     || env.BERRY_ROUTER_PROVIDER_ID?.trim()
     || "router";
+  const pricingByModel = compactionModelPricingFromEnv(env);
+  if (!hasCompleteCompactionPricing(pricingByModel[model])) return null;
   return new RouterCheckpointGenerator(
     new OpenAIChatCompletionsClient({
       provider: {
@@ -769,21 +903,88 @@ export function createCheckpointGenerator(env: NodeJS.ProcessEnv): CheckpointGen
     }),
     provider,
     model,
+    pricingByModel,
   );
 }
 
+export function compactionModelPricingFromEnv(env: NodeJS.ProcessEnv): CompactionPricingCatalog {
+  const raw = env.BERRY_ROUTER_MODELS_JSON?.trim();
+  if (!raw) return {};
+  const models = RemoteModelSchema.array().parse(JSON.parse(raw));
+  return Object.fromEntries(models.flatMap((model) => {
+    const cost = resolveModelCapabilities(model).cost;
+    return cost && Object.values(cost).some((value) => value !== undefined)
+      ? [[model.id, cost] as const]
+      : [];
+  }));
+}
+
+function hasCompleteCompactionPricing(pricing: ModelCostHints | undefined): boolean {
+  return nonnegativePrice(pricing?.input) !== null
+    && nonnegativePrice(pricing?.output) !== null;
+}
+
 export class CompactionRetryableError extends Error {
-  constructor(message: string, options?: unknown) {
-    super(message, options === undefined ? undefined : { cause: options });
+  readonly failure: CompactionFailureState;
+
+  constructor(category: CompactionFailureCategory, status: number | null = null) {
+    const failure = createCompactionFailureState(category, status);
+    super(failure.publicMessage);
     this.name = "CompactionRetryableError";
+    this.failure = failure;
   }
 }
 
 export class CompactionTerminalError extends Error {
-  constructor(message: string, options?: unknown) {
-    super(message, options === undefined ? undefined : { cause: options });
+  readonly failure: CompactionFailureState;
+
+  constructor(category: CompactionFailureCategory, status: number | null = null) {
+    const failure = createCompactionFailureState(category, status);
+    super(failure.publicMessage);
     this.name = "CompactionTerminalError";
+    this.failure = failure;
   }
+}
+
+export function compactionFailureState(error: unknown): CompactionFailureState {
+  if (error instanceof CompactionRetryableError || error instanceof CompactionTerminalError) {
+    return error.failure;
+  }
+  const failure = classifyProviderFailure(error);
+  return createCompactionFailureState(
+    providerCompactionFailureCategory(failure.category),
+    failure.status ?? null,
+  );
+}
+
+function createCompactionFailureState(
+  category: CompactionFailureCategory,
+  status: number | null,
+): CompactionFailureState {
+  return {
+    category,
+    status: status !== null && Number.isInteger(status) && status >= 100 && status <= 599
+      ? status
+      : null,
+    publicMessage: COMPACTION_FAILURE_MESSAGES[category],
+  };
+}
+
+function providerCompactionFailureCategory(
+  category: Exclude<ProviderFailureCategory, "success">,
+): CompactionFailureCategory {
+  return `provider_${category}` as CompactionFailureCategory;
+}
+
+function safeFallbackReason(value: string | null | undefined): string | null {
+  if (!value) return null;
+  if (value === "generator_unavailable") return value;
+  if (value.startsWith("checkpoint_validation_failed")) return "checkpoint_validation_failed";
+  return "checkpoint_generation_failed";
+}
+
+function nonnegativePrice(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 export async function processCompactionJob(
@@ -1075,11 +1276,11 @@ function checkpointInsertSql(): string {
 INSERT INTO session_checkpoints (
   tenant_id, session_id, kind, source_leaf_id, covered_entry_start, covered_entry_end,
   schema_version, checkpoint, validation_status, algorithm_version, tokens_before, tokens_after,
-  covered_sequence, physical_attempts, fallback_reason, usage_event_id,
+  serialized_bytes, covered_sequence, physical_attempts, fallback_reason, usage_event_id,
   model_provider, model, prompt_manifest_hash
 ) VALUES (
   $1::uuid, $2::uuid, $3, $4, $5, $6, 2, $7::jsonb, $8, $9, $10, $11,
-  $12::bigint, $13, $14, $15::uuid, $16, $17, $18
+  $12, $13::bigint, $14, $15, $16::uuid, $17, $18, $19
 )
   ON CONFLICT (
   tenant_id, session_id, kind, source_leaf_id, covered_entry_end, schema_version, algorithm_version
@@ -1098,8 +1299,8 @@ function checkpointInsertParams(
     model: string;
     rebased: boolean;
     algorithmVersion: string;
-    tokensBefore: number;
-    tokensAfter: number;
+    segmentMetrics: CheckpointPersistenceMetrics;
+    rollingMetrics: CheckpointPersistenceMetrics;
     physicalAttempts: number;
     fallbackReason: string | null;
     usage: CompactionUsage | null;
@@ -1109,6 +1310,7 @@ function checkpointInsertParams(
   usageEventId: string | null,
 ): readonly unknown[] {
   const coveredSequence = input.state.entries.find((entry) => entry.entryId === checkpoint.coveredEntryEnd)?.sequence ?? null;
+  const metrics = kind === "segment" ? input.segmentMetrics : input.rollingMetrics;
   return [
     input.state.tenantId,
     input.state.sessionId,
@@ -1119,8 +1321,9 @@ function checkpointInsertParams(
     JSON.stringify(checkpoint),
     input.validationStatus,
     input.algorithmVersion,
-    input.tokensBefore,
-    input.tokensAfter,
+    metrics.tokensBefore,
+    metrics.tokensAfter,
+    metrics.serializedBytes,
     coveredSequence,
     input.physicalAttempts,
     input.fallbackReason,
@@ -1140,6 +1343,8 @@ async function insertCompactionUsage(
     physicalAttempts: number;
     fallbackReason: string | null;
     usage: CompactionUsage;
+    segmentMetrics: CheckpointPersistenceMetrics;
+    rollingMetrics: CheckpointPersistenceMetrics;
   },
 ): Promise<string> {
   const coveredEnd = input.segment.coveredEntryEnd ?? "unknown";
@@ -1150,6 +1355,10 @@ async function insertCompactionUsage(
     algorithmVersion: input.algorithmVersion,
     physicalAttempts: input.physicalAttempts,
     fallbackReason: input.fallbackReason,
+    checkpointMetrics: {
+      segment: input.segmentMetrics,
+      rolling: input.rollingMetrics,
+    },
   });
   const rows = await executor.query<{ id: string }>(
     `
@@ -1186,7 +1395,7 @@ RETURNING id
     "SELECT id FROM usage_events WHERE tenant_id=$1::uuid AND request_id=$2 LIMIT 1",
     [input.state.tenantId, requestId],
   );
-  if (!existing[0]?.id) throw new CompactionRetryableError("Compaction usage receipt was not durable");
+  if (!existing[0]?.id) throw new CompactionRetryableError("usage_persistence_failed");
   return existing[0].id;
 }
 
@@ -1194,8 +1403,18 @@ function estimateTokens(entries: readonly CompactionEntryRecord[]): number {
   return Math.ceil(entries.reduce((sum, entry) => sum + JSON.stringify(entry.payload).length, 0) / 4);
 }
 
-function estimateCheckpointTokens(checkpoint: SessionCheckpointV2): number {
-  return Math.ceil(JSON.stringify(checkpoint).length / 4);
+function estimateCheckpointCoverageTokens(
+  entries: readonly CompactionEntryRecord[],
+  checkpoint: SessionCheckpointV2,
+): number {
+  const first = checkpoint.coveredEntryStart
+    ? entries.findIndex((entry) => entry.entryId === checkpoint.coveredEntryStart)
+    : 0;
+  const last = checkpoint.coveredEntryEnd
+    ? entries.findIndex((entry) => entry.entryId === checkpoint.coveredEntryEnd)
+    : entries.length - 1;
+  if (first < 0 || last < first) return estimateTokens(entries);
+  return estimateTokens(entries.slice(first, last + 1));
 }
 
 function retryClass(value: unknown): SessionCheckpointV2["toolCalls"][number]["retryClass"] {

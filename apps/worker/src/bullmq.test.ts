@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { RouterClientError } from "@berry/router-client";
 import { BullMqBerryQueueClient, BullMqBerryQueueRouter, workerFailureForRetryPolicy } from "./bullmq.js";
+import { CompactionTerminalError } from "./compaction.js";
 import { LEGACY_WORKER_QUEUE_NAME, type BerryWorkerJobName, workerQueueKind } from "./jobs.js";
 
 describe("BullMqBerryQueueClient", () => {
@@ -112,6 +113,19 @@ describe("BullMqBerryQueueClient", () => {
     Object.assign(new Error("connection reset"), { code: "ECONNRESET" }),
   ])("preserves BullMQ retries for transient non-memory provider failures", (transient) => {
     expect(workerFailureForRetryPolicy("title.generate", transient)).toBe(transient);
+  });
+
+  it("maps terminal compaction failures before provider classification and exposes only safe state", () => {
+    const terminal = new CompactionTerminalError("provider_permanent_client", 409);
+    Object.defineProperty(terminal, "requestId", { value: "provider-secret-request" });
+
+    const failure = workerFailureForRetryPolicy("session.compact", terminal);
+
+    expect(failure).toMatchObject({ name: "UnrecoverableError" });
+    expect((failure as Error).message).toContain("category=provider_permanent_client");
+    expect((failure as Error).message).toContain("status=409");
+    expect((failure as Error).message).toContain("The compaction provider rejected the request.");
+    expect((failure as Error).message).not.toContain("provider-secret-request");
   });
 
   it("preserves retries for generic non-provider worker failures", () => {

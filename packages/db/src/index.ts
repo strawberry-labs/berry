@@ -812,6 +812,7 @@ export const sessionCheckpoints = pgTable("session_checkpoints", {
   algorithmVersion: text("algorithm_version").notNull().default("checkpoint-v2"),
   tokensBefore: integer("tokens_before").notNull().default(0),
   tokensAfter: integer("tokens_after").notNull().default(0),
+  serializedBytes: integer("serialized_bytes").notNull().default(0),
   coveredSequence: bigint("covered_sequence", { mode: "number" }),
   physicalAttempts: integer("physical_attempts").notNull().default(0),
   fallbackReason: text("fallback_reason"),
@@ -5421,6 +5422,11 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_operational_events_retention_idx
   ON agent_operational_events (tenant_id, created_at)
 `.trim();
 
+export const SESSION_CHECKPOINT_SERIALIZED_BYTES_MIGRATION = `
+ALTER TABLE session_checkpoints
+  ADD COLUMN IF NOT EXISTS serialized_bytes integer NOT NULL DEFAULT 0
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5576,5 +5582,11 @@ export const cloudMigrations = [
     transactional: false,
     onlineIndexName: "agent_operational_events_retention_idx",
     onlineSql: [AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION],
+  },
+  {
+    id: 67,
+    name: "session_checkpoint_serialized_bytes_v1",
+    sql: SESSION_CHECKPOINT_SERIALIZED_BYTES_MIGRATION,
+    transactional: false,
   },
 ] as const;

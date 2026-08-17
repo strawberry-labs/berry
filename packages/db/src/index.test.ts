@@ -74,6 +74,7 @@ import {
   SELF_HOSTED_EMBEDDING_PROFILE_MIGRATION,
   KNOWLEDGE_VECTOR_HNSW_MIGRATION,
   SESSION_COMPACTION_LEASES_MIGRATION,
+  SESSION_CHECKPOINT_SERIALIZED_BYTES_MIGRATION,
   SKILL_PACKAGE_FILES_MIGRATION,
   TURN_ADMISSION_INTENTS_MIGRATION,
   PERSONAL_CAPABILITIES_MIGRATION,
@@ -188,7 +189,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
   });
 
   it("replaces legacy checkpoint uniqueness with the algorithm-version key", () => {
@@ -218,6 +219,16 @@ describe("cloud postgres schema", () => {
     expect(cloudMigrations.find((migration) => migration.id === 66)).toMatchObject({
       transactional: false,
       onlineIndexName: "agent_operational_events_retention_idx",
+    });
+  });
+
+  it("adds exact serialized-byte accounting for session checkpoints", () => {
+    expect(SESSION_CHECKPOINT_SERIALIZED_BYTES_MIGRATION).toContain(
+      "ADD COLUMN IF NOT EXISTS serialized_bytes integer NOT NULL DEFAULT 0",
+    );
+    expect(cloudMigrations.find((migration) => migration.id === 67)).toMatchObject({
+      name: "session_checkpoint_serialized_bytes_v1",
+      transactional: false,
     });
   });
 

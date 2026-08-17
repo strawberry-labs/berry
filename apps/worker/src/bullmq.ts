@@ -12,6 +12,7 @@ import {
 import { normalizeWorkerRole, sourceRevisionFromEnv } from "@berry/shared";
 import type { BerryWorkerDependencies } from "./processor.js";
 import { processBerryWorkerJob } from "./processor.js";
+import { CompactionTerminalError } from "./compaction.js";
 import { classifyProviderFailure } from "./provider-retry.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 
@@ -206,6 +207,14 @@ export function createBerryWorker(
 }
 
 export function workerFailureForRetryPolicy(jobName: string, error: unknown): unknown {
+  if (error instanceof CompactionTerminalError) {
+    return new UnrecoverableError([
+      `Non-retryable ${jobName} compaction failure`,
+      `category=${error.failure.category}`,
+      error.failure.status === null ? null : `status=${error.failure.status}`,
+      error.failure.publicMessage,
+    ].filter(Boolean).join(" "));
+  }
   const failure = classifyProviderFailure(error);
   if (failure.retryable) return error;
   emitWorkerOperationalEvent(

@@ -3,6 +3,8 @@ import {
   mergeSessionCheckpoints,
   parseSessionCheckpoint,
   rebaseSessionCheckpoint,
+  SESSION_CHECKPOINT_MAX_BYTES,
+  sessionCheckpointMetrics,
   validateSessionCheckpoint,
   type CheckpointDeterministicFields,
   type SessionCheckpointV2,
@@ -129,6 +131,47 @@ describe("portable session checkpoints", () => {
     expect(rebased.currentWork).toEqual(["three"]);
     expect(rebased.coveredEntryStart).toBe("entry-1");
     expect(rebased.coveredEntryEnd).toBe("entry-4");
+  });
+
+  it("bounds merged rolling history by exact serialized bytes while preserving the latest segment", () => {
+    const previousWork = Array.from({ length: 70 }, (_, index) => `previous-${index}-${"p".repeat(760)}`);
+    const latestWork = Array.from({ length: 20 }, (_, index) => `latest-${index}-${"l".repeat(760)}`);
+    const previous = checkpoint({ completedWork: previousWork });
+    const segment = checkpoint({
+      completedWork: latestWork,
+      coveredEntryStart: "entry-3",
+      coveredEntryEnd: "entry-4",
+      currentLeafId: "entry-4",
+    });
+
+    expect(sessionCheckpointMetrics(previous).serializedBytes).toBeLessThan(SESSION_CHECKPOINT_MAX_BYTES);
+    expect(sessionCheckpointMetrics(segment).serializedBytes).toBeLessThan(SESSION_CHECKPOINT_MAX_BYTES);
+
+    const merged = mergeSessionCheckpoints(previous, segment, deterministic({
+      coveredEntryStart: "entry-1",
+      coveredEntryEnd: "entry-4",
+      currentLeafId: "entry-4",
+    }));
+    const metrics = sessionCheckpointMetrics(merged);
+
+    expect(metrics.serializedBytes).toBeLessThanOrEqual(SESSION_CHECKPOINT_MAX_BYTES);
+    expect(latestWork.every((item) => merged.completedWork.includes(item))).toBe(true);
+    expect(merged.completedWork.length).toBeLessThan(previousWork.length + latestWork.length);
+    expect(validateSessionCheckpoint(merged, deterministic({
+      coveredEntryStart: "entry-1",
+      coveredEntryEnd: "entry-4",
+      currentLeafId: "entry-4",
+    })).issues).toEqual([]);
+  });
+
+  it("derives token estimates from the exact UTF-8 checkpoint serialization", () => {
+    const value = checkpoint({ narrative: "Checkpoint 😀" });
+    const serializedBytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+    expect(sessionCheckpointMetrics(value)).toEqual({
+      serializedBytes,
+      tokenEstimate: Math.ceil(serializedBytes / 4),
+    });
   });
 
   it("rejects unbounded output, missing tool-call coverage, and pathological reductions", () => {
