@@ -821,7 +821,6 @@ export const sessionCheckpoints = pgTable("session_checkpoints", {
   promptManifestHash: text("prompt_manifest_hash"),
   createdAt,
 }, (table) => [
-  uniqueIndex("session_checkpoints_idempotency_unique").on(table.tenantId, table.sessionId, table.kind, table.sourceLeafId, table.coveredEntryEnd, table.schemaVersion),
   uniqueIndex("session_checkpoints_algorithm_unique").on(table.tenantId, table.sessionId, table.kind, table.sourceLeafId, table.coveredEntryEnd, table.schemaVersion, table.algorithmVersion),
   index("session_checkpoints_latest_idx").on(table.tenantId, table.sessionId, table.createdAt),
 ]);
@@ -1028,6 +1027,7 @@ export const agentOperationalEvents = pgTable("agent_operational_events", {
   createdAt,
 }, (table) => [
   uniqueIndex("agent_operational_events_dedupe_unique").on(table.tenantId, table.dedupeKey),
+  index("agent_operational_events_retention_idx").on(table.tenantId, table.createdAt),
   index("agent_operational_events_run_created_idx").on(table.tenantId, table.runId, table.createdAt),
   index("agent_operational_events_type_created_idx").on(table.tenantId, table.eventType, table.createdAt),
 ]);
@@ -5373,6 +5373,54 @@ CREATE INDEX IF NOT EXISTS agent_operational_events_type_created_idx
 ${tenantRlsSql("agent_operational_events")}
 `.trim();
 
+export const AGENT_HARNESS_COMPACTION_ALGORITHM_KEY_MIGRATION = `
+DO $migration$
+DECLARE
+  legacy_constraint_name text;
+BEGIN
+  SELECT constraint_row.conname
+  INTO legacy_constraint_name
+  FROM pg_constraint constraint_row
+  WHERE constraint_row.conrelid = 'session_checkpoints'::regclass
+    AND constraint_row.contype = 'u'
+    AND (
+      SELECT array_agg(attribute_row.attname::text ORDER BY constraint_column.ordinality)
+      FROM unnest(constraint_row.conkey) WITH ORDINALITY
+        AS constraint_column(attnum, ordinality)
+      JOIN pg_attribute attribute_row
+        ON attribute_row.attrelid = constraint_row.conrelid
+       AND attribute_row.attnum = constraint_column.attnum
+    ) = ARRAY[
+      'tenant_id',
+      'session_id',
+      'kind',
+      'source_leaf_id',
+      'covered_entry_end',
+      'schema_version'
+    ]
+  LIMIT 1;
+
+  IF legacy_constraint_name IS NOT NULL THEN
+    EXECUTE format(
+      'ALTER TABLE session_checkpoints DROP CONSTRAINT %I',
+      legacy_constraint_name
+    );
+  END IF;
+END
+$migration$;
+
+DROP INDEX IF EXISTS session_checkpoints_idempotency_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS session_checkpoints_algorithm_unique
+  ON session_checkpoints (
+    tenant_id,session_id,kind,source_leaf_id,covered_entry_end,schema_version,algorithm_version
+  );
+`.trim();
+
+export const AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION = `
+CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_operational_events_retention_idx
+  ON agent_operational_events (tenant_id, created_at)
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5513,11 +5561,20 @@ export const cloudMigrations = [
     onlineSql: ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS,
   },
   { id: 57, name: "queued_follow_ups_server_owned_v1", sql: QUEUED_FOLLOW_UPS_MIGRATION },
-  { id: 58, name: "agent_harness_convergence_v1", sql: AGENT_HARNESS_CONVERGENCE_MIGRATION },
-  { id: 59, name: "agent_harness_bounds_v1", sql: AGENT_HARNESS_BOUNDS_MIGRATION },
-  { id: 60, name: "agent_harness_wait_finalization_v1", sql: AGENT_HARNESS_WAIT_FINALIZATION_MIGRATION },
-  { id: 61, name: "agent_harness_provider_recovery_v1", sql: AGENT_HARNESS_PROVIDER_RECOVERY_MIGRATION },
-  { id: 62, name: "agent_harness_compaction_v1", sql: AGENT_HARNESS_COMPACTION_MIGRATION },
-  { id: 63, name: "agent_harness_outbox_file_lifecycle_v1", sql: AGENT_HARNESS_OUTBOX_FILE_LIFECYCLE_MIGRATION },
-  { id: 64, name: "agent_harness_operational_telemetry_v1", sql: AGENT_HARNESS_OPERATIONAL_TELEMETRY_MIGRATION },
+  { id: 58, name: "agent_harness_convergence_v1", sql: AGENT_HARNESS_CONVERGENCE_MIGRATION, transactional: false },
+  { id: 59, name: "agent_harness_bounds_v1", sql: AGENT_HARNESS_BOUNDS_MIGRATION, transactional: false },
+  { id: 60, name: "agent_harness_wait_finalization_v1", sql: AGENT_HARNESS_WAIT_FINALIZATION_MIGRATION, transactional: false },
+  { id: 61, name: "agent_harness_provider_recovery_v1", sql: AGENT_HARNESS_PROVIDER_RECOVERY_MIGRATION, transactional: false },
+  { id: 62, name: "agent_harness_compaction_v1", sql: AGENT_HARNESS_COMPACTION_MIGRATION, transactional: false },
+  { id: 63, name: "agent_harness_outbox_file_lifecycle_v1", sql: AGENT_HARNESS_OUTBOX_FILE_LIFECYCLE_MIGRATION, transactional: false },
+  { id: 64, name: "agent_harness_operational_telemetry_v1", sql: AGENT_HARNESS_OPERATIONAL_TELEMETRY_MIGRATION, transactional: false },
+  { id: 65, name: "agent_harness_compaction_algorithm_key_v1", sql: AGENT_HARNESS_COMPACTION_ALGORITHM_KEY_MIGRATION, transactional: false },
+  {
+    id: 66,
+    name: "agent_operational_events_retention_index_v1",
+    sql: AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION,
+    transactional: false,
+    onlineIndexName: "agent_operational_events_retention_idx",
+    onlineSql: [AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION],
+  },
 ] as const;

@@ -1,5 +1,5 @@
 import { Test } from "@nestjs/testing";
-import { CLOUD_INITIAL_MIGRATION, SELF_HOST_TENANT_ID } from "@berry/db";
+import { CLOUD_INITIAL_MIGRATION, cloudMigrations, SELF_HOST_TENANT_ID } from "@berry/db";
 import { describe, expect, it } from "vitest";
 import { CloudDatabaseModule } from "./cloud-database.module.js";
 import { CloudDatabaseService, type SqlExecutor } from "./cloud-database.service.js";
@@ -67,7 +67,9 @@ describe("CloudDatabaseService", () => {
       ]),
     );
     expect(executor.transactionCount).toBe(2);
-    expect(executor.sessionCount).toBe(1);
+    expect(executor.sessionCount).toBe(
+      cloudMigrations.filter((migration) => "transactional" in migration && migration.transactional === false).length,
+    );
     expect(executor.calls.map((call) => call.sql)).toContain("SELECT pg_advisory_lock(hashtextextended('berry-cloud-migrations', 0))");
     expect(executor.calls.map((call) => call.sql)).toContain("SELECT pg_advisory_unlock(hashtextextended('berry-cloud-migrations', 0))");
   });

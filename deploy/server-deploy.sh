@@ -4,6 +4,7 @@ set -eu
 repo_dir="${BERRY_DEPLOY_REPO_DIR:-/opt/berry}"
 env_file="$repo_dir/deploy/.env.production"
 requested_ref="${1:-origin/main}"
+expected_domain="${BERRY_DEPLOY_EXPECTED_DOMAIN:-}"
 lock_dir="/tmp/berry-production-deploy.lock"
 
 if ! mkdir "$lock_dir" 2>/dev/null; then
@@ -18,6 +19,16 @@ if [ ! -d "$repo_dir/.git" ]; then
 fi
 if [ ! -f "$env_file" ]; then
   echo "Missing production environment file: $env_file" >&2
+  exit 1
+fi
+
+domain="$(sed -n 's/^BERRY_DOMAIN=//p' "$env_file" | tail -n 1)"
+if [ -z "$domain" ]; then
+  echo "BERRY_DOMAIN is missing from $env_file." >&2
+  exit 1
+fi
+if [ -n "$expected_domain" ] && [ "$domain" != "$expected_domain" ]; then
+  echo "Refusing deployment because the host domain does not match BERRY_DEPLOY_EXPECTED_DOMAIN." >&2
   exit 1
 fi
 
@@ -55,6 +66,10 @@ else
   target_ref="$requested_ref"
   git cat-file -e "$target_ref^{commit}"
 fi
+if ! git merge-base --is-ancestor "$target_ref" origin/main; then
+  echo "Refusing to deploy a commit that is not reachable from origin/main." >&2
+  exit 1
+fi
 
 deployed_ref="$(sed -n '1p' .deployment-commit 2>/dev/null || true)"
 case "$deployed_ref" in
@@ -73,6 +88,7 @@ fi
 
 changed_files="$(git diff --name-only "$deployed_ref" "$target_ref")"
 git reset --hard "$target_ref"
+export BERRY_BUILD_REVISION="$target_ref"
 
 storage_mode="$(sed -n 's/^BERRY_OBJECT_STORAGE_MODE=//p' "$env_file" | tail -n 1)"
 background_worker_replicas="$(sed -n 's/^BERRY_BACKGROUND_WORKER_REPLICAS=//p' "$env_file" | tail -n 1)"
@@ -180,11 +196,6 @@ if [ "$worker_scale_reconciled" = false ]; then
     $worker_scale_args worker worker-foreground
 fi
 
-domain="$(sed -n 's/^BERRY_DOMAIN=//p' "$env_file" | tail -n 1)"
-if [ -z "$domain" ]; then
-  echo "BERRY_DOMAIN is missing from $env_file." >&2
-  exit 1
-fi
 attempt=1
 while [ "$attempt" -le 18 ]; do
   if curl -fsS "https://$domain/healthz" >/dev/null 2>&1 \

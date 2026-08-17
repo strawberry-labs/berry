@@ -77,7 +77,7 @@ describe("memory operation generator model selection", () => {
 
   it("records one observable 400 failure for the implicit extractor", async () => {
     const metrics = new WorkerRuntimeMetrics();
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const operationalEvent = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const failure = new RouterClientError("tool_choice is unsupported", 400, "sensitive body", {
       code: "unsupported_tool_choice",
       requestId: "memory-request-400",
@@ -96,16 +96,19 @@ describe("memory operation generator model selection", () => {
     expect(metrics.render()).toContain(
       'berry_worker_provider_requests_total{model="memory-model",outcome="failure",status="400"} 1',
     );
-    expect(warning).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(String(warning.mock.calls[0]?.[0]))).toMatchObject({
-      event: "berry.memory.provider_failure",
-      jobName: "memory.extract",
+    expect(operationalEvent).toHaveBeenCalledTimes(1);
+    const event = JSON.parse(String(operationalEvent.mock.calls[0]?.[0])) as Record<string, unknown>;
+    expect(event).toMatchObject({
+      event: "berry.provider.attempt",
+      phase: "memory_extract",
       model: "memory-model",
-      status: 400,
-      code: "UNSUPPORTED_TOOL_CHOICE",
-      requestId: "memory-request-400",
-      latencyMs: 250,
+      outcome: "failed",
+      statusClass: "400",
+      category: "permanent_client",
+      durationMs: 250,
+      retryDecision: "not_retryable",
     });
+    expect(event).not.toHaveProperty("requestId");
   });
 });
 

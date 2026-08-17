@@ -221,6 +221,7 @@ services:
         condition: service_started
     environment:
       NODE_ENV: production
+      BERRY_BUILD_REVISION: ${BERRY_BUILD_REVISION:-unknown}
       PORT: 3000
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-self-hosted}
       BERRY_DATABASE_URL: postgres://berry_api:${BERRY_API_DATABASE_PASSWORD:-berry-api-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
@@ -390,6 +391,7 @@ services:
         condition: service_started
     environment:
       NODE_ENV: production
+      BERRY_BUILD_REVISION: ${BERRY_BUILD_REVISION:-unknown}
       BERRY_DATABASE_URL: postgres://berry_worker:${BERRY_WORKER_DATABASE_PASSWORD:-berry-worker-dev-password}@postgres:5432/${POSTGRES_DB:-berry}
       BERRY_REDIS_URL: redis://redis:6379
       BERRY_WORKER_ROLE: background
@@ -397,6 +399,8 @@ services:
       BERRY_LOG_MAX_BYTES: ${BERRY_LOG_MAX_BYTES:-10485760}
       BERRY_LOG_MAX_FILES: ${BERRY_LOG_MAX_FILES:-5}
       BERRY_OUTBOX_DISPATCH_ENABLED: ${BERRY_OUTBOX_DISPATCH_ENABLED:-true}
+      BERRY_WAIT_EXPIRY_ENABLED: ${BERRY_WAIT_EXPIRY_ENABLED:-false}
+      BERRY_TERMINAL_FINALIZATION_ENABLED: ${BERRY_TERMINAL_FINALIZATION_ENABLED:-false}
       BERRY_WORKER_CONCURRENCY: ${BERRY_WORKER_CONCURRENCY:-4}
       BERRY_BACKGROUND_WORKER_CONCURRENCY: ${BERRY_BACKGROUND_WORKER_CONCURRENCY:-4}
       BERRY_LEGACY_WORKER_CONCURRENCY: ${BERRY_LEGACY_WORKER_CONCURRENCY:-1}

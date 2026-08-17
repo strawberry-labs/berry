@@ -22,13 +22,17 @@ describe("workflow routing", () => {
     ]);
   });
 
-  it("keeps control tools while narrowing ordinary tools to the task", () => {
+  it("keeps admitted capabilities for ambiguous and multi-intent workflows", () => {
     expect(routedBuiltInToolNames("communications", [
       "bash",
       "read",
+      "write",
       "compose_message",
       "ask_user_question",
       "persist_artifact",
-    ])).toEqual(["read", "compose_message", "ask_user_question", "persist_artifact"]);
+      "write",
+    ])).toEqual(["bash", "read", "write", "compose_message", "ask_user_question", "persist_artifact"]);
+    expect(classifyWorkflowCategory({ input: "Draft a presentation for the board" }).category).toBe("documents");
+    expect(routedBuiltInToolNames("documents", ["read", "write", "edit"])).toEqual(["read", "write", "edit"]);
   });
 });

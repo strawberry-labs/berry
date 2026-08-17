@@ -147,6 +147,39 @@ describe("SqlMaintenanceRunner", () => {
     expect(cleanup?.sql).toContain("last_used_at");
   });
 
+  it("expires operational telemetry in bounded tenant-scoped batches", async () => {
+    const tenantId = "00000000-0000-7000-8000-000000000001";
+    const eventId = "00000000-0000-7000-8000-000000000010";
+    const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string, params = []) => {
+        queries.push({ sql, params });
+        if (sql.includes("FROM maintenance_runs")) {
+          return [{ status: "running", cursor: { phase: "agent_operational_events" } }] as T[];
+        }
+        if (sql.includes("DELETE FROM agent_operational_events")) return [{ id: eventId }] as T[];
+        return [] as T[];
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+
+    await expect(new SqlMaintenanceRunner(executor).cleanup({
+      tenantId,
+      runId: "00000000-0000-7000-8000-000000000002",
+      batchSize: 25,
+      generation: 0,
+      eventRetentionDays: 30,
+      diagnosticRetentionDays: 45,
+      outboxRetentionDays: 7,
+    })).resolves.toMatchObject({ status: "running", phase: "retrieval_snapshots", changed: 1 });
+
+    const cleanup = queries.find((query) => query.sql.includes("DELETE FROM agent_operational_events"));
+    expect(cleanup?.sql).toContain("tenant_id = $1::uuid");
+    expect(cleanup?.sql).toContain("LIMIT $3");
+    expect(cleanup?.params).toEqual([tenantId, 45, 25]);
+  });
+
   it("schedules blob deletion for a logical file that was already tombstoned", async () => {
     const tenantId = "00000000-0000-7000-8000-000000000001";
     const fileId = "00000000-0000-7000-8000-000000000010";

@@ -53,13 +53,13 @@ export function classifyWorkflowCategory(input: WorkflowClassificationInput): Wo
   if (/\b(code|coding|repository|repo|pull request|bug|typescript|javascript|python|sql|debug|compile|test suite)\b/.test(text)) {
     return classification("code");
   }
-  if (/\b(email|e-mail|slack|linkedin|sms|text message|message|communicat|reply|draft)\b/.test(text)) {
-    return classification("communications");
-  }
   if (/\b(calendar|schedule|meeting|appointment|invite|reminder)\b/.test(text)) return classification("calendar");
   if (/\b(image|illustration|photo|picture|visual|draw|logo|icon|render)\b/.test(text)) return classification("image");
   if (/\b(pdf|docx?|word|pptx?|powerpoint|spreadsheet|excel|csv|report|document|presentation)\b/.test(text)) {
     return classification("documents");
+  }
+  if (/\b(email|e-mail|slack|linkedin|sms|text message|message|communicat|reply|draft)\b/.test(text)) {
+    return classification("communications");
   }
   if (/\b(file|folder|directory|data|dataset|table|json|yaml|upload|download|artifact)\b/.test(text)) {
     return classification("file_data");
@@ -72,29 +72,17 @@ export function classifyWorkflowCategory(input: WorkflowClassificationInput): Wo
 }
 
 /**
- * Keep high-risk and user-control tools available, while limiting ordinary
- * built-ins to the admitted workflow. An unknown category deliberately keeps
- * the legacy requested set so older/resumed records remain compatible.
+ * Workflow classification is advisory: it may rank tools and select prompt
+ * guidance, but it must never remove a capability the caller already admitted.
+ * Natural-language requests are routinely multi-intent (for example, "draft a
+ * presentation"), so using one heuristic category as authorization can make
+ * otherwise valid work impossible.
  */
 export function routedBuiltInToolNames(
-  category: WorkflowCategory | null | undefined,
+  _category: WorkflowCategory | null | undefined,
   requested: readonly DurableBuiltInToolName[],
 ): DurableBuiltInToolName[] {
-  if (!category || category === "unknown") return unique(requested);
-  const safety = new Set(["ask_user_question", "compose_message", "persist_artifact", "save_personal_skill", "activate_skill"]);
-  const categoryTools: Record<Exclude<WorkflowCategory, "unknown">, readonly DurableBuiltInToolName[]> = {
-    general: ["read", "grep", "find", "ls"],
-    code: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    documents: ["read", "write", "edit", "grep", "find", "ls"],
-    communications: ["read", "grep", "find", "ls"],
-    file_data: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    image: ["read", "inspect_images", "create_image"],
-    calendar: ["read", "grep", "find", "ls"],
-    web_research: ["read", "grep", "find", "ls"],
-    memory: ["read", "grep", "find", "ls"],
-  };
-  const allowed = new Set([...safety, ...categoryTools[category]]);
-  return unique(requested.filter((name) => allowed.has(name)));
+  return unique(requested);
 }
 
 function classification(category: WorkflowCategory): WorkflowClassification {

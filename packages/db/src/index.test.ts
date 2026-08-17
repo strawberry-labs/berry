@@ -15,6 +15,8 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   APPEND_ONLY_SQL,
+  AGENT_HARNESS_COMPACTION_ALGORITHM_KEY_MIGRATION,
+  AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION,
   ALLOWANCE_BASE_HIERARCHY_MIGRATION,
   AUDIT_PLATFORM_MIGRATION,
   AUDIT_PLATFORM_TABLES,
@@ -186,7 +188,37 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
+  });
+
+  it("replaces legacy checkpoint uniqueness with the algorithm-version key", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 65)).toMatchObject({
+      name: "agent_harness_compaction_algorithm_key_v1",
+    });
+    expect(AGENT_HARNESS_COMPACTION_ALGORITHM_KEY_MIGRATION).toContain(
+      "ALTER TABLE session_checkpoints DROP CONSTRAINT",
+    );
+    expect(AGENT_HARNESS_COMPACTION_ALGORITHM_KEY_MIGRATION).toContain(
+      "tenant_id,session_id,kind,source_leaf_id,covered_entry_end,schema_version,algorithm_version",
+    );
+    expect(AGENT_HARNESS_COMPACTION_ALGORITHM_KEY_MIGRATION).toContain(
+      "DROP INDEX IF EXISTS session_checkpoints_idempotency_unique",
+    );
+  });
+
+  it("stages agent-harness migrations outside one release-wide transaction", () => {
+    expect(cloudMigrations
+      .filter((migration) => migration.id >= 58)
+      .every((migration) => "transactional" in migration && migration.transactional === false)).toBe(true);
+  });
+
+  it("adds an online retention index for operational telemetry cleanup", () => {
+    expect(AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION).toContain("CREATE INDEX CONCURRENTLY");
+    expect(AGENT_OPERATIONAL_EVENTS_RETENTION_INDEX_MIGRATION).toContain("tenant_id, created_at");
+    expect(cloudMigrations.find((migration) => migration.id === 66)).toMatchObject({
+      transactional: false,
+      onlineIndexName: "agent_operational_events_retention_idx",
+    });
   });
 
   it("tracks projection updates separately from message deletions", () => {
