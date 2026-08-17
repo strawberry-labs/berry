@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { RouterClientError } from "@berry/router-client";
-import { BullMqBerryQueueClient, BullMqBerryQueueRouter, workerFailureForRetryPolicy } from "./bullmq.js";
+import {
+  BullMqBerryQueueClient,
+  BullMqBerryQueueRouter,
+  foregroundQueueNameForShard,
+  foregroundQueueShardForKey,
+  workerFailureForRetryPolicy,
+} from "./bullmq.js";
 import { CompactionTerminalError } from "./compaction.js";
 import { LEGACY_WORKER_QUEUE_NAME, type BerryWorkerJobName, workerQueueKind } from "./jobs.js";
 
@@ -227,5 +233,43 @@ describe("BullMqBerryQueueClient", () => {
     expect(foreground.map(({ options }) => options.jobId)).toEqual(
       Array.from({ length: 100 }, (_, index) => `foreground-${index}`),
     );
+  });
+
+  it("routes every phase for one run to the same deterministic foreground shard", async () => {
+    const shards: Array<Array<{ name: string; payload: unknown }>> = [[], [], []];
+    const queue = (target: Array<{ name: string; payload: unknown }>) => ({
+      async add(name: string, payload: unknown) {
+        target.push({ name, payload });
+        return { id: `${name}-${target.length}` };
+      },
+      async close() {},
+      async waitUntilReady() {},
+      async getJobCounts() { return {}; },
+      async getJobs() { return []; },
+    });
+    const router = new BullMqBerryQueueRouter(
+      shards.map((target) => queue(target)) as never,
+      queue([]) as never,
+      queue([]) as never,
+    );
+    const payload = {
+      tenantId: "00000000-0000-7000-8000-000000000001",
+      runId: "00000000-0000-7000-8000-000000000002",
+      reason: "continue" as const,
+    };
+
+    await router.enqueue("turn.execute", payload, { jobId: "phase-1" });
+    await router.enqueue("turn.resume", { ...payload, reason: "operator-recovery" }, { jobId: "phase-2" });
+
+    const selected = shards.filter((shard) => shard.length > 0);
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.map((job) => job.name)).toEqual(["turn.execute", "turn.resume"]);
+    expect(foregroundQueueShardForKey(payload.runId, 3)).toBe(shards.indexOf(selected[0]!));
+  });
+
+  it("keeps shard zero on the original queue for rolling queue migrations", () => {
+    expect(foregroundQueueNameForShard("berry-cloud-turns", 0, 5)).toBe("berry-cloud-turns");
+    expect(foregroundQueueNameForShard("berry-cloud-turns", 1, 5)).toBe("berry-cloud-turns-1");
+    expect(foregroundQueueNameForShard("berry-cloud-turns", 0, 1)).toBe("berry-cloud-turns");
   });
 });

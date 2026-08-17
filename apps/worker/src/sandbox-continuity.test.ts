@@ -205,6 +205,47 @@ describe("SandboxContinuityManager", () => {
     expect(create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal });
   });
 
+  it("records an explicitly recovered sandbox after an ambiguous first-use create", async () => {
+    const create = vi.fn(async () => { throw new Error("remote create response was lost"); });
+    const recoverCreate = vi.fn(async () => ({
+      sandbox_id: "sandbox-recovered",
+      request_id: snapshot().id,
+      tenant_id: snapshot().tenantId,
+      provider: "e2b",
+      provider_kind: "e2b" as const,
+      status: "running" as const,
+      image: "berry-sandbox",
+      cwd: "/workspace",
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      metadata: {},
+    }));
+    const recordSandbox = vi.fn(async () => undefined);
+    const provider = {
+      kind: "e2b",
+      create,
+      recoverCreate,
+      files: { list: vi.fn(), read: vi.fn(), write: vi.fn() },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox,
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+
+    await expect(manager.execute(snapshot(), lsStep())).rejects.toThrow("remote create response was lost");
+    expect(recoverCreate).toHaveBeenCalledOnce();
+    expect(recordSandbox).toHaveBeenCalledWith(expect.objectContaining({
+      sandboxId: "sandbox-recovered",
+      state: "running",
+    }));
+  });
+
   it("pauses a terminal E2B sandbox after preserving its durable snapshot", async () => {
     const suspend = vi.fn(async () => ({
       sandbox_id: "sandbox-terminal",

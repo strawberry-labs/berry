@@ -86,9 +86,34 @@ describe("E2BSandboxProvider", () => {
     expect(sandbox.lastReadOptions).toEqual({ format: "text", requestTimeoutMs: 45_000, signal: controller.signal });
   });
 
+  it("reports bounded sub-operation timings without changing provider behavior", async () => {
+    const client = new FakeE2BClient();
+    const operations: Array<{ operation: string; durationMs: number; outcome: string }> = [];
+    const provider = new E2BSandboxProvider({
+      apiKey: "e2b_test",
+      client,
+      onOperation: (event) => operations.push(event),
+    });
+    const handle = await provider.create({ request_id: "operation-timing", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+    sandbox.filesByPath.set("/workspace/timed.txt", { content: Buffer.from("timed"), modifiedTime: new Date() });
+
+    await provider.files.read({ sandbox_id: handle.sandbox_id, path: "/workspace/timed.txt", encoding: "utf8" });
+
+    expect(operations.map((event) => event.operation)).toEqual(expect.arrayContaining([
+      "find",
+      "create",
+      "mkdir",
+      "file.getInfo",
+      "file.read",
+    ]));
+    expect(operations.every((event) => Number.isFinite(event.durationMs) && event.durationMs >= 0)).toBe(true);
+  });
+
   it("forwards native cancellation through creation, refresh, and reconnect", async () => {
     const client = new FakeE2BClient();
-    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 24_000 });
+    let now = new Date("2026-07-16T00:00:00.000Z");
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 24_000, now: () => now });
     const createController = new AbortController();
     const handle = await provider.create({
       request_id: "lifecycle-options",
@@ -112,6 +137,7 @@ describe("E2BSandboxProvider", () => {
       background: false,
     });
 
+    now = new Date(now.getTime() + 250_000);
     const refreshController = new AbortController();
     await provider.resume({ sandbox_id: handle.sandbox_id, reason: "refresh active sandbox" }, { signal: refreshController.signal });
     expect(sandbox.lastTimeoutOptions).toEqual({ requestTimeoutMs: 24_000, signal: refreshController.signal });
@@ -185,6 +211,24 @@ describe("E2BSandboxProvider", () => {
     controller.abort();
 
     await expect(write).rejects.toThrow("aborted");
+  });
+
+  it("recovers an E2B sandbox created before an ambiguous create rejection without deleting it", async () => {
+    const client = new FakeE2BClient();
+    client.rejectCreateAfterPersist = true;
+    const provider = new E2BSandboxProvider({
+      apiKey: "e2b_test",
+      client,
+      ambiguousCreateRecoveryTimeoutMs: 2_000,
+    });
+    const input = { request_id: "ambiguous-create", tenant_id: TENANT_ID, image: "base" };
+
+    await expect(provider.create(input)).rejects.toThrow("remote create response was lost");
+    const recovered = await provider.recoverCreate(input);
+
+    expect(recovered).toMatchObject({ sandbox_id: "e2b_1", request_id: input.request_id, status: "running" });
+    expect(client.sandboxes.has("e2b_1")).toBe(true);
+    expect(client.lastFindOptions).toMatchObject({ requestTimeoutMs: 2_000 });
   });
 
   it("bounds chmod command size when uploading a full skill package with long paths", async () => {
@@ -295,7 +339,7 @@ describe("E2BSandboxProvider", () => {
     ]));
   });
 
-  it("refreshes the sliding idle timeout on activity and disables the command timeout", async () => {
+  it("avoids redundant timeout updates while activity is healthy", async () => {
     const client = new FakeE2BClient();
     const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
     const sandbox = await provider.create({
@@ -305,7 +349,7 @@ describe("E2BSandboxProvider", () => {
       ttl_seconds: 300,
     });
     await provider.resume({ sandbox_id: sandbox.sandbox_id, reason: "active task reused the sandbox" });
-    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([300_000]);
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([]);
 
     await collectSandboxExecEvents(provider.exec({
       sandbox_id: sandbox.sandbox_id,
@@ -314,7 +358,7 @@ describe("E2BSandboxProvider", () => {
       timeout_ms: 0,
     }));
 
-    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([300_000, 300_000, 300_000]);
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([]);
     expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.lastCommandHandle?.timeoutMs).toBe(0);
   });
 
@@ -337,7 +381,7 @@ describe("E2BSandboxProvider", () => {
       timeout_ms: 0,
     }));
 
-    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([120_000, 120_000]);
+    expect(client.sandboxes.get(sandbox.sandbox_id)?.sandbox.timeoutUpdates).toEqual([120_000]);
   });
 
   it("keeps refreshing the sandbox while a long command is running", async () => {
@@ -442,6 +486,7 @@ class FakeE2BClient implements E2BSandboxClient {
   blockFind = false;
   blockFileReads = false;
   blockFileWrites = false;
+  rejectCreateAfterPersist = false;
 
   async create(input: Parameters<E2BSandboxClient["create"]>[0]): Promise<E2BSandboxLike> {
     this.lastCreate = input;
@@ -460,6 +505,7 @@ class FakeE2BClient implements E2BSandboxClient {
     };
     sandbox.onPause = () => { info.state = "paused"; };
     this.sandboxes.set(id, { sandbox, info });
+    if (this.rejectCreateAfterPersist) throw new Error("remote create response was lost");
     return sandbox;
   }
 

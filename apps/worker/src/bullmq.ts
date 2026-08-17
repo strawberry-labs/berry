@@ -93,16 +93,18 @@ export class BullMqBerryQueueClient implements BerryQueueClient {
 
 /** Routes new jobs by workload class while retaining the existing queue client API. */
 export class BullMqBerryQueueRouter implements BerryQueueClient {
-  readonly #foreground: BullMqBerryQueueClient;
+  readonly #foreground: readonly BullMqBerryQueueClient[];
   readonly #background: BullMqBerryQueueClient;
   readonly #legacy: BullMqBerryQueueClient;
 
   constructor(
-    foregroundQueue: Queue = createBerryQueue({ queueName: FOREGROUND_WORKER_QUEUE_NAME }),
+    foregroundQueue: Queue | readonly Queue[] = createBerryQueue({ queueName: FOREGROUND_WORKER_QUEUE_NAME }),
     backgroundQueue: Queue = createBerryQueue({ queueName: BACKGROUND_WORKER_QUEUE_NAME }),
     legacyQueue: Queue = createBerryQueue({ queueName: LEGACY_WORKER_QUEUE_NAME }),
   ) {
-    this.#foreground = new BullMqBerryQueueClient(foregroundQueue);
+    const foregroundQueues = Array.isArray(foregroundQueue) ? foregroundQueue : [foregroundQueue];
+    if (foregroundQueues.length === 0) throw new Error("BullMqBerryQueueRouter requires a foreground queue");
+    this.#foreground = foregroundQueues.map((queue) => new BullMqBerryQueueClient(queue));
     this.#background = new BullMqBerryQueueClient(backgroundQueue);
     this.#legacy = new BullMqBerryQueueClient(legacyQueue);
   }
@@ -112,35 +114,61 @@ export class BullMqBerryQueueRouter implements BerryQueueClient {
     payload: BerryWorkerJobMap[Name],
     options: JobsOptions = {},
   ): Promise<{ id: string | undefined; name: Name }> {
-    return this.client(workerQueueKind(name)).enqueue(name, payload, options);
+    if (workerQueueKind(name) === "foreground") {
+      return this.foregroundClient(name, payload).enqueue(name, payload, options);
+    }
+    return this.#background.enqueue(name, payload, options);
   }
 
   async close(): Promise<void> {
-    await Promise.all([this.#foreground.close(), this.#background.close(), this.#legacy.close()]);
+    await Promise.all([
+      ...this.#foreground.map((client) => client.close()),
+      this.#background.close(),
+      this.#legacy.close(),
+    ]);
   }
 
   async waitUntilReady(): Promise<void> {
     await Promise.all([
-      this.#foreground.waitUntilReady(),
+      ...this.#foreground.map((client) => client.waitUntilReady()),
       this.#background.waitUntilReady(),
       this.#legacy.waitUntilReady(),
     ]);
   }
 
   async ping(): Promise<void> {
-    await Promise.all([this.#foreground.ping(), this.#background.ping(), this.#legacy.ping()]);
+    await Promise.all([
+      ...this.#foreground.map((client) => client.ping()),
+      this.#background.ping(),
+      this.#legacy.ping(),
+    ]);
   }
 
   async operationalMetrics(nowMs = Date.now()): Promise<BerryQueueOperationalMetrics[]> {
+    const foreground = await Promise.all(
+      this.#foreground.map((client) => client.operationalMetrics("foreground", nowMs)),
+    );
+    const foregroundMetrics = foreground.reduce<BerryQueueOperationalMetrics>((total, current) => ({
+      queue: "foreground",
+      waiting: total.waiting + current.waiting,
+      active: total.active + current.active,
+      failed: total.failed + current.failed,
+      oldestWaitingSeconds: Math.max(total.oldestWaitingSeconds, current.oldestWaitingSeconds),
+    }), { queue: "foreground", waiting: 0, active: 0, failed: 0, oldestWaitingSeconds: 0 });
     return Promise.all([
-      this.#foreground.operationalMetrics("foreground", nowMs),
+      Promise.resolve(foregroundMetrics),
       this.#background.operationalMetrics("background", nowMs),
       this.#legacy.operationalMetrics("legacy", nowMs),
     ]);
   }
 
-  private client(kind: BerryWorkerQueueKind): BullMqBerryQueueClient {
-    return kind === "foreground" ? this.#foreground : this.#background;
+  private foregroundClient<Name extends BerryWorkerJobName>(
+    name: Name,
+    payload: BerryWorkerJobMap[Name],
+  ): BullMqBerryQueueClient {
+    const runId = runIdForPayload(payload);
+    const key = runId ?? deterministicJobId(name, payload);
+    return this.#foreground[foregroundQueueShardForKey(key, this.#foreground.length)]!;
   }
 }
 
@@ -168,12 +196,18 @@ export function createBerryQueue(options: { redisUrl?: string; queueName?: strin
 export function createBerryQueueRouter(options: {
   redisUrl?: string;
   foregroundQueueName?: string;
+  foregroundQueueShardCount?: number;
   backgroundQueueName?: string;
   legacyQueueName?: string;
 } = {}): BullMqBerryQueueRouter {
   const connection = options.redisUrl ? { redisUrl: options.redisUrl } : {};
+  const foregroundQueueShardCount = boundedQueueShardCount(options.foregroundQueueShardCount);
+  const foregroundQueueName = options.foregroundQueueName ?? FOREGROUND_WORKER_QUEUE_NAME;
   return new BullMqBerryQueueRouter(
-    createBerryQueue({ ...connection, queueName: options.foregroundQueueName ?? FOREGROUND_WORKER_QUEUE_NAME }),
+    Array.from({ length: foregroundQueueShardCount }, (_, shard) => createBerryQueue({
+      ...connection,
+      queueName: foregroundQueueNameForShard(foregroundQueueName, shard, foregroundQueueShardCount),
+    })),
     createBerryQueue({ ...connection, queueName: options.backgroundQueueName ?? BACKGROUND_WORKER_QUEUE_NAME }),
     createBerryQueue({ ...connection, queueName: options.legacyQueueName ?? LEGACY_WORKER_QUEUE_NAME }),
   );
@@ -186,10 +220,13 @@ export function createBerryWorker(
     queueName?: string;
     concurrency?: number;
     queueKind?: BerryWorkerQueueKind | "legacy";
+    queueShard?: number;
+    queueShardCount?: number;
   } = {},
 ): Worker {
   const queueKind = options.queueKind ?? "legacy";
-  const queueName = options.queueName ?? queueNameForKind(queueKind);
+  const queueShardCount = boundedQueueShardCount(options.queueShardCount);
+  const queueName = options.queueName ?? queueNameForKind(queueKind, options.queueShard ?? 0, queueShardCount);
   const processor: Processor = async (job) => {
     if (queueKind !== "legacy" && workerQueueKind(job.name as BerryWorkerJobName) !== queueKind) {
       throw new Error(`Job ${job.name} was delivered to the ${queueKind} worker queue`);
@@ -236,10 +273,40 @@ export function workerFailureForRetryPolicy(jobName: string, error: unknown): un
   ].filter(Boolean).join(" "));
 }
 
-function queueNameForKind(kind: BerryWorkerQueueKind | "legacy"): string {
-  if (kind === "foreground") return FOREGROUND_WORKER_QUEUE_NAME;
+function queueNameForKind(kind: BerryWorkerQueueKind | "legacy", shard = 0, shardCount = 1): string {
+  if (kind === "foreground") return foregroundQueueNameForShard(FOREGROUND_WORKER_QUEUE_NAME, shard, shardCount);
   if (kind === "background") return BACKGROUND_WORKER_QUEUE_NAME;
   return LEGACY_WORKER_QUEUE_NAME;
+}
+
+export function foregroundQueueNameForShard(baseName: string, shard: number, shardCount: number): string {
+  const count = boundedQueueShardCount(shardCount);
+  if (!Number.isSafeInteger(shard) || shard < 0 || shard >= count) {
+    throw new Error(`Foreground queue shard must be between 0 and ${count - 1}`);
+  }
+  // Keep shard zero on the original queue so a rolling deployment drains jobs
+  // already present in berry-cloud-turns while new shards come online.
+  return count === 1 || shard === 0 ? baseName : `${baseName}-${shard}`;
+}
+
+export function foregroundQueueShardForKey(key: string, shardCount: number): number {
+  const count = boundedQueueShardCount(shardCount);
+  const digest = createHash("sha256").update(key).digest();
+  return digest.readUInt32BE(0) % count;
+}
+
+function runIdForPayload(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const runId = (payload as { runId?: unknown }).runId;
+  return typeof runId === "string" && runId.trim() ? runId : undefined;
+}
+
+function boundedQueueShardCount(value: number | undefined): number {
+  if (value === undefined) return 1;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 128) {
+    throw new Error("Foreground queue shard count must be an integer between 1 and 128");
+  }
+  return value;
 }
 
 function createRedisConnection(redisUrl = process.env.BERRY_REDIS_URL ?? process.env.REDIS_URL ?? "redis://127.0.0.1:6379"): ConnectionOptions {

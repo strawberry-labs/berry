@@ -8,17 +8,22 @@ import {
 } from "@aws-sdk/client-s3";
 import {
   DockerSandboxProvider,
+  E2BSandboxProvider,
   createSandboxProviderFromConfig,
   sandboxProviderConfigFromEnv,
   type DockerCommandExecutor,
   type DockerCommandResult,
   type DockerStreamEvent,
+  type SandboxHandle,
+  type SandboxCreateInput,
   type SandboxProvider,
 } from "@berry/sandbox-contract";
 import type { ChatContentPart, ImageGenerationResult } from "@berry/router-client";
 import {
   DEFAULT_SANDBOX_INPUT_MAX_BYTES,
   ORGANIZATION_SKILL_PACKAGE_MAX_BYTES,
+  normalizeWorkerRole,
+  sourceRevisionFromEnv,
   type AgentStreamEvent,
   type JsonValue,
 } from "@berry/shared";
@@ -26,6 +31,7 @@ import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
+import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 import type {
   DurableTurnSnapshot,
   DurableTurnStep,
@@ -1486,11 +1492,16 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             if (signal) await this.provider.resume?.(resumeInput, { signal });
             else await this.provider.resume?.(resumeInput);
           }
-          await this.provider.files.list({
-            sandbox_id: snapshot.sandboxId!,
-            path: this.options.cwd ?? "/workspace",
-            recursive: false,
-          }, { signal });
+          if (this.provider.kind !== "e2b") {
+            // Local/Router providers retain the cheap liveness probe. E2B's
+            // first real operation is already a health check; its redundant
+            // data-plane list request added tens of seconds to cold reconnects.
+            await this.provider.files.list({
+              sandbox_id: snapshot.sandboxId!,
+              path: this.options.cwd ?? "/workspace",
+              recursive: false,
+            }, { signal });
+          }
           // The in-memory staged-file set is intentionally process-local. On
           // worker restart or lease handoff, re-stage the run's durable input
           // associations before a tool is allowed to execute.
@@ -1532,11 +1543,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             if (signal) await this.provider.resume?.(resumeInput, { signal });
             else await this.provider.resume?.(resumeInput);
           }
-          await this.provider.files.list({
-            sandbox_id: continuity.sandboxId!,
-            path: this.options.cwd ?? "/workspace",
-            recursive: false,
-          }, { signal });
+          if (this.provider.kind !== "e2b") {
+            await this.provider.files.list({
+              sandbox_id: continuity.sandboxId!,
+              path: this.options.cwd ?? "/workspace",
+              recursive: false,
+            }, { signal });
+          }
           await this.stageInputFiles(snapshot, continuity.sandboxId!, repository, undefined, signal);
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
@@ -1556,7 +1569,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         // The previous turn's sandbox expired. Restore its durable archive below.
       }
     }
-    const handle = await this.provider.create({
+    const createInput: SandboxCreateInput = {
       request_id: snapshot.id,
       tenant_id: snapshot.tenantId,
       task_id: snapshot.taskId,
@@ -1567,7 +1580,29 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy),
       writable_roots: [this.options.cwd ?? "/workspace"],
       metadata: { runId: snapshot.id },
-    }, { signal });
+    };
+    let handle: SandboxHandle;
+    try {
+      handle = await this.provider.create(createInput, { signal });
+    } catch (error) {
+      // A provider may have created remote compute before an abort reached its
+      // SDK promise. Recover only an explicit metadata match, persist its id,
+      // and leave the existing terminal cleanup/recovery machinery responsible
+      // for pausing it. Never guess an id or destroy an unowned sandbox here.
+      const recovered = this.provider.recoverCreate
+        ? await this.provider.recoverCreate(createInput).catch(() => null)
+        : null;
+      if (recovered) {
+        await this.repository.recordSandbox({
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          provider: recovered.provider,
+          sandboxId: recovered.sandbox_id,
+          state: recovered.status,
+        }).catch(() => undefined);
+      }
+      throw error;
+    }
     const restorePoint = latest ?? continuity?.snapshot ?? null;
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (restorePoint && this.objects) {
@@ -2651,6 +2686,17 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
 
 export function createWorkerSandboxProvider(env: NodeJS.ProcessEnv): SandboxProvider {
   const config = sandboxProviderConfigFromEnv(env);
+  if (config.provider === "e2b" && config.e2b) {
+    return new E2BSandboxProvider({
+      ...config.e2b,
+      onOperation: (event) => emitWorkerOperationalEvent(
+        "sandbox.operation",
+        normalizeWorkerRole(env.BERRY_WORKER_ROLE),
+        sourceRevisionFromEnv(env),
+        { ...event },
+      ),
+    });
+  }
   if (config.provider !== "docker") return createSandboxProviderFromConfig(config);
   return new DockerSandboxProvider({
     executor: new NodeDockerExecutor(),

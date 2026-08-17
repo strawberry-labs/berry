@@ -61,6 +61,12 @@ export interface SandboxProvider {
   readonly supportsPause?: boolean;
   readonly supportsResume?: boolean;
   create(input: SandboxCreateInput, options?: SandboxOperationOptions): Promise<SandboxHandle>;
+  /**
+   * Recover the id of a sandbox that the provider may have created before a
+   * cancelled create request reached the caller. This must never create or
+   * destroy a sandbox; it only returns an unambiguous durable match.
+   */
+  recoverCreate?(input: SandboxCreateInput): Promise<SandboxHandle | null>;
   exec(input: SandboxExecInput, options?: { signal?: AbortSignal | undefined }): AsyncIterable<SandboxExecEvent>;
   readonly files: SandboxFileApi;
   exposePort(input: SandboxExposePortInput): Promise<SandboxExposePortResult>;

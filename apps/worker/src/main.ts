@@ -1,7 +1,9 @@
-import { hostname } from "node:os";
+import { lookup } from "node:dns/promises";
+import { hostname, networkInterfaces } from "node:os";
 import { randomUUID } from "node:crypto";
 import { createPersonalMemoryProviderFromEnv } from "@berry/personal-memory";
-import { createBerryQueueRouter, createBerryWorker } from "./bullmq.ts";
+import { createBerryQueueRouter, createBerryWorker, foregroundQueueNameForShard } from "./bullmq.ts";
+import { FOREGROUND_WORKER_QUEUE_NAME } from "./jobs.ts";
 import {
   durableContextConfigFromEnv,
   normalizeWorkerRole,
@@ -52,7 +54,17 @@ import {
 } from "./turn-cancellation.ts";
 
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const processConfig = workerProcessConfigFromEnv(env);
+  const configuredProcess = workerProcessConfigFromEnv(env);
+  const processConfig = configuredProcess.foregroundQueueShardCount > 1
+    && (configuredProcess.role === "foreground" || configuredProcess.role === "all")
+    ? {
+        ...configuredProcess,
+        foregroundQueueShardIndex: await resolveForegroundQueueShardIndex(
+          env,
+          configuredProcess.foregroundQueueShardCount,
+        ),
+      }
+    : configuredProcess;
   const workerRole = normalizeWorkerRole(processConfig.role);
   const sourceRevision = sourceRevisionFromEnv(env);
   // The container/runtime owns rotation; parsing the same bounded policy here
@@ -69,6 +81,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const queue = createBerryQueueRouter({
     ...(redisUrl ? { redisUrl } : {}),
     ...(env.BERRY_FOREGROUND_QUEUE_NAME?.trim() ? { foregroundQueueName: env.BERRY_FOREGROUND_QUEUE_NAME.trim() } : {}),
+    foregroundQueueShardCount: processConfig.foregroundQueueShardCount,
     ...(env.BERRY_BACKGROUND_QUEUE_NAME?.trim() ? { backgroundQueueName: env.BERRY_BACKGROUND_QUEUE_NAME.trim() } : {}),
     ...(env.BERRY_LEGACY_QUEUE_NAME?.trim() ? { legacyQueueName: env.BERRY_LEGACY_QUEUE_NAME.trim() } : {}),
   });
@@ -210,7 +223,13 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       ...commonWorkerOptions,
       queueKind: "foreground",
       concurrency: processConfig.foregroundConcurrency,
-      ...(env.BERRY_FOREGROUND_QUEUE_NAME?.trim() ? { queueName: env.BERRY_FOREGROUND_QUEUE_NAME.trim() } : {}),
+      queueShard: processConfig.foregroundQueueShardIndex,
+      queueShardCount: processConfig.foregroundQueueShardCount,
+      queueName: foregroundQueueNameForShard(
+        env.BERRY_FOREGROUND_QUEUE_NAME?.trim() || FOREGROUND_WORKER_QUEUE_NAME,
+        processConfig.foregroundQueueShardIndex,
+        processConfig.foregroundQueueShardCount,
+      ),
     }));
   }
   if (processConfig.role === "background" || processConfig.role === "all") {
@@ -283,6 +302,8 @@ export type BerryWorkerProcessConfig = {
   foregroundConcurrency: number;
   backgroundConcurrency: number;
   legacyConcurrency: number;
+  foregroundQueueShardCount: number;
+  foregroundQueueShardIndex: number;
   drainLegacyQueue: boolean;
   databasePoolMax: number;
 };
@@ -293,6 +314,10 @@ export function workerProcessConfigFromEnv(env: NodeJS.ProcessEnv): BerryWorkerP
     throw new Error("BERRY_WORKER_ROLE must be foreground, background, or all");
   }
   const role: BerryWorkerProcessRole = rawRole;
+  const foregroundQueueShardCount = foregroundQueueShardCountFromEnv(env);
+  const foregroundQueueShardIndex = role === "foreground" || role === "all"
+    ? foregroundQueueShardIndexFromEnv(env, foregroundQueueShardCount, true)
+    : 0;
   const sharedConcurrency = positiveInteger(env.BERRY_WORKER_CONCURRENCY);
   const foregroundConcurrency = positiveInteger(env.BERRY_FOREGROUND_WORKER_CONCURRENCY)
     ?? sharedConcurrency
@@ -311,9 +336,79 @@ export function workerProcessConfigFromEnv(env: NodeJS.ProcessEnv): BerryWorkerP
     foregroundConcurrency,
     backgroundConcurrency,
     legacyConcurrency,
+    foregroundQueueShardCount,
+    foregroundQueueShardIndex,
     drainLegacyQueue: env.BERRY_LEGACY_QUEUE_DRAIN?.trim().toLowerCase() !== "false",
     databasePoolMax: positiveInteger(env.BERRY_WORKER_DB_POOL_MAX) ?? rolePoolMax ?? 10,
   };
+}
+
+export function foregroundQueueShardIndexFromEnv(
+  env: NodeJS.ProcessEnv,
+  shardCount: number,
+  allowUnresolved = false,
+): number {
+  if (!Number.isSafeInteger(shardCount) || shardCount < 1 || shardCount > 128) {
+    throw new Error("BERRY_FOREGROUND_QUEUE_SHARD_COUNT must be an integer between 1 and 128");
+  }
+  const explicit = env.BERRY_FOREGROUND_QUEUE_SHARD_INDEX?.trim();
+  if (explicit) {
+    const parsed = Number(explicit);
+    if (Number.isSafeInteger(parsed) && parsed >= 0 && parsed < shardCount) return parsed;
+    throw new Error(`BERRY_FOREGROUND_QUEUE_SHARD_INDEX must be between 0 and ${shardCount - 1}`);
+  }
+  if (shardCount === 1) return 0;
+  if (allowUnresolved) return 0;
+  const runtimeName = env.HOSTNAME?.trim() || hostname();
+  throw new Error(
+    `Unable to determine foreground queue shard for ${runtimeName}; set BERRY_FOREGROUND_QUEUE_SHARD_INDEX explicitly or configure the foreground service DNS name`,
+  );
+}
+
+function foregroundQueueShardCountFromEnv(env: NodeJS.ProcessEnv): number {
+  const raw = env.BERRY_FOREGROUND_QUEUE_SHARD_COUNT?.trim();
+  if (!raw) return 1;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 128) {
+    throw new Error("BERRY_FOREGROUND_QUEUE_SHARD_COUNT must be an integer between 1 and 128");
+  }
+  return parsed;
+}
+
+export async function resolveForegroundQueueShardIndex(
+  env: NodeJS.ProcessEnv,
+  shardCount: number,
+): Promise<number> {
+  // An explicit index is authoritative. Do not hide a typo by silently
+  // falling back to a DNS-derived assignment.
+  if (env.BERRY_FOREGROUND_QUEUE_SHARD_INDEX?.trim()) {
+    return foregroundQueueShardIndexFromEnv(env, shardCount);
+  }
+  try {
+    return foregroundQueueShardIndexFromEnv(env, shardCount);
+  } catch (error) {
+    const serviceName = env.BERRY_FOREGROUND_QUEUE_DNS_NAME?.trim() || "worker-foreground";
+    const records = await lookup(serviceName, { all: true, verbatim: false }).catch(() => []);
+    const addresses = [...new Set(records.map((record) => record.address))].sort();
+    const ownAddresses = Object.values(networkInterfaces())
+      .flatMap((interfaces) => interfaces ?? [])
+      .filter((entry) => !entry.internal)
+      .map((entry) => entry.address);
+    // A partial DNS answer during a rolling/startup window is not enough to
+    // assign ownership: two containers could both choose shard zero. Let the
+    // supervisor restart this process once every replica is discoverable.
+    if (addresses.length !== shardCount) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; DNS ${serviceName} returned ${addresses.length} addresses, expected ${shardCount} foreground replicas`,
+      );
+    }
+    const ownAddress = ownAddresses.find((address) => addresses.includes(address));
+    const index = ownAddress === undefined ? -1 : addresses.indexOf(ownAddress);
+    if (index >= 0 && index < shardCount) return index;
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; DNS ${serviceName} did not identify this worker among ${shardCount} foreground replicas`,
+    );
+  }
 }
 
 function knowledgeObjectStore(env: NodeJS.ProcessEnv): KnowledgeObjectStore {

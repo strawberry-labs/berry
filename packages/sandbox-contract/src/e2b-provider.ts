@@ -129,6 +129,14 @@ export interface E2BRequestOptions {
   signal?: AbortSignal | undefined;
 }
 
+export type E2BOperationOutcome = "success" | "failure" | "cancelled";
+
+export interface E2BOperationEvent {
+  operation: string;
+  durationMs: number;
+  outcome: E2BOperationOutcome;
+}
+
 export interface E2BSandboxClient {
   create(input: {
     template: string;
@@ -166,6 +174,9 @@ export interface E2BSandboxProviderOptions {
   /** Total estimated price of the selected E2B template in USD micros/hour. */
   estimatedHourlyCostMicros?: number | undefined;
   minimumExecCostMicros?: number | undefined;
+  /** Bound the best-effort metadata lookup used after an ambiguous create. */
+  ambiguousCreateRecoveryTimeoutMs?: number | undefined;
+  onOperation?: ((event: E2BOperationEvent) => void) | undefined;
   client?: E2BSandboxClient | undefined;
   now?: (() => Date) | undefined;
 }
@@ -183,6 +194,7 @@ const DEFAULT_RECONNECT_TTL_SECONDS = 900;
 const ACTIVE_EXPIRY_SAFETY_MS = 2_000;
 const MAX_KEEPALIVE_INTERVAL_MS = 60_000;
 const MAX_CHMOD_COMMAND_BYTES = 32 * 1024;
+const DEFAULT_AMBIGUOUS_CREATE_RECOVERY_TIMEOUT_MS = 5_000;
 
 /** Direct, server-side E2B implementation of Berry's provider-neutral sandbox contract. */
 export class E2BSandboxProvider implements SandboxProvider {
@@ -197,9 +209,12 @@ export class E2BSandboxProvider implements SandboxProvider {
   readonly #reuseByRequestId: boolean;
   readonly #estimatedHourlyCostMicros: number | undefined;
   readonly #minimumExecCostMicros: number;
+  readonly #ambiguousCreateRecoveryTimeoutMs: number;
+  readonly #onOperation: ((event: E2BOperationEvent) => void) | undefined;
   readonly #client: E2BSandboxClient;
   readonly #now: () => Date;
   readonly #sandboxes = new Map<string, SandboxRecord>();
+  readonly #ambiguousCreateRequests = new Set<string>();
 
   readonly files: SandboxFileApi = {
     read: (input, options) => this.readFile(input, options),
@@ -220,6 +235,11 @@ export class E2BSandboxProvider implements SandboxProvider {
     this.#reuseByRequestId = options.reuseByRequestId ?? true;
     this.#estimatedHourlyCostMicros = optionalNonnegativeInteger(options.estimatedHourlyCostMicros, "estimatedHourlyCostMicros");
     this.#minimumExecCostMicros = optionalNonnegativeInteger(options.minimumExecCostMicros, "minimumExecCostMicros") ?? 0;
+    this.#ambiguousCreateRecoveryTimeoutMs = positiveInteger(
+      options.ambiguousCreateRecoveryTimeoutMs,
+      "ambiguousCreateRecoveryTimeoutMs",
+    ) ?? DEFAULT_AMBIGUOUS_CREATE_RECOVERY_TIMEOUT_MS;
+    this.#onOperation = options.onOperation;
     this.#client = options.client ?? createE2BClient();
     this.#now = options.now ?? (() => new Date());
   }
@@ -240,13 +260,13 @@ export class E2BSandboxProvider implements SandboxProvider {
       berry_cwd: parsed.cwd,
     };
     if (this.#reuseByRequestId) {
-      const existing = await this.#client.find(lookupMetadata, this.#authOptions(options));
+      const existing = await this.#observe("find", options.signal, () => this.#client.find(lookupMetadata, this.#authOptions(options)));
       if (existing) {
         options.signal?.throwIfAborted();
-        const sandbox = await this.#client.connect(existing.sandboxId, {
+        const sandbox = await this.#observe("connect", options.signal, () => this.#client.connect(existing.sandboxId, {
           ...this.#authOptions(options),
           timeoutMs: parsed.ttl_seconds * 1_000,
-        });
+        }), existing.sandboxId);
         options.signal?.throwIfAborted();
         const handle = this.#handleFromInfo(existing, parsed);
         this.#remember(sandbox, handle, parsed.resources, parsed.ttl_seconds);
@@ -254,28 +274,38 @@ export class E2BSandboxProvider implements SandboxProvider {
       }
     }
 
-    const sandbox = await this.#client.create({
-      template,
-      options: {
-        ...this.#authOptions(options),
-        timeoutMs: parsed.ttl_seconds * 1_000,
-        secure: true,
-        envs: parsed.env,
-        metadata: sdkMetadata(parsed, template),
-        allowInternetAccess: parsed.network_policy.egress !== "off",
-        network: networkOptions(parsed.network_policy.egress, parsed.network_policy.allowedDomains),
-        lifecycle: {
-          onTimeout: { action: "pause", keepMemory: this.#keepMemoryOnPause },
-          autoResume: false,
+    let sandbox: E2BSandboxLike;
+    try {
+      sandbox = await this.#observe("create", options.signal, () => this.#client.create({
+        template,
+        options: {
+          ...this.#authOptions(options),
+          timeoutMs: parsed.ttl_seconds * 1_000,
+          secure: true,
+          envs: parsed.env,
+          metadata: sdkMetadata(parsed, template),
+          allowInternetAccess: parsed.network_policy.egress !== "off",
+          network: networkOptions(parsed.network_policy.egress, parsed.network_policy.allowedDomains),
+          lifecycle: {
+            onTimeout: { action: "pause", keepMemory: this.#keepMemoryOnPause },
+            autoResume: false,
+          },
         },
-      },
-    });
+      }));
+    } catch (error) {
+      this.#ambiguousCreateRequests.add(parsed.request_id);
+      if (this.#ambiguousCreateRequests.size > 1_024) {
+        const oldest = this.#ambiguousCreateRequests.values().next().value as string | undefined;
+        if (oldest) this.#ambiguousCreateRequests.delete(oldest);
+      }
+      throw error;
+    }
 
     try {
       options.signal?.throwIfAborted();
-      await runForeground(sandbox, `mkdir -p -- ${shellQuote(parsed.cwd)}`, this.#requestOptions(options));
+      await this.#observe("mkdir", options.signal, () => runForeground(sandbox, `mkdir -p -- ${shellQuote(parsed.cwd)}`, this.#requestOptions(options)), sandbox.sandboxId);
     } catch (error) {
-      await this.#client.kill(sandbox.sandboxId, this.#authOptions()).catch(() => false);
+      await this.#observe("kill", undefined, () => this.#client.kill(sandbox.sandboxId, this.#authOptions()), sandbox.sandboxId).catch(() => false);
       throw error;
     }
 
@@ -303,9 +333,31 @@ export class E2BSandboxProvider implements SandboxProvider {
     return handle;
   }
 
+  async recoverCreate(input: SandboxCreateInput): Promise<SandboxHandle | null> {
+    const parsed = SandboxCreateInputSchema.parse(input);
+    if (!this.#reuseByRequestId) return null;
+    if (!this.#ambiguousCreateRequests.delete(parsed.request_id)) return null;
+    const template = parsed.snapshot_id ?? this.#template;
+    const metadata = {
+      berry_request_id: parsed.request_id,
+      berry_tenant_id: parsed.tenant_id,
+      berry_image: template,
+      berry_cwd: parsed.cwd,
+    };
+    // A cancelled SDK create can have succeeded remotely before its response
+    // was delivered. Search without the caller's aborted signal, but keep the
+    // lookup short and never delete a candidate we did not prove to own.
+    const info = await this.#observe("recover.find", undefined, () => this.#client.find(metadata, {
+      ...this.#authOptions(),
+      requestTimeoutMs: this.#ambiguousCreateRecoveryTimeoutMs,
+    }));
+    if (!info || info.state !== "running") return null;
+    return this.#handleFromInfo(info, parsed);
+  }
+
   async *exec(input: SandboxExecInput, options: { signal?: AbortSignal | undefined } = {}): AsyncIterable<SandboxExecEvent> {
     const parsed = SandboxExecInputSchema.parse(input);
-    const sandbox = await this.#sandbox(parsed.sandbox_id, true, options);
+    const sandbox = await this.#sandbox(parsed.sandbox_id, options);
     const record = this.#sandboxes.get(parsed.sandbox_id);
     const command = commandString(parsed.command, parsed.code, parsed.language);
     const startedAt = this.#now();
@@ -314,7 +366,7 @@ export class E2BSandboxProvider implements SandboxProvider {
 
     let handle: E2BCommandHandleLike;
     try {
-      const started = await sandbox.commands.run(command, {
+      const started = await this.#observe("command.start", options.signal, () => sandbox.commands.run(command, {
         background: true,
         ...requestOptions,
         cwd: parsed.cwd ?? record?.handle.cwd ?? "/workspace",
@@ -323,7 +375,7 @@ export class E2BSandboxProvider implements SandboxProvider {
         timeoutMs: parsed.timeout_ms,
         onStdout: (data) => channel.push(SandboxExecEventSchema.parse({ kind: "stdout", data })),
         onStderr: (data) => channel.push(SandboxExecEventSchema.parse({ kind: "stderr", data })),
-      });
+      }), parsed.sandbox_id);
       if (!isCommandHandle(started)) throw new Error("E2B did not return a background command handle");
       handle = started;
     } catch (error) {
@@ -352,7 +404,7 @@ export class E2BSandboxProvider implements SandboxProvider {
           await handle.sendStdin(parsed.stdin);
           await handle.closeStdin();
         }
-        const result = await handle.wait();
+        const result = await this.#observe("command.wait", options.signal, () => handle.wait(), parsed.sandbox_id);
         channel.push(SandboxExecEventSchema.parse({ kind: "exit", exit_code: result.exitCode, signal: null }));
         if (result.exitCode !== 0) status = "failed";
       } catch (error) {
@@ -368,18 +420,6 @@ export class E2BSandboxProvider implements SandboxProvider {
         }
       } finally {
         await stopKeepAlive();
-        if (record && !options.signal?.aborted) {
-          try {
-            await this.#refreshTimeout(record, options);
-          } catch (error) {
-            if (status === "completed") status = "failed";
-            channel.push(SandboxExecEventSchema.parse({
-              kind: "error",
-              message: `Unable to reset the sandbox idle timeout after the command finished: ${errorMessage(error)}`,
-              code: "e2b_idle_timeout_reset_failed",
-            }));
-          }
-        }
         options.signal?.removeEventListener("abort", onAbort);
         const usage = this.#usageEvent(parsed, record, startedAt, status);
         if (usage) channel.push(usage);
@@ -407,10 +447,10 @@ export class E2BSandboxProvider implements SandboxProvider {
   async suspend(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
     const parsed = SandboxDestroyInputSchema.parse(input);
     try {
-      await this.#client.pause(parsed.sandbox_id, {
+      await this.#observe("pause", undefined, () => this.#client.pause(parsed.sandbox_id, {
         ...this.#authOptions(),
         keepMemory: this.#keepMemoryOnPause,
-      });
+      }), parsed.sandbox_id);
       this.#sandboxes.delete(parsed.sandbox_id);
       return SandboxDestroyResultSchema.parse({ sandbox_id: parsed.sandbox_id, destroyed: true, status: "stopped" });
     } catch (error) {
@@ -424,20 +464,28 @@ export class E2BSandboxProvider implements SandboxProvider {
     const parsed = SandboxResumeInputSchema.parse(input);
     options.signal?.throwIfAborted();
     const current = this.#sandboxes.get(parsed.sandbox_id);
-    if (current && this.#now().getTime() < current.activeUntil - ACTIVE_EXPIRY_SAFETY_MS) {
-      await this.#refreshTimeout(current, options);
-      return current.handle;
+    if (current) {
+      const remainingMs = current.activeUntil - this.#now().getTime();
+      // A durable turn calls resume before every phase. Do not issue an E2B
+      // timeout-update request for a healthy local handle; the normal data
+      // plane path refreshes near expiry and command keep-alives remain active.
+      if (remainingMs > keepAliveIntervalMs(current.ttlSeconds) + ACTIVE_EXPIRY_SAFETY_MS) {
+        return current.handle;
+      }
+      if (remainingMs > ACTIVE_EXPIRY_SAFETY_MS) {
+        await this.#refreshTimeout(current, options);
+        return current.handle;
+      }
     }
-
-    const info = await this.#client.getInfo(parsed.sandbox_id, this.#authOptions(options));
+    const info = await this.#observe("getInfo", options.signal, () => this.#client.getInfo(parsed.sandbox_id, this.#authOptions(options)), parsed.sandbox_id);
     const ttlSeconds = current?.ttlSeconds
       ?? positiveMetadataInteger(info.metadata.berry_ttl_seconds)
       ?? DEFAULT_RECONNECT_TTL_SECONDS;
     options.signal?.throwIfAborted();
-    const sandbox = await this.#client.connect(parsed.sandbox_id, {
+    const sandbox = await this.#observe("connect", options.signal, () => this.#client.connect(parsed.sandbox_id, {
       ...this.#authOptions(options),
       timeoutMs: ttlSeconds * 1_000,
-    });
+    }), parsed.sandbox_id);
     options.signal?.throwIfAborted();
     const handle = SandboxHandleSchema.parse({
       ...(current?.handle ?? this.#handleFromStoredInfo(info)),
@@ -451,7 +499,7 @@ export class E2BSandboxProvider implements SandboxProvider {
   async destroy(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
     const parsed = SandboxDestroyInputSchema.parse(input);
     try {
-      const destroyed = await this.#client.kill(parsed.sandbox_id, this.#authOptions());
+      const destroyed = await this.#observe("kill", undefined, () => this.#client.kill(parsed.sandbox_id, this.#authOptions()), parsed.sandbox_id);
       this.#sandboxes.delete(parsed.sandbox_id);
       return SandboxDestroyResultSchema.parse({
         sandbox_id: parsed.sandbox_id,
@@ -475,13 +523,13 @@ export class E2BSandboxProvider implements SandboxProvider {
   async readFile(input: SandboxFileReadInput, options: SandboxOperationOptions = {}): Promise<SandboxFileReadResult> {
     const parsed = SandboxFileReadInputSchema.parse(input);
     options.signal?.throwIfAborted();
-    const sandbox = await this.#sandbox(parsed.sandbox_id, false, options);
+    const sandbox = await this.#sandbox(parsed.sandbox_id, options);
     options.signal?.throwIfAborted();
     const requestOptions = this.#requestOptions(options);
-    const info = await sandbox.files.getInfo(parsed.path, requestOptions);
+    const info = await this.#observe("file.getInfo", options.signal, () => sandbox.files.getInfo(parsed.path, requestOptions), parsed.sandbox_id);
     options.signal?.throwIfAborted();
     if (parsed.encoding === "base64") {
-      const bytes = await sandbox.files.read(parsed.path, { format: "bytes", ...requestOptions });
+      const bytes = await this.#observe("file.readBytes", options.signal, () => sandbox.files.read(parsed.path, { format: "bytes", ...requestOptions }), parsed.sandbox_id);
       if (typeof bytes === "string") throw new Error("E2B returned text for a byte-oriented file read");
       return SandboxFileReadResultSchema.parse({
         path: parsed.path,
@@ -491,7 +539,7 @@ export class E2BSandboxProvider implements SandboxProvider {
         mtime: info.modifiedTime?.toISOString() ?? null,
       });
     }
-    const content = await sandbox.files.read(parsed.path, { format: "text", ...requestOptions });
+    const content = await this.#observe("file.read", options.signal, () => sandbox.files.read(parsed.path, { format: "text", ...requestOptions }), parsed.sandbox_id);
     if (typeof content !== "string") throw new Error("E2B returned bytes for a text-oriented file read");
     return SandboxFileReadResultSchema.parse({
       path: parsed.path,
@@ -505,14 +553,15 @@ export class E2BSandboxProvider implements SandboxProvider {
   async writeFile(input: SandboxFileWriteInput, options: SandboxOperationOptions = {}): Promise<SandboxFileWriteResult> {
     const parsed = SandboxFileWriteInputSchema.parse(input);
     options.signal?.throwIfAborted();
-    const sandbox = await this.#sandbox(parsed.sandbox_id, false, options);
+    const sandbox = await this.#sandbox(parsed.sandbox_id, options);
     options.signal?.throwIfAborted();
     const requestOptions = this.#requestOptions(options);
     const content = parsed.encoding === "base64" ? arrayBuffer(Buffer.from(parsed.content, "base64")) : parsed.content;
-    const info = await sandbox.files.write(parsed.path, content, requestOptions);
+    const info = await this.#observe("file.write", options.signal, () => sandbox.files.write(parsed.path, content, requestOptions), parsed.sandbox_id);
     if (parsed.mode !== undefined) {
       options.signal?.throwIfAborted();
-      await runForeground(sandbox, `chmod ${parsed.mode.toString(8)} -- ${shellQuote(parsed.path)}`, requestOptions);
+      const mode = parsed.mode;
+      await this.#observe("chmod", options.signal, () => runForeground(sandbox, `chmod ${mode.toString(8)} -- ${shellQuote(parsed.path)}`, requestOptions), parsed.sandbox_id);
     }
     return SandboxFileWriteResultSchema.parse({
       path: parsed.path,
@@ -528,16 +577,17 @@ export class E2BSandboxProvider implements SandboxProvider {
       encoding: "base64",
     });
     options.signal?.throwIfAborted();
-    const sandbox = await this.#sandbox(metadata.sandbox_id, false, options);
+    const sandbox = await this.#sandbox(metadata.sandbox_id, options);
     options.signal?.throwIfAborted();
     const requestOptions = this.#requestOptions(options);
     const bytes = Buffer.isBuffer(input.content)
       ? input.content
       : Buffer.from(input.content.buffer, input.content.byteOffset, input.content.byteLength);
-    const info = await sandbox.files.write(metadata.path, arrayBuffer(bytes), requestOptions);
+    const info = await this.#observe("file.writeBytes", options.signal, () => sandbox.files.write(metadata.path, arrayBuffer(bytes), requestOptions), metadata.sandbox_id);
     if (metadata.mode !== undefined) {
       options.signal?.throwIfAborted();
-      await runForeground(sandbox, `chmod ${metadata.mode.toString(8)} -- ${shellQuote(metadata.path)}`, requestOptions);
+      const mode = metadata.mode;
+      await this.#observe("chmod", options.signal, () => runForeground(sandbox, `chmod ${mode.toString(8)} -- ${shellQuote(metadata.path)}`, requestOptions), metadata.sandbox_id);
     }
     return SandboxFileWriteResultSchema.parse({
       path: metadata.path,
@@ -569,16 +619,16 @@ export class E2BSandboxProvider implements SandboxProvider {
       modeCommands.set(metadata.mode, paths);
     }
     const chmodCommands = buildChmodCommands(modeCommands);
-    const sandbox = await this.#sandbox(input.sandbox_id, false, options);
+    const sandbox = await this.#sandbox(input.sandbox_id, options);
     options.signal?.throwIfAborted();
     const requestOptions = this.#requestOptions(options);
-    const infos = await sandbox.files.write(files.map(({ metadata, bytes }) => ({
+    const infos = await this.#observe("file.writeManyBytes", options.signal, () => sandbox.files.write(files.map(({ metadata, bytes }) => ({
       path: metadata.path,
       data: arrayBuffer(bytes),
-    })), requestOptions);
+    })), requestOptions), input.sandbox_id);
     for (const command of chmodCommands) {
       options.signal?.throwIfAborted();
-      await runForeground(sandbox, command, requestOptions);
+      await this.#observe("chmod", options.signal, () => runForeground(sandbox, command, requestOptions), input.sandbox_id);
     }
     return files.map(({ metadata, bytes }, index) => {
       const info = infos[index];
@@ -593,9 +643,9 @@ export class E2BSandboxProvider implements SandboxProvider {
   async listFiles(input: SandboxFileListInput, options: SandboxOperationOptions = {}): Promise<SandboxFileListResult> {
     const parsed = SandboxFileListInputSchema.parse(input);
     options.signal?.throwIfAborted();
-    const sandbox = await this.#sandbox(parsed.sandbox_id, false, options);
+    const sandbox = await this.#sandbox(parsed.sandbox_id, options);
     options.signal?.throwIfAborted();
-    const entries = await sandbox.files.list(parsed.path, { depth: parsed.recursive ? 64 : 1, ...this.#requestOptions(options) });
+    const entries = await this.#observe("file.list", options.signal, () => sandbox.files.list(parsed.path, { depth: parsed.recursive ? 64 : 1, ...this.#requestOptions(options) }), parsed.sandbox_id);
     return SandboxFileListResultSchema.parse({
       path: parsed.path,
       entries: entries.map((entry) => ({
@@ -609,7 +659,6 @@ export class E2BSandboxProvider implements SandboxProvider {
 
   async #sandbox(
     sandboxId: string,
-    refreshBeforeUse = false,
     options: SandboxOperationOptions = {},
   ): Promise<E2BSandboxLike> {
     options.signal?.throwIfAborted();
@@ -617,7 +666,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     if (current) {
       const remainingMs = current.activeUntil - this.#now().getTime();
       const refreshThresholdMs = keepAliveIntervalMs(current.ttlSeconds) + ACTIVE_EXPIRY_SAFETY_MS;
-      if (!refreshBeforeUse && remainingMs > refreshThresholdMs) {
+      if (remainingMs > refreshThresholdMs) {
         return current.sandbox;
       }
       if (remainingMs > ACTIVE_EXPIRY_SAFETY_MS) {
@@ -627,14 +676,14 @@ export class E2BSandboxProvider implements SandboxProvider {
     }
 
     options.signal?.throwIfAborted();
-    const info = await this.#client.getInfo(sandboxId, this.#authOptions(options));
+    const info = await this.#observe("getInfo", options.signal, () => this.#client.getInfo(sandboxId, this.#authOptions(options)), sandboxId);
     if (info.state === "paused") throw new SandboxPausedError(sandboxId);
     const ttlSeconds = current?.ttlSeconds ?? positiveMetadataInteger(info?.metadata.berry_ttl_seconds) ?? DEFAULT_RECONNECT_TTL_SECONDS;
     options.signal?.throwIfAborted();
-    const sandbox = await this.#client.connect(sandboxId, {
+    const sandbox = await this.#observe("connect", options.signal, () => this.#client.connect(sandboxId, {
       ...this.#authOptions(options),
       timeoutMs: ttlSeconds * 1_000,
-    });
+    }), sandboxId);
     if (current) {
       this.#remember(sandbox, current.handle, current.resources, ttlSeconds);
     } else {
@@ -649,7 +698,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     options.signal?.throwIfAborted();
     const now = this.#now().getTime();
     const ttlMs = record.ttlSeconds * 1_000;
-    await record.sandbox.setTimeout(ttlMs, this.#requestOptions(options));
+    await this.#observe("setTimeout", options.signal, () => record.sandbox.setTimeout(ttlMs, this.#requestOptions(options)), record.handle.sandbox_id);
     record.activeUntil = now + ttlMs;
     record.handle = SandboxHandleSchema.parse({
       ...record.handle,
@@ -783,6 +832,32 @@ export class E2BSandboxProvider implements SandboxProvider {
     });
   }
 
+  async #observe<T>(
+    operation: string,
+    signal: AbortSignal | undefined,
+    action: () => Promise<T>,
+    sandboxId?: string,
+  ): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      const result = await action();
+      this.#reportOperation(operation, Date.now() - startedAt, signal?.aborted ? "cancelled" : "success");
+      return result;
+    } catch (error) {
+      if (sandboxId !== undefined && isSandboxNotFound(error)) this.#sandboxes.delete(sandboxId);
+      this.#reportOperation(operation, Date.now() - startedAt, signal?.aborted ? "cancelled" : "failure");
+      throw error;
+    }
+  }
+
+  #reportOperation(operation: string, durationMs: number, outcome: E2BOperationOutcome): void {
+    try {
+      this.#onOperation?.({ operation, durationMs: Math.max(0, durationMs), outcome });
+    } catch {
+      // Diagnostics must never change provider behavior.
+    }
+  }
+
   #requestOptions(options: SandboxOperationOptions = {}): E2BRequestOptions {
     return {
       ...(this.#requestTimeoutMs !== undefined ? { requestTimeoutMs: this.#requestTimeoutMs } : {}),
@@ -811,10 +886,14 @@ function createE2BClient(): E2BSandboxClient {
         limit: 10,
       } as SandboxListOpts);
       if (!paginator.hasNext) return undefined;
-      return (await paginator.nextItems({
+      const items = await paginator.nextItems({
         ...listOptions,
         ...(signal === undefined ? {} : { signal }),
-      } as SandboxApiOpts))[0] as E2BSandboxInfoLike | undefined;
+      } as SandboxApiOpts);
+      if (items.length > 1 || paginator.hasNext) {
+        throw new Error("E2B metadata lookup matched multiple sandboxes");
+      }
+      return items[0] as E2BSandboxInfoLike | undefined;
     },
     getInfo: async (sandboxId, options) => Sandbox.getInfo(sandboxId, options as SandboxApiOpts) as unknown as Promise<E2BSandboxInfoLike>,
     pause: (sandboxId, options) => Sandbox.pause(sandboxId, options as SandboxPauseOpts),
@@ -929,6 +1008,10 @@ function isNotFound(error: unknown): boolean {
   return error instanceof SandboxNotFoundError || (error instanceof Error && (error.name === "SandboxNotFoundError" || /not found/i.test(error.message)));
 }
 
+function isSandboxNotFound(error: unknown): boolean {
+  return error instanceof SandboxNotFoundError || (error instanceof Error && error.name === "SandboxNotFoundError");
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -951,6 +1034,12 @@ function positiveMetadataInteger(value: string | undefined): number | undefined 
 function optionalNonnegativeInteger(value: number | undefined, name: string): number | undefined {
   if (value === undefined) return undefined;
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a non-negative safe integer`);
+  return value;
+}
+
+function positiveInteger(value: number | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
   return value;
 }
 

@@ -44,6 +44,7 @@ export function sandboxProviderConfigFromEnv(env: Record<string, string | undefi
         ...(env.BERRY_E2B_REQUEST_TIMEOUT_MS ? { requestTimeoutMs: positiveInteger(env.BERRY_E2B_REQUEST_TIMEOUT_MS, "BERRY_E2B_REQUEST_TIMEOUT_MS") } : {}),
         ...(env.BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS ? { estimatedHourlyCostMicros: nonnegativeInteger(env.BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS, "BERRY_E2B_ESTIMATED_HOURLY_COST_MICROS") } : {}),
         ...(env.BERRY_E2B_MINIMUM_EXEC_COST_MICROS ? { minimumExecCostMicros: nonnegativeInteger(env.BERRY_E2B_MINIMUM_EXEC_COST_MICROS, "BERRY_E2B_MINIMUM_EXEC_COST_MICROS") } : {}),
+        ...(env.BERRY_E2B_AMBIGUOUS_CREATE_RECOVERY_TIMEOUT_MS ? { ambiguousCreateRecoveryTimeoutMs: positiveInteger(env.BERRY_E2B_AMBIGUOUS_CREATE_RECOVERY_TIMEOUT_MS, "BERRY_E2B_AMBIGUOUS_CREATE_RECOVERY_TIMEOUT_MS") } : {}),
         keepMemoryOnPause: booleanValue(env.BERRY_E2B_KEEP_MEMORY_ON_PAUSE, false),
       },
     };

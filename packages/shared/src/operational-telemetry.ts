@@ -15,6 +15,7 @@ export const OperationalEventTypeSchema = z.enum([
   "usage.settlement",
   "outbox.transition",
   "tool.manifest",
+  "sandbox.operation",
 ]);
 export type OperationalEventType = z.infer<typeof OperationalEventTypeSchema>;
 
@@ -71,6 +72,7 @@ const SAFE_FIELDS = new Set([
   "deadLetterReason",
   "workflowCategory",
   "workflowCategoryVersion",
+  "operation",
   "workerRole",
   "sourceRevision",
 ]);

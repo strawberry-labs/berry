@@ -84,14 +84,30 @@ storage_mode="$(env_value BERRY_OBJECT_STORAGE_MODE)"
 storage_mode="${storage_mode:-minio}"
 background_worker_replicas="$(env_value BERRY_BACKGROUND_WORKER_REPLICAS)"
 foreground_worker_replicas="$(env_value BERRY_FOREGROUND_WORKER_REPLICAS)"
+foreground_queue_shard_count="$(env_value BERRY_FOREGROUND_QUEUE_SHARD_COUNT)"
 background_worker_replicas="${background_worker_replicas:-1}"
 foreground_worker_replicas="${foreground_worker_replicas:-5}"
+foreground_queue_shard_count="${foreground_queue_shard_count:-$foreground_worker_replicas}"
 case "$background_worker_replicas:$foreground_worker_replicas" in
   *[!0-9:]*|0:*|*:0)
     echo "BERRY_BACKGROUND_WORKER_REPLICAS and BERRY_FOREGROUND_WORKER_REPLICAS must be positive integers." >&2
     exit 1
     ;;
 esac
+if [ "$foreground_queue_shard_count" != "$foreground_worker_replicas" ]; then
+  echo "BERRY_FOREGROUND_QUEUE_SHARD_COUNT must equal BERRY_FOREGROUND_WORKER_REPLICAS so every affinity shard has one consumer." >&2
+  exit 1
+fi
+case "$foreground_queue_shard_count" in
+  *[!0-9]*|0*)
+    echo "BERRY_FOREGROUND_QUEUE_SHARD_COUNT must be a positive integer." >&2
+    exit 1
+    ;;
+esac
+if [ "$foreground_queue_shard_count" -gt 128 ]; then
+  echo "BERRY_FOREGROUND_QUEUE_SHARD_COUNT must not exceed 128." >&2
+  exit 1
+fi
 domain="$(env_value BERRY_DOMAIN)"
 if [ -z "$domain" ]; then
   echo "BERRY_DOMAIN is required." >&2
