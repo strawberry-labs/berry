@@ -3175,7 +3175,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid AND lease_owner=$3
 INSERT INTO turn_finalizations (
   tenant_id,run_id,operation_key,terminal_state,status,completed_at
 )
-SELECT tenant_id,id,id::text || ':finalization',$4,
+SELECT tenant_id,id,id::text || ':finalization',$3::text,
        CASE WHEN sandbox_id IS NULL THEN 'skipped' ELSE 'pending' END,
        CASE WHEN sandbox_id IS NULL THEN now() ELSE NULL END
 FROM turn_runs
@@ -3200,7 +3200,7 @@ SET terminal_state=EXCLUDED.terminal_state,
     updated_at=now()
 WHERE turn_finalizations.status IN ('pending','failed','partial')
           `.trim(),
-          [snapshot.tenantId, snapshot.id, snapshot.leaseOwner, mutation.nextState],
+          [snapshot.tenantId, snapshot.id, mutation.nextState],
         );
         const finalizationOperationKey = `${snapshot.id}:finalization`;
         const hasSandbox = Boolean(mutation.sandbox?.id ?? snapshot.sandboxId);

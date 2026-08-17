@@ -2938,7 +2938,7 @@ describe("durable turn runner", () => {
   });
 
   it("settles a reopened sandboxless finalization as skipped on the next terminal commit", async () => {
-    const statements: string[] = [];
+    const statements: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
       query: async <T>(sql: string) => {
         if (sql.includes("SELECT state,cancelled_at FROM turn_runs")) {
@@ -2965,8 +2965,8 @@ describe("durable turn runner", () => {
         if (sql.includes("budget_reservations")) return [] as T[];
         throw new Error(`Unexpected query: ${sql}`);
       },
-      execute: async (sql: string) => {
-        statements.push(sql);
+      execute: async (sql: string, params: readonly unknown[] = []) => {
+        statements.push({ sql, params });
       },
     };
     const current = snapshot("calling_model", [admittedStep()]);
@@ -2981,16 +2981,18 @@ describe("durable turn runner", () => {
       taskStatus: "failed",
     });
 
-    const finalization = statements.find((sql) => sql.startsWith("INSERT INTO turn_finalizations"));
-    expect(finalization).toContain("WHEN EXCLUDED.status='skipped' THEN 'skipped'");
-    expect(finalization).toContain("WHEN EXCLUDED.status='skipped' THEN EXCLUDED.completed_at");
-    expect(finalization).toContain("manifest=CASE WHEN EXCLUDED.status='skipped' THEN NULL");
-    expect(finalization).toContain("item_count=CASE WHEN EXCLUDED.status='skipped' THEN 0");
-    const closeSteps = statements.find((sql) => sql.startsWith("UPDATE turn_steps"));
-    const closeToolCalls = statements.find((sql) => sql.startsWith("UPDATE tool_calls"));
-    expect(closeSteps).toContain("$3::text='recovery_required'");
-    expect(closeSteps).toContain("ELSE $4::text");
-    expect(closeToolCalls).toContain("$3::text='recovery_required'");
+    const finalization = statements.find(({ sql }) => sql.startsWith("INSERT INTO turn_finalizations"));
+    expect(finalization?.sql).toContain("id::text || ':finalization',$3::text");
+    expect(finalization?.params).toEqual([current.tenantId, current.id, "failed"]);
+    expect(finalization?.sql).toContain("WHEN EXCLUDED.status='skipped' THEN 'skipped'");
+    expect(finalization?.sql).toContain("WHEN EXCLUDED.status='skipped' THEN EXCLUDED.completed_at");
+    expect(finalization?.sql).toContain("manifest=CASE WHEN EXCLUDED.status='skipped' THEN NULL");
+    expect(finalization?.sql).toContain("item_count=CASE WHEN EXCLUDED.status='skipped' THEN 0");
+    const closeSteps = statements.find(({ sql }) => sql.startsWith("UPDATE turn_steps"));
+    const closeToolCalls = statements.find(({ sql }) => sql.startsWith("UPDATE tool_calls"));
+    expect(closeSteps?.sql).toContain("$3::text='recovery_required'");
+    expect(closeSteps?.sql).toContain("ELSE $4::text");
+    expect(closeToolCalls?.sql).toContain("$3::text='recovery_required'");
   });
 
   it("treats a duplicate step idempotency key as a replay instead of failing the turn", async () => {
