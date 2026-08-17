@@ -37,6 +37,7 @@ import { ConnectorsController, OrganizationConnectorsController } from "../conne
 import { SetupModule } from "../setup/setup.module.ts";
 import type { SetupService } from "../setup/setup.service.ts";
 import { QueuedFollowUpService } from "../runtime/queued-follow-up.service.js";
+import { SupportViewController } from "./support-view.controller.ts";
 
 export type AgentApiModuleOptions = {
   sessionHost: { useValue: SessionHost } | Pick<FactoryProvider<SessionHost>, "inject" | "useFactory">;
@@ -95,7 +96,7 @@ export class AgentApiModule {
         ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],
-      controllers: [AgentApiController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
+      controllers: [AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
       providers: [
         storeProvider,
         mobileDeviceProvider,

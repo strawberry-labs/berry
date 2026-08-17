@@ -37,6 +37,110 @@ describe("BerryApiClient", () => {
     );
   });
 
+  it("routes support-view reads through the admin-only subject scope", async () => {
+    const fetchImpl = vi.fn(async () => json({ items: [], nextCursor: null }));
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      supportView: { tenantId: "org_1", userId: "user/target" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await client.listFiles({ category: "documents" });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/orgs/org_1/support/users/user%2Ftarget/files?category=documents",
+      expect.objectContaining({ method: "GET", credentials: "include" }),
+    );
+  });
+
+  it("blocks every support-view mutation before a request is sent", async () => {
+    const fetchImpl = vi.fn();
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      supportView: { tenantId: "org_1", userId: "user_2" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(client.removeFileFromLibrary("file_1")).rejects.toMatchObject({
+      status: 403,
+      body: { code: "support_view_read_only" },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for reads that have no subject-scoped support endpoint", async () => {
+    const fetchImpl = vi.fn();
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      supportView: { tenantId: "org_1", userId: "user_2" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(client.listQueuedFollowUps("session_1", { limit: 100 })).rejects.toMatchObject({
+      status: 403,
+      body: { code: "support_view_read_not_available" },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before creating live streams in support view", () => {
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      supportView: { tenantId: "org_1", userId: "user_2" },
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+    });
+
+    expect(() => client.streamEvents("session_1", { onEvent: vi.fn() }))
+      .toThrow("Live event streams are not available in support view.");
+    expect(() => client.streamTaskEvents("task_1", { onEvent: vi.fn() }))
+      .toThrow("Live event streams are not available in support view.");
+  });
+
+  it("normalizes generated-image URLs to the scoped support endpoint", async () => {
+    const fileId = "00000000-0000-4000-8000-000000000010";
+    const messageId = "00000000-0000-4000-8000-000000000011";
+    const sessionId = "00000000-0000-4000-8000-000000000012";
+    const now = "2026-08-17T00:00:00.000Z";
+    const fetchImpl = vi.fn(async () => json([{
+      id: messageId,
+      sessionId,
+      role: "assistant",
+      status: "complete",
+      parts: [{
+        id: "part_1",
+        messageId,
+        kind: "image",
+        content: {
+          src: `/v1/files/${fileId}/content`,
+          downloadUrl: `/v1/files/${fileId}/content`,
+          fileId,
+          title: "Generated image",
+          aspectRatio: "1:1",
+          mimeType: "image/png",
+          transparentBackground: false,
+        },
+        position: 0,
+        createdAt: now,
+      }],
+      inputTokens: 0,
+      outputTokens: 0,
+      generationMs: 0,
+      createdAt: now,
+      updatedAt: now,
+    }]));
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      supportView: { tenantId: "org_1", userId: "user_2" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const [message] = await client.listMessages(sessionId);
+    const content = message?.parts[0]?.content as Record<string, unknown>;
+
+    expect(content.src).toBe(`https://api.berry.test/v1/orgs/org_1/support/users/user_2/files/${fileId}/content`);
+    expect(content.downloadUrl).toBe(`https://api.berry.test/v1/orgs/org_1/support/users/user_2/files/${fileId}/content?download=1`);
+  });
+
   it("removes a library membership through the authenticated file API", async () => {
     const fetchImpl = vi.fn(async () => json({ ok: true }));
     const client = new BerryApiClient({
@@ -73,6 +177,22 @@ describe("BerryApiClient", () => {
     expect(init).toEqual(expect.objectContaining({ method: "GET", credentials: "include", signal: controller.signal }));
     expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer session");
     expect(new Headers(init?.headers).get("Accept")).toBe("application/octet-stream");
+  });
+
+  it("downloads support-view attachments from the scoped content endpoint", async () => {
+    const fetchImpl = vi.fn(async () => new Response(new Blob(["attachment"])));
+    const client = new BerryApiClient({
+      baseUrl: "https://api.berry.test",
+      supportView: { tenantId: "org_1", userId: "user_2" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await client.downloadFile("file_1");
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/orgs/org_1/support/users/user_2/files/file_1/content?download=1",
+      expect.objectContaining({ method: "GET", credentials: "include" }),
+    );
   });
 
   it("returns structured errors when a private file download is rejected", async () => {

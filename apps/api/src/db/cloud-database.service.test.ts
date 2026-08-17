@@ -46,6 +46,17 @@ class FakeExecutor implements SqlExecutor {
   }
 }
 
+function countTransactionalMigrationRanges(): number {
+  let count = 0;
+  let inTransactionalRange = false;
+  for (const migration of cloudMigrations) {
+    const isTransactional = !("transactional" in migration && migration.transactional === false);
+    if (isTransactional && !inTransactionalRange) count += 1;
+    inTransactionalRange = isTransactional;
+  }
+  return count;
+}
+
 describe("CloudDatabaseService", () => {
   it("runs unapplied cloud migrations and exposes the self-host tenant default", async () => {
     const executor = new FakeExecutor();
@@ -66,7 +77,7 @@ describe("CloudDatabaseService", () => {
         "INSERT INTO schema_migrations (id, name) VALUES ($1, $2)",
       ]),
     );
-    expect(executor.transactionCount).toBe(2);
+    expect(executor.transactionCount).toBe(countTransactionalMigrationRanges());
     expect(executor.sessionCount).toBe(
       cloudMigrations.filter((migration) => "transactional" in migration && migration.transactional === false).length,
     );

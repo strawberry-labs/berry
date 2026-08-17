@@ -8,7 +8,7 @@ export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpe
   tasks: Task[];
   workspaces: Workspace[];
   onOpenTask: (taskId: string) => void;
-  onSettings: () => void;
+  onSettings?: (() => void) | undefined;
   onHelp: () => void;
 }) {
   const workspaceNames = new Map(workspaces.map((workspace) => [
@@ -32,7 +32,7 @@ export function WebCommandPalette({ open, onOpenChange, tasks, workspaces, onOpe
       <CommandList>
         <CommandEmpty>No tasks or actions found.</CommandEmpty>
         <CommandGroup heading="Actions">
-          <CommandItem value="settings preferences" onSelect={() => select(onSettings)}><Settings /> Settings <CommandShortcut>⌘,</CommandShortcut></CommandItem>
+          {onSettings ? <CommandItem value="settings preferences" onSelect={() => select(onSettings)}><Settings /> Settings <CommandShortcut>⌘,</CommandShortcut></CommandItem> : null}
           <CommandItem value="help docs support diagnostics" onSelect={() => select(onHelp)}><CircleHelp /> Help and diagnostics</CommandItem>
         </CommandGroup>
         <CommandGroup heading="Tasks">

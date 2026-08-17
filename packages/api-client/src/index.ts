@@ -92,6 +92,7 @@ import {
   DepartmentPageSchema,
   EffectivePermissionsSchema,
   FeatureFlagSchema,
+  GeneratedImageContentSchema,
   HostPushEventSchema,
   MessageHistoryPageSchema,
   MessageSchema,
@@ -218,6 +219,7 @@ import {
   type EffectivePermissions,
   type FeatureFlag,
   type HostPushEvent,
+  type JsonValue,
   type Message,
   type MessageHistoryPage,
   type MemoryItem,
@@ -292,6 +294,7 @@ export interface BerryApiClientOptions {
   baseUrl: string;
   fetchImpl?: typeof fetch | undefined;
   headers?: HeadersInit | undefined;
+  supportView?: { tenantId: string; userId: string } | undefined;
 }
 
 export interface CreateTaskRequest {
@@ -576,6 +579,7 @@ export class BerryApiClient {
   readonly #fetch: typeof fetch;
   readonly #headers: HeadersInit | undefined;
   readonly #useXhrUploads: boolean;
+  readonly #supportView: { tenantId: string; userId: string } | undefined;
 
   constructor(options: BerryApiClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -585,6 +589,7 @@ export class BerryApiClient {
     // invocation, so normalize every implementation through a bare call.
     this.#fetch = (...args) => fetchImpl(...args);
     this.#headers = options.headers;
+    this.#supportView = options.supportView;
     this.#useXhrUploads = options.fetchImpl === undefined && typeof globalThis.XMLHttpRequest !== "undefined";
   }
 
@@ -877,8 +882,9 @@ export class BerryApiClient {
   async downloadFile(fileId: string, options: { signal?: AbortSignal } = {}): Promise<Blob> {
     const headers = new Headers(this.#headers);
     headers.set("Accept", "application/octet-stream");
+    const path = this.#supportPath(`/v1/files/${encodeURIComponent(fileId)}/content?download=1`);
     const response = await this.#fetch(
-      `${this.#baseUrl}/v1/files/${encodeURIComponent(fileId)}/content?download=1`,
+      `${this.#baseUrl}${path}`,
       { method: "GET", headers, credentials: "include", ...(options.signal ? { signal: options.signal } : {}) },
     );
     if (!response.ok) {
@@ -1121,14 +1127,15 @@ export class BerryApiClient {
   }
 
   async listMessages(sessionId: string): Promise<Message[]> {
-    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, z.array(MessageSchema));
+    const messages = await this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, z.array(MessageSchema));
+    return messages.map((message) => this.#resolveMessageFileUrls(message));
   }
 
   async getMessage(sessionId: string, messageId: string): Promise<Message> {
-    return this.#request(
+    return this.#resolveMessageFileUrls(await this.#request(
       `/v1/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
       MessageSchema,
-    );
+    ));
   }
 
   async listMessagePage(sessionId: string, options: {
@@ -1152,7 +1159,7 @@ export class BerryApiClient {
     // long-history production traffic.
     if (Array.isArray(response)) {
       return {
-        messages: response,
+        messages: response.map((message) => this.#resolveMessageFileUrls(message)),
         hasOlder: false,
         hasNewer: false,
         oldestSequence: null,
@@ -1162,7 +1169,7 @@ export class BerryApiClient {
         historyDeletionRevision: null,
       };
     }
-    return response;
+    return { ...response, messages: response.messages.map((message) => this.#resolveMessageFileUrls(message)) };
   }
 
   async getSession(sessionId: string): Promise<Session> {
@@ -1805,6 +1812,9 @@ export class BerryApiClient {
     onError?: (error: unknown) => void;
     onOpen?: () => void;
   }, cursor?: string | null): EventSource {
+    if (this.#supportView) {
+      throw new BerryApiError("Live event streams are not available in support view.", 403, { code: "support_view_read_not_available" });
+    }
     const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
     const source = new EventSource(`${this.#baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`);
     source.onopen = () => callbacks.onOpen?.();
@@ -1826,6 +1836,9 @@ export class BerryApiClient {
     onError?: (error: unknown) => void;
     onOpen?: () => void;
   }): EventSource {
+    if (this.#supportView) {
+      throw new BerryApiError("Live event streams are not available in support view.", 403, { code: "support_view_read_not_available" });
+    }
     const source = new EventSource(`${this.#baseUrl}/v1/tasks/${encodeURIComponent(taskId)}/events`);
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
@@ -1861,8 +1874,30 @@ export class BerryApiClient {
     const base = `${this.#baseUrl}/`;
     return {
       ...file,
-      previewUrl: new URL(file.previewUrl, base).toString(),
-      downloadUrl: new URL(file.downloadUrl, base).toString(),
+      previewUrl: new URL(this.#supportPath(file.previewUrl), base).toString(),
+      downloadUrl: new URL(this.#supportPath(file.downloadUrl), base).toString(),
+    };
+  }
+
+  #resolveMessageFileUrls(message: Message): Message {
+    if (!this.#supportView || !this.#baseUrl) return message;
+    const base = `${this.#baseUrl}/`;
+    return {
+      ...message,
+      parts: message.parts.map((part) => {
+        if (part.kind !== "image") return part;
+        const image = GeneratedImageContentSchema.safeParse(part.content);
+        if (!image.success || !image.data.fileId) return part;
+        const contentPath = this.#supportPath(`/v1/files/${encodeURIComponent(image.data.fileId)}/content`);
+        return {
+          ...part,
+          content: {
+            ...(part.content as Record<string, JsonValue>),
+            src: new URL(contentPath, base).toString(),
+            downloadUrl: new URL(`${contentPath}?download=1`, base).toString(),
+          },
+        };
+      }),
     };
   }
 
@@ -1875,18 +1910,40 @@ export class BerryApiClient {
   }
 
   async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
+    const method = init.method ?? "GET";
+    if (this.#supportView && method !== "GET" && method !== "HEAD") {
+      throw new BerryApiError("Support view is read-only. Exit support view to make changes.", 403, { code: "support_view_read_only" });
+    }
     const headers = new Headers(this.#headers);
     headers.set("Accept", "application/json");
-    const request: RequestInit = { method: init.method ?? "GET", headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
+    const request: RequestInit = { method, headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
     if (init.body !== undefined) {
       headers.set("Content-Type", "application/json");
       request.body = JSON.stringify(init.body);
     }
-    const response = await this.#fetch(`${this.#baseUrl}${path}`, request);
+    const response = await this.#fetch(`${this.#baseUrl}${this.#supportPath(path)}`, request);
     const contentType = response.headers.get("content-type") ?? "";
     const body = contentType.includes("application/json") ? await response.json() : await response.text();
     return { response, body };
   }
+
+  #supportPath(path: string): string {
+    const support = this.#supportView;
+    if (!support) return path;
+    const pathname = path.split("?", 1)[0] ?? path;
+    if (!isSupportReadPath(pathname)) {
+      throw new BerryApiError("This resource is not available in support view.", 403, { code: "support_view_read_not_available" });
+    }
+    return `/v1/orgs/${encodeURIComponent(support.tenantId)}/support/users/${encodeURIComponent(support.userId)}${path.slice(3)}`;
+  }
+}
+
+function isSupportReadPath(pathname: string): boolean {
+  if (pathname === "/v1/workspaces/page") return true;
+  if (pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;
+  if (/^\/v1\/tasks\/(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|task_[0-9a-f]{32})$/i.test(pathname)) return true;
+  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?)?$/.test(pathname)) return true;
+  return pathname === "/v1/files" || /^\/v1\/files\/[^/]+(?:\/content)?$/.test(pathname);
 }
 
 function uploadBlobWithXhr(

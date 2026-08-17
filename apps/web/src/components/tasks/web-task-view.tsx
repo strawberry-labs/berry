@@ -21,7 +21,7 @@ const DocumentPreviewModal = React.lazy(async () => ({
   default: (await import("../library/document-preview-modal")).DocumentPreviewModal,
 }));
 
-export function Thread({ sessionId, taskId, messages, stream: initialStream, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, onLoadOlderMessages, hasOlderMessages = false, loadingOlderMessages = false, scrollRequest = 0 }: {
+export function Thread({ sessionId, taskId, messages, stream: initialStream, client, config, taskTitles, imageGeneration, onRetryImage, onEditGeneratedImage, onRegenerateGeneratedImage, editTurn, readOnly = false, recoveryRequired = false, activeStatus, cancelTurn, onViewTaskFiles, onLoadOlderMessages, hasOlderMessages = false, loadingOlderMessages = false, scrollRequest = 0 }: {
   sessionId: string;
   taskId: string;
   messages: Message[];
@@ -34,6 +34,7 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
   onEditGeneratedImage?: ((image: GeneratedImageView, instruction: string, annotations: ImageEditAnnotation[]) => void | Promise<void>) | undefined;
   onRegenerateGeneratedImage?: ((image: GeneratedImageView, aspectRatio: "1:1" | "3:4" | "4:3" | "9:16" | "16:9") => void | Promise<void>) | undefined;
   editTurn?: ((message: Message, text: string) => Promise<void>) | undefined;
+  readOnly?: boolean;
   recoveryRequired?: boolean;
   activeStatus?: string | undefined;
   cancelTurn: () => Promise<void>;
@@ -98,29 +99,31 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
         />
       ),
     } : {}),
-    ...(onEditGeneratedImage ? { onEditGeneratedImage } : {}),
-    ...(onRegenerateGeneratedImage ? { onRegenerateGeneratedImage } : {}),
+    ...(!readOnly && onEditGeneratedImage ? { onEditGeneratedImage } : {}),
+    ...(!readOnly && onRegenerateGeneratedImage ? { onRegenerateGeneratedImage } : {}),
     ...(client ? {
-      onApprovalDecide: async (approval, decision) => {
-        if (decision === "abort") {
-          await cancelTurn();
-          return;
-        }
-        await client.decideApproval(approval.approvalId, { decision });
-      },
-      onQuestionAnswer: async (question, answer, selectedOptions) => {
-        const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
-        await client.appendMessage(sessionId, {
-          messageId: answerMessageId,
-          role: "user",
-          parts: [{ kind: "text", content: answer }],
-        });
-        await client.answerQuestion(question.questionId, {
-          answer,
-          answerMessageId,
-          selectedOptions,
-        });
-      },
+      ...(!readOnly ? {
+        onApprovalDecide: async (approval, decision) => {
+          if (decision === "abort") {
+            await cancelTurn();
+            return;
+          }
+          await client.decideApproval(approval.approvalId, { decision });
+        },
+        onQuestionAnswer: async (question, answer, selectedOptions) => {
+          const answerMessageId = await stableQuestionAnswerMessageId(question.questionId);
+          await client.appendMessage(sessionId, {
+            messageId: answerMessageId,
+            role: "user",
+            parts: [{ kind: "text", content: answer }],
+          });
+          await client.answerQuestion(question.questionId, {
+            answer,
+            answerMessageId,
+            selectedOptions,
+          });
+        },
+      } : {}),
       onOpenAttachment: async (attachment) => {
         if (!attachment.fileId) return;
         try {
@@ -147,7 +150,7 @@ export function Thread({ sessionId, taskId, messages, stream: initialStream, cli
       },
       ...(onViewTaskFiles ? { onViewTaskFiles } : {}),
     } : {}),
-  }), [cancelTurn, client, config, editTurn, onEditGeneratedImage, onRegenerateGeneratedImage, onViewTaskFiles, taskId, taskTitles]);
+  }), [cancelTurn, client, config, editTurn, onEditGeneratedImage, onRegenerateGeneratedImage, onViewTaskFiles, readOnly, sessionId, taskId, taskTitles]);
   const activeImageTool = [...stream.timeline].reverse().find(
     (entry): entry is ToolEntry => entry.kind === "tool" && entry.name === "create_image" && entry.status === "running",
   );

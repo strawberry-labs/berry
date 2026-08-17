@@ -1807,7 +1807,12 @@ code, pre {
 }
 
 .berry-web-shell-frame {
-  height: 100svh;
+  min-height: 0;
+  flex: 1 1 0%;
+}
+
+.berry-web-shell-frame .berry-main-panel {
+  height: 100%;
 }
 
 /* Codex-derived type scale. Scope these overrides to the web surface so the

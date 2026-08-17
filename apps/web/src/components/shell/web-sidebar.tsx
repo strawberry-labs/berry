@@ -88,7 +88,7 @@ export function WebWindowChrome({ onHome, onSearch }: {
   );
 }
 
-export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onUsage, onSettings, onSignOut }: {
+export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeWorkspaceId, activeTaskId, tasksSelected, librarySelected, management, loadError, user, allowance, allowanceLoading, onRefreshAllowance, onNewTask, onCreateProject, onSelectWorkspace, onSelectTasks, onOpenTask, onToggleTaskPinned, onArchiveTask, onDeleteTask, onRenameTask, onShareTask, onToggleProjectPinned, onRenameProject, onArchiveProjectTasks, onRemoveProject, onRevealProject, onUploadToProject, onSkills, onLibrary, onUsage, onSettings, onSignOut, readOnly = false }: {
   workspaces: Workspace[];
   tasksByWorkspace: Record<string, Task[]>;
   generalTasks: Task[];
@@ -130,6 +130,7 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
   onUsage: () => void;
   onSettings: () => void;
   onSignOut: () => void;
+  readOnly?: boolean;
 }) {
   const { isMobile, setOpenMobile } = useSidebar();
   const allTasks = [...Object.values(tasksByWorkspace).flat(), ...generalTasks];
@@ -156,22 +157,24 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
         onSelectProject={onSelectWorkspace}
         onSelectChats={onSelectTasks}
         onOpenConversation={onOpenTask}
-        onToggleConversationPinned={onToggleTaskPinned}
-        onArchiveConversation={onArchiveTask}
-        onDeleteConversation={onDeleteTask}
-        onRenameConversation={onRenameTask}
-        onShareConversation={onShareTask}
-        onCreateProject={onCreateProject}
-        onNewProjectConversation={(workspace) => onSelectWorkspace(workspace.id)}
+        {...(!readOnly ? {
+          onToggleConversationPinned: onToggleTaskPinned,
+          onArchiveConversation: onArchiveTask,
+          onDeleteConversation: onDeleteTask,
+          onRenameConversation: onRenameTask,
+          onShareConversation: onShareTask,
+          onCreateProject,
+          onNewProjectConversation: (workspace: Workspace) => onSelectWorkspace(workspace.id),
+          renderProjectAction: (workspace: Workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveTasks={onArchiveProjectTasks} onRemove={onRemoveProject} onReveal={onRevealProject} onUpload={onUploadToProject} />,
+        } : {})}
         onAfterNavigate={() => { if (isMobile) setOpenMobile(false); }}
         formatAge={timeAgo}
-        renderProjectAction={(workspace) => <WebProjectRowActions workspace={workspace} tasks={tasksByWorkspace[workspace.id] ?? []} onTogglePinned={onToggleProjectPinned} onRename={onRenameProject} onArchiveTasks={onArchiveProjectTasks} onRemove={onRemoveProject} onReveal={onRevealProject} onUpload={onUploadToProject} />}
         commands={(
           <>
             <SidebarMenu className="berry-sidebar-commands">
-              <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New task</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem>
-              <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem>
-              <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem>
+              {!readOnly ? <SidebarMenuItem><SidebarMenuButton onClick={onNewTask} className="berry-sidebar-command berry-sidebar-command-primary font-medium"><PencilEdit02Icon /><span>New task</span><Kbd className="ml-auto" aria-hidden>⌘⇧O</Kbd></SidebarMenuButton></SidebarMenuItem> : null}
+              {!readOnly ? <SidebarMenuItem><SidebarMenuButton aria-label="Open capabilities" onClick={onSkills} className="berry-sidebar-command"><Wand2 /><span>Skills</span></SidebarMenuButton></SidebarMenuItem> : null}
+              {!readOnly ? <SidebarMenuItem><SidebarMenuButton isActive={librarySelected} aria-label="Open library" onClick={onLibrary} className="berry-sidebar-command"><FolderOpen /><span>Library</span></SidebarMenuButton></SidebarMenuItem> : null}
             </SidebarMenu>
           </>
         )}
@@ -221,8 +224,8 @@ export function WebSidebar({ workspaces, tasksByWorkspace, generalTasks, activeW
               </div>
             </PopoverContent>
           </Popover>
-          <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" aria-current={management ? "page" : undefined} data-active={management ? "true" : undefined} className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button>
-          {user ? <Button variant="ghost" size="icon-sm" onClick={onSignOut} aria-label="Sign out" className="berry-sidebar-mini-control"><LogOut size={15} /></Button> : null}
+          {!readOnly ? <Button variant="ghost" size="icon-lg" onClick={onSettings} aria-label="Settings" aria-current={management ? "page" : undefined} data-active={management ? "true" : undefined} className="berry-sidebar-mini-control berry-sidebar-footer-control"><SettingsIcon /></Button> : null}
+          {user && !readOnly ? <Button variant="ghost" size="icon-sm" onClick={onSignOut} aria-label="Sign out" className="berry-sidebar-mini-control"><LogOut size={15} /></Button> : null}
         </div>
       </SidebarFooter>
     </Sidebar>

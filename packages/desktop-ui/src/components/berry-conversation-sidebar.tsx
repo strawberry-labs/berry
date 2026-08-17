@@ -440,6 +440,7 @@ function ConversationActions({ task, onTogglePinned, onArchive, onDelete, onRena
   onRename?: ((task: Task) => void | Promise<void>) | undefined;
   onShare?: ((task: Task) => void | Promise<void>) | undefined;
 }) {
+  if (!onTogglePinned && !onArchive && !onDelete && !onRename && !onShare) return null;
   return (
     <>
       <SidebarMenuAction

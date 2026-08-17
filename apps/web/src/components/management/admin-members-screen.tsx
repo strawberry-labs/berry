@@ -1,6 +1,7 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Copy, Download, FileUp, Plus, Save, Search, UserPlus, Users } from "lucide-react";
+import { Copy, Download, Eye, FileUp, Plus, Save, Search, UserPlus, Users } from "lucide-react";
+import { toast } from "sonner";
 import {
   AsyncState, Button, Checkbox, DataTable, FormSelect, Input, ManagementDialog,
   ManagementPage, MetricGrid, SearchInput, Section, StatusPill, SuccessMessage,
@@ -13,6 +14,7 @@ import {
 } from "./usage-controls";
 import { parseMemberImportCsv, type MemberImportRow } from "../../lib/member-import";
 import { memberAccessStatusOptions, memberStatusUpdate } from "../../lib/member-administration";
+import { startSupportView } from "../../lib/support-view";
 export function AdminMembersScreen({
   client,
   config,
@@ -509,7 +511,25 @@ export function AdminMembersScreen({
             <StatusPill tone={m.status === "active" ? "good" : "warning"}>
               {m.status}
             </StatusPill>,
-            permissions.includes("members:write") ? <Button variant="secondary" onClick={() => openMember(m)}>Manage</Button> : null,
+            <div className="flex items-center justify-end gap-1.5">
+              {(actorRole === "owner" || actorRole === "admin") && m.userId !== userId ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    if (!userId) return;
+                    try {
+                      startSupportView({ tenantId, userId: m.userId, name: m.name ?? "", email: m.email ?? "" }, userId);
+                      void navigate({ to: "/" });
+                    } catch (cause) {
+                      toast.error(cause instanceof Error ? cause.message : "Support view could not be started.");
+                    }
+                  }}
+                >
+                  <Eye /> View as user
+                </Button>
+              ) : null}
+              {permissions.includes("members:write") ? <Button variant="secondary" onClick={() => openMember(m)}>Manage</Button> : null}
+            </div>,
           ])}
         />
       </AsyncState>
