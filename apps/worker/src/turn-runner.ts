@@ -461,8 +461,8 @@ const DEFAULT_NO_PROGRESS_WARNING_THRESHOLD = 3;
 const DEFAULT_NO_PROGRESS_HARD_THRESHOLD = 5;
 const DEFAULT_CUMULATIVE_TOOL_TIME_MS = 30 * 60_000;
 const DEFAULT_ACTIVE_COMPUTE_MS = 2 * 60 * 60_000;
-const MAX_TOOL_RESULT_CONTEXT_CHARS = 2_000;
-const MAX_TOOL_CONTEXT_CHARS = 48_000;
+const TOOL_CONTEXT_CHARACTERS_PER_TOKEN = 4;
+const MAX_TOOL_CONTEXT_ENVELOPE_CHARS = 4 * 1024 * 1024;
 const DEFAULT_TOOL_LIMITS: Record<"read" | "command" | "connector" | "image" | "default", ToolExecutionLimit> = {
   read: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
   command: { idleTimeoutMs: 180_000, maxDurationMs: 20 * 60_000 },
@@ -4904,6 +4904,7 @@ export function modelMessages(
   const system = [stableSystemPrompt, dynamicSystem].filter(Boolean).join("\n\n");
   const messages: ChatMessage[] = [{ role: "system", content: system }];
   let toolContextCharacters = 0;
+  const toolContextBudget = modelWindowToolContextCharacters(snapshot);
   for (const entry of uncompactedEntries(snapshot)) {
     const payload = record(entry.payload);
     const message = record(payload?.message);
@@ -4943,7 +4944,7 @@ export function modelMessages(
       const toolContent = boundedToolResultContext(
         entry.entryId,
         rawToolContent,
-        Math.max(0, MAX_TOOL_CONTEXT_CHARS - toolContextCharacters),
+        Math.max(0, toolContextBudget - toolContextCharacters),
       );
       toolContextCharacters += toolContent.length;
       messages.push({
@@ -5025,7 +5026,7 @@ function durableToolResultText(output: JsonValue): string {
 
 function boundedToolResultContext(entryId: string, content: string, remainingBudget: number): string {
   const reference = `[durable-result:${entryId}] The complete tool result is persisted; rerun the tool with a narrower scope if more detail is needed.`;
-  const budget = Math.max(0, Math.min(MAX_TOOL_RESULT_CONTEXT_CHARS, Math.floor(remainingBudget)));
+  const budget = Math.max(0, Math.floor(remainingBudget));
   if (budget === 0) return "";
   if (!content) return reference.slice(0, budget);
   if (budget <= reference.length) return reference.slice(0, budget);
@@ -5036,6 +5037,19 @@ function boundedToolResultContext(entryId: string, content: string, remainingBud
   const head = Math.ceil(available * 0.7);
   const tail = Math.max(0, available - head);
   return `${reference}\n${content.slice(0, head)}${marker}${tail > 0 ? content.slice(-tail) : ""}`;
+}
+
+function modelWindowToolContextCharacters(snapshot: DurableTurnSnapshot): number {
+  const contextWindow = Math.max(
+    1,
+    Math.floor(numberValue(snapshot.runtimeRequest.contextWindowTokens) ?? 128_000),
+  );
+  const reservedTokens = DEFAULT_COMPACTION_SETTINGS.reserveTokens + MODEL_CONTEXT_SAFETY_TOKENS;
+  const availableTokens = Math.max(1, contextWindow - reservedTokens);
+  return Math.min(
+    MAX_TOOL_CONTEXT_ENVELOPE_CHARS,
+    availableTokens * TOOL_CONTEXT_CHARACTERS_PER_TOKEN,
+  );
 }
 
 function automaticDurableAttachmentSkill(
@@ -6242,12 +6256,12 @@ async function closeTerminalChildren(
     `
 UPDATE turn_steps
 SET state=CASE
-      WHEN $3='recovery_required' AND state='recovery_required' THEN state
-      ELSE $4
+      WHEN $3::text='recovery_required' AND state='recovery_required' THEN state
+      ELSE $4::text
     END,
     error=CASE
       WHEN error IS NOT NULL THEN error
-      ELSE CASE WHEN $3 IN ('failed','recovery_required') THEN 'Closed with terminal run' ELSE 'Cancelled with terminal run' END
+      ELSE CASE WHEN $3::text IN ('failed','recovery_required') THEN 'Closed with terminal run' ELSE 'Cancelled with terminal run' END
     END,
     completed_at=COALESCE(completed_at,now()),
     closure_reason=COALESCE(closure_reason,'terminal_run'),
@@ -6262,7 +6276,7 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
     `
 UPDATE tool_calls
 SET status=CASE
-      WHEN $3='recovery_required' AND status='running' THEN 'failed'::tool_call_status
+      WHEN $3::text='recovery_required' AND status='running' THEN 'failed'::tool_call_status
       WHEN status IN ('pending','waiting-for-approval','running') THEN $4::tool_call_status
       ELSE status
     END,

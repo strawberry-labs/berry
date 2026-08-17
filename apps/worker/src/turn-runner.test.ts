@@ -688,7 +688,7 @@ describe("durable turn runner", () => {
     expect(receivedMaxTokens).toBeLessThanOrEqual(49_000);
   });
 
-  it("hard-bounds aggregate context across more than twenty-four tool results", () => {
+  it("keeps complete tool results when they fit the model-window envelope", () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     for (let index = 0; index < 30; index += 1) {
       current.entries.push({
@@ -711,15 +711,35 @@ describe("durable turn runner", () => {
 
     const toolMessages = modelMessages(current).messages.filter((message) => message.role === "tool");
     expect(toolMessages).toHaveLength(30);
-    let remainingBudget = 48_000;
-    for (const message of toolMessages) {
-      const length = String(message.content).length;
-      expect(length).toBeLessThanOrEqual(Math.min(2_000, remainingBudget));
-      remainingBudget -= length;
-    }
-    expect(toolMessages.reduce((total, message) => total + String(message.content).length, 0)).toBeLessThanOrEqual(48_000);
-    expect(String(toolMessages[0]?.content)).toContain("[durable-result:tool-entry-0]");
-    expect(String(toolMessages[24]?.content)).toBe("");
+    expect(String(toolMessages[0]?.content)).toBe(`${"unchanged-result ".repeat(400)}-0`);
+    expect(String(toolMessages[24]?.content)).toBe(`${"unchanged-result ".repeat(400)}-24`);
+    expect(toolMessages.reduce((total, message) => total + String(message.content).length, 0)).toBeGreaterThan(48_000);
+  });
+
+  it("bounds tool results at the model-window envelope before provider submission", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 32_000;
+    current.entries.push({
+      entryId: "huge-tool-entry",
+      parentEntryId: current.entries.at(-1)?.entryId ?? null,
+      entryType: "message",
+      sequence: current.entries.length + 1,
+      payload: {
+        type: "message",
+        id: "huge-tool-entry",
+        message: {
+          role: "toolResult",
+          toolCallId: "huge-tool-call",
+          toolName: "connector_search",
+          content: [{ type: "text", text: "x".repeat(200_000) }],
+        },
+      },
+    });
+
+    const toolMessage = modelMessages(current).messages.find((message) => message.role === "tool");
+    expect(String(toolMessage?.content).length).toBeLessThanOrEqual((32_000 - 16_384 - 1_024) * 4);
+    expect(String(toolMessage?.content)).toContain("[durable-result:huge-tool-entry]");
+    expect(String(toolMessage?.content)).toContain("[result content bounded]");
   });
 
   it("reclaims an expired lease from the persisted pending model step", async () => {
@@ -2966,6 +2986,11 @@ describe("durable turn runner", () => {
     expect(finalization).toContain("WHEN EXCLUDED.status='skipped' THEN EXCLUDED.completed_at");
     expect(finalization).toContain("manifest=CASE WHEN EXCLUDED.status='skipped' THEN NULL");
     expect(finalization).toContain("item_count=CASE WHEN EXCLUDED.status='skipped' THEN 0");
+    const closeSteps = statements.find((sql) => sql.startsWith("UPDATE turn_steps"));
+    const closeToolCalls = statements.find((sql) => sql.startsWith("UPDATE tool_calls"));
+    expect(closeSteps).toContain("$3::text='recovery_required'");
+    expect(closeSteps).toContain("ELSE $4::text");
+    expect(closeToolCalls).toContain("$3::text='recovery_required'");
   });
 
   it("treats a duplicate step idempotency key as a replay instead of failing the turn", async () => {
