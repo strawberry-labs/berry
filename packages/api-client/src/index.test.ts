@@ -53,19 +53,19 @@ describe("BerryApiClient", () => {
     );
   });
 
-  it("blocks every support-view mutation before a request is sent", async () => {
-    const fetchImpl = vi.fn();
+  it("routes support-view mutations through the admin-only subject scope", async () => {
+    const fetchImpl = vi.fn(async () => json({ ok: true }));
     const client = new BerryApiClient({
       baseUrl: "https://api.berry.test",
       supportView: { tenantId: "org_1", userId: "user_2" },
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
 
-    await expect(client.removeFileFromLibrary("file_1")).rejects.toMatchObject({
-      status: 403,
-      body: { code: "support_view_read_only" },
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(client.removeFileFromLibrary("file_1")).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/orgs/org_1/support/users/user_2/files/file_1",
+      expect.objectContaining({ method: "DELETE", credentials: "include" }),
+    );
   });
 
   it("fails closed for reads that have no subject-scoped support endpoint", async () => {
@@ -76,24 +76,34 @@ describe("BerryApiClient", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
 
-    await expect(client.listQueuedFollowUps("session_1", { limit: 100 })).rejects.toMatchObject({
+    await expect(client.listPersonalSkills()).rejects.toMatchObject({
       status: 403,
       body: { code: "support_view_read_not_available" },
     });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("fails closed before creating live streams in support view", () => {
+  it("routes live support-view streams through the subject scope", () => {
+    class FakeEventSource {
+      onopen: (() => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      onmessage: ((event: { data: string; lastEventId?: string }) => void) | null = null;
+      constructor(readonly url: string, readonly init: EventSourceInit) {}
+      close() {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
     const client = new BerryApiClient({
       baseUrl: "https://api.berry.test",
       supportView: { tenantId: "org_1", userId: "user_2" },
       fetchImpl: vi.fn() as unknown as typeof fetch,
     });
 
-    expect(() => client.streamEvents("session_1", { onEvent: vi.fn() }))
-      .toThrow("Live event streams are not available in support view.");
-    expect(() => client.streamTaskEvents("task_1", { onEvent: vi.fn() }))
-      .toThrow("Live event streams are not available in support view.");
+    const sessionSource = client.streamEvents("session_1", { onEvent: vi.fn() });
+    const taskSource = client.streamTaskEvents("task_1", { onEvent: vi.fn() });
+    expect(sessionSource.url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/sessions/session_1/events");
+    expect(taskSource.url).toBe("https://api.berry.test/v1/orgs/org_1/support/users/user_2/tasks/task_1/events");
+    expect((sessionSource as unknown as FakeEventSource).init).toEqual({ withCredentials: true });
+    vi.unstubAllGlobals();
   });
 
   it("normalizes generated-image URLs to the scoped support endpoint", async () => {

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AUDIT_SERVICE } from "../audit/audit.service.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 import { ENTERPRISE_IDENTITY_REPOSITORY } from "../identity/identity.repository.ts";
+import { AgentApiController } from "./agent-api.controller.ts";
 import { CLOUD_TASK_STORE } from "./cloud-task-store.ts";
 import { SupportViewController } from "./support-view.controller.ts";
 
@@ -20,7 +21,7 @@ function requestFor(userId: string) {
   return { auth: { user: { id: userId } }, headers: {} } as any;
 }
 
-async function controllerFor(role: "owner" | "admin" | "member") {
+async function controllerFor(role: "owner" | "admin" | "member", agentApi?: unknown) {
   const generatedImageMessage = {
     id: messageId,
     sessionId,
@@ -84,6 +85,7 @@ async function controllerFor(role: "owner" | "admin" | "member") {
       { provide: ENTERPRISE_IDENTITY_REPOSITORY, useValue: identity },
       { provide: FilePlatformService, useValue: files },
       { provide: AUDIT_SERVICE, useValue: audit },
+      ...(agentApi ? [{ provide: AgentApiController, useValue: agentApi }] : []),
     ],
   }).compile();
   return {
@@ -116,6 +118,33 @@ describe("SupportViewController", () => {
 
     await expect(controller.tasks(requestFor(actorId), SELF_HOST_TENANT_ID, subjectId, {}))
       .rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it("delegates turns with the selected member as the effective owner", async () => {
+    const agentApi = {
+      startTurn: vi.fn(async (_request: unknown, _sessionId: string, _body: unknown) => ({ turnId: "turn_1", sessionId })),
+    };
+    const { audit, controller } = await controllerFor("admin", agentApi);
+
+    await expect(controller.startTurn(
+      requestFor(actorId),
+      SELF_HOST_TENANT_ID,
+      subjectId,
+      sessionId,
+      { input: "Run this prompt", workspacePath: "/workspace" },
+    )).resolves.toEqual({ turnId: "turn_1", sessionId });
+
+    const delegatedRequest = agentApi.startTurn.mock.calls[0]?.[0] as any;
+    expect(delegatedRequest.auth.user.id).toBe(subjectId);
+    expect(delegatedRequest.auth.session.userId).toBe(subjectId);
+    expect(audit.append).toHaveBeenCalledWith(expect.objectContaining({
+      actorUserId: actorId,
+      action: "support-view-write",
+      targetType: "turn",
+      targetId: sessionId,
+      sessionId,
+      metadata: { subjectUserId: subjectId },
+    }));
   });
 
   it("verifies session ownership before returning messages", async () => {

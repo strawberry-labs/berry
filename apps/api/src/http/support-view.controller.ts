@@ -1,4 +1,4 @@
-import { BadRequestException, Controller, ForbiddenException, Get, Inject, NotFoundException, Param, Query, Req, Res } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Headers, Inject, NotFoundException, Optional, Param, Patch, Post, Query, Req, Res, ServiceUnavailableException, Sse } from "@nestjs/common";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import {
   GeneratedImageContentSchema,
@@ -7,6 +7,7 @@ import {
   type JsonValue,
   type Message,
   type MessageHistoryPage,
+  type OrgMembership,
   type Session,
 } from "@berry/shared";
 import type { ServerResponse } from "node:http";
@@ -18,6 +19,7 @@ import {
   type EnterpriseIdentityRepository,
 } from "../identity/identity.repository.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
+import { CompleteSchema, InitiateSchema, PartNumbersSchema } from "../files/file-platform.controller.ts";
 import { INVALID_FILE_CACHE_CONTROL } from "../files/file-response-security.ts";
 import {
   CLOUD_TASK_STORE,
@@ -25,6 +27,7 @@ import {
   MESSAGE_HISTORY_MAX_CURSOR,
   type CloudTaskStore,
 } from "./cloud-task-store.ts";
+import { AgentApiController } from "./agent-api.controller.ts";
 
 const MessageHistoryCursorSchema = z.string()
   .regex(/^[1-9]\d*$/)
@@ -63,7 +66,170 @@ export class SupportViewController {
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
     @Inject(FilePlatformService) private readonly files: FilePlatformService,
     @Inject(AUDIT_SERVICE) private readonly audit: AuditService,
+    @Optional() @Inject(AgentApiController) private readonly agentApi?: AgentApiController,
   ) {}
+
+  @Get("/workspaces")
+  async workspaceList(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Query("includeGeneral") includeGeneral?: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "user_workspaces",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().listWorkspaces(scoped, includeGeneral));
+  }
+
+  @Post("/workspaces")
+  async createWorkspace(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "workspace",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().createWorkspace(scoped, body));
+  }
+
+  @Patch("/workspaces/:workspaceId")
+  async updateWorkspace(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("workspaceId") workspaceId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "workspace",
+      targetId: workspaceId,
+    }, (scoped) => this.requireAgentApi().updateWorkspace(scoped, workspaceId, body));
+  }
+
+  @Delete("/workspaces/:workspaceId")
+  async deleteWorkspace(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("workspaceId") workspaceId: string,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "workspace",
+      targetId: workspaceId,
+    }, (scoped) => this.requireAgentApi().deleteWorkspace(scoped, workspaceId));
+  }
+
+  @Get("/models/catalog")
+  async modelCatalog(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "model_catalog",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().modelCatalog(scoped));
+  }
+
+  @Post("/prompts/improve")
+  async improvePrompt(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "prompt",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().improvePrompt(scoped, body));
+  }
+
+  @Post("/images/generations")
+  async generateImage(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "image_generation",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().generateImage(scoped, body));
+  }
+
+  @Post("/tasks")
+  async createTask(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "task",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().createTask(scoped, body));
+  }
+
+  @Patch("/tasks/:taskId")
+  async updateTask(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("taskId") taskId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "task",
+      targetId: taskId,
+      taskId,
+    }, (scoped) => this.requireAgentApi().updateTask(scoped, taskId, body));
+  }
+
+  @Delete("/tasks/:taskId")
+  async deleteTask(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("taskId") taskId: string,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "task",
+      targetId: taskId,
+      taskId,
+    }, (scoped) => this.requireAgentApi().deleteTask(scoped, taskId));
+  }
+
+  @Post("/tasks/:taskId/restore")
+  async restoreTask(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("taskId") taskId: string,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "task",
+      targetId: taskId,
+      taskId,
+    }, (scoped) => this.requireAgentApi().restoreTask(scoped, taskId));
+  }
+
+  @Post("/tasks/:taskId/sessions")
+  async createSession(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("taskId") taskId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "session",
+      targetId: taskId,
+      taskId,
+    }, (scoped) => this.requireAgentApi().createSession(scoped, taskId, body));
+  }
 
   @Get("/workspaces/page")
   async workspaces(
@@ -77,6 +243,16 @@ export class SupportViewController {
     const result = await this.store.listWorkspacePage({ ...parsed, ownerUserId: userId });
     await this.recordRead(request, tenantId, userId, { targetType: "user_workspaces", targetId: userId });
     return result;
+  }
+
+  @Get("/projects/page")
+  async projects(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Query() query: unknown,
+  ) {
+    return this.workspaces(request, tenantId, userId, query);
   }
 
   @Get("/tasks/page")
@@ -103,6 +279,236 @@ export class SupportViewController {
     const result = await this.store.taskSummary(userId);
     await this.recordRead(request, tenantId, userId, { targetType: "user_task_summary", targetId: userId });
     return result;
+  }
+
+  @Sse("/tasks/:taskId/events")
+  async taskEvents(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("taskId") taskId: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "task_events",
+      targetId: taskId,
+      taskId,
+    }, (scoped) => this.requireAgentApi().taskEvents(scoped, taskId));
+  }
+
+  @Post("/sessions/:sessionId/context-stats")
+  async contextStats(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "session_context",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().contextStats(scoped, sessionId, body));
+  }
+
+  @Post("/sessions/:sessionId/messages")
+  async appendMessage(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "message",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().appendMessage(scoped, sessionId, body));
+  }
+
+  @Post("/sessions/:sessionId/turns")
+  async startTurn(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "turn",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().startTurn(scoped, sessionId, body));
+  }
+
+  @Get("/sessions/:sessionId/turn-state")
+  async turnState(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "turn_state",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().turnState(scoped, sessionId));
+  }
+
+  @Post("/sessions/:sessionId/cancel")
+  async cancelTurn(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "turn",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().cancelTurn(scoped, sessionId, body));
+  }
+
+  @Post("/sessions/:sessionId/steer")
+  async steerTurn(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "turn",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().steerTurn(scoped, sessionId, body));
+  }
+
+  @Get("/sessions/:sessionId/follow-ups")
+  async listQueuedFollowUps(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Query() query: unknown,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "session_follow_ups",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().listQueuedFollowUps(scoped, sessionId, query));
+  }
+
+  @Post("/sessions/:sessionId/follow-ups")
+  async enqueueQueuedFollowUp(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "session_follow_up",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().enqueueQueuedFollowUp(scoped, sessionId, body));
+  }
+
+  @Patch("/follow-ups/:followUpId")
+  async updateQueuedFollowUp(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("followUpId") followUpId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "follow_up",
+      targetId: followUpId,
+    }, (scoped) => this.requireAgentApi().updateQueuedFollowUp(scoped, followUpId, body));
+  }
+
+  @Delete("/follow-ups/:followUpId")
+  async cancelQueuedFollowUp(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("followUpId") followUpId: string,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "follow_up",
+      targetId: followUpId,
+    }, (scoped) => this.requireAgentApi().cancelQueuedFollowUp(scoped, followUpId));
+  }
+
+  @Sse("/sessions/:sessionId/events")
+  async streamEvents(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+    @Headers("last-event-id") lastEventId?: string,
+    @Query("cursor") cursor?: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "session_events",
+      targetId: sessionId,
+      sessionId,
+    }, (scoped) => this.requireAgentApi().streamEvents(scoped, sessionId, lastEventId, cursor));
+  }
+
+  @Get("/approvals")
+  async listApprovals(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "approvals",
+      targetId: userId,
+    }, (scoped) => this.requireAgentApi().listApprovals(scoped));
+  }
+
+  @Post("/approvals/:approvalId/decision")
+  async decideApproval(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("approvalId") approvalId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "approval",
+      targetId: approvalId,
+    }, (scoped) => this.requireAgentApi().decideApproval(scoped, approvalId, body));
+  }
+
+  @Post("/questions/:questionId/answer")
+  async answerQuestion(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("questionId") questionId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "question",
+      targetId: questionId,
+    }, (scoped) => this.requireAgentApi().answerQuestion(scoped, questionId, body));
+  }
+
+  @Post("/runs/:runId/recovery")
+  async recoverTurn(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("runId") runId: string,
+    @Body() body: unknown,
+  ) {
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "turn_recovery",
+      targetId: runId,
+    }, (scoped) => this.requireAgentApi().recoverTurn(scoped, runId, body));
   }
 
   @Get("/tasks/:taskId")
@@ -161,6 +567,89 @@ export class SupportViewController {
     const result = await this.store.getMessage(session.id, parsedMessageId);
     await this.recordRead(request, tenantId, userId, { targetType: "message", targetId: parsedMessageId, sessionId: session.id });
     return this.scopeMessage(result, tenantId, userId);
+  }
+
+  @Post("/files/uploads")
+  async initiateFileUpload(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Body() body: unknown,
+  ) {
+    const input = parseInput(InitiateSchema, body);
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "file_upload",
+      targetId: userId,
+    }, () => this.files.initiateUpload(tenantId, userId, {
+      name: input.name,
+      mediaType: input.mediaType,
+      size: input.size,
+      ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+      ...(input.workspaceVisibility ? { workspaceVisibility: input.workspaceVisibility } : {}),
+      ...(input.sha256 ? { sha256: input.sha256 } : {}),
+      origin: input.origin,
+      associationRole: input.associationRole,
+    }));
+  }
+
+  @Post("/files/:fileId/uploads/:uploadId/parts")
+  async presignFileParts(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("fileId") fileId: string,
+    @Param("uploadId") uploadId: string,
+    @Body() body: unknown,
+  ) {
+    const parsedFileId = parseInput(UuidSchema, fileId);
+    const parsedUploadId = parseInput(UuidSchema, uploadId);
+    const input = parseInput(PartNumbersSchema, body);
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "file_upload",
+      targetId: parsedFileId,
+    }, () => this.files.presignParts(tenantId, userId, parsedFileId, parsedUploadId, input.partNumbers));
+  }
+
+  @Post("/files/:fileId/uploads/:uploadId/complete")
+  async completeFileUpload(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("fileId") fileId: string,
+    @Param("uploadId") uploadId: string,
+    @Body() body: unknown,
+  ) {
+    const parsedFileId = parseInput(UuidSchema, fileId);
+    const parsedUploadId = parseInput(UuidSchema, uploadId);
+    const input = parseInput(CompleteSchema, body);
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "file_upload",
+      targetId: parsedFileId,
+    }, () => this.files.completeUpload(
+      tenantId,
+      userId,
+      parsedFileId,
+      parsedUploadId,
+      input.parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag })),
+    ));
+  }
+
+  @Delete("/files/:fileId/uploads/:uploadId")
+  async abortFileUpload(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("fileId") fileId: string,
+    @Param("uploadId") uploadId: string,
+  ) {
+    const parsedFileId = parseInput(UuidSchema, fileId);
+    const parsedUploadId = parseInput(UuidSchema, uploadId);
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "file_upload",
+      targetId: parsedFileId,
+    }, () => this.files.abortUpload(tenantId, userId, parsedFileId, parsedUploadId));
   }
 
   @Get("/files")
@@ -247,6 +736,20 @@ export class SupportViewController {
     }
   }
 
+  @Delete("/files/:fileId")
+  async removeFile(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("fileId") fileId: string,
+  ) {
+    const parsedFileId = parseInput(UuidSchema, fileId);
+    return this.subjectWrite(request, tenantId, userId, {
+      targetType: "file",
+      targetId: parsedFileId,
+    }, () => this.files.removeFromLibrary(tenantId, userId, parsedFileId));
+  }
+
   private async requireOwnedSession(request: AuthenticatedRequest, tenantId: string, userId: string, sessionId: string): Promise<Session> {
     await this.requireAccess(request, tenantId, userId);
     const parsedSessionId = this.parseResourceId(SelfHostSessionIdSchema, sessionId);
@@ -286,7 +789,76 @@ export class SupportViewController {
     };
   }
 
-  private async requireAccess(request: AuthenticatedRequest, tenantId: string, userId: string) {
+  private requireAgentApi(): AgentApiController {
+    if (!this.agentApi) throw new ServiceUnavailableException("Support actions are not available in this deployment");
+    return this.agentApi;
+  }
+
+  private async subjectRequest(
+    request: AuthenticatedRequest,
+    tenantId: string,
+    userId: string,
+    requireActiveSubject: boolean,
+  ): Promise<AuthenticatedRequest> {
+    const { subject } = await this.requireAccess(request, tenantId, userId);
+    if (requireActiveSubject && subject.status !== "active") {
+      throw new ForbiddenException("The selected user does not have an active organization membership");
+    }
+    const subjectUser = {
+      id: subject.userId,
+      email: subject.email,
+      name: subject.name || null,
+      image: null,
+    };
+    const scoped = Object.create(request) as AuthenticatedRequest;
+    scoped.auth = {
+      ...request.auth!,
+      session: { ...request.auth!.session, userId: subject.userId },
+      user: subjectUser,
+    };
+    scoped.user = subjectUser;
+    return scoped;
+  }
+
+  private async subjectRead<T>(
+    request: AuthenticatedRequest,
+    tenantId: string,
+    userId: string,
+    target: {
+      targetType: string;
+      targetId: string;
+      taskId?: string;
+      sessionId?: string;
+      metadata?: Record<string, string | number | boolean | null>;
+    },
+    operation: (scoped: AuthenticatedRequest) => Promise<T>,
+  ): Promise<T> {
+    const scoped = await this.subjectRequest(request, tenantId, userId, false);
+    const result = await operation(scoped);
+    await this.recordRead(request, tenantId, userId, target);
+    return result;
+  }
+
+  private async subjectWrite<T>(
+    request: AuthenticatedRequest,
+    tenantId: string,
+    userId: string,
+    target: {
+      targetType: string;
+      targetId: string;
+      taskId?: string;
+      sessionId?: string;
+      metadata?: Record<string, string | number | boolean | null>;
+    },
+    operation: (scoped: AuthenticatedRequest) => Promise<T>,
+  ): Promise<T> {
+    const scoped = await this.subjectRequest(request, tenantId, userId, true);
+    const result = await operation(scoped);
+    await this.recordWrite(request, tenantId, userId, target);
+    return result;
+  }
+
+  private async requireAccess(request: AuthenticatedRequest, tenantId: string, userId: string): Promise<{ actor: OrgMembership; subject: OrgMembership }> {
     parseInput(UuidSchema, tenantId);
     parseInput(UuidSchema, userId);
     const configuredTenantId = process.env.BERRY_TENANT_ID?.trim() || SELF_HOST_TENANT_ID;
@@ -301,6 +873,7 @@ export class SupportViewController {
       throw new ForbiddenException("Only active organization administrators can use support view");
     }
     if (!subject) throw new ForbiddenException("The selected user does not belong to this organization");
+    return { actor, subject };
   }
 
   private recordRead(
@@ -321,6 +894,31 @@ export class SupportViewController {
       actorUserId: request.auth!.user.id,
       category: "support",
       action: input.action ?? "support-view-read",
+      targetType: input.targetType,
+      targetId: input.targetId,
+      ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      metadata: { subjectUserId: userId, ...(input.metadata ?? {}) },
+    });
+  }
+
+  private recordWrite(
+    request: AuthenticatedRequest,
+    tenantId: string,
+    userId: string,
+    input: {
+      targetType: string;
+      targetId: string;
+      taskId?: string;
+      sessionId?: string;
+      metadata?: Record<string, string | number | boolean | null>;
+    },
+  ) {
+    return this.audit.append({
+      tenantId,
+      actorUserId: request.auth!.user.id,
+      category: "support",
+      action: "support-view-write",
       targetType: input.targetType,
       targetId: input.targetId,
       ...(input.taskId ? { taskId: input.taskId } : {}),

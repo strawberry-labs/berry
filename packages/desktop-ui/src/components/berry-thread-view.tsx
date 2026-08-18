@@ -1237,6 +1237,9 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
 
   // When the turn's reply landed.
   const turnTimestamp = last?.createdAt ?? first?.createdAt;
+  const responseModel = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant" && message.model)?.model;
 
   // Split the turn into collapsible activity (reasoning + tool rows +
   // intermediate prose, matching the live view) and the always-visible final
@@ -1350,6 +1353,14 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
           {turnTimestamp ? (
             <span className="select-none pl-2" title={new Date(turnTimestamp).toLocaleString()}>
               {formatMessageTime(turnTimestamp)}
+            </span>
+          ) : null}
+          {responseModel ? (
+            <span
+              className="max-w-[min(40vw,18rem)] truncate px-2"
+              title={`Responding model: ${responseModel}`}
+            >
+              {responseModel}
             </span>
           ) : null}
         </MessageFooter>

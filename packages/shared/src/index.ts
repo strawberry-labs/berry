@@ -953,6 +953,7 @@ export const MessageSchema = z.object({
   role: MessageRoleSchema,
   status: z.enum(["streaming", "complete", "cancelled", "failed"]),
   parts: z.array(MessagePartSchema),
+  model: z.string().trim().min(1).optional(),
   inputTokens: z.number().default(0),
   outputTokens: z.number().default(0),
   generationMs: z.number().default(0),

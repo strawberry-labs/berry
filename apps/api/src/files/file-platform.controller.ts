@@ -16,7 +16,7 @@ const UploadMediaTypeSchema = z.string()
   .transform((value) => normalizeMediaType(value)!)
   .default("application/octet-stream");
 
-const InitiateSchema = z.object({
+export const InitiateSchema = z.object({
   name: z.string().trim().min(1).max(240),
   mediaType: UploadMediaTypeSchema,
   size: z.number().int().nonnegative(),
@@ -29,8 +29,8 @@ const InitiateSchema = z.object({
   associationRole: z.enum(["input", "output", "reference"]).default("input"),
 }).strict();
 
-const PartNumbersSchema = z.object({ partNumbers: z.array(z.number().int().positive()).min(1).max(100) }).strict();
-const CompleteSchema = z.object({
+export const PartNumbersSchema = z.object({ partNumbers: z.array(z.number().int().positive()).min(1).max(100) }).strict();
+export const CompleteSchema = z.object({
   parts: z.array(z.object({ partNumber: z.number().int().positive(), etag: z.string().min(1) }).strict()).min(1).max(10_000),
 }).strict();
 const ListSchema = z.object({

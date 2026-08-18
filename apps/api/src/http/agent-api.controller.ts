@@ -1998,6 +1998,7 @@ export class AgentApiController {
             role: "assistant",
             parts: parts.map((part) => ({ kind: part.kind, content: part.content })),
             status: message.status,
+            ...(message.model ? { model: message.model } : {}),
             inputTokens: message.usage?.inputTokens ?? 0,
             outputTokens: message.usage?.outputTokens ?? 0,
             // Older or non-streaming providers can omit a decode duration.

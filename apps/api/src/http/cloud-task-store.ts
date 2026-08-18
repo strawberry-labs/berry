@@ -98,6 +98,7 @@ export interface AppendMessageInput {
   role: MessageRole;
   parts: Array<{ kind: MessagePartKind; content: JsonValue }>;
   status?: Message["status"] | undefined;
+  model?: string | null | undefined;
   inputTokens?: number | undefined;
   outputTokens?: number | undefined;
   generationMs?: number | undefined;
@@ -485,6 +486,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
       role: MessageRoleSchema.parse(input.role),
       status: input.status ?? "complete",
       parts,
+      ...(input.model ? { model: input.model } : {}),
       inputTokens: input.inputTokens ?? 0,
       outputTokens: input.outputTokens ?? 0,
       generationMs: input.generationMs ?? 0,
@@ -959,8 +961,8 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid AND ($10::uuid IS NULL OR user_id I
       const messageId = input.id ?? randomUuid();
       const inserted = await executor.query<{ id: string }>(
         `
-INSERT INTO messages (id, tenant_id, session_id, task_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at)
-VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::message_role, $6::message_status, $7, $8, $9, $10, $10)
+INSERT INTO messages (id, tenant_id, session_id, task_id, role, status, model, input_tokens, output_tokens, generation_ms, created_at, updated_at)
+VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::message_role, $6::message_status, $7, $8, $9, $10, $11, $11)
 ON CONFLICT (id) DO NOTHING
 RETURNING id
         `.trim(),
@@ -971,6 +973,7 @@ RETURNING id
           session.taskId,
           MessageRoleSchema.parse(input.role),
           input.status ?? "complete",
+          input.model ?? null,
           input.inputTokens ?? 0,
           input.outputTokens ?? 0,
           input.generationMs ?? 0,
@@ -1000,7 +1003,7 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::message_part_kind, $5::jsonb, $6, $7)
       await this.getSessionInTenant(executor, sessionId);
       const rows = await executor.query<MessageRow>(
         `
-SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, model, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid
 ORDER BY sequence_id ASC
@@ -1016,7 +1019,7 @@ ORDER BY sequence_id ASC
       await this.getSessionInTenant(executor, sessionId);
       const [row] = await executor.query<MessageRow>(
         `
-SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, model, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND id = $3::uuid
         `.trim(),
@@ -1054,7 +1057,7 @@ WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND id = $3::uuid
       await this.getSessionInTenant(executor, sessionId);
       const [row] = await executor.query<MessageRow>(
         `
-SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, model, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid AND role = 'user'::message_role
 ORDER BY sequence_id DESC
@@ -1071,7 +1074,7 @@ LIMIT 1
       await this.getSessionInTenant(executor, sessionId);
       const [row] = await executor.query<MessageRow & { user_ordinal: string | number }>(
         `
-SELECT m.id, m.session_id, m.sequence_id, m.role, m.status, m.input_tokens, m.output_tokens, m.generation_ms, m.created_at, m.updated_at,
+SELECT m.id, m.session_id, m.sequence_id, m.role, m.status, m.model, m.input_tokens, m.output_tokens, m.generation_ms, m.created_at, m.updated_at,
        (SELECT COUNT(*) FROM messages prior
         WHERE prior.tenant_id = m.tenant_id AND prior.session_id = m.session_id
           AND prior.role = 'user'::message_role AND prior.sequence_id <= m.sequence_id) AS user_ordinal
@@ -1097,7 +1100,7 @@ WHERE m.tenant_id = $1::uuid AND m.session_id = $2::uuid AND m.id = $3::uuid
       const descending = after === null;
       const rows = await executor.query<MessageRow>(
         `
-SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, model, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND session_id = $2::uuid
   AND ($3::bigint IS NULL OR sequence_id < $3::bigint)
@@ -1247,7 +1250,7 @@ WHERE tenant_id = $1::uuid AND id = $2::uuid
   private async getMessageInTenant(executor: SqlExecutor, messageId: string): Promise<Message> {
     const [row] = await executor.query<MessageRow>(
       `
-SELECT id, session_id, sequence_id, role, status, input_tokens, output_tokens, generation_ms, created_at, updated_at
+SELECT id, session_id, sequence_id, role, status, model, input_tokens, output_tokens, generation_ms, created_at, updated_at
 FROM messages
 WHERE tenant_id = $1::uuid AND id = $2::uuid
       `.trim(),
@@ -1272,6 +1275,7 @@ ORDER BY ordinal ASC
       sessionId: row.session_id,
       role: row.role,
       status: row.status,
+      ...(row.model ? { model: row.model } : {}),
       parts: parts.map((part) => ({
         id: part.id,
         messageId: part.message_id,
@@ -1417,6 +1421,7 @@ interface MessageRow {
   sequence_id: number | string;
   role: string;
   status: string;
+  model: string | null;
   input_tokens: number;
   output_tokens: number;
   generation_ms: number;
@@ -1439,6 +1444,7 @@ function messageFromRowParts(row: MessageRow, parts: MessagePartRow[]): Message 
     sessionId: row.session_id,
     role: row.role,
     status: row.status,
+    ...(row.model ? { model: row.model } : {}),
     parts: parts.map((part) => ({
       id: part.id,
       messageId: part.message_id,

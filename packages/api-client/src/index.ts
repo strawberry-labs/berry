@@ -1812,11 +1812,9 @@ export class BerryApiClient {
     onError?: (error: unknown) => void;
     onOpen?: () => void;
   }, cursor?: string | null): EventSource {
-    if (this.#supportView) {
-      throw new BerryApiError("Live event streams are not available in support view.", 403, { code: "support_view_read_not_available" });
-    }
     const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
-    const source = new EventSource(`${this.#baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`);
+    const path = this.#supportPath(`/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`);
+    const source = new EventSource(`${this.#baseUrl}${path}`, { withCredentials: true });
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
@@ -1836,10 +1834,8 @@ export class BerryApiClient {
     onError?: (error: unknown) => void;
     onOpen?: () => void;
   }): EventSource {
-    if (this.#supportView) {
-      throw new BerryApiError("Live event streams are not available in support view.", 403, { code: "support_view_read_not_available" });
-    }
-    const source = new EventSource(`${this.#baseUrl}/v1/tasks/${encodeURIComponent(taskId)}/events`);
+    const path = this.#supportPath(`/v1/tasks/${encodeURIComponent(taskId)}/events`);
+    const source = new EventSource(`${this.#baseUrl}${path}`, { withCredentials: true });
     source.onopen = () => callbacks.onOpen?.();
     source.onerror = (event) => callbacks.onError?.(event);
     source.onmessage = (event) => {
@@ -1911,9 +1907,6 @@ export class BerryApiClient {
 
   async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
     const method = init.method ?? "GET";
-    if (this.#supportView && method !== "GET" && method !== "HEAD") {
-      throw new BerryApiError("Support view is read-only. Exit support view to make changes.", 403, { code: "support_view_read_only" });
-    }
     const headers = new Headers(this.#headers);
     headers.set("Accept", "application/json");
     const request: RequestInit = { method, headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
@@ -1931,19 +1924,26 @@ export class BerryApiClient {
     const support = this.#supportView;
     if (!support) return path;
     const pathname = path.split("?", 1)[0] ?? path;
-    if (!isSupportReadPath(pathname)) {
+    if (!isSupportPath(pathname)) {
       throw new BerryApiError("This resource is not available in support view.", 403, { code: "support_view_read_not_available" });
     }
     return `/v1/orgs/${encodeURIComponent(support.tenantId)}/support/users/${encodeURIComponent(support.userId)}${path.slice(3)}`;
   }
 }
 
-function isSupportReadPath(pathname: string): boolean {
-  if (pathname === "/v1/workspaces/page") return true;
-  if (pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;
-  if (/^\/v1\/tasks\/(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|task_[0-9a-f]{32})$/i.test(pathname)) return true;
-  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?)?$/.test(pathname)) return true;
-  return pathname === "/v1/files" || /^\/v1\/files\/[^/]+(?:\/content)?$/.test(pathname);
+function isSupportPath(pathname: string): boolean {
+  if (/^\/v1\/(?:workspaces|projects)(?:\/page)?$/.test(pathname)) return true;
+  if (/^\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
+  if (pathname === "/v1/tasks" || pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;
+  if (/^\/v1\/tasks\/[^/]+(?:\/restore|\/sessions|\/events)?$/.test(pathname)) return true;
+  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
+  if (/^\/v1\/follow-ups\/[^/]+$/.test(pathname)) return true;
+  if (/^\/v1\/(?:approvals|questions\/[^/]+\/answer|runs\/[^/]+\/recovery)$/.test(pathname)) return true;
+  if (/^\/v1\/approvals\/[^/]+\/decision$/.test(pathname)) return true;
+  if (pathname === "/v1/models/catalog" || pathname === "/v1/prompts/improve" || pathname === "/v1/images/generations") return true;
+  if (pathname === "/v1/files" || pathname === "/v1/files/uploads") return true;
+  if (/^\/v1\/files\/[^/]+$/.test(pathname) || /^\/v1\/files\/[^/]+\/content$/.test(pathname)) return true;
+  return /^\/v1\/files\/[^/]+\/uploads\/[^/]+(?:\/parts|\/complete)?$/.test(pathname);
 }
 
 function uploadBlobWithXhr(

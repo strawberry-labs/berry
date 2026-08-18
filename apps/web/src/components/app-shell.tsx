@@ -998,25 +998,19 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   }, [activeTask]);
 
   React.useEffect(() => {
-    if (!client || supportView || !activeTask || !taskHasUnreadActivity(activeTask)) return;
+    if (!client || !activeTask || !taskHasUnreadActivity(activeTask)) return;
     const taskId = activeTask.id;
     const readThrough = activeTask.unreadAt;
     if (!readThrough) return;
     void client.updateTask(taskId, { read: true, readThrough })
       .then((updated) => setTasks((current) => current.map((task) => task.id === updated.id ? updated : task)))
       .catch(() => undefined);
-  }, [activeTask, client, supportView]);
+  }, [activeTask, client]);
 
   React.useEffect(() => {
     const sessionId = activeTask?.activeSessionId;
     if (!sessionId) return;
     let cancelled = false;
-    if (supportView) {
-      const next = { ...followUpsBySessionRef.current, [sessionId]: [] };
-      followUpsBySessionRef.current = next;
-      setFollowUpsBySession(next);
-      return () => { cancelled = true; };
-    }
     if (!client) {
       setFollowUpsBySession((current) => {
         if (sessionId in current) return current;
@@ -1057,7 +1051,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       setFollowUpsBySession(next);
     })().catch(() => undefined);
     return () => { cancelled = true; };
-  }, [activeTask?.activeSessionId, activeTask?.workspaceId, client, supportView]);
+  }, [activeTask?.activeSessionId, activeTask?.workspaceId, client]);
 
   React.useEffect(() => {
     if (client) return;
@@ -1154,7 +1148,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   // reconnecting. Poll only while a task claims to be active, then stop as
   // soon as the durable task projection reaches a terminal state.
   React.useEffect(() => {
-    if (!client || supportView || !tasksLoaded || !hasInProgressTasks) return;
+    if (!client || !tasksLoaded || !hasInProgressTasks) return;
     let cancelled = false;
     let refreshing = false;
     const refresh = async () => {
@@ -1188,12 +1182,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [client, hasInProgressTasks, inProgressTaskIdsKey, supportView, tasksLoaded]);
+  }, [client, hasInProgressTasks, inProgressTaskIdsKey, tasksLoaded]);
 
   React.useEffect(() => {
-    if (!client || !tasksLoaded || supportView) return;
+    if (!client || !tasksLoaded) return;
     let cancelled = false;
-    void Promise.allSettled([client.modelCatalog(), client.listOrganizations()])
+    const organizationsRequest = supportView ? Promise.resolve([]) : client.listOrganizations();
+    void Promise.allSettled([client.modelCatalog(), organizationsRequest])
       .then(([catalogResult, organizationsResult]) => {
         if (cancelled) return;
         if (organizationsResult.status === "fulfilled" && organizationsResult.value.length > 0) {
@@ -1784,7 +1779,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
   };
 
   const attachSessionStream = React.useCallback((sessionId: string) => {
-    if (!client || supportView) return Promise.resolve();
+    if (!client) return Promise.resolve();
     trackedSessionsRef.current.add(sessionId);
     const existing = sessionConnectionsRef.current.get(sessionId);
     if (existing) return existing.ready;
@@ -1951,9 +1946,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     void enqueueHistoryRequest(sessionId, async () => {
       const [page, state] = await Promise.all([
         client.listMessagePage(sessionId, { limit: MESSAGE_PAGE_SIZE }),
-        supportView
-          ? Promise.resolve<TurnState>({ active: false, turnId: null, bufferedEvents: [], replayOnly: true, owner: null, runState: null })
-          : client.turnState(sessionId),
+        client.turnState(sessionId),
       ]);
       if (cancelled || (historyEpochRef.current.get(sessionId) ?? 0) !== epoch) return null;
       setMessageHistoryState(sessionId, { ...page, loadingOlder: false });
@@ -1996,7 +1989,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
         if (!cancelled) setResourceError("messages", cause instanceof Error ? cause.message : "Unable to load this task");
       });
     return () => { cancelled = true; };
-  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, clearPersistedRequestMessages, client, enqueueHistoryRequest, findPersistedMessage, reconcileSessionMessageSnapshot, replaceSessionMessages, resetSessionStream, setMessageHistoryState, supportView]);
+  }, [activeTask?.activeSessionId, applyDurableState, attachSessionStream, clearPersistedRequestMessages, client, enqueueHistoryRequest, findPersistedMessage, reconcileSessionMessageSnapshot, replaceSessionMessages, resetSessionStream, setMessageHistoryState]);
 
   const runTurn = React.useCallback(async (
     task: Task,
@@ -3208,7 +3201,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       {supportView ? (
         <div className="relative z-[70] flex min-h-12 shrink-0 items-center justify-between gap-3 bg-[var(--berry-danger)] px-3 py-1.5 text-sm text-white sm:px-4" role="status" data-testid="support-view-banner">
           <span className="min-w-0 truncate">
-            Viewing as <strong>{supportView.name || supportView.email}</strong>. Support view is read-only.
+            Viewing as <strong>{supportView.name || supportView.email}</strong>. Prompts, edits, and task changes apply to this member’s account.
           </span>
           <Button
             type="button"
@@ -3286,7 +3279,6 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             onUsage={() => navigateToSettings("usage")}
             onSettings={() => navigateToSettings("general")}
             onSignOut={() => void signOut()}
-            readOnly={Boolean(supportView)}
           />
         )}
       >
@@ -3299,11 +3291,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           leading={
             <>
               <h1 className="berry-task-title min-w-0 truncate">
-                {supportView ? (
-                  <span className="berry-task-title-input block min-w-0 max-w-[min(42vw,460px)] truncate px-2">
-                    {activeTask?.title ?? "Berry task"}
-                  </span>
-                ) : editingTitle ? (
+                {editingTitle ? (
                   <input
                     ref={titleInputRef}
                     autoFocus
@@ -3341,7 +3329,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                     if (taskId && taskId !== activeTask.id) navigateToTask(taskId);
                     else if (!taskId) navigateHome();
                   }}
-                  onCreateProject={supportView ? undefined : () => setCreatingProject(true)}
+                  onCreateProject={() => setCreatingProject(true)}
                 />
               ) : null}
               {activeTask?.worktreeBranch ? (
@@ -3350,7 +3338,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                   <span className="truncate font-mono">{activeTask.worktreeBranch}</span>
                 </span>
               ) : null}
-              {!supportView ? <DropdownMenu>
+              <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="ghost" size="icon-sm" aria-label="More actions" className="berry-titlebar-control shrink-0"><Ellipsis /></Button>
                 </DropdownMenuTrigger>
@@ -3362,7 +3350,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                   <DropdownMenuItem onClick={() => navigator.clipboard?.writeText(activeTask?.id ?? "")}>Copy task ID</DropdownMenuItem>
                   <DropdownMenuItem onClick={() => void deleteTask(activeTask)}>Delete task</DropdownMenuItem>
                 </DropdownMenuContent>
-              </DropdownMenu> : null}
+              </DropdownMenu>
             </>
           }
           trailing={
@@ -3383,7 +3371,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                   <TooltipContent side="bottom">View all files</TooltipContent>
                 </Tooltip>
               </TooltipProvider>
-              {!supportView ? <Button
+              <Button
                 variant="ghost"
                 size="icon-sm"
                 aria-label={activeTask?.pinned ? "Unpin task" : "Pin task"}
@@ -3392,7 +3380,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 className="berry-titlebar-control"
               >
                 {activeTask?.pinned ? <PinOff /> : <Pin />}
-              </Button> : null}
+              </Button>
               <WebHelpMenu />
             </>
           }
@@ -3411,8 +3399,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onRetryImage={(prompt) => void generateImage(activeTask, prompt, false)}
               onEditGeneratedImage={editGeneratedImage}
               onRegenerateGeneratedImage={regenerateGeneratedImage}
-              editTurn={!supportView && activeTask.activeSessionId ? editTurn : undefined}
-              readOnly={Boolean(supportView)}
+              editTurn={activeTask.activeSessionId ? editTurn : undefined}
               recoveryRequired={durableState?.runState === "recovery_required"}
               activeStatus={durableTurnPhase(durableState)}
               cancelTurn={cancelTurn}
@@ -3422,7 +3409,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               loadingOlderMessages={activeMessageHistory?.loadingOlder ?? false}
               scrollRequest={threadScrollRequest?.sessionId === (activeTask.activeSessionId ?? activeTask.id) ? threadScrollRequest.id : 0}
             />
-            {!supportView ? <Composer
+            <Composer
               config={config}
               activeTask={activeTask}
               taskTitles={taskTitles}
@@ -3490,7 +3477,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 resetSessionStream(sessionId);
               }}
               onEvent={updateSessionStream}
-            /> : null}
+            />
           </section>
         </div>
         </>
@@ -3504,7 +3491,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               window.setTimeout(() => setTasksLoaded(true), 0);
             }}
             onHome={navigateHome}
-            onRestore={!supportView && activeTask?.deletedAt ? () => void restoreTask(activeTask) : undefined}
+            onRestore={activeTask?.deletedAt ? () => void restoreTask(activeTask) : undefined}
           />
         ) : shouldMountTaskSurface(surface) ? (
           <BerryWorkspaceHomeFrame
@@ -3512,11 +3499,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             greeting={homeGreeting}
             help={<WebHelpMenu />}
             error={Object.values(resourceErrors).find(Boolean) ? <p className="composer-error" role="alert">{Object.values(resourceErrors).find(Boolean)}</p> : undefined}
-            composer={supportView ? (
-              <div className="rounded-xl border border-[var(--berry-border)] bg-[var(--berry-control-bg)] px-4 py-3 text-center text-sm text-[var(--berry-text-secondary)]">
-                Select a conversation from the sidebar to review it.
-              </div>
-            ) : (
+            composer={(
               <Composer
                 config={config}
                 activeTask={null}
@@ -3588,14 +3571,12 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
           </div>
         ) : null}
       </div>
-      {!supportView ? (
-        <ProjectCreationDialog
-          container={mainPanelRef.current}
-          open={creatingProject}
-          onOpenChange={setCreatingProject}
-          onSubmit={createProject}
-        />
-      ) : null}
+      <ProjectCreationDialog
+        container={mainPanelRef.current}
+        open={creatingProject}
+        onOpenChange={setCreatingProject}
+        onSubmit={createProject}
+      />
       </BerryShellFrame>
       <WebCommandPalette
         open={searchOpen}
