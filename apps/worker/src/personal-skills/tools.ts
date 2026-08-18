@@ -264,7 +264,11 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const availableResources = rows.map((row) => row.path);
     const unknownResources = requestedResources.filter((path) => !availableResources.includes(path));
     if (unknownResources.length > 0) {
-      throw new Error(`Unknown ${skill.name} resource${unknownResources.length === 1 ? "" : "s"}: ${unknownResources.join(", ")}`);
+      throw new Error([
+        `Unknown ${skill.name} resource${unknownResources.length === 1 ? "" : "s"}: ${unknownResources.join(", ")}.`,
+        "Resource paths belong to exactly one skill package. Do not retry this activation with the same resource.",
+        "Activate the skill that lists the resource, then use the exact directory returned by that activation.",
+      ].join(" "));
     }
     if (requestedResources.length === 0) {
       return renderActivationResult(skill, {

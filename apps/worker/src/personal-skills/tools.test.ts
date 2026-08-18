@@ -610,6 +610,30 @@ describe("DurablePersonalSkillToolExecutor", () => {
     expect(query.mock.calls.some(([sql]) => String(sql).includes("SELECT path,content"))).toBe(false);
     expect(baseExecute).toHaveBeenCalledTimes(1);
   });
+
+  it("tells the model not to retry a resource that belongs to another skill package", async () => {
+    const query = vi.fn(async (sql: string) => sql.includes("SELECT path,size_bytes,sha256,mode")
+      ? [{ path: "scripts/validate_artifact.py", size_bytes: 11, sha256: "a".repeat(64), mode: 0o755 }]
+      : []);
+    const stageSkillPackage = vi.fn();
+    const tools = new DurablePersonalSkillToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+      stageSkillPackage,
+    }, { execute: vi.fn(), query: query as never });
+
+    await expect(tools.execute(storedSkillSnapshot(), {
+      id: "activate-wrong-package",
+      sequence: 1,
+      type: "tool.activate_skill",
+      input: {
+        toolName: "activate_skill",
+        arguments: { name: "branding", resources: ["scripts/create_aesg_docx.py"] },
+      },
+    } as never)).rejects.toThrow(
+      "Resource paths belong to exactly one skill package. Do not retry this activation with the same resource.",
+    );
+    expect(stageSkillPackage).not.toHaveBeenCalled();
+  });
 });
 
 function storedSkillSnapshot(): DurableTurnSnapshot {

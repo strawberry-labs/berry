@@ -814,7 +814,7 @@ export class DurableTurnRunner {
     await this.repository.commit(snapshot, {
       expectedState: "calling_model",
       nextState: "calling_model",
-      steps: [{ ...step, state: "running", incrementAttempt: true }],
+      steps: [{ ...step, state: "running" }],
       progress: {
         logicalModelIteration: modelIteration(snapshot.steps),
       },
@@ -869,18 +869,25 @@ export class DurableTurnRunner {
       await this.commitAndWake(snapshot, {
         expectedState: "calling_model",
         nextState: "compacting",
-        steps: [{
-          id: randomUUID(),
-          sequence: nextStepSequence(snapshot.steps),
-          type: "session.compact",
-          state: "pending",
-          input: {
-            reason: "token-threshold",
-            estimatedUncompactedTokens: estimateUncompactedTokens(snapshot),
+        steps: [
+          {
+            ...step,
+            state: "pending",
+            error: null,
           },
-          retryClass: "idempotent_with_key",
-          idempotencyKey: `${snapshot.id}:compact:${snapshot.entries.at(-1)?.entryId ?? "empty"}`,
-        }],
+          {
+            id: randomUUID(),
+            sequence: nextStepSequence(snapshot.steps),
+            type: "session.compact",
+            state: "pending",
+            input: {
+              reason: "token-threshold",
+              estimatedUncompactedTokens: estimateUncompactedTokens(snapshot),
+            },
+            retryClass: "idempotent_with_key",
+            idempotencyKey: `${snapshot.id}:compact:${snapshot.entries.at(-1)?.entryId ?? "empty"}`,
+          },
+        ],
         events: [{
           kind: "session.note",
           note: "compacting",
@@ -922,6 +929,7 @@ export class DurableTurnRunner {
       steps: [{
         ...step,
         state: "running",
+        incrementAttempt: true,
         output: { streamMessageId: messageId },
         startedAt: new Date(modelStartedAt).toISOString(),
       }],
@@ -1385,7 +1393,11 @@ export class DurableTurnRunner {
       );
     }
     const priorRepairAttempts = matchingToolFailureCount(snapshot, step);
-    const repairBudget = Math.max(1, this.options.maxToolRepairAttempts ?? IDENTICAL_TOOL_FAILURE_LIMIT);
+    const identicalFailureLimit = identicalToolFailureLimit(step);
+    const repairBudget = Math.min(
+      identicalFailureLimit,
+      Math.max(1, this.options.maxToolRepairAttempts ?? identicalFailureLimit),
+    );
     if (repairBudget < IDENTICAL_TOOL_FAILURE_LIMIT && priorRepairAttempts >= repairBudget) {
       throw new DurableTurnTerminalError(
         `${toolName} exhausted its ${repairBudget}-attempt repair budget. Berry stopped the repair loop; choose a different strategy or provide corrected input.`,
@@ -1394,7 +1406,7 @@ export class DurableTurnRunner {
     const repeatedFailure = repeatedToolFailure(snapshot, step);
     if (repeatedFailure) {
       throw new DurableTurnTerminalError(
-        `${toolName} failed ${IDENTICAL_TOOL_FAILURE_LIMIT} times with identical arguments and error. Berry stopped the task before attempt ${IDENTICAL_TOOL_FAILURE_LIMIT + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
+        `${toolName} failed ${identicalFailureLimit} times with identical arguments and error. Berry stopped the task before attempt ${identicalFailureLimit + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
       );
     }
     if (toolName === "ask_user_question") {
@@ -1910,8 +1922,9 @@ export class DurableTurnRunner {
     for (const step of steps) {
       const repeatedFailure = repeatedToolFailure(snapshot, step);
       if (repeatedFailure) {
+        const failureLimit = identicalToolFailureLimit(step);
         throw new DurableTurnTerminalError(
-          `${toolNameForStep(step)} failed ${IDENTICAL_TOOL_FAILURE_LIMIT} times with identical arguments and error. Berry stopped the task before attempt ${IDENTICAL_TOOL_FAILURE_LIMIT + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
+          `${toolNameForStep(step)} failed ${failureLimit} times with identical arguments and error. Berry stopped the task before attempt ${failureLimit + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
         );
       }
     }
@@ -4154,40 +4167,52 @@ function modelIteration(steps: readonly DurableTurnStep[]): number {
 }
 
 function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
+  const failureLimit = identicalToolFailureLimit(step);
   const fingerprint = toolArgumentFingerprint(step.input.arguments);
   const precedingToolSteps = snapshot.steps
-    .filter((candidate) => candidate.sequence < step.sequence && candidate.type === step.type)
+    .filter((candidate) => candidate.sequence < step.sequence
+      && candidate.type === step.type
+      && toolArgumentFingerprint(candidate.input.arguments) === fingerprint)
     .sort((left, right) => right.sequence - left.sequence);
   let repeatedError: string | null = null;
   let repeatedFailures = 0;
   for (const candidate of precedingToolSteps) {
-    const error = typeof candidate.error === "string" ? candidate.error.trim() : "";
+    const error = toolFailureIdentity(candidate.error);
     if (candidate.state !== "failed"
-      || toolArgumentFingerprint(candidate.input.arguments) !== fingerprint
       || !error
       || (repeatedError !== null && error !== repeatedError)) {
       break;
     }
     repeatedError = error;
     repeatedFailures += 1;
-    if (repeatedFailures >= IDENTICAL_TOOL_FAILURE_LIMIT) {
+    if (repeatedFailures >= failureLimit) {
       return error.slice(0, 1_000);
     }
   }
   return null;
 }
 
+function identicalToolFailureLimit(step: DurableTurnStep): number {
+  return toolNameForStep(step) === "activate_skill" ? 3 : IDENTICAL_TOOL_FAILURE_LIMIT;
+}
+
+function toolFailureIdentity(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^Tool failed \(repair attempt \d+\/\d+\)\.\s*/i, "");
+}
+
 function matchingToolFailureCount(snapshot: DurableTurnSnapshot, step: DurableTurnStep): number {
   const fingerprint = toolArgumentFingerprint(step.input.arguments);
   const precedingToolSteps = snapshot.steps
-    .filter((candidate) => candidate.sequence < step.sequence && candidate.type === step.type)
+    .filter((candidate) => candidate.sequence < step.sequence
+      && candidate.type === step.type
+      && toolArgumentFingerprint(candidate.input.arguments) === fingerprint)
     .sort((left, right) => right.sequence - left.sequence);
   let count = 0;
   let error: string | null = null;
   for (const candidate of precedingToolSteps) {
-    const candidateError = typeof candidate.error === "string" ? candidate.error.trim() : "";
+    const candidateError = toolFailureIdentity(candidate.error);
     if (candidate.state !== "failed"
-      || toolArgumentFingerprint(candidate.input.arguments) !== fingerprint
       || !candidateError
       || (error !== null && candidateError !== error)) break;
     error = candidateError;
@@ -4223,7 +4248,6 @@ function declaredPolling(step: DurableTurnStep): boolean {
 }
 
 const NON_OBSERVATIONAL_READ_ONLY_TOOLS = new Set([
-  "activate_skill",
   "ask_user_question",
   "compose_message",
 ]);

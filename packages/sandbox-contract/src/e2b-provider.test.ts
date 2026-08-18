@@ -103,7 +103,7 @@ describe("E2BSandboxProvider", () => {
     expect(operations.map((event) => event.operation)).toEqual(expect.arrayContaining([
       "find",
       "create",
-      "mkdir",
+      "file.makeDir",
       "file.getInfo",
       "file.read",
     ]));
@@ -131,10 +131,9 @@ describe("E2BSandboxProvider", () => {
       requestTimeoutMs: 24_000,
       signal: createController.signal,
     });
-    expect(sandbox.foregroundOptions.at(-1)).toEqual({
+    expect(sandbox.lastMakeDirOptions).toEqual({
       requestTimeoutMs: 24_000,
       signal: createController.signal,
-      background: false,
     });
 
     now = new Date(now.getTime() + 250_000);
@@ -163,6 +162,35 @@ describe("E2BSandboxProvider", () => {
 
     expect(sandbox.lastBatchWriteOptions).toEqual({ requestTimeoutMs: 12_000, signal: controller.signal });
     expect(sandbox.foregroundOptions.at(-1)).toEqual({ requestTimeoutMs: 12_000, signal: controller.signal, background: false });
+  });
+
+  it("streams a complete file through one native E2B filesystem write", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 18_000 });
+    const handle = await provider.create({ request_id: "stream-options", tenant_id: TENANT_ID, image: "base" });
+    const sandbox = client.sandboxes.get(handle.sandbox_id)!.sandbox;
+    const commandsBeforeWrite = sandbox.foregroundCommands.length;
+    const controller = new AbortController();
+    const chunks = [Buffer.from("large "), Buffer.from("attachment")];
+    const stream = new ReadableStream<Uint8Array>({
+      pull(streamController) {
+        const chunk = chunks.shift();
+        if (chunk) streamController.enqueue(chunk);
+        else streamController.close();
+      },
+    });
+
+    const result = await provider.files.writeStream!({
+      sandbox_id: handle.sandbox_id,
+      path: "/workspace/inputs/file/report.pdf",
+      content: stream,
+      size_bytes: 16,
+    }, { signal: controller.signal });
+
+    expect(result.size_bytes).toBe(16);
+    expect(Buffer.from(sandbox.filesByPath.get("/workspace/inputs/file/report.pdf")!.content).toString()).toBe("large attachment");
+    expect(sandbox.lastStreamWriteOptions).toEqual({ requestTimeoutMs: 18_000, signal: controller.signal });
+    expect(sandbox.foregroundCommands.slice(commandsBeforeWrite)).toEqual([]);
   });
 
   it("rejects a blocked native read when its signal aborts", async () => {
@@ -565,6 +593,8 @@ class FakeSandbox implements E2BSandboxLike {
   lastGetInfoOptions: E2BRequestOptions | undefined;
   lastReadOptions: E2BRequestOptions | undefined;
   lastBatchWriteOptions: E2BRequestOptions | undefined;
+  lastStreamWriteOptions: E2BRequestOptions | undefined;
+  lastMakeDirOptions: E2BRequestOptions | undefined;
   lastTimeoutOptions: E2BRequestOptions | undefined;
   onPause: (() => void) | undefined;
   lastCommandHandle: FakeCommandHandle | undefined;
@@ -589,8 +619,8 @@ class FakeSandbox implements E2BSandboxLike {
         return options.format === "bytes" ? file.content : Buffer.from(file.content).toString("utf8");
       },
       write: (async (
-        pathOrFiles: string | Array<{ path: string; data: string | ArrayBuffer }>,
-        data?: string | ArrayBuffer,
+        pathOrFiles: string | Array<{ path: string; data: string | ArrayBuffer | ReadableStream<Uint8Array> }>,
+        data?: string | ArrayBuffer | ReadableStream<Uint8Array>,
         options?: E2BRequestOptions,
       ) => {
         if (Array.isArray(pathOrFiles)) {
@@ -602,18 +632,41 @@ class FakeSandbox implements E2BSandboxLike {
             });
           }
         }
-        const writeOne = (path: string, value: string | ArrayBuffer) => {
-          const content = typeof value === "string" ? Buffer.from(value) : new Uint8Array(value);
+        const writeOne = async (path: string, value: string | ArrayBuffer | ReadableStream<Uint8Array>) => {
+          let content: Uint8Array;
+          if (typeof value === "string") content = Buffer.from(value);
+          else if (value instanceof ReadableStream) {
+            this.lastStreamWriteOptions = options;
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            const reader = value.getReader();
+            while (true) {
+              const next = await reader.read();
+              if (next.done) break;
+              chunks.push(next.value);
+              total += next.value.byteLength;
+            }
+            content = new Uint8Array(total);
+            let offset = 0;
+            for (const chunk of chunks) {
+              content.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+          } else content = new Uint8Array(value);
           const modifiedTime = new Date("2026-07-16T00:00:01.000Z");
           this.filesByPath.set(path, { content, modifiedTime });
           return fileInfo(path, content.byteLength, modifiedTime);
         };
         if (Array.isArray(pathOrFiles)) {
-          return pathOrFiles.map((file) => writeOne(file.path, file.data));
+          return Promise.all(pathOrFiles.map((file) => writeOne(file.path, file.data)));
         }
         if (data === undefined) throw new Error("Missing file data");
         return writeOne(pathOrFiles, data);
       }) as E2BSandboxLike["files"]["write"],
+      makeDir: async (_path, options) => {
+        this.lastMakeDirOptions = options;
+        return true;
+      },
       list: async (path) => [...this.filesByPath.entries()]
         .filter(([candidate]) => candidate.startsWith(`${path.replace(/\/$/, "")}/`))
         .map(([candidate, file]) => fileInfo(candidate, file.content.byteLength, file.modifiedTime)),

@@ -38,6 +38,15 @@ export interface SandboxFileWriteManyBytesInput {
   files: readonly Omit<SandboxFileWriteBytesInput, "sandbox_id">[];
 }
 
+export interface SandboxFileWriteStreamInput {
+  sandbox_id: string;
+  path: string;
+  content: ReadableStream<Uint8Array>;
+  /** Validated source size used when the provider does not return one. */
+  size_bytes: number;
+  mode?: number;
+}
+
 export interface SandboxOperationOptions {
   signal?: AbortSignal | undefined;
 }
@@ -53,6 +62,8 @@ export interface SandboxFileApi {
   writeBytes?(input: SandboxFileWriteBytesInput, options?: SandboxOperationOptions): Promise<SandboxFileWriteResult>;
   /** Write several binary files in one provider operation when supported. */
   writeManyBytes?(input: SandboxFileWriteManyBytesInput, options?: SandboxOperationOptions): Promise<SandboxFileWriteResult[]>;
+  /** Stream one binary file through the provider's native filesystem API. */
+  writeStream?(input: SandboxFileWriteStreamInput, options?: SandboxOperationOptions): Promise<SandboxFileWriteResult>;
   list(input: SandboxFileListInput, options?: SandboxOperationOptions): Promise<SandboxFileListResult>;
 }
 

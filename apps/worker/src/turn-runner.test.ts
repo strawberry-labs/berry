@@ -982,7 +982,7 @@ describe("durable turn runner", () => {
     await expect(execution)
       .rejects.toThrow("Model input preparation exceeded its maximum duration");
     expect(modelCalls).toBe(0);
-    expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(1);
+    expect(repository.current.steps.find((step) => step.type === "model.call")?.attempt).toBe(0);
     expect(repository.current.leaseOwner).toBe("");
   });
 
@@ -1347,6 +1347,13 @@ describe("durable turn runner", () => {
     });
 
     expect((await runner.execute({ tenantId, runId, reason: "continue" })).state).toBe("compacting");
+    expect(repository.current.steps.find((step) => step.type === "model.call")).toMatchObject({
+      state: "pending",
+      attempt: 0,
+    });
+    expect(repository.current.steps.find((step) => step.type === "session.compact")).toMatchObject({
+      state: "pending",
+    });
     expect(repository.events).toContainEqual({
       kind: "session.note",
       note: "compacting",
@@ -1782,7 +1789,7 @@ describe("durable turn runner", () => {
           requiresApproval: false,
           approvalKind: "file-edit",
         },
-        error,
+        error: `Tool failed (repair attempt ${index + 1}/5). ${error}`,
       });
       steps.push({
         ...runCommandStep("completed", index * 2 + 2, `printf ${index}`),
@@ -1817,6 +1824,69 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
     expect(executions).toBe(0);
     expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
+  });
+
+  it("stops repeated unknown skill resources even when other activations succeed between failures", async () => {
+    const badArguments = { name: "aesg-branding", resources: ["scripts/create_aesg_docx.py"] };
+    const error = "Unknown aesg-branding resource: scripts/create_aesg_docx.py";
+    const steps: DurableTurnStep[] = [admittedStep()];
+    for (let index = 0; index < 3; index += 1) {
+      steps.push({
+        ...toolStep("failed", "read_only", false),
+        id: randomUUID(),
+        sequence: index * 2 + 1,
+        type: "tool.activate_skill",
+        input: {
+          toolCallId: randomUUID(),
+          toolName: "activate_skill",
+          arguments: badArguments,
+          requiresApproval: false,
+          approvalKind: "file-edit",
+        },
+        error: `Tool failed (repair attempt ${index + 1}/3). ${error}`,
+      });
+      steps.push({
+        ...toolStep("completed", "read_only", false),
+        id: randomUUID(),
+        sequence: index * 2 + 2,
+        type: "tool.activate_skill",
+        input: {
+          toolCallId: randomUUID(),
+          toolName: "activate_skill",
+          arguments: { name: "docx", resources: [] },
+          requiresApproval: false,
+          approvalKind: "file-edit",
+        },
+        output: { location: "/runtime-skills/docx/SKILL.md" },
+      });
+    }
+    const pending = {
+      ...toolStep("pending", "read_only", false),
+      id: randomUUID(),
+      sequence: 7,
+      type: "tool.activate_skill",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "activate_skill",
+        arguments: badArguments,
+        requiresApproval: false,
+        approvalKind: "file-edit" as const,
+      },
+    };
+    steps.push(pending);
+    let executions = 0;
+    const repository = new FakeTurnRepository(snapshot("executing_tool", steps));
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: {}, summary: "unexpected" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(executions).toBe(0);
+    expect(repository.current.error).toContain("activate_skill exhausted its 3-attempt repair budget");
   });
 
   it("does not count changed tool arguments as a repeated failure", async () => {

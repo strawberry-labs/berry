@@ -42,7 +42,7 @@ function formatAesgArtifactRouting(skills: Skill[]): string {
 		"Sandbox map:",
 		"- The runtime prompt supplies the exact workspace root. Use it verbatim. Any `/workspace` path in a skill is a placeholder for that root, not a guaranteed directory.",
 		"- Attachments: use the exact `Sandbox path:` supplied with the file, normally `<workspace-root>/inputs/<file-id>/<filename>`. Do not guess paths or look for attached content in the Library.",
-		"- Skill packages: `activate_skill` returns the exact staged skill directory. Resolve every `scripts/...`, `references/...`, and `assets/...` path against that directory; never guess a global skill path, reference `/.berry`, or copy/rewrite a bundled generator.",
+		"- Skill packages: `activate_skill` returns the exact staged skill directory. Resources are package-scoped: request each `scripts/...`, `references/...`, or `assets/...` path from the skill that lists it, then resolve it against that activation's returned directory. Never move a resource path between skills, retry an unknown-resource activation unchanged, guess a global skill path, reference `/.berry`, or copy/rewrite a bundled generator.",
 		"- Working files, specs, extractions, and previews: `<workspace-root>/tmp/<skill-id>`. Final deliverables only: `<workspace-root>/outputs`.",
 		"Validate and render as the skill requires, then publish each requested final file once with its correct extension and media type. Do not publish specs, scripts, previews, or extracted images.",
 	].join("\n");

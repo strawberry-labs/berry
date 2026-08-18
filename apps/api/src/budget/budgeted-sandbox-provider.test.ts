@@ -107,8 +107,10 @@ describe("BudgetedSandboxProvider", () => {
     const list = vi.spyOn(underlying.files, "list");
     const writeBytes = vi.fn(async () => ({ path: "/workspace/a.bin", size_bytes: 1, mtime: "2026-07-10T00:00:00.000Z" }));
     const writeManyBytes = vi.fn(async () => [{ path: "/workspace/a.bin", size_bytes: 1, mtime: "2026-07-10T00:00:00.000Z" }]);
+    const writeStream = vi.fn(async () => ({ path: "/workspace/a.bin", size_bytes: 1, mtime: "2026-07-10T00:00:00.000Z" }));
     underlying.files.writeBytes = writeBytes;
     underlying.files.writeManyBytes = writeManyBytes;
+    underlying.files.writeStream = writeStream;
     const provider = new BudgetedSandboxProvider({
       provider: underlying,
       budgets: new BudgetService({
@@ -124,6 +126,12 @@ describe("BudgetedSandboxProvider", () => {
     await provider.files.write({ sandbox_id: sandbox.sandbox_id, path: "/workspace/a.txt", content: "ok" }, operationOptions);
     await provider.files.writeBytes!({ sandbox_id: sandbox.sandbox_id, path: "/workspace/a.bin", content: Buffer.from("a") }, operationOptions);
     await provider.files.writeManyBytes!({ sandbox_id: sandbox.sandbox_id, files: [{ path: "/workspace/a.bin", content: Buffer.from("a") }] }, operationOptions);
+    await provider.files.writeStream!({
+      sandbox_id: sandbox.sandbox_id,
+      path: "/workspace/a.bin",
+      content: new ReadableStream({ start: (controller) => { controller.enqueue(Buffer.from("a")); controller.close(); } }),
+      size_bytes: 1,
+    }, operationOptions);
     await provider.files.list({ sandbox_id: sandbox.sandbox_id, path: "/workspace", recursive: false }, operationOptions);
 
     expect(create).toHaveBeenCalledWith(createInput(), operationOptions);
@@ -132,6 +140,7 @@ describe("BudgetedSandboxProvider", () => {
     expect(write).toHaveBeenCalledWith(expect.anything(), operationOptions);
     expect(writeBytes).toHaveBeenCalledWith(expect.anything(), operationOptions);
     expect(writeManyBytes).toHaveBeenCalledWith(expect.anything(), operationOptions);
+    expect(writeStream).toHaveBeenCalledWith(expect.anything(), operationOptions);
     expect(list).toHaveBeenCalledWith(expect.anything(), operationOptions);
   });
 });

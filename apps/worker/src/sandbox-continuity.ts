@@ -429,12 +429,13 @@ export interface SandboxSnapshotObjectStore {
     objectVersionId?: string | null;
   }>;
   get(key: string): Promise<Uint8Array>;
-  getSource(key: string, versionId?: string | null): Promise<Uint8Array>;
-  streamSource?(key: string, maxBytes: number, versionId?: string | null): AsyncIterable<Uint8Array>;
+  getSource(key: string, versionId?: string | null, signal?: AbortSignal): Promise<Uint8Array>;
+  streamSource?(key: string, maxBytes: number, versionId?: string | null, signal?: AbortSignal): AsyncIterable<Uint8Array>;
 }
 
 export class SandboxContinuityManager implements DurableTurnToolExecutor {
   readonly #stagedInputFileIds = new Map<string, Set<string>>();
+  readonly #inputFileStages = new Map<string, Promise<void>>();
   readonly #sandboxStarts = new Map<string, Promise<{ provider: string; id: string; state: string }>>();
 
   constructor(
@@ -528,7 +529,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!objects) throw new Error("Input image object storage is not configured");
       return Promise.all(files.map(async (file) => {
         signal?.throwIfAborted();
-        const bytes = await objects.getSource(file.objectKey, file.objectVersionId);
+        const bytes = await objects.getSource(file.objectKey, file.objectVersionId, signal);
         signal?.throwIfAborted();
         reportProgress?.();
         if (bytes.byteLength !== file.sizeBytes) {
@@ -602,11 +603,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }[]> {
     const sandbox = await this.ensureSandbox(snapshot, options.signal);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    const selected = new Set(fileIds);
+    const selected = new Set(fileIds.map((fileId) => fileId.toLowerCase()));
     const files = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
-      .filter((file) => selected.has(file.fileId));
+      .filter((file) => selected.has(file.fileId.toLowerCase()));
     options.signal?.throwIfAborted();
-    await this.stageInputFiles(snapshot, sandbox.id, this.repository, selected, options.signal, options.reportProgress);
+    await this.stageInputFiles(snapshot, sandbox.id, this.repository, selected, options.signal, options.reportProgress, files);
     return files.map((file) => ({
       fileId: file.fileId,
       name: file.name,
@@ -767,6 +768,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       : {};
     const sandbox = await this.ensureSandbox(snapshot, signal);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const referencedInputIds = referencedInputFileIds(args, workspaceRoot);
+    if (referencedInputIds.size > 0) {
+      await this.stageInputFiles(snapshot, sandbox.id, this.repository, referencedInputIds, signal, reportProgress);
+    }
     if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const mediaType = binaryMediaType(path);
@@ -1502,10 +1507,6 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
               recursive: false,
             }, { signal });
           }
-          // The in-memory staged-file set is intentionally process-local. On
-          // worker restart or lease handoff, re-stage the run's durable input
-          // associations before a tool is allowed to execute.
-          await this.stageInputFiles(snapshot, snapshot.sandboxId!, repository, undefined, signal);
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
@@ -1550,7 +1551,6 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
               recursive: false,
             }, { signal });
           }
-          await this.stageInputFiles(snapshot, continuity.sandboxId!, repository, undefined, signal);
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
@@ -1607,17 +1607,29 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     if (restorePoint && this.objects) {
       const archive = JSON.parse(Buffer.from(await this.objects.get(restorePoint.objectKey)).toString("utf8")) as SnapshotArchive;
-      for (const file of archive.files) {
-        await this.provider.files.write({
+      signal?.throwIfAborted();
+      const restoredFiles = archive.files.map((file) => ({
+        path: safeWorkspacePath(file.path, workspaceRoot),
+        content: Buffer.from(file.content, "base64"),
+        ...(file.mode !== undefined ? { mode: file.mode } : {}),
+      }));
+      if (restoredFiles.length > 0 && this.provider.files.writeManyBytes) {
+        await this.provider.files.writeManyBytes({
           sandbox_id: handle.sandbox_id,
-          path: safeWorkspacePath(file.path, workspaceRoot),
-          content: file.content,
-          encoding: "base64",
-          ...(file.mode !== undefined ? { mode: file.mode } : {}),
+          files: restoredFiles,
         }, { signal });
+      } else {
+        for (const file of archive.files) {
+          await this.provider.files.write({
+            sandbox_id: handle.sandbox_id,
+            path: safeWorkspacePath(file.path, workspaceRoot),
+            content: file.content,
+            encoding: "base64",
+            ...(file.mode !== undefined ? { mode: file.mode } : {}),
+          }, { signal });
+        }
       }
     }
-    await this.stageInputFiles(snapshot, handle.sandbox_id, this.repository, undefined, signal);
     await this.repository.recordSandbox({
       tenantId: snapshot.tenantId,
       runId: snapshot.id,
@@ -1645,138 +1657,69 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     selectedFileIds?: ReadonlySet<string>,
     signal?: AbortSignal,
     reportProgress?: () => void,
+    knownFiles?: readonly SandboxInputFile[],
   ): Promise<void> {
     signal?.throwIfAborted();
     const staged = this.#stagedInputFileIds.get(sandboxId) ?? new Set<string>();
     this.#stagedInputFileIds.set(sandboxId, staged);
-    const files = (await repository.inputFiles(snapshot.tenantId, snapshot.id))
-      .filter((file) => (!selectedFileIds || selectedFileIds.has(file.fileId)) && !staged.has(file.fileId));
+    const files = (knownFiles ?? await repository.inputFiles(snapshot.tenantId, snapshot.id))
+      .filter((file) => (!selectedFileIds || selectedFileIds.has(file.fileId.toLowerCase())) && !staged.has(file.fileId));
     signal?.throwIfAborted();
     if (files.length === 0) return;
     if (!this.objects) throw new Error("Input file object storage is not configured");
-    for (const file of files) {
-      const maxInputBytes = this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES;
-      if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
-      const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-      const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
-      await this.prepareSandboxDirectory(snapshot.id, sandboxId, path, file.name, workspaceRoot, signal);
-      await this.truncateSandboxFile(snapshot.id, sandboxId, path, file.name, signal);
-      const source = this.objects.streamSource
-        ? this.objects.streamSource(file.objectKey, maxInputBytes, file.objectVersionId)
-        : singleChunk(await this.objects.getSource(file.objectKey, file.objectVersionId));
-      signal?.throwIfAborted();
-      let written = 0;
-      for await (const sourceChunk of source) {
-        for (let offset = 0; offset < sourceChunk.byteLength; offset += 256 * 1024) {
-          const chunk = sourceChunk.subarray(offset, Math.min(sourceChunk.byteLength, offset + 256 * 1024));
-          written += chunk.byteLength;
-          if (written > maxInputBytes || written > file.sizeBytes) {
-            throw new Error(`Input file ${file.name} exceeds its validated size`);
-          }
-          signal?.throwIfAborted();
-          await this.appendSandboxChunk(snapshot.id, sandboxId, path, file.name, chunk, written, signal);
-        }
-      }
-      if (written !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
-      staged.add(file.fileId);
-      reportProgress?.();
-    }
+    await mapWithConcurrency(files, 4, async (file) => {
+      const stageKey = `${sandboxId}:${file.fileId}`;
+      const existing = this.#inputFileStages.get(stageKey);
+      if (existing) return existing;
+      const stage = this.stageInputFile(sandboxId, file, signal)
+        .then(() => {
+          staged.add(file.fileId);
+          reportProgress?.();
+        })
+        .finally(() => {
+          if (this.#inputFileStages.get(stageKey) === stage) this.#inputFileStages.delete(stageKey);
+        });
+      this.#inputFileStages.set(stageKey, stage);
+      return stage;
+    });
   }
 
-  private async truncateSandboxFile(
-    runId: string,
+  private async stageInputFile(
     sandboxId: string,
-    path: string,
-    name: string,
+    file: SandboxInputFile,
     signal?: AbortSignal,
   ): Promise<void> {
-    for await (const event of this.provider.exec({
-      sandbox_id: sandboxId,
-      request_id: `${runId}:stage:truncate:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
-      command: ["sh", "-c", ': > "$1"', "berry-stage", path],
-      timeout_ms: 30_000,
-    }, { signal })) {
-      if (event.kind === "error") throw new Error(event.message);
-      if (event.kind === "exit" && event.exit_code !== 0) {
-        throw new Error(`Unable to initialize the sandbox file for ${name}`);
-      }
-    }
-  }
-
-  private async prepareSandboxDirectory(
-    runId: string,
-    sandboxId: string,
-    path: string,
-    name: string,
-    cwd?: string,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const directoryOutput: string[] = [];
-    for await (const event of this.provider.exec({
-      sandbox_id: sandboxId,
-      request_id: `${runId}:stage:mkdir:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
-      command: ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))],
-      ...(cwd ? { cwd } : {}),
-      timeout_ms: 30_000,
-    }, { signal })) {
-      if (event.kind === "stdout" || event.kind === "stderr") directoryOutput.push(event.data);
-      if (event.kind === "error") throw new Error(event.message);
-      if (event.kind === "exit" && event.exit_code !== 0) {
-        const detail = directoryOutput.join("").trim().slice(-2_000);
-        throw new Error(`Unable to prepare the sandbox directory for ${name}${detail ? `: ${detail}` : ""}`);
-      }
-    }
-  }
-
-  private async setSandboxFileMode(
-    runId: string,
-    sandboxId: string,
-    path: string,
-    name: string,
-    mode: number,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    for await (const event of this.provider.exec({
-      sandbox_id: sandboxId,
-      request_id: `${runId}:stage:chmod:${createHash("sha256").update(path).digest("hex").slice(0, 16)}`,
-      command: ["chmod", mode.toString(8), "--", path],
-      timeout_ms: 30_000,
-    }, { signal })) {
-      if (event.kind === "error") throw new Error(event.message);
-      if (event.kind === "exit" && event.exit_code !== 0) throw new Error(`Unable to set permissions for ${name}`);
-    }
-  }
-
-  private async appendSandboxChunk(
-    runId: string,
-    sandboxId: string,
-    path: string,
-    name: string,
-    chunk: Uint8Array,
-    written: number,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    for await (const event of this.provider.exec({
-      sandbox_id: sandboxId,
-      request_id: `${runId}:stage:append:${createHash("sha256").update(path).digest("hex").slice(0, 12)}:${written}`,
-      command: [
-        "sh",
-        "-c",
-        'base64 -d >> "$1"',
-        "berry-stage",
+    const maxInputBytes = this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES;
+    if (file.sizeBytes > maxInputBytes) throw new Error(`Input file ${file.name} exceeds the sandbox input limit`);
+    if (!this.objects) throw new Error("Input file object storage is not configured");
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
+    const source = this.objects.streamSource
+      ? this.objects.streamSource(file.objectKey, maxInputBytes, file.objectVersionId, signal)
+      : singleChunk(await this.objects.getSource(file.objectKey, file.objectVersionId, signal));
+    signal?.throwIfAborted();
+    if (this.provider.files.writeStream) {
+      const stream = validatedInputFileStream(source, file, maxInputBytes, signal);
+      const result = await this.provider.files.writeStream({
+        sandbox_id: sandboxId,
         path,
-      ],
-      // Keep attachment bytes out of argv. A 256 KiB chunk expands beyond
-      // Linux's per-argument limit when base64 encoded, which prevented E2B
-      // from starting the staging process at all.
-      stdin: Buffer.from(chunk).toString("base64"),
-      timeout_ms: 30_000,
-    }, { signal })) {
-      if (event.kind === "error") throw new Error(event.message);
-      if (event.kind === "exit" && event.exit_code !== 0) {
-        throw new Error(`Unable to stream ${name} into the sandbox`);
-      }
+        content: stream,
+        size_bytes: file.sizeBytes,
+      }, { signal });
+      if (result.size_bytes !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
+      return;
     }
+    const content = await collectInputFileBytes(source, file, maxInputBytes, signal);
+    if (this.provider.files.writeBytes) {
+      await this.provider.files.writeBytes({ sandbox_id: sandboxId, path, content }, { signal });
+      return;
+    }
+    await this.provider.files.write({
+      sandbox_id: sandboxId,
+      path,
+      content: Buffer.from(content).toString("base64"),
+      encoding: "base64",
+    }, { signal });
   }
 
   private async capture(sandboxId: string, deadlineAt: number): Promise<SnapshotArchive> {
@@ -2636,14 +2579,20 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     return this.readObject(this.snapshotKey(key), MAX_SNAPSHOT_ARCHIVE_BYTES, "Sandbox snapshot");
   }
 
-  async getSource(key: string, versionId?: string | null): Promise<Uint8Array> {
-    return this.readObject(key, this.maxSourceBytes, "Input file", versionId);
+  async getSource(key: string, versionId?: string | null, signal?: AbortSignal): Promise<Uint8Array> {
+    return this.readObject(key, this.maxSourceBytes, "Input file", versionId, signal);
   }
 
-  private async readObject(key: string, maxBytes: number, label: string, versionId?: string | null): Promise<Uint8Array> {
+  private async readObject(
+    key: string,
+    maxBytes: number,
+    label: string,
+    versionId?: string | null,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let total = 0;
-    for await (const chunk of this.streamKey(key, maxBytes, label, versionId)) {
+    for await (const chunk of this.streamKey(key, maxBytes, label, versionId, signal)) {
       chunks.push(chunk);
       total += chunk.byteLength;
     }
@@ -2656,22 +2605,30 @@ export class S3SandboxSnapshotObjectStore implements SandboxSnapshotObjectStore 
     return result;
   }
 
-  async *streamSource(key: string, maxBytes: number, versionId?: string | null): AsyncIterable<Uint8Array> {
-    yield* this.streamKey(key, maxBytes, "Input file", versionId);
+  async *streamSource(key: string, maxBytes: number, versionId?: string | null, signal?: AbortSignal): AsyncIterable<Uint8Array> {
+    yield* this.streamKey(key, maxBytes, "Input file", versionId, signal);
   }
 
-  private async *streamKey(key: string, maxBytes: number, label: string, versionId?: string | null): AsyncIterable<Uint8Array> {
+  private async *streamKey(
+    key: string,
+    maxBytes: number,
+    label: string,
+    versionId?: string | null,
+    signal?: AbortSignal,
+  ): AsyncIterable<Uint8Array> {
+    signal?.throwIfAborted();
     const result = await this.client.send(new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
       ...(versionId ? { VersionId: versionId } : {}),
-    }));
+    }), signal ? { abortSignal: signal } : undefined);
     if (!result.Body) throw new Error(`${label} object has no body`);
     if (result.ContentLength !== undefined && result.ContentLength > maxBytes) {
       throw new Error(`${label} object exceeds the ${maxBytes}-byte sandbox limit`);
     }
     let total = 0;
     for await (const raw of result.Body as AsyncIterable<Uint8Array>) {
+      signal?.throwIfAborted();
       const chunk = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
       total += chunk.byteLength;
       if (total > maxBytes) throw new Error(`${label} object exceeds the ${maxBytes}-byte sandbox limit`);
@@ -2988,6 +2945,123 @@ function safeWorkspaceRoot(value: string): string {
     throw new Error("Sandbox workspace root must be an absolute path without traversal segments");
   }
   return `/${parts.join("/")}`;
+}
+
+function referencedInputFileIds(value: unknown, workspaceRoot: string): Set<string> {
+  const ids = new Set<string>();
+  const prefix = `${workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/inputs/`;
+  const fileId = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})";
+  const patterns = [
+    new RegExp(`${prefix}${fileId}(?=/|[\\s'\"]|$)`, "gi"),
+    new RegExp(`(?:^|[\\s'\"])(?:\\./)?inputs/${fileId}(?=/|[\\s'\"]|$)`, "gi"),
+  ];
+  const visit = (candidate: unknown, depth: number): void => {
+    if (depth > 8 || candidate === null || candidate === undefined) return;
+    if (typeof candidate === "string") {
+      for (const pattern of patterns) {
+        for (const match of candidate.matchAll(pattern)) ids.add(match[1]!.toLowerCase());
+        pattern.lastIndex = 0;
+      }
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) visit(item, depth + 1);
+      return;
+    }
+    if (typeof candidate === "object") {
+      for (const child of Object.values(candidate as Record<string, unknown>)) visit(child, depth + 1);
+    }
+  };
+  visit(value, 0);
+  return ids;
+}
+
+function validatedInputFileStream(
+  source: AsyncIterable<Uint8Array>,
+  file: SandboxInputFile,
+  maxBytes: number,
+  signal?: AbortSignal,
+): ReadableStream<Uint8Array> {
+  const iterator = source[Symbol.asyncIterator]();
+  let written = 0;
+  let finished = false;
+  let abortHandler: (() => void) | undefined;
+  const removeAbortHandler = () => {
+    if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+  };
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (!signal) return;
+      abortHandler = () => {
+        if (finished) return;
+        finished = true;
+        removeAbortHandler();
+        void iterator.return?.().catch(() => undefined);
+        controller.error(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      };
+      signal.addEventListener("abort", abortHandler, { once: true });
+      if (signal.aborted) abortHandler();
+    },
+    async pull(controller) {
+      if (finished) return;
+      try {
+        signal?.throwIfAborted();
+        const next = await iterator.next();
+        signal?.throwIfAborted();
+        if (next.done) {
+          if (written !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
+          finished = true;
+          removeAbortHandler();
+          controller.close();
+          return;
+        }
+        const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+        written += chunk.byteLength;
+        if (written > maxBytes || written > file.sizeBytes) {
+          throw new Error(`Input file ${file.name} exceeds its validated size`);
+        }
+        controller.enqueue(chunk);
+      } catch (error) {
+        if (finished) return;
+        finished = true;
+        removeAbortHandler();
+        await iterator.return?.().catch(() => undefined);
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      finished = true;
+      removeAbortHandler();
+      await iterator.return?.();
+    },
+  });
+}
+
+async function collectInputFileBytes(
+  source: AsyncIterable<Uint8Array>,
+  file: SandboxInputFile,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let written = 0;
+  for await (const raw of source) {
+    signal?.throwIfAborted();
+    const chunk = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    written += chunk.byteLength;
+    if (written > maxBytes || written > file.sizeBytes) {
+      throw new Error(`Input file ${file.name} exceeds its validated size`);
+    }
+    chunks.push(chunk);
+  }
+  if (written !== file.sizeBytes) throw new Error(`Input file ${file.name} is incomplete`);
+  const content = new Uint8Array(written);
+  let offset = 0;
+  for (const chunk of chunks) {
+    content.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return content;
 }
 
 function isMissingSandboxPath(error: unknown): boolean {

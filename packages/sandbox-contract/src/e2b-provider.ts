@@ -48,6 +48,7 @@ import {
   type SandboxFileApi,
   type SandboxFileWriteBytesInput,
   type SandboxFileWriteManyBytesInput,
+  type SandboxFileWriteStreamInput,
   type SandboxOperationOptions,
   type SandboxProvider,
 } from "./provider.js";
@@ -83,8 +84,9 @@ export interface E2BSandboxLike {
   readonly trafficAccessToken?: string | undefined;
   readonly files: {
     read(path: string, options: { format: "text" | "bytes" } & E2BRequestOptions): Promise<string | Uint8Array>;
-    write(path: string, data: string | ArrayBuffer, options?: E2BRequestOptions): Promise<E2BFileInfoLike>;
-    write(files: Array<{ path: string; data: string | ArrayBuffer }>, options?: E2BRequestOptions): Promise<E2BFileInfoLike[]>;
+    write(path: string, data: string | ArrayBuffer | ReadableStream<Uint8Array>, options?: E2BRequestOptions): Promise<E2BFileInfoLike>;
+    write(files: Array<{ path: string; data: string | ArrayBuffer | ReadableStream<Uint8Array> }>, options?: E2BRequestOptions): Promise<E2BFileInfoLike[]>;
+    makeDir(path: string, options?: E2BRequestOptions): Promise<boolean>;
     list(path: string, options?: { depth?: number | undefined } & E2BRequestOptions): Promise<E2BFileInfoLike[]>;
     getInfo(path: string, options?: E2BRequestOptions): Promise<E2BFileInfoLike>;
   };
@@ -221,6 +223,7 @@ export class E2BSandboxProvider implements SandboxProvider {
     write: (input, options) => this.writeFile(input, options),
     writeBytes: (input, options) => this.writeFileBytes(input, options),
     writeManyBytes: (input, options) => this.writeManyFileBytes(input, options),
+    writeStream: (input, options) => this.writeFileStream(input, options),
     list: (input, options) => this.listFiles(input, options),
   };
 
@@ -303,7 +306,12 @@ export class E2BSandboxProvider implements SandboxProvider {
 
     try {
       options.signal?.throwIfAborted();
-      await this.#observe("mkdir", options.signal, () => runForeground(sandbox, `mkdir -p -- ${shellQuote(parsed.cwd)}`, this.#requestOptions(options)), sandbox.sandboxId);
+      await this.#observe(
+        "file.makeDir",
+        options.signal,
+        () => sandbox.files.makeDir(parsed.cwd, this.#requestOptions(options)),
+        sandbox.sandboxId,
+      );
     } catch (error) {
       await this.#observe("kill", undefined, () => this.#client.kill(sandbox.sandboxId, this.#authOptions()), sandbox.sandboxId).catch(() => false);
       throw error;
@@ -592,6 +600,37 @@ export class E2BSandboxProvider implements SandboxProvider {
     return SandboxFileWriteResultSchema.parse({
       path: metadata.path,
       size_bytes: info.size ?? bytes.byteLength,
+      mtime: info.modifiedTime?.toISOString() ?? this.#now().toISOString(),
+    });
+  }
+
+  async writeFileStream(input: SandboxFileWriteStreamInput, options: SandboxOperationOptions = {}): Promise<SandboxFileWriteResult> {
+    const { content: _content, encoding: _encoding, ...metadata } = SandboxFileWriteInputSchema.parse({
+      ...input,
+      content: "",
+      encoding: "base64",
+    });
+    if (!Number.isSafeInteger(input.size_bytes) || input.size_bytes < 0) {
+      throw new Error("Streamed sandbox file size must be a non-negative safe integer");
+    }
+    options.signal?.throwIfAborted();
+    const sandbox = await this.#sandbox(metadata.sandbox_id, options);
+    options.signal?.throwIfAborted();
+    const requestOptions = this.#requestOptions(options);
+    const info = await this.#observe(
+      "file.writeStream",
+      options.signal,
+      () => sandbox.files.write(metadata.path, input.content, requestOptions),
+      metadata.sandbox_id,
+    );
+    if (metadata.mode !== undefined) {
+      options.signal?.throwIfAborted();
+      const mode = metadata.mode;
+      await this.#observe("chmod", options.signal, () => runForeground(sandbox, `chmod ${mode.toString(8)} -- ${shellQuote(metadata.path)}`, requestOptions), metadata.sandbox_id);
+    }
+    return SandboxFileWriteResultSchema.parse({
+      path: metadata.path,
+      size_bytes: info.size ?? input.size_bytes,
       mtime: info.modifiedTime?.toISOString() ?? this.#now().toISOString(),
     });
   }

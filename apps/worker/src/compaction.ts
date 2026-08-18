@@ -304,6 +304,7 @@ export class DurableSessionCompactor implements SessionCompactionRunner {
           goal: fallbackContext.goal.slice(0, 512),
           nextAction: fallbackContext.nextAction.slice(0, 768),
           narrative: fallbackContext.narrative.slice(-1_024),
+          completedWork: fallbackContext.completedWork.map((item) => item.slice(0, 512)),
           currentWork: fallbackContext.currentWork.map((item) => item.slice(0, 512)),
         };
         segment = checkpointFallback(null, deterministic, boundedFallback);
@@ -724,11 +725,14 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       Math.max(1, Math.floor(input.maxPhysicalAttempts ?? MAX_COMPACTION_PHYSICAL_ATTEMPTS)),
     );
     const first = await this.complete(messages, input.maxTokens, input.signal, 1, input.onProviderAttempt);
-    let parsed = parseSessionCheckpoint(first.text);
-    let validation = parsed.checkpoint
-      ? validateSessionCheckpoint(parsed.checkpoint, input.deterministic, {
+    let parsed = parseSessionCheckpoint(checkpointCandidateWithDeterminism(first.text, input.deterministic));
+    let candidate = parsed.checkpoint
+      ? applyCheckpointDeterminism(parsed.checkpoint, input.deterministic)
+      : null;
+    let validation = candidate
+      ? validateSessionCheckpoint(candidate, input.deterministic, {
           tokensBefore: input.tokensBefore,
-          tokensAfter: sessionCheckpointMetrics(parsed.checkpoint).tokenEstimate,
+          tokensAfter: sessionCheckpointMetrics(candidate).tokenEstimate,
         })
       : { checkpoint: null, issues: parsed.issues };
     if (validation.checkpoint) {
@@ -759,11 +763,14 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
         ].join("\n"),
       },
     ], input.maxTokens, input.signal, 2, input.onProviderAttempt);
-    parsed = parseSessionCheckpoint(repaired.text);
-    validation = parsed.checkpoint
-      ? validateSessionCheckpoint(parsed.checkpoint, input.deterministic, {
+    parsed = parseSessionCheckpoint(checkpointCandidateWithDeterminism(repaired.text, input.deterministic));
+    candidate = parsed.checkpoint
+      ? applyCheckpointDeterminism(parsed.checkpoint, input.deterministic)
+      : null;
+    validation = candidate
+      ? validateSessionCheckpoint(candidate, input.deterministic, {
           tokensBefore: input.tokensBefore,
-          tokensAfter: sessionCheckpointMetrics(parsed.checkpoint).tokenEstimate,
+          tokensAfter: sessionCheckpointMetrics(candidate).tokenEstimate,
         })
       : { checkpoint: null, issues: parsed.issues };
     const usage = compactUsage(this.provider, this.model, [first, repaired], this.pricingByModel);
@@ -818,6 +825,30 @@ export class RouterCheckpointGenerator implements CheckpointGenerator {
       model: result.model,
     };
   }
+}
+
+function checkpointCandidateWithDeterminism(
+  value: string,
+  deterministic: CheckpointDeterministicFields,
+): unknown {
+  const trimmed = value.trim();
+  const json = trimmed.startsWith("```")
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
+    : trimmed;
+  let candidate: unknown;
+  try {
+    candidate = JSON.parse(json);
+  } catch {
+    return value;
+  }
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
+  return {
+    ...(candidate as Record<string, unknown>),
+    generatedAt: deterministic.generatedAt,
+    coveredEntryStart: deterministic.coveredEntryStart,
+    coveredEntryEnd: deterministic.coveredEntryEnd,
+    currentLeafId: deterministic.currentLeafId,
+  };
 }
 
 function compactUsage(
@@ -1146,34 +1177,71 @@ function inferFallbackContext(entries: readonly CompactionEntryRecord[]): {
   goal: string;
   nextAction: string;
   narrative: string;
+  completedWork: string[];
   currentWork: string[];
 } {
   const userTexts: string[] = [];
+  const assistantTexts: string[] = [];
+  const completedToolResults: string[] = [];
+  const failedToolResults: string[] = [];
   for (const entry of entries) {
-    collectUserText(entry.payload, userTexts);
+    collectFallbackText(entry.payload, {
+      userTexts,
+      assistantTexts,
+      completedToolResults,
+      failedToolResults,
+    });
   }
   const goal = userTexts[0]?.slice(0, 512) ?? "";
-  const latest = userTexts.at(-1)?.slice(0, 768) ?? "";
+  const latestUser = userTexts.at(-1)?.slice(0, 768) ?? "";
+  const latestAssistant = assistantTexts.at(-1)?.slice(0, 768) ?? "";
+  const recentCompleted = completedToolResults.slice(-8).map((text) => text.slice(0, 512));
+  const recentCurrent = [
+    ...assistantTexts.slice(-3).map((text) => text.slice(0, 512)),
+    ...failedToolResults.slice(-3).map((text) => text.slice(0, 512)),
+  ];
+  const preservedState = [...recentCompleted.slice(-3), ...recentCurrent.slice(-3)].join("\n");
   return {
     goal,
-    nextAction: latest ? `Continue the requested work: ${latest}` : "Continue from the latest durable checkpoint.",
-    narrative: latest || "Deterministic checkpoint generated from persisted session entries.",
-    currentWork: latest ? [latest] : [],
+    nextAction: latestAssistant
+      ? `Continue from the preserved in-progress plan without repeating completed tool calls: ${latestAssistant}`
+      : latestUser
+        ? `Continue the requested work from the preserved tool results: ${latestUser}`
+        : "Continue from the latest durable checkpoint without repeating completed tool calls.",
+    narrative: preservedState || latestUser || "Deterministic checkpoint generated from persisted session entries.",
+    completedWork: recentCompleted,
+    currentWork: recentCurrent.length > 0 ? recentCurrent : latestUser ? [latestUser] : [],
   };
 }
 
-function collectUserText(value: unknown, output: string[], depth = 0): void {
+function collectFallbackText(
+  value: unknown,
+  output: {
+    userTexts: string[];
+    assistantTexts: string[];
+    completedToolResults: string[];
+    failedToolResults: string[];
+  },
+  depth = 0,
+): void {
   if (!value || typeof value !== "object" || depth > 6) return;
   if (Array.isArray(value)) {
-    for (const item of value) collectUserText(item, output, depth + 1);
+    for (const item of value) collectFallbackText(item, output, depth + 1);
     return;
   }
   const object = value as Record<string, unknown>;
-  if (object.role === "user") {
-    const text = contentText(object.content);
-    if (text) output.push(text);
+  const text = contentText(object.content);
+  if (text) {
+    if (object.role === "user") output.userTexts.push(text);
+    else if (object.role === "assistant") output.assistantTexts.push(text);
+    else if (object.role === "toolResult") {
+      const toolName = typeof object.toolName === "string" ? object.toolName : "tool";
+      const summary = `${toolName}: ${text}`;
+      if (object.isError === true) output.failedToolResults.push(summary);
+      else output.completedToolResults.push(summary);
+    }
   }
-  for (const child of Object.values(object)) collectUserText(child, output, depth + 1);
+  for (const child of Object.values(object)) collectFallbackText(child, output, depth + 1);
 }
 
 function contentText(value: unknown): string {

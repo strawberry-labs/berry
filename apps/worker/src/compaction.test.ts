@@ -203,6 +203,44 @@ describe("durable session compactor", () => {
     expect(reports).toEqual([]);
   });
 
+  it("overrides model-supplied checkpoint identity before validation instead of paying for a repair", async () => {
+    const complete = vi.fn().mockResolvedValue(modelResponse(JSON.stringify({
+      ...checkpointOutput(),
+      generatedAt: "wrong-time",
+      coveredEntryStart: "invented-start",
+      coveredEntryEnd: "invented-end",
+      currentLeafId: "invented-leaf",
+    })));
+    const generator = new RouterCheckpointGenerator(
+      { complete } as unknown as OpenAIChatCompletionsClient,
+      "router",
+      "checkpoint-test",
+      { "checkpoint-test": { input: 1, output: 2 } },
+    );
+    const deterministic = {
+      generatedAt: "2026-07-28T12:00:00.000Z",
+      coveredEntryStart: "entry-1",
+      coveredEntryEnd: "entry-1",
+      currentLeafId: "entry-2",
+    };
+
+    const result = await generator.generate({
+      conversation: '{"entryId":"entry-1"}',
+      deterministic,
+      previousRolling: null,
+      maxTokens: 128,
+      tokensBefore: 128,
+      algorithmVersion: "checkpoint-v2-bounded",
+    });
+
+    expect(result).toMatchObject({
+      validationStatus: "valid",
+      attempts: 1,
+      checkpoint: deterministic,
+    });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
   it("does not make a paid compaction call when pricing is unavailable", async () => {
     const complete = vi.fn().mockResolvedValue(modelResponse(JSON.stringify(checkpointOutput())));
     const generator = new RouterCheckpointGenerator(
@@ -437,6 +475,7 @@ describe("durable session compactor", () => {
       schema: "berry.session-checkpoint",
       version: 2,
       goal: "Implement durable compaction.",
+      currentWork: ["Implement durable compaction."],
       currentLeafId: "entry-2",
       coveredEntryEnd: "entry-1",
     } satisfies Partial<SessionCheckpointV2>);
@@ -484,6 +523,86 @@ describe("durable session compactor", () => {
     expect(replay.noOp).toBe(true);
     expect(generatorCalls).toBe(2);
     expect(states.get("algorithm-v1")?.previousRolling).not.toBe(states.get("algorithm-v2")?.previousRolling);
+  });
+
+  it("preserves completed tool results and the active plan in a deterministic fallback checkpoint", async () => {
+    let persistedSegment: SessionCheckpointV2 | null = null;
+    const state = compactionState({
+      sourceLeafId: "entry-4",
+      entries: [
+        {
+          entryId: "entry-1",
+          parentEntryId: null,
+          entryType: "message",
+          sequence: 1,
+          payload: { role: "user", content: "Create the Phase 4D report." },
+          isLeafMarker: false,
+          createdAt: "2026-07-28T12:00:00.000Z",
+        },
+        {
+          entryId: "entry-2",
+          parentEntryId: "entry-1",
+          entryType: "message",
+          sequence: 2,
+          payload: { role: "assistant", content: "I am extracting the template structure." },
+          isLeafMarker: false,
+          createdAt: "2026-07-28T12:01:00.000Z",
+        },
+        {
+          entryId: "entry-3",
+          parentEntryId: "entry-2",
+          entryType: "message",
+          sequence: 3,
+          payload: {
+            role: "toolResult",
+            toolName: "read",
+            content: [{ type: "text", text: "Template text extracted." }],
+            isError: false,
+          },
+          isLeafMarker: false,
+          createdAt: "2026-07-28T12:02:00.000Z",
+        },
+        {
+          entryId: "entry-4",
+          parentEntryId: "entry-3",
+          entryType: "message",
+          sequence: 4,
+          payload: { role: "assistant", content: "Next I will build the document." },
+          isLeafMarker: true,
+          createdAt: "2026-07-28T12:03:00.000Z",
+        },
+      ],
+    });
+    const repository: SessionCompactionRepository = {
+      claim: async () => true,
+      load: async () => state,
+      persist: async (input) => {
+        persistedSegment = input.segment;
+        return { segmentCheckpointId: "segment", rollingCheckpointId: "rolling", usageEventId: null };
+      },
+      release: async () => {},
+    };
+    const generator: CheckpointGenerator = {
+      provider: "test",
+      model: "checkpoint-test",
+      generate: async () => ({
+        checkpoint: null,
+        validationStatus: "fallback",
+        attempts: 1,
+        fallbackReason: "checkpoint_validation_failed",
+      }),
+    };
+
+    await new DurableSessionCompactor(repository, generator, {
+      leaseOwner: "test-worker",
+      keepRecentTokens: 1,
+    }).compactSession(job);
+
+    expect(persistedSegment).toMatchObject({
+      goal: "Create the Phase 4D report.",
+      completedWork: ["read: Template text extracted."],
+      currentWork: ["I am extracting the template structure."],
+    });
   });
 
   it("rejects a final rolling checkpoint whose protected identity exceeds the serialized byte limit", async () => {
