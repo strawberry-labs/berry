@@ -17,7 +17,6 @@ describe("browser file preview policy", () => {
   });
 
   it.each([
-    ["report.pdf", "application/pdf"],
     ["active.svg", "image/svg+xml"],
     ["scan.bmp", "image/bmp"],
     ["photo.heic", "image/heic"],
@@ -29,6 +28,10 @@ describe("browser file preview policy", () => {
   });
 
   it("keeps non-embedding document viewers available", () => {
+    expect(filePreviewKind({ name: "report.pdf", mediaType: "application/pdf" })).toBe("pdf");
+    expect(filePreviewDecision({ name: "report.pdf", mediaType: "application/pdf", size: 4_000 })).toMatchObject({ kind: "pdf", allowed: true, maxSourceBytes: PREVIEW_LIMITS.pdfBytes });
+    expect(filePreviewDecision({ name: "large.pdf", mediaType: "application/pdf", size: PREVIEW_LIMITS.pdfBytes + 1 }).allowed).toBe(false);
+    expect(filePreviewDecision({ name: "renamed.bin", mediaType: "application/pdf", size: 4_000 }).allowed).toBe(false);
     expect(filePreviewKind({ name: "data.csv", mediaType: "text/csv" })).toBe("spreadsheet");
     expect(filePreviewKind({ name: "notes.md", mediaType: "text/markdown" })).toBe("code");
     expect(filePreviewDecision({ name: "report.docx", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 4_000 })).toMatchObject({ kind: "docx", allowed: true });

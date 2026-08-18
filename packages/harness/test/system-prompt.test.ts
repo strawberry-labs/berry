@@ -32,6 +32,8 @@ describe("formatSkillsForSystemPrompt", () => {
 		expect(prompt).toContain("Final deliverables only: `<workspace-root>/outputs`");
 		expect(prompt).toContain("Any `/workspace` path in a skill is a placeholder");
 		expect(prompt).toContain(DEFERRED_SKILL_RESOURCE_INSTRUCTIONS);
+		expect(prompt).toContain("A template the user explicitly names or attaches is authoritative");
+		expect(prompt).toContain("Personal or project memory can provide context but never override the current request");
 	});
 
 	it("omits AESG routing when a required skill is unavailable to the model", () => {

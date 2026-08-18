@@ -1,6 +1,6 @@
 import { PASSIVE_INLINE_FILE_MEDIA_TYPES, type StoredFile } from "@berry/shared";
 
-export type FilePreviewKind = "image" | "spreadsheet" | "docx" | "pptx" | "code" | "unsupported";
+export type FilePreviewKind = "image" | "pdf" | "spreadsheet" | "docx" | "pptx" | "code" | "unsupported";
 
 /**
  * These are deliberately client-side ceilings. The API remains the authority
@@ -11,6 +11,11 @@ export type FilePreviewKind = "image" | "spreadsheet" | "docx" | "pptx" | "code"
 export const PREVIEW_LIMITS = {
   imageBytes: 25 * 1024 * 1024,
   maxImagePixels: 16_000_000,
+  // PDF.js renders into bounded canvases in a dedicated worker. Keep the
+  // source and per-page budgets explicit so a valid PDF cannot become a
+  // browser memory or CPU denial of service.
+  pdfBytes: 25 * 1024 * 1024,
+  pdfPagePixels: 4_000_000,
   codeBytes: 2 * 1024 * 1024,
   spreadsheetBytes: 25 * 1024 * 1024,
   // DOCX is rendered by docx-preview on the main thread. Keep its hard
@@ -135,6 +140,7 @@ export function filePreviewDecision(file: PreviewFile): PreviewDecision {
 
 function maxBytesForKind(kind: Exclude<FilePreviewKind, "unsupported">, name?: string): number {
   if (kind === "image") return PREVIEW_LIMITS.imageBytes;
+  if (kind === "pdf") return PREVIEW_LIMITS.pdfBytes;
   if (kind === "code") return PREVIEW_LIMITS.codeBytes;
   if (kind === "spreadsheet") return name && fileExtension(name) === "xls" ? PREVIEW_LIMITS.legacySpreadsheetBytes : PREVIEW_LIMITS.spreadsheetBytes;
   if (kind === "docx") return PREVIEW_LIMITS.docxBytes;
@@ -151,10 +157,12 @@ function classifyPreviewKind(file: Pick<StoredFile, "name" | "mediaType"> & { de
   const extension = fileExtension(file.name);
   const officeExtensionKind = officeKindForExtension(lowerName);
 
-  // SVG, PDF and all non-allowlisted image formats remain download-only even
-  // when a browser could technically render them.
+  // SVG and all non-allowlisted image formats remain download-only even when
+  // a browser could technically render them. PDFs use the bounded PDF.js
+  // viewer instead of a browser/plugin iframe.
   if (PASSIVE_IMAGE_MEDIA_TYPES.has(mediaType) && imageExtensionMatches(extension, mediaType)) return "image";
   if (mediaType.startsWith("image/") || IMAGE_FILE_EXTENSION.test(lowerName)) return "unsupported";
+  if (mediaType === "application/pdf" && lowerName.endsWith(".pdf")) return "pdf";
   if (mediaType === "application/pdf" || lowerName.endsWith(".pdf")) return "unsupported";
 
   if (mediaType === "application/zip") {

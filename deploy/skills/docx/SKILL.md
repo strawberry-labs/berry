@@ -1,6 +1,6 @@
 ---
 name: docx
-description: Create, edit, inspect, or convert Word DOCX files. Use for every Word-document request and combine with aesg-branding for AESG output. Route direct, recipient-led, or signed correspondence such as letters, leave requests, short memos, confirmations, and notices to the AESG Letterhead. Route reports, proposals, studies, policies, technical notes, project briefs, and other structured publications to the AESG General Report template. Choose by purpose and structure, not page count alone.
+description: Create, edit, inspect, or convert Word DOCX files. Use for every Word-document request and combine with aesg-branding for AESG output. Route direct, recipient-led, or signed correspondence such as letters, leave requests, short memos, confirmations, and notices to the AESG Letterhead, and route reports, proposals, studies, policies, technical notes, project briefs, and other structured publications to the AESG General Report template only when the user has not supplied or named another template. Choose by purpose and structure, not page count alone.
 ---
 
 # DOCX
@@ -9,6 +9,13 @@ For AESG output, activate `aesg-branding`, read
 `<aesg-branding-skill-directory>/references/brand-system.md`, and use the bundled
 generators from their activated skill directories. This routes reports through
 the General Template and letters through the retained letterhead.
+
+If the user supplies or explicitly names a DOCX template, use that exact file
+as the structural and visual authority and pass it to the generator with
+`--template` when supported. The bundled AESG General Report and Letterhead are
+fallbacks only when no user template is supplied. If the user supplies a PDF
+template but requests an editable DOCX, inspect that exact PDF and reconstruct
+its structure in the DOCX; do not substitute the bundled General Report.
 
 ## Canonical workflow
 

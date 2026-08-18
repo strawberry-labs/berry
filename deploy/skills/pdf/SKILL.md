@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: Create, inspect, validate, or convert PDF files. Use for every PDF request. For an AESG office PDF, combine with aesg-branding and docx, select Letterhead for direct, recipient-led, or signed correspondence, or General Report for a structured publication, then convert the generated DOCX. Choose the source template by purpose and structure, not page count alone.
+description: Create, inspect, validate, or convert PDF files. Use for every PDF request. For an AESG office PDF, combine with aesg-branding and docx, select Letterhead for direct, recipient-led, or signed correspondence, or General Report for a structured publication only when the user has not supplied or named another template, then convert the generated DOCX. Choose the source template by purpose and structure, not page count alone.
 ---
 
 # PDF
@@ -15,6 +15,15 @@ confirmations, and notices. Use `kind: "report"` for structured publications
 and formal project deliverables. The PDF must come from the selected generated
 DOCX rather than a direct PDF recreation. Do not choose Letterhead merely
 because the document is short.
+
+When the user attaches or explicitly names a template, that exact template
+outranks the bundled AESG templates. For a DOCX template, pass the file through
+to the DOCX generator with `--template` when supported. For a PDF template,
+read or render that exact PDF as the authoritative visual and structural
+reference; if an editable DOCX is requested, reconstruct its structure and
+apply AESG styling only where compatible. Do not add the General Report cover,
+approval page, or photographic dividers unless they are present in the supplied
+template or explicitly requested.
 
 ## Canonical workflow
 

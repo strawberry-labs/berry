@@ -3165,7 +3165,8 @@ input.berry-command-search-input:focus-visible {
 .berry-document-preview-stage { overflow: hidden; background: var(--berry-main-bg); }
 .berry-document-preview-stage > * { height: 100%; }
 .berry-docx-viewer,
-.berry-pptx-viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: var(--berry-vibrancy-fallback); }
+.berry-pptx-viewer,
+.berry-pdf-viewer { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: var(--berry-vibrancy-fallback); }
 .berry-docx-canvas,
 .berry-pptx-canvas { width: 100%; height: 100%; overflow: auto; }
 .berry-docx-canvas { padding: 24px; }
@@ -3173,6 +3174,32 @@ input.berry-command-search-input:focus-visible {
 .berry-docx-canvas .docx-wrapper > section.docx { margin: 0 auto 20px; box-shadow: var(--berry-shadow-md); }
 .berry-pptx-canvas { padding: 24px; }
 .berry-pptx-canvas > * { margin-inline: auto; }
+.berry-pdf-canvas {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  gap: 18px;
+  align-items: center;
+  overflow: auto;
+  padding: 24px;
+  background: var(--berry-vibrancy-fallback);
+}
+.berry-pdf-page {
+  display: flex;
+  width: min(100%, 1200px);
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--berry-border);
+  border-radius: 10px;
+  background: var(--berry-preview-paper);
+  box-shadow: var(--berry-shadow-md);
+}
+.berry-pdf-page canvas { display: block; max-width: 100%; height: auto; }
+.berry-pdf-page-label { color: var(--berry-preview-muted); font-size: 11px; }
 .berry-office-loading {
   position: absolute;
   inset: 0;

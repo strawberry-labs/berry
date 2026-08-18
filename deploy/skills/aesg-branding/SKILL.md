@@ -1,6 +1,6 @@
 ---
 name: aesg-branding
-description: Apply AESG's approved identity and select the correct AESG assets or template for generated images and DOCX, PDF, PPTX, or XLSX output. Use when creating, editing, reviewing, or converting an AESG-branded artifact; when AESG is the author or requested visual identity; or when a visual is meant to depict an AESG office, headquarters, person, project, building, or campaign. Pair with the matching format skill. For Word or office PDF output, use Letterhead for direct correspondence and General Report for structured publications. For generated images, use the bundled visual references and one approved PNG, then composite the exact logo only when the output is a finished branded communication.
+description: Apply AESG's approved identity and select the correct AESG assets or template for generated images and DOCX, PDF, PPTX, or XLSX output. Use when creating, editing, reviewing, or converting an AESG-branded artifact; when AESG is the author or requested visual identity; or when a visual is meant to depict an AESG office, headquarters, person, project, building, or campaign. Pair with the matching format skill. For Word or office PDF output, use Letterhead for direct correspondence and General Report for structured publications only when the user has not supplied or named another template. For generated images, use the bundled visual references and one approved PNG, then composite the exact logo only when the output is a finished branded communication.
 ---
 
 # AESG brand authority
@@ -10,6 +10,15 @@ editing, also read `references/image-generation.md`. Treat the retained Office
 template as the design authority for its format. Treat `brand-system.md` and
 `assets/brand-tokens.json`, distilled from the audited January 2022 manual, as
 the runtime authority for identity, imagery, and cross-channel rules.
+
+An exact template the user attaches or names is the authority for that
+artifact's structure, layout, section order, terminology, and visual hierarchy.
+Never replace it with an AESG Letterhead or General Report template. If the
+user also requests AESG formatting, apply only compatible, non-destructive
+identity styling; do not add a cover, approval page, photographic divider, or
+General Report layout unless the supplied template contains it or the user
+explicitly asks for it. Personal memory and bundled defaults never override the
+current request.
 
 ## Select the format and route
 

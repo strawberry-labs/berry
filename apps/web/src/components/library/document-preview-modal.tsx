@@ -14,6 +14,7 @@ import { readResponseBytes } from "./preview-stream";
 import { assertImagePreviewBounds } from "./image-preview-bounds";
 
 const DocxDocumentViewer = React.lazy(() => import("./docx-document-viewer"));
+const PdfDocumentViewer = React.lazy(() => import("./pdf-document-viewer"));
 const PptxDocumentViewer = React.lazy(() => import("./pptx-document-viewer"));
 const SpreadsheetDocumentViewer = React.lazy(() => import("./spreadsheet-document-viewer"));
 const CodeDocumentViewer = React.lazy(() => import("./code-document-viewer"));
@@ -44,6 +45,12 @@ export function DocumentPreviewModal({ file, onOpenChange }: { file: StoredFile 
                 <DownloadOnlyPreview file={file} reason={previewDecision.reason ?? "This file cannot be previewed safely in the browser."} />
               ) : previewKind === "image" ? (
                 <AuthenticatedImagePreview file={file} decision={previewDecision} />
+              ) : previewKind === "pdf" ? (
+                <React.Suspense fallback={<DocumentPreviewLoading name={file.name} />}>
+                  <ViewerErrorBoundary key={file.id} file={file}>
+                    <PdfDocumentViewer file={file} />
+                  </ViewerErrorBoundary>
+                </React.Suspense>
               ) : previewKind === "spreadsheet" ? (
                 <React.Suspense fallback={<DocumentPreviewLoading name={file.name} />}>
                   <ViewerErrorBoundary key={file.id} file={file}>

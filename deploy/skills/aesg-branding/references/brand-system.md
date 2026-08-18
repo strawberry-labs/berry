@@ -9,6 +9,13 @@
 4. `assets/brand-tokens.json` and the two visual reference boards.
 5. Generic format guidance.
 
+An attached or explicitly named template is the retained template for this
+request and therefore outranks bundled AESG templates, personal memory, and
+generic defaults. Preserve its structure and visual hierarchy. A separate
+request for AESG formatting adds only compatible identity styling; it does not
+authorise substituting the General Report or adding brand-specific pages that
+are absent from the supplied template.
+
 The original 60-page manual was text-extracted and visually inspected in full
 during skill maintenance. It is intentionally not bundled at runtime. If a
 rule is not captured here, do not invent it; consult the original source pack
