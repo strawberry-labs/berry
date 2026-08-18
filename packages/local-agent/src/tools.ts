@@ -894,15 +894,15 @@ export function createBerryTools(options: BerryToolsOptions): AgentTool[] {
         Type.Object({
           path: Type.String({ description: "Path to a file inside the workspace or sandbox" }),
           name: Type.Optional(Type.String({ description: "Display name for the artifact; the source extension is appended when omitted" })),
-          media_type: Type.Optional(Type.String({ description: "MIME type; inferred from the source filename when omitted" })),
+          media_type: Type.Optional(Type.String({ description: "Optional MIME type; the runtime inspects the file and then falls back to the source path and name" })),
         }),
         async (_id, params) => {
           const target = safeWorkspacePath(toolWorkspacePath, String(params.path));
           const requestedName = typeof params.name === "string" ? params.name : undefined;
-          const name = artifactDisplayName(target, requestedName);
           const mediaType = typeof params.media_type === "string" && params.media_type.trim()
             ? params.media_type.trim()
             : artifactMediaType(target);
+          const name = artifactDisplayName(target, requestedName, mediaType);
           const stored = await options.artifactStore!.persistFile({
             env,
             path: target,

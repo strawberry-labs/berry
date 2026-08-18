@@ -18,6 +18,11 @@ import {
   type SandboxCreateInput,
   type SandboxProvider,
 } from "@berry/sandbox-contract";
+import {
+  artifactDisplayName,
+  isAutoPublishableArtifact,
+  resolveArtifactMediaType,
+} from "@berry/local-agent";
 import type { ChatContentPart, ImageGenerationResult } from "@berry/router-client";
 import {
   DEFAULT_SANDBOX_INPUT_MAX_BYTES,
@@ -1219,10 +1224,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const maxBytes = this.options.maxInputBytes ?? DEFAULT_SANDBOX_INPUT_MAX_BYTES;
       if (bytes.byteLength === 0) throw new Error("Cannot persist an empty artifact");
       if (bytes.byteLength > maxBytes) throw new Error(`Artifact exceeds the ${maxBytes}-byte output limit`);
-      const name = safeArtifactName(stringValue(args.name) ?? path.split("/").at(-1) ?? "artifact");
-      const mediaType = stringValue(args.media_type)
-        ?? binaryMediaType(name)
-        ?? "application/octet-stream";
+      const requestedName = stringValue(args.name);
+      const mediaType = resolveArtifactMediaType({
+        bytes,
+        sourcePath: path,
+        requestedName,
+        explicitMediaType: stringValue(args.media_type),
+      });
+      const name = safeArtifactName(artifactDisplayName(path, requestedName, mediaType));
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const stored = await this.objects.putArtifact(
         `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${name}`,
@@ -1383,7 +1392,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const bytes = Buffer.from(source.content, "base64");
       if (bytes.byteLength === 0) continue;
       const name = safeArtifactName(path.split("/").at(-1) ?? "artifact");
-      const mediaType = durableArtifactMediaType(name);
+      const mediaType = resolveArtifactMediaType({ bytes, sourcePath: path, requestedName: name });
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       if (previouslyPublished.has(`${path}\0${sha256}`)) continue;
       const relativeKey = path.slice(`${workspaceRoot}/`.length);
@@ -4219,57 +4228,8 @@ function isExtractableOfficeMediaType(mediaType: string): boolean {
   ]).has(mediaType);
 }
 
-const DURABLE_ARTIFACT_MEDIA_TYPES: Record<string, string> = {
-  avif: "image/avif",
-  bmp: "image/bmp",
-  csv: "text/csv",
-  doc: "application/msword",
-  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  epub: "application/epub+zip",
-  gif: "image/gif",
-  html: "text/html",
-  jpeg: "image/jpeg",
-  jpg: "image/jpeg",
-  json: "application/json",
-  md: "text/markdown",
-  mov: "video/quicktime",
-  mp3: "audio/mpeg",
-  mp4: "video/mp4",
-  odp: "application/vnd.oasis.opendocument.presentation",
-  ods: "application/vnd.oasis.opendocument.spreadsheet",
-  odt: "application/vnd.oasis.opendocument.text",
-  pdf: "application/pdf",
-  png: "image/png",
-  ppt: "application/vnd.ms-powerpoint",
-  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  rtf: "application/rtf",
-  svg: "image/svg+xml",
-  tar: "application/x-tar",
-  tif: "image/tiff",
-  tiff: "image/tiff",
-  tsv: "text/tab-separated-values",
-  txt: "text/plain",
-  wav: "audio/wav",
-  webm: "video/webm",
-  webp: "image/webp",
-  xls: "application/vnd.ms-excel",
-  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
-  xml: "application/xml",
-  yaml: "application/yaml",
-  yml: "application/yaml",
-  zip: "application/zip",
-};
-
-function durableArtifactMediaType(path: string): string {
-  const extension = path.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? "";
-  return DURABLE_ARTIFACT_MEDIA_TYPES[extension] ?? "application/octet-stream";
-}
-
 function isDurableArtifact(path: string): boolean {
-  const name = path.split("/").at(-1) ?? "";
-  if (!name || name.startsWith(".") || name.endsWith("~")) return false;
-  return durableArtifactMediaType(name) !== "application/octet-stream";
+  return isAutoPublishableArtifact(path);
 }
 
 function objectValue(value: unknown): Record<string, unknown> {

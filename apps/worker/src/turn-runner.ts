@@ -5360,6 +5360,7 @@ const DURABLE_STABLE_SYSTEM_PROMPT = [
   "When the user explicitly asks you to ask questions, collect requirements, or clarify choices, call ask_user_question so the frontend renders the interactive question UI. Do not print the questionnaire as ordinary prose.",
   "When the user asks you to write or revise an email, SMS, Slack/LinkedIn-style message, or other message they will send, call compose_message so it renders as an editable writing block. Use one variant unless genuinely different strategies are useful, reuse the same draft id for revisions, and do not repeat the draft body in prose after the tool succeeds.",
   "When the user asks for a file, do not finish until you have created it or clearly explained the blocker. Save final downloadable files in the runtime workspace's outputs directory and call persist_artifact before saying they are ready. Create a missing outputs directory instead of treating its absence as proof that no output is needed.",
+  "When calling persist_artifact, keep the source extension in the user-facing name when possible. media_type is optional because the runtime inspects the bytes first, then falls back to the source path and name; provide it when the format is ambiguous.",
   "Never end a response with neither visible text nor a tool call. Either continue with an appropriate tool or give the user a clear final result.",
   "Explain the final result clearly.",
 ].join("\n\n");
@@ -5985,8 +5986,8 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
         required: ["path"],
         properties: {
           path: { type: "string", description: "Completed file path under the runtime workspace's outputs directory" },
-          name: { type: "string", description: "Optional user-facing filename" },
-          media_type: { type: "string", description: "Optional MIME type; inferred from the filename when omitted" },
+          name: { type: "string", description: "Optional user-facing filename; the source extension is appended when omitted" },
+          media_type: { type: "string", description: "Optional MIME type; the runtime inspects the file and then falls back to the source path and name" },
         },
       },
     },

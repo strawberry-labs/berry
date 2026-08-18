@@ -35,6 +35,13 @@ export {
   type McpOAuthState,
 } from "./mcp-oauth.ts";
 export { HookRunner, loadHookConfiguration, parseHookConfig, type HookPayload, type LoadedHooks } from "./hooks.ts";
+export {
+  artifactDisplayName,
+  artifactMediaType,
+  detectArtifactMediaType,
+  isAutoPublishableArtifact,
+  resolveArtifactMediaType,
+} from "./artifacts.ts";
 export { SandboxEnforcer, assertShellWritePolicy, resolveSandboxHelper, seatbeltProfile, type SandboxEnforcerOptions } from "./sandbox.ts";
 export {
   AnthropicMessagesAdapter,

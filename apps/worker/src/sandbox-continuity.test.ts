@@ -2070,7 +2070,7 @@ describe("SandboxContinuityManager", () => {
 
     await expect(manager.execute(snapshot(), toolStep("persist_artifact", {
       path: "/workspace/outputs/report.pdf",
-      name: "Project report.pdf",
+      name: "Project report",
     }))).resolves.toMatchObject({
       output: {
         artifact: {
@@ -2087,6 +2087,10 @@ describe("SandboxContinuityManager", () => {
       "application/pdf",
     );
     expect(repository.persistOutput).toHaveBeenCalledOnce();
+    expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({
+      name: "Project report.pdf",
+      mediaType: "application/pdf",
+    }));
     await expect(manager.execute(snapshot(), toolStep("persist_artifact", {
       path: "/workspace/tmp/private.pdf",
     }))).rejects.toThrow("Artifacts must be created under /workspace/outputs");
