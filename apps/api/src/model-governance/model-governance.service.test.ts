@@ -78,6 +78,34 @@ describe("model governance scoped access", () => {
     );
   });
 
+  it("persists top-level model context and output limits in governance capabilities", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+    await service.synchronizeRuntimeCatalog(tenantId, {
+      id: "router",
+      name: "Berry Router",
+      kind: "berry-router",
+      baseUrl: "https://router.example.test/v1",
+      apiType: "openai-chat-completions",
+      defaultModel: "minimax-m3",
+      models: [{
+        id: "minimax-m3",
+        name: "MiniMax M3",
+        contextWindow: 1_000_000,
+        maxOutputTokens: 128_000,
+        capabilities: { tools: true, reasoning: true },
+      }],
+    });
+
+    expect(await service.listModels(tenantId)).toContainEqual(expect.objectContaining({
+      model: "minimax-m3",
+      capabilities: expect.objectContaining({
+        tools: true,
+        reasoning: true,
+        context: { windowTokens: 1_000_000, maxOutputTokens: 128_000 },
+      }),
+    }));
+  });
+
   it("does not rewrite an unchanged jsonb policy when object keys are reordered", async () => {
     const base = new InMemoryModelGovernanceRepository(false);
     await base.upsertPolicy({

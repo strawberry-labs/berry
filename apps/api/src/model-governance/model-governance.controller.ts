@@ -21,7 +21,7 @@ import { z } from "zod";
 import { AUDIT_SERVICE, type AuditService } from "../audit/audit.service.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { ENTERPRISE_IDENTITY_REPOSITORY, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
-import { MODEL_GOVERNANCE_SERVICE, type ModelGovernanceService } from "./model-governance.service.ts";
+import { MODEL_GOVERNANCE_SERVICE, runtimeModelCapabilities, type ModelGovernanceService } from "./model-governance.service.ts";
 import {
   ORGANIZATION_PROVIDER_RUNTIME,
   OrganizationProviderHealthCheckError,
@@ -451,6 +451,7 @@ export function synchronizeRuntimeModels(
   for (const model of provider.models) {
     const key = `${provider.id}:${model.id}`;
     const existing = byKey.get(key);
+    const capabilities = runtimeModelCapabilities(model) ?? existing?.capabilities ?? {};
     byKey.set(key, OrgModelPolicySchema.parse({
       id: existing?.id ?? `runtime:${provider.id}:${model.id}`,
       tenantId,
@@ -459,7 +460,7 @@ export function synchronizeRuntimeModels(
       displayName: model.name ?? model.id,
       presetId: provider.kind === "berry-router" ? "berry-router" : existing?.presetId ?? null,
       apiType: model.apiType ?? provider.apiType,
-      capabilities: model.capabilities ?? existing?.capabilities ?? {},
+      capabilities,
       status: existing?.status ?? "allowed",
       enforce: existing?.enforce ?? false,
       modeAllow: existing?.modeAllow ?? ["chat", "code"],

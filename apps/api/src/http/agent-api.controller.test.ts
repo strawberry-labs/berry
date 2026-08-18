@@ -1440,7 +1440,7 @@ describe("AgentApiController", () => {
     }));
   });
 
-  it("keeps the conservative output default when model metadata is missing", async () => {
+  it("uses the current catalog maximum when model metadata is missing", async () => {
     const repository = new InMemoryModelGovernanceRepository(false);
     await repository.upsertPolicy({
       tenantId: SELF_HOST_TENANT_ID,
@@ -1482,7 +1482,61 @@ describe("AgentApiController", () => {
     expect(admit).toHaveBeenCalledWith(expect.objectContaining({
       runtimeRequest: expect.objectContaining({
         model: "chat-model",
-        maxTokens: 16_384,
+        maxTokens: 384_000,
+      }),
+    }));
+  });
+
+  it("uses the selected model output limit instead of the deployment fallback cap", async () => {
+    const repository = new InMemoryModelGovernanceRepository(false);
+    await repository.upsertPolicy({
+      tenantId: SELF_HOST_TENANT_ID,
+      providerId: "router",
+      model: "chat-model",
+      status: "allowed",
+      enforce: false,
+      modeAllow: ["chat", "code"],
+    });
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({
+      runId: "turn_model_limit",
+      sessionId: input.sessionId,
+    }));
+    app = await createApp(fakeSessionHost(), {
+      modelGovernance: new ModelGovernanceService(repository),
+      runtimeConfig: new CloudRuntimeConfigService({
+        ...chatRuntimeEnv(),
+        BERRY_CLOUD_MODEL_MAX_OUTPUT_TOKENS: "4096",
+        BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
+          id: "chat-model",
+          name: "Chat Model",
+          contextWindow: 128_000,
+          maxOutputTokens: 32_768,
+        }]),
+      }),
+      durableTurns: { enabled: true, replayAdmission: async () => null, admit },
+    });
+    const created = await request(app.getHttpServer())
+      .post("/v1/tasks")
+      .set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Model limit" })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/v1/sessions/${created.body.session.id}/turns`)
+      .set(authHeader())
+      .send({
+        input: "Run the task",
+        workspacePath: "/workspace",
+        provider: { id: "router" },
+        model: "chat-model",
+      })
+      .expect(201);
+
+    expect(admit).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeRequest: expect.objectContaining({
+        model: "chat-model",
+        maxTokens: 32_768,
+        contextWindowTokens: 128_000,
       }),
     }));
   });
@@ -1621,7 +1675,18 @@ describe("AgentApiController", () => {
     await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader()).send({
       input: "run",
       workspacePath: "/workspace",
-      provider: { id: "provider", kind: "custom", name: "Mock", baseUrl: "https://example.test", apiType: "openai-chat-completions", authType: "none", cost: { input: 1, output: 1 } },
+      model: "gpt-test",
+      provider: {
+        id: "provider",
+        kind: "custom",
+        name: "Mock",
+        baseUrl: "https://example.test",
+        apiType: "openai-chat-completions",
+        authType: "none",
+        defaultModel: "gpt-test",
+        models: [{ id: "gpt-test", name: "GPT Test", maxOutputTokens: 8_000 }],
+        cost: { input: 1, output: 1 },
+      },
     }).expect(201);
     await nextTick();
 
@@ -2080,7 +2145,7 @@ function visionRuntimeConfig(): CloudRuntimeConfigService {
         id: "minimax-m3",
         name: "MiniMax M3",
         contextWindow: 1_000_000,
-        maxOutputTokens: 524_288,
+        maxOutputTokens: 128_000,
         capabilities: { vision: true, cost: { input: 0.3, output: 1.2, cacheRead: 0.06 } },
       },
     ]),

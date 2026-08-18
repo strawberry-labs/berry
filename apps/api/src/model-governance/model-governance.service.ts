@@ -6,6 +6,7 @@ import {
   OrgAiAccessRuleSchema,
   OrgModelDefaultSchema,
   OrgModelPolicySchema,
+  resolveModelCapabilities,
   type ConversationKind,
   type JsonValue,
   type ModelApiType,
@@ -19,6 +20,7 @@ import {
   type OrgAiAccessRuleUpsert,
   type OrgModelDefault,
   type OrgModelPolicy,
+  type RemoteModel,
 } from "@berry/shared";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import type { BerryModelProviderInfo } from "@berry/local-agent";
@@ -54,6 +56,23 @@ export type UpsertAuxiliaryModelDefaultInput = {
   providerId: string;
   model: string;
 };
+
+/**
+ * Persist the effective runtime capabilities, including legacy top-level
+ * context fields such as `maxOutputTokens`, without adding empty objects to
+ * existing governance policies.
+ */
+export function runtimeModelCapabilities(model: RemoteModel): ModelCapabilities | undefined {
+  if (!model.capabilities && !model.capabilityOverrides && !model.contextWindow && !model.maxOutputTokens) {
+    return undefined;
+  }
+  const { context, cost, ...base } = resolveModelCapabilities(model);
+  return {
+    ...base,
+    ...(context && Object.keys(context).length > 0 ? { context } : {}),
+    ...(cost && Object.keys(cost).length > 0 ? { cost } : {}),
+  };
+}
 
 export interface ModelGovernanceRepository {
   listProviders(tenantId: string): Promise<OrganizationModelProvider[]>;
@@ -92,6 +111,7 @@ export class ModelGovernanceService {
 
     for (const model of runtimeModels) {
       const existing = policiesByModel.get(model.id);
+      const capabilities = runtimeModelCapabilities(model) ?? existing?.capabilities ?? {};
       const metadata = {
         ...jsonObject(existing?.metadata),
         source: "runtime-catalog",
@@ -103,7 +123,7 @@ export class ModelGovernanceService {
         displayName: model.name ?? model.id,
         presetId: provider.kind === "berry-router" ? "berry-router" : existing?.presetId ?? null,
         apiType: model.apiType ?? provider.apiType ?? existing?.apiType ?? null,
-        capabilities: model.capabilities ?? existing?.capabilities ?? {},
+        capabilities,
         status: existing?.status ?? "allowed" as const,
         enforce: existing?.enforce ?? false,
         modeAllow: existing?.modeAllow ?? ["chat", "code"] as ConversationKind[],

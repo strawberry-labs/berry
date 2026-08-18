@@ -104,7 +104,9 @@ const PROMPT_IMPROVEMENT_TIMEOUT_MS = 30_000;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
 const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
-const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 16_384;
+// Highest max-output limit in the current Berry catalog, verified against
+// models.dev. Explicit model metadata still takes precedence for each model.
+const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 384_000;
 const DEFAULT_DURABLE_ADMISSION_PREPARATION_TIMEOUT_MS = 1_500;
 const DURABLE_TASK_WITHOUT_ADMISSION_STALE_MS = 15_000;
 const DURABLE_PREPARING_ADMISSION_STALE_MS = 120_000;
@@ -1641,10 +1643,12 @@ export class AgentApiController {
     const governedCapabilities = resolveModelCapabilities(governedModel);
     const advertisedMaxOutputTokens = governedCapabilities.context?.maxOutputTokens;
     const configuredMaxOutputTokens = resolvedRuntime.providerMaxOutputTokens;
-    const modelMaxOutputTokens = advertisedMaxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT_TOKENS;
-    const governedMaxOutputTokens = configuredMaxOutputTokens
-      ? Math.min(modelMaxOutputTokens, configuredMaxOutputTokens)
-      : modelMaxOutputTokens;
+    // A model's catalog metadata is authoritative when it declares a limit.
+    // The deployment setting is only a safety fallback for metadata-poor
+    // models, so one conservative provider-wide value cannot silently cap
+    // every model in the catalog.
+    const governedMaxOutputTokens = advertisedMaxOutputTokens
+      ?? Math.min(DEFAULT_MODEL_MAX_OUTPUT_TOKENS, configuredMaxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT_TOKENS);
     const imageAccess = await this.#resolveImageGenerationAccess(tenantId, userId, departmentId, mode);
     if (request.intent === "image_generation") this.#assertImageGenerationAvailable(imageAccess);
     const contextInput = {
