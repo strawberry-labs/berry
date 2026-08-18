@@ -85,6 +85,11 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     ...(env.BERRY_BACKGROUND_QUEUE_NAME?.trim() ? { backgroundQueueName: env.BERRY_BACKGROUND_QUEUE_NAME.trim() } : {}),
     ...(env.BERRY_LEGACY_QUEUE_NAME?.trim() ? { legacyQueueName: env.BERRY_LEGACY_QUEUE_NAME.trim() } : {}),
   });
+  const documentExtractor = new DocumentExtractor(durableConfig.tikaUrl, {
+    timeoutMs: 60_000,
+    maxInputBytes: durableConfig.knowledgeMaxInputBytes,
+    maxOutputBytes: durableConfig.knowledgeMaxOutputBytes,
+  });
   const sandboxContinuity = new SandboxContinuityManager(
     createWorkerSandboxProvider(env),
     new SqlSandboxSnapshotRepository(executor),
@@ -94,6 +99,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
       cwd: env.BERRY_SANDBOX_CWD ?? "/workspace",
       ttlSeconds: Math.min(positiveInteger(env.BERRY_SANDBOX_TTL_SECONDS) ?? 300, 300),
       maxInputBytes: durableConfig.sandboxInputMaxBytes,
+      documentTextExtractor: (input) => documentExtractor.extract(input),
       enableTerminalFinalization: env.BERRY_TERMINAL_FINALIZATION_ENABLED?.trim().toLowerCase() === "true",
       ...(env.BERRY_ROUTER_INFERENCE_BASE_URL?.trim() && env.BERRY_ROUTER_IMAGE_MODEL?.trim()
         ? {
@@ -113,11 +119,7 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
   const knowledge = new KnowledgeProcessor({
     repository: new SqlKnowledgeRepository(executor),
     objects: knowledgeObjectStore(env),
-    extractor: new DocumentExtractor(durableConfig.tikaUrl, {
-      timeoutMs: 60_000,
-      maxInputBytes: durableConfig.knowledgeMaxInputBytes,
-      maxOutputBytes: durableConfig.knowledgeMaxOutputBytes,
-    }),
+    extractor: documentExtractor,
     chunker: new KnowledgeChunker(durableConfig.knowledgeChunkTokens, durableConfig.knowledgeChunkOverlapTokens),
     embeddings: createEmbeddingProviderFromEnv(env, {
       provider: durableConfig.embeddingProvider,

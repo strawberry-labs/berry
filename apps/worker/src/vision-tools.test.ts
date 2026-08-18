@@ -46,6 +46,32 @@ describe("DurableVisionToolExecutor", () => {
       }]);
   });
 
+  it("still runs base model preparation for text-only turns without images", async () => {
+    const modelContent = vi.fn(async () => [{
+      type: "text" as const,
+      text: "[Current-turn attachments are staged.]",
+    }]);
+    const base: DurableTurnToolExecutor = {
+      modelContent,
+      execute: async () => { throw new Error("unexpected base execution"); },
+    };
+    const snapshot = visionSnapshot();
+    const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
+    snapshot.runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
+      ...runtime,
+      attachments: [{
+        name: "requirements.docx",
+        mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        size: 1_024,
+        sourceKind: "upload",
+      }],
+    });
+
+    await expect(new DurableVisionToolExecutor(base, new MemoryVisionCache()).modelContent(snapshot))
+      .resolves.toEqual([{ type: "text", text: "[Current-turn attachments are staged.]" }]);
+    expect(modelContent).toHaveBeenCalledOnce();
+  });
+
   it("withholds raw pixels from a text-only model and reuses cached observations without a second charge", async () => {
     const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
       id: "vision-response",

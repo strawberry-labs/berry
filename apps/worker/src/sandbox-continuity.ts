@@ -50,6 +50,58 @@ const PI_TOOL_MAX_BYTES = 50 * 1024;
 const PI_READ_MAX_LINE_LENGTH = 2_000;
 const PI_GREP_MAX_LINE_LENGTH = 500;
 const PI_GREP_META_PREFIX = "__BERRY_PI_GREP_META__";
+const DEFAULT_PDF_PAGE_WINDOW = 10;
+const MAX_ARCHIVE_ENTRIES = 2_000;
+const MAX_ARCHIVE_INVENTORY_ENTRIES = 256;
+const MAX_ARCHIVE_EXTRACTED_BYTES = 512 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRY_BYTES = 100 * 1024 * 1024;
+const MAX_ARCHIVE_COMPRESSION_RATIO = 250;
+const ZIP_PREFLIGHT_SCRIPT = String.raw`
+import json
+import stat
+import sys
+import zipfile
+
+archive = sys.argv[1]
+max_entries = int(sys.argv[2])
+max_total = int(sys.argv[3])
+max_entry = int(sys.argv[4])
+max_ratio = float(sys.argv[5])
+
+with zipfile.ZipFile(archive) as source:
+    infos = source.infolist()
+    if len(infos) > max_entries:
+        raise RuntimeError(f"ZIP archive contains {len(infos)} entries; limit is {max_entries}")
+    total = 0
+    seen = set()
+    for info in infos:
+        name = info.filename
+        normalized = name.replace("\\", "/")
+        parts = normalized.split("/")
+        if (not normalized or normalized.startswith("/") or chr(0) in normalized
+                or (len(normalized) >= 3 and normalized[1:3] == ":/")
+                or any(part in (".", "..") for part in parts)):
+            raise RuntimeError(f"ZIP archive contains an unsafe entry path: {name}")
+        key = normalized.rstrip("/")
+        if key in seen:
+            raise RuntimeError(f"ZIP archive contains a duplicate entry path: {name}")
+        seen.add(key)
+        mode = (info.external_attr >> 16) & 0xFFFF
+        if stat.S_ISLNK(mode):
+            raise RuntimeError(f"ZIP archive contains a symbolic link: {name}")
+        if info.flag_bits & 1:
+            raise RuntimeError(f"ZIP archive contains an encrypted entry: {name}")
+        if not info.is_dir():
+            if info.file_size > max_entry:
+                raise RuntimeError(f"ZIP entry exceeds the {max_entry}-byte limit: {name}")
+            total += info.file_size
+            if total > max_total:
+                raise RuntimeError(f"ZIP archive expands beyond the {max_total}-byte limit")
+            ratio = info.file_size / max(1, info.compress_size)
+            if ratio > max_ratio:
+                raise RuntimeError(f"ZIP entry exceeds the {max_ratio:g}:1 compression-ratio limit: {name}")
+    print(json.dumps({"entryCount": len(infos), "totalBytes": total}))
+`;
 export const PI_BASH_WRAPPER_SCRIPT = 'mkdir -p -- "$(dirname "$2")" || exit; set -o pipefail; bash -lc "$1" 2>&1 | tee -- "$2"; pipeline_status=("${PIPESTATUS[@]}"); [ "${pipeline_status[0]}" -ne 0 ] && exit "${pipeline_status[0]}"; exit "${pipeline_status[1]}"';
 export const DURABLE_IMAGE_REQUEST_TIMEOUT_MS = 15 * 60_000;
 export const DURABLE_IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
@@ -453,6 +505,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       terminalSnapshotTimeoutMs?: number;
       terminalSuspendTimeoutMs?: number;
       enableTerminalFinalization?: boolean;
+      documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
       imageGeneration?: {
         endpoint: string;
         editsEndpoint: string;
@@ -470,9 +523,21 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   ): Promise<readonly ChatContentPart[]> {
     signal?.throwIfAborted();
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    const attachedImages = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn"))
-      .filter((file) => file.mediaType.startsWith("image/"));
+    const turnInputFiles = await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn");
     signal?.throwIfAborted();
+    if (turnInputFiles.length > 0) {
+      const sandbox = await this.ensureSandbox(snapshot, signal);
+      await this.stageInputFiles(
+        snapshot,
+        sandbox.id,
+        this.repository,
+        new Set(turnInputFiles.map((file) => file.fileId.toLowerCase())),
+        signal,
+        reportProgress,
+        turnInputFiles,
+      );
+    }
+    const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
     const requestedSandboxImages = (explicitPaths ?? exposedSandboxImagePaths(snapshot, workspaceRoot))
@@ -778,7 +843,71 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const mediaType = binaryMediaType(path);
       if (mediaType === "application/pdf") {
-        const content = await extractPdfText(this.provider, sandbox.id, path, step, workspaceRoot, signal, reportProgress);
+        const extraction = await extractPdfText(this.provider, sandbox.id, path, args, step, workspaceRoot, signal, reportProgress);
+        const formatted = piReadPdfContent(extraction.content, args, {
+          totalPages: extraction.totalPages,
+          pageStart: extraction.pageStart,
+          pageEnd: extraction.pageEnd,
+          sourceTruncated: extraction.sourceTruncated,
+        });
+        return {
+          output: {
+            path,
+            content: formatted.content,
+            mediaType,
+            extractedText: true,
+            ...formatted.details,
+            ...inputRepairDetails,
+          },
+          summary: `Extracted text from ${path}`,
+          sandbox,
+        };
+      }
+      if (mediaType === "application/zip") {
+        const archive = await extractZipArchive(
+          this.provider,
+          sandbox.id,
+          path,
+          step,
+          workspaceRoot,
+          signal,
+          reportProgress,
+        );
+        const formatted = piReadContent(archive.content, args);
+        return {
+          output: {
+            path,
+            mediaType,
+            extractedArchive: true,
+            extractionRoot: archive.extractionRoot,
+            entryCount: archive.entryCount,
+            entriesShown: archive.entriesShown,
+            inventoryTruncated: archive.inventoryTruncated,
+            content: formatted.content,
+            ...formatted.details,
+            ...inputRepairDetails,
+          } as JsonValue,
+          summary: `Safely extracted ${path}`,
+          sandbox,
+        };
+      }
+      if (mediaType && isExtractableOfficeMediaType(mediaType) && this.options.documentTextExtractor) {
+        const source = await this.provider.files.read({
+          sandbox_id: sandbox.id,
+          path,
+          encoding: "base64",
+        }, signal ? { signal } : undefined);
+        reportProgress?.();
+        const maxInputBytes = this.options.maxInputBytes ?? MAX_ARCHIVE_ENTRY_BYTES;
+        if (source.size_bytes > maxInputBytes) {
+          throw new Error(`Document exceeds the ${maxInputBytes}-byte extraction limit: ${path}`);
+        }
+        const bytes = Buffer.from(source.content, "base64");
+        if (bytes.byteLength !== source.size_bytes) {
+          throw new Error(`Document read was incomplete: expected ${source.size_bytes} bytes, received ${bytes.byteLength}`);
+        }
+        const content = await this.options.documentTextExtractor({ bytes, mediaType });
+        reportProgress?.();
         const formatted = piReadContent(content, args);
         return {
           output: {
@@ -1019,9 +1148,19 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         ? Buffer.from(first.b64_json, "base64")
         : await downloadGeneratedImage(first.url, signal);
       if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
+      // Image generation happens outside the sandbox and may outlive its
+      // provider TTL. Reconnect/resume before the first post-generation
+      // sandbox operation, including turns that created the sandbox earlier
+      // in this execution and have not persisted sandboxId on the snapshot.
+      const writableSandbox = await this.ensureSandbox({
+        ...snapshot,
+        sandboxProvider: sandbox.provider,
+        sandboxId: sandbox.id,
+        sandboxState: sandbox.state,
+      }, signal);
       const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp)$/i, "");
       const path = `${workspaceRoot}/outputs/${title}.png`;
-      const writeInput = { sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
+      const writeInput = { sandbox_id: writableSandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
       await (signal
         ? this.provider.files.write(writeInput, { signal })
         : this.provider.files.write(writeInput));
@@ -1065,7 +1204,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return {
         output: { text: `Generated ${title}.png`, image, visionPath: path, artifact: { kind: "file", path: image.src, fileId: output.fileId, name: output.name, mediaType: output.mediaType, size: output.sizeBytes } },
         summary: `Generated ${title}.png`,
-        sandbox,
+        sandbox: writableSandbox,
       };
     }
     if (toolName === "persist_artifact") {
@@ -1517,20 +1656,33 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (snapshot.sandboxId) {
       try {
         return await this.withSandboxLifecycleLock(snapshot.tenantId, snapshot.sandboxId, async (repository) => {
+          let activeSandbox: { provider: string; id: string; state: string } = {
+            provider: snapshot.sandboxProvider ?? this.provider.kind,
+            id: snapshot.sandboxId!,
+            state: "running",
+          };
           if (this.provider.supportsResume !== false) {
             const resumeInput = {
               sandbox_id: snapshot.sandboxId!,
               reason: "Durable turn requested sandbox access",
             } as const;
-            if (signal) await this.provider.resume?.(resumeInput, { signal });
-            else await this.provider.resume?.(resumeInput);
+            const resumed = signal
+              ? await this.provider.resume?.(resumeInput, { signal })
+              : await this.provider.resume?.(resumeInput);
+            if (resumed) {
+              activeSandbox = {
+                provider: resumed.provider ?? activeSandbox.provider,
+                id: resumed.sandbox_id,
+                state: resumed.status ?? "running",
+              };
+            }
           }
           if (this.provider.kind !== "e2b") {
             // Local/Router providers retain the cheap liveness probe. E2B's
             // first real operation is already a health check; its redundant
             // data-plane list request added tens of seconds to cold reconnects.
             await this.provider.files.list({
-              sandbox_id: snapshot.sandboxId!,
+              sandbox_id: activeSandbox.id,
               path: this.options.cwd ?? "/workspace",
               recursive: false,
             }, { signal });
@@ -1538,11 +1690,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
-            provider: snapshot.sandboxProvider ?? this.provider.kind,
-            sandboxId: snapshot.sandboxId!,
-            state: "running",
+            provider: activeSandbox.provider,
+            sandboxId: activeSandbox.id,
+            state: activeSandbox.state,
           });
-          return { provider: snapshot.sandboxProvider ?? this.provider.kind, id: snapshot.sandboxId!, state: "running" };
+          return activeSandbox;
         });
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -1564,17 +1716,30 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             sandboxId: continuity.sandboxId!,
             state: "resume_requested",
           });
+          let activeSandbox: { provider: string; id: string; state: string } = {
+            provider: continuity.provider ?? this.provider.kind,
+            id: continuity.sandboxId!,
+            state: "running",
+          };
           if (this.provider.supportsResume !== false) {
             const resumeInput = {
               sandbox_id: continuity.sandboxId!,
               reason: "Follow-up turn requested the prior sandbox",
             } as const;
-            if (signal) await this.provider.resume?.(resumeInput, { signal });
-            else await this.provider.resume?.(resumeInput);
+            const resumed = signal
+              ? await this.provider.resume?.(resumeInput, { signal })
+              : await this.provider.resume?.(resumeInput);
+            if (resumed) {
+              activeSandbox = {
+                provider: resumed.provider ?? activeSandbox.provider,
+                id: resumed.sandbox_id,
+                state: resumed.status ?? "running",
+              };
+            }
           }
           if (this.provider.kind !== "e2b") {
             await this.provider.files.list({
-              sandbox_id: continuity.sandboxId!,
+              sandbox_id: activeSandbox.id,
               path: this.options.cwd ?? "/workspace",
               recursive: false,
             }, { signal });
@@ -1582,15 +1747,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           await repository.recordSandbox({
             tenantId: snapshot.tenantId,
             runId: snapshot.id,
-            provider: continuity.provider ?? this.provider.kind,
-            sandboxId: continuity.sandboxId!,
-            state: "running",
+            provider: activeSandbox.provider,
+            sandboxId: activeSandbox.id,
+            state: activeSandbox.state,
           });
-          return {
-            provider: continuity.provider ?? this.provider.kind,
-            id: continuity.sandboxId!,
-            state: "running",
-          };
+          return activeSandbox;
         });
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -2764,8 +2925,9 @@ async function sandboxCommand(
   cwd: string,
   signal?: AbortSignal,
   reportProgress?: () => void,
+  timeoutMs = 0,
 ): Promise<string> {
-  const result = await sandboxCommandOutput(provider, sandboxId, requestId, command, cwd, signal, reportProgress);
+  const result = await sandboxCommandOutput(provider, sandboxId, requestId, command, cwd, signal, reportProgress, timeoutMs);
   return result.stdout;
 }
 
@@ -2777,19 +2939,24 @@ async function sandboxCommandOutput(
   cwd: string,
   signal?: AbortSignal,
   reportProgress?: () => void,
-): Promise<{ stdout: string; stderr: string }> {
+  timeoutMs = 0,
+): Promise<{ stdout: string; stderr: string; stdoutTruncated: boolean }> {
   let stdout = "";
   let stderr = "";
+  let stdoutTruncated = false;
   let exitCode: number | null = null;
   for await (const event of provider.exec({
     sandbox_id: sandboxId,
     request_id: requestId,
     command,
     cwd,
-    timeout_ms: 0,
+    timeout_ms: timeoutMs,
   }, { signal })) {
     reportProgress?.();
-    if (event.kind === "stdout") stdout = appendBoundedHead(stdout, event.data, 1_000_000);
+    if (event.kind === "stdout") {
+      stdoutTruncated ||= stdout.length >= 1_000_000 || stdout.length + event.data.length > 1_000_000;
+      stdout = appendBoundedHead(stdout, event.data, 1_000_000);
+    }
     else if (event.kind === "stderr") stderr = appendBoundedTail(stderr, event.data, 100_000);
     else if (event.kind === "exit") exitCode = event.exit_code;
     else if (event.kind === "error") throw new Error(event.message);
@@ -2798,7 +2965,7 @@ async function sandboxCommandOutput(
     const detail = (stderr || stdout).slice(-4_000);
     throw new Error(`Command exited with ${exitCode ?? "unknown"}: ${detail}`);
   }
-  return { stdout, stderr };
+  return { stdout, stderr, stdoutTruncated };
 }
 
 function appendBoundedHead(current: string, chunk: string, maximum: number): string {
@@ -3256,12 +3423,14 @@ export function piReadContent(
   const details: Record<string, JsonValue> = {};
   if (truncated.truncated) {
     const endDisplay = startDisplay + truncated.outputLines - 1;
-    notices.push(`Showing lines ${startDisplay}-${endDisplay} of ${allLines.length}${truncated.truncatedBy === "bytes" ? " (50.0KB limit)" : ""}. Use offset=${endDisplay + 1} to continue.`);
+    const nextOffset = endDisplay + 1;
+    notices.push(`Showing lines ${startDisplay}-${endDisplay} of ${allLines.length}${truncated.truncatedBy === "bytes" ? " (50.0KB limit)" : ""}. Use offset=${nextOffset} to continue.`);
     Object.assign(details, {
       truncated: true,
       truncatedBy: truncated.truncatedBy,
       totalLines: allLines.length,
       outputLines: truncated.outputLines,
+      nextOffset,
     });
   } else if (limit !== null && endLine < allLines.length) {
     notices.push(`${allLines.length - endLine} more lines in file. Use offset=${endLine + 1} to continue.`);
@@ -3273,6 +3442,114 @@ export function piReadContent(
   }
   return {
     content: `${truncated.content}${notices.length > 0 ? `\n\n[${notices.join(" ")}]` : ""}`,
+    details,
+  };
+}
+
+export function piReadPdfContent(
+  source: string,
+  args: Record<string, unknown>,
+  sourceRange?: {
+    totalPages: number;
+    pageStart: number;
+    pageEnd: number;
+    sourceTruncated?: boolean;
+  },
+): { content: string; details: Record<string, JsonValue> } {
+  const normalized = normalizeToolText(source);
+  const rawPages = normalized.split("\f");
+  if (sourceRange) {
+    // pdftotext emits a trailing form-feed after the final selected page.
+    // Remove that delimiter, then restore genuinely blank pages from the
+    // page-count metadata so blank pages do not shift later page numbers.
+    if (rawPages.length > 1 && rawPages.at(-1)?.trim() === "") rawPages.pop();
+    const expectedPages = Math.max(0, sourceRange.pageEnd - sourceRange.pageStart + 1);
+    if (!sourceRange.sourceTruncated) {
+      while (rawPages.length < expectedPages) rawPages.push("");
+      if (rawPages.length > expectedPages) rawPages.length = expectedPages;
+    }
+  } else {
+    while (rawPages.length > 1 && rawPages.at(-1)?.trim() === "") rawPages.pop();
+  }
+  const pages = rawPages.map((page) => page.trim());
+  const totalPages = sourceRange?.totalPages ?? pages.length;
+  const sourcePageStart = sourceRange?.pageStart ?? 1;
+  const sourcePageEnd = sourceRange?.pageEnd ?? (sourcePageStart + pages.length - 1);
+  const requestedStart = numberValue(args.page_start);
+  const requestedEnd = numberValue(args.page_end);
+  const pageStart = requestedStart ?? sourcePageStart;
+  const pageEnd = requestedEnd
+    ?? (requestedStart === null ? Math.min(totalPages, DEFAULT_PDF_PAGE_WINDOW) : requestedStart);
+  if (pageEnd < pageStart) throw new Error("read page_end must be greater than or equal to page_start");
+  if (pageStart > totalPages) {
+    return {
+      content: `[Page ${pageStart} is beyond the end of this PDF (${totalPages} pages total). Retry with a smaller page_start.]`,
+      details: { eof: true, totalPages, pageStart, pageEnd },
+    };
+  }
+  if (pages.length === 0 || pages.every((page) => page.length === 0)) {
+    return {
+      content: "[The PDF contains no extractable text. It may be scanned and require OCR.]",
+      details: { empty: true, totalPages, pageStart, pageEnd },
+    };
+  }
+
+  const availablePageStart = sourcePageStart;
+  const availablePageEnd = Math.min(sourcePageEnd, sourcePageStart + pages.length - 1);
+  const actualStart = Math.max(pageStart, availablePageStart);
+  const actualEnd = Math.min(pageEnd, totalPages, availablePageEnd);
+  if (actualStart > actualEnd) {
+    return {
+      content: sourceRange?.sourceTruncated
+        ? "[The selected PDF range exceeded the bounded extraction window. Retry with a smaller page range.]"
+        : "[The selected PDF pages contain no extractable text. The PDF may be scanned and require OCR.]",
+      details: {
+        empty: true,
+        totalPages,
+        pageStart,
+        pageEnd,
+        ...(sourceRange?.sourceTruncated ? { extractionTruncated: true } : {}),
+      },
+    };
+  }
+  const selectedPages = pages.slice(actualStart - sourcePageStart, actualEnd - sourcePageStart + 1);
+  const rendered = selectedPages.map((page, index) => {
+    const pageNumber = actualStart + index;
+    return `--- Page ${pageNumber} of ${totalPages} ---\n${page || "[No extractable text on this page.]"}`;
+  }).join("\n\n");
+  const formatted = piReadContent(rendered, args);
+  const outputPages = (formatted.content.match(/^--- Page \d+ of \d+ ---$/gm) ?? []).length;
+  const details: Record<string, JsonValue> = {
+    ...formatted.details,
+    totalPages,
+    pageStart: actualStart,
+    pageEnd: actualEnd,
+    outputPages,
+  };
+  if (sourceRange?.sourceTruncated) details.extractionTruncated = true;
+  const textWasTruncated = formatted.details.truncated === true;
+  if (!textWasTruncated && !sourceRange?.sourceTruncated && actualEnd < totalPages) {
+    details.hasMorePages = true;
+    details.nextPageStart = actualEnd + 1;
+    details.nextPageEnd = Math.min(totalPages, actualEnd + DEFAULT_PDF_PAGE_WINDOW);
+  }
+  const nextOffset = numberValue(formatted.details.nextOffset);
+  const notices = [
+    ...(textWasTruncated && nextOffset !== null
+      ? [`This page range exceeded the read limit. Continue with page_start=${actualStart}, page_end=${actualEnd}, offset=${nextOffset}.`]
+      : []),
+    ...(sourceRange?.sourceTruncated
+      ? ["PDF extraction reached its bounded safety limit before the requested range was complete. Retry with a smaller page range."]
+      : []),
+    ...(!sourceRange?.sourceTruncated && actualEnd < pageEnd && actualEnd >= totalPages
+      ? [`PDF ends at page ${totalPages}; showing pages ${actualStart}-${actualEnd}.`]
+      : []),
+    ...(!textWasTruncated && !sourceRange?.sourceTruncated && actualEnd < totalPages
+      ? [`More PDF pages are available. Use page_start=${actualEnd + 1} and page_end=${Math.min(totalPages, actualEnd + DEFAULT_PDF_PAGE_WINDOW)} to continue.`]
+      : []),
+  ];
+  return {
+    content: `${formatted.content}${notices.length > 0 ? `\n\n[${notices.join(" ")}]` : ""}`,
     details,
   };
 }
@@ -3413,7 +3690,7 @@ function moveCoreArgumentAlias(
 }
 
 function coreOptionalFields(toolName: string): readonly string[] {
-  if (toolName === "read") return ["offset", "limit"];
+  if (toolName === "read") return ["offset", "limit", "page_start", "page_end"];
   if (toolName === "bash") return ["timeout"];
   if (toolName === "grep") return ["path", "glob", "ignoreCase", "literal", "context", "limit"];
   if (toolName === "find") return ["path", "limit"];
@@ -3442,7 +3719,7 @@ function validateCoreToolArguments(toolName: string, args: Record<string, unknow
       `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper.`,
     );
   }
-  const allowed = toolName === "read" ? ["path", "offset", "limit"]
+  const allowed = toolName === "read" ? ["path", "offset", "limit", "page_start", "page_end"]
     : toolName === "bash" ? ["command", "timeout"]
       : toolName === "edit" ? ["path", "edits"]
         : toolName === "write" ? ["path", "content"]
@@ -3458,6 +3735,8 @@ function validateCoreToolArguments(toolName: string, args: Record<string, unknow
     validateCorePath(args, toolName, true);
     validateOptionalInteger(args, "offset", 1, toolName);
     validateOptionalInteger(args, "limit", 1, toolName);
+    validateOptionalInteger(args, "page_start", 1, toolName);
+    validateOptionalInteger(args, "page_end", 1, toolName);
     return;
   }
   if (toolName === "bash") {
@@ -3723,32 +4002,181 @@ async function extractPdfText(
   provider: SandboxProvider,
   sandboxId: string,
   path: string,
+  args: Record<string, unknown>,
   step: DurableTurnStep,
   workspaceRoot: string,
   signal?: AbortSignal,
   reportProgress?: () => void,
-): Promise<string> {
-  const stdout: string[] = [];
-  const stderr: string[] = [];
-  let exitCode: number | null = null;
-  for await (const event of provider.exec({
+): Promise<{
+  content: string;
+  totalPages: number;
+  pageStart: number;
+  pageEnd: number;
+  sourceTruncated: boolean;
+}> {
+  const requestId = step.idempotencyKey ?? step.id;
+  const pageInfo = await sandboxCommandOutput(
+    provider,
+    sandboxId,
+    `${requestId}:pdf-info`,
+    ["pdfinfo", path],
+    workspaceRoot,
+    signal,
+    reportProgress,
+    120_000,
+  );
+  const pageMatch = pageInfo.stdout.match(/(?:^|\n)Pages:\s*(\d+)\s*(?:\n|$)/);
+  const totalPages = pageMatch ? Number(pageMatch[1]) : NaN;
+  if (!Number.isSafeInteger(totalPages) || totalPages < 1) {
+    throw new Error(`PDF page metadata did not contain a valid page count for ${path}`);
+  }
+  const requestedStart = numberValue(args.page_start);
+  const requestedEnd = numberValue(args.page_end);
+  const pageStart = requestedStart ?? 1;
+  const requestedPageEnd = requestedEnd
+    ?? (requestedStart === null ? Math.min(totalPages, DEFAULT_PDF_PAGE_WINDOW) : requestedStart);
+  if (requestedPageEnd < pageStart) throw new Error("read page_end must be greater than or equal to page_start");
+  if (pageStart > totalPages) {
+    return {
+      content: "",
+      totalPages,
+      pageStart,
+      pageEnd: requestedPageEnd,
+      sourceTruncated: false,
+    };
+  }
+  const pageEnd = Math.min(requestedPageEnd, totalPages);
+  const extracted = await sandboxCommandOutput(
+    provider,
+    sandboxId,
+    `${requestId}:pdf-text:${pageStart}-${pageEnd}`,
+    ["pdftotext", "-layout", "-f", String(pageStart), "-l", String(pageEnd), path, "-"],
+    workspaceRoot,
+    signal,
+    reportProgress,
+    120_000,
+  );
+  return {
+    content: extracted.stdout,
+    totalPages,
+    pageStart,
+    pageEnd,
+    sourceTruncated: extracted.stdoutTruncated,
+  };
+}
+
+async function extractZipArchive(
+  provider: SandboxProvider,
+  sandboxId: string,
+  path: string,
+  step: DurableTurnStep,
+  workspaceRoot: string,
+  signal?: AbortSignal,
+  reportProgress?: () => void,
+): Promise<{
+  extractionRoot: string;
+  entryCount: number;
+  entriesShown: number;
+  inventoryTruncated: boolean;
+  content: string;
+}> {
+  const requestId = step.idempotencyKey ?? step.id;
+  const preflightText = await sandboxCommand(
+    provider,
+    sandboxId,
+    `${requestId}:archive:preflight`,
+    [
+      "python",
+      "-c",
+      ZIP_PREFLIGHT_SCRIPT,
+      path,
+      String(MAX_ARCHIVE_ENTRIES),
+      String(MAX_ARCHIVE_EXTRACTED_BYTES),
+      String(MAX_ARCHIVE_ENTRY_BYTES),
+      String(MAX_ARCHIVE_COMPRESSION_RATIO),
+    ],
+    workspaceRoot,
+    signal,
+    reportProgress,
+  );
+  let preflight: Record<string, unknown>;
+  try {
+    preflight = objectValue(JSON.parse(preflightText.trim()));
+  } catch {
+    throw new Error("ZIP archive preflight returned an invalid manifest");
+  }
+  const preflightEntryCount = numberValue(preflight.entryCount);
+  if (preflightEntryCount === null || !Number.isSafeInteger(preflightEntryCount) || preflightEntryCount < 0) {
+    throw new Error("ZIP archive preflight returned an invalid entry count");
+  }
+  if (preflightEntryCount > MAX_ARCHIVE_ENTRIES) {
+    throw new Error(`ZIP archive contains ${preflightEntryCount} entries; the safe limit is ${MAX_ARCHIVE_ENTRIES}`);
+  }
+
+  const archiveKey = createHash("sha256").update(`${path}\0${requestId}`).digest("hex").slice(0, 20);
+  const extractionRoot = `${workspaceRoot}/tmp/archives/${archiveKey}`;
+  await sandboxCommand(
+    provider,
+    sandboxId,
+    `${requestId}:archive:mkdir`,
+    ["mkdir", "-p", extractionRoot],
+    workspaceRoot,
+    signal,
+    reportProgress,
+  );
+
+  await sandboxCommand(
+    provider,
+    sandboxId,
+    `${requestId}:archive:extract`,
+    ["unzip", "-o", "-q", path, "-d", extractionRoot],
+    workspaceRoot,
+    signal,
+    reportProgress,
+  );
+  const listing = await provider.files.list({
     sandbox_id: sandboxId,
-    request_id: `${step.idempotencyKey ?? step.id}:pdf-text`,
-    command: ["pdftotext", "-layout", path, "-"],
-    cwd: workspaceRoot,
-    timeout_ms: 120_000,
-  }, { signal })) {
-    reportProgress?.();
-    if (event.kind === "stdout") stdout.push(event.data);
-    else if (event.kind === "stderr") stderr.push(event.data);
-    else if (event.kind === "exit") exitCode = event.exit_code;
-    else if (event.kind === "error") throw new Error(event.message);
+    path: extractionRoot,
+    recursive: true,
+  }, signal ? { signal } : undefined);
+  reportProgress?.();
+  if (listing.entries.some((entry) => entry.type === "symlink")) {
+    throw new Error("ZIP archive contains symbolic links and was not exposed to the model");
   }
-  const content = stdout.join("").slice(0, 1_000_000);
-  if (exitCode !== 0) {
-    throw new Error(`PDF text extraction exited with ${exitCode ?? "unknown"}: ${stderr.join("").slice(-4_000)}`);
+  const files = listing.entries
+    .filter((entry) => entry.type === "file")
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const extractedBytes = files.reduce((total, entry) => total + Math.max(0, entry.size_bytes), 0);
+  if (extractedBytes > MAX_ARCHIVE_EXTRACTED_BYTES) {
+    throw new Error(`ZIP archive expands to ${extractedBytes} bytes; the safe limit is ${MAX_ARCHIVE_EXTRACTED_BYTES} bytes`);
   }
-  return content || "[The PDF contains no extractable text. It may be scanned and require OCR.]";
+  const oversized = files.find((entry) => entry.size_bytes > MAX_ARCHIVE_ENTRY_BYTES);
+  if (oversized) {
+    throw new Error(`ZIP entry exceeds the ${MAX_ARCHIVE_ENTRY_BYTES}-byte limit: ${oversized.path}`);
+  }
+  const entries = files.slice(0, MAX_ARCHIVE_INVENTORY_ENTRIES).map((entry) => ({
+    path: entry.path,
+    mediaType: binaryMediaType(entry.path) ?? "application/octet-stream",
+    sizeBytes: entry.size_bytes,
+  }));
+  const inventoryTruncated = files.length > entries.length;
+  const content = [
+    `Archive extracted safely: ${path}`,
+    `Extraction root: ${extractionRoot}`,
+    `Entries: ${files.length}`,
+    ...entries.map((entry) => `- ${entry.path} (${entry.mediaType}, ${entry.sizeBytes} bytes)`),
+    ...(inventoryTruncated
+      ? [`[Showing the first ${entries.length} entries. Use find under ${extractionRoot} to locate additional files.]`]
+      : []),
+    "Call read on the exact extracted paths for the relevant documents. PDF reads preserve page markers and support page_start/page_end.",
+  ].join("\n");
+  return {
+    extractionRoot,
+    entryCount: files.length,
+    entriesShown: entries.length,
+    inventoryTruncated,
+    content,
+  };
 }
 
 function binaryMediaType(path: string): string | null {
@@ -3767,6 +4195,7 @@ function binaryMediaType(path: string): string | null {
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     xls: "application/vnd.ms-excel",
     xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
     ppt: "application/vnd.ms-powerpoint",
     pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     zip: "application/zip",
@@ -3776,6 +4205,18 @@ function binaryMediaType(path: string): string | null {
     mp4: "video/mp4",
     mov: "video/quicktime",
   } as Record<string, string>)[extension] ?? null;
+}
+
+function isExtractableOfficeMediaType(mediaType: string): boolean {
+  return new Set([
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel.sheet.macroEnabled.12",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ]).has(mediaType);
 }
 
 const DURABLE_ARTIFACT_MEDIA_TYPES: Record<string, string> = {
@@ -3813,6 +4254,7 @@ const DURABLE_ARTIFACT_MEDIA_TYPES: Record<string, string> = {
   webp: "image/webp",
   xls: "application/vnd.ms-excel",
   xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
   xml: "application/xml",
   yaml: "application/yaml",
   yml: "application/yaml",

@@ -11,6 +11,7 @@ import {
   PI_GREP_FILTER_SCRIPT,
   PI_READ_STREAM_SCRIPT,
   piReadContent,
+  piReadPdfContent,
   type SandboxSnapshotObjectStore,
   type SandboxSnapshotRepository,
 } from "./sandbox-continuity.js";
@@ -804,9 +805,20 @@ describe("SandboxContinuityManager", () => {
       sizeBytes: index === 0 ? 20 * 1024 * 1024 + 1 : 1,
       objectKey: `objects/image-${index + 1}.png`,
     }));
+    const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array> }) => {
+      const reader = input.content.getReader();
+      let size = 0;
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+      }
+      return { path: input.path, size_bytes: size, mtime: null };
+    });
     const provider = {
       kind: "e2b",
-      files: { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-images", provider: "e2b", status: "running" })),
+      files: { read: vi.fn(), write: vi.fn(), writeStream, list: vi.fn() },
     } as unknown as SandboxProvider;
     const repository = {
       loadRun: vi.fn(),
@@ -825,6 +837,10 @@ describe("SandboxContinuityManager", () => {
       putArtifact: vi.fn(),
       get: vi.fn(),
       getSource,
+      streamSource: vi.fn(async function* (key: string) {
+        const index = Number(/image-(\d+)/.exec(key)?.[1] ?? 0) - 1;
+        yield new Uint8Array(inputFiles[index]!.sizeBytes);
+      }),
     } satisfies SandboxSnapshotObjectStore;
     const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
     const current = snapshot();
@@ -838,6 +854,7 @@ describe("SandboxContinuityManager", () => {
     })));
     expect(getSource).toHaveBeenCalledTimes(5);
     expect(getSource).not.toHaveBeenCalledWith("objects/image-1.png", undefined);
+    expect(writeStream).toHaveBeenCalledTimes(6);
   });
 
   it("does not let an older terminal cleanup pause a sandbox claimed by a follow-up run", async () => {
@@ -1067,7 +1084,7 @@ describe("SandboxContinuityManager", () => {
     );
 
     await expect(manager.execute(snapshot(), toolStep("bash", {
-      command: "pdftotext missing.pdf - | grep never",
+      command: "printf '' | grep never",
     }))).resolves.toMatchObject({
       output: {
         hasMeaningfulOutput: false,
@@ -1608,13 +1625,22 @@ describe("SandboxContinuityManager", () => {
       write: vi.fn(),
       list: vi.fn(),
     }, async function* (input: { command: string[] }) {
-      expect(input.command).toEqual([
-        "pdftotext",
-        "-layout",
-        "/workspace/inputs/file-id/reference.pdf",
-        "-",
-      ]);
-      yield { kind: "stdout", data: "Page one text\fPage two text" };
+      if (input.command[0] === "pdfinfo") {
+        expect(input.command).toEqual(["pdfinfo", "/workspace/inputs/file-id/reference.pdf"]);
+        yield { kind: "stdout", data: "Pages:           2\n" };
+      } else {
+        expect(input.command).toEqual([
+          "pdftotext",
+          "-layout",
+          "-f",
+          "1",
+          "-l",
+          "2",
+          "/workspace/inputs/file-id/reference.pdf",
+          "-",
+        ]);
+        yield { kind: "stdout", data: "Page one text\fPage two text" };
+      }
       yield { kind: "exit", exit_code: 0, signal: null };
     });
 
@@ -1623,21 +1649,229 @@ describe("SandboxContinuityManager", () => {
     }))).resolves.toMatchObject({
       output: {
         path: "/workspace/inputs/file-id/reference.pdf",
-        content: "Page one text\fPage two text",
+        content: expect.stringContaining("--- Page 1 of 2 ---\nPage one text"),
         mediaType: "application/pdf",
         extractedText: true,
+        totalPages: 2,
       },
     });
     expect(read).not.toHaveBeenCalled();
   });
 
-  it("applies Pi read pagination to extracted PDF text", async () => {
+  it("extracts only the requested PDF pages even when the document is much larger", async () => {
+    const commands: string[][] = [];
     const manager = managerWithProvider({
       read: vi.fn(),
       write: vi.fn(),
       list: vi.fn(),
-    }, async function* () {
-      yield { kind: "stdout", data: Array.from({ length: 10 }, (_, index) => `page line ${index + 1}`).join("\n") };
+    }, async function* (input: { command: string[] }) {
+      commands.push(input.command);
+      if (input.command[0] === "pdfinfo") yield { kind: "stdout", data: "Pages: 2000\n" };
+      if (input.command[0] === "pdftotext") yield { kind: "stdout", data: "Page 1900 text" };
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/large.pdf",
+      page_start: 1900,
+      page_end: 1900,
+    }))).resolves.toMatchObject({
+      output: {
+        content: expect.stringContaining("--- Page 1900 of 2000 ---\nPage 1900 text"),
+        totalPages: 2000,
+        pageStart: 1900,
+        pageEnd: 1900,
+      },
+    });
+    expect(commands).toContainEqual([
+      "pdftotext",
+      "-layout",
+      "-f",
+      "1900",
+      "-l",
+      "1900",
+      "/workspace/inputs/file-id/large.pdf",
+      "-",
+    ]);
+  });
+
+  it("reads a requested PDF page range without making the model guess line offsets", () => {
+    const result = piReadPdfContent("Page one\fPage two\fPage three", {
+      page_start: 2,
+      page_end: 2,
+    });
+
+    expect(result.content).toContain("--- Page 2 of 3 ---\nPage two");
+    expect(result.content).not.toContain("Page one");
+    expect(result.content).not.toContain("Page three");
+    expect(result.details).toMatchObject({ totalPages: 3, pageStart: 2, pageEnd: 2, outputPages: 1, nextPageStart: 3 });
+  });
+
+  it("defaults large PDFs to a bounded page window with an exact continuation", () => {
+    const source = Array.from({ length: 12 }, (_, index) => `Page ${index + 1}`).join("\f");
+    const result = piReadPdfContent(source, {});
+
+    expect(result.content).toContain("--- Page 1 of 12 ---");
+    expect(result.content).toContain("--- Page 10 of 12 ---");
+    expect(result.content).not.toContain("--- Page 11 of 12 ---");
+    expect(result.content).toContain("Use page_start=11 and page_end=12 to continue");
+    expect(result.details).toMatchObject({
+      totalPages: 12,
+      pageStart: 1,
+      pageEnd: 10,
+      nextPageStart: 11,
+      nextPageEnd: 12,
+    });
+  });
+
+  it("continues large PDFs in bounded multi-page windows", () => {
+    const source = Array.from({ length: 25 }, (_, index) => `Page ${index + 1}`).join("\f");
+    const result = piReadPdfContent(source, {});
+
+    expect(result.content).toContain("Use page_start=11 and page_end=20 to continue");
+    expect(result.details).toMatchObject({ nextPageStart: 11, nextPageEnd: 20 });
+  });
+
+  it("keeps page markers when continuing inside a PDF page range", () => {
+    const result = piReadPdfContent("First line\nSecond line\nThird line", {
+      page_start: 1,
+      page_end: 1,
+      offset: 2,
+      limit: 2,
+    });
+
+    expect(result.content).toContain("First line\nSecond line");
+    expect(result.content).toContain("Use offset=4 to continue");
+    expect(result.details).toMatchObject({ totalPages: 1, pageStart: 1, pageEnd: 1 });
+  });
+
+  it("returns the next offset when a selected PDF range exceeds the read limit", () => {
+    const largePage = Array.from({ length: 2_000 }, (_, index) => `Line ${index + 1} ${"x".repeat(40)}`).join("\n");
+    const result = piReadPdfContent(`${largePage}\fSecond page`, {
+      page_start: 1,
+      page_end: 2,
+    });
+
+    expect(result.details).toMatchObject({
+      truncated: true,
+      nextOffset: expect.any(Number),
+      pageStart: 1,
+      pageEnd: 2,
+    });
+    expect(result.content).toMatch(/Continue with page_start=1, page_end=2, offset=\d+/);
+  });
+
+  it("extracts Office document text through the shared document extractor", async () => {
+    const bytes = Buffer.from("binary docx bytes");
+    const read = vi.fn(async () => ({
+      path: "/workspace/inputs/file-id/requirements.docx",
+      encoding: "base64" as const,
+      content: bytes.toString("base64"),
+      size_bytes: bytes.byteLength,
+      mtime: null,
+    }));
+    const documentTextExtractor = vi.fn(async () => "Award requirements\nMaximum 1,500 words");
+    const manager = managerWithProvider({ read, write: vi.fn(), list: vi.fn() }, undefined, {
+      documentTextExtractor,
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/requirements.docx",
+    }))).resolves.toMatchObject({
+      output: {
+        content: "Award requirements\nMaximum 1,500 words",
+        mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        extractedText: true,
+      },
+    });
+    expect(documentTextExtractor).toHaveBeenCalledWith(expect.objectContaining({
+      mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }));
+  });
+
+  it("extracts macro-enabled Excel through the shared document extractor", async () => {
+    const bytes = Buffer.from("binary xlsm bytes");
+    const read = vi.fn(async () => ({
+      path: "/workspace/inputs/file-id/forecast.xlsm",
+      encoding: "base64" as const,
+      content: bytes.toString("base64"),
+      size_bytes: bytes.byteLength,
+      mtime: null,
+    }));
+    const documentTextExtractor = vi.fn(async () => "Forecast assumptions\nRevenue plan");
+    const manager = managerWithProvider({ read, write: vi.fn(), list: vi.fn() }, undefined, {
+      documentTextExtractor,
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/forecast.xlsm",
+    }))).resolves.toMatchObject({
+      output: {
+        content: "Forecast assumptions\nRevenue plan",
+        mediaType: "application/vnd.ms-excel.sheet.macroEnabled.12",
+        extractedText: true,
+      },
+    });
+    expect(documentTextExtractor).toHaveBeenCalledWith(expect.objectContaining({
+      mediaType: "application/vnd.ms-excel.sheet.macroEnabled.12",
+    }));
+  });
+
+  it("safely extracts ZIP attachments and exposes exact nested document paths", async () => {
+    const read = vi.fn();
+    const list = vi.fn(async (input: { path: string }) => input.path.includes("/tmp/archives/")
+      ? {
+          path: input.path,
+          entries: [
+            { path: `${input.path}/brief.pdf`, type: "file", size_bytes: 123 },
+            { path: `${input.path}/notes.txt`, type: "file", size_bytes: 45 },
+          ],
+        }
+      : { path: input.path, entries: [] });
+    const commands: string[][] = [];
+    const manager = managerWithProvider({ read, write: vi.fn(), list }, async function* (input: { command: string[] }) {
+      commands.push(input.command);
+      if (input.command[0] === "python" && input.command[1] === "-c") {
+        yield {
+          kind: "stdout",
+          data: JSON.stringify({
+            entryCount: 2,
+            totalBytes: 168,
+          }),
+        };
+      }
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/evidence.zip",
+    }))).resolves.toMatchObject({
+      output: {
+        mediaType: "application/zip",
+        extractedArchive: true,
+        entryCount: 2,
+        entriesShown: 2,
+        inventoryTruncated: false,
+        content: expect.stringContaining("/tmp/archives/"),
+      },
+    });
+    expect(commands.some((command) => command[0] === "mkdir" && command[1] === "-p")).toBe(true);
+    expect(commands.some((command) => command[0] === "python" && command[1] === "-c")).toBe(true);
+    expect(commands.some((command) => command[0] === "unzip" && command.includes("-d"))).toBe(true);
+  });
+
+  it("applies bounded pagination to page-numbered PDF text", async () => {
+    const manager = managerWithProvider({
+      read: vi.fn(),
+      write: vi.fn(),
+      list: vi.fn(),
+    }, async function* (input: { command: string[] }) {
+      yield {
+        kind: "stdout",
+        data: input.command[0] === "pdfinfo"
+          ? "Pages: 1\n"
+          : Array.from({ length: 10 }, (_, index) => `page line ${index + 1}`).join("\n"),
+      };
       yield { kind: "exit", exit_code: 0, signal: null };
     });
 
@@ -1647,9 +1881,10 @@ describe("SandboxContinuityManager", () => {
       limit: 2,
     }))).resolves.toMatchObject({
       output: {
-        content: "page line 3\npage line 4\n\n[6 more lines in file. Use offset=5 to continue.]",
+        content: expect.stringContaining("page line 2\npage line 3"),
         mediaType: "application/pdf",
         extractedText: true,
+        totalPages: 1,
       },
     });
   });
@@ -1728,6 +1963,9 @@ describe("SandboxContinuityManager", () => {
       putArtifact: vi.fn(),
       get: vi.fn(),
       getSource: vi.fn(async (key: string) => key.endsWith("brief.pdf") ? new Uint8Array(5) : attached),
+      streamSource: vi.fn(async function* (key: string) {
+        yield key.endsWith("brief.pdf") ? new Uint8Array(5) : attached;
+      }),
     } satisfies SandboxSnapshotObjectStore;
     const manager = new SandboxContinuityManager(provider, repository, objects, {
       image: "berry-sandbox",
@@ -1761,8 +1999,9 @@ describe("SandboxContinuityManager", () => {
       path: "/workspace/outputs/chart.png",
       encoding: "base64",
     });
-    // Model vision reads only the selected image. It does not stage every task
-    // attachment into an existing sandbox as a side effect.
+    // All inputs are staged, while only the selected image is loaded into the
+    // model's vision content.
+    expect(provider.files.write).toHaveBeenCalledTimes(2);
     expect(objects.getSource).toHaveBeenCalledTimes(1);
     expect(objects.getSource).toHaveBeenCalledWith(
       "artifacts/tenants/t/reference.png",
@@ -2105,23 +2344,35 @@ describe("SandboxContinuityManager", () => {
     expect(repository.persistOutput).not.toHaveBeenCalled();
   });
 
-  it("generates, stages, and registers an admitted durable image", async () => {
+  it("resumes the sandbox after image generation before registering the image", async () => {
     const bytes = Buffer.from([137, 80, 78, 71]);
+    let paused = false;
+    let resumeCount = 0;
     const provider = {
       kind: "e2b",
+      supportsResume: true,
       create: vi.fn(async () => ({
-        sandbox_id: "sandbox-image",
+        sandbox_id: "sandbox-image-restored",
         provider: "e2b",
         status: "running",
       })),
+      resume: vi.fn(async () => {
+        resumeCount += 1;
+        if (resumeCount === 1) throw new Error("sandbox expired");
+        paused = false;
+        return { sandbox_id: "sandbox-image-final", provider: "e2b", status: "running" };
+      }),
       exec: vi.fn(),
       files: {
         read: vi.fn(),
-        write: vi.fn(async (input: { path: string; content: string }) => ({
-          path: input.path,
-          size_bytes: Buffer.from(input.content, "base64").byteLength,
-          mtime: null,
-        })),
+        write: vi.fn(async (input: { path: string; content: string }) => {
+          if (paused) throw new Error("sandbox paused");
+          return {
+            path: input.path,
+            size_bytes: Buffer.from(input.content, "base64").byteLength,
+            mtime: null,
+          };
+        }),
         list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })),
       },
     } as unknown as SandboxProvider;
@@ -2157,12 +2408,17 @@ describe("SandboxContinuityManager", () => {
       },
     });
     const current = snapshot();
+    current.sandboxId = "sandbox-image";
+    current.sandboxProvider = "e2b";
     current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
     const originalFetch = globalThis.fetch;
-    const imageFetch = vi.fn(async () => new Response(JSON.stringify({
-      model: "gpt-image-1",
-      data: [{ b64_json: bytes.toString("base64"), revised_prompt: "A revised prompt" }],
-    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const imageFetch = vi.fn(async () => {
+      paused = true;
+      return new Response(JSON.stringify({
+        model: "gpt-image-1",
+        data: [{ b64_json: bytes.toString("base64"), revised_prompt: "A revised prompt" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
     globalThis.fetch = imageFetch;
     const imageStep = {
       ...toolStep("create_image", {
@@ -2176,6 +2432,9 @@ describe("SandboxContinuityManager", () => {
 
     try {
       await expect(manager.execute(current, imageStep)).resolves.toMatchObject({
+        sandbox: {
+          id: "sandbox-image-final",
+        },
         output: {
           image: {
             fileId: "00000000-0000-7000-8000-000000000010",
@@ -2192,13 +2451,16 @@ describe("SandboxContinuityManager", () => {
     }
 
     expect(globalThis.fetch).toBe(originalFetch);
+    expect(provider.create).toHaveBeenCalledTimes(1);
     expect(imageFetch).toHaveBeenCalledWith(
       "https://images.example.test/v1/images/generations",
       expect.objectContaining({
         headers: expect.objectContaining({ "Idempotency-Key": "durable-image-step-key" }),
       }),
     );
+    expect(provider.resume).toHaveBeenCalledTimes(2);
     expect(provider.files.write).toHaveBeenCalledWith(expect.objectContaining({
+      sandbox_id: "sandbox-image-final",
       path: "/workspace/outputs/Berry icon.png",
       content: bytes.toString("base64"),
       encoding: "base64",
@@ -2386,6 +2648,95 @@ describe("SandboxContinuityManager", () => {
 
     await expect(Promise.all([first, second])).resolves.toHaveLength(2);
     expect(writeStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("stages every current-turn attachment before preparing the first model request", async () => {
+    const staged = new Map<string, Uint8Array>();
+    const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array> }) => {
+      const reader = input.content.getReader();
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        chunks.push(next.value);
+      }
+      staged.set(input.path, Buffer.concat(chunks));
+      return { path: input.path, size_bytes: staged.get(input.path)!.byteLength, mtime: null };
+    });
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-model-inputs", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(),
+        write: vi.fn(),
+        writeStream,
+        list: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          entries: [...staged.entries()].map(([path, content]) => ({
+            path,
+            type: "file",
+            size_bytes: content.byteLength,
+            mtime: null,
+          })),
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const files = [{
+      fileId: "00000000-0000-7000-8000-000000000099",
+      name: "requirements.docx",
+      mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      sizeBytes: 4,
+      objectKey: "objects/requirements.docx",
+    }, {
+      fileId: "00000000-0000-7000-8000-000000000098",
+      name: "evidence.zip",
+      mediaType: "application/zip",
+      sizeBytes: 3,
+      objectKey: "objects/evidence.zip",
+    }];
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async (_tenantId: string, _runId: string, scope?: "turn" | "session") => {
+        expect(scope).toBe("turn");
+        return files;
+      }),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+      streamSource: vi.fn(async function* (key: string) {
+        yield key.endsWith(".docx") ? new Uint8Array([1, 2, 3, 4]) : new Uint8Array([5, 6, 7]);
+      }),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      cwd: "/home/user/workspace",
+    });
+    const current = snapshot();
+    current.steps = [];
+
+    await expect(manager.modelContent(current)).resolves.toEqual([]);
+
+    expect([...staged.keys()].sort()).toEqual([
+      "/home/user/workspace/inputs/00000000-0000-7000-8000-000000000098/evidence.zip",
+      "/home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/requirements.docx",
+    ]);
+    expect(writeStream).toHaveBeenCalledTimes(2);
+    await expect(manager.execute(current, toolStep("ls", {
+      path: "/home/user/workspace/inputs",
+    }))).resolves.toMatchObject({
+      output: {
+        content: expect.stringContaining("requirements.docx"),
+      },
+    });
   });
 
   it("does not stage task attachments for an unrelated sandbox operation", async () => {
@@ -3213,7 +3564,11 @@ function managerWithProvider(
   exec: unknown = async function* () {
     yield { kind: "exit", exit_code: 0, signal: null };
   },
-  options: { ttlSeconds?: number; cwd?: string } = {},
+  options: {
+    ttlSeconds?: number;
+    cwd?: string;
+    documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
+  } = {},
 ): SandboxContinuityManager {
   const provider = {
     kind: "e2b",

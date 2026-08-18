@@ -53,6 +53,22 @@ as filling a form, extracting pages, adding annotations, or creating explicit
 marketing collateral. Preserve existing forms, bookmarks, links, crop boxes,
 and accessibility metadata when editing.
 
+## Runtime reading in Berry
+
+When the durable runtime exposes the `read` tool, use it for PDF inspection.
+Call `read` with the exact sandbox path supplied for the attachment; the
+runtime invokes the safe PDF text extractor and preserves page markers. Use
+`page_start` and `page_end` for targeted pages, and use `offset`/`limit` only
+for line-level continuation inside an already selected page range.
+
+If the attachment is a ZIP, call `read` on the ZIP path first. The runtime
+safely extracts the archive and returns exact entry paths; call `read` on the
+returned PDF path. Prefer the runtime reader for ordinary extraction because
+its output is bounded and page-numbered. Use the shell utilities in this skill
+as a fallback when `read` reports no extractable text, or when the user's
+request depends on visual layout, diagrams, scanned pages, or a PDF
+transformation.
+
 Validate with `qpdf --check` and `pdfinfo`, render every page, and inspect
 fonts, pagination, tables, images, and link placement. Publish only the final
 file with media type `application/pdf`.

@@ -146,6 +146,24 @@ describe("durable turn runner", () => {
     expect(DURABLE_BASE_BUILT_IN_TOOLS.slice(0, 7)).toEqual(["read", "bash", "edit", "write", "grep", "find", "ls"]);
   });
 
+  it("advertises document and ZIP routing on the read tool", () => {
+    const read = DURABLE_TOOL_DEFINITIONS.find((tool) => tool.function.name === "read");
+    expect(read?.function.description).toContain("PDFs");
+    expect(read?.function.description).toContain("Word documents");
+    expect(read?.function.description).toContain("spreadsheets");
+    expect(read?.function.description).toContain("ZIP archives");
+    expect(read?.function.parameters).toMatchObject({
+      properties: {
+        page_start: { description: expect.stringContaining("PDF page") },
+        page_end: { description: expect.stringContaining("PDF page") },
+      },
+    });
+    const current = providerSnapshot("openai-responses");
+    current.runtimeRequest = { ...current.runtimeRequest, builtInTools: [...DURABLE_BASE_BUILT_IN_TOOLS] };
+    expect(modelMessages(current).messages[0]?.content)
+      .toContain("For an uploaded PDF, Word document, spreadsheet, presentation, or ZIP, call read");
+  });
+
   it("offers the same file-edit tools to DeepSeek V4 Flash", () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.runtimeRequest = {
@@ -2860,9 +2878,7 @@ describe("durable turn runner", () => {
     expect(JSON.stringify(userContent)).toContain(
       "Sandbox path: /home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
-    expect(JSON.stringify(userContent)).toContain(
-      "read extracts its text",
-    );
+    expect(JSON.stringify(userContent)).toContain("page-numbered text");
     expect(userContent).toContainEqual({
       type: "image_url",
       image_url: { url: "data:image/png;base64,AQID" },

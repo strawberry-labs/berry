@@ -106,13 +106,19 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     signal?: AbortSignal,
     reportProgress?: () => void,
   ): Promise<readonly ChatContentPart[]> {
+    // Always delegate first because the base executor also prepares durable
+    // workspace state, including staging current-turn attachments. Text-only
+    // models still need those files even though they cannot receive pixels.
+    const inherited = await (this.base.modelContent?.(snapshot, signal, reportProgress) ?? []);
     const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
     if (!runtime.success || runtime.data.modelAcceptsImages) {
-      return this.base.modelContent?.(snapshot, signal, reportProgress) ?? [];
+      return inherited;
     }
+    const nonImageContent = inherited.filter((part) => part.type !== "image_url");
     const imageCount = inspectableImageCount(snapshot, runtime.data.attachments, runtime.data.workspacePath);
-    if (imageCount === 0) return [];
+    if (imageCount === 0) return nonImageContent;
     return [
+      ...nonImageContent,
       {
         type: "text",
         text: runtime.data.vision

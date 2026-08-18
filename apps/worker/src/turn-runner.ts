@@ -4902,6 +4902,28 @@ function shouldCompactSnapshot(
   const contextWindow = numberValue(snapshot.runtimeRequest.contextWindowTokens)
     ?? options.contextWindowTokens
     ?? 128_000;
+  // A completed compaction already reduced the journal tail. Tool manifests
+  // and the stable system prompt are fixed request overhead, so they can sit
+  // above the reserve threshold even when the model still has ample room for
+  // its response. Do not compact the same tail forever in that case; only
+  // stop when the request genuinely leaves no safe output capacity.
+  const completedCompaction = completedCompactionForCurrentTail(snapshot);
+  const compactionOutput = record(completedCompaction?.output);
+  const compactedTokensAfter = nonnegativeNumber(compactionOutput?.tokensAfter);
+  const reserveThreshold = Math.max(
+    1,
+    Math.min(
+      contextWindow - DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+      Math.floor(contextWindow * DEFAULT_COMPACTION_SETTINGS.triggerRatio),
+    ),
+  );
+  if (completedCompaction && compactedTokensAfter !== null && compactedTokensAfter <= reserveThreshold) {
+    const safetyTokens = Math.min(
+      MODEL_CONTEXT_SAFETY_TOKENS,
+      Math.max(1, Math.floor(contextWindow * 0.01)),
+    );
+    if (estimatedTokens + safetyTokens < contextWindow) return false;
+  }
   return shouldCompact(
     estimatedTokens,
     contextWindow,
@@ -5359,8 +5381,9 @@ function durableBuiltInToolGuidance(toolNames: readonly string[]): string {
   const guidance: string[] = [];
   if (toolNames.includes("read")) {
     guidance.push([
-      "Coding tools: read (read file contents), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents). Empty or unchanged output is not progress; do not repeat identical completed calls. Change inputs or strategy, and poll only when supported.",
+      "Coding tools: read (read text and extract supported documents and archives), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents). Empty or unchanged output is not progress; do not repeat identical completed calls. Change inputs or strategy, and poll only when supported.",
       "Use read to examine files instead of cat or sed.",
+      "For an uploaded PDF, Word document, spreadsheet, presentation, or ZIP, call read on the exact Sandbox path first. For a ZIP, read its inventory and then read only the extracted documents relevant to the task. For PDFs, use page_start/page_end instead of guessing line ranges. Use the matching format skill when visual layout, formulas, rendering, or editing matter. Use shell-based extraction only when read reports that the format is unsupported or has no extractable text.",
       "Use edit for precise changes; every edits[].oldText must match exactly and uniquely in the original file.",
       "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls.",
       "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
@@ -5823,7 +5846,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "read",
-      description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first), and individual lines are capped at 2000 characters. Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+      description: "Read text and extract searchable content from PDFs, Word documents, spreadsheets, presentations, ZIP archives, and supported images. PDFs return page markers and accept page_start/page_end. ZIPs return exact extracted entry paths. Use offset/limit to continue long text. Output is capped at 2000 lines/50KB; use a format skill when visual layout, formulas, rendering, or editing matter.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -5832,6 +5855,8 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
           path: { type: "string", description: "Path to the file to read (relative or absolute)" },
           offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
           limit: { type: "number", description: "Maximum number of lines to read" },
+          page_start: { type: "number", description: "First PDF page, inclusive (1-based)" },
+          page_end: { type: "number", description: "Last PDF page, inclusive (1-based)" },
         },
       },
     },

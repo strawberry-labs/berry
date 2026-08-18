@@ -13,10 +13,14 @@ export function durableAttachmentPath(
 }
 
 export function durableAttachmentPrompt(attachment: DurableAttachmentReference, workspaceRoot = "/workspace"): string {
-  const mediaType = attachment.mediaType?.trim().toLowerCase() ?? "";
   const lowerName = attachment.name.toLowerCase();
+  const mediaType = semanticAttachmentMediaType(lowerName, attachment.mediaType);
+  const isPdf = mediaType === "application/pdf";
+  const isZip = mediaType === "application/zip";
+  const isOfficeDocument = /\.(docx?|xlsx?|xlsm|pptx?)$/.test(lowerName)
+    || /wordprocessingml|msword|spreadsheet|excel|presentationml|powerpoint/.test(mediaType);
   const details = [
-    attachment.mediaType?.trim(),
+    mediaType,
     typeof attachment.size === "number" && Number.isFinite(attachment.size)
       ? `${attachment.size} bytes`
       : null,
@@ -24,12 +28,31 @@ export function durableAttachmentPrompt(attachment: DurableAttachmentReference, 
   return [
     `Attached file: ${attachment.name}${details ? ` (${details})` : ""}`,
     `Sandbox path: ${durableAttachmentPath(attachment, workspaceRoot)}`,
-    mediaType === "application/pdf" || lowerName.endsWith(".pdf")
-      ? "Use read on this PDF path; read extracts its text safely instead of decoding the PDF bytes as UTF-8."
+    isPdf
+      ? "Use read on this PDF path for page-numbered text. Use page_start/page_end for a targeted range."
+      : isZip
+        ? "Use read on this ZIP path first to get a safe inventory, then use read on the exact extracted document paths you need."
+        : isOfficeDocument
+          ? "Use read on this document path for extracted text. Use the matching document skill when layout, formatting, formulas, or editing matter."
       : mediaType.startsWith("image/")
         ? "This is a binary image. read returns safe metadata; use an image-capable skill/tool when visual inspection is required."
         : "",
   ].filter(Boolean).join("\n");
+}
+
+function semanticAttachmentMediaType(name: string, declaredMediaType: string | null | undefined): string {
+  const extensionMediaType = ({
+    pdf: "application/pdf",
+    doc: "application/msword",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xls: "application/vnd.ms-excel",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ppt: "application/vnd.ms-powerpoint",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    zip: "application/zip",
+  } as Record<string, string>)[name.split(".").at(-1) ?? ""];
+  return extensionMediaType ?? declaredMediaType?.trim().toLowerCase() ?? "";
 }
 
 function safeWorkspaceRoot(value: string): string {
