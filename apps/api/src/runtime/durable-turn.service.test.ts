@@ -505,6 +505,17 @@ describe("DurableTurnService", () => {
     ]);
   });
 
+  it("keeps only the latest progress update for each replayed tool", () => {
+    expect(compactReplayEvents([
+      { kind: "tool.update", toolCallId: "tool-a", detail: "starting" },
+      { kind: "tool.update", toolCallId: "tool-b", detail: "searching" },
+      { kind: "tool.update", toolCallId: "tool-a", detail: "finished" },
+    ])).toEqual([
+      { kind: "tool.update", toolCallId: "tool-b", detail: "searching" },
+      { kind: "tool.update", toolCallId: "tool-a", detail: "finished" },
+    ]);
+  });
+
   it("uses the exact persisted user message instead of matching transformed prompt text", async () => {
     const executions: string[] = [];
     const executor: SqlExecutor = {
@@ -809,7 +820,7 @@ describe("DurableTurnService", () => {
     }));
   });
 
-  it("replays only the open model segment while keeping the latest durable cursor", async () => {
+  it("replays the complete active turn while keeping the latest durable cursor", async () => {
     const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
     const executor: SqlExecutor = {
       execute: async () => undefined,
@@ -818,10 +829,10 @@ describe("DurableTurnService", () => {
         if (sql.includes("SELECT id,state,lease_owner")) {
           return [{
             id: runId,
-            state: "calling_model",
+            state: "executing_tool",
             lease_owner: "worker",
             waiting_reason: null,
-            next_action: "Model request in progress",
+            next_action: "Running tool",
             error: null,
             created_at: "2026-08-05T13:42:15.000Z",
             continuation: true,
@@ -829,19 +840,25 @@ describe("DurableTurnService", () => {
         }
         if (sql.includes("MAX(sequence) FILTER")) {
           return [{
-            message_start: 10,
-            message_end: 5,
-            tool_start: null,
-            tool_end: null,
             turn_start: 1,
-            maximum: 12,
+            maximum: 13,
           }] as T[];
         }
         if (sql.includes("sequence >= $3")) {
           return [
-            { sequence: 10, payload: { kind: "message.start", messageId: questionId, role: "assistant" } },
-            { sequence: 11, payload: { kind: "message.delta", messageId: questionId, delta: "Hel", channel: "text" } },
-            { sequence: 12, payload: { kind: "message.delta", messageId: questionId, delta: "lo", channel: "text" } },
+            { sequence: 1, payload: { kind: "turn.start", turnId: runId } },
+            { sequence: 2, payload: { kind: "message.start", messageId: questionId, role: "assistant" } },
+            { sequence: 3, payload: { kind: "message.delta", messageId: questionId, delta: "Working", channel: "text" } },
+            { sequence: 4, payload: { kind: "message.end", messageId: questionId } },
+            { sequence: 5, payload: { kind: "tool.start", toolCallId: "tool_first", name: "read", title: "Read first file" } },
+            { sequence: 6, payload: { kind: "tool.update", toolCallId: "tool_first", detail: "first progress" } },
+            { sequence: 7, payload: { kind: "tool.update", toolCallId: "tool_first", detail: "latest progress" } },
+            { sequence: 8, payload: { kind: "tool.end", toolCallId: "tool_first", status: "completed", summary: "First file read" } },
+            { sequence: 9, payload: { kind: "tool.start", toolCallId: "tool_second", name: "grep", title: "Search second file" } },
+            { sequence: 10, payload: { kind: "tool.end", toolCallId: "tool_second", status: "completed", summary: "Second file searched" } },
+            { sequence: 11, payload: { kind: "message.start", messageId: questionId, role: "assistant" } },
+            { sequence: 12, payload: { kind: "tool.start", toolCallId: "tool_current", name: "read", title: "Read current file" } },
+            { sequence: 13, payload: { kind: "tool.update", toolCallId: "tool_current", detail: "Current file in progress" } },
           ] as T[];
         }
         return [] as T[];
@@ -852,14 +869,24 @@ describe("DurableTurnService", () => {
 
     const state = await service.state(tenantId, sessionId);
 
-    expect(state.lastEventId).toBe(`${runId}:12`);
+    expect(state.lastEventId).toBe(`${runId}:13`);
     expect(state.startedAt).toBe("2026-08-05T13:42:15.000Z");
     expect(state.continuation).toBe(true);
     expect(state.bufferedEvents).toEqual([
+      { kind: "turn.start", turnId: runId },
       { kind: "message.start", messageId: questionId, role: "assistant" },
-      { kind: "message.delta", messageId: questionId, delta: "Hello", channel: "text" },
+      { kind: "message.delta", messageId: questionId, delta: "Working", channel: "text" },
+      { kind: "message.end", messageId: questionId },
+      { kind: "tool.start", toolCallId: "tool_first", name: "read", title: "Read first file" },
+      { kind: "tool.update", toolCallId: "tool_first", detail: "latest progress" },
+      { kind: "tool.end", toolCallId: "tool_first", status: "completed", summary: "First file read" },
+      { kind: "tool.start", toolCallId: "tool_second", name: "grep", title: "Search second file" },
+      { kind: "tool.end", toolCallId: "tool_second", status: "completed", summary: "Second file searched" },
+      { kind: "message.start", messageId: questionId, role: "assistant" },
+      { kind: "tool.start", toolCallId: "tool_current", name: "read", title: "Read current file" },
+      { kind: "tool.update", toolCallId: "tool_current", detail: "Current file in progress" },
     ]);
-    expect(queries.find(({ sql }) => sql.includes("sequence >= $3"))?.params[2]).toBe(10);
+    expect(queries.find(({ sql }) => sql.includes("sequence >= $3"))?.params[2]).toBe(1);
   });
 
   it("resets a future or unknown event cursor to the latest run", async () => {

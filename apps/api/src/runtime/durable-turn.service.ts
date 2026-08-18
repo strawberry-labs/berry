@@ -532,19 +532,11 @@ LIMIT 1
       if (!run) return TurnStateSchema.parse({ active: false, turnId: null, bufferedEvents: [], replayOnly: false });
       const active = !["completed", "failed", "cancelled", "recovery_required"].includes(run.state);
       const positions = await executor.query<{
-        message_start: number | string | null;
-        message_end: number | string | null;
-        tool_start: number | string | null;
-        tool_end: number | string | null;
         turn_start: number | string | null;
         maximum: number | string | null;
       }>(
         `
 SELECT
-  MAX(sequence) FILTER (WHERE event_type='message.start') AS message_start,
-  MAX(sequence) FILTER (WHERE event_type='message.end') AS message_end,
-  MAX(sequence) FILTER (WHERE event_type='tool.start') AS tool_start,
-  MAX(sequence) FILTER (WHERE event_type='tool.end') AS tool_end,
   MAX(sequence) FILTER (WHERE event_type='turn.start') AS turn_start,
   MAX(sequence) AS maximum
 FROM turn_events
@@ -554,8 +546,12 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
       );
       const position = positions[0];
       const maximum = nullableNumber(position?.maximum);
+      // Rehydrate the complete active run, not only the currently open model
+      // or tool segment. The web client replaces its in-memory live timeline
+      // with this snapshot when a user navigates away and returns, so a
+      // segment-only boundary makes completed tools disappear mid-turn.
       const replayFrom = active
-        ? activeReplayBoundary(run.state, position, maximum)
+        ? activeTurnReplayBoundary(position, maximum)
         : null;
       const events = await executor.query<{ sequence: number; payload: unknown }>(
         active
@@ -2543,6 +2539,7 @@ export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentS
 
   const keep = new Array<boolean>(merged.length).fill(true);
   const latestPartial = new Set<string>();
+  const latestToolUpdate = new Set<string>();
   let keptUsage = false;
   for (let index = merged.length - 1; index >= 0; index -= 1) {
     const event = merged[index]!;
@@ -2550,6 +2547,9 @@ export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentS
       const key = `${event.toolCallId}:${event.requestIndex}`;
       if (latestPartial.has(key)) keep[index] = false;
       else latestPartial.add(key);
+    } else if (event.kind === "tool.update") {
+      if (latestToolUpdate.has(event.toolCallId)) keep[index] = false;
+      else latestToolUpdate.add(event.toolCallId);
     } else if (event.kind === "usage") {
       if (keptUsage) keep[index] = false;
       else keptUsage = true;
@@ -2558,32 +2558,13 @@ export function compactReplayEvents(events: readonly AgentStreamEvent[]): AgentS
   return merged.filter((_event, index) => keep[index]);
 }
 
-function activeReplayBoundary(
-  state: string,
+function activeTurnReplayBoundary(
   positions: {
-    message_start: number | string | null;
-    message_end: number | string | null;
-    tool_start: number | string | null;
-    tool_end: number | string | null;
     turn_start: number | string | null;
   } | undefined,
   maximum: number | null,
 ): number {
-  const afterEverything = (maximum ?? 0) + 1;
-  if (state === "queued" || state === "assembling_context") {
-    return nullableNumber(positions?.turn_start) ?? afterEverything;
-  }
-  if (state === "calling_model") {
-    const start = nullableNumber(positions?.message_start);
-    const end = nullableNumber(positions?.message_end);
-    return start !== null && start > (end ?? 0) ? start : afterEverything;
-  }
-  if (state === "executing_tool" || state === "waiting") {
-    const start = nullableNumber(positions?.tool_start);
-    const end = nullableNumber(positions?.tool_end);
-    return start !== null && start > (end ?? 0) ? start : afterEverything;
-  }
-  return afterEverything;
+  return nullableNumber(positions?.turn_start) ?? (maximum ?? 0) + 1;
 }
 
 function nullableNumber(value: number | string | null | undefined): number | null {
