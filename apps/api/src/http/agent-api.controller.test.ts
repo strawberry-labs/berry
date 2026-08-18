@@ -21,10 +21,18 @@ import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissio
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
-import { durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { SupportViewController } from "./support-view.controller.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
+
+  it("wires support-view delegation in the production module", async () => {
+    app = await createApp(fakeSessionHost());
+
+    const supportView = app.get(SupportViewController) as unknown as { agentApi?: unknown };
+    expect(supportView.agentApi).toBeInstanceOf(AgentApiController);
+  });
 
   afterEach(async () => {
     await app?.close();

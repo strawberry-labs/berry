@@ -98,6 +98,10 @@ export class AgentApiModule {
       ],
       controllers: [AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
       providers: [
+        // SupportViewController delegates member-scoped operations through the
+        // existing API surface. Register the controller as a provider as well
+        // so that delegation is available in the production module.
+        AgentApiController,
         storeProvider,
         mobileDeviceProvider,
         sandboxWorkspaceProvider,
