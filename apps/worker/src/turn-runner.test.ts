@@ -233,6 +233,7 @@ describe("durable turn runner", () => {
         emitDelta: async (delta) => { deltas.push(delta); },
         policyForTool: () => ({
           retryClass: "read_only",
+          repeatPolicy: "compare_result",
           requiresApproval: false,
           approvalKind: "mcp",
         }),
@@ -274,6 +275,7 @@ describe("durable turn runner", () => {
           emitDelta: async () => undefined,
           policyForTool: () => ({
             retryClass: "read_only",
+            repeatPolicy: "compare_result",
             requiresApproval: false,
             approvalKind: "mcp",
           }),
@@ -1987,40 +1989,215 @@ describe("durable turn runner", () => {
     }
   });
 
-  it("stops twenty successful identical reads with a durable no-progress budget", async () => {
-    const prior = Array.from({ length: 19 }, (_, index) => ({
-      ...readOnlyToolStep("read", index + 1, `/workspace/read-${index}.txt`, "completed"),
-      output: { content: "unchanged" } as const,
-    }));
-    const pending = readOnlyToolStep("read", 20, "/workspace/read-19.txt");
-    const current = snapshot("executing_tool", [admittedStep(), ...prior, pending]);
-    current.progress = {
-      progressEpoch: 19,
-      progressKind: "result_repeated",
-      consecutiveNoProgress: 19,
-      physicalModelAttempt: 0,
-      logicalModelIteration: 0,
-      toolRepairAttempts: 0,
-      cumulativeToolMs: 0,
-      cumulativeActiveComputeMs: 0,
-      budgetReason: null,
+  it("suppresses a third identical successful bash call and terminates a fourth without execution", async () => {
+    const bashStep = (sequence: number, timeout: number): DurableTurnStep => {
+      const step = runCommandStep("pending", sequence, "printf same");
+      return {
+        ...step,
+        input: {
+          ...step.input,
+          arguments: { command: "printf same", timeout },
+        },
+      };
     };
-    const repository = new FakeTurnRepository(current);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [
+      admittedStep(),
+      bashStep(1, 1),
+    ]));
+    let executions = 0;
     const runner = new DurableTurnRunner(repository, unusedModel(), {
-      execute: async () => ({ output: { content: "unchanged" }, summary: "same read" }),
-    }, { noProgressHardThreshold: 20 });
+      execute: async () => {
+        executions += 1;
+        return {
+          output: { command: "printf same", exitCode: 0, output: "(no output)" },
+          summary: "Command completed",
+        };
+      },
+    });
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
-    expect(repository.current.progress).toMatchObject({
-      consecutiveNoProgress: 20,
-      budgetReason: "no_progress_budget",
-    });
+      .resolves.toMatchObject({ state: "calling_model" });
+    queueToolForExecution(repository, bashStep(3, 2));
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(repository.events).toContainEqual(expect.objectContaining({
       kind: "turn.progress",
       progressKind: "result_repeated",
-      budgetReason: "no_progress_budget",
     }));
+
+    const third = bashStep(5, 3);
+    queueToolForExecution(repository, third);
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(2);
+    expect(repository.current.steps.find((step) => step.id === third.id))
+      .toMatchObject({ state: "failed", error: "duplicate_tool_call_suppressed" });
+
+    const fourth = bashStep(7, 4);
+    queueToolForExecution(repository, fourth);
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(executions).toBe(2);
+    expect(repository.current.error).toBe("duplicate_tool_call_loop");
+    expect(repository.current.steps.find((step) => step.id === fourth.id))
+      .toMatchObject({ state: "failed", error: "duplicate_tool_call_loop" });
+  });
+
+  it("finishes the remaining sequential tools before giving the model a correction turn", async () => {
+    const first = { ...runCommandStep("completed", 1, "printf same"), output: { command: "printf same", output: "" } as const };
+    const second = { ...runCommandStep("completed", 2, "printf same"), output: { command: "printf same", output: "" } as const };
+    const duplicate = runCommandStep("pending", 3, "printf same");
+    const nextWrite = { ...toolStep("pending", "idempotent", false), sequence: 4 };
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [
+      admittedStep(),
+      first,
+      second,
+      duplicate,
+      nextWrite,
+    ]));
+    const executions: string[] = [];
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async (_snapshot, step) => {
+        executions.push(toolNameFromTestStep(step));
+        return { output: { acknowledged: true }, summary: "completed" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "executing_tool" });
+    expect(executions).toEqual([]);
+    expect(repository.current.steps.find((step) => step.id === duplicate.id))
+      .toMatchObject({ state: "failed", error: "duplicate_tool_call_suppressed" });
+    expect(repository.current.steps.find((step) => step.id === nextWrite.id))
+      .toMatchObject({ state: "pending" });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toEqual(["write"]);
+  });
+
+  it("normalizes Bash formatting and aliases in the repeat signature", async () => {
+    const first = { ...runCommandStep("completed", 1, "printf same"), output: { command: "printf same", output: "" } as const };
+    const second = {
+      ...runCommandStep("completed", 2, "ignored"),
+      input: {
+        ...runCommandStep("completed", 2, "ignored").input,
+        arguments: { cmd: "  printf same  " },
+      },
+      output: { command: "printf same", output: "" } as const,
+    };
+    const pending = runCommandStep("pending", 3, "printf same");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second, pending]));
+    let executions = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: { command: "printf same", output: "" }, summary: "completed" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(0);
+    expect(repository.current.steps.find((step) => step.id === pending.id))
+      .toMatchObject({ state: "failed", error: "duplicate_tool_call_suppressed" });
+  });
+
+  it("allows the same semantic call again when its result changes", async () => {
+    const first = runCommandStep("pending", 1, "printf state");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first]));
+    let executions = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return {
+          output: { command: "printf state", exitCode: 0, output: executions === 1 ? "old" : "new" },
+          summary: "Command completed",
+        };
+      },
+    });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+    const second = runCommandStep("pending", 3, "printf state");
+    queueToolForExecution(repository, second);
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(2);
+    expect(repository.current.steps.find((step) => step.id === second.id))
+      .toMatchObject({ state: "completed", resultFingerprint: expect.any(String) });
+  });
+
+  it("allows pagination when semantic offsets change even if page content overlaps", async () => {
+    const pageStep = (sequence: number, offset: number): DurableTurnStep => {
+      const step = readOnlyToolStep("read", sequence, "/workspace/items.txt");
+      return {
+        ...step,
+        input: {
+          ...step.input,
+          arguments: { path: "/workspace/items.txt", offset, limit: 50 },
+        },
+      };
+    };
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [
+      admittedStep(),
+      pageStep(1, 1),
+    ]));
+    let executions = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: { content: "overlapping page" }, summary: "Read page" };
+      },
+    });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+    const second = pageStep(3, 51);
+    queueToolForExecution(repository, second);
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(2);
+  });
+
+  it("suppresses a repeated successful mutation before its second execution", async () => {
+    const first = toolStep("pending", "idempotent", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first]));
+    let executions = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: { acknowledged: true }, summary: "Write completed" };
+      },
+    });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+    const second = { ...toolStep("pending", "idempotent", false), sequence: 3 };
+    queueToolForExecution(repository, second);
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === second.id))
+      .toMatchObject({ state: "failed", error: "duplicate_tool_call_suppressed" });
+  });
+
+  it("executes only one copy of duplicate read calls emitted in one parallel batch", async () => {
+    const first = readOnlyToolStep("read", 1, "/workspace/items.txt");
+    const second = readOnlyToolStep("read", 2, "/workspace/items.txt");
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), first, second]));
+    let executions = 0;
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        executions += 1;
+        return { output: { content: "same file" }, summary: "Read file" };
+      },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(executions).toBe(1);
+    expect(repository.current.steps.find((step) => step.id === first.id))
+      .toMatchObject({ state: "completed" });
+    expect(repository.current.steps.find((step) => step.id === second.id))
+      .toMatchObject({ state: "failed", error: "duplicate_tool_call_suppressed" });
   });
 
   it("treats distinct successful mutations with generic acknowledgements as progress", async () => {
@@ -2069,7 +2246,7 @@ describe("durable turn runner", () => {
     });
   });
 
-  it("detects same-output progress loss after read arguments change", async () => {
+  it("allows the same output when read arguments change", async () => {
     const first = { ...readOnlyToolStep("read", 1, "/workspace/old-a.txt", "completed"), output: { content: "same" } as const };
     const second = { ...readOnlyToolStep("read", 2, "/workspace/old-b.txt", "completed"), output: { content: "same" } as const };
     const pending = readOnlyToolStep("read", 3, "/workspace/new.txt");
@@ -2091,15 +2268,18 @@ describe("durable turn runner", () => {
     }, { noProgressHardThreshold: 5 });
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
-    expect(repository.current.progress?.consecutiveNoProgress).toBe(5);
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(repository.current.progress).toMatchObject({
+      consecutiveNoProgress: 0,
+      progressKind: "tool_progress",
+    });
   });
 
-  it("labels alternating read results as no progress and allows declared polling", async () => {
-    const readA = { ...readOnlyToolStep("read", 1, "/workspace/a.txt", "completed"), output: { content: "a" } as const };
-    const grepB = { ...readOnlyToolStep("grep", 2, "/workspace/b.txt", "completed"), output: { content: "b" } as const };
-    const alternatingPending = readOnlyToolStep("read", 3, "/workspace/c.txt");
-    const alternatingCurrent = snapshot("executing_tool", [admittedStep(), readA, grepB, alternatingPending]);
+  it("labels same-signature alternating results as no progress and bounds polling", async () => {
+    const readA = { ...readOnlyToolStep("read", 1, "/workspace/poll.txt", "completed"), output: { content: "a" } as const };
+    const readB = { ...readOnlyToolStep("read", 2, "/workspace/poll.txt", "completed"), output: { content: "b" } as const };
+    const alternatingPending = readOnlyToolStep("read", 3, "/workspace/poll.txt");
+    const alternatingCurrent = snapshot("executing_tool", [admittedStep(), readA, readB, alternatingPending]);
     alternatingCurrent.progress = {
       progressEpoch: 4,
       progressKind: "result_repeated",
@@ -2127,21 +2307,23 @@ describe("durable turn runner", () => {
       ...readOnlyToolStep("read", 3, "/workspace/poll.txt"),
       input: {
         ...readOnlyToolStep("read", 3, "/workspace/poll.txt").input,
-        arguments: { path: "/workspace/poll.txt", progressPolicy: "polling" },
+        repeatPolicy: "bounded_polling",
+        arguments: { path: "/workspace/poll.txt" },
       },
     };
-    const pollingCurrent = snapshot("executing_tool", [admittedStep(), readA, grepB, pollingPending]);
-    pollingCurrent.progress = { ...alternatingCurrent.progress };
+    const pollingCurrent = snapshot("executing_tool", [admittedStep(), readA, readB, pollingPending]);
+    pollingCurrent.progress = { ...alternatingCurrent.progress, consecutiveNoProgress: 4 };
     const pollingRepository = new FakeTurnRepository(pollingCurrent);
     const pollingRunner = new DurableTurnRunner(pollingRepository, unusedModel(), {
       execute: async () => ({ output: { content: "a" }, summary: "poll result" }),
     }, { noProgressHardThreshold: 5 });
 
     await expect(pollingRunner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "calling_model" });
+      .resolves.toMatchObject({ state: "failed" });
     expect(pollingRepository.current.progress).toMatchObject({
-      consecutiveNoProgress: 0,
+      consecutiveNoProgress: 5,
       progressKind: "declared_polling",
+      budgetReason: "no_progress_budget",
     });
   });
 
@@ -2173,26 +2355,31 @@ describe("durable turn runner", () => {
     expect(toolNames).toEqual(DURABLE_BASE_BUILT_IN_TOOLS);
     expect(composePolicy).toEqual({
       retryClass: "read_only",
+      repeatPolicy: "block_after_success",
       requiresApproval: false,
       approvalKind: "file-edit",
     });
     expect(imagePolicy).toEqual({
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: false,
       approvalKind: "file-edit",
     });
     expect(writePolicy).toEqual({
       retryClass: "idempotent",
+      repeatPolicy: "block_after_success",
       requiresApproval: true,
       approvalKind: "file-edit",
     });
     expect(editPolicy).toEqual({
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: true,
       approvalKind: "file-edit",
     });
     expect(bashPolicy).toEqual({
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "compare_result",
       requiresApproval: true,
       approvalKind: "shell",
     });
@@ -2645,6 +2832,7 @@ describe("durable turn runner", () => {
         emitDelta: async (delta, channel) => { deltas.push({ delta, channel }); },
         policyForTool: () => ({
           retryClass: "read_only",
+          repeatPolicy: "compare_result",
           requiresApproval: false,
           approvalKind: "mcp",
         }),
@@ -2943,6 +3131,7 @@ describe("durable turn runner", () => {
       emitDelta: async () => undefined,
       policyForTool: () => ({
         retryClass: "read_only",
+        repeatPolicy: "compare_result",
         requiresApproval: false,
         approvalKind: "file-edit",
       }),
@@ -3694,6 +3883,16 @@ function runCommandStep(
 
 function noTools(): DurableTurnToolExecutor {
   return { execute: async () => ({ output: {}, summary: "" }) };
+}
+
+function queueToolForExecution(repository: FakeTurnRepository, step: DurableTurnStep): void {
+  repository.current.steps = repository.current.steps.map((candidate) =>
+    candidate.type === "model.call" && candidate.state === "pending"
+      ? { ...candidate, state: "completed", output: {} }
+      : candidate,
+  );
+  repository.current.steps.push(step);
+  repository.current.state = "executing_tool";
 }
 
 function unusedModel(): DurableTurnModel {

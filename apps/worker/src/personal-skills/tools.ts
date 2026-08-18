@@ -67,6 +67,7 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
     if (toolName === "save_personal_skill") {
       return {
         retryClass: "idempotent_with_key",
+        repeatPolicy: "block_after_success",
         requiresApproval: false,
         approvalKind: "file-edit",
       };

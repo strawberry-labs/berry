@@ -330,6 +330,7 @@ describe("durable MCP tool exposure", () => {
 
     expect(tools.policy(snapshot, "tool_search", "ask")).toEqual({
       retryClass: "read_only",
+      repeatPolicy: "compare_result",
       requiresApproval: false,
       approvalKind: "mcp",
     });

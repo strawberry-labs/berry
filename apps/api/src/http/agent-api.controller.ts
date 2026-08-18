@@ -101,6 +101,7 @@ Make the prompt more effective by:
 Never invent facts, requirements, attachments, audiences, deadlines, examples, or preferences the user did not provide. Do not ask the downstream model to reveal hidden chain-of-thought. When reasoning matters, request a concise rationale, verification, or step-by-step result instead.`;
 
 const PROMPT_IMPROVEMENT_TIMEOUT_MS = 30_000;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const PROMPT_IMPROVEMENT_MAX_OUTPUT_TOKENS = 4_096;
 const PROMPT_IMPROVEMENT_MIN_OUTPUT_TOKENS = 1_024;
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 16_384;
@@ -2597,7 +2598,7 @@ async function imageToolResult(result: {
   const data = await Promise.all(result.data.map(async (item) => {
     if (item.b64_json) return { data: item.b64_json, mimeType: "image/png" };
     if (!item.url) throw new Error("The image provider returned no image data");
-    const response = await fetch(item.url, { signal: AbortSignal.timeout(120_000) });
+    const response = await fetch(item.url, { signal: AbortSignal.timeout(IMAGE_DOWNLOAD_TIMEOUT_MS) });
     if (!response.ok) throw new Error(`Unable to download generated image (${response.status})`);
     const mimeType = response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "image/png";
     return { data: Buffer.from(await response.arrayBuffer()).toString("base64"), mimeType };

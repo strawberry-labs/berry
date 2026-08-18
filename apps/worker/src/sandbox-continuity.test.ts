@@ -1058,6 +1058,42 @@ describe("SandboxContinuityManager", () => {
     }));
   });
 
+  it("classifies successful empty bash output separately from returned content", async () => {
+    const manager = managerWithProvider(
+      { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      async function* () {
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
+    );
+
+    await expect(manager.execute(snapshot(), toolStep("bash", {
+      command: "pdftotext missing.pdf - | grep never",
+    }))).resolves.toMatchObject({
+      output: {
+        hasMeaningfulOutput: false,
+        outcome: "empty",
+        output: expect.stringContaining("produced no output"),
+      },
+      progress: {
+        outcome: "empty",
+        fingerprintBasis: { exitCode: 0, output: "", truncated: false },
+      },
+    });
+  });
+
+  it("does not describe a failed empty bash command as successful", async () => {
+    const manager = managerWithProvider(
+      { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+      async function* () {
+        yield { kind: "exit", exit_code: 2, signal: null };
+      },
+    );
+
+    await expect(manager.execute(snapshot(), toolStep("bash", {
+      command: "grep never missing.txt",
+    }))).rejects.toThrow("Command produced no output.\n\nCommand exited with code 2");
+  });
+
   it("rejects malformed raw tool wrappers with an actionable error", async () => {
     const read = vi.fn();
     const write = vi.fn();

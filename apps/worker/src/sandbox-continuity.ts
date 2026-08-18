@@ -51,6 +51,8 @@ const PI_READ_MAX_LINE_LENGTH = 2_000;
 const PI_GREP_MAX_LINE_LENGTH = 500;
 const PI_GREP_META_PREFIX = "__BERRY_PI_GREP_META__";
 export const PI_BASH_WRAPPER_SCRIPT = 'mkdir -p -- "$(dirname "$2")" || exit; set -o pipefail; bash -lc "$1" 2>&1 | tee -- "$2"; pipeline_status=("${PIPESTATUS[@]}"); [ "${pipeline_status[0]}" -ne 0 ] && exit "${pipeline_status[0]}"; exit "${pipeline_status[1]}"';
+export const DURABLE_IMAGE_REQUEST_TIMEOUT_MS = 15 * 60_000;
+export const DURABLE_IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
 const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
@@ -1009,16 +1011,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         transparentBackground: args.transparent_background === true,
         idempotencyKey: step.idempotencyKey ?? step.id,
         ...(referenceImageUrls.length > 0 ? { referenceImageUrls } : {}),
+        ...(signal ? { signal } : {}),
       });
       const first = generated.data[0];
       if (!first) throw new Error("The image provider returned no image");
       const bytes = first.b64_json
         ? Buffer.from(first.b64_json, "base64")
-        : await downloadGeneratedImage(first.url);
+        : await downloadGeneratedImage(first.url, signal);
       if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
       const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp)$/i, "");
       const path = `${workspaceRoot}/outputs/${title}.png`;
-      await this.provider.files.write({ sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64" });
+      const writeInput = { sandbox_id: sandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
+      await (signal
+        ? this.provider.files.write(writeInput, { signal })
+        : this.provider.files.write(writeInput));
       if (!this.objects) throw new Error("Artifact object storage is not configured");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const stored = await this.objects.putArtifact(
@@ -1145,7 +1151,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         else if (event.kind === "error") throw new Error(event.message);
       }
       const truncated = output.result();
-      let text = truncated.content || "(no output)";
+      const rawOutput = truncated.content;
+      const hasMeaningfulOutput = rawOutput.trim().length > 0;
+      let text = hasMeaningfulOutput
+        ? rawOutput
+        : exitCode === 0
+          ? "Command exited successfully but produced no output. This does not confirm that any matching data was found. Do not repeat the same command unchanged; change the query, use another tool, inspect the source directly, or report that no matching data was found."
+          : "Command produced no output.";
       if (truncated.truncated) {
         const startLine = truncated.totalLines - truncated.outputLines + 1;
         text += truncated.truncatedBy === "lines"
@@ -1154,7 +1166,23 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
       if (exitCode !== 0) throw new Error(`${text}\n\nCommand exited with code ${exitCode ?? "unknown"}`);
       return {
-        output: { command, exitCode, output: text, ...(truncated.truncated ? { fullOutputPath, truncated: true } : {}), ...inputRepairDetails },
+        output: {
+          command,
+          exitCode,
+          output: text,
+          hasMeaningfulOutput,
+          outcome: hasMeaningfulOutput ? "data" : "empty",
+          ...(truncated.truncated ? { fullOutputPath, truncated: true } : {}),
+          ...inputRepairDetails,
+        },
+        progress: {
+          outcome: hasMeaningfulOutput ? "data" : "empty",
+          fingerprintBasis: {
+            exitCode,
+            output: hasMeaningfulOutput ? rawOutput : "",
+            truncated: truncated.truncated,
+          },
+        },
         summary: `Command completed with exit code ${exitCode ?? 0}`,
         sandbox,
       };
@@ -2852,11 +2880,11 @@ function parsePiGrepMetadata(stderr: string): {
   };
 }
 
-async function downloadGeneratedImage(url: string | undefined): Promise<Buffer> {
+async function downloadGeneratedImage(url: string | undefined, signal?: AbortSignal): Promise<Buffer> {
   if (!url) throw new Error("The image provider returned no image payload");
   const parsed = new URL(url);
   if (parsed.protocol !== "https:") throw new Error("Generated image downloads must use HTTPS");
-  const response = await fetch(parsed, { signal: AbortSignal.timeout(120_000) });
+  const response = await fetch(parsed, { signal: timeoutSignal(signal, DURABLE_IMAGE_DOWNLOAD_TIMEOUT_MS) });
   if (!response.ok) throw new Error(`Unable to download generated image (${response.status})`);
   return Buffer.from(await response.arrayBuffer());
 }
@@ -2870,6 +2898,7 @@ async function generateDurableImage(
     transparentBackground: boolean;
     idempotencyKey: string;
     referenceImageUrls?: string[];
+    signal?: AbortSignal;
   },
 ): Promise<ImageGenerationResult> {
   const references = input.referenceImageUrls ?? [];
@@ -2895,12 +2924,17 @@ async function generateDurableImage(
       background: input.transparentBackground ? "transparent" : "auto",
       ...(input.transparentBackground ? { output_format: "png" } : {}),
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: timeoutSignal(input.signal, DURABLE_IMAGE_REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`Image provider request failed with ${response.status}: ${(await response.text()).slice(0, 2_000)}`);
   const payload = await response.json() as ImageGenerationResult;
   if (!Array.isArray(payload.data)) throw new Error("Image provider response did not include data");
   return payload;
+}
+
+function timeoutSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 function imageSizeForAspectRatio(value: string | null): string {

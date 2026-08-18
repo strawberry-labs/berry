@@ -151,7 +151,12 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     permissionMode: string,
   ): DurableToolPolicy | undefined {
     if (toolName === "inspect_images") {
-      return { retryClass: "idempotent_with_key", requiresApproval: false, approvalKind: "file-edit" };
+      return {
+        retryClass: "idempotent_with_key",
+        repeatPolicy: "compare_result",
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      };
     }
     return this.base.policy?.(snapshot, toolName, permissionMode);
   }

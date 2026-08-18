@@ -147,6 +147,7 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
     if (toolName === "remember_memory" || toolName === "forget_memory") {
       return {
         retryClass: "idempotent_with_key",
+        repeatPolicy: "block_after_success",
         requiresApproval: false,
         approvalKind: "file-edit",
       };

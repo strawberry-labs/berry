@@ -50,6 +50,8 @@ const ImageGenerationResponseSchema = z.object({
   }).passthrough()).min(1),
 }).passthrough();
 
+const IMAGE_GENERATION_REQUEST_TIMEOUT_MS = 15 * 60_000;
+
 interface CloudImageGenerationConfig {
   endpoint: string;
   editsEndpoint: string;
@@ -223,7 +225,7 @@ export class CloudRuntimeConfigService {
         ...(this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : {}),
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(IMAGE_GENERATION_REQUEST_TIMEOUT_MS),
     });
     let response = await request(requestBody, stream);
     if (!response.ok && stream && [400, 404, 415, 422].includes(response.status)) {

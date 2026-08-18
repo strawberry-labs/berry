@@ -73,6 +73,7 @@ describe("DurablePersonalSkillToolExecutor", () => {
 
     expect(tools.policy(snapshot, "save_personal_skill", "full-access")).toEqual({
       retryClass: "idempotent_with_key",
+      repeatPolicy: "block_after_success",
       requiresApproval: false,
       approvalKind: "file-edit",
     });

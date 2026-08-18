@@ -86,6 +86,15 @@ const TERMINAL_STATES = new Set<TurnRunState>([
 ]);
 const IDENTICAL_TOOL_FAILURE_LIMIT = 5;
 
+export type ToolRepeatPolicy =
+  | "compare_result"
+  | "block_after_success"
+  | "bounded_polling";
+
+const TOOL_REPEAT_HISTORY_LIMIT = 32;
+const DUPLICATE_TOOL_CALL_SUPPRESSED = "duplicate_tool_call_suppressed";
+const DUPLICATE_TOOL_CALL_LOOP = "duplicate_tool_call_loop";
+
 export interface DurableTurnStep {
   id: string;
   sequence: number;
@@ -202,6 +211,9 @@ export interface DurableStepMutation {
   outcomeCertainty?: "known" | "unknown" | "not_applicable" | null;
   startedAt?: string | null;
   completedAt?: string | null;
+  repeatDecision?: ToolRepeatAssessment["decision"];
+  repeatSignature?: string;
+  repeatPolicy?: ToolRepeatPolicy;
 }
 
 export interface DurableTurnMutation {
@@ -330,6 +342,7 @@ export interface TurnModelToolIntent {
   name: string;
   input: JsonValue;
   retryClass: ToolRetryClass;
+  repeatPolicy?: ToolRepeatPolicy;
   idempotencyKey: string | null;
   requiresApproval: boolean;
   approvalKind: DurableTurnMutation["approval"] extends infer T
@@ -352,6 +365,7 @@ export interface TurnModelResult {
 
 export interface DurableToolPolicy {
   retryClass: ToolRetryClass;
+  repeatPolicy: ToolRepeatPolicy;
   requiresApproval: boolean;
   approvalKind: NonNullable<TurnModelToolIntent["approvalKind"]>;
 }
@@ -379,6 +393,10 @@ export interface DurableTurnModel {
 export interface TurnToolResult {
   output: JsonValue;
   summary: string;
+  progress?: {
+    outcome: "data" | "empty" | "acknowledged";
+    fingerprintBasis?: JsonValue;
+  };
   sandbox?: { provider: string; id: string; state: string };
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
 }
@@ -484,7 +502,7 @@ const DEFAULT_TOOL_LIMITS: Record<"read" | "command" | "connector" | "image" | "
   read: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
   command: { idleTimeoutMs: 180_000, maxDurationMs: 20 * 60_000 },
   connector: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
-  image: { idleTimeoutMs: 300_000, maxDurationMs: 20 * 60_000 },
+  image: { idleTimeoutMs: 15 * 60_000, maxDurationMs: 30 * 60_000 },
   default: { idleTimeoutMs: 120_000, maxDurationMs: 15 * 60_000 },
 };
 
@@ -551,6 +569,7 @@ export class DurableTurnRunner {
       noProgressWarningThreshold?: number;
       noProgressHardThreshold?: number;
       maxToolRepairAttempts?: number;
+      toolRepeatGuardMode?: "observe" | "enforce";
       abortCleanupTimeoutMs?: number;
       compactor?: SessionCompactionRunner;
       cancellations?: ActiveTurnCancellationRegistry;
@@ -1218,6 +1237,7 @@ export class DurableTurnRunner {
         toolCallId: call.id,
         toolName: call.name,
         arguments: call.input,
+        repeatPolicy: call.repeatPolicy,
         requiresApproval: call.requiresApproval,
         approvalKind: call.approvalKind,
       },
@@ -1357,6 +1377,11 @@ export class DurableTurnRunner {
     });
   }
 
+  private toolRepeatGuardMode(): "observe" | "enforce" {
+    return this.options.toolRepeatGuardMode
+      ?? (process.env.BERRY_TOOL_REPEAT_GUARD_MODE === "observe" ? "observe" : "enforce");
+  }
+
   private async executeTool(snapshot: DurableTurnSnapshot): Promise<TurnRunState> {
     const runnableSteps = snapshot.steps
       .filter(isRunnableToolStep)
@@ -1408,6 +1433,16 @@ export class DurableTurnRunner {
       throw new DurableTurnTerminalError(
         `${toolName} failed ${identicalFailureLimit} times with identical arguments and error. Berry stopped the task before attempt ${identicalFailureLimit + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
       );
+    }
+    const repeatAssessment = assessRepeatedToolCall(snapshot, step);
+    const repeatGuardEnforced = this.toolRepeatGuardMode() === "enforce";
+    if (!(step.state === "running" && step.retryClass === "non_idempotent_manual")) {
+      if (repeatAssessment.decision === "terminate" && repeatGuardEnforced) {
+        return this.terminateForDuplicateToolLoop(snapshot, step, repeatAssessment);
+      }
+      if (repeatAssessment.decision === "suppress" && repeatGuardEnforced) {
+        return this.suppressRepeatedToolCall(snapshot, step, repeatAssessment);
+      }
     }
     if (toolName === "ask_user_question") {
       const questions = durableQuestionItems(step.input.arguments);
@@ -1722,6 +1757,9 @@ export class DurableTurnRunner {
             ...step,
             state: "failed",
             error: typedRepairMessage,
+            repeatDecision: repeatAssessment.decision,
+            repeatSignature: repeatAssessment.signature,
+            repeatPolicy: repeatAssessment.policy,
             ...(timedOut ? {
               timedOut: true,
               outcomeCertainty: "known" as const,
@@ -1788,7 +1826,7 @@ export class DurableTurnRunner {
       return remaining ? "executing_tool" : "calling_model";
     }
     const toolDurationMs = Math.max(0, Date.now() - toolStartedAt);
-    const resultFingerprint = progressFingerprint(snapshot.id, result.output);
+    const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
     const progressAssessment = assessToolProgress(snapshot, step, resultFingerprint);
     const updatedProgress = nextProgress(snapshot, {
       kind: progressAssessment.kind,
@@ -1813,7 +1851,11 @@ export class DurableTurnRunner {
         toolDurationMs,
       );
     }
-    const progressEvent = progressAssessment.noProgress && updatedProgress.consecutiveNoProgress >= noProgressWarningThreshold
+    const repeatedSameResultWarning = progressAssessment.noProgress
+      && repeatAssessment.priorCompletedCount > 0
+      && repeatAssessment.policy === "compare_result";
+    const progressEvent = (repeatedSameResultWarning
+      || (progressAssessment.noProgress && updatedProgress.consecutiveNoProgress >= noProgressWarningThreshold))
       ? {
           kind: "turn.progress" as const,
           progressKind: progressAssessment.kind,
@@ -1836,6 +1878,9 @@ export class DurableTurnRunner {
           output: result.output,
           resultFingerprint,
           sessionEntryId: entryId,
+          repeatDecision: repeatAssessment.decision,
+          repeatSignature: repeatAssessment.signature,
+          repeatPolicy: repeatAssessment.policy,
         },
         ...(!remaining ? [{
           id: randomUUID(),
@@ -1928,7 +1973,26 @@ export class DurableTurnRunner {
         );
       }
     }
-    const pendingSteps = steps.filter((step) => step.state === "pending");
+    const repeatAssessments = new Map(steps.map((step) => [step.id, assessRepeatedToolCall(snapshot, step)]));
+    const guardEnforced = this.toolRepeatGuardMode() === "enforce";
+    const terminating = steps.find((step) => repeatAssessments.get(step.id)?.decision === "terminate");
+    if (terminating && guardEnforced) {
+      return this.terminateForDuplicateToolLoop(snapshot, terminating, repeatAssessments.get(terminating.id)!);
+    }
+    const executableSteps: DurableTurnStep[] = [];
+    const suppressedSteps: Array<{ step: DurableTurnStep; assessment: ToolRepeatAssessment; batchDuplicate: boolean }> = [];
+    const seenBatchSignatures = new Set<string>();
+    for (const step of steps) {
+      const assessment = repeatAssessments.get(step.id)!;
+      const batchDuplicate = seenBatchSignatures.has(assessment.signature);
+      if (guardEnforced && (assessment.decision === "suppress" || batchDuplicate)) {
+        suppressedSteps.push({ step, assessment, batchDuplicate });
+        continue;
+      }
+      seenBatchSignatures.add(assessment.signature);
+      executableSteps.push(step);
+    }
+    const pendingSteps = executableSteps.filter((step) => step.state === "pending");
     const toolLimits = toolExecutionLimits("read", this.options);
     const batchStartedAt = Date.now();
     const deadlineAt = new Date(batchStartedAt + toolLimits.maxDurationMs).toISOString();
@@ -1936,7 +2000,7 @@ export class DurableTurnRunner {
     await this.repository.commit(snapshot, {
       expectedState: "executing_tool",
       nextState: "executing_tool",
-      steps: steps.map((step) => ({
+      steps: executableSteps.map((step) => ({
         ...step,
         state: "running",
         incrementAttempt: true,
@@ -1949,25 +2013,25 @@ export class DurableTurnRunner {
         name: toolNameForStep(step),
         args: (step.input.arguments ?? {}) as JsonValue,
       })),
-      nextAction: `Execute ${steps.length} independent read-only tools concurrently`,
+      nextAction: `Execute ${executableSteps.length} independent read-only tools concurrently`,
       keepLease: true,
     });
-    for (const step of steps) {
+    for (const step of executableSteps) {
       step.state = "running";
       step.deadlineAt = deadlineAt;
       step.idleDeadlineAt = idleDeadlineAt;
     }
 
     const startedAt = batchStartedAt;
-    const entryIds = steps.map(() => randomUUID());
+    const entryIds = executableSteps.map(() => randomUUID());
     const settled = await this.withHeartbeat(
       snapshot,
       ({ signal, reportProgress }) => Promise.allSettled(
-        steps.map((step) => this.tools.execute(snapshot, step, signal, reportProgress)),
+        executableSteps.map((step) => this.tools.execute(snapshot, step, signal, reportProgress)),
       ),
       {
         label: "Parallel read-only tool batch",
-        abortable: steps.every((step) =>
+        abortable: executableSteps.every((step) =>
           step.retryClass === "read_only"
           && this.tools.supportsAbort?.(snapshot, step) === true
         ),
@@ -1990,8 +2054,71 @@ export class DurableTurnRunner {
     let hardNoProgress = false;
     const noProgressWarningThreshold = Math.max(1, this.options.noProgressWarningThreshold ?? DEFAULT_NO_PROGRESS_WARNING_THRESHOLD);
     const noProgressHardThreshold = Math.max(noProgressWarningThreshold + 1, this.options.noProgressHardThreshold ?? DEFAULT_NO_PROGRESS_HARD_THRESHOLD);
-    for (let index = 0; index < steps.length; index += 1) {
-      const step = steps[index]!;
+    for (const suppressed of suppressedSteps) {
+      const { step, assessment, batchDuplicate } = suppressed;
+      const entryId = randomUUID();
+      const message = batchDuplicate
+        ? "Duplicate tool call suppressed because the same tool and input was already scheduled in this tool batch."
+        : assessment.policy === "block_after_success"
+          ? "Duplicate tool call suppressed because this external operation already completed successfully once."
+          : "Duplicate tool call suppressed because this tool and input already completed successfully with no new result.";
+      batchProgress = nextProgress({ ...snapshot, progress: batchProgress }, {
+        kind: "result_repeated",
+        noProgress: true,
+      });
+      mutations.push({
+        ...step,
+        state: "failed",
+        error: DUPLICATE_TOOL_CALL_SUPPRESSED,
+        repeatDecision: "suppress",
+        repeatSignature: assessment.signature,
+        repeatPolicy: assessment.policy,
+      });
+      events.push(
+        {
+          kind: "tool.end",
+          toolCallId: toolCallIdForStep(step),
+          status: "failed",
+          summary: "Duplicate tool call suppressed.",
+        },
+        {
+          kind: "turn.progress",
+          progressKind: "result_repeated",
+          progressEpoch: batchProgress.progressEpoch,
+          consecutiveNoProgress: batchProgress.consecutiveNoProgress,
+        },
+      );
+      toolResultMessages.push({
+        id: entryId,
+        toolCallId: toolCallIdForStep(step),
+        name: toolNameForStep(step),
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "failed",
+        output: { error: DUPLICATE_TOOL_CALL_SUPPRESSED, message },
+        summary: "Duplicate tool call suppressed.",
+      });
+      entries.push({
+        entryId,
+        entryType: "message",
+        stepId: step.id,
+        payload: {
+          type: "message",
+          id: entryId,
+          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId: toolCallIdForStep(step),
+            toolName: toolNameForStep(step),
+            content: [{ type: "text", text: message }],
+            isError: true,
+            timestamp: Date.now(),
+          },
+        },
+      });
+    }
+    for (let index = 0; index < executableSteps.length; index += 1) {
+      const step = executableSteps[index]!;
       const outcome = settled[index]!;
       const entryId = entryIds[index]!;
       const toolName = toolNameForStep(step);
@@ -1999,14 +2126,14 @@ export class DurableTurnRunner {
       const durationMs = Math.max(0, Date.now() - startedAt);
       if (outcome.status === "fulfilled") {
         const result = outcome.value;
-        const resultFingerprint = progressFingerprint(snapshot.id, result.output);
+        const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
         const assessmentSnapshot: DurableTurnSnapshot = {
           ...snapshot,
           progress: batchProgress,
           steps: [
             ...snapshot.steps,
             ...mutations.map((mutation) => {
-              const original = steps.find((candidate) => candidate.id === mutation.id) ?? step;
+              const original = executableSteps.find((candidate) => candidate.id === mutation.id) ?? step;
               return {
                 ...original,
                 state: mutation.state,
@@ -2017,13 +2144,16 @@ export class DurableTurnRunner {
           ],
         };
         const assessment = assessToolProgress(assessmentSnapshot, step, resultFingerprint);
+        const repeatGuardAssessment = repeatAssessments.get(step.id)!;
         batchProgress = nextProgress(assessmentSnapshot, {
           kind: assessment.kind,
           noProgress: assessment.noProgress,
           toolMs: durationMs,
         });
         if (assessment.noProgress && batchProgress.consecutiveNoProgress >= noProgressHardThreshold) hardNoProgress = true;
-        if (assessment.noProgress && batchProgress.consecutiveNoProgress >= noProgressWarningThreshold) {
+        const repeatAssessment = repeatAssessments.get(step.id);
+        if (assessment.noProgress && (batchProgress.consecutiveNoProgress >= noProgressWarningThreshold
+          || (repeatAssessment?.priorCompletedCount ?? 0) > 0)) {
           events.push({
             kind: "turn.progress",
             progressKind: assessment.kind,
@@ -2038,6 +2168,9 @@ export class DurableTurnRunner {
           output: result.output,
           resultFingerprint,
           sessionEntryId: entryId,
+          repeatDecision: repeatGuardAssessment.decision,
+          repeatSignature: repeatGuardAssessment.signature,
+          repeatPolicy: repeatGuardAssessment.policy,
         });
         events.push({
           kind: "tool.end",
@@ -2082,7 +2215,15 @@ export class DurableTurnRunner {
         ? outcome.reason.usage
         : undefined;
       const message = (outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)).slice(0, 4_000);
-      mutations.push({ ...step, state: "failed", error: message });
+      const repeatGuardAssessment = repeatAssessments.get(step.id)!;
+      mutations.push({
+        ...step,
+        state: "failed",
+        error: message,
+        repeatDecision: repeatGuardAssessment.decision,
+        repeatSignature: repeatGuardAssessment.signature,
+        repeatPolicy: repeatGuardAssessment.policy,
+      });
       events.push({
         kind: "tool.end",
         toolCallId,
@@ -2171,6 +2312,189 @@ export class DurableTurnRunner {
     return nextState;
   }
 
+  private async suppressRepeatedToolCall(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    assessment: ToolRepeatAssessment,
+  ): Promise<TurnRunState> {
+    const toolCallId = toolCallIdForStep(step);
+    const toolName = toolNameForStep(step);
+    const entryId = randomUUID();
+    const iteration = modelIteration(snapshot.steps) + 1;
+    const message = assessment.policy === "block_after_success"
+      ? [
+          "Duplicate tool call suppressed.",
+          "This external operation already completed successfully once.",
+          "Running it again could repeat the external change.",
+          "Continue using the existing result, choose a different operation, or explain the blocker. Do not repeat this call.",
+        ].join("\n\n")
+      : [
+          "Duplicate tool call suppressed.",
+          "This exact tool and input already completed twice with the same result.",
+          "Running it again would not provide new information.",
+          "Choose different arguments, use a different tool, continue using the existing result, or explain the blocker. Do not repeat this call.",
+        ].join("\n\n");
+    const progress = nextProgress(snapshot, {
+      kind: "result_repeated",
+      noProgress: true,
+    });
+    const remaining = snapshot.steps.some((candidate) =>
+      candidate.id !== step.id && isRunnableToolStep(candidate)
+    );
+    const nextState: TurnRunState = remaining ? "executing_tool" : "calling_model";
+    await this.commitAndWake(snapshot, {
+      expectedState: "executing_tool",
+      nextState,
+      steps: [
+        {
+          ...step,
+          state: "failed",
+          error: DUPLICATE_TOOL_CALL_SUPPRESSED,
+          repeatDecision: "suppress",
+          repeatSignature: assessment.signature,
+          repeatPolicy: assessment.policy,
+        },
+        ...(!remaining ? [{
+          id: randomUUID(),
+          sequence: nextStepSequence(snapshot.steps),
+          type: "model.call" as const,
+          state: "pending" as const,
+          input: { iteration },
+          retryClass: "idempotent_with_key" as const,
+          idempotencyKey: `${snapshot.id}:model:${iteration}`,
+        }] : []),
+      ],
+      events: [
+        {
+          kind: "tool.end",
+          toolCallId,
+          status: "failed",
+          summary: "Duplicate tool call suppressed.",
+        },
+        {
+          kind: "turn.progress",
+          progressKind: "result_repeated",
+          progressEpoch: progress.progressEpoch,
+          consecutiveNoProgress: progress.consecutiveNoProgress,
+        },
+      ],
+      toolResultMessage: {
+        id: entryId,
+        toolCallId,
+        name: toolName,
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "failed",
+        output: { error: DUPLICATE_TOOL_CALL_SUPPRESSED, message },
+        summary: "Duplicate tool call suppressed.",
+      },
+      entries: [{
+        entryId,
+        entryType: "message",
+        stepId: step.id,
+        payload: {
+          type: "message",
+          id: entryId,
+          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId,
+            toolName,
+            content: [{ type: "text", text: message }],
+            isError: true,
+            timestamp: Date.now(),
+          },
+        },
+      }],
+      progress,
+      nextAction: remaining
+        ? "Execute the next tool step after suppressing the duplicate tool call"
+        : "Give the model one correction turn after suppressing the duplicate tool call",
+    });
+    return nextState;
+  }
+
+  private async terminateForDuplicateToolLoop(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    assessment: ToolRepeatAssessment,
+  ): Promise<TurnRunState> {
+    const toolCallId = toolCallIdForStep(step);
+    const toolName = toolNameForStep(step);
+    const entryId = randomUUID();
+    const error = DUPLICATE_TOOL_CALL_LOOP;
+    const message = "Berry stopped this task because the model repeatedly requested the same tool call after receiving an unchanged result and a correction instruction. No additional duplicate call was executed.";
+    const progress = nextProgress(snapshot, {
+      kind: "result_repeated",
+      noProgress: true,
+      budgetReason: error,
+    });
+    await this.repository.commit(snapshot, {
+      expectedState: "executing_tool",
+      nextState: "failed",
+      steps: [{
+        ...step,
+        state: "failed",
+        error,
+        repeatDecision: "terminate",
+        repeatSignature: assessment.signature,
+        repeatPolicy: assessment.policy,
+      }],
+      events: [
+        {
+          kind: "tool.end",
+          toolCallId,
+          status: "failed",
+          summary: "Duplicate tool call loop stopped before execution.",
+        },
+        {
+          kind: "turn.progress",
+          progressKind: "result_repeated",
+          progressEpoch: progress.progressEpoch,
+          consecutiveNoProgress: progress.consecutiveNoProgress,
+          budgetReason: error,
+        },
+        { kind: "error", message },
+        { kind: "turn.end", turnId: snapshot.id, status: "failed" },
+      ],
+      toolResultMessage: {
+        id: entryId,
+        toolCallId,
+        name: toolName,
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "failed",
+        output: { error, message },
+        summary: message,
+      },
+      entries: [{
+        entryId,
+        entryType: "message",
+        stepId: step.id,
+        payload: {
+          type: "message",
+          id: entryId,
+          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId,
+            toolName,
+            content: [{ type: "text", text: message }],
+            isError: true,
+            timestamp: Date.now(),
+          },
+        },
+      }],
+      terminalAssistant: { status: "failed", error: message },
+      nextAction: null,
+      waitingReason: null,
+      error,
+      taskStatus: "failed",
+      progress,
+    });
+    return "failed";
+  }
+
   private async stopForNoProgress(
     snapshot: DurableTurnSnapshot,
     step: DurableTurnStep,
@@ -2198,7 +2522,11 @@ export class DurableTurnRunner {
         { kind: "tool.end", toolCallId, status: "completed", summary: result.summary.slice(0, 2_000) },
         {
           kind: "turn.progress",
-          progressKind: progress.progressKind === "alternating_no_progress" ? "alternating_no_progress" : "result_repeated",
+          progressKind: progress.progressKind === "alternating_no_progress"
+            ? "alternating_no_progress"
+            : progress.progressKind === "declared_polling"
+              ? "declared_polling"
+              : "result_repeated",
           progressEpoch: progress.progressEpoch,
           consecutiveNoProgress: progress.consecutiveNoProgress,
           budgetReason: error,
@@ -3362,7 +3690,17 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
             attempt: step.incrementAttempt ? 1 : 0,
             phaseClaimCount: step.phaseClaimCount ?? 0,
             outcome: step.state,
-            ...(step.type.startsWith("tool.") ? { toolFamily: stableToolFamily(step.type.slice(5)) } : {}),
+            ...(step.type.startsWith("tool.") ? {
+              toolFamily: stableToolFamily(step.type.slice(5)),
+              toolName: toolNameForStep({
+                ...step,
+                input: step.input ?? {},
+                type: step.type,
+              } as DurableTurnStep),
+              ...(step.repeatSignature ? { toolRepeatSignature: step.repeatSignature } : {}),
+              ...(step.repeatDecision ? { toolRepeatDecision: step.repeatDecision } : {}),
+              ...(step.repeatPolicy ? { toolRepeatPolicy: step.repeatPolicy } : {}),
+            } : {}),
           },
         });
       }
@@ -3623,6 +3961,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
         name: call.function.name,
         input: safeJson(call.function.arguments),
         retryClass: policy.retryClass,
+        repeatPolicy: policy.repeatPolicy,
         idempotencyKey: policy.retryClass === "idempotent_with_key"
           ? `${snapshot.id}:tool:${call.id}`
           : null,
@@ -3798,6 +4137,7 @@ async function callProviderStream(
       name: part.name,
       input: JSON.parse(JSON.stringify(part.arguments ?? {})) as JsonValue,
       retryClass: policy.retryClass,
+      repeatPolicy: policy.repeatPolicy,
       idempotencyKey: policy.retryClass === "idempotent_with_key"
         ? `${snapshot.id}:tool:${part.id}`
         : null,
@@ -4243,8 +4583,7 @@ function progressFingerprint(runId: string, value: unknown): string {
 }
 
 function declaredPolling(step: DurableTurnStep): boolean {
-  const argumentsValue = record(step.input.arguments);
-  return argumentsValue?.progressPolicy === "polling" || argumentsValue?.allowNoProgress === true;
+  return repeatPolicyForStep(step) === "bounded_polling";
 }
 
 const NON_OBSERVATIONAL_READ_ONLY_TOOLS = new Set([
@@ -4253,7 +4592,7 @@ const NON_OBSERVATIONAL_READ_ONLY_TOOLS = new Set([
 ]);
 
 function supportsResultOnlyNoProgress(step: DurableTurnStep): boolean {
-  return step.retryClass === "read_only"
+  return (repeatPolicyForStep(step) === "compare_result" || repeatPolicyForStep(step) === "bounded_polling")
     && !NON_OBSERVATIONAL_READ_ONLY_TOOLS.has(toolNameForStep(step));
 }
 
@@ -4262,19 +4601,18 @@ function assessToolProgress(
   step: DurableTurnStep,
   fingerprint: string,
 ): { noProgress: boolean; kind: "tool_progress" | "result_repeated" | "alternating_no_progress" | "declared_polling" } {
-  if (declaredPolling(step)) return { noProgress: false, kind: "declared_polling" };
   if (!supportsResultOnlyNoProgress(step)) return { noProgress: false, kind: "tool_progress" };
+  const polling = declaredPolling(step);
   const completed = snapshot.steps
-    .filter((candidate) => candidate.state === "completed" && supportsResultOnlyNoProgress(candidate))
+    .filter((candidate) => candidate.state === "completed"
+      && supportsResultOnlyNoProgress(candidate)
+      && toolRepeatSignature(candidate) === toolRepeatSignature(step))
     .slice(-8);
   const fingerprints = completed
-    .map((candidate) => candidate.resultFingerprint ?? (
-      candidate.output === null || candidate.output === undefined
-        ? null
-        : progressFingerprint(snapshot.id, candidate.output)
-    ))
+    .map((candidate) => resultFingerprintForStep(snapshot, candidate))
     .filter((value): value is string => Boolean(value));
   if (fingerprints.includes(fingerprint)) {
+    if (polling) return { noProgress: true, kind: "declared_polling" };
     const previous = fingerprints.at(-1);
     const twoBack = fingerprints.at(-2);
     if (previous && twoBack && previous !== twoBack && twoBack === fingerprint) {
@@ -4355,6 +4693,136 @@ function toolExecutionLimits(
 function toolArgumentFingerprint(value: unknown): string {
   const canonical = canonicalizeToolArguments(value);
   return createHash("sha256").update(JSON.stringify(canonical) ?? String(canonical)).digest("hex");
+}
+
+interface ToolRepeatAssessment {
+  signature: string;
+  policy: ToolRepeatPolicy;
+  priorCompletedCount: number;
+  consecutiveSameResultCount: number;
+  priorSuppressionCount: number;
+  decision: "allow" | "allow_with_warning" | "suppress" | "terminate";
+}
+
+const REPEAT_ARGUMENT_IGNORED_KEYS = new Set([
+  "timeout",
+  "timeout_ms",
+  "request_id",
+  "requestId",
+  "tool_call_id",
+  "toolCallId",
+  "idempotency_key",
+  "idempotencyKey",
+]);
+
+function canonicalizeRepeatArguments(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeRepeatArguments);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !REPEAT_ARGUMENT_IGNORED_KEYS.has(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalizeRepeatArguments(item)]));
+  }
+  return value;
+}
+
+function repeatArgumentsForSignature(toolName: string, value: unknown): unknown {
+  if (toolName !== "bash") return canonicalizeRepeatArguments(value);
+  if (typeof value === "string") return { command: value.trim() };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return canonicalizeRepeatArguments(value);
+  }
+  const args = { ...(value as Record<string, unknown>) };
+  for (const alias of ["cmd", "shellCommand", "shell_command"]) {
+    if (!(alias in args)) continue;
+    if (args.command === undefined) args.command = args[alias];
+    delete args[alias];
+  }
+  if (typeof args.command === "string") args.command = args.command.trim();
+  return canonicalizeRepeatArguments(args);
+}
+
+function toolRepeatSignature(step: DurableTurnStep): string {
+  const toolName = toolNameForStep(step).trim().toLowerCase();
+  const argumentsValue = repeatArgumentsForSignature(toolName, step.input.arguments ?? {});
+  return createHash("sha256")
+    .update(JSON.stringify({ toolName, arguments: argumentsValue }) ?? String(argumentsValue))
+    .digest("hex");
+}
+
+function isToolRepeatPolicy(value: unknown): value is ToolRepeatPolicy {
+  return value === "compare_result"
+    || value === "block_after_success"
+    || value === "bounded_polling";
+}
+
+function repeatPolicyForStep(step: DurableTurnStep): ToolRepeatPolicy {
+  const persisted = record(step.input)?.repeatPolicy;
+  if (isToolRepeatPolicy(persisted)) return persisted;
+  const toolName = toolNameForStep(step);
+  if (["read", "grep", "find", "ls", "bash", "inspect_images"].includes(toolName)) {
+    return "compare_result";
+  }
+  if (step.retryClass === "read_only" && !NON_OBSERVATIONAL_READ_ONLY_TOOLS.has(toolName)) {
+    return "compare_result";
+  }
+  return "block_after_success";
+}
+
+function resultFingerprintForStep(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
+  if (step.resultFingerprint) return step.resultFingerprint;
+  if (step.output === null || step.output === undefined) return null;
+  return progressFingerprint(snapshot.id, step.output);
+}
+
+function resultFingerprintForToolResult(snapshot: DurableTurnSnapshot, result: TurnToolResult): string {
+  return progressFingerprint(snapshot.id, result.progress?.fingerprintBasis ?? result.output);
+}
+
+function assessRepeatedToolCall(
+  snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
+): ToolRepeatAssessment {
+  const signature = toolRepeatSignature(step);
+  const policy = repeatPolicyForStep(step);
+  const relevant = snapshot.steps
+    .filter((candidate) => candidate.id !== step.id
+      && candidate.sequence < step.sequence
+      && isToolStep(candidate)
+      && toolRepeatSignature(candidate) === signature)
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-TOOL_REPEAT_HISTORY_LIMIT);
+  const completed = relevant.filter((candidate) => candidate.state === "completed");
+  const suppressions = relevant.filter((candidate) =>
+    candidate.state === "failed" && candidate.error === DUPLICATE_TOOL_CALL_SUPPRESSED,
+  );
+  const lastFingerprint = completed.length > 0
+    ? resultFingerprintForStep(snapshot, completed.at(-1)!)
+    : null;
+  let consecutiveSameResultCount = 0;
+  if (lastFingerprint) {
+    for (const candidate of [...completed].reverse()) {
+      if (resultFingerprintForStep(snapshot, candidate) !== lastFingerprint) break;
+      consecutiveSameResultCount += 1;
+    }
+  }
+  const decision = suppressions.length > 0
+    ? "terminate"
+    : policy === "block_after_success" && completed.length > 0
+      ? "suppress"
+      : policy === "compare_result" && consecutiveSameResultCount >= 2
+        ? "suppress"
+        : policy === "compare_result" && consecutiveSameResultCount === 1
+          ? "allow_with_warning"
+          : "allow";
+  return {
+    signature,
+    policy,
+    priorCompletedCount: completed.length,
+    consecutiveSameResultCount,
+    priorSuppressionCount: suppressions.length,
+    decision,
+  };
 }
 
 function canonicalizeToolArguments(value: unknown): unknown {
@@ -4701,6 +5169,7 @@ function approvalKind(value: unknown): NonNullable<TurnModelToolIntent["approval
 
 function durableToolPolicy(name: string, permissionMode: string): {
   retryClass: ToolRetryClass;
+  repeatPolicy: ToolRepeatPolicy;
   requiresApproval: boolean;
   approvalKind: NonNullable<TurnModelToolIntent["approvalKind"]>;
 } {
@@ -4709,15 +5178,27 @@ function durableToolPolicy(name: string, permissionMode: string): {
     || name === "find"
     || name === "ls"
     || name === "grep"
-    || name === "activate_skill"
-    || name === "ask_user_question"
-    || name === "compose_message"
+    || name === "bash"
   ) {
-    return { retryClass: "read_only", requiresApproval: false, approvalKind: "file-edit" };
+    return {
+      retryClass: name === "bash" ? "non_idempotent_manual" : "read_only",
+      repeatPolicy: "compare_result",
+      requiresApproval: name === "bash" ? permissionMode !== "full-access" : false,
+      approvalKind: name === "bash" ? "shell" : "file-edit",
+    };
+  }
+  if (name === "activate_skill" || name === "ask_user_question" || name === "compose_message") {
+    return {
+      retryClass: "read_only",
+      repeatPolicy: "block_after_success",
+      requiresApproval: false,
+      approvalKind: "file-edit",
+    };
   }
   if (name === "write") {
     return {
       retryClass: "idempotent",
+      repeatPolicy: "block_after_success",
       requiresApproval: !["auto-edit", "full-access"].includes(permissionMode),
       approvalKind: "file-edit",
     };
@@ -4725,6 +5206,7 @@ function durableToolPolicy(name: string, permissionMode: string): {
   if (name === "edit") {
     return {
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: !["auto-edit", "full-access"].includes(permissionMode),
       approvalKind: "file-edit",
     };
@@ -4732,6 +5214,7 @@ function durableToolPolicy(name: string, permissionMode: string): {
   if (name === "persist_artifact") {
     return {
       retryClass: "idempotent_with_key",
+      repeatPolicy: "block_after_success",
       requiresApproval: false,
       approvalKind: "file-edit",
     };
@@ -4739,6 +5222,7 @@ function durableToolPolicy(name: string, permissionMode: string): {
   if (name === "inspect_images") {
     return {
       retryClass: "idempotent_with_key",
+      repeatPolicy: "compare_result",
       requiresApproval: false,
       approvalKind: "file-edit",
     };
@@ -4746,12 +5230,14 @@ function durableToolPolicy(name: string, permissionMode: string): {
   if (name === "create_image") {
     return {
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: false,
       approvalKind: "file-edit",
     };
   }
   return {
     retryClass: "non_idempotent_manual",
+    repeatPolicy: "block_after_success",
     requiresApproval: permissionMode !== "full-access",
     approvalKind: "shell",
   };
@@ -4873,7 +5359,7 @@ function durableBuiltInToolGuidance(toolNames: readonly string[]): string {
   const guidance: string[] = [];
   if (toolNames.includes("read")) {
     guidance.push([
-      "Coding tools: read (read file contents), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents).",
+      "Coding tools: read (read file contents), bash (execute Bash commands), edit (precise exact-text replacements, including multiple disjoint edits), write (create or overwrite files), grep (search file contents and respect .gitignore), find (find files by glob and respect .gitignore), and ls (list directory contents). Empty or unchanged output is not progress; do not repeat identical completed calls. Change inputs or strategy, and poll only when supported.",
       "Use read to examine files instead of cat or sed.",
       "Use edit for precise changes; every edits[].oldText must match exactly and uniquely in the original file.",
       "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls.",

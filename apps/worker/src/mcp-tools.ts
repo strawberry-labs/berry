@@ -99,6 +99,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     if (toolName === "tool_search") {
       return {
         retryClass: "read_only",
+        repeatPolicy: "compare_result",
         requiresApproval: false,
         approvalKind: "mcp",
       };
@@ -113,6 +114,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     if (!server) {
       return {
         retryClass: "non_idempotent_manual",
+        repeatPolicy: "block_after_success",
         requiresApproval: true,
         approvalKind: "mcp",
       };
@@ -554,6 +556,7 @@ export function durableMcpToolPolicy(
   if (hints?.nonReplayable) {
     return {
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: hints.requiresApproval === true && permissionMode !== "full-access",
       approvalKind: "mcp",
     };
@@ -561,6 +564,7 @@ export function durableMcpToolPolicy(
   if (hints?.requiresApproval) {
     return {
       retryClass: hints.idempotent ? "idempotent_with_key" : "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: permissionMode !== "full-access",
       approvalKind: "mcp",
     };
@@ -568,6 +572,7 @@ export function durableMcpToolPolicy(
   if (hints?.trustedReadOnly) {
     return {
       retryClass: "read_only",
+      repeatPolicy: "compare_result",
       requiresApproval: false,
       approvalKind: "mcp",
     };
@@ -577,6 +582,7 @@ export function durableMcpToolPolicy(
   if (server.trustReadOnlyAnnotations !== true) {
     return {
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval: permissionMode !== "full-access",
       approvalKind: "mcp",
     };
@@ -585,6 +591,7 @@ export function durableMcpToolPolicy(
   if (hints?.destructive) {
     return {
       retryClass: "non_idempotent_manual",
+      repeatPolicy: "block_after_success",
       requiresApproval,
       approvalKind: "mcp",
     };
@@ -592,12 +599,14 @@ export function durableMcpToolPolicy(
   if (hints?.idempotent) {
     return {
       retryClass: "idempotent_with_key",
+      repeatPolicy: "block_after_success",
       requiresApproval,
       approvalKind: "mcp",
     };
   }
   return {
     retryClass: "non_idempotent_manual",
+    repeatPolicy: "block_after_success",
     requiresApproval,
     approvalKind: "mcp",
   };
