@@ -22,6 +22,10 @@ FONT = "Verdana"
 GREEN = RGBColor(0x00, 0x8C, 0x95)
 GRAY = RGBColor(0x34, 0x37, 0x41)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+PPT_TITLE_PT = 21.0
+PPT_SECTION_PT = 8.5
+PPT_BODY_PT = 9.0
+PPT_DIVIDER_PT = 22.0
 
 
 LAYOUTS = {
@@ -131,8 +135,10 @@ def replace_paragraph(
     paragraph,
     text: str,
     *,
-    size: float | None = None,
-    color: RGBColor | None = None,
+    size: float = PPT_BODY_PT,
+    color: RGBColor = GRAY,
+    bold: bool | None = False,
+    italic: bool | None = False,
 ) -> None:
     if paragraph.runs:
         paragraph.runs[0].text = text
@@ -142,10 +148,20 @@ def replace_paragraph(
         paragraph.add_run().text = text
     for run in paragraph.runs:
         run.font.name = FONT
-        if size is not None:
-            run.font.size = Pt(size)
-        if color is not None:
-            run.font.color.rgb = color
+        run.font.size = Pt(size)
+        run.font.color.rgb = color
+        if bold is not None:
+            run.font.bold = bold
+        if italic is not None:
+            run.font.italic = italic
+        run.font.underline = False
+        properties = run._r.get_or_add_rPr()
+        for tag in ("latin", "ea", "cs"):
+            element = properties.find(qn(f"a:{tag}"))
+            if element is None:
+                element = properties.makeelement(qn(f"a:{tag}"), {})
+                properties.append(element)
+            element.set("typeface", FONT)
 
 
 def text_runs(value) -> list[tuple[str, bool, bool]]:
@@ -185,8 +201,8 @@ def set_block(
     shape,
     value,
     *,
-    size: float | None = None,
-    color: RGBColor | None = None,
+    size: float = PPT_BODY_PT,
+    color: RGBColor = GRAY,
     force_bold: bool | None = None,
 ) -> None:
     if shape is None or not getattr(shape, "has_text_frame", False):
@@ -201,10 +217,15 @@ def set_block(
     paragraphs = shape.text_frame.paragraphs
     for index, paragraph in enumerate(paragraphs):
         text, bold, bullet = values[index]
-        replace_paragraph(paragraph, text, size=size, color=color)
+        replace_paragraph(
+            paragraph,
+            text,
+            size=size,
+            color=color,
+            bold=bold if force_bold is None else force_bold,
+            italic=False,
+        )
         set_bullet(paragraph, bullet)
-        if paragraph.runs:
-            paragraph.runs[0].font.bold = bold if force_bold is None else force_bold
 
 
 def remove_shape(container, shape) -> None:
@@ -345,13 +366,19 @@ def fill_slide(slide, slide_spec: dict, slide_number: int) -> None:
         divider_shape = shape_by_id(slide, config["bodies"][0])
         if divider_shape is None:
             raise ValueError(f"missing divider text slot in {layout}")
-        set_block(divider_shape, slide_spec.get("title", "Section"))
+        set_block(
+            divider_shape,
+            slide_spec.get("title", "Section"),
+            size=PPT_DIVIDER_PT,
+            color=WHITE,
+            force_bold=True,
+        )
     elif mode != "closing":
         set_or_remove(
             slide,
             config.get("title"),
             slide_spec.get("title", ""),
-            size=21,
+            size=PPT_TITLE_PT,
             color=GRAY,
             force_bold=True,
         )
@@ -359,7 +386,7 @@ def fill_slide(slide, slide_spec: dict, slide_number: int) -> None:
             slide,
             config.get("section"),
             str(slide_spec.get("section", "")).upper(),
-            size=8.5,
+            size=PPT_SECTION_PT,
             color=GREEN,
             force_bold=True,
         )
@@ -375,7 +402,13 @@ def fill_slide(slide, slide_spec: dict, slide_number: int) -> None:
             body_shape = shape_by_id(slide, shape_id)
             if body_shape is None:
                 raise ValueError(f"missing text slot {shape_id} in {layout}")
-            set_block(body_shape, value)
+            set_block(
+                body_shape,
+                value,
+                size=PPT_BODY_PT,
+                color=GRAY,
+                force_bold=None,
+            )
         for shape_id in body_ids[len(values) :]:
             remove_shape(slide, shape_by_id(slide, shape_id))
 

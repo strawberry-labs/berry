@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from office_converter import assert_pdf_fonts, convert_to_pdf
+
 
 def run(command: list[str]) -> None:
     result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -25,6 +27,7 @@ def main() -> int:
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--dpi", type=int, default=120)
+    parser.add_argument("--soffice")
     args = parser.parse_args()
 
     artifact = args.artifact.resolve()
@@ -35,22 +38,13 @@ def main() -> int:
 
     pdf = artifact
     if artifact.suffix.casefold() != ".pdf":
-        if not shutil.which("soffice"):
-            raise RuntimeError("soffice is required to render Office files")
-        profile = Path(tempfile.mkdtemp(prefix="lo-profile-", dir=output_dir))
-        run(
-            [
-                "soffice",
-                "--headless",
-                f"-env:UserInstallation={profile.as_uri()}",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                str(output_dir),
-                str(artifact),
-            ]
+        pdf = convert_to_pdf(
+            artifact,
+            output_dir,
+            soffice=args.soffice,
+            profile_parent=output_dir,
         )
-        pdf = output_dir / f"{artifact.stem}.pdf"
+        assert_pdf_fonts(pdf)
     if not pdf.is_file():
         raise RuntimeError(f"PDF render intermediate was not created: {pdf}")
     if not shutil.which("pdftoppm"):

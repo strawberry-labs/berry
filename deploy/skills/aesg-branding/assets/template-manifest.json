@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "generated": "2026-08-14",
   "sourceEvidence": [
     {
@@ -24,20 +24,20 @@
   "runtimeTemplates": [
     {
       "path": "templates/AESG_General_Report_Template.docx",
-      "sha256": "cf8f283ef5537359ccb8cd2f7d08c86d627771ca6214a9d64e41919b5b056702",
+      "sha256": "8c6cc9112ff1a266028ab1db1adc748bcc34183740c20876b0a94a34224cf0e1",
       "purpose": "Sanitised General Template source for reports and long-form Word documents"
     },
     {
       "path": "templates/AESG_Letterhead_Dubai.docx",
-      "sha256": "652b1cc1b8c16bca1203c5925bc56a994a7720fd20ece1e12f040c48dec8b40e",
+      "sha256": "fa67946c2d51ae9270d60404cc84d0176824dc97a7201c6a98713ca877a0ea61",
       "purpose": "Retained A4 letterhead for letters, leave requests, short memos, confirmations, and simple correspondence"
     },
     {
       "path": "templates/AESG_General_Presentation.pptx",
-      "sha256": "977cbfc96d4d65ef3df4cbcdd335e7492c7666397e29aa6b53eb7d92e3d61dc5",
-      "bytes": 10999321,
+      "sha256": "7e081409636535a50b4e6647adc12bbbb0ceb20e7303ed21d02566c08ffcd943",
+      "bytes": 10999817,
       "purpose": "Compact CRC-clean General Presentation with 17 specimens, 1 master, and 17 reachable layouts",
-      "evidence": "Unused masters, layouts, and their media were pruned with compact_pptx_template.py; all 17 rendered slides are pixel-identical to the repaired source"
+      "evidence": "Unused masters, layouts, and their media were pruned with compact_pptx_template.py; retained body specimens were then normalised to Verdana 9 pt and AESG Gray"
     },
     {
       "path": "templates/AESG_Excel_Template_2023.xlsx",

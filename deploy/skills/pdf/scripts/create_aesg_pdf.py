@@ -8,8 +8,16 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+
+def converter_module(branding_skill_dir: Path):
+    scripts_dir = branding_skill_dir / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from office_converter import assert_pdf_fonts, convert_to_pdf
+
+    return assert_pdf_fonts, convert_to_pdf
 
 
 def run(command: list[str]) -> None:
@@ -27,11 +35,11 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--docx-skill-dir", required=True, type=Path)
     parser.add_argument("--branding-skill-dir", required=True, type=Path)
+    parser.add_argument("--soffice")
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".pdf":
         raise ValueError("--output must end in .pdf")
-    if not shutil.which("soffice"):
-        raise RuntimeError("soffice is required")
+    assert_pdf_fonts, convert_to_pdf = converter_module(args.branding_skill_dir)
 
     docx_script = args.docx_skill_dir / "scripts/create_aesg_docx.py"
     work_dir = args.output.parent.parent / "tmp/pdfs"
@@ -39,28 +47,19 @@ def main() -> int:
     temp_docx = work_dir / f"{args.output.stem}.source.docx"
     run([sys.executable, str(docx_script), "--spec", str(args.spec), "--output", str(temp_docx), "--branding-skill-dir", str(args.branding_skill_dir)])
 
-    profile = Path(tempfile.mkdtemp(prefix="lo-profile-", dir=work_dir))
-    run(
-        [
-            "soffice",
-            "--headless",
-            f"-env:UserInstallation={profile.as_uri()}",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            str(work_dir),
-            str(temp_docx),
-        ]
+    converted = convert_to_pdf(
+        temp_docx,
+        work_dir,
+        soffice=args.soffice,
+        profile_parent=work_dir,
     )
-    converted = work_dir / f"{temp_docx.stem}.pdf"
-    if not converted.is_file():
-        raise RuntimeError(f"LibreOffice did not create {converted}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(converted, args.output)
     if shutil.which("qpdf"):
         run(["qpdf", "--check", str(args.output)])
     run(["pdfinfo", str(args.output)])
-    print(json.dumps({"ok": True, "output": str(args.output.resolve()), "bytes": args.output.stat().st_size}))
+    fonts = assert_pdf_fonts(args.output)
+    print(json.dumps({"ok": True, "output": str(args.output.resolve()), "bytes": args.output.stat().st_size, "pdffonts": fonts}))
     return 0
 
 

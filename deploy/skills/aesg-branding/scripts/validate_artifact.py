@@ -29,9 +29,25 @@ PRESENTATION_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
+PPT_BODY_SHAPE_IDS = {
+    499, 500, 503, 504, 507, 508, 515, 518, 522, 524, 528, 533, 537, 541,
+    546, 547, 548, 550, 551, 552, 553, 554, 557,
+}
+PPT_TITLE_SHAPE_IDS = {498, 502, 506, 509, 517, 521, 527, 531, 556}
+PPT_SECTION_SHAPE_IDS = {497, 501, 505, 516, 520, 526, 530}
+PPT_DIVIDER_SHAPE_IDS = {532}
+
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def pptx_rgb(font) -> str | None:
+    try:
+        value = font.color.rgb
+    except ValueError:
+        return None
+    return str(value).upper() if value is not None else None
 
 
 def package_text(path: Path) -> str:
@@ -157,8 +173,29 @@ def validate_pdf(path: Path, errors: list[str], evidence: dict) -> None:
         fonts = run(["pdffonts", str(path)])
         evidence["pdffonts"] = fonts.stdout.strip()
         font_text = fonts.stdout.casefold()
-        if not any(name in font_text for name in ("verdana", "ubuntu", "tahoma")):
-            errors.append("expected AESG font not found in PDF")
+        evidence["fontContract"] = {
+            "verdana": "verdana" in font_text,
+            "fallbacks": [
+                name
+                for name in (
+                    "linuxlibertine",
+                    "liberationserif",
+                    "liberationsans",
+                    "dejavuserif",
+                    "dejavusans",
+                    "noto serif",
+                    "noto sans",
+                )
+                if name in font_text
+            ],
+        }
+        if "verdana" not in font_text:
+            errors.append("Verdana is not embedded in AESG PDF")
+        if evidence["fontContract"]["fallbacks"]:
+            errors.append(
+                "fallback fonts embedded in AESG PDF: "
+                + ", ".join(evidence["fontContract"]["fallbacks"])
+            )
     if shutil.which("file"):
         mime = run(["file", "--brief", "--mime-type", str(path)]).stdout.strip()
         evidence["mime"] = mime
@@ -179,6 +216,37 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     xml = package_text(path).casefold()
     if "verdana" not in xml:
         errors.append("Verdana is not declared in DOCX package")
+    style_map = {style.name.casefold(): style for style in document.styles if style.name}
+
+    def check_style(name: str, size_pt: float, color: str) -> None:
+        style = style_map.get(name.casefold())
+        if style is None:
+            errors.append(f"missing required AESG style: {name}")
+            return
+        if (style.font.name or "").casefold() != "verdana":
+            errors.append(f"{name} is not explicitly Verdana")
+        actual_size = style.font.size.pt if style.font.size is not None else None
+        if actual_size is None or abs(actual_size - size_pt) > 0.05:
+            errors.append(f"{name} size is {actual_size}, expected {size_pt} pt")
+        actual_color = style.font.color.rgb
+        if actual_color is None or str(actual_color).upper() != color:
+            errors.append(f"{name} colour is {actual_color}, expected {color}")
+
+    is_report = "aesg main heading" in style_map
+    if is_report:
+        check_style("AESG Body Text", 10, "343741")
+        check_style("AESG Main Heading", 22, "059B9B")
+        check_style("AESG Sub H1", 16, "059B9B")
+        check_style("AESG H2", 14, "059B9B")
+        content_sections = document.sections[1:] if len(document.sections) > 1 else document.sections
+        top_margins = [round(section.top_margin.twips) for section in content_sections]
+        evidence["reportTopMarginsDxa"] = top_margins
+        if any(value < 1080 for value in top_margins):
+            errors.append(f"report content top margin is below 1080 DXA: {top_margins}")
+    else:
+        check_style("Heading 1", 12, "008C95")
+        check_style("Heading 2", 9, "53565A")
+        check_style("Normal", 9, "53565A")
     validate_core_author(path, errors, evidence)
     evidence.update(
         {
@@ -254,6 +322,43 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
     xml = package_text(path).casefold()
     if "verdana" not in xml:
         errors.append("Verdana is not declared in PPTX package")
+    typography_errors: list[str] = []
+    role_contract = {
+        "body": (PPT_BODY_SHAPE_IDS, 9.0, "343741"),
+        "title": (PPT_TITLE_SHAPE_IDS, 21.0, "343741"),
+        "section": (PPT_SECTION_SHAPE_IDS, 8.5, "008C95"),
+        "divider": (PPT_DIVIDER_SHAPE_IDS, 22.0, "FFFFFF"),
+    }
+    for slide_number, slide in enumerate(presentation.slides, start=1):
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            role = next(
+                (
+                    role_name
+                    for role_name, (shape_ids, _size, _color) in role_contract.items()
+                    if shape.shape_id in shape_ids
+                ),
+                None,
+            )
+            if role is None:
+                continue
+            _shape_ids, expected_size, expected_color = role_contract[role]
+            for paragraph in shape.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    if not run.text:
+                        continue
+                    font_name = (run.font.name or "").casefold()
+                    actual_size = run.font.size.pt if run.font.size is not None else None
+                    actual_color = pptx_rgb(run.font)
+                    if font_name != "verdana":
+                        typography_errors.append(f"slide {slide_number} shape {shape.shape_id} {role}: font {run.font.name}")
+                    if actual_size is None or abs(actual_size - expected_size) > 0.05:
+                        typography_errors.append(f"slide {slide_number} shape {shape.shape_id} {role}: size {actual_size}")
+                    if actual_color is None or str(actual_color).upper() != expected_color:
+                        typography_errors.append(f"slide {slide_number} shape {shape.shape_id} {role}: colour {actual_color}")
+    if typography_errors:
+        errors.append("PPTX typography contract failed: " + "; ".join(typography_errors[:12]))
     layout_count = sum(len(master.slide_layouts) for master in presentation.slide_masters)
     expected_size = [9906000, 6858000]
     actual_size = [presentation.slide_width, presentation.slide_height]
@@ -271,6 +376,7 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
             "sizeEmu": actual_size,
             "emptyPlaceholders": empty_placeholders,
             "picturePlaceholders": picture_placeholders,
+            "typographyContract": "passed" if not typography_errors else typography_errors[:12],
         }
     )
 

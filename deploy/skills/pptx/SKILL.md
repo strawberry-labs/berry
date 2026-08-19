@@ -73,6 +73,13 @@ measured capacities. Some visual specimens are intentionally titleless; do not
 add `title` or `section` to those routes. Split dense content across slides
 rather than bypassing the checks or adding generic overlays.
 
+Every generated text role is formatted explicitly after the slot is cloned:
+Verdana 21 pt dark-grey titles, Verdana 8.5 pt AESG Green section labels,
+Verdana 9 pt dark-grey body text, and Verdana 22 pt white divider text. Never
+leave body size, colour, boldness, or font family to the specimen slot's
+inheritance. This is required because the compact template contains legacy
+specimen text in more than one font.
+
 Render and inspect every slide. Confirm titles, page numbers, image crops,
 alignment, master artwork, and absence of placeholder text or empty picture
 slots. Publish only the final `.pptx` with media type

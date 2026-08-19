@@ -73,6 +73,12 @@ before generating anything.
 - Cite reproduced images, figures, tables, data, and external claims.
 - Do not present generated architecture as a factual AESG office, project, or
   headquarters unless the user supplies an authoritative reference.
+- Office generators must apply the role-level typography contract in
+  `references/brand-system.md` directly to generated runs. Do not rely on
+  specimen inheritance for font family, size, colour, or boldness.
+- For office PDFs, set `AESG_SOFFICE` to the approved converter when more than
+  one LibreOffice runtime is available. A PDF without embedded Verdana, or
+  with a known fallback such as Linux Libertine, fails validation.
 
 ## Minimal runtime set
 
@@ -116,5 +122,8 @@ For Office artifacts:
 3. Render with `python <aesg-branding-skill-directory>/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
 4. Inspect every rendered page, slide, or relevant sheet and correct clipping,
    overlap, blank placeholders, weak pagination, or distorted images.
-5. Publish only the final artifact, once, with the correct extension and MIME
+5. For a report, compare the first content line on page 1 with a continuation
+   page. The header-to-body spacing must be consistent; do not add blank lead-in
+   paragraphs to compensate.
+6. Publish only the final artifact, once, with the correct extension and MIME
    type.

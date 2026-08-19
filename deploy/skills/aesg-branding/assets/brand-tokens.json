@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 8,
+  "schemaVersion": 9,
   "brand": "AESG",
   "sourceManual": {
     "title": "AESG Brand Guidelines",
@@ -34,7 +34,44 @@
   "typography": {
     "office": "Verdana",
     "externalMarketing": "Ubuntu",
-    "arabicMarketing": "Tahoma"
+    "arabicMarketing": "Tahoma",
+    "officeContracts": {
+      "report": {
+        "family": "Verdana",
+        "bodySizePt": 10,
+        "bodyColor": "#343741",
+        "headingColor": "#059B9B",
+        "headingSizesPt": {
+          "h1": 22,
+          "h2": 16,
+          "h3": 14
+        },
+        "bodyLineSpacing": 1.15,
+        "bodySpaceBeforePt": 6,
+        "bodySpaceAfterPt": 6,
+        "contentTopMarginDxa": 1080
+      },
+      "letterhead": {
+        "family": "Verdana",
+        "bodySizePt": 9,
+        "bodyColor": "#53565A",
+        "subjectSizePt": 12,
+        "headingSizePt": 12,
+        "headingColor": "#008C95",
+        "recipientReferenceLineSpacingPt": 13.8
+      },
+      "presentation": {
+        "family": "Verdana",
+        "titleSizePt": 21,
+        "titleColor": "#343741",
+        "sectionSizePt": 8.5,
+        "sectionColor": "#008C95",
+        "bodySizePt": 9,
+        "bodyColor": "#343741",
+        "dividerSizePt": 22,
+        "dividerColor": "#FFFFFF"
+      }
+    }
   },
   "logo": {
     "aspectRatio": 3.465210356,
@@ -117,6 +154,7 @@
     "widthDxa": 11900,
     "heightDxa": 16840,
     "marginsDxa": {"top": 720, "right": 720, "bottom": 720, "left": 720},
+    "contentTopMarginDxa": 1080,
     "headerDxa": 1134,
     "footerDxa": 1134,
     "letterhead": {

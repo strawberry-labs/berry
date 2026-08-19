@@ -107,6 +107,13 @@ Dubai address footer, continuation-page symbol and page number, Verdana 9 pt
 body text, and Verdana 12 pt Bold subject. Do not use the report cover or
 approval page for these documents.
 
+The report route uses an explicit typography contract: Verdana 10 pt in
+`#343741` for body, bullet, numbered, table, and callout text; Verdana 22/16/14
+pt in `#059B9B` for H1/H2/H3; 1.15 line spacing; and 6 pt paragraph spacing
+before and after. The generated body section uses a 1080 DXA top margin on
+every page. Do not depend on a retained specimen run to supply any of those
+values.
+
 Use `kind: "report"` for structured publications and formal project
 deliverables, including reports, proposals, studies, policies, technical
 notes, and project briefs. Indicators include a cover, document control,
@@ -121,6 +128,9 @@ while a multi-page signed letter may use letterhead continuation pages.
 - Use OOXML only for features `python-docx` cannot preserve.
 - Inspect every rendered page. Correct orphan headings, broken tables,
   stretched images, and stray sample text.
+- Check the first content line on page 1 and on a continuation page. It must
+  sit at the same measured distance below the retained header; do not fix this
+  by adding leading blank paragraphs.
 - Validation scans document stories, content controls, and text boxes, not
   only high-level paragraphs and tables.
 - Publish only the final `.docx` with media type

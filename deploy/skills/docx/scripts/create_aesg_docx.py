@@ -27,6 +27,13 @@ LETTER_TEXT = "53565A"
 LETTER_BODY_PT = 9.0
 LETTER_SUBJECT_PT = 12.0
 LETTER_BLOCK_LINE_PT = 13.8
+REPORT_BODY_PT = 10.0
+REPORT_BODY_COLOR = GRAY
+REPORT_HEADING_COLOR = "059B9B"
+REPORT_HEADING_SIZES = {1: 22.0, 2: 16.0, 3: 14.0}
+REPORT_BODY_LINE_SPACING = 1.15
+REPORT_BODY_SPACE_PT = 6.0
+REPORT_CONTENT_TOP_DXA = 1080
 LETTER_KINDS = {
     "letter",
     "letterhead",
@@ -179,6 +186,14 @@ def add_section_break(document: Document, section_properties) -> None:
     properties.append(copy.deepcopy(section_properties))
 
 
+def set_section_top_margin(section_properties, top_dxa: int) -> None:
+    page_margins = section_properties.find(qn("w:pgMar"))
+    if page_margins is None:
+        page_margins = OxmlElement("w:pgMar")
+        section_properties.append(page_margins)
+    page_margins.set(qn("w:top"), str(top_dxa))
+
+
 def style_by_name(document: Document, *names: str):
     styles = list(document.styles)
     for name in names:
@@ -201,6 +216,8 @@ def set_run_font(
     fonts = run._element.get_or_add_rPr().get_or_add_rFonts()
     fonts.set(qn("w:ascii"), FONT)
     fonts.set(qn("w:hAnsi"), FONT)
+    fonts.set(qn("w:eastAsia"), FONT)
+    fonts.set(qn("w:cs"), FONT)
     if bold is not None:
         run.bold = bold
     if italic is not None:
@@ -222,6 +239,7 @@ def add_text(
     space_before_pt: float | None = None,
     space_after_pt: float | None = None,
     line_spacing_pt: float | None = None,
+    line_spacing: float | None = None,
 ):
     style = style_by_name(document, *style_names)
     paragraph = document.add_paragraph(style=style)
@@ -233,6 +251,8 @@ def add_text(
         paragraph.paragraph_format.space_after = Pt(space_after_pt)
     if line_spacing_pt is not None:
         paragraph.paragraph_format.line_spacing = Pt(line_spacing_pt)
+    if line_spacing is not None:
+        paragraph.paragraph_format.line_spacing = line_spacing
     run = paragraph.add_run(str(value))
     set_run_font(
         run,
@@ -344,6 +364,7 @@ def add_table(
     spec: dict,
     *,
     font_size_pt: float | None = None,
+    font_color: str | None = None,
 ) -> None:
     headers = [str(value) for value in spec.get("headers", [])]
     rows = list(spec.get("rows", []))
@@ -369,7 +390,7 @@ def add_table(
         for index, cell in enumerate(cells):
             value = values[index] if index < len(values) else ""
             run = cell.paragraphs[0].add_run(str(value))
-            set_run_font(run, size_pt=font_size_pt)
+            set_run_font(run, size_pt=font_size_pt, color=font_color)
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
     set_table_geometry(table, widths)
     document.add_paragraph()
@@ -380,19 +401,26 @@ def add_callout(
     value: str,
     *,
     font_size_pt: float | None = None,
+    font_color: str = GRAY,
 ) -> None:
     table = document.add_table(rows=1, cols=1)
     cell = table.cell(0, 0)
     shade(cell, "E6F4F5")
     paragraph = cell.paragraphs[0]
     run = paragraph.add_run(value)
-    set_run_font(run, bold=True, size_pt=font_size_pt)
-    run.font.color.rgb = RGBColor.from_string(GRAY)
+    set_run_font(run, bold=True, size_pt=font_size_pt, color=font_color)
     set_table_geometry(table, [table_width_dxa(document)])
     document.add_paragraph()
 
 
-def add_image(document: Document, image_spec) -> None:
+def add_image(
+    document: Document,
+    image_spec,
+    *,
+    font_size_pt: float | None = None,
+    font_color: str | None = None,
+    line_spacing: float | None = None,
+) -> None:
     if isinstance(image_spec, str):
         image_spec = {"path": image_spec}
     path = Path(str(image_spec.get("path", "")))
@@ -409,12 +437,26 @@ def add_image(document: Document, image_spec) -> None:
             str(image_spec["caption"]),
             "AESG Figure Captions",
             "Caption",
+            bold=False,
             italic=True,
+            size_pt=font_size_pt,
+            color=font_color,
+            line_spacing=line_spacing,
         )
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
         caption.paragraph_format.keep_with_next = bool(image_spec.get("source"))
     if image_spec.get("source"):
-        add_text(document, f"Source: {image_spec['source']}", "AESG Body Text", "Normal", italic=True)
+        add_text(
+            document,
+            f"Source: {image_spec['source']}",
+            "AESG Body Text",
+            "Normal",
+            bold=False,
+            italic=True,
+            size_pt=font_size_pt,
+            color=font_color,
+            line_spacing=line_spacing,
+        )
 
 
 def add_divider(
@@ -469,16 +511,65 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 2: ("AESG Sub H1", "Heading 2"),
                 3: ("AESG H2", "Heading 3"),
             }[level]
-            add_text(document, heading, *styles)
+            add_text(
+                document,
+                heading,
+                *styles,
+                size_pt=REPORT_HEADING_SIZES[level],
+                color=REPORT_HEADING_COLOR,
+                space_before_pt=0,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+            )
         for paragraph in section.get("paragraphs", []):
             value = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
-            add_text(document, str(value), "AESG Body Text", "Normal")
+            add_text(
+                document,
+                str(value),
+                "AESG Body Text",
+                "Normal",
+                bold=False,
+                italic=False,
+                size_pt=REPORT_BODY_PT,
+                color=REPORT_BODY_COLOR,
+                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
         for bullet in section.get("bullets", []):
-            add_text(document, str(bullet), "AESG Bullet", "List Bullet")
+            add_text(
+                document,
+                str(bullet),
+                "AESG Bullet",
+                "List Bullet",
+                bold=False,
+                italic=False,
+                size_pt=REPORT_BODY_PT,
+                color=REPORT_BODY_COLOR,
+                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
         for numbered in section.get("numbered", []):
-            add_text(document, str(numbered), "AESG Numbering", "List Number")
+            add_text(
+                document,
+                str(numbered),
+                "AESG Numbering",
+                "List Number",
+                bold=False,
+                italic=False,
+                size_pt=REPORT_BODY_PT,
+                color=REPORT_BODY_COLOR,
+                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
         if section.get("callout"):
-            add_callout(document, str(section["callout"]))
+            add_callout(
+                document,
+                str(section["callout"]),
+                font_size_pt=REPORT_BODY_PT,
+                font_color=REPORT_BODY_COLOR,
+            )
         if section.get("table"):
             if section["table"].get("caption"):
                 add_text(
@@ -486,15 +577,45 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                     str(section["table"]["caption"]),
                     "AESG Table Caption",
                     "Caption",
+                    bold=False,
+                    italic=False,
+                    size_pt=REPORT_BODY_PT,
+                    color=REPORT_BODY_COLOR,
+                    space_before_pt=REPORT_BODY_SPACE_PT,
+                    space_after_pt=REPORT_BODY_SPACE_PT,
+                    line_spacing=REPORT_BODY_LINE_SPACING,
                 )
-            add_table(document, section["table"])
+            add_table(
+                document,
+                section["table"],
+                font_size_pt=REPORT_BODY_PT,
+                font_color=REPORT_BODY_COLOR,
+            )
         images = section.get("images", [])
         if section.get("image"):
             images = [section["image"], *images]
         for image in images:
-            add_image(document, image)
+            add_image(
+                document,
+                image,
+                font_size_pt=REPORT_BODY_PT,
+                font_color=REPORT_BODY_COLOR,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
         if section.get("source"):
-            add_text(document, f"Source: {section['source']}", "AESG Body Text", "Normal", italic=True)
+            add_text(
+                document,
+                f"Source: {section['source']}",
+                "AESG Body Text",
+                "Normal",
+                bold=False,
+                italic=True,
+                size_pt=REPORT_BODY_PT,
+                color=REPORT_BODY_COLOR,
+                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
 
 
 def populate_approval_table(table_element, spec: dict) -> None:
@@ -546,7 +667,11 @@ def populate_approval_table(table_element, spec: dict) -> None:
 def create_report(document: Document, spec: dict) -> None:
     cover, approval, divider, sections = source_parts(document)
     clear_body(document)
-    set_final_section(document, sections[1])
+    content_section = copy.deepcopy(sections[0])
+    set_section_top_margin(content_section, REPORT_CONTENT_TOP_DXA)
+    final_section = copy.deepcopy(sections[1])
+    set_section_top_margin(final_section, REPORT_CONTENT_TOP_DXA)
+    set_final_section(document, final_section)
     if spec.get("cover", True):
         remove_shape_by_leaf_text(cover, "Client Logo")
         replace_leaf_text(
@@ -565,7 +690,9 @@ def create_report(document: Document, spec: dict) -> None:
         if approval_page:
             populate_approval_table(approval, spec)
             append_before_final_section(document, approval)
-        add_section_break(document, sections[0])
+        add_section_break(document, content_section)
+    else:
+        set_final_section(document, content_section)
     replacements = {
         "Project Name": spec.get("project", spec.get("title", "AESG")),
         "Report Title": spec.get("title", "AESG report"),
@@ -579,7 +706,16 @@ def create_report(document: Document, spec: dict) -> None:
         replace_leaf_text(section.footer._element, replacements)
         clear_text_highlight(section.footer._element, str(replacements["AESG – OPE – MAR - REP"]))
     if spec.get("documentTitle"):
-        add_text(document, str(spec["documentTitle"]), "AESG Title", "Title")
+        add_text(
+            document,
+            str(spec["documentTitle"]),
+            "AESG Title",
+            "Title",
+            bold=True,
+            size_pt=REPORT_HEADING_SIZES[1],
+            color=REPORT_HEADING_COLOR,
+            space_after_pt=REPORT_BODY_SPACE_PT,
+        )
     add_sections(document, list(spec.get("sections", [])), divider)
 
 
@@ -588,6 +724,8 @@ def add_letter_multiline(document: Document, lines: list[str]) -> None:
         return
     style = style_by_name(document, "Heading 2", "heading 2", "Normal")
     paragraph = document.add_paragraph(style=style)
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(0)
     paragraph.paragraph_format.line_spacing = Pt(LETTER_BLOCK_LINE_PT)
     for index, line in enumerate(lines):
         if index:
@@ -608,6 +746,7 @@ def add_letter_reference_subject(document: Document, spec: dict) -> None:
         return
     style = style_by_name(document, "Heading 2", "heading 2", "Normal")
     paragraph = document.add_paragraph(style=style)
+    paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.line_spacing = Pt(LETTER_BLOCK_LINE_PT)
     paragraph.paragraph_format.space_after = Pt(18)
     if reference:
@@ -637,6 +776,7 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 heading,
                 "Heading 1",
                 bold=True,
+                italic=False,
                 size_pt=LETTER_SUBJECT_PT,
                 color=GREEN,
                 space_before_pt=12,
@@ -648,6 +788,8 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 document,
                 str(value),
                 "Normal",
+                bold=False,
+                italic=False,
                 size_pt=LETTER_BODY_PT,
                 color=LETTER_TEXT,
                 space_after_pt=9,
@@ -658,6 +800,8 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 str(bullet),
                 "List Bullet",
                 "Normal",
+                bold=False,
+                italic=False,
                 size_pt=LETTER_BODY_PT,
                 color=LETTER_TEXT,
                 space_after_pt=3,
@@ -668,6 +812,8 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 str(numbered),
                 "List Number",
                 "Normal",
+                bold=False,
+                italic=False,
                 size_pt=LETTER_BODY_PT,
                 color=LETTER_TEXT,
                 space_after_pt=3,
@@ -677,6 +823,7 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 document,
                 str(section["callout"]),
                 font_size_pt=LETTER_BODY_PT,
+                font_color=LETTER_TEXT,
             )
         if section.get("table"):
             if section["table"].get("caption"):
@@ -685,6 +832,7 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                     str(section["table"]["caption"]),
                     "Normal",
                     bold=True,
+                    italic=False,
                     size_pt=LETTER_BODY_PT,
                     color=LETTER_TEXT,
                     space_before_pt=9,
@@ -694,17 +842,24 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 document,
                 section["table"],
                 font_size_pt=LETTER_BODY_PT,
+                font_color=LETTER_TEXT,
             )
         images = section.get("images", [])
         if section.get("image"):
             images = [section["image"], *images]
         for image in images:
-            add_image(document, image)
+            add_image(
+                document,
+                image,
+                font_size_pt=LETTER_BODY_PT,
+                font_color=LETTER_TEXT,
+            )
         if section.get("source"):
             add_text(
                 document,
                 f"Source: {section['source']}",
                 "Normal",
+                bold=False,
                 italic=True,
                 size_pt=LETTER_BODY_PT,
                 color=LETTER_TEXT,
@@ -728,6 +883,8 @@ def create_letter(document: Document, spec: dict) -> None:
         document,
         str(spec.get("salutation", "Dear Sir or Madam,")),
         "Normal",
+        bold=False,
+        italic=False,
         size_pt=LETTER_BODY_PT,
         color=LETTER_TEXT,
         space_after_pt=9,
@@ -737,6 +894,8 @@ def create_letter(document: Document, spec: dict) -> None:
         document,
         str(spec.get("closing", "Yours sincerely,")),
         "Normal",
+        bold=False,
+        italic=False,
         size_pt=LETTER_BODY_PT,
         color=LETTER_TEXT,
         space_before_pt=9,
@@ -747,6 +906,8 @@ def create_letter(document: Document, spec: dict) -> None:
             document,
             str(spec["signatory"]),
             "Normal",
+            bold=False,
+            italic=False,
             size_pt=LETTER_BODY_PT,
             color=LETTER_TEXT,
         )
@@ -755,6 +916,8 @@ def create_letter(document: Document, spec: dict) -> None:
             document,
             str(spec["designation"]),
             "Normal",
+            bold=False,
+            italic=False,
             size_pt=LETTER_BODY_PT,
             color=LETTER_TEXT,
         )

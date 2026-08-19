@@ -46,6 +46,13 @@ python <aesg-branding-skill-directory>/scripts/render_artifact.py \
 The generator keeps its temporary DOCX and LibreOffice profile under
 `/workspace/tmp`. Do not publish either.
 
+PDF typography is inherited from the generated DOCX, but conversion is a
+separate quality gate. Set `AESG_SOFFICE` to the approved LibreOffice binary
+when the runtime has more than one office installation. The converter must
+produce Verdana for AESG office text; a fallback such as Linux Libertine is a
+failure, not an acceptable approximation. Run `pdffonts` as part of validation
+and render the PDF pages after conversion.
+
 ## Direct PDF work
 
 Use direct PDF libraries only when the request is not an office document, such

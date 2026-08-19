@@ -92,6 +92,27 @@ already embedded in retained template artwork.
 - Arabic external marketing: Tahoma.
 - Never claim exact typographic fidelity after silently substituting fonts.
 
+### Office typography contract
+
+The generators must set role formatting on the generated text runs. They must
+not rely on the font, colour, or size inherited from a specimen slot or a
+converter fallback.
+
+| Artifact | Role | Font | Size | Colour |
+|---|---|---|---:|---|
+| General Report DOCX/PDF | Body, bullets, numbered text, table text | Verdana | 10 pt | `#343741` |
+| General Report DOCX/PDF | H1 / H2 / H3 | Verdana | 22 / 16 / 14 pt | `#059B9B` |
+| Letterhead DOCX/PDF | Body, metadata, lists | Verdana | 9 pt | `#53565A` |
+| Letterhead DOCX/PDF | Subject / optional heading | Verdana | 12 pt | `#53565A` / `#008C95` |
+| AESG PPTX | Body text | Verdana | 9 pt | `#343741` |
+| AESG PPTX | Title / section label | Verdana | 21 / 8.5 pt | `#343741` / `#008C95` |
+| AESG PPTX | Divider text | Verdana | 22 pt | `#FFFFFF` |
+
+Report body paragraphs use 1.15 line spacing with 6 pt before and after. The
+first content section uses a 1080 DXA (54 pt) top margin so page one and every
+following page begin at the same distance below the retained header. The
+letterhead geometry remains the retained measured geometry above.
+
 ## Photography and generated imagery
 
 | Subject | Direction |
@@ -137,7 +158,10 @@ the tool and reference-image workflow.
   multicolour curves. Continuation pages use the circular AESG symbol, reduced
   curve footer, and native page-number field.
 - The General Template is A4, with `11900 × 16840` DXA page geometry, 720 DXA
-  margins, and 1134 DXA header/footer distances.
+  left/right/bottom margins, a 1080 DXA content top margin, and 1134 DXA
+  header/footer distances. Preserve the cover's native visual geometry; apply
+  the content top margin to the report body section, not by inserting arbitrary
+  blank paragraphs.
 - Preserve its cover artwork, section relationship hierarchy, media, and AESG
   styles. Main headings are 22 pt, first subheadings 16 pt, and second
   subheadings 14 pt in the retained template.
