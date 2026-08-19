@@ -100,16 +100,13 @@ def remove_shape_by_leaf_text(element, value: str) -> None:
             parent.remove(target)
 
 
-def clear_text_highlight(element, value: str) -> None:
-    wanted = normalise(value)
-    for paragraph in leaf_paragraphs(element):
-        nodes = paragraph.xpath('.//*[local-name()="t"]')
-        if normalise("".join(node.text or "" for node in nodes)) != wanted:
-            continue
-        for properties in paragraph.xpath('.//*[local-name()="rPr"]'):
-            for child in list(properties):
-                if child.tag.rsplit("}", 1)[-1] in {"highlight", "shd"}:
-                    properties.remove(child)
+def clear_text_highlight(element) -> None:
+    """Remove specimen highlighting from an entire generated footer story."""
+
+    for properties in element.xpath('.//*[local-name()="rPr"]'):
+        for child in list(properties):
+            if child.tag.rsplit("}", 1)[-1] in {"highlight", "shd"}:
+                properties.remove(child)
 
 
 def remove_page_breaks(element) -> None:
@@ -194,6 +191,14 @@ def set_section_top_margin(section_properties, top_dxa: int) -> None:
     page_margins.set(qn("w:top"), str(top_dxa))
 
 
+def set_section_page_number_start(section_properties, start: int = 1) -> None:
+    page_number = section_properties.find(qn("w:pgNumType"))
+    if page_number is None:
+        page_number = OxmlElement("w:pgNumType")
+        section_properties.append(page_number)
+    page_number.set(qn("w:start"), str(start))
+
+
 def style_by_name(document: Document, *names: str):
     styles = list(document.styles)
     for name in names:
@@ -243,6 +248,10 @@ def add_text(
 ):
     style = style_by_name(document, *style_names)
     paragraph = document.add_paragraph(style=style)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    if any("heading" in name.casefold() or name.casefold().startswith("aesg main") or name.casefold().startswith("aesg sub") or name.casefold() == "aesg h2" for name in style_names):
+        paragraph.paragraph_format.keep_with_next = True
+        paragraph.paragraph_format.keep_together = True
     if style is None:
         paragraph.paragraph_format.space_after = Pt(7)
     if space_before_pt is not None:
@@ -669,8 +678,10 @@ def create_report(document: Document, spec: dict) -> None:
     clear_body(document)
     content_section = copy.deepcopy(sections[0])
     set_section_top_margin(content_section, REPORT_CONTENT_TOP_DXA)
+    set_section_page_number_start(content_section)
     final_section = copy.deepcopy(sections[1])
     set_section_top_margin(final_section, REPORT_CONTENT_TOP_DXA)
+    set_section_page_number_start(final_section)
     set_final_section(document, final_section)
     if spec.get("cover", True):
         remove_shape_by_leaf_text(cover, "Client Logo")
@@ -704,7 +715,7 @@ def create_report(document: Document, spec: dict) -> None:
     for section in document.sections:
         replace_leaf_text(section.header._element, replacements)
         replace_leaf_text(section.footer._element, replacements)
-        clear_text_highlight(section.footer._element, str(replacements["AESG – OPE – MAR - REP"]))
+        clear_text_highlight(section.footer._element)
     if spec.get("documentTitle"):
         add_text(
             document,

@@ -17,7 +17,8 @@ from xml.etree import ElementTree
 PLACEHOLDER_RE = re.compile(
     r"(?:\b(?:lorem ipsum|insert title|sample heading|sample sub-heading|"
     r"replace text|name another|name surname|client name|click to add|"
-    r"click to edit|section heading|xxxx-xxx)\b|x{8,})",
+    r"click to edit|section heading|xxxx-xxx)\b|x{8,}|"
+    r"\[[^\]]+\|\s*(?:word|excel|powerpoint)\])",
     re.IGNORECASE,
 )
 ERROR_TOKENS = ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A", "#NUM!", "#NULL!")
@@ -216,6 +217,44 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     xml = package_text(path).casefold()
     if "verdana" not in xml:
         errors.append("Verdana is not declared in DOCX package")
+    with zipfile.ZipFile(path) as archive:
+        styles_xml = archive.read("word/styles.xml").decode("utf-8", errors="ignore")
+        theme_xml = archive.read("word/theme/theme1.xml").decode("utf-8", errors="ignore")
+        theme_font_attrs = sorted(
+            set(
+                re.findall(
+                    r"w:(?:asciiTheme|hAnsiTheme|eastAsiaTheme|csTheme|cstheme)=\"([^\"]+)\"",
+                    styles_xml,
+                )
+            )
+        )
+        theme_typefaces = sorted(
+            set(
+                re.findall(
+                    r"<a:(?:latin|ea|cs)\b[^>]*typeface=\"([^\"]*)\"",
+                    theme_xml,
+                )
+            )
+        )
+        evidence["docxTheme"] = {
+            "styleThemeFonts": theme_font_attrs,
+            "typefaces": theme_typefaces,
+        }
+        if theme_font_attrs:
+            errors.append(
+                "DOCX styles still contain theme font mappings: "
+                + ", ".join(theme_font_attrs)
+            )
+        if any(value and value.casefold() != "verdana" for value in theme_typefaces):
+            errors.append("DOCX theme contains a non-Verdana typeface")
+        footer_highlights = [
+            name
+            for name in archive.namelist()
+            if re.fullmatch(r"word/footer\d+\.xml", name)
+            and b"<w:highlight" in archive.read(name)
+        ]
+        if footer_highlights:
+            errors.append("DOCX footer highlighting remains: " + ", ".join(footer_highlights))
     style_map = {style.name.casefold(): style for style in document.styles if style.name}
 
     def check_style(name: str, size_pt: float, color: str) -> None:
@@ -234,6 +273,7 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
 
     is_report = "aesg main heading" in style_map
     if is_report:
+        check_style("Normal", 10, "343741")
         check_style("AESG Body Text", 10, "343741")
         check_style("AESG Main Heading", 22, "059B9B")
         check_style("AESG Sub H1", 16, "059B9B")

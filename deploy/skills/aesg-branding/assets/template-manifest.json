@@ -24,12 +24,12 @@
   "runtimeTemplates": [
     {
       "path": "templates/AESG_General_Report_Template.docx",
-      "sha256": "8c6cc9112ff1a266028ab1db1adc748bcc34183740c20876b0a94a34224cf0e1",
+      "sha256": "14479cefe638aa9b2f50290aef5f468c8a8c59834e56049e0948b77c530d7bf0",
       "purpose": "Sanitised General Template source for reports and long-form Word documents"
     },
     {
       "path": "templates/AESG_Letterhead_Dubai.docx",
-      "sha256": "fa67946c2d51ae9270d60404cc84d0176824dc97a7201c6a98713ca877a0ea61",
+      "sha256": "bdcb61000b108ba5ad9ecf65e97e2268dcec41d7dd68e3d68824c4faa3cc9bcf",
       "purpose": "Retained A4 letterhead for letters, leave requests, short memos, confirmations, and simple correspondence"
     },
     {

@@ -114,6 +114,32 @@ before and after. The generated body section uses a 1080 DXA top margin on
 every page. Do not depend on a retained specimen run to supply any of those
 values.
 
+## Repairing an existing generated report
+
+When an existing AESG report has been generated with a legacy template or
+conflicting Word theme metadata, repair the delivered DOCX before asking the
+user to review it:
+
+```bash
+python <docx-skill-directory>/scripts/repair_aesg_docx.py \
+  --input /workspace/input/report.docx \
+  --output /workspace/outputs/report-repaired.docx
+python <aesg-branding-skill-directory>/scripts/validate_artifact.py \
+  /workspace/outputs/report-repaired.docx
+python <aesg-branding-skill-directory>/scripts/render_artifact.py \
+  /workspace/outputs/report-repaired.docx \
+  --output-dir /workspace/tmp/docx/repaired-rendered
+```
+
+The repair pass makes fonts and colours explicit in every report story,
+removes conflicting theme font mappings and accidental automatic heading
+numbering, restores the measured page/header/footer geometry, splits body
+items that were joined with manual line breaks, removes source-system tokens,
+and removes only empty or incomplete unmerged gap-table scaffolding. It preserves
+source-authored findings and manual section labels, so content review remains
+separate from layout repair. Inspect the rendered first page, a continuation
+page, each table sequence, and the final page before publishing.
+
 Use `kind: "report"` for structured publications and formal project
 deliverables, including reports, proposals, studies, policies, technical
 notes, and project briefs. Indicators include a cover, document control,
