@@ -76,6 +76,13 @@ Supported report blocks include paragraphs, bullets, numbering, callouts,
 tables, images with captions/sources, page breaks, approval pages, and branded
 section dividers. Image objects accept `path`, `caption`, `source`, and
 `widthInches`. Table `widths` accepts one positive relative width per header.
+Use `pattern: "images"` for the supplied three-column evidence table (white
+header with teal labels and alternating body rows) and `pattern: "monitoring"`
+for the landscape monitoring table (teal header, grey banding, and dark grouped
+edge columns). Monitoring tables may use `rowSpans` objects such as
+`{ "column": 0, "start": 0, "span": 4 }` to merge group labels across rows.
+Set a heading's `headingNumbered` field to `false` for source-authored unnumbered
+headings such as `Appendices`.
 The generator clones the native cover, approval table, and complete
 photographic divider component; it clears unused approval placeholders and
 keeps image captions after their figures.
@@ -107,12 +114,31 @@ Dubai address footer, continuation-page symbol and page number, Verdana 9 pt
 body text, and Verdana 12 pt Bold subject. Do not use the report cover or
 approval page for these documents.
 
-The report route uses an explicit typography contract: Verdana 10 pt in
-`#343741` for body, bullet, numbered, table, and callout text; Verdana 22/16/14
-pt in `#059B9B` for H1/H2/H3; 1.15 line spacing; and 6 pt paragraph spacing
-before and after. The generated body section uses a 1080 DXA top margin on
-every page. Do not depend on a retained specimen run to supply any of those
-values.
+The report route follows the supplied `General Template_AESG.docx` contract:
+Verdana 10 pt in `#343741` for body, bullet, numbered, table, and callout text;
+Verdana 22/16/14 pt in `#008C95` for H1/H2/H3; 1.15 line spacing; and 3 pt
+body paragraph spacing after (0 pt before). Heading spacing is 10 pt before for
+H1 and 4 pt before for H2/H3, with 0 pt after. Table captions are centred,
+Verdana 9 pt in `#04999A`; figure captions are centred, Verdana 9 pt italic in
+`#008C95`. The narrative portrait section uses the template's 1701 DXA top
+margin; landscape monitoring pages use 720 DXA. Left, right, and bottom margins
+are 720 DXA and header/footer distances are 1134 DXA. Preserve continuous page
+numbering across section breaks. Do not depend on a retained specimen run to
+supply any of those values.
+
+For screenshot QA, load the approved Verdana faces before invoking LibreOffice.
+On the AESG artifact image they are installed and refreshed with `fc-cache -f`;
+on a local workstation set `FONTCONFIG_FILE` to a task-local fontconfig file
+that includes the supplied Verdana directory. A screenshot or PDF containing
+Linux Libertine, Liberation, DejaVu, or another fallback is a failed QA pass,
+even when the DOCX XML declares `Verdana`.
+
+The bundled report source is the supplied `General Template_AESG.docx` after
+metadata-only Verdana sanitisation. It is a 66-page visual reference, not a
+content library: clone only its cover/control parts, photographic divider, page
+chrome, and table patterns. Do not copy its TOC fields, bookmark errors,
+placeholder image frames, floating caption/image specimens, chart objects, or
+sample text. Use inline images and fixed-width tables in generated content.
 
 ## Repairing an existing generated report
 

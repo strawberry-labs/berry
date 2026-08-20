@@ -47,11 +47,18 @@ The generator keeps its temporary DOCX and LibreOffice profile under
 `/workspace/tmp`. Do not publish either.
 
 PDF typography is inherited from the generated DOCX, but conversion is a
-separate quality gate. Set `AESG_SOFFICE` to the approved LibreOffice binary
-when the runtime has more than one office installation. The converter must
-produce Verdana for AESG office text; a fallback such as Linux Libertine is a
-failure, not an acceptable approximation. Run `pdffonts` as part of validation
-and render the PDF pages after conversion.
+separate quality gate. The current General Template contract is Verdana 10 pt
+`#343741` body text, Verdana 22/16/14 pt `#008C95` H1/H2/H3, 3 pt body spacing
+after, and a 1701 DXA portrait narrative top margin (720 DXA for landscape
+monitoring pages). Table captions are 9 pt `#04999A`; figure captions are 9 pt
+italic `#008C95`. Set `AESG_SOFFICE` to the approved LibreOffice binary when
+the runtime has more than one office installation. The converter must produce
+Verdana for AESG office text; a fallback such as Linux Libertine is a failure,
+not an acceptable approximation. Run `pdffonts` as part of validation and
+render every PDF page after conversion. Screenshot QA must load the approved
+Verdana faces before rendering; the bundled converter creates a task-local
+fontconfig cache automatically, while a manual LibreOffice/render command must
+set `FONTCONFIG_FILE` to a config that includes the supplied Verdana directory.
 
 ## Direct PDF work
 

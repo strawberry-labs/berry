@@ -27,46 +27,47 @@ WORD_FONT_ATTRIBUTES = (
 WORD_FONT_SLOTS = ("ascii", "hAnsi", "eastAsia", "cs")
 WORD_THEME_COLOUR_ATTRIBUTES = ("themeColor", "themeShade", "themeTint")
 REPORT_FOOTER_COLOUR = "53565A"
+HEADER_TEXTBOX_WIDTH_PT = 260
+HEADER_TEXTBOX_HEIGHT_PT = 30
 
 # The retained report template contains a large legacy style catalogue.  The
 # generator only uses a small role set, but every inherited style must still
 # resolve to Verdana so that Word and LibreOffice do not select a theme or
 # platform fallback for imported text.
 REPORT_GENERIC_STYLES = {
-    "Heading 1": (22, "059B9B", True),
-    "Heading 2": (16, "059B9B", False),
-    "Heading 3": (14, "059B9B", False),
-    "Heading 1 Char": (22, "059B9B", True),
-    "Heading 2 Char": (16, "059B9B", False),
-    "Heading 3 Char": (14, "059B9B", False),
-    "Title": (22, "059B9B", True),
-    "Title Char": (22, "059B9B", True),
-    "Caption": (10, "343741", False),
+    "Heading 1": (20, "262930", False),
+    "Heading 2": (16, "262930", False),
+    "Heading 3": (14, "262930", False),
+    "Heading 1 Char": (20, "262930", False),
+    "Heading 2 Char": (16, "262930", False),
+    "Heading 3 Char": (14, "262930", False),
+    "Title": (28, "343741", False),
+    "Title Char": (28, "343741", False),
+    "Caption": (9, "0E2841", False),
     "List Paragraph": (10, "343741", False),
     "List Bullet": (10, "343741", False),
     "List Number": (10, "343741", False),
     "Default Paragraph Font": (10, "343741", False),
+    "AESG Title": (12, "008C95", True),
+    "AESG Title 2": (10, "343741", True),
+    "AESG Divider Heading": (26, "FFFFFF", True),
 }
-
-REPORT_UNNUMBERED_HEADING_STYLE_PREFIXES = (
-    "aesgmainheading",
-    "aesgsubh",
-    "aesgdividerheading",
-)
 
 REPORT_BODY_STYLES = {
     "Normal": (10, "343741", False),
     "AESG Body Text": (10, "343741", False),
     "AESG Body Text Char": (10, "343741", False),
     "AESG Bullet": (10, "343741", False),
+    "AESG Bullets": (10, "343741", False),
     "AESG Numbering": (10, "343741", False),
-    "AESG Table Caption": (10, "343741", False),
-    "AESG Figure Captions": (10, "343741", False),
+    "AESG Table Caption": (9, "04999A", False),
+    "AESG Figure Captions": (9, "008C95", False),
+    "AESG Figure Captions Char": (9, "008C95", False),
 }
 REPORT_HEADING_STYLES = {
-    "AESG Main Heading": (22, "059B9B", False),
-    "AESG Sub H1": (16, "059B9B", False),
-    "AESG H2": (14, "059B9B", False),
+    "AESG Main Heading": (22, "008C95", False),
+    "AESG Sub H1": (16, "008C95", False),
+    "AESG H2": (14, "008C95", False),
 }
 LETTER_STYLES = {
     "Normal": (9, "53565A", False),
@@ -237,8 +238,8 @@ def normalise_header_geometry(data: bytes) -> bytes:
         if not text:
             continue
         style = shape.get("style", "")
-        style = _replace_style_dimension(style, "width", "190")
-        style = _replace_style_dimension(style, "height", "18")
+        style = _replace_style_dimension(style, "width", str(HEADER_TEXTBOX_WIDTH_PT))
+        style = _replace_style_dimension(style, "height", str(HEADER_TEXTBOX_HEIGHT_PT))
         style = re.sub(r"v-text-anchor:[^;]+", "v-text-anchor:top", style, flags=re.IGNORECASE)
         shape.set("style", style)
         for body in shape.xpath('.//*[local-name()="bodyPr"]'):
@@ -247,16 +248,16 @@ def normalise_header_geometry(data: bytes) -> bytes:
         # The DrawingML representation is used by some Word/LibreOffice
         # viewers; keep it in step with the VML fallback box.
         for extent in shape.xpath('.//*[local-name()="extent"]'):
-            extent.set("cx", str(190 * 12700))
-            extent.set("cy", str(18 * 12700))
+            extent.set("cx", str(HEADER_TEXTBOX_WIDTH_PT * 12700))
+            extent.set("cy", str(HEADER_TEXTBOX_HEIGHT_PT * 12700))
     for anchor in root.xpath('.//*[local-name()="anchor"]'):
         text = "".join(anchor.xpath('.//*[local-name()="t"]/text()')).strip().casefold()
         if not text:
             continue
         for extent in anchor.xpath('.//*[local-name()="extent"]'):
             if extent.tag.rsplit("}", 1)[-1] == "extent":
-                extent.set("cx", str(190 * 12700))
-                extent.set("cy", str(18 * 12700))
+                extent.set("cx", str(HEADER_TEXTBOX_WIDTH_PT * 12700))
+                extent.set("cy", str(HEADER_TEXTBOX_HEIGHT_PT * 12700))
         for extent in anchor.xpath('.//*[local-name()="ext"]'):
             extent.set("cx", str(190 * 12700))
             extent.set("cy", str(18 * 12700))
@@ -331,15 +332,27 @@ def normalise_footer_geometry(data: bytes) -> bytes:
 
 
 def normalise_footer_story(data: bytes) -> bytes:
-    return normalise_footer_geometry(normalise_word_story(data, footer=True))
+    root = etree.fromstring(normalise_footer_geometry(normalise_word_story(data, footer=False)))
+    for run in root.iter(qn(W_NS, "r")):
+        properties = run.find(qn(W_NS, "rPr"))
+        if properties is None:
+            continue
+        for child in list(properties):
+            if child.tag in {qn(W_NS, "highlight"), qn(W_NS, "shd")}:
+                properties.remove(child)
+        style = properties.find(qn(W_NS, "rStyle"))
+        if style is not None and style.get(qn(W_NS, "val"), "").casefold() == "pagenumber":
+            continue
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
-def normalise_document_part(data: bytes) -> bytes:
+def normalise_document_part(data: bytes, *, reset_page_numbers: bool = False) -> bytes:
     root = etree.fromstring(data)
     normalise_word_fonts(root)
-    for section in root.iter(qn(W_NS, "sectPr")):
-        page_number = ensure_child(section, W_NS, "pgNumType")
-        page_number.set(qn(W_NS, "start"), "1")
+    if reset_page_numbers:
+        for section in root.iter(qn(W_NS, "sectPr")):
+            page_number = ensure_child(section, W_NS, "pgNumType")
+            page_number.set(qn(W_NS, "start"), "1")
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
@@ -366,10 +379,12 @@ def normalise_docx_styles(data: bytes, *, report: bool) -> bytes:
         name_node = style.find(qn(W_NS, "name"))
         name = name_node.get(qn(W_NS, "val"), "") if name_node is not None else ""
         style_id = style.get(qn(W_NS, "styleId"), "").casefold()
-        if report and (
-            style_id.startswith(REPORT_UNNUMBERED_HEADING_STYLE_PREFIXES)
-            or style_id in {"aesgsubtext", "aesgsubh30"}
-        ):
+        # The supplied General Template deliberately carries numbering on its
+        # AESG heading styles.  Preserve that numPr: removing it makes the
+        # generated report lose the 1 / 1.1 / 1.1.1 prefixes even though the
+        # typography itself is correct.  Only obsolete helper styles that are
+        # not part of the template's heading hierarchy are unnumbered.
+        if report and style_id in {"aesgsubtext", "aesgsubh30"}:
             ppr = style.find(qn(W_NS, "pPr"))
             if ppr is not None:
                 numbering = ppr.find(qn(W_NS, "numPr"))
@@ -381,7 +396,14 @@ def normalise_docx_styles(data: bytes, *, report: bool) -> bytes:
         size_pt, color, bold = contract
         set_style_font(style, size_pt, color, bold)
         if report and name.casefold() in {key.casefold() for key in REPORT_BODY_STYLES}:
-            set_style_spacing(style, 120, 120, 276)
+            if name.casefold() in {
+                "aesg table caption",
+                "aesg figure captions",
+                "aesg figure captions char",
+            }:
+                set_style_spacing(style, 0, 0, 240)
+            else:
+                set_style_spacing(style, 0, 60, 276)
     normalise_word_fonts(
         root,
         default_size_pt=10 if report else 9,
@@ -451,7 +473,7 @@ def normalise_report(path: Path) -> None:
                 name: (
                     normalise_header_story
                     if name.startswith("word/header")
-                    else lambda data: normalise_word_story(data, footer=True)
+                    else normalise_footer_story
                 )
                 for name in story_names
             },

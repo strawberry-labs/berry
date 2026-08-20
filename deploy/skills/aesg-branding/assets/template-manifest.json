@@ -1,12 +1,12 @@
 {
-  "schemaVersion": 6,
-  "generated": "2026-08-14",
+  "schemaVersion": 7,
+  "generated": "2026-08-20",
   "sourceEvidence": [
     {
       "name": "General Template_AESG.docx",
-      "sha256": "d7c2570afae3c0322308c7f6dae884f8c4017f30aa1907015a1ccb814af67979",
-      "status": "accepted after metadata sanitisation",
-      "evidence": "Clean CRC; 66 rendered pages; 5 sections; 108 styles; 4 headers; 4 footers"
+      "sha256": "dbe9481498fd4b80f2054c2a1e60c013d74e9d14d30ea247bc144c1155255841",
+      "status": "accepted as the new visual authority after Verdana metadata sanitisation",
+      "evidence": "Clean CRC; 66 rendered pages; 5 sections; portrait narrative, divider, image/table specimens, landscape monitoring summary, and appendix/back-matter patterns"
     },
     {
       "name": "General Template_AESG.pptx",
@@ -24,8 +24,8 @@
   "runtimeTemplates": [
     {
       "path": "templates/AESG_General_Report_Template.docx",
-      "sha256": "14479cefe638aa9b2f50290aef5f468c8a8c59834e56049e0948b77c530d7bf0",
-      "purpose": "Sanitised General Template source for reports and long-form Word documents"
+      "sha256": "d995820a51c6ec20d8cad9271a8f5c5df262929c9517a1e92fa9a4e5a68c6856",
+      "purpose": "Supplied General Template_AESG.docx, retained as the report source after Verdana metadata sanitisation"
     },
     {
       "path": "templates/AESG_Letterhead_Dubai.docx",

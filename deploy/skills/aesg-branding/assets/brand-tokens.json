@@ -23,7 +23,7 @@
     "red": "#DA291C",
     "yellow": "#FFC72C",
     "black": "#000000",
-    "templateHeadingGreen": "#059B9B"
+    "templateHeadingGreen": "#008C95"
   },
   "colorHierarchy": {
     "whiteSpaceTarget": 0.55,
@@ -40,16 +40,21 @@
         "family": "Verdana",
         "bodySizePt": 10,
         "bodyColor": "#343741",
-        "headingColor": "#059B9B",
+        "headingColor": "#008C95",
         "headingSizesPt": {
           "h1": 22,
           "h2": 16,
           "h3": 14
         },
         "bodyLineSpacing": 1.15,
-        "bodySpaceBeforePt": 6,
-        "bodySpaceAfterPt": 6,
-        "contentTopMarginDxa": 1080
+        "bodySpaceBeforePt": 0,
+        "bodySpaceAfterPt": 3,
+        "headingBeforePt": {"h1": 10, "h2": 4, "h3": 4},
+        "captionSizePt": 9,
+        "captionColor": "#04999A",
+        "figureCaptionColor": "#008C95",
+        "contentTopMarginDxa": 1701,
+        "landscapeContentTopMarginDxa": 720
       },
       "letterhead": {
         "family": "Verdana",
@@ -153,8 +158,9 @@
     "pageSize": "A4",
     "widthDxa": 11900,
     "heightDxa": 16840,
-    "marginsDxa": {"top": 720, "right": 720, "bottom": 720, "left": 720},
-    "contentTopMarginDxa": 1080,
+    "marginsDxa": {"top": 1701, "right": 720, "bottom": 720, "left": 720},
+    "contentTopMarginDxa": 1701,
+    "landscapeContentTopMarginDxa": 720,
     "headerDxa": 1134,
     "footerDxa": 1134,
     "letterhead": {

@@ -212,6 +212,13 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(text)))
     if placeholders:
         errors.append(f"placeholder text remains: {', '.join(placeholders)}")
+    broken_fields = [
+        token
+        for token in ("error! bookmark not defined", "includepicture", "click here to enter text")
+        if token in text.casefold()
+    ]
+    if broken_fields:
+        errors.append("broken or specimen fields remain: " + ", ".join(broken_fields))
     if not document.sections:
         errors.append("DOCX has no sections")
     xml = package_text(path).casefold()
@@ -275,14 +282,24 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     if is_report:
         check_style("Normal", 10, "343741")
         check_style("AESG Body Text", 10, "343741")
-        check_style("AESG Main Heading", 22, "059B9B")
-        check_style("AESG Sub H1", 16, "059B9B")
-        check_style("AESG H2", 14, "059B9B")
+        check_style("AESG Main Heading", 22, "008C95")
+        check_style("AESG Sub H1", 16, "008C95")
+        check_style("AESG H2", 14, "008C95")
+        check_style("AESG Bullet", 10, "343741")
+        check_style("AESG Numbering", 10, "343741")
+        check_style("AESG Table Caption", 9, "04999A")
+        check_style("AESG Figure Captions", 9, "008C95")
         content_sections = document.sections[1:] if len(document.sections) > 1 else document.sections
         top_margins = [round(section.top_margin.twips) for section in content_sections]
         evidence["reportTopMarginsDxa"] = top_margins
-        if any(value < 1080 for value in top_margins):
-            errors.append(f"report content top margin is below 1080 DXA: {top_margins}")
+        expected_margins = [
+            720 if section.page_width > section.page_height else 1701
+            for section in content_sections
+        ]
+        if top_margins != expected_margins:
+            errors.append(
+                f"report content top margins are {top_margins}; expected {expected_margins} DXA"
+            )
     else:
         check_style("Heading 1", 12, "008C95")
         check_style("Heading 2", 9, "53565A")

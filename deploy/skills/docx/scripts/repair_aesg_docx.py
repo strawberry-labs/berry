@@ -38,7 +38,7 @@ W = lambda local: f"{{{W_NS}}}{local}"
 FONT = "Verdana"
 BODY_SIZE = 20
 BODY_COLOR = "343741"
-HEADING_COLOR = "059B9B"
+HEADING_COLOR = "008C95"
 HEADER_COLOR = "FFFFFF"
 FOOTER_COLOR = "53565A"
 SOURCE_TOKEN_RE = re.compile(
@@ -337,28 +337,41 @@ def normalise_report_content(root) -> None:
             continue
         sid = style_id(paragraph).casefold()
         if "mainheading" in sid or sid in {"heading1", "title", "reporttitlecoverpage"}:
-            size, before = 44, 0
+            size, before, after = 44, 200, 0
         elif "subh1" in sid or sid == "heading2":
-            size, before = 32, 0
+            size, before, after = 32, 80, 0
         elif any(token in sid for token in ("h2", "subh2", "subh3", "heading3")):
-            size, before = 28, 0
+            size, before, after = 28, 80, 0
+        elif "tablecaption" in sid:
+            size, before, after = 18, 0, 0
+        elif "figurecaptions" in sid or sid == "caption":
+            size, before, after = 18, 0, 0
         else:
-            size, before = BODY_SIZE, 120
+            size, before, after = BODY_SIZE, 0, 60
         set_paragraph_contract(
             paragraph,
             size=size,
-            color=HEADING_COLOR if size > BODY_SIZE else BODY_COLOR,
+            color=("04999A" if "tablecaption" in sid else HEADING_COLOR)
+            if size > BODY_SIZE or "caption" in sid
+            else BODY_COLOR,
             before=before,
-            after=120,
+            after=after,
             line=276,
-            keep_next=size > BODY_SIZE,
+            keep_next=size > BODY_SIZE or "caption" in sid,
+            bold=None,
         )
 
 
 def normalise_document_geometry(root) -> None:
-    for section in root.iter(W("sectPr")):
+    sections = list(root.iter(W("sectPr")))
+    for index, section in enumerate(sections):
         margins = ensure_child(section, "pgMar")
-        margins.set(W("top"), "1080")
+        page_size = section.find(W("pgSz"))
+        width = int(page_size.get(W("w"), "0")) if page_size is not None else 0
+        height = int(page_size.get(W("h"), "0")) if page_size is not None else 0
+        landscape = width > height
+        portrait_appendix = len(sections) >= 5 and index == len(sections) - 1
+        margins.set(W("top"), "720" if landscape or portrait_appendix else "1701")
         margins.set(W("right"), "720")
         margins.set(W("bottom"), "720")
         margins.set(W("left"), "720")

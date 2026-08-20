@@ -35,6 +35,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--docx-skill-dir", required=True, type=Path)
     parser.add_argument("--branding-skill-dir", required=True, type=Path)
+    parser.add_argument("--template", type=Path, help="Optional report template override")
     parser.add_argument("--soffice")
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".pdf":
@@ -45,7 +46,19 @@ def main() -> int:
     work_dir = args.output.parent.parent / "tmp/pdfs"
     work_dir.mkdir(parents=True, exist_ok=True)
     temp_docx = work_dir / f"{args.output.stem}.source.docx"
-    run([sys.executable, str(docx_script), "--spec", str(args.spec), "--output", str(temp_docx), "--branding-skill-dir", str(args.branding_skill_dir)])
+    command = [
+        sys.executable,
+        str(docx_script),
+        "--spec",
+        str(args.spec),
+        "--output",
+        str(temp_docx),
+        "--branding-skill-dir",
+        str(args.branding_skill_dir),
+    ]
+    if args.template:
+        command.extend(["--template", str(args.template)])
+    run(command)
 
     converted = convert_to_pdf(
         temp_docx,

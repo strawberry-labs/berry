@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
+import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -20,20 +23,30 @@ from docx.shared import Inches, Pt, RGBColor
 GREEN = "008C95"
 GRAY = "343741"
 WHITE = "FFFFFF"
+TABLE_TEAL = "069B9B"
+TABLE_BAND = "F2F2F2"
+TABLE_BORDER = "A6A6A6"
 FONT = "Verdana"
 REPORT_USABLE_WIDTH_DXA = 10460
 CELL_MARGIN_DXA = 120
+REPORT_CELL_MARGIN_DXA = 108
+REPORT_TABLE_INDENT_DXA = 0
 LETTER_TEXT = "53565A"
 LETTER_BODY_PT = 9.0
 LETTER_SUBJECT_PT = 12.0
 LETTER_BLOCK_LINE_PT = 13.8
 REPORT_BODY_PT = 10.0
 REPORT_BODY_COLOR = GRAY
-REPORT_HEADING_COLOR = "059B9B"
+REPORT_HEADING_COLOR = GREEN
 REPORT_HEADING_SIZES = {1: 22.0, 2: 16.0, 3: 14.0}
 REPORT_BODY_LINE_SPACING = 1.15
-REPORT_BODY_SPACE_PT = 6.0
-REPORT_CONTENT_TOP_DXA = 1080
+REPORT_BODY_SPACE_PT = 3.0
+REPORT_HEADING_SPACING_PT = {1: (10.0, 0.0), 2: (4.0, 0.0), 3: (4.0, 0.0)}
+REPORT_CAPTION_PT = 9.0
+REPORT_CAPTION_COLOR = "04999A"
+REPORT_FIGURE_CAPTION_COLOR = GREEN
+REPORT_CONTENT_TOP_DXA = 1701
+REPORT_LANDSCAPE_TOP_DXA = 720
 LETTER_KINDS = {
     "letter",
     "letterhead",
@@ -191,8 +204,12 @@ def set_section_top_margin(section_properties, top_dxa: int) -> None:
     page_margins.set(qn("w:top"), str(top_dxa))
 
 
-def set_section_page_number_start(section_properties, start: int = 1) -> None:
+def set_section_page_number_start(section_properties, start: int | None = None) -> None:
     page_number = section_properties.find(qn("w:pgNumType"))
+    if start is None:
+        if page_number is not None:
+            section_properties.remove(page_number)
+        return
     if page_number is None:
         page_number = OxmlElement("w:pgNumType")
         section_properties.append(page_number)
@@ -314,8 +331,34 @@ def usable_width_dxa(document: Document) -> int:
     return int(section.page_width.twips - section.left_margin.twips - section.right_margin.twips)
 
 
-def table_width_dxa(document: Document) -> int:
-    return usable_width_dxa(document) - CELL_MARGIN_DXA
+def table_width_dxa(
+    document: Document,
+    spec: dict | None = None,
+    *,
+    report: bool = True,
+) -> int:
+    """Return a source-pattern width instead of Word's auto-fit width."""
+
+    spec = spec or {}
+    if not report:
+        return usable_width_dxa(document) - CELL_MARGIN_DXA
+    requested = spec.get("tableWidthDxa")
+    if requested is not None:
+        value = int(requested)
+        if value <= 0:
+            raise ValueError("table.tableWidthDxa must be positive")
+        return value
+    pattern = str(spec.get("pattern", "")).casefold()
+    count = len(spec.get("headers", []))
+    if pattern in {"monitoring", "monitoring-summary", "landscape"}:
+        return usable_width_dxa(document)
+    if pattern in {"images", "image", "with-images"} and count == 3:
+        return 10608
+    if count == 2:
+        return 10198
+    if count == 3:
+        return 10380
+    return usable_width_dxa(document)
 
 
 def column_widths(spec: dict, count: int, total_width_dxa: int) -> list[int]:
@@ -334,7 +377,36 @@ def column_widths(spec: dict, count: int, total_width_dxa: int) -> list[int]:
     return widths
 
 
-def set_table_geometry(table, widths: list[int]) -> None:
+def set_table_borders(table, *, colour: str = TABLE_BORDER) -> None:
+    properties = table._tbl.tblPr
+    borders = properties.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        properties.append(borders)
+    for edge in ("top", "bottom", "insideH"):
+        node = borders.find(qn(f"w:{edge}"))
+        if node is None:
+            node = OxmlElement(f"w:{edge}")
+            borders.append(node)
+        node.set(qn("w:val"), "single")
+        node.set(qn("w:sz"), "4")
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), colour)
+    for edge in ("left", "right", "insideV"):
+        node = borders.find(qn(f"w:{edge}"))
+        if node is None:
+            node = OxmlElement(f"w:{edge}")
+            borders.append(node)
+        node.set(qn("w:val"), "nil")
+
+
+def set_table_geometry(
+    table,
+    widths: list[int],
+    *,
+    indent_dxa: int = REPORT_TABLE_INDENT_DXA,
+    cell_margin_dxa: int = REPORT_CELL_MARGIN_DXA,
+) -> None:
     table.autofit = False
     properties = table._tbl.tblPr
     width = properties.find(qn("w:tblW"))
@@ -347,8 +419,13 @@ def set_table_geometry(table, widths: list[int]) -> None:
     if indent is None:
         indent = OxmlElement("w:tblInd")
         properties.append(indent)
-    indent.set(qn("w:w"), str(CELL_MARGIN_DXA))
+    indent.set(qn("w:w"), str(indent_dxa))
     indent.set(qn("w:type"), "dxa")
+    layout = properties.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        properties.append(layout)
+    layout.set(qn("w:type"), "fixed")
     grid = table._tbl.tblGrid
     for child in list(grid):
         grid.remove(child)
@@ -365,7 +442,53 @@ def set_table_geometry(table, widths: list[int]) -> None:
                 cell_properties.append(cell_width)
             cell_width.set(qn("w:w"), str(value))
             cell_width.set(qn("w:type"), "dxa")
-            set_cell_margins(cell)
+            set_cell_margins(cell, cell_margin_dxa)
+
+
+def set_paragraph_cell_format(
+    paragraph,
+    *,
+    alignment: WD_ALIGN_PARAGRAPH = WD_ALIGN_PARAGRAPH.LEFT,
+    before_pt: float = 0.0,
+    after_pt: float = 0.0,
+    line_spacing: float = REPORT_BODY_LINE_SPACING,
+) -> None:
+    paragraph.alignment = alignment
+    paragraph.paragraph_format.space_before = Pt(before_pt)
+    paragraph.paragraph_format.space_after = Pt(after_pt)
+    paragraph.paragraph_format.line_spacing = line_spacing
+
+
+def add_cell_value(
+    cell,
+    value,
+    *,
+    font_size_pt: float | None,
+    font_color: str | None,
+    bold: bool = False,
+    alignment: WD_ALIGN_PARAGRAPH = WD_ALIGN_PARAGRAPH.LEFT,
+    max_width_inches: float | None = None,
+) -> None:
+    paragraph = cell.paragraphs[0]
+    set_paragraph_cell_format(paragraph, alignment=alignment)
+    if isinstance(value, dict):
+        text = value.get("text", "")
+        image_path = value.get("image", value.get("path"))
+        if image_path:
+            path = Path(str(image_path))
+            if not path.is_file():
+                raise FileNotFoundError(f"table image not found: {path}")
+            width = float(value.get("widthInches", value.get("width", 1.1)))
+            if max_width_inches is not None:
+                width = min(width, max_width_inches)
+            picture_run = paragraph.add_run()
+            picture_run.add_picture(str(path), width=Inches(width))
+        if text:
+            run = paragraph.add_run(str(text))
+            set_run_font(run, bold=bold, size_pt=font_size_pt, color=font_color)
+        return
+    run = paragraph.add_run(str(value))
+    set_run_font(run, bold=bold, size_pt=font_size_pt, color=font_color)
 
 
 def add_table(
@@ -374,35 +497,115 @@ def add_table(
     *,
     font_size_pt: float | None = None,
     font_color: str | None = None,
+    report: bool = True,
 ) -> None:
     headers = [str(value) for value in spec.get("headers", [])]
     rows = list(spec.get("rows", []))
     if not headers:
         return
     table = document.add_table(rows=1, cols=len(headers))
-    preferred = style_by_name(document, "AESG Table", "Table Grid")
+    pattern = str(spec.get("pattern", "")).casefold()
+    image_pattern = pattern in {"images", "image", "with-images"}
+    monitoring_pattern = pattern in {"monitoring", "monitoring-summary", "landscape"}
+    preferred = style_by_name(
+        document,
+        "Plain Table 4",
+        "PlainTable4",
+        "AESG Table",
+        "Table Grid",
+    )
     if preferred is not None:
         table.style = preferred
-    widths = column_widths(spec, len(headers), table_width_dxa(document))
+    widths = column_widths(
+        spec,
+        len(headers),
+        table_width_dxa(document, spec, report=report),
+    )
+    header_alignment = (
+        WD_ALIGN_PARAGRAPH.CENTER
+        if pattern in {"monitoring", "monitoring-summary", "landscape"}
+        else WD_ALIGN_PARAGRAPH.LEFT
+    )
     for index, header in enumerate(headers):
         cell = table.rows[0].cells[index]
-        shade(cell, GREEN)
+        if not image_pattern:
+            shade(cell, TABLE_TEAL)
         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-        paragraph = cell.paragraphs[0]
-        run = paragraph.add_run(header)
-        set_run_font(run, bold=True, size_pt=font_size_pt)
-        run.font.color.rgb = RGBColor.from_string(WHITE)
+        add_cell_value(
+            cell,
+            header,
+            font_size_pt=font_size_pt,
+            font_color=(REPORT_BODY_COLOR if index == 0 else TABLE_TEAL)
+            if image_pattern
+            else WHITE,
+            bold=True,
+            alignment=header_alignment,
+        )
     set_repeat_table_header(table.rows[0])
-    for row_values in rows:
-        values = list(row_values.values()) if isinstance(row_values, dict) else list(row_values)
+    for row_index, row_values in enumerate(rows):
+        if isinstance(row_values, dict):
+            values = row_values.get("values", row_values.get("cells", []))
+            if not values:
+                values = [row_values.get(header, "") for header in headers]
+        else:
+            values = list(row_values)
         cells = table.add_row().cells
         for index, cell in enumerate(cells):
             value = values[index] if index < len(values) else ""
-            run = cell.paragraphs[0].add_run(str(value))
-            set_run_font(run, size_pt=font_size_pt, color=font_color)
-            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    set_table_geometry(table, widths)
-    document.add_paragraph()
+            if monitoring_pattern:
+                fill = "D1D1D1" if row_index % 2 == 0 else "E9E9EA"
+                if index in {0, len(cells) - 1}:
+                    fill = "808080" if row_index % 2 == 0 else "95999E"
+                shade(cell, fill)
+                cell_alignment = WD_ALIGN_PARAGRAPH.CENTER if index == 0 else WD_ALIGN_PARAGRAPH.LEFT
+                cell_color = WHITE if index in {0, len(cells) - 1} else font_color
+            else:
+                shade(cell, TABLE_BAND if row_index % 2 == 0 else WHITE)
+                cell_alignment = (
+                    WD_ALIGN_PARAGRAPH.CENTER
+                    if image_pattern and isinstance(value, dict) and value.get("image", value.get("path"))
+                    else WD_ALIGN_PARAGRAPH.LEFT
+                )
+                cell_color = font_color
+            max_width = max((widths[index] / 1440.0) - 0.2, 0.45)
+            add_cell_value(
+                cell,
+                value,
+                font_size_pt=font_size_pt,
+                font_color=cell_color,
+                alignment=cell_alignment,
+                max_width_inches=max_width,
+            )
+            cell.vertical_alignment = (
+                WD_CELL_VERTICAL_ALIGNMENT.TOP
+                if image_pattern or monitoring_pattern
+                else WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            )
+    for span in spec.get("rowSpans", []):
+        if not isinstance(span, dict):
+            raise ValueError("table.rowSpans must contain objects")
+        column = int(span.get("column", -1))
+        start = int(span.get("start", -1))
+        length = int(span.get("span", 0))
+        if column < 0 or column >= len(headers) or start < 0 or length < 2 or start + length > len(rows):
+            raise ValueError("table.rowSpans contains an invalid column, start, or span")
+        for row_number in range(start + 1, start + length):
+            table.cell(row_number + 1, column).text = ""
+        merged = table.cell(start + 1, column).merge(table.cell(start + length, column))
+        if monitoring_pattern and column in {0, len(headers) - 1}:
+            shade(merged, "808080")
+            merged.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    set_table_geometry(
+        table,
+        widths,
+        indent_dxa=REPORT_TABLE_INDENT_DXA if report else CELL_MARGIN_DXA,
+        cell_margin_dxa=REPORT_CELL_MARGIN_DXA if report else CELL_MARGIN_DXA,
+    )
+    set_table_borders(table, colour=TABLE_BORDER)
+    spacer = document.add_paragraph()
+    spacer.paragraph_format.space_before = Pt(0)
+    spacer.paragraph_format.space_after = Pt(0)
+    spacer.paragraph_format.line_spacing = 1.0
 
 
 def add_callout(
@@ -411,6 +614,7 @@ def add_callout(
     *,
     font_size_pt: float | None = None,
     font_color: str = GRAY,
+    report: bool = True,
 ) -> None:
     table = document.add_table(rows=1, cols=1)
     cell = table.cell(0, 0)
@@ -418,8 +622,17 @@ def add_callout(
     paragraph = cell.paragraphs[0]
     run = paragraph.add_run(value)
     set_run_font(run, bold=True, size_pt=font_size_pt, color=font_color)
-    set_table_geometry(table, [table_width_dxa(document)])
-    document.add_paragraph()
+    set_table_geometry(
+        table,
+        [table_width_dxa(document, report=report)],
+        indent_dxa=REPORT_TABLE_INDENT_DXA if report else CELL_MARGIN_DXA,
+        cell_margin_dxa=REPORT_CELL_MARGIN_DXA if report else CELL_MARGIN_DXA,
+    )
+    set_table_borders(table, colour="E6F4F5")
+    spacer = document.add_paragraph()
+    spacer.paragraph_format.space_before = Pt(0)
+    spacer.paragraph_format.space_after = Pt(0)
+    spacer.paragraph_format.line_spacing = 1.0
 
 
 def add_image(
@@ -436,8 +649,12 @@ def add_image(
     if not path.is_file():
         raise FileNotFoundError(f"image not found: {path}")
     width = float(image_spec.get("widthInches", image_spec.get("width", 6.2)))
+    width = min(width, max((usable_width_dxa(document) / 1440.0) - 0.1, 1.0))
     paragraph = document.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.keep_with_next = bool(image_spec.get("caption"))
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(0)
     paragraph.add_run().add_picture(str(path), width=Inches(width))
     if image_spec.get("caption"):
         paragraph.paragraph_format.keep_with_next = True
@@ -448,8 +665,10 @@ def add_image(
             "Caption",
             bold=False,
             italic=True,
-            size_pt=font_size_pt,
-            color=font_color,
+            size_pt=REPORT_CAPTION_PT,
+            color=REPORT_FIGURE_CAPTION_COLOR,
+            space_before_pt=0,
+            space_after_pt=6.0,
             line_spacing=line_spacing,
         )
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -501,8 +720,37 @@ def add_divider(
         append_before_final_section(document, element)
 
 
-def add_sections(document: Document, sections: list[dict], divider_source=None) -> None:
+def section_is_landscape(section: dict) -> bool:
+    if str(section.get("orientation", "")).casefold() == "landscape":
+        return True
+    table = section.get("table")
+    return isinstance(table, dict) and str(table.get("pattern", "")).casefold() in {
+        "monitoring",
+        "monitoring-summary",
+        "landscape",
+    }
+
+
+def add_sections(
+    document: Document,
+    sections: list[dict],
+    divider_source=None,
+    *,
+    portrait_section=None,
+    landscape_section=None,
+) -> None:
+    in_landscape = False
     for index, section in enumerate(sections):
+        wants_landscape = section_is_landscape(section)
+        if wants_landscape != in_landscape and landscape_section is not None and portrait_section is not None:
+            # A sectPr on the paragraph before the content closes the current
+            # section; the body-level sectPr then governs the new content.
+            add_section_break(document, portrait_section if wants_landscape else landscape_section)
+            set_final_section(
+                document,
+                landscape_section if wants_landscape else portrait_section,
+            )
+            in_landscape = wants_landscape
         heading = str(section.get("heading", "")).strip()
         if section.get("divider") and heading and divider_source is not None:
             add_divider(
@@ -520,15 +768,33 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 2: ("AESG Sub H1", "Heading 2"),
                 3: ("AESG H2", "Heading 3"),
             }[level]
-            add_text(
+            heading_before, heading_after = REPORT_HEADING_SPACING_PT[level]
+            heading_paragraph = add_text(
                 document,
                 heading,
                 *styles,
                 size_pt=REPORT_HEADING_SIZES[level],
                 color=REPORT_HEADING_COLOR,
-                space_before_pt=0,
-                space_after_pt=REPORT_BODY_SPACE_PT,
+                space_before_pt=heading_before,
+                space_after_pt=heading_after,
+                line_spacing=1.0,
             )
+            if section.get("headingNumbered") is False:
+                properties = heading_paragraph._p.get_or_add_pPr()
+                numbering = properties.find(qn("w:numPr"))
+                if numbering is None:
+                    numbering = OxmlElement("w:numPr")
+                    properties.append(numbering)
+                ilvl = numbering.find(qn("w:ilvl"))
+                if ilvl is None:
+                    ilvl = OxmlElement("w:ilvl")
+                    numbering.append(ilvl)
+                ilvl.set(qn("w:val"), "0")
+                num_id = numbering.find(qn("w:numId"))
+                if num_id is None:
+                    num_id = OxmlElement("w:numId")
+                    numbering.append(num_id)
+                num_id.set(qn("w:val"), "0")
         for paragraph in section.get("paragraphs", []):
             value = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
             add_text(
@@ -540,7 +806,7 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 italic=False,
                 size_pt=REPORT_BODY_PT,
                 color=REPORT_BODY_COLOR,
-                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_before_pt=0,
                 space_after_pt=REPORT_BODY_SPACE_PT,
                 line_spacing=REPORT_BODY_LINE_SPACING,
             )
@@ -554,7 +820,7 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 italic=False,
                 size_pt=REPORT_BODY_PT,
                 color=REPORT_BODY_COLOR,
-                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_before_pt=0,
                 space_after_pt=REPORT_BODY_SPACE_PT,
                 line_spacing=REPORT_BODY_LINE_SPACING,
             )
@@ -568,7 +834,7 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 italic=False,
                 size_pt=REPORT_BODY_PT,
                 color=REPORT_BODY_COLOR,
-                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_before_pt=0,
                 space_after_pt=REPORT_BODY_SPACE_PT,
                 line_spacing=REPORT_BODY_LINE_SPACING,
             )
@@ -578,6 +844,7 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 str(section["callout"]),
                 font_size_pt=REPORT_BODY_PT,
                 font_color=REPORT_BODY_COLOR,
+                report=True,
             )
         if section.get("table"):
             if section["table"].get("caption"):
@@ -588,17 +855,19 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                     "Caption",
                     bold=False,
                     italic=False,
-                    size_pt=REPORT_BODY_PT,
-                    color=REPORT_BODY_COLOR,
-                    space_before_pt=REPORT_BODY_SPACE_PT,
-                    space_after_pt=REPORT_BODY_SPACE_PT,
-                    line_spacing=REPORT_BODY_LINE_SPACING,
+                    size_pt=REPORT_CAPTION_PT,
+                    color=REPORT_CAPTION_COLOR,
+                    space_before_pt=4.0,
+                    space_after_pt=3.0,
+                    line_spacing=1.0,
                 )
+                document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
             add_table(
                 document,
                 section["table"],
                 font_size_pt=REPORT_BODY_PT,
                 font_color=REPORT_BODY_COLOR,
+                report=True,
             )
         images = section.get("images", [])
         if section.get("image"):
@@ -621,7 +890,7 @@ def add_sections(document: Document, sections: list[dict], divider_source=None) 
                 italic=True,
                 size_pt=REPORT_BODY_PT,
                 color=REPORT_BODY_COLOR,
-                space_before_pt=REPORT_BODY_SPACE_PT,
+                space_before_pt=0,
                 space_after_pt=REPORT_BODY_SPACE_PT,
                 line_spacing=REPORT_BODY_LINE_SPACING,
             )
@@ -678,10 +947,14 @@ def create_report(document: Document, spec: dict) -> None:
     clear_body(document)
     content_section = copy.deepcopy(sections[0])
     set_section_top_margin(content_section, REPORT_CONTENT_TOP_DXA)
-    set_section_page_number_start(content_section)
+    set_section_page_number_start(content_section, None)
     final_section = copy.deepcopy(sections[1])
     set_section_top_margin(final_section, REPORT_CONTENT_TOP_DXA)
-    set_section_page_number_start(final_section)
+    set_section_page_number_start(final_section, None)
+    landscape_section = copy.deepcopy(sections[3]) if len(sections) > 3 else None
+    if landscape_section is not None:
+        set_section_top_margin(landscape_section, REPORT_LANDSCAPE_TOP_DXA)
+        set_section_page_number_start(landscape_section, None)
     set_final_section(document, final_section)
     if spec.get("cover", True):
         remove_shape_by_leaf_text(cover, "Client Logo")
@@ -712,10 +985,6 @@ def create_report(document: Document, spec: dict) -> None:
             "reference", spec.get("documentControl", {}).get("reference", "AESG")
         ),
     }
-    for section in document.sections:
-        replace_leaf_text(section.header._element, replacements)
-        replace_leaf_text(section.footer._element, replacements)
-        clear_text_highlight(section.footer._element)
     if spec.get("documentTitle"):
         add_text(
             document,
@@ -727,7 +996,18 @@ def create_report(document: Document, spec: dict) -> None:
             color=REPORT_HEADING_COLOR,
             space_after_pt=REPORT_BODY_SPACE_PT,
         )
-    add_sections(document, list(spec.get("sections", [])), divider)
+    add_sections(
+        document,
+        list(spec.get("sections", [])),
+        divider,
+        portrait_section=final_section,
+        landscape_section=landscape_section,
+    )
+    for section in document.sections:
+        replace_leaf_text(section.header._element, replacements)
+        replace_leaf_text(section.footer._element, replacements)
+        clear_text_highlight(section.header._element)
+        clear_text_highlight(section.footer._element)
 
 
 def add_letter_multiline(document: Document, lines: list[str]) -> None:
@@ -835,6 +1115,7 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 str(section["callout"]),
                 font_size_pt=LETTER_BODY_PT,
                 font_color=LETTER_TEXT,
+                report=False,
             )
         if section.get("table"):
             if section["table"].get("caption"):
@@ -854,6 +1135,7 @@ def add_letter_sections(document: Document, sections: list[dict]) -> None:
                 section["table"],
                 font_size_pt=LETTER_BODY_PT,
                 font_color=LETTER_TEXT,
+                report=False,
             )
         images = section.get("images", [])
         if section.get("image"):
@@ -962,6 +1244,51 @@ def restore_letter_template_parts(template: Path, output: Path) -> None:
     temporary.replace(output)
 
 
+def normalise_report_output_parts(output: Path) -> None:
+    """Make every generated report story explicit after python-docx saves it."""
+
+    scripts_dir = Path(__file__).resolve().parents[2] / "aesg-branding" / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from normalise_office_templates import (  # noqa: PLC0415
+        normalise_document_part,
+        normalise_docx_styles,
+        normalise_footer_story,
+        normalise_header_story,
+        normalise_theme_fonts,
+    )
+
+    with zipfile.ZipFile(output) as source:
+        names = set(source.namelist())
+        transforms = {
+            "word/document.xml": normalise_document_part,
+            "word/styles.xml": lambda data: normalise_docx_styles(data, report=True),
+            "word/theme/theme1.xml": normalise_theme_fonts,
+        }
+        for name in names:
+            if name.startswith("word/header") and name.endswith(".xml"):
+                transforms[name] = normalise_header_story
+            elif name.startswith("word/footer") and name.endswith(".xml"):
+                transforms[name] = normalise_footer_story
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output.stem}-",
+            suffix=output.suffix,
+            dir=output.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            with zipfile.ZipFile(temporary, "w") as target:
+                for info in source.infolist():
+                    data = source.read(info.filename)
+                    transform = transforms.get(info.filename)
+                    target.writestr(info, transform(data) if transform else data)
+            temporary.replace(output)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+
 def normalise_new_text(document: Document) -> None:
     for paragraph in document.paragraphs:
         for run in paragraph.runs:
@@ -1019,7 +1346,9 @@ def main() -> int:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     document.save(args.output)
-    if kind == "letter":
+    if kind == "report":
+        normalise_report_output_parts(args.output)
+    else:
         restore_letter_template_parts(template, args.output)
     print(
         json.dumps(
