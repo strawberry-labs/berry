@@ -667,6 +667,55 @@ describe("router client", () => {
     expect(text.join("")).toBe("answer");
   });
 
+  it("uses Kimi K2.6 thinking mode and streams its reasoning_content", async () => {
+    let requestBody: Record<string, unknown> = {};
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => {
+        raw += String(chunk);
+      });
+      request.on("end", () => {
+        requestBody = JSON.parse(raw) as Record<string, unknown>;
+        response.setHeader("Content-Type", "text/event-stream");
+        response.write('data: {"id":"1","model":"canopywave/moonshotai/kimi-k2.6","choices":[{"delta":{"reasoning_content":"inspect image"}}]}\n\n');
+        response.write('data: {"id":"1","model":"canopywave/moonshotai/kimi-k2.6","choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n');
+        response.end("data: [DONE]\n\n");
+      });
+    });
+    const client = new OpenRouterCompatibleClient({
+      provider: {
+        baseUrl,
+        defaultModel: "canopywave/moonshotai/kimi-k2.6",
+        kind: "berry-router",
+        name: "Berry Router",
+      },
+      apiKey: "key",
+    });
+    const reasoning: string[] = [];
+    const text: string[] = [];
+    for await (const chunk of client.stream({
+      reasoningEffort: "high",
+      temperature: 0,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "describe" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,aGk=" } },
+        ],
+      }],
+    })) {
+      if (chunk.reasoningDelta) reasoning.push(chunk.reasoningDelta);
+      if (chunk.delta) text.push(chunk.delta);
+    }
+
+    expect(requestBody.thinking).toEqual({ type: "enabled" });
+    expect(requestBody).not.toHaveProperty("reasoning");
+    expect(requestBody).not.toHaveProperty("reasoning_effort");
+    expect(requestBody).not.toHaveProperty("temperature");
+    expect(reasoning.join("")).toBe("inspect image");
+    expect(text.join("")).toBe("answer");
+  });
+
   it("normalizes MiniMax M3 think tags split across streaming chunks", async () => {
     const baseUrl = await withServer((_request, response) => {
       response.setHeader("Content-Type", "text/event-stream");

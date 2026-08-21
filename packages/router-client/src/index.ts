@@ -784,15 +784,20 @@ export class OpenAIChatCompletionsClient {
 
   async #post(options: ChatCompletionOptions & { stream: boolean }): Promise<Response> {
     const url = requestUrl(this.#provider, this.#provider.endpointPath ?? "/chat/completions");
+    const model = options.model ?? this.#provider.defaultModel;
+    const usesKimiThinking = usesKimiThinkingShape(model);
     const body: Record<string, unknown> = {
-      model: options.model ?? this.#provider.defaultModel,
+      model,
       messages: options.messages.map(serializeMessage),
-      temperature: options.temperature,
+      ...(!usesKimiThinking && options.temperature !== undefined
+        ? { temperature: options.temperature }
+        : {}),
       max_tokens: options.maxTokens,
       stream: options.stream,
     };
     if (options.reasoningEffort) {
-      if (usesOpenRouterReasoningShape(this.#provider)) body.reasoning = { effort: options.reasoningEffort };
+      if (usesKimiThinking) body.thinking = { type: "enabled" };
+      else if (usesOpenRouterReasoningShape(this.#provider)) body.reasoning = { effort: options.reasoningEffort };
       else body.reasoning_effort = options.reasoningEffort;
     }
     if (options.promptCacheKey) body.prompt_cache_key = options.promptCacheKey;
@@ -1259,6 +1264,11 @@ function safeDiagnosticValue(value: string | undefined, maximum: number): string
 function usesOpenRouterReasoningShape(provider: ProviderTransportInfo): boolean {
   if (provider.kind === "berry-router") return true;
   return provider.baseUrl.toLowerCase().includes("openrouter.ai");
+}
+
+function usesKimiThinkingShape(model: string): boolean {
+  const modelName = model.trim().toLowerCase().split("/").at(-1) ?? "";
+  return modelName === "kimi-k2.6" || modelName.startsWith("kimi-k2.6-");
 }
 
 function normalizeUsage(usage: OpenAIUsage | undefined): ChatCompletionUsage | undefined {
