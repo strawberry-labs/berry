@@ -333,6 +333,30 @@ describe("E2BSandboxProvider", () => {
     expect(client.connectCount).toBe(connectsBeforeRead + 1);
   });
 
+  it("evicts a cached handle when E2B reports a sandbox timeout as a generic error", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const sandbox = await provider.create({ request_id: "expired-cache", tenant_id: TENANT_ID, image: "base" });
+    const remote = client.sandboxes.get(sandbox.sandbox_id)!.sandbox;
+    const originalWrite = remote.files.write;
+    remote.files.write = async () => {
+      throw new Error("The sandbox was not found: This error is likely due to sandbox timeout.");
+    };
+
+    await expect(provider.files.write({
+      sandbox_id: sandbox.sandbox_id,
+      path: "/workspace/expired.txt",
+      content: "expired",
+      encoding: "utf8",
+    })).rejects.toThrow("sandbox was not found");
+
+    remote.files.write = originalWrite;
+    const connectsBeforeResume = client.connectCount;
+    await provider.resume({ sandbox_id: sandbox.sandbox_id, reason: "retry after timeout" });
+
+    expect(client.connectCount).toBe(connectsBeforeResume + 1);
+  });
+
   it("does not reuse a sandbox from an older template or workspace root", async () => {
     const client = new FakeE2BClient();
     const firstProvider = new E2BSandboxProvider({ apiKey: "e2b_test", template: "aesg-v5", client });

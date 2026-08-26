@@ -113,6 +113,8 @@ export const DURABLE_IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
 const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
+const DEFAULT_INPUT_AVAILABILITY_TIMEOUT_MS = 75_000;
+const DEFAULT_INPUT_AVAILABILITY_POLL_MS = 1_000;
 const MAX_SNAPSHOT_FILES = 5_000;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
@@ -509,6 +511,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       intervalSnapshotTimeoutMs?: number;
       terminalSnapshotTimeoutMs?: number;
       terminalSuspendTimeoutMs?: number;
+      inputAvailabilityTimeoutMs?: number;
+      inputAvailabilityPollMs?: number;
       enableTerminalFinalization?: boolean;
       documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
       imageGeneration?: {
@@ -528,7 +532,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   ): Promise<readonly ChatContentPart[]> {
     signal?.throwIfAborted();
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    const turnInputFiles = await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn");
+    const turnInputFiles = await this.awaitTurnInputFiles(snapshot, signal, reportProgress);
     signal?.throwIfAborted();
     if (turnInputFiles.length > 0) {
       const sandbox = await this.ensureSandbox(snapshot, signal);
@@ -842,7 +846,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const referencedInputIds = referencedInputFileIds(args, workspaceRoot);
     if (referencedInputIds.size > 0) {
-      await this.stageInputFiles(snapshot, sandbox.id, this.repository, referencedInputIds, signal, reportProgress);
+      await this.stageInputFiles(snapshot, sandbox.id, this.repository, referencedInputIds, signal, reportProgress, undefined, true);
     }
     if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
@@ -1856,30 +1860,96 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     signal?: AbortSignal,
     reportProgress?: () => void,
     knownFiles?: readonly SandboxInputFile[],
+    verifySelectedFiles = false,
   ): Promise<void> {
     signal?.throwIfAborted();
     const staged = this.#stagedInputFileIds.get(sandboxId) ?? new Set<string>();
     this.#stagedInputFileIds.set(sandboxId, staged);
-    const files = (knownFiles ?? await repository.inputFiles(snapshot.tenantId, snapshot.id))
-      .filter((file) => (!selectedFileIds || selectedFileIds.has(file.fileId.toLowerCase())) && !staged.has(file.fileId));
+    const candidates = (knownFiles ?? await repository.inputFiles(snapshot.tenantId, snapshot.id))
+      .filter((file) => !selectedFileIds || selectedFileIds.has(file.fileId.toLowerCase()));
+    if (verifySelectedFiles && selectedFileIds) {
+      const available = new Set(candidates.map((file) => file.fileId.toLowerCase()));
+      const unavailable = [...selectedFileIds].filter((fileId) => !available.has(fileId));
+      if (unavailable.length > 0) {
+        throw new Error(`Referenced input files are not available for sandbox staging: ${unavailable.join(", ")}`);
+      }
+    }
+    const verified = new Set<string>();
+    if (verifySelectedFiles) {
+      await mapWithConcurrency(candidates.filter((file) => staged.has(file.fileId.toLowerCase())), 4, async (file) => {
+        const fileId = file.fileId.toLowerCase();
+        if (await this.isInputFileStaged(sandboxId, file, signal)) verified.add(fileId);
+        else staged.delete(fileId);
+      });
+    }
+    const files = candidates.filter((file) => !staged.has(file.fileId.toLowerCase()));
     signal?.throwIfAborted();
-    if (files.length === 0) return;
-    if (!this.objects) throw new Error("Input file object storage is not configured");
-    await mapWithConcurrency(files, 4, async (file) => {
-      const stageKey = `${sandboxId}:${file.fileId}`;
-      const existing = this.#inputFileStages.get(stageKey);
-      if (existing) return existing;
-      const stage = this.stageInputFile(sandboxId, file, signal)
-        .then(() => {
-          staged.add(file.fileId);
-          reportProgress?.();
-        })
-        .finally(() => {
-          if (this.#inputFileStages.get(stageKey) === stage) this.#inputFileStages.delete(stageKey);
-        });
-      this.#inputFileStages.set(stageKey, stage);
-      return stage;
-    });
+    if (files.length > 0) {
+      if (!this.objects) throw new Error("Input file object storage is not configured");
+      await mapWithConcurrency(files, 4, async (file) => {
+        const fileId = file.fileId.toLowerCase();
+        const stageKey = `${sandboxId}:${fileId}`;
+        const existing = this.#inputFileStages.get(stageKey);
+        if (existing) return existing;
+        const stage = this.stageInputFile(sandboxId, file, signal)
+          .then(() => {
+            staged.add(fileId);
+            reportProgress?.();
+          })
+          .finally(() => {
+            if (this.#inputFileStages.get(stageKey) === stage) this.#inputFileStages.delete(stageKey);
+          });
+        this.#inputFileStages.set(stageKey, stage);
+        return stage;
+      });
+    }
+    if (verifySelectedFiles) {
+      await mapWithConcurrency(candidates.filter((file) => !verified.has(file.fileId.toLowerCase())), 4, async (file) => {
+        if (await this.isInputFileStaged(sandboxId, file, signal)) return;
+        staged.delete(file.fileId.toLowerCase());
+        throw new Error(`Input file ${file.name} was not materialized in the sandbox`);
+      });
+    }
+  }
+
+  private async awaitTurnInputFiles(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly SandboxInputFile[]> {
+    const expected = runtimeAttachmentFileIds(snapshot);
+    let files = await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn");
+    if (expected.size === 0 || expectedInputFilesAvailable(files, expected)) return files;
+    const timeoutMs = Math.max(0, this.options.inputAvailabilityTimeoutMs ?? DEFAULT_INPUT_AVAILABILITY_TIMEOUT_MS);
+    const pollMs = Math.max(1, this.options.inputAvailabilityPollMs ?? DEFAULT_INPUT_AVAILABILITY_POLL_MS);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await waitForInputAvailability(Math.min(pollMs, Math.max(1, deadline - Date.now())), signal);
+      files = await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn");
+      reportProgress?.();
+      if (expectedInputFilesAvailable(files, expected)) return files;
+    }
+    const missing = [...expected].filter((fileId) => !files.some((file) => file.fileId.toLowerCase() === fileId));
+    throw new Error(`Attached files are still being verified and cannot be staged: ${missing.join(", ")}`);
+  }
+
+  private async isInputFileStaged(
+    sandboxId: string,
+    file: SandboxInputFile,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
+    const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
+    const parent = path.slice(0, path.lastIndexOf("/"));
+    try {
+      const listing = await this.provider.files.list({ sandbox_id: sandboxId, path: parent, recursive: false }, { signal });
+      return listing.entries.some((entry) => entry.path === path && entry.type === "file" && entry.size_bytes === file.sizeBytes);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/(?:the )?sandbox (?:was )?not found/i.test(message)) throw error;
+      if (/not found|does not exist|no such file/i.test(message)) return false;
+      throw error;
+    }
   }
 
   private async stageInputFile(
@@ -3184,6 +3254,37 @@ function referencedInputFileIds(value: unknown, workspaceRoot: string): Set<stri
   };
   visit(value, 0);
   return ids;
+}
+
+function runtimeAttachmentFileIds(snapshot: DurableTurnSnapshot): Set<string> {
+  const attachments = Array.isArray(snapshot.runtimeRequest.attachments)
+    ? snapshot.runtimeRequest.attachments
+    : [];
+  return new Set(attachments.flatMap((attachment) => {
+    const value = objectValue(attachment);
+    const fileId = value ? stringValue(value.fileId) : undefined;
+    return fileId ? [fileId.toLowerCase()] : [];
+  }));
+}
+
+function expectedInputFilesAvailable(files: readonly SandboxInputFile[], expected: ReadonlySet<string>): boolean {
+  const available = new Set(files.map((file) => file.fileId.toLowerCase()));
+  return [...expected].every((fileId) => available.has(fileId));
+}
+
+function waitForInputAvailability(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("Input-file staging was aborted"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function validatedInputFileStream(

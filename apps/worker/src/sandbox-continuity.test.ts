@@ -2743,6 +2743,136 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+  it("waits for current-turn attachment verification before preparing model input", async () => {
+    const file = {
+      fileId: "00000000-0000-7000-8000-000000000099",
+      name: "candidate.pdf",
+      mediaType: "application/pdf",
+      sizeBytes: 4,
+      objectKey: "objects/candidate.pdf",
+    };
+    let inputFileReads = 0;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => ++inputFileReads === 1 ? [] : [file]),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const writeStream = vi.fn(async (input: { path: string; size_bytes: number }) => ({
+      path: input.path,
+      size_bytes: input.size_bytes,
+      mtime: null,
+    }));
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-verification", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: { read: vi.fn(), write: vi.fn(), writeStream, list: vi.fn() },
+    } as unknown as SandboxProvider;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+      streamSource: vi.fn(async function* () { yield new Uint8Array([1, 2, 3, 4]); }),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      inputAvailabilityTimeoutMs: 50,
+      inputAvailabilityPollMs: 1,
+    });
+    const current = snapshot();
+    current.steps = [];
+    current.runtimeRequest = {
+      attachments: [{
+        fileId: file.fileId,
+        name: file.name,
+        mediaType: file.mediaType,
+        size: file.sizeBytes,
+      }],
+    };
+
+    await expect(manager.modelContent(current)).resolves.toEqual([]);
+
+    expect(repository.inputFiles).toHaveBeenCalledTimes(2);
+    expect(writeStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("restages a referenced attachment when it disappeared from a resumed sandbox", async () => {
+    const file = {
+      fileId: "00000000-0000-7000-8000-000000000099",
+      name: "candidate.png",
+      mediaType: "image/png",
+      sizeBytes: 4,
+      objectKey: "objects/candidate.png",
+    };
+    const staged = new Map<string, Uint8Array>();
+    const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array> }) => {
+      const reader = input.content.getReader();
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        chunks.push(next.value);
+      }
+      const content = Buffer.concat(chunks);
+      staged.set(input.path, content);
+      return { path: input.path, size_bytes: content.byteLength, mtime: null };
+    });
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-repair", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(),
+        write: vi.fn(),
+        writeStream,
+        list: vi.fn(async (input: { path: string }) => ({
+          path: input.path,
+          entries: [...staged.entries()].map(([path, content]) => ({
+            path,
+            type: "file" as const,
+            size_bytes: content.byteLength,
+            mtime: null,
+          })),
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => [file]),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(),
+      streamSource: vi.fn(async function* () { yield new Uint8Array([1, 2, 3, 4]); }),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      cwd: "/home/user/workspace",
+    });
+    const current = snapshot();
+    const stagedFiles = await manager.stageAssociatedInputFiles(current, [file.fileId]);
+    const path = stagedFiles[0]!.path;
+    staged.clear();
+
+    await expect(manager.execute(current, toolStep("read", { path }))).resolves.toMatchObject({
+      output: { path, binary: true, mediaType: "image/png" },
+    });
+
+    expect(writeStream).toHaveBeenCalledTimes(2);
+  });
+
   it("does not stage task attachments for an unrelated sandbox operation", async () => {
     const writeStream = vi.fn();
     const provider = {

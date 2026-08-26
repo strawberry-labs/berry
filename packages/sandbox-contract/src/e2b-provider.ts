@@ -1048,7 +1048,10 @@ function isNotFound(error: unknown): boolean {
 }
 
 function isSandboxNotFound(error: unknown): boolean {
-  return error instanceof SandboxNotFoundError || (error instanceof Error && error.name === "SandboxNotFoundError");
+  return error instanceof SandboxNotFoundError || (error instanceof Error && (
+    error.name === "SandboxNotFoundError"
+    || /(?:the )?sandbox (?:was )?not found/i.test(error.message)
+  ));
 }
 
 function errorMessage(error: unknown): string {
