@@ -31,6 +31,10 @@ docx_generator = load_module(
     "aesg_create_docx",
     REPOSITORY / "deploy/skills/docx/scripts/create_aesg_docx.py",
 )
+docx_repair = load_module(
+    "aesg_repair_docx",
+    REPOSITORY / "deploy/skills/docx/scripts/repair_aesg_docx.py",
+)
 
 
 class ArtifactPlaceholderValidationTests(unittest.TestCase):
@@ -125,6 +129,148 @@ class LetterheadGeometryTests(unittest.TestCase):
                                 run.font.size.pt,
                                 docx_generator.LETTER_BODY_PT,
                             )
+
+
+class ReportStructureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.template = (
+            REPOSITORY
+            / "deploy/skills/aesg-branding/assets/templates/AESG_General_Report_Template.docx"
+        )
+
+    def test_ordered_blocks_preserve_sequence_and_real_list_styles(self) -> None:
+        document = Document(self.template)
+        docx_generator.create_report(
+            document,
+            {
+                "title": "Structure smoke test",
+                "approvalPage": False,
+                "sections": [
+                    {
+                        "heading": "Actions",
+                        "blocks": [
+                            {"type": "paragraph", "text": "Opening prose."},
+                            {"type": "label", "text": "Recommendations:"},
+                            {"type": "bullets", "items": ["First action", "Second action"]},
+                            {"type": "paragraph", "text": "Closing prose."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+        by_text = {paragraph.text: paragraph for paragraph in document.paragraphs}
+        ordered = [
+            next(
+                index
+                for index, paragraph in enumerate(document.paragraphs)
+                if paragraph.text == text
+            )
+            for text in (
+                "Opening prose.",
+                "Recommendations:",
+                "First action",
+                "Second action",
+                "Closing prose.",
+            )
+        ]
+        self.assertEqual(ordered, sorted(ordered))
+        self.assertEqual(by_text["First action"].style.name, "AESG Bullet")
+        self.assertEqual(by_text["Second action"].style.name, "AESG Bullet")
+        self.assertTrue(by_text["Recommendations:"].runs[0].bold)
+
+    def test_monitoring_table_block_uses_a_landscape_section(self) -> None:
+        document = Document(self.template)
+        docx_generator.create_report(
+            document,
+            {
+                "title": "Monitoring layout test",
+                "approvalPage": False,
+                "sections": [
+                    {
+                        "heading": "Monitoring summary",
+                        "blocks": [
+                            {
+                                "type": "table",
+                                "table": {
+                                    "pattern": "monitoring",
+                                    "headers": ["Location", "Reading", "Status"],
+                                    "rows": [["North boundary", "42", "Compliant"]],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        self.assertTrue(
+            any(section.page_width > section.page_height for section in document.sections)
+        )
+
+    def test_repair_disables_template_numbering_for_manual_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manual-heading.docx"
+            document = Document(self.template)
+            docx_generator.create_report(
+                document,
+                {
+                    "title": "Numbering smoke test",
+                    "approvalPage": False,
+                    "sections": [
+                        {"heading": "2.1 Background", "level": 2},
+                        {
+                            "table": {
+                                "headers": ["Requirement", "Gap", "RAG"],
+                                "rows": [["Access control", "Upgrade required", "RED"]],
+                            }
+                        },
+                    ],
+                },
+            )
+            document.save(path)
+            docx_repair.repair_report(path)
+            repaired = Document(path)
+            heading = next(
+                paragraph
+                for paragraph in repaired.paragraphs
+                if paragraph.text == "2.1 Background"
+            )
+            numbering = heading._p.pPr.find(qn("w:numPr"))
+            self.assertEqual(numbering.find(qn("w:numId")).get(qn("w:val")), "0")
+            compliance = next(
+                table
+                for table in repaired.tables
+                if table.rows and table.cell(0, 0).text == "Requirement"
+            )
+            self.assertEqual(compliance.cell(1, 2).text, "Red")
+
+    def test_validator_rejects_flat_lists_and_manual_heading_numbering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "flat-report.docx"
+            document = Document(self.template)
+            docx_generator.create_report(
+                document,
+                {
+                    "title": "Validation smoke test",
+                    "approvalPage": False,
+                    "sections": [
+                        {
+                            "heading": "2.1 Background",
+                            "level": 2,
+                            "paragraphs": ["Examples:", "One", "Two", "Three"],
+                        }
+                    ],
+                },
+            )
+            document.save(path)
+            docx_generator.normalise_report_output_parts(path)
+            errors: list[str] = []
+            evidence: dict = {}
+            validator.validate_docx(path, errors, evidence)
+
+        self.assertTrue(any("inherit automatic numbering" in error for error in errors))
+        self.assertTrue(any("flattened as body paragraphs" in error for error in errors))
 
 
 if __name__ == "__main__":

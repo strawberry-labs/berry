@@ -723,12 +723,134 @@ def add_divider(
 def section_is_landscape(section: dict) -> bool:
     if str(section.get("orientation", "")).casefold() == "landscape":
         return True
-    table = section.get("table")
-    return isinstance(table, dict) and str(table.get("pattern", "")).casefold() in {
+    landscape_patterns = {
         "monitoring",
         "monitoring-summary",
         "landscape",
     }
+    table = section.get("table")
+    if isinstance(table, dict) and str(table.get("pattern", "")).casefold() in landscape_patterns:
+        return True
+    for block in section.get("blocks", []):
+        if not isinstance(block, dict):
+            continue
+        kind = str(block.get("type", "paragraph")).strip().casefold().replace("_", "-")
+        if kind != "table":
+            continue
+        table_spec = block.get("table")
+        if table_spec is None:
+            table_spec = block
+        if isinstance(table_spec, dict) and str(table_spec.get("pattern", "")).casefold() in landscape_patterns:
+            return True
+    return False
+
+
+def add_report_block(document: Document, block: dict) -> None:
+    """Render one ordered report block without flattening its structure."""
+
+    if not isinstance(block, dict):
+        raise TypeError("report blocks must be objects with a type")
+    kind = str(block.get("type", "paragraph")).strip().casefold().replace("_", "-")
+    if kind in {"paragraph", "body", "label", "finding-header"}:
+        value = block.get("text", block.get("value", ""))
+        add_text(
+            document,
+            str(value),
+            "AESG Body Text",
+            "Normal",
+            bold=kind in {"label", "finding-header"} or bool(block.get("bold")),
+            italic=bool(block.get("italic")),
+            size_pt=REPORT_BODY_PT,
+            color=REPORT_BODY_COLOR,
+            space_before_pt=0,
+            space_after_pt=REPORT_BODY_SPACE_PT,
+            line_spacing=REPORT_BODY_LINE_SPACING,
+        )
+        return
+    if kind in {"bullets", "bullet-list", "list"}:
+        for item in block.get("items", []):
+            add_text(
+                document,
+                str(item),
+                "AESG Bullet",
+                "List Bullet",
+                bold=False,
+                italic=False,
+                size_pt=REPORT_BODY_PT,
+                color=REPORT_BODY_COLOR,
+                space_before_pt=0,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
+        return
+    if kind in {"numbered", "numbered-list"}:
+        for item in block.get("items", []):
+            add_text(
+                document,
+                str(item),
+                "AESG Numbering",
+                "List Number",
+                bold=False,
+                italic=False,
+                size_pt=REPORT_BODY_PT,
+                color=REPORT_BODY_COLOR,
+                space_before_pt=0,
+                space_after_pt=REPORT_BODY_SPACE_PT,
+                line_spacing=REPORT_BODY_LINE_SPACING,
+            )
+        return
+    if kind == "callout":
+        add_callout(
+            document,
+            str(block.get("text", block.get("value", ""))),
+            font_size_pt=REPORT_BODY_PT,
+            font_color=REPORT_BODY_COLOR,
+            report=True,
+        )
+        return
+    if kind == "table":
+        table_spec = block.get("table")
+        if table_spec is None:
+            table_spec = {key: value for key, value in block.items() if key != "type"}
+        if table_spec.get("caption"):
+            caption = add_text(
+                document,
+                str(table_spec["caption"]),
+                "AESG Table Caption",
+                "Caption",
+                bold=False,
+                italic=False,
+                size_pt=REPORT_CAPTION_PT,
+                color=REPORT_CAPTION_COLOR,
+                space_before_pt=4.0,
+                space_after_pt=3.0,
+                line_spacing=1.0,
+            )
+            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        add_table(
+            document,
+            table_spec,
+            font_size_pt=REPORT_BODY_PT,
+            font_color=REPORT_BODY_COLOR,
+            report=True,
+        )
+        return
+    if kind in {"image", "figure"}:
+        image_spec = block.get("image")
+        if image_spec is None:
+            image_spec = {key: value for key, value in block.items() if key != "type"}
+        add_image(
+            document,
+            image_spec,
+            font_size_pt=REPORT_BODY_PT,
+            font_color=REPORT_BODY_COLOR,
+            line_spacing=REPORT_BODY_LINE_SPACING,
+        )
+        return
+    if kind in {"page-break", "pagebreak"}:
+        document.add_page_break()
+        return
+    raise ValueError(f"unsupported report block type: {kind}")
 
 
 def add_sections(
@@ -795,6 +917,10 @@ def add_sections(
                     num_id = OxmlElement("w:numId")
                     numbering.append(num_id)
                 num_id.set(qn("w:val"), "0")
+        if "blocks" in section:
+            for block in section.get("blocks", []):
+                add_report_block(document, block)
+            continue
         for paragraph in section.get("paragraphs", []):
             value = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
             add_text(

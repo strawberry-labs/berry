@@ -206,6 +206,7 @@ def validate_pdf(path: Path, errors: list[str], evidence: dict) -> None:
 
 def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     from docx import Document
+    from docx.oxml.ns import qn
 
     document = Document(path)
     text = docx_story_text(path)
@@ -300,6 +301,96 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
             errors.append(
                 f"report content top margins are {top_margins}; expected {expected_margins} DXA"
             )
+        heading_styles = {"aesg main heading", "aesg sub h1", "aesg h2"}
+        manual_heading_re = re.compile(
+            r"^\s*(?:\d+(?:\.\d+)*(?:[.)])?\s+|appendix\s+[a-z]\b)",
+            re.IGNORECASE,
+        )
+
+        def numbering_disabled(paragraph) -> bool:
+            properties = paragraph._p.find(qn("w:pPr"))
+            numbering = properties.find(qn("w:numPr")) if properties is not None else None
+            num_id = numbering.find(qn("w:numId")) if numbering is not None else None
+            return num_id is not None and num_id.get(qn("w:val")) == "0"
+
+        duplicate_numbering = [
+            paragraph.text.strip()
+            for paragraph in document.paragraphs
+            if paragraph.text.strip()
+            and paragraph.style is not None
+            and paragraph.style.name.casefold() in heading_styles
+            and manual_heading_re.match(paragraph.text)
+            and not numbering_disabled(paragraph)
+        ]
+        if duplicate_numbering:
+            errors.append(
+                "source-numbered AESG headings still inherit automatic numbering: "
+                + ", ".join(duplicate_numbering[:5])
+            )
+
+        list_intro_labels = {
+            "recommendations:",
+            "examples:",
+            "suggested priorities:",
+            "the locking strategy should include:",
+        }
+        list_style_names = {"aesg bullet", "list bullet", "aesg numbering", "list number"}
+        suspicious_lists: list[str] = []
+        paragraphs = document.paragraphs
+        for index, paragraph in enumerate(paragraphs):
+            label = paragraph.text.strip().casefold()
+            if label not in list_intro_labels:
+                continue
+            candidates = []
+            for following in paragraphs[index + 1 :]:
+                text_value = following.text.strip()
+                if not text_value:
+                    continue
+                style_name = following.style.name.casefold() if following.style else ""
+                if style_name in heading_styles or text_value.casefold() in list_intro_labels:
+                    break
+                if len(text_value) <= 180:
+                    candidates.append(following)
+                if len(candidates) >= 5 or len(text_value) > 180:
+                    break
+            if len(candidates) >= 3 and not any(
+                item.style is not None and item.style.name.casefold() in list_style_names
+                for item in candidates
+            ):
+                suspicious_lists.append(paragraph.text.strip())
+        if suspicious_lists:
+            errors.append(
+                "list-shaped report blocks are flattened as body paragraphs after: "
+                + ", ".join(suspicious_lists[:5])
+            )
+
+        empty_compliance_rows = 0
+        rag_values: list[str] = []
+        for table in document.tables:
+            if not table.rows:
+                continue
+            header = [cell.text.strip().casefold() for cell in table.rows[0].cells]
+            is_compliance = "requirement" in header and ("gap" in header or "rag" in header)
+            if not is_compliance:
+                continue
+            for row in table.rows[1:]:
+                values = [cell.text.strip() for cell in row.cells]
+                if all(not value for value in values):
+                    empty_compliance_rows += 1
+                if values and values[-1].casefold() in {"green", "amber", "red"}:
+                    rag_values.append(values[-1])
+        if empty_compliance_rows:
+            errors.append(
+                f"compliance table contains {empty_compliance_rows} empty scaffold rows"
+            )
+        if any(value not in {"Green", "Amber", "Red"} for value in rag_values):
+            errors.append("compliance-table RAG values are not consistently title-cased")
+        evidence["reportStructure"] = {
+            "sourceNumberedHeadings": len(duplicate_numbering),
+            "flattenedListBlocks": len(suspicious_lists),
+            "emptyComplianceRows": empty_compliance_rows,
+            "ragValues": sorted(set(rag_values)),
+        }
     else:
         check_style("Heading 1", 12, "008C95")
         check_style("Heading 2", 9, "53565A")

@@ -76,6 +76,46 @@ Supported report blocks include paragraphs, bullets, numbering, callouts,
 tables, images with captions/sources, page breaks, approval pages, and branded
 section dividers. Image objects accept `path`, `caption`, `source`, and
 `widthInches`. Table `widths` accepts one positive relative width per header.
+When source order matters, use an ordered `blocks` array instead of the legacy
+grouped fields. Supported block types are `paragraph`, `label`,
+`finding-header`, `bullets`, `numbered`, `callout`, `table`, `image`, and
+`page-break`. For example:
+
+```json
+{
+  "heading": "Immediate actions",
+  "level": 2,
+  "blocks": [
+    {"type": "paragraph", "text": "The assessment identified three actions."},
+    {"type": "label", "text": "Recommendations:"},
+    {"type": "bullets", "items": ["Action one", "Action two", "Action three"]},
+    {"type": "finding-header", "text": "Finding:"},
+    {"type": "paragraph", "text": "Supporting evidence and analysis."}
+  ]
+}
+```
+
+Do not stream every non-heading source paragraph into `paragraphs`. Classify
+source content before generation and preserve explicit list introductions,
+list items, finding labels, tables, and paragraph boundaries in `blocks`.
+Use real `bullets` or `numbered` blocks for list-shaped content; never imitate a
+list with line breaks or consecutive body paragraphs. `Objective:` normally
+introduces one prose statement, not a list. Treat `Recommendations:`,
+`Examples:`, `Suggested priorities:`, and `The locking strategy should
+include:` as list signals when meaningful items follow. If a source-authored
+heading already includes a numeric or Appendix label, set
+`headingNumbered: false` so the template does not add a second prefix.
+
+Keep report-specific editorial cleanup outside the generic skill. Remove
+unambiguous placeholders and window-title fragments, but do not globally strip
+people's names or infer section renumbering. Flag duplicate section labels,
+ambiguous anchors, and uncertain editorial notes for review.
+
+Validation fails when source-numbered headings still inherit template
+numbering, list-shaped blocks remain flat body paragraphs, compliance tables
+retain empty scaffold rows, or RAG values use inconsistent case. Fix the spec
+or run the repair pass, then validate again before screenshot QA.
+
 Use `pattern: "images"` for the supplied three-column evidence table (white
 header with teal labels and alternating body rows) and `pattern: "monitoring"`
 for the landscape monitoring table (teal header, grey banding, and dark grouped

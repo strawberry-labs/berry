@@ -45,6 +45,10 @@ SOURCE_TOKEN_RE = re.compile(
     r"\s*\[[^\]]+\|\s*(?:Word|Excel|PowerPoint)\]",
     re.IGNORECASE,
 )
+MANUAL_HEADING_PREFIX_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*(?:[.)])?\s+|appendix\s+[a-z]\b)",
+    re.IGNORECASE,
+)
 THEME_FONT_ATTRS = ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme", "csTheme")
 FONT_SLOTS = ("ascii", "hAnsi", "eastAsia", "cs")
 
@@ -165,6 +169,23 @@ def set_paragraph_contract(
     for run in paragraph.iter(W("r")):
         if run.find(W("t")) is not None or run.find(W("instrText")) is not None:
             set_run_contract(run, size=size, color=color, bold=bold)
+
+
+def suppress_style_numbering(paragraph) -> None:
+    """Disable heading-style numbering when the source text already has a label."""
+
+    ppr = paragraph.find(W("pPr"))
+    if ppr is None:
+        ppr = etree.Element(W("pPr"))
+        paragraph.insert(0, ppr)
+    numbering = ppr.find(W("numPr"))
+    if numbering is None:
+        numbering = etree.Element(W("numPr"))
+        ppr.append(numbering)
+    ilvl = ensure_child(numbering, "ilvl")
+    ilvl.set(W("val"), "0")
+    num_id = ensure_child(numbering, "numId")
+    num_id.set(W("val"), "0")
 
 
 def clean_source_tokens(root) -> None:
@@ -290,10 +311,37 @@ def remove_gap_table_placeholder_rows(root) -> None:
                 table.remove(row)
 
 
+def normalise_compliance_rag_values(root) -> None:
+    values = {"green": "Green", "amber": "Amber", "red": "Red"}
+    for table in root.iter(W("tbl")):
+        rows = table.findall(W("tr"))
+        if not rows:
+            continue
+        headers = [cell_text(cell).casefold() for cell in rows[0].findall(W("tc"))]
+        if "requirement" not in headers or "rag" not in headers:
+            continue
+        rag_index = headers.index("rag")
+        for row in rows[1:]:
+            cells = row.findall(W("tc"))
+            if rag_index >= len(cells):
+                continue
+            cell = cells[rag_index]
+            canonical = values.get(cell_text(cell).casefold())
+            if canonical is None:
+                continue
+            text_nodes = list(cell.iter(W("t")))
+            if not text_nodes:
+                continue
+            text_nodes[0].text = canonical
+            for text_node in text_nodes[1:]:
+                text_node.text = ""
+
+
 def normalise_report_content(root) -> None:
     clean_source_tokens(root)
     split_collapsed_body_paragraphs(root)
     remove_gap_table_placeholder_rows(root)
+    normalise_compliance_rag_values(root)
     for table_index, table in enumerate(root.iter(W("tbl"))):
         rows = table.findall(W("tr"))
         is_gap_table = bool(rows and "requirement" in cell_text(rows[0]).casefold())
@@ -360,6 +408,8 @@ def normalise_report_content(root) -> None:
             keep_next=size > BODY_SIZE or "caption" in sid,
             bold=None,
         )
+        if size > BODY_SIZE and MANUAL_HEADING_PREFIX_RE.match(paragraph_text(paragraph)):
+            suppress_style_numbering(paragraph)
 
 
 def normalise_document_geometry(root) -> None:
