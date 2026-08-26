@@ -31,6 +31,8 @@ import {
   CAPABILITY_PERMISSION_DEFAULTS_MIGRATION,
   CLOUD_INITIAL_MIGRATION,
   CONVERSATION_KIND_AND_GENERAL_WORKSPACES_MIGRATION,
+  CONNECTOR_APPROVAL_WORKFLOW_MIGRATION,
+  CONNECTOR_APPROVAL_REQUESTS_MIGRATION,
   CONNECTORS_MIGRATION,
   CLOUD_SCHEMA_SQL,
   CLOUD_SCHEMA_TABLES,
@@ -189,7 +191,7 @@ describe("cloud postgres schema", () => {
     expect(USAGE_ROLLUPS_MIGRATION).toContain("UNIQUE (tenant_id, bucket_start, granularity, feature, provider, model, status)");
     expect(USAGE_ROLLUPS_MIGRATION).toContain("usage_rollups_nonnegative_counts");
     expect(USAGE_ROLLUPS_MIGRATION).not.toContain("ALTER TABLE usage_events");
-    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+    expect(cloudMigrations.map((migration) => migration.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]);
   });
 
   it("replaces legacy checkpoint uniqueness with the algorithm-version key", () => {
@@ -377,6 +379,29 @@ describe("cloud postgres schema", () => {
     expect(CONNECTORS_MIGRATION).toContain("credential_envelope jsonb");
     expect(CONNECTORS_MIGRATION).toContain("PRIMARY KEY (tenant_id, state_digest)");
     expect(CONNECTORS_MIGRATION).not.toMatch(/client_secret\s+text|refresh_token\s+text|access_token\s+text/);
+  });
+
+  it("adds an online organization approval queue for custom MCP servers", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 68)).toMatchObject({
+      name: "connector_approval_workflow_v1",
+      transactional: false,
+      onlineIndexName: "organization_connectors_approval_queue_idx",
+    });
+    expect(CONNECTOR_APPROVAL_WORKFLOW_MIGRATION).toContain("approval_status");
+    expect(CONNECTOR_APPROVAL_WORKFLOW_MIGRATION).toContain("requested_by");
+    expect(CONNECTOR_APPROVAL_WORKFLOW_MIGRATION).toContain("reviewed_by");
+    expect(CONNECTOR_APPROVAL_WORKFLOW_MIGRATION).toContain("CREATE INDEX CONCURRENTLY");
+  });
+
+  it("tracks each member who requests an MCP server behind tenant RLS", () => {
+    expect(cloudMigrations.find((migration) => migration.id === 69)).toMatchObject({
+      name: "connector_approval_requests_v1",
+      transactional: false,
+    });
+    expect(CONNECTOR_APPROVAL_REQUESTS_MIGRATION).toContain("CREATE TABLE IF NOT EXISTS connector_approval_requests");
+    expect(CONNECTOR_APPROVAL_REQUESTS_MIGRATION).toContain("PRIMARY KEY (tenant_id, connector_id, user_id)");
+    expect(CONNECTOR_APPROVAL_REQUESTS_MIGRATION).toContain("CREATE POLICY connector_approval_requests_tenant_isolation");
+    expect(CONNECTOR_APPROVAL_REQUESTS_MIGRATION).toContain("requested_by IS NOT NULL");
   });
 
   it("removes obsolete server-side queued follow-up storage", () => {

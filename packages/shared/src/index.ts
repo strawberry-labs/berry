@@ -2975,6 +2975,8 @@ export const ConnectorConnectionStatusSchema = z.enum(["not_connected", "connect
 export type ConnectorConnectionStatus = z.infer<typeof ConnectorConnectionStatusSchema>;
 export const ConnectorPublicationStatusSchema = z.enum(["draft", "published"]);
 export type ConnectorPublicationStatus = z.infer<typeof ConnectorPublicationStatusSchema>;
+export const ConnectorApprovalStatusSchema = z.enum(["pending", "approved", "rejected"]);
+export type ConnectorApprovalStatus = z.infer<typeof ConnectorApprovalStatusSchema>;
 export const ConnectorSchema = z.object({
   id: z.string(),
   key: z.string(),
@@ -2988,6 +2990,8 @@ export const ConnectorSchema = z.object({
   authStrategy: ConnectorAuthStrategySchema,
   authType: ConnectorAuthTypeSchema,
   publicationStatus: ConnectorPublicationStatusSchema,
+  approvalStatus: ConnectorApprovalStatusSchema.default("approved"),
+  serverApproved: z.boolean().default(false),
   transport: z.enum(["http-sse", "streamable-http"]).nullable(),
   url: z.string().url().nullable(),
   websiteUrl: z.string().url().nullable().optional(),

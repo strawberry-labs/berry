@@ -31,6 +31,7 @@ export {
   completeRemoteMcpOAuth,
   refreshRemoteMcpOAuth,
   startRemoteMcpOAuth,
+  validateRemoteMcpOAuthIssuer,
   type McpOAuthStartResult,
   type McpOAuthState,
 } from "./mcp-oauth.ts";

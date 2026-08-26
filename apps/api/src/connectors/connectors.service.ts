@@ -1,11 +1,12 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { BadRequestException, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import {
   completeRemoteMcpOAuth,
   discoverRemoteMcpTools,
   refreshRemoteMcpOAuth,
   resolvePublicRemoteUrl,
   startRemoteMcpOAuth,
+  validateRemoteMcpOAuthIssuer,
   type McpOAuthState,
   type McpServerSpec,
 } from "@berry/local-agent";
@@ -73,6 +74,10 @@ type ConnectorRow = {
   endpoint_url: string | null;
   auth_type: "none" | "bearer" | "oauth";
   publication_status: "draft" | "published";
+  approval_status?: "pending" | "approved" | "rejected";
+  requested_by?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: Date | string | null;
   shared_credential_envelope: unknown;
   config: unknown;
   created_at: Date | string;
@@ -137,6 +142,7 @@ type CustomConnectorConfig = {
   websiteUrl?: string;
   privacyPolicyUrl?: string;
   lastDiscoveredAt?: string;
+  serverApproved?: boolean;
 };
 
 @Injectable()
@@ -161,6 +167,108 @@ export class ConnectorsService {
     });
     const custom = rows.filter((row) => row.kind === "custom_mcp").map((row) => this.#connectorView(row, byConnector, userId, true));
     return ConnectorSchema.array().parse([...builtIns, ...custom]);
+  }
+
+  async listCustomRequests(tenantId: string, userId: string): Promise<Connector[]> {
+    const rows = await this.database.withTenant(tenantId, (db) => db.query<{ id: string }>(`
+      SELECT request.connector_id AS id
+      FROM connector_approval_requests AS request
+      JOIN organization_connectors AS connector
+        ON connector.tenant_id=request.tenant_id AND connector.id=request.connector_id
+      WHERE request.user_id=$1 AND connector.kind='custom_mcp'
+      ORDER BY request.requested_at DESC
+    `, [userId]));
+    const visible = new Set(rows.map((row) => row.id));
+    return (await this.list(tenantId, userId)).filter((connector) => visible.has(connector.id));
+  }
+
+  async requestCustom(tenantId: string, userId: string, input: { url: string }): Promise<Connector> {
+    const url = await safeRemoteUrl(input.url, this.env.NODE_ENV !== "production");
+    const id = await this.database.withTenant(tenantId, async (db) => {
+      await db.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        [`berry-custom-mcp-request:${tenantId}:${url}`],
+      );
+      const existingRows = await db.query<ConnectorRow>(`
+        SELECT * FROM organization_connectors
+        WHERE kind='custom_mcp' AND endpoint_url=$1
+        ORDER BY CASE
+          WHEN approval_status='approved' AND publication_status='published' AND enabled=true THEN 0
+          WHEN approval_status='pending' THEN 1
+          WHEN approval_status='rejected' THEN 2
+          ELSE 3
+        END, created_at
+        LIMIT 1
+      `, [url]);
+      const existing = existingRows[0];
+      if (existing) {
+        const approvedAndAvailable = (existing.approval_status ?? "approved") === "approved"
+          && existing.publication_status === "published"
+          && existing.enabled;
+        if (approvedAndAvailable) return existing.id;
+        if (existing.approval_status === "pending") {
+          await this.#recordCustomRequest(db, tenantId, existing.id, userId);
+          return existing.id;
+        }
+        if (existing.approval_status === "rejected") {
+          await db.execute(`
+            UPDATE organization_connectors
+            SET approval_status='pending', requested_by=$1, reviewed_by=NULL, reviewed_at=NULL,
+                enabled=false, publication_status='draft',
+                config=$2::jsonb, updated_at=now()
+            WHERE id=$3
+          `, [userId, JSON.stringify({ ...customConfig(existing.config), serverApproved: false }), existing.id]);
+          await this.#recordCustomRequest(db, tenantId, existing.id, userId);
+          return existing.id;
+        }
+        if ((existing.approval_status ?? "approved") === "approved") {
+          throw new ConflictException("This MCP server already exists but is not available. Ask an administrator to enable and publish it.");
+        }
+      }
+
+      const createdId = `connector_mcp_${randomUUID()}`;
+      await db.execute(`
+        INSERT INTO organization_connectors (
+          id, tenant_id, connector_key, kind, provider, name, description, enabled,
+          max_access_level, auth_strategy, transport, endpoint_url, auth_type,
+          publication_status, config, created_by, approval_status, requested_by
+        ) VALUES (
+          $1,$2::uuid,$3,'custom_mcp','mcp',$4,$5,false,
+          'full','personal','streamable-http',$6,'oauth',
+          'draft',$7::jsonb,$8,'pending',$8
+        )
+      `, [
+        createdId,
+        tenantId,
+        `custom-mcp-${randomUUID()}`,
+        mcpNameFromUrl(url),
+        `Streamable HTTP MCP server at ${new URL(url).hostname}.`,
+        url,
+        JSON.stringify({ serverApproved: false } satisfies CustomConnectorConfig),
+        userId,
+      ]);
+      await this.#recordCustomRequest(db, tenantId, createdId, userId);
+      return createdId;
+    });
+    return this.#find(await this.list(tenantId, userId), id);
+  }
+
+  async reviewCustomRequest(tenantId: string, userId: string, id: string, decision: "approved" | "rejected"): Promise<Connector> {
+    const approved = decision === "approved";
+    const reviewed = await this.database.withTenant(tenantId, (db) => db.query<{ id: string }>(`
+      UPDATE organization_connectors
+      SET approval_status=$1, reviewed_by=$2, reviewed_at=now(),
+          enabled=$3, publication_status=$4,
+          config=COALESCE(config, '{}'::jsonb) || jsonb_build_object('serverApproved', $3::boolean),
+          updated_at=now()
+      WHERE id=$5 AND kind='custom_mcp' AND approval_status='pending'
+      RETURNING id
+    `, [decision, userId, approved, approved ? "published" : "draft", id]));
+    if (!reviewed[0]) {
+      await this.#row(tenantId, id);
+      throw new BadRequestException("This MCP request is no longer pending");
+    }
+    return this.#find(await this.list(tenantId, userId), id);
   }
 
   async googleConfiguration(tenantId: string) {
@@ -377,6 +485,7 @@ export class ConnectorsService {
       ? await this.#seal(input.personalCredential.trim(), connectionContext(tenantId, id, userId))
       : null;
     const config: CustomConnectorConfig = {
+      ...(!authorityChanged && priorConfig.serverApproved !== undefined ? { serverApproved: priorConfig.serverApproved } : {}),
       ...(!authorityChanged && priorConfig.discoveredTools ? { discoveredTools: priorConfig.discoveredTools } : {}),
       ...(!authorityChanged && priorConfig.allowedTools ? { allowedTools: priorConfig.allowedTools } : {}),
       ...(!authorityChanged && priorConfig.lastDiscoveredAt ? { lastDiscoveredAt: priorConfig.lastDiscoveredAt } : {}),
@@ -413,6 +522,7 @@ export class ConnectorsService {
   async discoverCustom(tenantId: string, userId: string, id: string): Promise<Connector> {
     const row = await this.#row(tenantId, id);
     if (row.kind !== "custom_mcp" || !row.endpoint_url || !row.transport) throw new BadRequestException("Custom MCP is incomplete");
+    if (customConfig(row.config).serverApproved) throw new BadRequestException("Organization catalog servers discover their tools through each user's connection");
     const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
     const credential = await this.#customCredential(tenantId, userId, row, false);
     const tools = await discoverRemoteMcpTools({ id: row.id, name: row.name, url: endpoint, transport: row.transport, ...(credential ? { credential } : {}) });
@@ -425,7 +535,9 @@ export class ConnectorsService {
   async publishCustom(tenantId: string, userId: string, id: string, input: { enabled: boolean; allowedTools?: string[] | undefined }): Promise<Connector> {
     const row = await this.#row(tenantId, id);
     if (row.kind !== "custom_mcp") throw new BadRequestException("Only custom MCP connectors can be published");
+    if ((row.approval_status ?? "approved") !== "approved") throw new BadRequestException("Approve this MCP server before publishing it");
     const config = customConfig(row.config);
+    if (config.serverApproved) throw new BadRequestException("Organization catalog servers are published by the approval workflow");
     if (!config.discoveredTools?.length) throw new BadRequestException("Discover and review MCP tools before publishing");
     const discovered = new Set(config.discoveredTools.map((tool) => tool.name));
     const allowedTools = [...new Set(input.allowedTools ?? config.allowedTools ?? [])];
@@ -443,6 +555,7 @@ export class ConnectorsService {
 
   async connectBearer(tenantId: string, userId: string, id: string, credential: string): Promise<Connector> {
     const row = await this.#row(tenantId, id);
+    if ((row.approval_status ?? "approved") !== "approved") throw new BadRequestException("This MCP server is awaiting organization approval");
     if (!row.enabled) throw new BadRequestException("This connector is disabled by the administrator");
     if (row.publication_status !== "published") throw new BadRequestException("This connector has not been published by the administrator");
     if (row.kind !== "custom_mcp" || row.auth_type !== "bearer" || row.auth_strategy !== "personal") throw new BadRequestException("This connector does not accept a personal bearer token");
@@ -564,11 +677,13 @@ export class ConnectorsService {
   async startCustomOAuth(tenantId: string, userId: string, id: string, allowShared = false, redirectAfter = "/settings/connectors") {
     const row = await this.#row(tenantId, id);
     if (row.kind !== "custom_mcp" || row.auth_type !== "oauth" || !row.endpoint_url) throw new BadRequestException("This connector does not use MCP OAuth");
+    if ((row.approval_status ?? "approved") !== "approved") throw new BadRequestException("This MCP server is awaiting organization approval");
     if (row.auth_strategy === "shared" && !allowShared) throw new BadRequestException("Only an administrator can authorize this organization-wide connector");
     if (!allowShared && (row.publication_status !== "published" || !row.enabled)) throw new BadRequestException("This connector is not available to members");
     const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
     const state = randomBytes(32).toString("base64url"); const stateDigest = sha256(state); const config = customConfig(row.config); const callbackUrl = this.mcpCallbackUrl();
-    const started = await startRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl, requestState: state, ...(config.oauthScope ? { scope: config.oauthScope } : {}) });
+    const clientMetadataUrl = this.mcpClientMetadataUrl();
+    const started = await startRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl, requestState: state, ...(config.oauthScope ? { scope: config.oauthScope } : {}), ...(clientMetadataUrl ? { clientMetadataUrl } : {}) });
     const envelope = await this.#seal(JSON.stringify({ type: "mcp", state: started.state }), oauthStateContext(tenantId, stateDigest));
     const expiresAt = new Date(Date.now() + 10 * 60_000);
     await this.database.withTenant(tenantId, async (db) => {
@@ -581,19 +696,22 @@ export class ConnectorsService {
     return { connectorId: row.id, state, authorizationUrl: started.authorizationUrl, expiresAt: expiresAt.toISOString() };
   }
 
-  async completeCustomOAuth(tenantId: string, userId: string, input: { state: string; code?: string; error?: string }) {
+  async completeCustomOAuth(tenantId: string, userId: string, input: { state: string; code?: string; error?: string; issuer?: string }) {
     const stateDigest = sha256(input.state);
     const states = await this.database.withTenant(tenantId, (db) => db.query<OAuthStateRow>("UPDATE connector_oauth_states SET consumed_at=now() WHERE state_digest=$1 AND user_id=$2 AND consumed_at IS NULL AND expires_at>now() RETURNING *", [stateDigest, userId]));
     const flow = states[0]; if (!flow) throw new BadRequestException("MCP OAuth state is invalid or expired");
     try {
-      if (input.error) throw new BadRequestException(`MCP authorization failed: ${input.error}`); if (!input.code) throw new BadRequestException("MCP authorization code is missing");
       const row = await this.#row(tenantId, flow.connector_id); if (row.kind !== "custom_mcp" || row.auth_type !== "oauth" || !row.endpoint_url) throw new BadRequestException("OAuth state references an invalid MCP connector");
       const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
       const envelope = connectorEnvelope(flow.code_verifier_envelope); if (!envelope) throw new BadRequestException("MCP OAuth state is invalid");
       const stored = JSON.parse(await this.#open(envelope, oauthStateContext(tenantId, stateDigest))) as { type?: string; state?: McpOAuthState };
       if (stored.type !== "mcp" || !stored.state) throw new BadRequestException("MCP OAuth state is invalid");
+      validateRemoteMcpOAuthIssuer(stored.state, input.issuer);
+      if (input.error) throw new BadRequestException(`MCP authorization failed: ${input.error}`);
+      if (!input.code) throw new BadRequestException("MCP authorization code is missing");
       const config = customConfig(row.config);
-      const completed = await completeRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl: this.mcpCallbackUrl(), requestState: input.state, authorizationCode: input.code, state: stored.state, ...(config.oauthScope ? { scope: config.oauthScope } : {}) });
+      const clientMetadataUrl = this.mcpClientMetadataUrl();
+      const completed = await completeRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl: this.mcpCallbackUrl(), requestState: input.state, authorizationCode: input.code, state: stored.state, ...(config.oauthScope ? { scope: config.oauthScope } : {}), ...(clientMetadataUrl ? { clientMetadataUrl } : {}) });
       const credential: StoredMcpOAuth = { state: completed, obtainedAt: new Date().toISOString() };
       if (row.auth_strategy === "shared") {
         const shared = await this.#seal(JSON.stringify(credential), sharedCredentialContext(tenantId, row.id));
@@ -602,6 +720,15 @@ export class ConnectorsService {
         const personal = await this.#seal(JSON.stringify(credential), connectionContext(tenantId, row.id, userId));
         await this.#upsertConnection(tenantId, row.id, userId, row.max_access_level, personal, null, null, flow.requested_scopes, null);
       }
+      if (config.serverApproved && row.transport && completed.tokens?.access_token) {
+        try {
+          const tools = await discoverRemoteMcpTools({ id: row.id, name: row.name, url: endpoint, transport: row.transport, credential: completed.tokens.access_token });
+          const next: CustomConnectorConfig = { ...config, discoveredTools: tools, lastDiscoveredAt: new Date().toISOString() };
+          await this.database.withTenant(tenantId, (db) => db.execute("UPDATE organization_connectors SET config=$1::jsonb, updated_at=now() WHERE id=$2", [JSON.stringify(next), row.id]));
+        } catch {
+          // Authorization succeeded. Live tool discovery will retry when the connector is used.
+        }
+      }
       return { redirectAfter: flow.redirect_after, connectorId: row.id };
     } finally {
       await this.database.withTenant(tenantId, (db) => db.execute("DELETE FROM connector_oauth_states WHERE state_digest=$1", [stateDigest]));
@@ -609,7 +736,7 @@ export class ConnectorsService {
   }
 
   async runtime(tenantId: string, userId: string, context: { taskId?: string; sessionId?: string } = {}): Promise<McpServerSpec[]> {
-    const rows = await this.database.withTenant(tenantId, (db) => db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE enabled=true AND publication_status='published' ORDER BY kind, name"));
+    const rows = await this.database.withTenant(tenantId, (db) => db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE enabled=true AND publication_status='published' AND approval_status='approved' ORDER BY kind, name"));
     const servers: McpServerSpec[] = [];
     for (const row of rows) {
       if (isGoogleKey(row.connector_key)) {
@@ -650,9 +777,12 @@ export class ConnectorsService {
       }
       if (row.auth_type !== "none" && !credential) continue;
       const config = customConfig(row.config);
+      const serverApproved = config.serverApproved === true;
       const approved = new Set(config.allowedTools ?? []);
-      const cachedTools = (config.discoveredTools ?? []).filter((tool) => approved.has(tool.name));
-      if (!cachedTools.length) continue;
+      const cachedTools = serverApproved
+        ? config.discoveredTools ?? []
+        : (config.discoveredTools ?? []).filter((tool) => approved.has(tool.name));
+      if (!serverApproved && !cachedTools.length) continue;
       servers.push({
         id: row.id,
         name: row.name,
@@ -665,7 +795,7 @@ export class ConnectorsService {
         trusted: true,
         credentialKey: `connector:${row.id}:${row.auth_strategy === "shared" ? "shared" : userId}`,
         cachedTools,
-        allowedTools: cachedTools.map((tool) => tool.name),
+        ...(!serverApproved ? { allowedTools: cachedTools.map((tool) => tool.name) } : {}),
         ...(credential ? { credential } : {}),
       });
     }
@@ -766,6 +896,8 @@ export class ConnectorsService {
       authStrategy: row.auth_strategy,
       authType: row.auth_type,
       publicationStatus: row.publication_status,
+      approvalStatus: row.approval_status ?? "approved",
+      serverApproved: config.serverApproved === true,
       transport: row.transport,
       url: row.endpoint_url,
       websiteUrl: googleKey ? BUILT_INS[googleKey].websiteUrl : config.websiteUrl ?? null,
@@ -777,8 +909,16 @@ export class ConnectorsService {
       accountEmail: connection?.account_email ?? null,
       grantedScopes: connection?.granted_scopes ?? [],
       services: googleKey ? GOOGLE_CONNECTOR_SERVICES[googleKey] : ["Custom MCP"],
-      tools: googleKey ? googleToolCatalog(googleKey, visibleGoogleAccessLevel, connection?.granted_scopes?.length ? connection.granted_scopes : undefined).map((item) => item.name) : config.allowedTools ?? [],
-      limitations: google ? [] : ["The administrator's exact tool allowlist is enforced, and Berry requires approval for every custom MCP call. Server-supplied safety annotations are not trusted."],
+      tools: googleKey
+        ? googleToolCatalog(googleKey, visibleGoogleAccessLevel, connection?.granted_scopes?.length ? connection.granted_scopes : undefined).map((item) => item.name)
+        : config.serverApproved
+          ? (config.discoveredTools ?? []).map((tool) => tool.name)
+          : config.allowedTools ?? [],
+      limitations: google
+        ? []
+        : [config.serverApproved
+            ? "The organization approved this MCP server. Its live tool catalog may change, and server-supplied safety annotations are not trusted."
+            : "The administrator's exact tool allowlist is enforced, and Berry requires approval for every custom MCP call. Server-supplied safety annotations are not trusted."],
       createdAt: virtual(row.created_at),
       updatedAt: virtual(row.updated_at),
     };
@@ -812,6 +952,15 @@ export class ConnectorsService {
     const rows = await this.database.withTenant(tenantId, (db) => db.query<ConnectorRow>("SELECT * FROM organization_connectors WHERE id=$1 LIMIT 1", [id]));
     if (!rows[0]) throw new NotFoundException("Connector not found");
     return rows[0];
+  }
+
+  async #recordCustomRequest(db: SqlExecutor, tenantId: string, connectorId: string, userId: string): Promise<void> {
+    await db.execute(`
+      INSERT INTO connector_approval_requests (tenant_id, connector_id, user_id, requested_at)
+      VALUES ($1::uuid,$2,$3,now())
+      ON CONFLICT (tenant_id, connector_id, user_id)
+      DO UPDATE SET requested_at=EXCLUDED.requested_at
+    `, [tenantId, connectorId, userId]);
   }
 
   async #connection(tenantId: string, connectorId: string, userId: string): Promise<ConnectionRow | null> {
@@ -971,6 +1120,21 @@ export class ConnectorsService {
   #publicApiBase(): string { return this.env.BERRY_AUTH_BASE_URL?.trim() || "http://localhost:3001"; }
   #internalMcpUrl(key: GoogleConnectorKey): string { return new URL(`/v1/connectors/mcp/${key}`, this.#publicApiBase()).toString(); }
   mcpCallbackUrl(): string { return new URL("/v1/connectors/mcp/oauth/callback", this.#publicApiBase()).toString(); }
+  mcpClientMetadataUrl(): string | undefined {
+    const url = new URL("/v1/connectors/mcp/oauth/client-metadata", this.#publicApiBase());
+    return url.protocol === "https:" ? url.toString() : undefined;
+  }
+  mcpClientMetadata() {
+    const clientId = new URL("/v1/connectors/mcp/oauth/client-metadata", this.#publicApiBase()).toString();
+    return {
+      client_id: clientId,
+      client_name: "Berry Connectors",
+      redirect_uris: [this.mcpCallbackUrl()],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    };
+  }
   #signSession(session: ConnectorSession): string {
     const payload = Buffer.from(JSON.stringify(session)).toString("base64url");
     const signature = createHmac("sha256", Buffer.from(this.#encryptionKey(), "base64")).update(payload).digest("base64url");
@@ -994,6 +1158,12 @@ export class ConnectorsService {
 function virtualBuiltIn(key: GoogleConnectorKey): ConnectorRow {
   const item = BUILT_INS[key];
   return { id: item.id, connector_key: key, kind: "app", provider: "google", name: item.name, description: item.description, enabled: false, max_access_level: "read", workspace_access_mode: key === "google-workspace" ? "selected_files" : null, auth_strategy: "personal", transport: null, endpoint_url: null, auth_type: "oauth", publication_status: "published", shared_credential_envelope: null, config: {}, created_at: "", updated_at: "" };
+}
+function mcpNameFromUrl(raw: string): string {
+  const hostname = new URL(raw).hostname.replace(/^www\./, "");
+  const label = hostname.split(".").filter(Boolean).slice(0, -1).join(" ") || hostname;
+  const words = label.split(/[-_.\s]+/).filter(Boolean).map((word) => word[0]!.toUpperCase() + word.slice(1));
+  return `${words.join(" ") || "Custom"} MCP`.slice(0, 100);
 }
 function virtual(value: Date | string): string | null { if (!value) return null; return new Date(value).toISOString(); }
 function isGoogleKey(value: string): value is GoogleConnectorKey { return (GOOGLE_KEYS as readonly string[]).includes(value); }

@@ -1,5 +1,6 @@
 import {
   auth,
+  extractWWWAuthenticateParams,
   refreshAuthorization,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
@@ -33,7 +34,9 @@ class PersistedOAuthProvider implements OAuthClientProvider {
     private readonly oauthState: McpOAuthState,
     private readonly requestState: string,
     initialClientInformation?: OAuthClientInformationMixed,
+    clientMetadataUrl?: string,
   ) {
+    if (clientMetadataUrl) (this as OAuthClientProvider).clientMetadataUrl = clientMetadataUrl;
     if (initialClientInformation && !this.oauthState.clientInformation) {
       this.oauthState.clientInformation = initialClientInformation;
     }
@@ -63,19 +66,23 @@ export async function startRemoteMcpOAuth(input: {
   requestState: string;
   scope?: string;
   clientInformation?: OAuthClientInformationMixed;
+  clientMetadataUrl?: string;
 }): Promise<McpOAuthStartResult> {
   const serverUrl = validatedRemoteMcpUrl(input.serverUrl);
+  const challenge = await discoverMcpOAuthChallenge(serverUrl);
   const state: McpOAuthState = {};
   const provider = new PersistedOAuthProvider(
     input.callbackUrl,
-    clientMetadata(input.callbackUrl),
+    clientMetadata(input.callbackUrl, input.scope),
     state,
     input.requestState,
     input.clientInformation,
+    input.clientMetadataUrl,
   );
   const result = await auth(provider, {
     serverUrl,
-    ...(input.scope ? { scope: input.scope } : {}),
+    ...(challenge.scope ? { scope: challenge.scope } : {}),
+    ...(challenge.resourceMetadataUrl ? { resourceMetadataUrl: challenge.resourceMetadataUrl } : {}),
     fetchFn: guardedOAuthFetch,
   });
   if (result !== "REDIRECT" || !provider.authorizationUrl) {
@@ -92,18 +99,20 @@ export async function completeRemoteMcpOAuth(input: {
   authorizationCode: string;
   state: McpOAuthState;
   scope?: string;
+  clientMetadataUrl?: string;
 }): Promise<McpOAuthState> {
   const serverUrl = validatedRemoteMcpUrl(input.serverUrl);
   const provider = new PersistedOAuthProvider(
     input.callbackUrl,
-    clientMetadata(input.callbackUrl),
+    clientMetadata(input.callbackUrl, input.scope),
     input.state,
     input.requestState,
+    undefined,
+    input.clientMetadataUrl,
   );
   const result = await auth(provider, {
     serverUrl,
     authorizationCode: input.authorizationCode,
-    ...(input.scope ? { scope: input.scope } : {}),
     fetchFn: guardedOAuthFetch,
   });
   if (result !== "AUTHORIZED" || !input.state.tokens?.access_token) {
@@ -111,6 +120,17 @@ export async function completeRemoteMcpOAuth(input: {
   }
   delete input.state.codeVerifier;
   return input.state;
+}
+
+export function validateRemoteMcpOAuthIssuer(state: McpOAuthState, issuer: string | undefined): void {
+  const metadata = state.discoveryState?.authorizationServerMetadata as ({ issuer?: unknown; authorization_response_iss_parameter_supported?: unknown } | undefined);
+  const expected = typeof metadata?.issuer === "string" ? metadata.issuer : null;
+  const required = metadata?.authorization_response_iss_parameter_supported === true;
+  if (!issuer) {
+    if (required) throw new Error("MCP OAuth response did not include the authorization server issuer");
+    return;
+  }
+  if (!expected || issuer !== expected) throw new Error("MCP OAuth response issuer does not match the discovered authorization server");
 }
 
 export async function refreshRemoteMcpOAuth(input: {
@@ -138,16 +158,45 @@ export async function refreshRemoteMcpOAuth(input: {
   return input.state;
 }
 
-function clientMetadata(callbackUrl: string): OAuthClientMetadata {
+function clientMetadata(callbackUrl: string, scope?: string): OAuthClientMetadata {
   return {
     client_name: "Berry Connectors",
     redirect_uris: [callbackUrl],
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
     token_endpoint_auth_method: "none",
+    ...(scope ? { scope } : {}),
   };
 }
 
 async function guardedOAuthFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   return createPublicRemoteFetch({ redirect: "manual", timeoutMs: 15_000 })(input, init);
+}
+
+async function discoverMcpOAuthChallenge(serverUrl: string | URL): Promise<{ resourceMetadataUrl?: URL; scope?: string }> {
+  let response: Response;
+  try {
+    response = await guardedOAuthFetch(serverUrl, {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-protocol-version": "2025-11-25",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "berry-oauth-discovery", method: "tools/list", params: {} }),
+    });
+  } catch {
+    return {};
+  }
+  try {
+    if (response.status !== 401) return {};
+    const challenge = extractWWWAuthenticateParams(response);
+    if (challenge.resourceMetadataUrl) await resolvePublicRemoteUrl(challenge.resourceMetadataUrl.toString());
+    return {
+      ...(challenge.resourceMetadataUrl ? { resourceMetadataUrl: challenge.resourceMetadataUrl } : {}),
+      ...(challenge.scope ? { scope: challenge.scope } : {}),
+    };
+  } finally {
+    await response.body?.cancel().catch(() => undefined);
+  }
 }

@@ -72,6 +72,8 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
   const googleApps = React.useMemo(() => resource.data.connectors.filter((item) => item.provider === "google"), [resource.data.connectors]);
   const googleConfigured = resource.data.google.configured || googleApps.some((connector) => connector.configured);
   const custom = React.useMemo(() => resource.data.connectors.filter((item) => item.kind === "custom_mcp"), [resource.data.connectors]);
+  const pendingRequests = React.useMemo(() => custom.filter((item) => item.approvalStatus === "pending"), [custom]);
+  const approvedCustom = React.useMemo(() => custom.filter((item) => item.approvalStatus === "approved"), [custom]);
   const [setupOpen, setSetupOpen] = React.useState(false);
   const [customOpen, setCustomOpen] = React.useState(false);
   const [pendingDelete, setPendingDelete] = React.useState<Connector | null>(null);
@@ -165,6 +167,16 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
       resource.retry();
     } catch (cause) { toast.error(message(cause)); } finally { setBusy(null); }
   };
+  const reviewRequest = async (connector: Connector, decision: "approve" | "reject") => {
+    if (!client) return;
+    setBusy(`${connector.id}:${decision}`);
+    try {
+      if (decision === "approve") await client.approveOrganizationConnectorRequest(tenantId, connector.id);
+      else await client.rejectOrganizationConnectorRequest(tenantId, connector.id);
+      toast.success(decision === "approve" ? `${connector.name} is now available to the organization` : `${connector.name} was not approved`);
+      resource.retry();
+    } catch (cause) { toast.error(message(cause)); } finally { setBusy(null); }
+  };
 
   return <ManagementPage title="Connectors" eyebrow="Organization administration" description="Configure native apps and publish reviewed MCP servers to everyone in your organization." actions={<>
     <Button variant="outline" disabled={!canConfigure} onClick={() => setSetupOpen(true)}><KeyRound />Google OAuth</Button>
@@ -173,9 +185,15 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
     <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
       <div className="grid gap-3 sm:grid-cols-3" aria-label="Connector status summary">
         <ConnectorSummary label="Native apps enabled" value={`${googleApps.filter((connector) => connector.enabled).length} of ${googleApps.length}`} detail={googleConfigured ? "Google OAuth is configured" : "Google OAuth setup required"} tone={googleConfigured ? "good" : "warning"} />
-        <ConnectorSummary label="Custom MCP published" value={String(custom.filter((connector) => connector.publicationStatus === "published" && connector.enabled).length)} detail={`${custom.length} saved connector${custom.length === 1 ? "" : "s"}`} tone="neutral" />
-        <ConnectorSummary label="Connection authority" value="Organization policy" detail="Users connect only within the limits below" tone="neutral" />
+        <ConnectorSummary label="Custom MCP published" value={String(approvedCustom.filter((connector) => connector.publicationStatus === "published" && connector.enabled).length)} detail={`${approvedCustom.length} approved server${approvedCustom.length === 1 ? "" : "s"}`} tone="neutral" />
+        <ConnectorSummary label="Approval requests" value={String(pendingRequests.length)} detail={pendingRequests.length ? "Waiting for an administrator" : "Queue is clear"} tone={pendingRequests.length ? "warning" : "good"} />
       </div>
+      <Section title="MCP approval requests" description="Review member-submitted Streamable HTTP servers. Approval adds the server to the organization catalog; each user still authorizes their own account.">
+        {pendingRequests.length ? <div className="grid gap-2">{pendingRequests.map((connector) => <div key={connector.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2.5">
+          <span className="flex min-w-0 items-center gap-3"><ConnectorIcon connector={connector} /><span className="min-w-0"><span className="flex items-center gap-2"><b className="truncate text-sm font-medium">{connector.name}</b><StatusPill tone="warning">Pending</StatusPill></span><small className="block truncate text-xs text-muted-foreground">{connector.url}</small><small className="mt-0.5 block text-[11px] text-muted-foreground">Streamable HTTP · OAuth · Per-user authorization</small></span></span>
+          <div className="flex items-center gap-1.5"><Button size="sm" variant="ghost" disabled={!canWrite || Boolean(busy)} onClick={() => void reviewRequest(connector, "reject")}>Reject</Button><Button size="sm" disabled={!canWrite || Boolean(busy)} onClick={() => void reviewRequest(connector, "approve")}><Check />{busy === `${connector.id}:approve` ? "Approving…" : "Approve"}</Button></div>
+        </div>)}</div> : <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center"><Check className="mx-auto size-5 text-muted-foreground" /><b className="mt-2 block text-sm font-medium">No requests waiting</b><p className="mt-1 text-xs text-muted-foreground">New member requests will appear here.</p></div>}
+      </Section>
       <Section title="Google apps" description="The OAuth app is configured once. Each user then connects their own Google account.">
         {canReadGoogleConfiguration ? <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2.5">
           <span><b className="block text-sm font-medium">Google OAuth client</b><small className="text-xs text-muted-foreground">{resource.data.google.configured ? `${resource.data.google.status} · ${resource.data.google.clientId}` : "Not configured"}</small></span>
@@ -183,23 +201,23 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
         </div> : null}
         <div className="grid gap-3">{googleApps.map((connector) => <GooglePolicyRow key={connector.id} connector={connector} disabled={!canWrite || busy === connector.id || !googleConfigured} onChange={(enabled, level, mode) => void updateGoogle(connector, enabled, level, mode)} />)}</div>
       </Section>
-      <Section title="Custom MCP" description="Save a draft, authenticate if needed, inspect its advertised tools, then publish an exact allowlist.">
-        {custom.length ? <div className="grid gap-3">{custom.map((connector) => <div key={connector.id} className="rounded-xl border border-border bg-card p-3.5">
+      <Section title="Custom MCP" description="Approved servers form the organization catalog. Advanced administrator-created connectors can still use an exact reviewed tool allowlist.">
+        {approvedCustom.length ? <div className="grid gap-3">{approvedCustom.map((connector) => <div key={connector.id} className="rounded-xl border border-border bg-card p-3.5">
           <div className="flex flex-wrap items-start justify-between gap-3">
-            <span className="flex min-w-0 items-start gap-3"><ConnectorIcon connector={connector} /><span className="min-w-0"><b className="block truncate text-sm font-medium">{connector.name}</b><small className="block truncate text-xs text-muted-foreground">{connector.url}</small><span className="mt-1.5 flex gap-1.5"><StatusPill tone={connector.publicationStatus === "published" ? connector.enabled ? "good" : "warning" : "neutral"}>{connector.publicationStatus === "draft" ? "Draft" : connector.enabled ? "Published" : "Disabled"}</StatusPill><Badge variant="outline">{connector.authStrategy === "shared" ? "Organization auth" : "Per-user auth"}</Badge></span></span></span>
+            <span className="flex min-w-0 items-start gap-3"><ConnectorIcon connector={connector} /><span className="min-w-0"><b className="block truncate text-sm font-medium">{connector.name}</b><small className="block truncate text-xs text-muted-foreground">{connector.url}</small><span className="mt-1.5 flex gap-1.5"><StatusPill tone={connector.publicationStatus === "published" ? connector.enabled ? "good" : "warning" : "neutral"}>{connector.publicationStatus === "draft" ? "Draft" : connector.enabled ? "Published" : "Disabled"}</StatusPill><Badge variant="outline">{connector.serverApproved ? "Organization catalog" : connector.authStrategy === "shared" ? "Organization auth" : "Per-user auth"}</Badge></span></span></span>
             <div className="flex flex-wrap justify-end gap-1.5">
-              {connector.authType === "oauth" && !connector.credentialConfigured ? <Button size="sm" variant="outline" disabled={!canWrite || Boolean(busy)} onClick={() => void action(connector, "oauth")}><KeyRound />Authorize</Button> : null}
-              <Button size="sm" variant="outline" disabled={!canWrite || Boolean(busy) || (connector.authType !== "none" && !connector.credentialConfigured)} onClick={() => void action(connector, "discover")}><Search />Discover tools</Button>
-              {connector.publicationStatus === "draft" && connector.tools.length ? <Button size="sm" disabled={!canWrite || Boolean(busy) || !(toolAllowlist[connector.id]?.selected.length ?? connector.tools.length)} onClick={() => void action(connector, "publish")}><ShieldCheck />Publish {toolAllowlist[connector.id]?.selected.length ?? connector.tools.length}</Button> : null}
-              {connector.publicationStatus === "published" ? <Button size="sm" variant="outline" disabled={!canWrite || Boolean(busy)} onClick={() => void action(connector, connector.enabled ? "disable" : "publish")}>{connector.enabled ? "Disable" : "Enable"}</Button> : null}
+              {!connector.serverApproved && connector.authType === "oauth" && !connector.credentialConfigured ? <Button size="sm" variant="outline" disabled={!canWrite || Boolean(busy)} onClick={() => void action(connector, "oauth")}><KeyRound />Authorize</Button> : null}
+              {!connector.serverApproved ? <Button size="sm" variant="outline" disabled={!canWrite || Boolean(busy) || (connector.authType !== "none" && !connector.credentialConfigured)} onClick={() => void action(connector, "discover")}><Search />Discover tools</Button> : null}
+              {!connector.serverApproved && connector.publicationStatus === "draft" && connector.tools.length ? <Button size="sm" disabled={!canWrite || Boolean(busy) || !(toolAllowlist[connector.id]?.selected.length ?? connector.tools.length)} onClick={() => void action(connector, "publish")}><ShieldCheck />Publish {toolAllowlist[connector.id]?.selected.length ?? connector.tools.length}</Button> : null}
+              {!connector.serverApproved && connector.publicationStatus === "published" ? <Button size="sm" variant="outline" disabled={!canWrite || Boolean(busy)} onClick={() => void action(connector, connector.enabled ? "disable" : "publish")}>{connector.enabled ? "Disable" : "Enable"}</Button> : null}
               <Button size="icon-sm" variant="ghost" disabled={!canWrite || Boolean(busy)} aria-label={`Delete ${connector.name}`} onClick={() => setPendingDelete(connector)}><Trash2 /></Button>
             </div>
           </div>
           {connector.tools.length ? <div className="mt-3 border-t border-border pt-3">
-            <div className="mb-2 flex items-center justify-between gap-3"><b className="text-xs font-medium">Published tool allowlist</b><small className="text-xs text-muted-foreground">Select only tools users may call</small></div>
-            <div className="flex flex-wrap gap-1.5">{connector.tools.map((tool) => { const selected = toolAllowlist[connector.id]?.selected.includes(tool) ?? true; return <button key={tool} type="button" role="checkbox" aria-checked={selected} disabled={!canWrite || connector.publicationStatus === "published"} onClick={() => setToolAllowlist((current) => { const entry = current[connector.id] ?? { available: connector.tools, selected: connector.tools }; return { ...current, [connector.id]: { ...entry, selected: selected ? entry.selected.filter((name) => name !== tool) : [...entry.selected, tool] } }; })} className={cn("rounded-md border px-2 py-1 text-[11px] transition-colors disabled:cursor-default", selected ? "border-foreground/20 bg-muted text-foreground" : "border-border bg-transparent text-muted-foreground line-through")}>{tool}</button>; })}</div>
-          </div> : <p className="mt-3 border-t border-border pt-3 text-xs text-muted-foreground">No reviewed tools yet.</p>}
-        </div>)}</div> : <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center"><PlugZap className="mx-auto size-5 text-muted-foreground" /><b className="mt-2 block text-sm font-medium">No custom MCP connectors</b><p className="mt-1 text-xs text-muted-foreground">Only administrators can add and publish one.</p></div>}
+            <div className="mb-2 flex items-center justify-between gap-3"><b className="text-xs font-medium">{connector.serverApproved ? "Discovered tools" : "Published tool allowlist"}</b><small className="text-xs text-muted-foreground">{connector.serverApproved ? "Live catalog; each user connects separately" : "Select only tools users may call"}</small></div>
+            <div className="flex flex-wrap gap-1.5">{connector.tools.map((tool) => { const selected = connector.serverApproved || (toolAllowlist[connector.id]?.selected.includes(tool) ?? true); return <button key={tool} type="button" role={connector.serverApproved ? undefined : "checkbox"} aria-checked={connector.serverApproved ? undefined : selected} disabled={connector.serverApproved || !canWrite || connector.publicationStatus === "published"} onClick={() => setToolAllowlist((current) => { const entry = current[connector.id] ?? { available: connector.tools, selected: connector.tools }; return { ...current, [connector.id]: { ...entry, selected: selected ? entry.selected.filter((name) => name !== tool) : [...entry.selected, tool] } }; })} className={cn("rounded-md border px-2 py-1 text-[11px] transition-colors disabled:cursor-default", selected ? "border-foreground/20 bg-muted text-foreground" : "border-border bg-transparent text-muted-foreground line-through")}>{tool}</button>; })}</div>
+          </div> : <p className="mt-3 border-t border-border pt-3 text-xs text-muted-foreground">{connector.serverApproved ? "Tools appear after the first successful user connection." : "No reviewed tools yet."}</p>}
+        </div>)}</div> : <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center"><PlugZap className="mx-auto size-5 text-muted-foreground" /><b className="mt-2 block text-sm font-medium">No approved custom MCP servers</b><p className="mt-1 text-xs text-muted-foreground">Member requests and administrator-created connectors will appear here after approval.</p></div>}
       </Section>
     </AsyncState>
 

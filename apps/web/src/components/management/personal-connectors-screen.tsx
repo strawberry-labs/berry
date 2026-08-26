@@ -3,6 +3,7 @@ import type { Connector, GoogleConnectorConfiguration } from "@berry/shared";
 import {
   CalendarDays,
   Check,
+  Clock3,
   ExternalLink,
   FileText,
   HardDrive,
@@ -61,14 +62,21 @@ export async function loadAdminConnectorData(client: AdminConnectorClient, tenan
   return { connectors, google };
 }
 
-export function PersonalConnectorsScreen({ client }: ManagementScreenProps) {
+export function PersonalConnectorsScreen({ client, permissions }: ManagementScreenProps) {
   const resource = useResource("connectors:me", () => client?.listConnectors() ?? Promise.resolve([]), [] as Connector[]);
+  const requests = useResource("connectors:requests", () => client?.listConnectorRequests() ?? Promise.resolve([]), [] as Connector[]);
+  const canApprove = permissions.includes("mcp:write");
+  const requestUrlId = React.useId();
   const [query, setQuery] = React.useState("");
+  const [addOpen, setAddOpen] = React.useState(false);
+  const [requestUrl, setRequestUrl] = React.useState("");
+  const [requestBusy, setRequestBusy] = React.useState(false);
   const [selected, setSelected] = React.useState<Connector | null>(null);
   const [access, setAccess] = React.useState<"read" | "full">("read");
   const [credential, setCredential] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const visible = resource.data.filter((connector) => `${connector.name} ${connector.description} ${connector.services.join(" ")}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const hasPendingRequest = requests.data.some((connector) => connector.approvalStatus === "pending");
 
   React.useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -79,8 +87,15 @@ export function PersonalConnectorsScreen({ client }: ManagementScreenProps) {
       params.delete("connector_error"); params.delete("connected"); params.delete("connector");
       window.history.replaceState(null, "", `${window.location.pathname}${params.size ? `?${params}` : ""}`);
       resource.retry();
+      requests.retry();
     }
   }, []);
+
+  React.useEffect(() => {
+    if (!hasPendingRequest) return;
+    const timer = window.setInterval(() => { requests.retry(); resource.retry(); }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [hasPendingRequest]);
 
   const open = (connector: Connector) => {
     setSelected(connector);
@@ -103,6 +118,21 @@ export function PersonalConnectorsScreen({ client }: ManagementScreenProps) {
     } catch (cause) {
       toast.error(message(cause));
     } finally { setBusy(false); }
+  };
+  const requestMcp = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!client || !requestUrl.trim()) return;
+    setRequestBusy(true);
+    try {
+      const connector = await client.requestMcpConnector(requestUrl.trim());
+      resource.retry(); requests.retry(); setRequestUrl(""); setAddOpen(false);
+      if (connector.approvalStatus === "approved") {
+        toast.success(`${connector.name} is approved and ready to connect`);
+        open(connector);
+      } else {
+        toast.success("MCP server sent for organization approval");
+      }
+    } catch (cause) { toast.error(message(cause)); } finally { setRequestBusy(false); }
   };
   const disconnect = async () => {
     if (!client || !selected) return;
@@ -138,7 +168,18 @@ export function PersonalConnectorsScreen({ client }: ManagementScreenProps) {
     } catch (cause) { toast.error(message(cause)); } finally { setBusy(false); }
   };
 
-  return <ManagementPage title="Connectors" description="Connect approved apps once, then let Berry use their tools when a task needs them.">
+  const unresolvedRequests = requests.data.filter((connector) => connector.approvalStatus !== "approved");
+  const approvedMcp = resource.data.filter((connector) => connector.kind === "custom_mcp");
+
+  return <ManagementPage title="Connectors" description="Connect approved apps once, then let Berry use their tools when a task needs them." actions={<Button onClick={() => setAddOpen(true)}><Plus />Add MCP server</Button>}>
+    {unresolvedRequests.length ? <Section title="MCP approval status" description="Connect becomes available after an organization administrator approves the server.">
+      <div className="grid gap-2">
+        {unresolvedRequests.map((connector) => <div key={connector.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2.5">
+          <span className="flex min-w-0 items-center gap-3"><ConnectorIcon connector={connector} /><span className="min-w-0"><b className="block truncate text-sm font-medium">{connector.name}</b><small className="block truncate text-xs text-muted-foreground">{connector.url}</small></span></span>
+          <div className="flex items-center gap-2"><StatusPill tone={connector.approvalStatus === "pending" ? "warning" : "neutral"}>{connector.approvalStatus === "pending" ? <><Clock3 className="size-3" />Awaiting approval</> : "Not approved"}</StatusPill><Button size="sm" disabled>{connector.approvalStatus === "pending" ? "Connect after approval" : "Connect unavailable"}</Button></div>
+        </div>)}
+      </div>
+    </Section> : null}
     <div className="relative">
       <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
       <Input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Search connectors" aria-label="Search connectors" className="h-10 pl-9" />
@@ -148,6 +189,24 @@ export function PersonalConnectorsScreen({ client }: ManagementScreenProps) {
         {visible.map((connector) => <ConnectorCard key={connector.id} connector={connector} onClick={() => open(connector)} />)}
       </div>
     </AsyncState>
+    <Dialog open={addOpen} onOpenChange={setAddOpen}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Add an MCP server</DialogTitle>
+          <DialogDescription>{canApprove ? "Paste a Streamable HTTP MCP URL. Administrators can approve it immediately." : "Paste a Streamable HTTP MCP URL. An administrator must approve a new server before anyone can connect."}</DialogDescription>
+        </DialogHeader>
+        {approvedMcp.length ? <div className="grid gap-2">
+          <div><b className="text-xs font-medium">Organization catalog</b><p className="mt-0.5 text-xs text-muted-foreground">Already approved and available to everyone.</p></div>
+          <div className="max-h-48 space-y-1.5 overflow-y-auto">{approvedMcp.map((connector) => <div key={connector.id} className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2"><span className="min-w-0"><b className="block truncate text-sm font-medium">{connector.name}</b><small className="block truncate text-xs text-muted-foreground">{connector.url}</small></span><Button size="sm" variant="outline" onClick={() => { setAddOpen(false); open(connector); }}>{connector.connectionStatus === "connected" ? "View" : "Connect"}</Button></div>)}</div>
+        </div> : null}
+        <form className="grid gap-3" onSubmit={(event) => void requestMcp(event)}>
+          {approvedMcp.length ? <div className="flex items-center gap-3 text-[11px] uppercase tracking-wide text-muted-foreground"><span className="h-px flex-1 bg-border" /><span>New server</span><span className="h-px flex-1 bg-border" /></div> : null}
+          <Field label="Streamable HTTP MCP URL" htmlFor={requestUrlId}><Input id={requestUrlId} type="url" required value={requestUrl} onChange={(event) => setRequestUrl(event.currentTarget.value)} placeholder="https://mcp.example.com/mcp" autoComplete="url" /></Field>
+          <div className="rounded-lg border border-border bg-muted/20 p-3 text-xs leading-5 text-muted-foreground">Berry discovers the server’s OAuth configuration when you connect. Your authorization is personal; approving the server does not share anyone’s OAuth tokens.</div>
+          <DialogFooter><Button type="button" variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button><Button type="submit" disabled={requestBusy || !client || !requestUrl.trim()}>{requestBusy ? "Submitting…" : canApprove ? "Add to organization" : "Request approval"}</Button></DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
     <Dialog open={Boolean(selected)} onOpenChange={(value) => { if (!value) setSelected(null); }}>
       {selected ? <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader className="items-center text-center sm:items-center sm:text-center">
@@ -178,7 +237,7 @@ export function PersonalConnectorsScreen({ client }: ManagementScreenProps) {
           </div>
           <div>
             <h3 className="text-xs font-medium text-foreground">What Berry can do</h3>
-            <div className="mt-2 grid gap-1.5 sm:grid-cols-2">{selected.tools.slice(0, 10).map((tool) => <div key={tool} className="rounded-md border border-border px-2.5 py-2 text-xs text-muted-foreground">{humanTool(tool)}</div>)}</div>
+            {selected.tools.length ? <div className="mt-2 grid gap-1.5 sm:grid-cols-2">{selected.tools.slice(0, 10).map((tool) => <div key={tool} className="rounded-md border border-border px-2.5 py-2 text-xs text-muted-foreground">{humanTool(tool)}</div>)}</div> : <p className="mt-2 text-xs leading-5 text-muted-foreground">Berry will discover this server’s tools after you authorize your account.</p>}
             {selected.tools.length > 10 ? <small className="mt-2 block text-xs text-muted-foreground">Plus {selected.tools.length - 10} more approved tools</small> : null}
           </div>
           {selected.limitations.length ? <div className="rounded-lg border border-border bg-muted/20 p-3"><b className="text-xs font-medium">Security boundary</b>{selected.limitations.map((limitation) => <p key={limitation} className="mt-1 text-xs leading-5 text-muted-foreground">{limitation}</p>)}</div> : null}
@@ -223,7 +282,7 @@ function GooglePolicyRow({ connector, disabled, onChange }: { connector: Connect
   </div></div>{connector.key === "google-workspace" ? <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3"><span><b className="block text-xs font-medium">Drive access boundary</b><small className="text-xs text-muted-foreground">Selected files uses Google Picker; workspace search can search all files the user can access.</small></span><div className="w-48"><FormSelect value={mode} onChange={(value) => { const next = value as typeof mode; setMode(next); if (connector.enabled) onChange(true, connector.maxAccessLevel, next); }} options={[{ value: "selected_files", label: "Selected files only" }, { value: "search_workspace", label: "Workspace search" }]} /></div></div> : null}</div>;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) { return <div className="grid gap-1.5"><Label className="text-xs">{label}</Label>{children}</div>; }
+function Field({ label, htmlFor, children }: { label: string; htmlFor?: string; children: React.ReactNode }) { return <div className="grid gap-1.5"><Label htmlFor={htmlFor} className="text-xs">{label}</Label>{children}</div>; }
 function humanTool(value: string): string { return value.replace(/^google_/, "").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
 function message(cause: unknown): string { return cause instanceof Error ? cause.message : "Connector request failed"; }
 

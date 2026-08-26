@@ -31,6 +31,7 @@ import { FilePlatformService } from "../files/file-platform.service.ts";
 const GoogleKeySchema = z.enum(["google-workspace", "gmail", "google-calendar"]);
 const OAuthStartSchema = z.object({ accessLevel: ConnectorAccessLevelSchema.default("read") }).strict();
 const BearerCredentialSchema = z.object({ credential: z.string().trim().min(1).max(32_768) }).strict();
+const McpRequestSchema = z.object({ url: z.string().url().max(2_048) }).strict();
 const GoogleConfigurationInputSchema = z.object({
   clientId: z.string().trim().regex(/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/, "Expected a Google OAuth web client ID").max(1_000),
   clientSecret: z.string().trim().min(1).max(8_192).optional(),
@@ -65,12 +66,38 @@ export class ConnectorsController {
   constructor(
     @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
     @Inject(AUDIT_SERVICE) private readonly audit: AuditService,
+    @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
     @Inject(FilePlatformService) private readonly files: FilePlatformService,
   ) {}
 
   @Get()
   list(@Req() request: AuthenticatedRequest): Promise<Connector[]> {
-    return this.connectors.list(tenantId(), request.auth!.user.id).then((items) => items.filter((item) => item.enabled && item.publicationStatus === "published"));
+    return this.connectors.list(tenantId(), request.auth!.user.id).then((items) => items.filter((item) => item.enabled && item.publicationStatus === "published" && item.approvalStatus === "approved"));
+  }
+
+  @Get("requests")
+  listRequests(@Req() request: AuthenticatedRequest): Promise<Connector[]> {
+    return this.connectors.listCustomRequests(tenantId(), request.auth!.user.id);
+  }
+
+  @Post("requests")
+  async requestMcp(@Req() request: AuthenticatedRequest, @Body() body: unknown) {
+    const organizationId = tenantId();
+    const userId = request.auth!.user.id;
+    const input = parse(McpRequestSchema, body);
+    let result = await this.connectors.requestCustom(organizationId, userId, input);
+    if (result.approvalStatus === "approved") {
+      await this.record(userId, "custom-mcp-catalog-selected", result.id, safeConnectorMetadata(result));
+      return result;
+    }
+    const canApprove = await this.identity.authorize(userId, organizationId, "mcp:write");
+    if (canApprove && result.approvalStatus === "pending") {
+      result = await this.connectors.reviewCustomRequest(organizationId, userId, result.id, "approved");
+      await this.record(userId, "custom-mcp-auto-approved", result.id, safeConnectorMetadata(result));
+      return result;
+    }
+    await this.record(userId, "custom-mcp-approval-requested", result.id, safeConnectorMetadata(result));
+    return result;
   }
 
   @Post(":id/oauth/start")
@@ -114,11 +141,18 @@ export class ConnectorsController {
     });
   }
 
+  @PublicAuth()
+  @Get("mcp/oauth/client-metadata")
+  @Header("Cache-Control", "public, max-age=3600")
+  mcpClientMetadata() {
+    return this.connectors.mcpClientMetadata();
+  }
+
   @Get("mcp/oauth/callback")
-  async mcpCallback(@Req() request: AuthenticatedRequest, @Query("state") state: string | undefined, @Query("code") code: string | undefined, @Query("error") error: string | undefined, @Res() response: ServerResponse) {
+  async mcpCallback(@Req() request: AuthenticatedRequest, @Query("state") state: string | undefined, @Query("code") code: string | undefined, @Query("error") error: string | undefined, @Query("iss") issuer: string | undefined, @Res() response: ServerResponse) {
     await this.completeAndRedirect(response, "/settings/connectors", async () => {
       if (!state) throw new BadRequestException("MCP OAuth state is missing");
-      const result = await this.connectors.completeCustomOAuth(tenantId(), request.auth!.user.id, { state, ...(code ? { code } : {}), ...(error ? { error } : {}) });
+      const result = await this.connectors.completeCustomOAuth(tenantId(), request.auth!.user.id, { state, ...(code ? { code } : {}), ...(error ? { error } : {}), ...(issuer ? { issuer } : {}) });
       await this.record(request.auth!.user.id, "connector-connected", result.connectorId, { provider: "mcp", authType: "oauth" });
       return result;
     });
@@ -242,6 +276,22 @@ export class OrganizationConnectorsController {
     return this.connectors.startCustomOAuth(organizationId, request.auth!.user.id, id, true, "/admin/connectors");
   }
 
+  @Post("custom/:id/approve")
+  async approveCustomRequest(@Req() request: AuthenticatedRequest, @Param("tenantId") organizationId: string, @Param("id") id: string) {
+    await this.allow(request, organizationId, "mcp:write");
+    const result = await this.connectors.reviewCustomRequest(organizationId, request.auth!.user.id, id, "approved");
+    await this.record(organizationId, request.auth!.user.id, "custom-mcp-approved", result.id, safeConnectorMetadata(result));
+    return result;
+  }
+
+  @Post("custom/:id/reject")
+  async rejectCustomRequest(@Req() request: AuthenticatedRequest, @Param("tenantId") organizationId: string, @Param("id") id: string) {
+    await this.allow(request, organizationId, "mcp:write");
+    const result = await this.connectors.reviewCustomRequest(organizationId, request.auth!.user.id, id, "rejected");
+    await this.record(organizationId, request.auth!.user.id, "custom-mcp-rejected", result.id, safeConnectorMetadata(result));
+    return result;
+  }
+
   @Post("custom/:id/discover")
   async discoverCustom(@Req() request: AuthenticatedRequest, @Param("tenantId") organizationId: string, @Param("id") id: string) {
     await this.allow(request, organizationId, "mcp:write");
@@ -284,4 +334,4 @@ function parse<T extends z.ZodTypeAny>(schema: T, body: unknown): z.infer<T> {
 
 function tenantId(): string { return process.env.BERRY_TENANT_ID ?? SELF_HOST_TENANT_ID; }
 function redirect(response: ServerResponse, location: string): void { response.statusCode = 302; response.setHeader("location", location); response.end(); }
-function safeConnectorMetadata(connector: Connector): JsonValue { return { name: connector.name, url: connector.url, authType: connector.authType, authStrategy: connector.authStrategy, maxAccessLevel: connector.maxAccessLevel, publicationStatus: connector.publicationStatus }; }
+function safeConnectorMetadata(connector: Connector): JsonValue { return { name: connector.name, url: connector.url, authType: connector.authType, authStrategy: connector.authStrategy, maxAccessLevel: connector.maxAccessLevel, publicationStatus: connector.publicationStatus, approvalStatus: connector.approvalStatus }; }

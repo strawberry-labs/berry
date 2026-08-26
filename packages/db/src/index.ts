@@ -5427,6 +5427,58 @@ ALTER TABLE session_checkpoints
   ADD COLUMN IF NOT EXISTS serialized_bytes integer NOT NULL DEFAULT 0
 `.trim();
 
+export const CONNECTOR_APPROVAL_WORKFLOW_MIGRATION = `
+ALTER TABLE organization_connectors
+  ADD COLUMN IF NOT EXISTS approval_status text NOT NULL DEFAULT 'approved'
+    CHECK (approval_status IN ('pending','approved','rejected')),
+  ADD COLUMN IF NOT EXISTS requested_by text,
+  ADD COLUMN IF NOT EXISTS reviewed_by text,
+  ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS organization_connectors_approval_queue_idx
+  ON organization_connectors (tenant_id, approval_status, created_at DESC)
+  WHERE kind = 'custom_mcp';
+`.trim();
+
+export const CONNECTOR_APPROVAL_REQUESTS_MIGRATION = `
+CREATE TABLE IF NOT EXISTS connector_approval_requests (
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  connector_id text NOT NULL,
+  user_id text NOT NULL,
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, connector_id, user_id),
+  FOREIGN KEY (tenant_id, connector_id)
+    REFERENCES organization_connectors(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS connector_approval_requests_user_idx
+  ON connector_approval_requests (tenant_id, user_id, requested_at DESC);
+
+DO $berry_connector_request_backfill$
+DECLARE
+  target_tenant record;
+BEGIN
+  FOR target_tenant IN SELECT id FROM tenants LOOP
+    PERFORM berry_set_tenant_id(target_tenant.id);
+    INSERT INTO connector_approval_requests (tenant_id, connector_id, user_id, requested_at)
+    SELECT tenant_id, id, requested_by, created_at
+    FROM organization_connectors
+    WHERE tenant_id = target_tenant.id
+      AND kind = 'custom_mcp'
+      AND requested_by IS NOT NULL
+      AND requested_by <> ''
+    ON CONFLICT (tenant_id, connector_id, user_id) DO NOTHING;
+  END LOOP;
+  PERFORM set_config('berry.tenant_id', '', true);
+END;
+$berry_connector_request_backfill$;
+
+ALTER TABLE connector_approval_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE connector_approval_requests FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS connector_approval_requests_tenant_isolation ON connector_approval_requests;
+CREATE POLICY connector_approval_requests_tenant_isolation ON connector_approval_requests
+  USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5587,6 +5639,23 @@ export const cloudMigrations = [
     id: 67,
     name: "session_checkpoint_serialized_bytes_v1",
     sql: SESSION_CHECKPOINT_SERIALIZED_BYTES_MIGRATION,
+    transactional: false,
+  },
+  {
+    id: 68,
+    name: "connector_approval_workflow_v1",
+    sql: CONNECTOR_APPROVAL_WORKFLOW_MIGRATION,
+    transactional: false,
+    onlineIndexName: "organization_connectors_approval_queue_idx",
+    onlineSql: [
+      "ALTER TABLE organization_connectors ADD COLUMN IF NOT EXISTS approval_status text NOT NULL DEFAULT 'approved' CHECK (approval_status IN ('pending','approved','rejected')), ADD COLUMN IF NOT EXISTS requested_by text, ADD COLUMN IF NOT EXISTS reviewed_by text, ADD COLUMN IF NOT EXISTS reviewed_at timestamptz",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS organization_connectors_approval_queue_idx ON organization_connectors (tenant_id, approval_status, created_at DESC) WHERE kind = 'custom_mcp'",
+    ],
+  },
+  {
+    id: 69,
+    name: "connector_approval_requests_v1",
+    sql: CONNECTOR_APPROVAL_REQUESTS_MIGRATION,
     transactional: false,
   },
 ] as const;

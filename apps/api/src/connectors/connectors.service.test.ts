@@ -6,6 +6,7 @@ import { ConnectorsService } from "./connectors.service.ts";
 
 const TENANT_ID = "00000000-0000-7000-8000-000000000001";
 const USER_ID = "00000000-0000-7000-8000-000000000201";
+const SECOND_USER_ID = "00000000-0000-7000-8000-000000000202";
 const ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
 type TestRow = Record<string, unknown>;
@@ -26,6 +27,10 @@ function customRow(overrides: TestRow = {}): TestRow {
     endpoint_url: "http://localhost:4000/mcp",
     auth_type: "bearer",
     publication_status: "published",
+    approval_status: "approved",
+    requested_by: null,
+    reviewed_by: null,
+    reviewed_at: null,
     shared_credential_envelope: { version: 1, algorithm: "aes-256-gcm", iv: "old", ciphertext: "old", tag: "old" },
     config: {
       discoveredTools: [{ name: "old_tool", description: null, inputSchema: { type: "object" } }],
@@ -65,11 +70,32 @@ function googleRow(overrides: TestRow = {}): TestRow {
 function serviceHarness(initialRow: TestRow | null) {
   let row = initialRow;
   let connection: TestRow | null = null;
+  const requesters = new Set<string>();
+  if (typeof initialRow?.requested_by === "string") requesters.add(initialRow.requested_by);
   const executions: Array<{ sql: string; params: readonly unknown[] }> = [];
+  const queries: Array<{ sql: string; params: readonly unknown[] }> = [];
   const executor: SqlExecutor = {
     execute: async (sql, params = []) => {
       executions.push({ sql, params });
-      if (sql.includes("INSERT INTO organization_connectors")) {
+      if (sql.includes("INSERT INTO organization_connectors") && sql.includes("approval_status, requested_by")) {
+        row = customRow({
+          id: params[0],
+          connector_key: params[2],
+          name: params[3],
+          description: params[4],
+          enabled: false,
+          max_access_level: "full",
+          auth_strategy: "personal",
+          transport: "streamable-http",
+          endpoint_url: params[5],
+          auth_type: "oauth",
+          publication_status: "draft",
+          approval_status: "pending",
+          requested_by: params[7],
+          config: JSON.parse(String(params[6])),
+          shared_credential_envelope: null,
+        });
+      } else if (sql.includes("INSERT INTO organization_connectors")) {
         row = customRow({
           ...(row ?? {}),
           id: params[0],
@@ -86,6 +112,9 @@ function serviceHarness(initialRow: TestRow | null) {
           publication_status: "draft",
           config: JSON.parse(String(params[11])),
         });
+      }
+      if (sql.includes("INSERT INTO connector_approval_requests") && typeof params[2] === "string") {
+        requesters.add(params[2]);
       }
       if (sql.includes("DELETE FROM connector_connections")) connection = null;
       if (sql.includes("INSERT INTO connector_connections")) {
@@ -106,8 +135,26 @@ function serviceHarness(initialRow: TestRow | null) {
         };
       }
     },
-    query: async <T>(sql: string) => {
+    query: async <T>(sql: string, params: readonly unknown[] = []) => {
+      queries.push({ sql, params });
+      if (sql.includes("UPDATE organization_connectors") && sql.includes("approval_status='pending'")) {
+        if (!row || row.id !== params[4] || row.kind !== "custom_mcp" || row.approval_status !== "pending") return [];
+        row = {
+          ...row,
+          approval_status: params[0],
+          reviewed_by: params[1],
+          reviewed_at: "2026-01-02T00:00:00.000Z",
+          enabled: params[2],
+          publication_status: params[3],
+          config: { ...(row.config as Record<string, unknown>), serverApproved: params[2] },
+        };
+        return [{ id: row.id }] as T[];
+      }
+      if (sql.includes("FROM connector_approval_requests AS request")) {
+        return (row && requesters.has(String(params[0])) ? [{ id: row.id }] : []) as T[];
+      }
       if (sql.includes("SELECT * FROM organization_connectors WHERE id=")) return (row ? [row] : []) as T[];
+      if (sql.includes("WHERE kind='custom_mcp' AND endpoint_url=$1")) return (row && row.endpoint_url === params[0] ? [row] : []) as T[];
       if (sql.includes("SELECT * FROM organization_connectors ORDER BY")) return (row ? [row] : []) as T[];
       if (sql.includes("SELECT * FROM connector_connections")) return (connection ? [connection] : []) as T[];
       if (sql.includes("SELECT * FROM connector_provider_credentials")) return [] as T[];
@@ -119,6 +166,8 @@ function serviceHarness(initialRow: TestRow | null) {
   };
   return {
     executions,
+    queries,
+    requesters,
     service: new ConnectorsService(database as never, {
       NODE_ENV: "development",
       BERRY_CONNECTOR_ENCRYPTION_KEY: ENCRYPTION_KEY,
@@ -127,6 +176,105 @@ function serviceHarness(initialRow: TestRow | null) {
 }
 
 describe("ConnectorsService custom MCP credential lifecycle", () => {
+  it("creates member-submitted Streamable HTTP OAuth servers as pending and disabled", async () => {
+    const { service, executions } = serviceHarness(null);
+
+    const result = await service.requestCustom(TENANT_ID, USER_ID, { url: "http://localhost:5000/mcp" });
+
+    expect(result).toMatchObject({
+      kind: "custom_mcp",
+      transport: "streamable-http",
+      authType: "oauth",
+      authStrategy: "personal",
+      approvalStatus: "pending",
+      publicationStatus: "draft",
+      enabled: false,
+      serverApproved: false,
+    });
+    expect(executions.some(({ sql }) => sql.includes("approval_status, requested_by"))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("pg_advisory_xact_lock"))).toBe(true);
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO connector_approval_requests"))).toBe(true);
+  });
+
+  it("scopes pending status to requesters while reusing one connector", async () => {
+    const { service, executions, requesters } = serviceHarness(null);
+
+    await service.requestCustom(TENANT_ID, USER_ID, { url: "http://localhost:5000/mcp" });
+
+    await expect(service.listCustomRequests(TENANT_ID, USER_ID)).resolves.toHaveLength(1);
+    await expect(service.listCustomRequests(TENANT_ID, SECOND_USER_ID)).resolves.toEqual([]);
+
+    await service.requestCustom(TENANT_ID, SECOND_USER_ID, { url: "http://localhost:5000/mcp" });
+
+    await expect(service.listCustomRequests(TENANT_ID, SECOND_USER_ID)).resolves.toHaveLength(1);
+    expect(requesters).toEqual(new Set([USER_ID, SECOND_USER_ID]));
+    expect(executions.filter(({ sql }) => sql.includes("INSERT INTO organization_connectors"))).toHaveLength(1);
+    expect(executions.filter(({ sql }) => sql.includes("pg_advisory_xact_lock"))).toHaveLength(2);
+  });
+
+  it("does not create a duplicate when an approved server is currently unavailable", async () => {
+    const { service, executions } = serviceHarness(customRow({
+      endpoint_url: "http://localhost:5000/mcp",
+      enabled: false,
+      publication_status: "draft",
+      approval_status: "approved",
+    }));
+
+    await expect(service.requestCustom(TENANT_ID, USER_ID, { url: "http://localhost:5000/mcp" }))
+      .rejects.toThrow("already exists but is not available");
+
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO organization_connectors"))).toBe(false);
+    expect(executions.some(({ sql }) => sql.includes("INSERT INTO connector_approval_requests"))).toBe(false);
+  });
+
+  it("publishes an approved request to the organization catalog without sharing credentials", async () => {
+    const { service, queries } = serviceHarness(customRow({
+      enabled: false,
+      auth_strategy: "personal",
+      auth_type: "oauth",
+      publication_status: "draft",
+      approval_status: "pending",
+      requested_by: USER_ID,
+      shared_credential_envelope: null,
+      config: { serverApproved: false },
+    }));
+
+    const result = await service.reviewCustomRequest(TENANT_ID, USER_ID, "connector_mcp_test", "approved");
+
+    expect(result).toMatchObject({
+      approvalStatus: "approved",
+      publicationStatus: "published",
+      enabled: true,
+      serverApproved: true,
+      authStrategy: "personal",
+      credentialConfigured: false,
+    });
+    const transition = queries.find(({ sql }) => sql.includes("UPDATE organization_connectors"));
+    expect(transition?.sql).toContain("approval_status='pending'");
+    await expect(service.reviewCustomRequest(TENANT_ID, USER_ID, "connector_mcp_test", "rejected"))
+      .rejects.toThrow("no longer pending");
+  });
+
+  it("admits an approved server with a live tool catalog even before tools are cached", async () => {
+    const row = customRow({
+      auth_type: "none",
+      auth_strategy: "personal",
+      shared_credential_envelope: null,
+      config: { serverApproved: true },
+    });
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => sql.includes("enabled=true") ? [row] as T[] : [],
+    };
+    const database = { withTenant: async <T>(_tenantId: string, callback: (db: SqlExecutor) => Promise<T>) => callback(executor) };
+    const service = new ConnectorsService(database as never, { NODE_ENV: "development", BERRY_CONNECTOR_ENCRYPTION_KEY: ENCRYPTION_KEY });
+
+    const runtime = await service.runtime(TENANT_ID, USER_ID);
+
+    expect(runtime).toHaveLength(1);
+    expect(runtime[0]).not.toHaveProperty("allowedTools");
+  });
+
   it("invalidates credentials and reviewed tools when the MCP authority changes", async () => {
     const { service, executions } = serviceHarness(customRow());
 
