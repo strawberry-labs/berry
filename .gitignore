@@ -55,6 +55,9 @@ artifacts/
 output/pdf/
 tmp/pdfs/
 
+# Local production-request captures used for incident analysis
+/berryrouter-request-*.json
+
 # Local generated deliverables, previews, and office lock files
 /outputs/
 /tmp/
