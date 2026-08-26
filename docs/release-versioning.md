@@ -25,7 +25,7 @@ Release automation must fail if public artifact versions disagree for a tag.
 - CLI releases use `cli-v<semver>` tags.
 - Desktop releases use `desktop-v<semver>` tags.
 - Platform/self-host releases use `platform-v<semver>` tags once the hosted
-  release workflow is enabled.
+  release process is enabled.
 - Mobile and extension store builds should reference the product SemVer plus
   the store build number in their store consoles.
 

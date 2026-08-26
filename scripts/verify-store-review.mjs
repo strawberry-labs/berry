@@ -12,8 +12,6 @@ const privacyManifest = readText("apps/mobile/PrivacyInfo.xcprivacy");
 const appStorePrivacy = readText("distribution/mobile/app-store-privacy.md");
 const playSafety = readJson("distribution/mobile/google-play-data-safety.json");
 const mobileNotes = readText("distribution/mobile/review-notes.md");
-const extensionWorkflow = readText(".github/workflows/extension-store-package.yml");
-const mobileWorkflow = readText(".github/workflows/mobile-internal-tracks.yml");
 
 assert(!("host_permissions" in extensionManifest), "extension manifest must not request broad host_permissions");
 assert(Array.isArray(extensionManifest.optional_host_permissions), "extension manifest must use optional host permissions");
@@ -32,15 +30,8 @@ assert(appStorePrivacy.includes("Nothing leaves the device except data sent to e
 assert(playSafety.dataCollected === false && playSafety.dataShared === false, "Play data safety must declare no collection/sharing by Berry");
 assert(mobileNotes.includes("No terminal is available on mobile"), "mobile review notes must cover read-only code mode");
 
-assert(extensionWorkflow.includes("pnpm --filter @berry/extension build"), "extension workflow must build extension");
-assert(extensionWorkflow.includes("mkdir -p artifacts"), "extension workflow must create artifact directory");
-assert(extensionWorkflow.includes("berry-companion-extension.zip"), "extension workflow must upload extension zip");
-assert(mobileWorkflow.includes("EXPO_TOKEN"), "mobile workflow must use human-owned Expo token");
-assert(mobileWorkflow.includes("internal-ios") && mobileWorkflow.includes("internal-android"), "mobile workflow must target internal tracks");
-assert(mobileWorkflow.includes("submit --platform ios") && mobileWorkflow.includes("submit --platform android"), "mobile workflow must submit both internal tracks");
-
 console.log("[store] extension listing and review package OK");
-console.log("[store] mobile privacy manifests and internal-track config OK");
+console.log("[store] mobile privacy manifests and manual-release config OK");
 
 function readJson(path) {
   return JSON.parse(readText(path));
