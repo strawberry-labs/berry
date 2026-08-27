@@ -3,7 +3,7 @@ import { ConflictException, UnauthorizedException, type INestApplication } from 
 import { Test } from "@nestjs/testing";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import type { AgentStreamEvent } from "@berry/shared";
-import type { SessionHost, StartTurnOptions } from "@berry/local-agent";
+import type { McpServerSpec, SessionHost, StartTurnOptions } from "@berry/local-agent";
 import request from "supertest";
 import { firstValueFrom, take } from "rxjs";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,7 +21,7 @@ import { DurableTurnService, type DurableTurnAdmission, type DurableTurnAdmissio
 import { ContextAssemblyService } from "../memory/context-assembly.service.ts";
 import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository } from "../identity/identity.repository.ts";
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
-import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
+import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, networkPolicyWithApprovedMcpDomains, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 import { SupportViewController } from "./support-view.controller.ts";
 
 describe("AgentApiController", () => {
@@ -54,6 +54,32 @@ describe("AgentApiController", () => {
       .toBe("$research\n\nFind and cite the latest AI news.");
     expect(preservePromptSkillTokens("Use $research to find and cite the latest AI news.", ["research"]))
       .toBe("Use $research to find and cite the latest AI news.");
+  });
+
+  it("adds approved MCP hosts to a restricted runtime network allowlist", () => {
+    const approvedServer: McpServerSpec = {
+      id: "connector_mcp_pricing",
+      name: "AESG Pricing",
+      transport: "streamable-http",
+      command: null,
+      args: [],
+      url: "https://e51f-2a00-f29-280.ngrok-free.app/mcp",
+      env: {},
+      enabled: true,
+      trusted: true,
+    };
+
+    expect(networkPolicyWithApprovedMcpDomains(
+      { egress: "on", allowedDomains: ["registry.npmjs.org"] },
+      [approvedServer],
+    )).toEqual({
+      egress: "on",
+      allowedDomains: ["registry.npmjs.org", "e51f-2a00-f29-280.ngrok-free.app"],
+    });
+    expect(networkPolicyWithApprovedMcpDomains(
+      { egress: "on", allowedDomains: [] },
+      [approvedServer],
+    )).toEqual({ egress: "on", allowedDomains: [] });
   });
 
   it("keeps a task active while its durable admission intent is still preparing", () => {

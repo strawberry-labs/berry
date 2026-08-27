@@ -275,6 +275,38 @@ describe("ConnectorsService custom MCP credential lifecycle", () => {
     expect(runtime[0]).not.toHaveProperty("allowedTools");
   });
 
+  it("exposes every discovered tool from an organization-approved server on the first model call", async () => {
+    const row = customRow({
+      auth_type: "none",
+      auth_strategy: "personal",
+      shared_credential_envelope: null,
+      config: {
+        serverApproved: true,
+        discoveredTools: [
+          { name: "calculate", description: "Calculate pricing", inputSchema: { type: "object" } },
+          { name: "explain", description: "Explain pricing", inputSchema: { type: "object" } },
+        ],
+      },
+    });
+    const executor: SqlExecutor = {
+      execute: async () => undefined,
+      query: async <T>(sql: string) => sql.includes("enabled=true") ? [row] as T[] : [],
+    };
+    const database = { withTenant: async <T>(_tenantId: string, callback: (db: SqlExecutor) => Promise<T>) => callback(executor) };
+    const service = new ConnectorsService(database as never, { NODE_ENV: "development", BERRY_CONNECTOR_ENCRYPTION_KEY: ENCRYPTION_KEY });
+
+    const runtime = await service.runtime(TENANT_ID, USER_ID);
+
+    expect(runtime[0]).toMatchObject({
+      defaultTools: ["calculate", "explain"],
+      cachedTools: [
+        expect.objectContaining({ name: "calculate" }),
+        expect.objectContaining({ name: "explain" }),
+      ],
+    });
+    expect(runtime[0]).not.toHaveProperty("allowedTools");
+  });
+
   it("invalidates credentials and reviewed tools when the MCP authority changes", async () => {
     const { service, executions } = serviceHarness(customRow());
 

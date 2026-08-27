@@ -795,6 +795,7 @@ export class ConnectorsService {
         trusted: true,
         credentialKey: `connector:${row.id}:${row.auth_strategy === "shared" ? "shared" : userId}`,
         cachedTools,
+        ...(serverApproved && cachedTools.length ? { defaultTools: cachedTools.map((tool) => tool.name) } : {}),
         ...(!serverApproved ? { allowedTools: cachedTools.map((tool) => tool.name) } : {}),
         ...(credential ? { credential } : {}),
       });

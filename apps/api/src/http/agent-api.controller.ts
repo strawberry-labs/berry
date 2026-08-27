@@ -46,6 +46,7 @@ import {
   type JsonValue,
   type Message,
   type ModelGovernanceDecision,
+  type NetworkPolicy,
   type TaskStatus,
 } from "@berry/shared";
 import type {
@@ -1633,7 +1634,13 @@ export class AgentApiController {
       });
       await this.modelGovernance.synchronizeRuntimeCatalog(tenantId, baseRuntime.provider);
     }
-    const resolvedRuntime = { ...baseRuntime, mcpServers: [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers, ...connectorRuntime], extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills] };
+    const mcpServers = [...baseRuntime.mcpServers, ...effectiveRuntime.mcpServers, ...connectorRuntime];
+    const resolvedRuntime = {
+      ...baseRuntime,
+      mcpServers,
+      extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills],
+      networkPolicy: networkPolicyWithApprovedMcpDomains(baseRuntime.networkPolicy, connectorRuntime),
+    };
     const providerId = modelDecision.providerId;
     const governedModelId = modelDecision.model;
     if (session.modelProviderId !== modelDecision.providerId || session.model !== governedModelId) {
@@ -2672,6 +2679,26 @@ async function durableMcpServer(server: McpServerSpec): Promise<DurableMcpServer
     ...(server.approvalRequiredTools ? { approvalRequiredTools: server.approvalRequiredTools } : {}),
     ...(secret.credential ? { credential: secret.credential } : {}),
   };
+}
+
+export function networkPolicyWithApprovedMcpDomains(
+  policy: NetworkPolicy | undefined,
+  approvedServers: readonly Pick<McpServerSpec, "enabled" | "trusted" | "url">[],
+): NetworkPolicy | undefined {
+  // An empty allowlist means unrestricted egress. Preserve that meaning rather
+  // than narrowing an unrestricted deployment to only its MCP hosts.
+  if (!policy || policy.allowedDomains.length === 0) return policy;
+  const allowedDomains = new Set(policy.allowedDomains);
+  for (const server of approvedServers) {
+    if (!server.enabled || !server.trusted || !server.url) continue;
+    try {
+      allowedDomains.add(new URL(server.url).hostname.toLowerCase());
+    } catch {
+      // Connector admission validates remote URLs. Ignore malformed legacy
+      // entries here so they cannot weaken or break the existing policy.
+    }
+  }
+  return { ...policy, allowedDomains: [...allowedDomains] };
 }
 
 async function durableCredential(
