@@ -69,6 +69,8 @@ import { useResource, type ManagementScreenProps } from "./management-context";
 export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
   const [query, setQuery] = React.useState("");
   const [creating, setCreating] = React.useState(false);
+  const [draftAuth, setDraftAuth] = React.useState<PersonalMcpServer["auth"]>("none");
+  const [draftCredential, setDraftCredential] = React.useState("");
   const [selected, setSelected] = React.useState<PersonalMcpServer | null>(
     null,
   );
@@ -107,18 +109,20 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
     event.preventDefault();
     if (!client) return;
     const form = new FormData(event.currentTarget);
-    const credential = String(form.get("credential"));
+    const credential = personalMcpManualCredential(draftAuth, draftCredential);
     await client.savePersonalMcpServer({
       name: String(form.get("name")),
       url: String(form.get("url")),
       transport: String(form.get("transport")) as
         "http-sse" | "streamable-http",
-      auth: String(form.get("auth")) as "none" | "bearer" | "oauth",
+      auth: draftAuth,
       ...(credential ? { credential } : {}),
       enabled: true,
       trusted: false,
     });
     setCreating(false);
+    setDraftAuth("none");
+    setDraftCredential("");
     setMessage("Server saved. Test its connection before trusting it.");
     resource.retry();
   }
@@ -136,7 +140,11 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
       description="Inspect tools, authentication state, trust, and connection health."
       eyebrow="Tools & connections"
       actions={
-        <Button disabled={!client} onClick={() => setCreating(true)}>
+        <Button disabled={!client} onClick={() => {
+          setDraftAuth("none");
+          setDraftCredential("");
+          setCreating(true);
+        }}>
           <Plus />
           Add server
         </Button>
@@ -153,7 +161,13 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
       <ManagementDialog
         open={creating}
-        onOpenChange={setCreating}
+        onOpenChange={(open) => {
+          setCreating(open);
+          if (!open) {
+            setDraftAuth("none");
+            setDraftCredential("");
+          }
+        }}
         title="Review server connection"
         description="Credentials are stored by reference and are never returned to the browser."
         footer={
@@ -161,7 +175,11 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
             <Button
               type="button"
               variant="secondary"
-              onClick={() => setCreating(false)}
+              onClick={() => {
+                setCreating(false);
+                setDraftAuth("none");
+                setDraftCredential("");
+              }}
             >
               Cancel
             </Button>
@@ -199,7 +217,12 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
             Authentication
             <FormSelect
               name="auth"
-              defaultValue="none"
+              value={draftAuth}
+              onChange={(value) => {
+                const auth = value as PersonalMcpServer["auth"];
+                setDraftAuth(auth);
+                if (!personalMcpNeedsManualCredential(auth)) setDraftCredential("");
+              }}
               options={[
                 { value: "none", label: "None" },
                 { value: "bearer", label: "Bearer token" },
@@ -207,10 +230,18 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
               ]}
             />
           </label>
-          <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-            Credential
-            <Input name="credential" type="password" autoComplete="off" />
-          </label>
+          {personalMcpNeedsManualCredential(draftAuth) ? (
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              Bearer token
+              <Input
+                name="credential"
+                type="password"
+                autoComplete="off"
+                value={draftCredential}
+                onChange={(event) => setDraftCredential(event.currentTarget.value)}
+              />
+            </label>
+          ) : null}
         </form>
       </ManagementDialog>
       <AsyncState
@@ -298,6 +329,15 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
       ) : null}
     </ManagementPage>
   );
+}
+
+export function personalMcpNeedsManualCredential(auth: PersonalMcpServer["auth"]): boolean {
+  return auth === "bearer";
+}
+
+export function personalMcpManualCredential(auth: PersonalMcpServer["auth"], value: string): string | undefined {
+  if (!personalMcpNeedsManualCredential(auth)) return undefined;
+  return value.trim() || undefined;
 }
 
 function Detail({

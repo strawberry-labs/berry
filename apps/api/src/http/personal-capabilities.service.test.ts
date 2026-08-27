@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { PersonalMcpServerSchema } from "@berry/shared";
 import { PersonalCapabilitiesService } from "./personal-capabilities.service.ts";
 
 describe("PersonalCapabilitiesService personalization", () => {
@@ -92,6 +93,41 @@ describe("PersonalCapabilitiesService personalization", () => {
     await expect(service.runtime("tenant-1", "user-1")).resolves.toMatchObject({
       mcpServers: [expect.not.objectContaining({ credential: expect.anything() })],
     });
+  });
+
+  it("serializes persisted MCP check timestamps as ISO datetimes", async () => {
+    const tenantId = "00000000-0000-7000-8000-000000000001";
+    const lastCheckedAt = new Date("2026-08-27T00:15:30.000Z");
+    const database = {
+      withTenant: async (_tenantId: string, operation: (executor: unknown) => Promise<unknown>) => operation({
+        execute: async () => undefined,
+        query: async (sql: string) => sql.includes("FROM personal_mcp_servers") ? [{
+          id: "mcp_remote",
+          tenant_id: tenantId,
+          user_id: "user-1",
+          name: "Remote tools",
+          url: "https://mcp.example.test/rpc",
+          transport: "streamable-http",
+          auth: "oauth",
+          credential_ref: "secret_mcp_remote",
+          credential_envelope: null,
+          enabled: true,
+          trusted: false,
+          health: "unknown",
+          tool_count: 0,
+          last_checked_at: lastCheckedAt,
+          diagnostics: [],
+          created_at: new Date("2026-08-26T23:00:00.000Z"),
+          updated_at: new Date("2026-08-27T00:15:30.000Z"),
+        }] : [],
+      }),
+    };
+    const service = new PersonalCapabilitiesService(database as never);
+
+    const servers = await service.listMcp(tenantId, "user-1");
+
+    expect(servers[0]?.lastCheckedAt).toBe(lastCheckedAt.toISOString());
+    expect(() => PersonalMcpServerSchema.array().parse(servers)).not.toThrow();
   });
 
   it("refreshes skills written by durable workers after the user was loaded", async () => {

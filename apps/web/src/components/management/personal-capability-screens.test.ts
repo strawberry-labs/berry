@@ -8,6 +8,10 @@ import {
   skillMarkdownBody,
   skillPackageTreeEntries,
 } from "./personal-skills-screen";
+import {
+  personalMcpManualCredential,
+  personalMcpNeedsManualCredential,
+} from "./personal-mcp-screen";
 
 describe("personal capability screens", () => {
   it("keeps personal skills available when organization capability metadata is forbidden", async () => {
@@ -88,5 +92,13 @@ describe("personal capability screens", () => {
     }] as never;
     expect(isManagedSkillDuplicate("aesg-branding", effective)).toBe(true);
     expect(isManagedSkillDuplicate("research", effective)).toBe(false);
+  });
+
+  it("only asks for and submits a manual credential for bearer authentication", () => {
+    expect(personalMcpNeedsManualCredential("bearer")).toBe(true);
+    expect(personalMcpNeedsManualCredential("oauth")).toBe(false);
+    expect(personalMcpNeedsManualCredential("none")).toBe(false);
+    expect(personalMcpManualCredential("bearer", "  token-value  ")).toBe("token-value");
+    expect(personalMcpManualCredential("oauth", "stale-token")).toBeUndefined();
   });
 });
