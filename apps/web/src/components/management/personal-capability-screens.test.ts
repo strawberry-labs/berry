@@ -9,6 +9,7 @@ import {
   skillPackageTreeEntries,
 } from "./personal-skills-screen";
 import {
+  personalMcpConnectionAction,
   personalMcpManualCredential,
   personalMcpNeedsManualCredential,
 } from "./personal-mcp-screen";
@@ -100,5 +101,15 @@ describe("personal capability screens", () => {
     expect(personalMcpNeedsManualCredential("none")).toBe(false);
     expect(personalMcpManualCredential("bearer", "  token-value  ")).toBe("token-value");
     expect(personalMcpManualCredential("oauth", "stale-token")).toBeUndefined();
+  });
+
+  it("uses approval-aware OAuth actions instead of testing without credentials", () => {
+    const oauth = { auth: "oauth", transport: "streamable-http" } as const;
+    expect(personalMcpConnectionAction(oauth, null, true)).toEqual({ kind: "connect", label: "Connect", disabled: false });
+    expect(personalMcpConnectionAction(oauth, null, false)).toEqual({ kind: "request", label: "Request approval", disabled: false });
+    expect(personalMcpConnectionAction(oauth, { approvalStatus: "pending", connectionStatus: "not_connected" }, false)).toEqual({ kind: "pending", label: "Awaiting approval", disabled: true });
+    expect(personalMcpConnectionAction(oauth, { approvalStatus: "approved", connectionStatus: "not_connected" }, false)).toEqual({ kind: "connect", label: "Connect", disabled: false });
+    expect(personalMcpConnectionAction(oauth, { approvalStatus: "approved", connectionStatus: "connected" }, false)).toEqual({ kind: "reconnect", label: "Reconnect", disabled: false });
+    expect(personalMcpConnectionAction({ auth: "none", transport: "streamable-http" }, null, false)).toEqual({ kind: "test", label: "Test", disabled: false });
   });
 });

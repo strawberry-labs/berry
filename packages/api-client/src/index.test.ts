@@ -3,6 +3,26 @@ import type { ManagedPolicyBundle } from "@berry/shared";
 import { BerryApiClient, BerryApiError } from "./index.ts";
 
 describe("BerryApiClient", () => {
+  it("keeps MCP OAuth callbacks on the screen that started the connection", async () => {
+    const response = {
+      connectorId: "connector_mcp_figma",
+      state: "oauth-state",
+      authorizationUrl: "https://authorization.example/authorize",
+      expiresAt: "2026-08-27T10:00:00.000Z",
+    };
+    const fetchImpl = vi.fn(async () => json(response));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.startConnectorOAuth("connector_mcp_figma", "full", "/settings/mcp")).resolves.toEqual(response);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.berry.test/v1/connectors/connector_mcp_figma/oauth/start",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ accessLevel: "full", redirectAfter: "/settings/mcp" }),
+      }),
+    );
+  });
+
   it("improves a task prompt without creating a task turn", async () => {
     const fetchImpl = vi.fn(async () => json({
       prompt: "Write a concise executive summary with three recommendations.",

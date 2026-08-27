@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Check,
   ChevronDown,
+  Clock3,
   Code2,
   Download,
   EllipsisVertical,
@@ -17,6 +18,7 @@ import {
   LoaderCircle,
   MessageCircle,
   Plus,
+  PlugZap,
   Trash2,
   Upload,
   X,
@@ -44,6 +46,7 @@ import {
   TooltipTrigger,
 } from "@berry/desktop-ui/components/ui/tooltip";
 import type {
+  Connector,
   EffectiveCapability,
   PersonalMcpServer,
   PersonalSkill,
@@ -66,7 +69,7 @@ import {
   Toolbar,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
-export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
+export function PersonalMcpScreen({ client, config, permissions }: ManagementScreenProps) {
   const [query, setQuery] = React.useState("");
   const [creating, setCreating] = React.useState(false);
   const [draftAuth, setDraftAuth] = React.useState<PersonalMcpServer["auth"]>("none");
@@ -75,6 +78,9 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
     null,
   );
   const [message, setMessage] = React.useState("");
+  const [connectionError, setConnectionError] = React.useState("");
+  const [busyServerId, setBusyServerId] = React.useState<string | null>(null);
+  const canApprove = permissions.includes("mcp:write");
   const resource = useResource(
     "personal-mcp",
     async () =>
@@ -101,16 +107,53 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
           })),
     [] as PersonalMcpServer[],
   );
+  const connectorResource = useResource(
+    "personal-mcp-connectors",
+    async () => {
+      if (!client) return [];
+      const [available, requested] = await Promise.all([
+        client.listConnectors(),
+        client.listConnectorRequests(),
+      ]);
+      return [...new Map([...requested, ...available].map((connector) => [connector.id, connector])).values()]
+        .filter((connector) => connector.kind === "custom_mcp");
+    },
+    [] as Connector[],
+  );
   const rows = resource.data.filter((server) =>
     `${server.name} ${server.url}`.toLowerCase().includes(query.toLowerCase()),
   );
 
+  React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const error = params.get("connector_error");
+    if (error) setConnectionError(error);
+    if (params.get("connected") === "true") setMessage("MCP server connected and ready to use.");
+    if (error || params.has("connected")) {
+      params.delete("connector_error");
+      params.delete("connected");
+      params.delete("connector");
+      window.history.replaceState(null, "", `${window.location.pathname}${params.size ? `?${params}` : ""}`);
+      connectorResource.retry();
+      resource.retry();
+    }
+  }, []);
+
+  const hasPendingApproval = connectorResource.data.some((connector) => connector.approvalStatus === "pending");
+  React.useEffect(() => {
+    if (!hasPendingApproval) return;
+    const timer = window.setInterval(connectorResource.retry, 15_000);
+    return () => window.clearInterval(timer);
+  }, [hasPendingApproval]);
+
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!client) return;
+    setMessage("");
+    setConnectionError("");
     const form = new FormData(event.currentTarget);
     const credential = personalMcpManualCredential(draftAuth, draftCredential);
-    await client.savePersonalMcpServer({
+    const server = await client.savePersonalMcpServer({
       name: String(form.get("name")),
       url: String(form.get("url")),
       transport: String(form.get("transport")) as
@@ -123,7 +166,19 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
     setCreating(false);
     setDraftAuth("none");
     setDraftCredential("");
-    setMessage("Server saved. Test its connection before trusting it.");
+    if (server.auth === "oauth" && server.transport === "streamable-http") {
+      try {
+        const connector = await client.requestMcpConnector(server.url);
+        setMessage(connector.approvalStatus === "approved"
+          ? "Server approved. Click Connect to authorize your account."
+          : "Server submitted for organization approval. Connect will unlock after approval.");
+        connectorResource.retry();
+      } catch (cause) {
+        setConnectionError(`Server was saved, but approval could not be submitted: ${errorMessage(cause)}`);
+      }
+    } else {
+      setMessage("Server saved. Test its connection before trusting it.");
+    }
     resource.retry();
   }
 
@@ -134,10 +189,34 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
     resource.retry();
   }
 
+  async function connect(server: PersonalMcpServer) {
+    if (!client) return;
+    setBusyServerId(server.id);
+    setMessage("");
+    setConnectionError("");
+    try {
+      let connector = connectorForServer(connectorResource.data, server);
+      if (!connector || connector.approvalStatus !== "approved") {
+        connector = await client.requestMcpConnector(server.url);
+        connectorResource.retry();
+      }
+      if (connector.approvalStatus !== "approved") {
+        setMessage("Server submitted for organization approval. Connect will unlock after approval.");
+        return;
+      }
+      const flow = await client.startConnectorOAuth(connector.id, "full", "/settings/mcp");
+      window.location.assign(flow.authorizationUrl);
+    } catch (cause) {
+      setConnectionError(errorMessage(cause));
+    } finally {
+      setBusyServerId(null);
+    }
+  }
+
   return (
     <ManagementPage
       title="MCP servers"
-      description="Inspect tools, authentication state, trust, and connection health."
+      description="Connect approved Streamable HTTP MCP servers and inspect their authorization state."
       eyebrow="Tools & connections"
       actions={
         <Button disabled={!client} onClick={() => {
@@ -159,6 +238,7 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
         />
       </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
+      {connectionError ? <p className="rounded-lg border border-[var(--berry-danger)]/25 bg-[var(--berry-danger)]/5 px-3 py-2 text-xs text-[var(--berry-danger)]" role="alert">{connectionError}</p> : null}
       <ManagementDialog
         open={creating}
         onOpenChange={(open) => {
@@ -184,7 +264,7 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
               Cancel
             </Button>
             <Button type="submit" form="create-personal-mcp-form">
-              Save for testing
+              {draftAuth === "oauth" ? canApprove ? "Save and approve" : "Submit for approval" : "Save for testing"}
             </Button>
           </>
         }
@@ -260,7 +340,12 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
             "Health",
             "Actions",
           ]}
-          rows={rows.map((server) => [
+          rows={rows.map((server) => {
+            const connector = connectorForServer(connectorResource.data, server);
+            const action = personalMcpConnectionAction(server, connector, canApprove);
+            const oauth = server.auth === "oauth" ? personalMcpOAuthStatus(connector) : null;
+            const busy = busyServerId === server.id;
+            return [
             <Button
               variant="ghost"
               className="grid h-auto max-w-80 justify-start gap-0.5 p-0 text-left [&_b]:truncate [&_small]:truncate [&_small]:text-xs [&_small]:text-muted-foreground"
@@ -270,33 +355,41 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
               <small>{server.url}</small>
             </Button>,
             server.transport,
-            server.credentialConfigured
+            oauth
+              ? `oauth ${oauth.authentication}`
+              : server.credentialConfigured
               ? `${server.auth} configured`
               : server.auth,
-            server.trusted ? "Reviewed" : "Needs review",
+            oauth ? oauth.approval : server.trusted ? "Reviewed" : "Needs review",
             <StatusPill
               tone={
-                server.health === "healthy"
+                oauth
+                  ? oauth.tone
+                  : server.health === "healthy"
                   ? "good"
                   : server.health === "unreachable"
                     ? "danger"
                     : "warning"
               }
             >
-              {server.health}
+              {oauth?.health ?? server.health}
             </StatusPill>,
             <Button
               variant="secondary"
-              disabled={!client}
-              onClick={() => test(server)}
+              disabled={!client || action.disabled || busy}
+              onClick={() => action.kind === "test" ? void test(server) : void connect(server)}
             >
-              <FlaskConical />
-              Test
+              {busy ? <LoaderCircle className="animate-spin" /> : action.kind === "test" ? <FlaskConical /> : action.kind === "pending" ? <Clock3 /> : <PlugZap />}
+              {busy ? "Connecting…" : action.label}
             </Button>,
-          ])}
+            ];
+          })}
         />
       </AsyncState>
-      {selected ? (
+      {selected ? (() => {
+        const connector = connectorForServer(connectorResource.data, selected);
+        const oauth = selected.auth === "oauth" ? personalMcpOAuthStatus(connector) : null;
+        return (
         <Detail title={selected.name} onClose={() => setSelected(null)}>
           <dl>
             <div>
@@ -306,27 +399,29 @@ export function PersonalMcpScreen({ client, config }: ManagementScreenProps) {
             <div>
               <dt>Authentication</dt>
               <dd>
-                {selected.credentialConfigured
+                {(oauth ? oauth.authentication === "connected" : selected.credentialConfigured)
                   ? "Configured"
                   : "Not configured"}
               </dd>
             </div>
+            {oauth ? <div><dt>Organization approval</dt><dd>{oauth.approval}</dd></div> : null}
             <div>
-              <dt>Last tested</dt>
-              <dd>
-                {selected.lastCheckedAt
+              <dt>{oauth ? "Connection" : "Last tested"}</dt>
+              <dd>{oauth
+                ? oauth.health
+                : selected.lastCheckedAt
                   ? new Date(selected.lastCheckedAt).toLocaleString()
-                  : "Never"}
-              </dd>
+                  : "Never"}</dd>
             </div>
           </dl>
-          {selected.diagnostics.length ? (
+          {selected.auth !== "oauth" && selected.diagnostics.length ? (
             <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
               {selected.diagnostics.join(" · ")}
             </div>
           ) : null}
         </Detail>
-      ) : null}
+        );
+      })() : null}
     </ManagementPage>
   );
 }
@@ -338,6 +433,51 @@ export function personalMcpNeedsManualCredential(auth: PersonalMcpServer["auth"]
 export function personalMcpManualCredential(auth: PersonalMcpServer["auth"], value: string): string | undefined {
   if (!personalMcpNeedsManualCredential(auth)) return undefined;
   return value.trim() || undefined;
+}
+
+export type PersonalMcpConnectionAction = {
+  kind: "test" | "connect" | "request" | "pending" | "reconnect" | "unsupported";
+  label: string;
+  disabled: boolean;
+};
+
+export function personalMcpConnectionAction(
+  server: Pick<PersonalMcpServer, "auth" | "transport">,
+  connector: Pick<Connector, "approvalStatus" | "connectionStatus"> | null,
+  canApprove: boolean,
+): PersonalMcpConnectionAction {
+  if (server.auth !== "oauth") return { kind: "test", label: "Test", disabled: false };
+  if (server.transport !== "streamable-http") return { kind: "unsupported", label: "OAuth unavailable", disabled: true };
+  if (connector?.approvalStatus === "pending") return { kind: "pending", label: "Awaiting approval", disabled: true };
+  if (connector?.approvalStatus === "approved") {
+    return connector.connectionStatus === "connected"
+      ? { kind: "reconnect", label: "Reconnect", disabled: false }
+      : { kind: "connect", label: "Connect", disabled: false };
+  }
+  return canApprove
+    ? { kind: "connect", label: "Connect", disabled: false }
+    : { kind: "request", label: "Request approval", disabled: false };
+}
+
+function connectorForServer(connectors: readonly Connector[], server: Pick<PersonalMcpServer, "url">): Connector | null {
+  const url = comparableUrl(server.url);
+  return connectors.find((connector) => connector.url && comparableUrl(connector.url) === url) ?? null;
+}
+
+function personalMcpOAuthStatus(connector: Connector | null): { authentication: string; approval: string; health: string; tone: "good" | "warning" | "danger" | "neutral" } {
+  if (connector?.approvalStatus === "pending") return { authentication: "pending", approval: "Awaiting approval", health: "approval pending", tone: "warning" };
+  if (connector?.approvalStatus === "rejected") return { authentication: "not connected", approval: "Not approved", health: "not connected", tone: "danger" };
+  if (connector?.approvalStatus === "approved" && connector.connectionStatus === "connected") return { authentication: "connected", approval: "Approved", health: "connected", tone: "good" };
+  if (connector?.approvalStatus === "approved") return { authentication: "not connected", approval: "Approved", health: "not connected", tone: "warning" };
+  return { authentication: "not connected", approval: "Not submitted", health: "not connected", tone: "neutral" };
+}
+
+function comparableUrl(value: string): string {
+  try { return new URL(value).toString(); } catch { return value; }
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : "MCP connection failed";
 }
 
 function Detail({

@@ -29,7 +29,10 @@ import type { GoogleConnectorKey } from "./google-tools.ts";
 import { FilePlatformService } from "../files/file-platform.service.ts";
 
 const GoogleKeySchema = z.enum(["google-workspace", "gmail", "google-calendar"]);
-const OAuthStartSchema = z.object({ accessLevel: ConnectorAccessLevelSchema.default("read") }).strict();
+const OAuthStartSchema = z.object({
+  accessLevel: ConnectorAccessLevelSchema.default("read"),
+  redirectAfter: z.enum(["/settings/connectors", "/settings/mcp"]).default("/settings/connectors"),
+}).strict();
 const BearerCredentialSchema = z.object({ credential: z.string().trim().min(1).max(32_768) }).strict();
 const McpRequestSchema = z.object({ url: z.string().url().max(2_048) }).strict();
 const GoogleConfigurationInputSchema = z.object({
@@ -107,7 +110,7 @@ export class ConnectorsController {
     const connector = available.find((item) => item.id === id);
     if (!connector) throw new BadRequestException("Connector not found");
     if (connector.provider === "google") return this.connectors.startGoogleOAuth(tenantId(), request.auth!.user.id, id, input.accessLevel);
-    return this.connectors.startCustomOAuth(tenantId(), request.auth!.user.id, id);
+    return this.connectors.startCustomOAuth(tenantId(), request.auth!.user.id, id, false, input.redirectAfter);
   }
 
   @Post(":id/credentials")
