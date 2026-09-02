@@ -60,9 +60,9 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
           content: { type: "string", minLength: 1, maxLength: 20_000 },
           value: { type: "object", additionalProperties: true },
           expires_at: {
-            type: ["string", "null"],
+            type: "string",
             format: "date-time",
-            description: "Optional expiry time for a non-permanent memory.",
+            description: "Optional expiry time for a non-permanent memory. Omit this field for no expiry.",
           },
         },
       },

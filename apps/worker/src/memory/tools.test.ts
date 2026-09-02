@@ -40,6 +40,19 @@ describe("DurablePersonalMemoryToolExecutor", () => {
       "remember_memory",
       "forget_memory",
     ]);
+    expect(definitions.find((tool) => tool.function.name === "remember_memory"))
+      .toMatchObject({
+        function: {
+          parameters: {
+            properties: {
+              expires_at: {
+                type: "string",
+                format: "date-time",
+              },
+            },
+          },
+        },
+      });
   });
 
   it("stores an explicit personal memory with turn provenance", async () => {
