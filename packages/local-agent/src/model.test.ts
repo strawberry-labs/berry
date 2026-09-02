@@ -71,6 +71,12 @@ describe("BerryModelAdapter", () => {
           requestId: "router-request-buffered",
           content: "done",
           finishReason: "stop",
+          toolCalls: [{
+            id: "default_api:bash",
+            type: "function",
+            function: { name: "bash", arguments: '{"command":"pwd"}' },
+            extraContent: { google: { thought_signature: "signature-buffered" } },
+          }],
           raw: {},
         };
       },
@@ -86,6 +92,10 @@ describe("BerryModelAdapter", () => {
       expect.objectContaining({
         id: "buffered_request_id",
         requestId: "router-request-buffered",
+        toolCalls: [expect.objectContaining({
+          id: "default_api:bash",
+          extraContent: { google: { thought_signature: "signature-buffered" } },
+        })],
       }),
     ]);
   });

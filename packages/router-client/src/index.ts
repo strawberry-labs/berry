@@ -19,6 +19,8 @@ export interface ChatToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+  /** Opaque provider continuation metadata that must round-trip with the tool call. */
+  extraContent?: JsonValue;
 }
 
 export interface ChatMessage {
@@ -76,6 +78,8 @@ export interface ChatToolCallDelta {
   index: number;
   id?: string;
   function?: { name?: string; arguments?: string };
+  /** Opaque provider continuation metadata that must round-trip with the tool call. */
+  extraContent?: JsonValue;
 }
 
 export interface ChatCompletionChunk {
@@ -1095,7 +1099,12 @@ function serializeMessage(message: ChatMessage): Record<string, unknown> {
   }
   if (message.name) wire.name = message.name;
   if (message.toolCallId) wire.tool_call_id = message.toolCallId;
-  if (message.toolCalls && message.toolCalls.length > 0) wire.tool_calls = message.toolCalls;
+  if (message.toolCalls && message.toolCalls.length > 0) {
+    wire.tool_calls = message.toolCalls.map(({ extraContent, ...toolCall }) => ({
+      ...toolCall,
+      ...(extraContent !== undefined ? { extra_content: extraContent } : {}),
+    }));
+  }
   return wire;
 }
 
@@ -1440,6 +1449,9 @@ function normalizeToolCalls(toolCalls: OpenAIToolCall[] | undefined): ChatToolCa
       name: call.function?.name ?? "",
       arguments: call.function?.arguments ?? "",
     },
+    ...(call.extra_content !== undefined
+      ? { extraContent: call.extra_content as JsonValue }
+      : {}),
   }));
 }
 
@@ -1517,6 +1529,9 @@ function normalizeToolCallDeltas(deltas: OpenAIToolCallDelta[] | undefined): Cha
       if (typeof delta.function.arguments === "string") fn.arguments = delta.function.arguments;
       normalized.function = fn;
     }
+    if (delta.extra_content !== undefined) {
+      normalized.extraContent = delta.extra_content as JsonValue;
+    }
     return normalized;
   });
 }
@@ -1578,6 +1593,7 @@ interface OpenAIToolCall {
   id?: string;
   type?: string;
   function?: { name?: string; arguments?: string };
+  extra_content?: unknown;
 }
 
 interface OpenAIToolCallDelta {
@@ -1585,6 +1601,7 @@ interface OpenAIToolCallDelta {
   id?: string;
   type?: string;
   function?: { name?: string; arguments?: string };
+  extra_content?: unknown;
 }
 
 interface OpenAICompletionResponse {

@@ -2769,6 +2769,7 @@ describe("durable turn runner", () => {
             index: 0,
             id: "call_1",
             function: { name: "mcp__BerryCrawl__search", arguments: wrappedArguments.slice(0, 12) },
+            extraContent: { google: { thought_signature: "gemini-signature" } },
           }],
           finishReason: null,
           raw: {},
@@ -2908,8 +2909,10 @@ describe("durable turn runner", () => {
       outputTokens: 4,
       usage: { costRawMicros: "18" },
       toolCalls: [{
+        providerCallId: "call_1",
         name: "mcp__BerryCrawl__search",
         input: { query: "AI news" },
+        extraContent: { google: { thought_signature: "gemini-signature" } },
         retryClass: "read_only",
         requiresApproval: false,
       }],
@@ -3066,12 +3069,14 @@ describe("durable turn runner", () => {
     }
   });
 
-  it("persists and replays interleaved reasoning with assistant tool calls", async () => {
+  it("persists and replays reasoning plus provider continuation metadata with tool calls", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),
       modelStep("pending", 1),
     ]));
     const toolCallId = randomUUID();
+    const providerCallId = "default_api:read";
+    const extraContent = { google: { thought_signature: "gemini-signature" } };
     const runner = new DurableTurnRunner(repository, {
       call: async () => ({
         text: "",
@@ -3081,8 +3086,10 @@ describe("durable turn runner", () => {
         outputTokens: 8,
         toolCalls: [{
           id: toolCallId,
+          providerCallId,
           name: "read",
           input: { path: "/workspace/input.txt" },
+          extraContent,
           retryClass: "read_only",
           idempotencyKey: null,
           requiresApproval: false,
@@ -3099,6 +3106,14 @@ describe("durable turn runner", () => {
         reasoningContent: "I need the file contents before answering.",
       },
     });
+    expect(repository.current.steps.find((step) => step.type === "model.call")?.output)
+      .toMatchObject({
+        providerToolCalls: {
+          [toolCallId]: { providerCallId, extraContent },
+        },
+      });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
 
     let replayedRequest: ChatCompletionOptions | undefined;
     const replayClient = {
@@ -3168,8 +3183,10 @@ describe("durable turn runner", () => {
     expect(replayedRequest?.messages.find((message) => message.role === "assistant"))
       .toMatchObject({
         reasoningContent: "I need the file contents before answering.",
-        toolCalls: [{ id: toolCallId }],
+        toolCalls: [{ id: providerCallId, extraContent }],
       });
+    expect(replayedRequest?.messages.find((message) => message.role === "tool"))
+      .toMatchObject({ toolCallId: providerCallId });
     expect(replayedRequest?.messages.find((message) => message.role === "system")?.content)
       .not.toContain("file-tool compatibility guard");
   });

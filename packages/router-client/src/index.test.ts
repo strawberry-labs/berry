@@ -363,6 +363,40 @@ describe("router client", () => {
     });
   });
 
+  it("preserves provider continuation metadata from buffered tool calls", async () => {
+    const baseUrl = await withServer((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        id: "chatcmpl_tool_metadata",
+        model: "gemini-3.7-flash",
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [{
+              id: "default_api:bash",
+              type: "function",
+              function: { name: "bash", arguments: '{"command":"pwd"}' },
+              extra_content: { google: { thought_signature: "signature-buffered" } },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+      }));
+    });
+    const client = new OpenAIChatCompletionsClient({
+      provider: { baseUrl, defaultModel: "gemini-3.7-flash", kind: "berry-router", name: "Berry Router" },
+      apiKey: "key",
+    });
+
+    await expect(client.complete({ messages: [{ role: "user", content: "run pwd" }] }))
+      .resolves.toMatchObject({
+        toolCalls: [{
+          id: "default_api:bash",
+          extraContent: { google: { thought_signature: "signature-buffered" } },
+        }],
+      });
+  });
+
   it("captures a sanitized request id on successful buffered completions", async () => {
     const baseUrl = await withServer((_request, response) => {
       response.writeHead(200, {
@@ -579,7 +613,12 @@ describe("router client", () => {
         {
           role: "assistant",
           content: null,
-          toolCalls: [{ id: "call_1", type: "function", function: { name: "list_dir", arguments: "{}" } }],
+          toolCalls: [{
+            id: "call_1",
+            type: "function",
+            function: { name: "list_dir", arguments: "{}" },
+            extraContent: { google: { thought_signature: "signature-1" } },
+          }],
         },
         { role: "tool", content: "a.txt", toolCallId: "call_1", name: "list_dir" },
       ],
@@ -594,7 +633,12 @@ describe("router client", () => {
     expect(messages[1]).toMatchObject({
       role: "assistant",
       content: null,
-      tool_calls: [{ id: "call_1", type: "function", function: { name: "list_dir", arguments: "{}" } }],
+      tool_calls: [{
+        id: "call_1",
+        type: "function",
+        function: { name: "list_dir", arguments: "{}" },
+        extra_content: { google: { thought_signature: "signature-1" } },
+      }],
     });
     expect(messages[2]).toMatchObject({ role: "tool", tool_call_id: "call_1", name: "list_dir" });
     expect(messages[2]?.toolCallId).toBeUndefined();
@@ -604,7 +648,7 @@ describe("router client", () => {
     const baseUrl = await withServer((_request, response) => {
       response.setHeader("Content-Type", "text/event-stream");
       response.write(
-        'data: {"id":"1","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"grep","arguments":""}}]}}]}\n\n',
+        'data: {"id":"1","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"grep","arguments":""},"extra_content":{"google":{"thought_signature":"signature-9"}}}]}}]}\n\n',
       );
       response.write(
         'data: {"id":"1","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"pattern\\":"}}]}}]}\n\n',
@@ -621,22 +665,29 @@ describe("router client", () => {
       provider: { baseUrl, defaultModel: "m", kind: "openrouter-compatible", name: "test" },
       apiKey: "key",
     });
-    const toolDeltas: Array<{ index: number; id?: string; name?: string; args?: string }> = [];
+    const toolDeltas: Array<{ index: number; id?: string; name?: string; args?: string; extraContent?: unknown }> = [];
     let finishReason: string | null = null;
     let usage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined;
     for await (const chunk of client.stream({ messages: [{ role: "user", content: "hi" }] })) {
       for (const delta of chunk.toolCalls ?? []) {
-        const flattened: { index: number; id?: string; name?: string; args?: string } = { index: delta.index };
+        const flattened: { index: number; id?: string; name?: string; args?: string; extraContent?: unknown } = { index: delta.index };
         if (delta.id) flattened.id = delta.id;
         if (delta.function?.name !== undefined) flattened.name = delta.function.name;
         if (delta.function?.arguments !== undefined) flattened.args = delta.function.arguments;
+        if (delta.extraContent !== undefined) flattened.extraContent = delta.extraContent;
         toolDeltas.push(flattened);
       }
       if (chunk.finishReason) finishReason = chunk.finishReason;
       if (chunk.usage) usage = chunk.usage;
     }
     expect(toolDeltas).toEqual([
-      { index: 0, id: "call_9", name: "grep", args: "" },
+      {
+        index: 0,
+        id: "call_9",
+        name: "grep",
+        args: "",
+        extraContent: { google: { thought_signature: "signature-9" } },
+      },
       { index: 0, args: '{"pattern":' },
       { index: 0, args: '"berry"}' },
     ]);

@@ -339,8 +339,12 @@ export interface DurableTurnRetryDiagnostics {
 
 export interface TurnModelToolIntent {
   id: string;
+  /** Provider-issued call id used when replaying the call and its result. */
+  providerCallId?: string;
   name: string;
   input: JsonValue;
+  /** Opaque provider continuation metadata that must round-trip with the call. */
+  extraContent?: JsonValue;
   retryClass: ToolRetryClass;
   repeatPolicy?: ToolRepeatPolicy;
   idempotencyKey: string | null;
@@ -1189,6 +1193,14 @@ export class DurableTurnRunner {
       ...responseProviderAttempts,
       ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
     ];
+    const providerToolCalls: Record<string, JsonValue> = {};
+    for (const call of result.toolCalls) {
+      if (call.providerCallId === undefined && call.extraContent === undefined) continue;
+      providerToolCalls[call.id] = {
+        ...(call.providerCallId !== undefined ? { providerCallId: call.providerCallId } : {}),
+        ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
+      };
+    }
     const entries: DurableTurnMutation["entries"] = [{
       entryId: messageId,
       entryType: "message",
@@ -1258,6 +1270,7 @@ export class DurableTurnRunner {
             toolCallIds: result.toolCalls.map((call) => call.id),
             finishReason: result.finishReason ?? null,
             ...(result.providerResponseId ? { providerResponseId: result.providerResponseId } : {}),
+            ...(Object.keys(providerToolCalls).length > 0 ? { providerToolCalls } : {}),
             providerDiagnostics,
           },
           sessionEntryId: messageId,
@@ -3852,6 +3865,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       id: string;
       name: string;
       arguments: string;
+      extraContent?: JsonValue;
     }>();
     let rawText = "";
     let rawReasoning = "";
@@ -3930,6 +3944,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
         if (delta.id) current.id += delta.id;
         if (delta.function?.name) current.name += delta.function.name;
         if (delta.function?.arguments) current.arguments += delta.function.arguments;
+        if (delta.extraContent !== undefined) current.extraContent = delta.extraContent;
         streamedToolCalls.set(delta.index, current);
       }
       if (chunk.usage) finalUsage = chunk.usage;
@@ -3950,6 +3965,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
           name: call.name,
           arguments: call.arguments || "{}",
         },
+        ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
       }] : []);
     const resultToolCalls = nativeToolCalls.length > 0
       ? nativeToolCalls
@@ -3958,8 +3974,10 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       const policy = context.policyForTool(call.function.name);
       return {
         id: uuidFromToolCall(call.id),
+        providerCallId: call.id,
         name: call.function.name,
         input: safeJson(call.function.arguments),
+        ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
         retryClass: policy.retryClass,
         repeatPolicy: policy.repeatPolicy,
         idempotencyKey: policy.retryClass === "idempotent_with_key"
@@ -5426,6 +5444,33 @@ export function durableVisionToolSelectionPrompt(toolNames: readonly string[]): 
   return toolNames.includes("inspect_images") ? DURABLE_VISION_TOOL_SELECTION_PROMPT : "";
 }
 
+type ProviderToolCallReplay = {
+  providerCallId?: string;
+  extraContent?: JsonValue;
+};
+
+function providerToolCallReplayById(
+  steps: readonly DurableTurnStep[],
+): ReadonlyMap<string, ProviderToolCallReplay> {
+  const replayById = new Map<string, ProviderToolCallReplay>();
+  for (const step of steps) {
+    const stored = record(record(step.output)?.providerToolCalls);
+    if (!stored) continue;
+    for (const [toolCallId, value] of Object.entries(stored)) {
+      const replay = record(value);
+      if (!replay) continue;
+      const providerCallId = stringValue(replay.providerCallId) ?? undefined;
+      const hasExtraContent = Object.prototype.hasOwnProperty.call(replay, "extraContent");
+      if (!providerCallId && !hasExtraContent) continue;
+      replayById.set(toolCallId, {
+        ...(providerCallId ? { providerCallId } : {}),
+        ...(hasExtraContent ? { extraContent: replay.extraContent as JsonValue } : {}),
+      });
+    }
+  }
+  return replayById;
+}
+
 export function modelMessages(
   snapshot: DurableTurnSnapshot,
   additionalUserContent: readonly ChatContentPart[] = [],
@@ -5479,6 +5524,7 @@ export function modelMessages(
   ].filter(Boolean).join("\n\n");
   const system = [stableSystemPrompt, dynamicSystem].filter(Boolean).join("\n\n");
   const messages: ChatMessage[] = [{ role: "system", content: system }];
+  const providerToolCalls = providerToolCallReplayById(snapshot.steps);
   let toolContextCharacters = 0;
   const toolContextBudget = modelWindowToolContextCharacters(snapshot);
   for (const entry of uncompactedEntries(snapshot)) {
@@ -5497,13 +5543,17 @@ export function modelMessages(
             const id = stringValue(item.id);
             const name = stringValue(item.name);
             if (!id || !name) return [];
+            const replay = providerToolCalls.get(id);
             return [{
-              id,
+              id: replay?.providerCallId ?? id,
               type: "function" as const,
               function: {
                 name,
                 arguments: JSON.stringify(item.arguments ?? {}),
               },
+              ...(replay?.extraContent !== undefined
+                ? { extraContent: replay.extraContent }
+                : {}),
             }];
           })
         : [];
@@ -5523,9 +5573,10 @@ export function modelMessages(
         Math.max(0, toolContextBudget - toolContextCharacters),
       );
       toolContextCharacters += toolContent.length;
+      const toolCallId = stringValue(message?.toolCallId) ?? entry.entryId;
       messages.push({
         role: "tool",
-        toolCallId: stringValue(message?.toolCallId) ?? entry.entryId,
+        toolCallId: providerToolCalls.get(toolCallId)?.providerCallId ?? toolCallId,
         ...(stringValue(message?.toolName) ? { name: stringValue(message?.toolName)! } : {}),
         content: toolContent,
       });

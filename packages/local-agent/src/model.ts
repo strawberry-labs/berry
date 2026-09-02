@@ -219,6 +219,7 @@ export class BufferedChatCompletionClient implements ChatCompletionStreamClient 
           index,
           id: call.id,
           function: { name: call.function.name, arguments: call.function.arguments },
+          ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
         })),
       } : {}),
       finishReason: result.finishReason,
