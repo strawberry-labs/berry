@@ -42,12 +42,21 @@ describe("durable prompt cache planning", () => {
     expect(second.manifest.dynamicContextBoundary).toBe("stable system".length);
   });
 
-  it("omits cache controls when capability support is not declared", () => {
+  it("omits cache controls for Gemini 3.7 Flash when support is not declared", () => {
+    const model = "google-vertex/gemini-3.7-flash";
     const unsupported = promptCacheCapabilityFromEnv({
       BERRY_PROMPT_CACHE_ENABLED: "true",
-      BERRY_ROUTER_MODELS_JSON: "[]",
-    }, "model-a");
-    const plan = planned({ capability: unsupported });
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([{
+        id: model,
+        capabilities: {
+          tools: true,
+          vision: true,
+          reasoning: true,
+          cost: { input: 0.75, output: 3.75, cacheRead: 0.075 },
+        },
+      }]),
+    }, model);
+    const plan = planned({ model, capability: unsupported });
 
     expect(plan.cacheKey).toBeNull();
     expect(plan.retention).toBe("none");

@@ -142,6 +142,63 @@ describe("cloud runtime configuration", () => {
     expect(resolved.provider.models?.map((model) => model.id)).toEqual(["kimi-2.6", "glm-5.2"]);
   });
 
+  it("parses Gemini 3.7 Flash metadata without changing the configured default", () => {
+    const defaultModel = "canopywave/deepseek/deepseek-v4-flash";
+    const config = createCloudRuntimeConfigFromEnv({
+      BERRY_API_MODEL_MODE: "live",
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: defaultModel,
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([
+        { id: defaultModel, name: "DeepSeek V4 Flash" },
+        {
+          id: "google-vertex/gemini-3.7-flash",
+          name: "Gemini 3.7 Flash",
+          ownedBy: "google",
+          apiType: "openai-chat-completions",
+          family: "gemini-3.7",
+          contextWindow: 1_048_576,
+          maxOutputTokens: 65_536,
+          inputModalities: ["text", "image"],
+          outputModalities: ["text"],
+          capabilities: {
+            tools: true,
+            vision: true,
+            reasoning: true,
+            reasoningEfforts: ["low", "medium", "high"],
+            json: true,
+            cost: { input: 0.75, output: 3.75, cacheRead: 0.075 },
+          },
+        },
+      ]),
+    });
+
+    expect(config.provider?.defaultModel).toBe(defaultModel);
+    expect(config.provider?.models?.map((model) => model.id)).toEqual([
+      defaultModel,
+      "google-vertex/gemini-3.7-flash",
+    ]);
+    expect(config.provider?.models?.[1]).toEqual({
+      id: "google-vertex/gemini-3.7-flash",
+      name: "Gemini 3.7 Flash",
+      ownedBy: "google",
+      apiType: "openai-chat-completions",
+      family: "gemini-3.7",
+      contextWindow: 1_048_576,
+      maxOutputTokens: 65_536,
+      inputModalities: ["text", "image"],
+      outputModalities: ["text"],
+      capabilities: {
+        tools: true,
+        vision: true,
+        reasoning: true,
+        reasoningEfforts: ["low", "medium", "high"],
+        json: true,
+        cost: { input: 0.75, output: 3.75, cacheRead: 0.075 },
+      },
+    });
+    expect(config.provider?.models?.[1]?.capabilities).not.toHaveProperty("promptCaching");
+  });
+
   it("does not trust a client-supplied Worker credential reference", async () => {
     const service = new CloudRuntimeConfigService({ BERRY_API_MODEL_MODE: "fixture" });
 

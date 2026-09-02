@@ -27,6 +27,7 @@ import {
   durableToolManifestMetrics,
   queuedFollowUpRuntimeRequest,
   modelMessages,
+  usageCostMicros,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -47,6 +48,18 @@ afterEach(() => {
 });
 
 describe("durable turn runner", () => {
+  it("prices Gemini 3.7 Flash usage in micro-dollars from per-million rates", () => {
+    expect(usageCostMicros({
+      inputTokens: 1_000,
+      outputTokens: 100,
+      cacheReadTokens: 200,
+    }, {
+      input: 0.75,
+      output: 3.75,
+      cacheRead: 0.075,
+    })).toBe(990n);
+  });
+
   it("measures the serialized tool manifest before model calls", () => {
     const metrics = durableToolManifestMetrics([
       {

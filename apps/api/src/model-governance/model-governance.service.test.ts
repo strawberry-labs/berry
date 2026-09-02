@@ -78,31 +78,58 @@ describe("model governance scoped access", () => {
     );
   });
 
-  it("persists top-level model context and output limits in governance capabilities", async () => {
-    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository(false));
+  it("synchronizes Gemini 3.7 Flash with its runtime capabilities and cost hints", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository());
+    const defaultModel = "canopywave/deepseek/deepseek-v4-flash";
     await service.synchronizeRuntimeCatalog(tenantId, {
       id: "router",
       name: "Berry Router",
       kind: "berry-router",
       baseUrl: "https://router.example.test/v1",
       apiType: "openai-chat-completions",
-      defaultModel: "minimax-m3",
-      models: [{
-        id: "minimax-m3",
-        name: "MiniMax M3",
-        contextWindow: 1_000_000,
-        maxOutputTokens: 128_000,
-        capabilities: { tools: true, reasoning: true },
-      }],
+      defaultModel,
+      models: [
+        { id: defaultModel, name: "DeepSeek V4 Flash" },
+        {
+          id: "google-vertex/gemini-3.7-flash",
+          name: "Gemini 3.7 Flash",
+          ownedBy: "google",
+          apiType: "openai-chat-completions",
+          family: "gemini-3.7",
+          contextWindow: 1_048_576,
+          maxOutputTokens: 65_536,
+          inputModalities: ["text", "image"],
+          outputModalities: ["text"],
+          capabilities: {
+            tools: true,
+            vision: true,
+            reasoning: true,
+            reasoningEfforts: ["low", "medium", "high"],
+            json: true,
+            cost: { input: 0.75, output: 3.75, cacheRead: 0.075 },
+          },
+        },
+      ],
     });
 
+    expect(await service.listDefaults(tenantId)).toEqual([
+      expect.objectContaining({ mode: "chat", providerId: "router", model: defaultModel }),
+      expect.objectContaining({ mode: "code", providerId: "router", model: defaultModel }),
+    ]);
     expect(await service.listModels(tenantId)).toContainEqual(expect.objectContaining({
-      model: "minimax-m3",
-      capabilities: expect.objectContaining({
+      model: "google-vertex/gemini-3.7-flash",
+      displayName: "Gemini 3.7 Flash",
+      apiType: "openai-chat-completions",
+      status: "allowed",
+      capabilities: {
         tools: true,
+        vision: true,
         reasoning: true,
-        context: { windowTokens: 1_000_000, maxOutputTokens: 128_000 },
-      }),
+        reasoningEfforts: ["low", "medium", "high"],
+        json: true,
+        context: { windowTokens: 1_048_576, maxOutputTokens: 65_536 },
+        cost: { input: 0.75, output: 3.75, cacheRead: 0.075 },
+      },
     }));
   });
 

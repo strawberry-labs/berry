@@ -13,7 +13,7 @@ For a repeatable AWS installation, use the CloudFormation stack in
 - One private RDS PostgreSQL instance reachable only from the EC2 security group. Create separate `berry` and `mem0` databases, enable `pgcrypto` and `vector`, require TLS, and enable automated backups with point-in-time recovery.
 - Docker Engine with the Compose v2 plugin, Git, curl, openssl, and enough free disk to build the monorepo image.
 - Two private S3 buckets in `eu-west-1`, one for artifacts and one for audit exports. The EC2 instance profile needs `s3:ListBucket` on both buckets; artifact objects need `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion`, and `s3:AbortMultipartUpload`, while audit objects need only `s3:PutObject`. Keep Block Public Access enabled. Configure CORS only on the artifact bucket so `https://ai.example.com` can upload through presigned URLs and read the returned `ETag`; the audit bucket remains server-only.
-- BerryRouter inference URL/key, exact Router IDs for Kimi 2.6 and GLM 5.2, their input/output prices per million tokens, the chat-completions path, and an image model/path.
+- BerryRouter inference URL/key, exact Router IDs and effective prices per million tokens for every deployed model, the chat-completions path, and an image model/path.
 - An E2B Cloud team with billing enabled, a server API key, and either the built-in `base` template or a reviewed custom template ID. The E2B key is injected only into the private API container and never reaches the web app or browser.
 - BerryCrawl public HTTPS MCP URL and bearer key.
 
@@ -31,6 +31,21 @@ The AWS production profile does not start PostgreSQL, Mem0 PostgreSQL, or MinIO 
 ## External service contracts required by this build
 
 Inference must expose an OpenAI-compatible streaming `POST /chat/completions` beneath `BERRY_ROUTER_INFERENCE_BASE_URL`. It must preserve streaming text, tool-call deltas, token usage, model identity, and provider identity. Image generation must accept OpenAI-style `POST /images/generations` with `model`, `prompt`, `n`, `size`, and `response_format`, returning `data[0].b64_json` or `data[0].url`.
+
+The checked-in production environment example includes the GA route
+`google-vertex/gemini-3.7-flash` for upstream `gemini-3.7-flash`. Berry exposes
+text and image input, text output, tools, JSON, vision, and the supported low,
+medium, and high thinking levels; medium is the upstream default. The route does
+not advertise audio, video, PDF, or explicit prompt caching because its current
+BerryRouter adapter does not expose those request controls.
+
+Gemini 3.7 Flash cost hints are USD per million tokens for Google's global
+Standard endpoint through December 31, 2026: input `0.75`, output (including
+visible and reasoning tokens) `3.75`, and cache read `0.075`. Starting January 1,
+2027, those list prices become `1.50`, `7.50`, and `0.15`. Recheck the effective
+BerryRouter charge before that date and use any customer multiplier or discount
+instead of the provider list price. Berry Chat stores only `BERRY_ROUTER_API_KEY`;
+the Google Vertex credential stays in BerryRouter.
 
 Providers registered through Settings are inactive until an administrator runs the guarded health check. Add every permitted exact hostname to `BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS`; HTTPS is mandatory by default. Store additional credential references in the untracked `BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON` object or inject the referenced environment variable into the API container. Never place raw provider keys in the admin form.
 
