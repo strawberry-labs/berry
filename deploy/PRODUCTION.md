@@ -39,6 +39,12 @@ medium, and high thinking levels; medium is the upstream default. The route does
 not advertise audio, video, PDF, or explicit prompt caching because its current
 BerryRouter adapter does not expose those request controls.
 
+When a Gemini reasoning level is selected, BerryRouter requests Google's
+best-effort thought summaries and exposes them as `reasoning_content`. Berry
+Chat streams that field into the reasoning panel separately from the answer.
+These summaries are not Gemini's private raw chain of thought and may be absent
+for simple requests.
+
 Gemini 3.7 Flash cost hints are USD per million tokens for Google's global
 Standard endpoint through December 31, 2026: input `0.75`, output (including
 visible and reasoning tokens) `3.75`, and cache read `0.075`. Starting January 1,
@@ -46,6 +52,13 @@ visible and reasoning tokens) `3.75`, and cache read `0.075`. Starting January 1
 BerryRouter charge before that date and use any customer multiplier or discount
 instead of the provider list price. Berry Chat stores only `BERRY_ROUTER_API_KEY`;
 the Google Vertex credential stays in BerryRouter.
+
+The Canopy Wave route `canopywave/qwen/qwen3.8-flash-next` exposes Qwen 3.8
+Flash Next with a 1,000,000-token context window, a 128,000-token output limit,
+text and image input, streaming, tools, reasoning, JSON output, and vision. Its
+configured cost hints per million tokens are `0.150` input, `0.500` output, and
+`0.020` cache read. This route is available without changing the organization
+default model.
 
 Providers registered through Settings are inactive until an administrator runs the guarded health check. Add every permitted exact hostname to `BERRY_ORGANIZATION_PROVIDER_ALLOWED_HOSTS`; HTTPS is mandatory by default. Store additional credential references in the untracked `BERRY_ORGANIZATION_PROVIDER_CREDENTIALS_JSON` object or inject the referenced environment variable into the API container. Never place raw provider keys in the admin form.
 

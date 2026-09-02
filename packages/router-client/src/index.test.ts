@@ -718,6 +718,46 @@ describe("router client", () => {
     expect(text.join("")).toBe("answer");
   });
 
+  it("forwards Gemini reasoning effort to BerryRouter and accepts thought-summary deltas", async () => {
+    let requestBody: Record<string, unknown> = {};
+    const baseUrl = await withServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => {
+        raw += String(chunk);
+      });
+      request.on("end", () => {
+        requestBody = JSON.parse(raw) as Record<string, unknown>;
+        response.setHeader("Content-Type", "text/event-stream");
+        response.write('data: {"id":"1","model":"google-vertex/gemini-3.7-flash","choices":[{"delta":{"reasoning_content":"Check the constraints."}}]}\n\n');
+        response.write('data: {"id":"1","model":"google-vertex/gemini-3.7-flash","choices":[{"delta":{"content":"The answer."},"finish_reason":"stop"}]}\n\n');
+        response.end("data: [DONE]\n\n");
+      });
+    });
+    const client = new OpenRouterCompatibleClient({
+      provider: {
+        baseUrl,
+        defaultModel: "google-vertex/gemini-3.7-flash",
+        kind: "berry-router",
+        name: "Berry Router",
+      },
+      apiKey: "key",
+    });
+    const reasoning: string[] = [];
+    const text: string[] = [];
+
+    for await (const chunk of client.stream({
+      reasoningEffort: "high",
+      messages: [{ role: "user", content: "Solve this." }],
+    })) {
+      if (chunk.reasoningDelta) reasoning.push(chunk.reasoningDelta);
+      if (chunk.delta) text.push(chunk.delta);
+    }
+
+    expect(requestBody.reasoning).toEqual({ effort: "high" });
+    expect(reasoning.join("")).toBe("Check the constraints.");
+    expect(text.join("")).toBe("The answer.");
+  });
+
   it("uses Kimi K2.6 thinking mode and streams its reasoning_content", async () => {
     let requestBody: Record<string, unknown> = {};
     const baseUrl = await withServer((request, response) => {

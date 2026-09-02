@@ -199,6 +199,42 @@ describe("cloud runtime configuration", () => {
     expect(config.provider?.models?.[1]?.capabilities).not.toHaveProperty("promptCaching");
   });
 
+  it("parses Qwen 3.8 Flash Next metadata without changing the configured default", () => {
+    const defaultModel = "canopywave/deepseek/deepseek-v4-flash";
+    const qwenModel = {
+      id: "canopywave/qwen/qwen3.8-flash-next",
+      name: "Qwen 3.8 Flash Next",
+      ownedBy: "qwen",
+      apiType: "openai-chat-completions" as const,
+      family: "qwen3.8",
+      contextWindow: 1_000_000,
+      maxOutputTokens: 128_000,
+      inputModalities: ["text", "image"],
+      outputModalities: ["text"],
+      capabilities: {
+        tools: true,
+        vision: true,
+        reasoning: true,
+        json: true,
+        cost: { input: 0.15, output: 0.5, cacheRead: 0.02 },
+      },
+    };
+    const config = createCloudRuntimeConfigFromEnv({
+      BERRY_API_MODEL_MODE: "live",
+      BERRY_ROUTER_INFERENCE_BASE_URL: "https://router.example.test/v1",
+      BERRY_ROUTER_DEFAULT_MODEL: defaultModel,
+      BERRY_ROUTER_MODELS_JSON: JSON.stringify([
+        { id: defaultModel, name: "DeepSeek V4 Flash" },
+        qwenModel,
+      ]),
+    });
+
+    expect(config.provider?.defaultModel).toBe(defaultModel);
+    expect(config.provider?.models?.[1]).toEqual(qwenModel);
+    expect(config.provider?.models?.[1]?.capabilities).not.toHaveProperty("reasoningEfforts");
+    expect(config.provider?.models?.[1]?.capabilities).not.toHaveProperty("promptCaching");
+  });
+
   it("does not trust a client-supplied Worker credential reference", async () => {
     const service = new CloudRuntimeConfigService({ BERRY_API_MODEL_MODE: "fixture" });
 

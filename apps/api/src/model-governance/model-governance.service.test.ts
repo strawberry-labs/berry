@@ -133,6 +133,55 @@ describe("model governance scoped access", () => {
     }));
   });
 
+  it("synchronizes Qwen 3.8 Flash Next with its runtime limits and cost hints", async () => {
+    const service = new ModelGovernanceService(new InMemoryModelGovernanceRepository());
+    const defaultModel = "canopywave/deepseek/deepseek-v4-flash";
+    await service.synchronizeRuntimeCatalog(tenantId, {
+      id: "router",
+      name: "Berry Router",
+      kind: "berry-router",
+      baseUrl: "https://router.example.test/v1",
+      apiType: "openai-chat-completions",
+      defaultModel,
+      models: [
+        { id: defaultModel, name: "DeepSeek V4 Flash" },
+        {
+          id: "canopywave/qwen/qwen3.8-flash-next",
+          name: "Qwen 3.8 Flash Next",
+          ownedBy: "qwen",
+          apiType: "openai-chat-completions",
+          family: "qwen3.8",
+          contextWindow: 1_000_000,
+          maxOutputTokens: 128_000,
+          inputModalities: ["text", "image"],
+          outputModalities: ["text"],
+          capabilities: {
+            tools: true,
+            vision: true,
+            reasoning: true,
+            json: true,
+            cost: { input: 0.15, output: 0.5, cacheRead: 0.02 },
+          },
+        },
+      ],
+    });
+
+    expect(await service.listModels(tenantId)).toContainEqual(expect.objectContaining({
+      model: "canopywave/qwen/qwen3.8-flash-next",
+      displayName: "Qwen 3.8 Flash Next",
+      apiType: "openai-chat-completions",
+      status: "allowed",
+      capabilities: {
+        tools: true,
+        vision: true,
+        reasoning: true,
+        json: true,
+        context: { windowTokens: 1_000_000, maxOutputTokens: 128_000 },
+        cost: { input: 0.15, output: 0.5, cacheRead: 0.02 },
+      },
+    }));
+  });
+
   it("does not rewrite an unchanged jsonb policy when object keys are reordered", async () => {
     const base = new InMemoryModelGovernanceRepository(false);
     await base.upsertPolicy({
