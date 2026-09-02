@@ -672,7 +672,9 @@ export const memoryItemVersions = pgTable("memory_item_versions", {
   actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
   sourceTaskId: uuid("source_task_id").references(() => tasks.id, { onDelete: "set null" }),
   sourceSessionId: uuid("source_session_id").references(() => sessions.id, { onDelete: "set null" }),
-  sourceMessageId: uuid("source_message_id").references(() => messages.id, { onDelete: "set null" }),
+  // Edited transcript messages are removed while version rows stay immutable, so
+  // this is a durable provenance identifier rather than a cascading foreign key.
+  sourceMessageId: uuid("source_message_id"),
   extractorVersion: text("extractor_version"),
   reason: text("reason"),
   createdAt,
@@ -5479,6 +5481,14 @@ CREATE POLICY connector_approval_requests_tenant_isolation ON connector_approval
   USING (tenant_id = berry_current_tenant_id()) WITH CHECK (tenant_id = berry_current_tenant_id());
 `.trim();
 
+export const MEMORY_ITEM_VERSION_SOURCE_MESSAGE_PROVENANCE_MIGRATION = `
+ALTER TABLE memory_item_versions
+  DROP CONSTRAINT IF EXISTS memory_item_versions_source_message_id_fkey;
+
+COMMENT ON COLUMN memory_item_versions.source_message_id IS
+  'Immutable provenance identifier retained after an edited source message is removed.';
+`.trim();
+
 export const cloudMigrations = [
   {
     id: 1,
@@ -5656,6 +5666,12 @@ export const cloudMigrations = [
     id: 69,
     name: "connector_approval_requests_v1",
     sql: CONNECTOR_APPROVAL_REQUESTS_MIGRATION,
+    transactional: false,
+  },
+  {
+    id: 70,
+    name: "memory_item_version_source_message_provenance_v1",
+    sql: MEMORY_ITEM_VERSION_SOURCE_MESSAGE_PROVENANCE_MIGRATION,
     transactional: false,
   },
 ] as const;
