@@ -72,7 +72,7 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
     type: "function",
     function: {
       name: "forget_memory",
-      description: "Forget one durable personal memory for this user. Use a memory id when known, otherwise use its exact stable key.",
+      description: "Forget one durable personal memory for this user. Provide memory_id when known; otherwise provide stable_key. At least one is required.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -80,10 +80,6 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
           memory_id: { type: "string", minLength: 1 },
           stable_key: { type: "string", minLength: 1, maxLength: 240 },
         },
-        anyOf: [
-          { required: ["memory_id"] },
-          { required: ["stable_key"] },
-        ],
       },
     },
   },

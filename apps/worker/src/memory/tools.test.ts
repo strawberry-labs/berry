@@ -53,6 +53,19 @@ describe("DurablePersonalMemoryToolExecutor", () => {
           },
         },
       });
+    const forgetMemory = definitions.find((tool) => tool.function.name === "forget_memory");
+    expect(forgetMemory).toMatchObject({
+      function: {
+        parameters: {
+          type: "object",
+          properties: {
+            memory_id: { type: "string" },
+            stable_key: { type: "string" },
+          },
+        },
+      },
+    });
+    expect(forgetMemory?.function.parameters).not.toHaveProperty("anyOf");
   });
 
   it("stores an explicit personal memory with turn provenance", async () => {
