@@ -323,6 +323,36 @@ export function reduceDurableTurnState(
   return base;
 }
 
+export function reconcileAcceptedTurnState(
+  previous: TurnState | undefined,
+  pendingTurnId: string,
+  acceptedTurnId: string,
+  continuation: boolean,
+): TurnState {
+  const queued: TurnState = {
+    active: true,
+    turnId: acceptedTurnId,
+    continuation,
+    bufferedEvents: [],
+    replayOnly: false,
+    owner: null,
+    runState: "queued",
+    waitingReason: null,
+    nextAction: "Waiting for worker",
+    error: null,
+  };
+  if (!previous?.active) return queued;
+  if (previous.turnId !== pendingTurnId && previous.turnId !== acceptedTurnId) return queued;
+  if (!previous.runState || previous.runState === "queued" || previous.runState === "assembling_context") {
+    return queued;
+  }
+  return {
+    ...previous,
+    turnId: acceptedTurnId,
+    continuation,
+  };
+}
+
 export function durableTurnPhase(state: TurnState | undefined): string | undefined {
   if (!state?.active) return undefined;
   if (state.nextAction === "Submitting the turn") return "Submitting";
@@ -2080,18 +2110,15 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       // this run and reopen the stream from the cursor that event supplied.
       activeSessionsRef.current.add(sessionId);
       setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "running" } : item));
-      applyDurableState(sessionId, {
-        active: true,
-        turnId: started.turnId,
-        continuation: params.continueInterruptedTurn === true,
-        bufferedEvents: [],
-        replayOnly: false,
-        owner: null,
-        runState: "queued",
-        waitingReason: null,
-        nextAction: "Waiting for worker",
-        error: null,
-      });
+      setDurableStatesBySession((current) => ({
+        ...current,
+        [sessionId]: reconcileAcceptedTurnState(
+          current[sessionId],
+          pendingTurnId,
+          started.turnId,
+          params.continueInterruptedTurn === true,
+        ),
+      }));
       void attachSessionStream(sessionId).catch(() => undefined);
     } catch (cause) {
       if (submission.cancelRequested) {

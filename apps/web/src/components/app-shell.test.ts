@@ -3,7 +3,7 @@ import { BerryApiError, type StartTurnRequest } from "@berry/api-client";
 import type { Task } from "@berry/shared";
 import { parseCloudShellLocation } from "@/lib/cloud-shell-state";
 import { PERSONAL_NAV, visibleAdministrationGroups } from "./management/management-navigation";
-import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, greetingForDate, greetingForHour, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
+import { activeTurnStateAfterConflict, clearDurableEventReplayBoundary, continueAfterMessageRefresh, durableTurnPhase, existingTaskTurnModelOverride, findPersistedMessageById, findPersistedMessagesByIds, greetingForDate, greetingForHour, historyDeletionRevisionChanged, historyRevisionChanged, hydratedExistingTaskModel, initialCloudContent, isInterruptedTurnAvailable, isLegacyMessageHistoryPage, mergeMessagePage, mergeRefreshedMessagePage, mergeTaskSnapshots, newTaskModelOverride, preferredNewTaskModel, prepareTurnCancellation, reconcileAcceptedTurnState, reduceDurableTurnState, replayDurableStreamState, retryTurnAdmission, revokeAuthSession, shouldConfirmTurnAdmission, shouldKeepTurnPendingAfterFailedConfirmation, shouldMountTaskSurface, shouldRefreshAdministration, shouldShowComposerProjectSwitcher, shouldUpdateDurableStateForEvent, type ShellData } from "./app-shell";
 import { accountAvatarInitial, allowanceProgress, formatAllowanceResetDate } from "./shell/web-sidebar";
 
 describe("cloud shell bootstrap", () => {
@@ -411,6 +411,42 @@ describe("cloud shell bootstrap", () => {
     expect(durableTurnPhase(active("queued"))).toBe("Waiting for worker");
     expect(durableTurnPhase(active("calling_model"))).toBe("Calling model");
     expect(durableTurnPhase(active("executing_tool"))).toBe("Running tool");
+  });
+
+  it("does not reset an SSE-advanced turn to waiting when admission finishes", () => {
+    const accepted = reduceDurableTurnState(undefined, { kind: "turn.start", turnId: "turn_1" });
+    const callingModel = reduceDurableTurnState(
+      accepted ?? undefined,
+      { kind: "message.start", messageId: "message_1", role: "assistant" },
+    );
+
+    expect(reconcileAcceptedTurnState(callingModel ?? undefined, "pending_1", "turn_1", false))
+      .toMatchObject({
+        active: true,
+        turnId: "turn_1",
+        runState: "calling_model",
+        nextAction: "Calling model",
+      });
+  });
+
+  it("rebinds an early advanced pending turn and queues only an unadvanced admission", () => {
+    const pending = {
+      active: true,
+      turnId: "pending_1",
+      bufferedEvents: [],
+      replayOnly: false,
+      owner: null,
+      runState: "assembling_context" as const,
+      waitingReason: null,
+      nextAction: "Preparing context",
+      error: null,
+    };
+    const callingModel = { ...pending, runState: "calling_model" as const, nextAction: "Calling model" };
+
+    expect(reconcileAcceptedTurnState(callingModel, "pending_1", "turn_1", false))
+      .toMatchObject({ turnId: "turn_1", runState: "calling_model", nextAction: "Calling model" });
+    expect(reconcileAcceptedTurnState(pending, "pending_1", "turn_1", false))
+      .toMatchObject({ turnId: "turn_1", runState: "queued", nextAction: "Waiting for worker" });
   });
 
   it("hydrates the elapsed timer from the durable run start", () => {
