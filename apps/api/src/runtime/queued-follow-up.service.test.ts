@@ -1,4 +1,6 @@
+import { Test } from "@nestjs/testing";
 import { describe, expect, it } from "vitest";
+import { CloudDatabaseModule } from "../db/cloud-database.module.js";
 import { CloudDatabaseService, type SqlExecutor } from "../db/cloud-database.service.js";
 import { QueuedFollowUpService } from "./queued-follow-up.service.js";
 
@@ -65,6 +67,22 @@ function executorFor(options: { existing?: Record<string, unknown>; inserted?: R
 }
 
 describe("QueuedFollowUpService", () => {
+  it("receives CloudDatabaseService through Nest module injection", async () => {
+    const fake = executorFor();
+    const moduleRef = await Test.createTestingModule({
+      imports: [CloudDatabaseModule.register({ useValue: fake.executor })],
+      providers: [QueuedFollowUpService],
+    }).compile();
+
+    try {
+      await expect(moduleRef.get(QueuedFollowUpService).list(tenantId, userId, sessionId)).resolves.toMatchObject({
+        items: [{ id: queueId }],
+      });
+    } finally {
+      await moduleRef.close();
+    }
+  });
+
   it("is idempotent and strips browser-only attachment payloads before persistence", async () => {
     const first = executorFor({ inserted: queueRow({ attachments: [{ fileId: "00000000-0000-7000-8000-000000000007", name: "brief.txt", mediaType: "text/plain", size: 12 }] }) });
     const service = new QueuedFollowUpService(new CloudDatabaseService(first.executor));

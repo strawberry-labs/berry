@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
+import { ConflictException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import {
   QueuedFollowUpCreateSchema,
   QueuedFollowUpPageSchema,
@@ -42,7 +42,7 @@ type QueueRow = {
 
 @Injectable()
 export class QueuedFollowUpService {
-  constructor(private readonly database: CloudDatabaseService) {}
+  constructor(@Inject(CloudDatabaseService) private readonly database: CloudDatabaseService) {}
 
   async enqueue(tenantId: string, userId: string, sessionId: string, value: QueuedFollowUpCreate): Promise<ServerQueuedFollowUp> {
     const input = QueuedFollowUpCreateSchema.parse(value);
