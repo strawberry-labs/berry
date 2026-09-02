@@ -210,6 +210,9 @@ describe("McpToolSource", () => {
     const server = servers[0]!;
     const source = new McpToolSource({ servers });
 
+    expect(server.cachedTools?.find((tool) => tool.name === "berrycrawl_scrape_url")?.description).toBe(
+      "Scrape one public URL with Berrycrawl. YouTube video URLs automatically return timestamped transcripts; every successful transcript response costs 5 credits. Other URLs return requested text/HTML/link/image formats using Patchright and automatic proxy escalation when needed. Cached ordinary page scrapes and failed requests are free.",
+    );
     expect(server.cachedTools?.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       "berrycrawl_search_web",
       "berrycrawl_scrape_url",
