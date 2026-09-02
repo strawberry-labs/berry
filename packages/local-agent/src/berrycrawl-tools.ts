@@ -20,7 +20,7 @@ export type BundledMcpToolDefinition = {
 export const BERRYCRAWL_TOOL_CATALOG: BundledMcpToolDefinition[] = [
   {
     "name": "berrycrawl_scrape_url",
-    "description": "Scrape one public web page with Berrycrawl. Returns requested text/HTML/link/image formats, cache and fetch metadata, and credits used. Uses Patchright and automatic proxy escalation when needed. Cached and failed requests are free.",
+    "description": "Scrape one public URL with Berrycrawl. YouTube video URLs automatically return timestamped transcripts; every successful transcript response costs 5 credits. Other URLs return requested text/HTML/link/image formats using Patchright and automatic proxy escalation when needed. Cached ordinary page scrapes and failed requests are free.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "type": "object",
