@@ -17,7 +17,7 @@ import type {
   SandboxHandle,
   SandboxProvider as ContractSandboxProvider,
 } from "@berry/sandbox-contract";
-import { networkPolicyForSandbox, type SandboxPolicy } from "@berry/shared";
+import { networkPolicyForSandbox, type NetworkPolicy } from "@berry/shared";
 import type { SandboxProvider, SandboxSession, SandboxSessionOptions } from "./sandbox-provider.ts";
 
 export interface CloudSandboxProviderOptions {
@@ -52,6 +52,7 @@ export class CloudSandboxProvider implements SandboxProvider {
   }
 
   async createSession(options: SandboxSessionOptions): Promise<SandboxSession> {
+    const networkPolicy = options.networkPolicy ?? networkPolicyForSandbox(options.policy);
     const sandbox = await this.#provider.create({
       request_id: `session_${options.sessionId}`,
       tenant_id: this.#tenantId,
@@ -62,14 +63,14 @@ export class CloudSandboxProvider implements SandboxProvider {
       env: this.#env,
       resources: this.#resources,
       ttl_seconds: this.#ttlSeconds,
-      network_policy: networkPolicyForSandbox(options.policy),
+      network_policy: networkPolicy,
       writable_roots: [this.#cwd],
       metadata: {
         local_workspace_path: options.workspacePath,
         sandbox_tier: options.policy.tier,
       },
     });
-    const session = new CloudSandboxSession(this.#provider, sandbox);
+    const session = new CloudSandboxSession(this.#provider, sandbox, networkPolicy);
     this.#sessions.add(session);
     return {
       env: session.env,
@@ -79,7 +80,7 @@ export class CloudSandboxProvider implements SandboxProvider {
         tier: options.policy.tier,
         enforcement: "enforced",
         mechanism: "none",
-        network: options.policy.tier === "danger-full-access" ? "unrestricted" : options.policy.tier === "workspace-write" ? options.policy.network : "off",
+        network: networkPolicy.egress,
         reason: null,
       },
       dispose: async () => {
@@ -102,10 +103,10 @@ class CloudSandboxSession {
   readonly #sandboxId: string;
   #disposed = false;
 
-  constructor(provider: ContractSandboxProvider, sandbox: SandboxHandle) {
+  constructor(provider: ContractSandboxProvider, sandbox: SandboxHandle, networkPolicy: NetworkPolicy) {
     this.#provider = provider;
     this.#sandboxId = sandbox.sandbox_id;
-    this.env = new SandboxExecutionEnv({ provider, sandbox });
+    this.env = new SandboxExecutionEnv({ provider, sandbox, networkPolicy });
   }
 
   async dispose(): Promise<void> {
@@ -121,16 +122,19 @@ class CloudSandboxSession {
 export interface SandboxExecutionEnvOptions {
   provider: ContractSandboxProvider;
   sandbox: SandboxHandle;
+  networkPolicy?: NetworkPolicy;
 }
 
 export class SandboxExecutionEnv implements ExecutionEnv {
   readonly cwd: string;
   readonly #provider: ContractSandboxProvider;
   readonly #sandbox: SandboxHandle;
+  readonly #networkPolicy: NetworkPolicy | undefined;
 
   constructor(options: SandboxExecutionEnvOptions) {
     this.#provider = options.provider;
     this.#sandbox = options.sandbox;
+    this.#networkPolicy = options.networkPolicy;
     this.cwd = options.sandbox.cwd;
   }
 
@@ -326,6 +330,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     await this.#provider.resume({
       sandbox_id: this.#sandbox.sandbox_id,
       reason: "Active cloud sandbox session operation",
+      ...(this.#provider.kind === "e2b" && this.#networkPolicy ? { network_policy: this.#networkPolicy } : {}),
     });
   }
 }

@@ -1,6 +1,6 @@
 import type { ExecutionEnv } from "@berry/harness";
 import { LocalProcessExecutor, NodeExecutionEnv, type CommandWrapper } from "@berry/harness/node";
-import type { SandboxPolicy, SandboxStatus } from "@berry/shared";
+import type { NetworkPolicy, SandboxPolicy, SandboxStatus } from "@berry/shared";
 
 import { SandboxEnforcer } from "./sandbox.ts";
 
@@ -17,6 +17,7 @@ export interface SandboxSessionOptions {
   taskId: string;
   workspacePath: string;
   policy: SandboxPolicy;
+  networkPolicy?: NetworkPolicy;
   enforceEscalated: boolean;
 }
 

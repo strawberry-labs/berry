@@ -271,6 +271,18 @@ export const PromptManifestSchema = z.object({
   dynamicContextBoundary: z.number().int().nonnegative(),
   stablePrefixHash: z.string().min(1),
   manifestHash: z.string().min(1),
+  // Hashes of the actual OpenAI-compatible wire messages, including grounding
+  // and checkpoints. No prompt text or image bytes are retained here.
+  requestPrefix: z.object({
+    toolsHash: z.string(),
+    messages: z.array(z.object({ hash: z.string(), characters: z.number().int().nonnegative() })),
+    comparedToPrevious: z.boolean(),
+    reusedMessages: z.number().int().nonnegative(),
+    reusedCharacters: z.number().int().nonnegative(),
+    previousCharacters: z.number().int().nonnegative(),
+    firstChangedMessage: z.number().int().nonnegative().nullable(),
+    toolsChanged: z.boolean(),
+  }).optional(),
 });
 export type PromptManifest = z.infer<typeof PromptManifestSchema>;
 

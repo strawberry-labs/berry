@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { PromptCachingCapabilities } from "@berry/shared";
 import {
+  canonicalToolDefinitions,
   planDurablePromptCache,
   promptCacheCapabilityFromEnv,
 } from "./prompt-cache.js";
@@ -25,7 +26,7 @@ describe("durable prompt cache planning", () => {
     const plan = planned({ capability: selected });
 
     expect(plan.eligible).toBe(true);
-    expect(plan.cacheKey).toMatch(/^berry_[a-f0-9]{64}$/);
+    expect(plan.cacheKey).toMatch(/^[a-f0-9]{64}$/);
     expect(plan.cacheKey).not.toContain("tenant-a");
     expect(plan.missReason).toBe("first_request");
   });
@@ -40,6 +41,12 @@ describe("durable prompt cache planning", () => {
 
     expect(second.missReason).toBe("routing_changed");
     expect(second.manifest.dynamicContextBoundary).toBe("stable system".length);
+  });
+
+  it("honors the admitted provider catalog while preserving the global control switch", () => {
+    const provider = { models: [{ id: "admitted", capabilities: { promptCaching: capability } }] };
+    expect(promptCacheCapabilityFromEnv({}, "admitted", provider)).toEqual(capability);
+    expect(promptCacheCapabilityFromEnv({ BERRY_PROMPT_CACHE_ENABLED: "false" }, "admitted", provider).supported).toBe(false);
   });
 
   it("omits cache controls for Gemini 3.7 Flash when support is not declared", () => {
@@ -60,7 +67,34 @@ describe("durable prompt cache planning", () => {
 
     expect(plan.cacheKey).toBeNull();
     expect(plan.retention).toBe("none");
-    expect(plan.missReason).toBe("provider_unsupported");
+    expect(plan.missReason).toBe("unknown");
+  });
+
+  it("keeps session affinity through tool discovery, but isolates tenants and models", () => {
+    const first = planned();
+    expect(planned({ tools: [] }).cacheKey).toBe(first.cacheKey);
+    expect(planned({ tenantId: "another-tenant" }).cacheKey).not.toBe(first.cacheKey);
+    expect(planned({ sessionId: "another-session" }).cacheKey).not.toBe(first.cacheKey);
+    expect(planned({ model: "another-model" }).cacheKey).not.toBe(first.cacheKey);
+  });
+
+  it("detects changes beyond the stable prompt and preserves appended history", () => {
+    const messages = [{ role: "system" as const, content: "instructions plus grounding" }, { role: "user" as const, content: "private request" }];
+    const first = planned({ messages });
+    const appended = planned({ previousManifest: first.manifest, messages: [...messages, { role: "assistant", content: "response" }] });
+    expect(appended.manifest.requestPrefix).toMatchObject({ comparedToPrevious: true, reusedMessages: 2, firstChangedMessage: null, toolsChanged: false });
+    const changed = planned({ previousManifest: first.manifest, messages: [{ ...messages[0]!, content: "instructions plus new grounding" }, messages[1]!] });
+    expect(changed.manifest.requestPrefix).toMatchObject({ reusedMessages: 0, firstChangedMessage: 0 });
+    expect(planned({ previousManifest: first.manifest, messages, tools: [] }).manifest.requestPrefix?.toolsChanged).toBe(true);
+    expect(JSON.stringify(first.manifest)).not.toContain("private request");
+    expect(JSON.stringify(first.manifest)).not.toContain("instructions plus grounding");
+  });
+
+  it("serializes equivalent tool sets identically without mutating their schemas", () => {
+    const left = [{ type: "function" as const, function: { name: "z", parameters: { type: "object", properties: { b: {}, a: {} } } } }, { type: "function" as const, function: { name: "a", parameters: {} } }];
+    const right = [left[1]!, { type: "function" as const, function: { parameters: { properties: { a: {}, b: {} }, type: "object" }, name: "z" } }];
+    expect(JSON.stringify(canonicalToolDefinitions(left))).toBe(JSON.stringify(canonicalToolDefinitions(right)));
+    expect(left[0]?.function.name).toBe("z");
   });
 });
 

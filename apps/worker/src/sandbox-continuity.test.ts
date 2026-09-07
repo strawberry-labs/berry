@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
-import type { SandboxProvider } from "@berry/sandbox-contract";
+import { SandboxNetworkPolicyUpdateError, type SandboxProvider } from "@berry/sandbox-contract";
 import {
   S3SandboxSnapshotObjectStore,
   SandboxContinuityManager,
@@ -11,6 +11,7 @@ import {
   PI_GREP_FILTER_SCRIPT,
   PI_READ_STREAM_SCRIPT,
   piReadContent,
+  sandboxNetworkFailureHint,
   piReadPdfContent,
   type SandboxSnapshotObjectStore,
   type SandboxSnapshotRepository,
@@ -19,6 +20,16 @@ import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 describe("SandboxContinuityManager", () => {
+  it("identifies blocked S3 downloads without exposing signed URL credentials", () => {
+    const command = 'curl -s "https://s3.eu-west-1.amazonaws.com/bucket/book.xlsx?X-Amz-Signature=secret"';
+    const policy = { egress: "on" as const, allowedDomains: ["connect.aesg.com"] };
+    const hint = sandboxNetworkFailureHint(command, policy, 35, "");
+    expect(hint).toContain("s3.eu-west-1.amazonaws.com is blocked");
+    expect(hint).not.toContain("secret");
+    expect(sandboxNetworkFailureHint(command, { ...policy, allowedDomains: ["s3.eu-west-1.amazonaws.com"] }, 35, "")).toBeNull();
+    expect(sandboxNetworkFailureHint(command, policy, 0, "download complete")).toBeNull();
+    expect(sandboxNetworkFailureHint(command, policy, 0, "FAILED: [SSL: UNEXPECTED_EOF_WHILE_READING]")).toContain("is blocked");
+  });
   it("keeps core reads non-abortable while repository and object-store seams lack signals", () => {
     const manager = new SandboxContinuityManager({ kind: "e2b" } as SandboxProvider, {} as SandboxSnapshotRepository, null, { image: "berry-sandbox" });
 
@@ -2922,11 +2933,14 @@ describe("SandboxContinuityManager", () => {
     expect(writeStream).not.toHaveBeenCalled();
   });
 
-  it("reuses the previous live sandbox for a follow-up turn in the same session", async () => {
+  it.each([false, true])("applies policy before reusing a follow-up sandbox (update failure: %s)", async (updateFails) => {
     const provider = {
       kind: "e2b",
       create: vi.fn(),
-      resume: vi.fn(async () => ({ sandbox_id: "sandbox-from-previous-turn" })),
+      resume: vi.fn(async () => {
+        if (updateFails) throw new SandboxNetworkPolicyUpdateError("network update failed");
+        return { sandbox_id: "sandbox-from-previous-turn" };
+      }),
       exec: vi.fn(),
       files: {
         read: vi.fn(),
@@ -2960,12 +2974,20 @@ describe("SandboxContinuityManager", () => {
       image: "berry-sandbox",
     });
 
+    if (updateFails) {
+      await expect(manager.execute(snapshot(), lsStep())).rejects.toThrow("network update failed");
+      expect(provider.create).not.toHaveBeenCalled();
+      expect(provider.files.list).not.toHaveBeenCalled();
+      expect(provider.exec).not.toHaveBeenCalled();
+      return;
+    }
     await manager.execute(snapshot(), lsStep());
 
     expect(provider.create).not.toHaveBeenCalled();
     expect(provider.resume).toHaveBeenCalledWith({
       sandbox_id: "sandbox-from-previous-turn",
       reason: "Follow-up turn requested the prior sandbox",
+      network_policy: { egress: "off", allowedDomains: [] },
     });
     expect(repository.recordSandbox.mock.calls.map(([input]) => input.state)).toEqual([
       "resume_requested",

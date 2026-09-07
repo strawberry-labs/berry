@@ -236,7 +236,7 @@ describe("durable turn runner", () => {
             "",
           ].join("\n\n")
         : [
-            `data: {"type":"message_start","message":{"id":"${responseId}","model":"served-model","usage":{"input_tokens":2}}}`,
+            `data: {"type":"message_start","message":{"id":"${responseId}","model":"served-model","usage":{"input_tokens":2,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}}`,
             'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}',
             'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
             'data: {"type":"content_block_stop","index":0}',
@@ -275,10 +275,16 @@ describe("durable turn runner", () => {
       text: "ok",
       providerResponseId: responseId,
       routerRequestId: `${apiType}_request_42`,
-      inputTokens: 2,
+      inputTokens: apiType === "anthropic-messages" ? 9 : 2,
       outputTokens: 1,
     });
     expect(deltas.join("")).toBe("ok");
+    if (apiType === "anthropic-messages") {
+      expect(result.usage).toMatchObject({ inputTokens: 9, cacheReadTokens: 5, cacheWriteTokens: 2, totalTokens: 10 });
+      expect(usageCostMicros({ inputTokens: result.inputTokens, outputTokens: result.outputTokens,
+        cacheReadTokens: result.usage?.cacheReadTokens ?? 0, cacheWriteTokens: result.usage?.cacheWriteTokens ?? 0 },
+      { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 2 })).toBe(8n);
+    }
   });
 
   it.each(["openai-responses", "anthropic-messages"] as const)(
@@ -2777,6 +2783,17 @@ describe("durable turn runner", () => {
     expect(JSON.stringify(current.entries)).not.toContain("base64");
   });
 
+  it("appends text-only tool context without changing the original user prefix", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.entries.push({ entryId: "image-read", parentEntryId: current.entries[0]!.entryId, entryType: "message", sequence: 2,
+      payload: { message: { role: "toolResult", toolCallId: "read-image", toolName: "read", content: [{ type: "text", text: "Image available" }] } } });
+    const original = modelMessages(current).messages;
+    const supplemental = [{ type: "text" as const, text: "Two images available through inspect_images" }];
+    const changed = modelMessages(current, supplemental).messages;
+    expect(changed.slice(0, original.length)).toEqual(original);
+    expect(changed.at(-1)).toMatchObject({ role: "user", content: expect.arrayContaining(supplemental) });
+  });
+
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
     let request: ChatCompletionOptions | undefined;
     const client = {
@@ -2902,8 +2919,7 @@ describe("durable turn runner", () => {
       },
     );
 
-    expect(request?.tools?.[0]?.function.name).toBe("mcp__BerryCrawl__search");
-    expect(request?.tools?.[1]?.function.name).toBe("create_image");
+    expect(request?.tools?.map((tool) => tool.function.name)).toEqual(["create_image", "mcp__BerryCrawl__search"]);
     expect(request?.messages[0]?.content).toContain("The user explicitly selected Create image. Call create_image");
     expect(request?.messages[0]?.content).toContain(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
     expect(request?.messages[0]?.content).toContain(

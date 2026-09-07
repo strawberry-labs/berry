@@ -1,5 +1,7 @@
 import { BadGatewayException, BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Headers, HttpException, Inject, NotFoundException, Param, Patch, Post, Put, Query, Req, RequestTimeoutException, ServiceUnavailableException, Sse } from "@nestjs/common";
 import { createHash, randomUUID } from "node:crypto";
+import { MANAGEMENT_SERVICE, ManagementService } from "../management/management.service.ts";
+import { organizationNetworkPolicy } from "../runtime/execution-network-policy.ts";
 import { SELF_HOST_TENANT_ID } from "@berry/db";
 import { OpenAIChatCompletionsClient, RouterClientError, type ChatCompletionUsage } from "@berry/router-client";
 import {
@@ -552,6 +554,7 @@ export class AgentApiController {
     @Inject(QueuedFollowUpService) private readonly queuedFollowUps: QueuedFollowUpService,
     @Inject(ENTERPRISE_IDENTITY_REPOSITORY) private readonly identity: EnterpriseIdentityRepository,
     @Inject(CONNECTORS) private readonly connectors: ConnectorsService,
+    @Inject(MANAGEMENT_SERVICE) private readonly management: ManagementService,
   ) {}
 
   async #primaryDepartmentId(tenantId: string, userId: string | null): Promise<string | null> {
@@ -1639,7 +1642,10 @@ export class AgentApiController {
       ...baseRuntime,
       mcpServers,
       extraSkills: [...baseRuntime.extraSkills, ...effectiveRuntime.skills],
-      networkPolicy: networkPolicyWithApprovedMcpDomains(baseRuntime.networkPolicy, connectorRuntime),
+      networkPolicy: organizationNetworkPolicy(
+        await this.management.getConfiguredExecution(tenantId),
+        networkPolicyWithApprovedMcpDomains(baseRuntime.networkPolicy, connectorRuntime),
+      ),
     };
     const providerId = modelDecision.providerId;
     const governedModelId = modelDecision.model;

@@ -353,6 +353,7 @@ export function routerRequestIdFromAssistantMessage(message: AssistantMessage): 
 
 function observeCacheRead(promptCache: BerryPromptCacheMetadata, cacheReadTokens: number): void {
   if (cacheReadTokens <= 0) return;
+  promptCache.eligible = true;
   promptCache.missReason = null;
   promptCache.missComponentId = null;
 }
@@ -1338,7 +1339,8 @@ export class AnthropicMessagesAdapter {
           const usage = event.usage as { output_tokens?: number } | undefined;
           if (usage?.output_tokens !== undefined) {
             message.usage.output = usage.output_tokens;
-            message.usage.totalTokens = message.usage.input + message.usage.output;
+            message.usage.totalTokens = message.usage.input + message.usage.cacheRead
+              + message.usage.cacheWrite + message.usage.output;
           }
           continue;
         }

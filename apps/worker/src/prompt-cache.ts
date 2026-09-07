@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
+import { serializeMessage, type ChatMessage, type ChatToolDefinition } from "@berry/router-client";
 import {
   PromptManifestSchema,
+  PromptCachingCapabilitiesSchema,
   RemoteModelSchema,
   resolveModelCapabilities,
   type PromptCacheMissReason,
   type PromptCachingCapabilities,
   type PromptManifest,
+  type DurableProviderTransport,
 } from "@berry/shared";
 
 const UNSUPPORTED_CAPABILITY: PromptCachingCapabilities = {
@@ -30,8 +33,14 @@ export interface DurablePromptCachePlan {
 export function promptCacheCapabilityFromEnv(
   env: NodeJS.ProcessEnv,
   model: string,
+  provider?: Pick<DurableProviderTransport, "models" | "capabilities">,
 ): PromptCachingCapabilities {
   if (!envBoolean(env.BERRY_PROMPT_CACHE_ENABLED, true)) return UNSUPPORTED_CAPABILITY;
+  const admittedModel = RemoteModelSchema.safeParse(provider?.models.find((candidate) => candidate.id === model));
+  const modelCapability = admittedModel.success ? resolveModelCapabilities(admittedModel.data).promptCaching : undefined;
+  if (modelCapability) return modelCapability;
+  const providerCapability = PromptCachingCapabilitiesSchema.safeParse(provider?.capabilities?.promptCaching);
+  if (providerCapability.success) return providerCapability.data;
   const rawModels = env.BERRY_ROUTER_MODELS_JSON?.trim();
   if (!rawModels) return UNSUPPORTED_CAPABILITY;
   let decoded: unknown;
@@ -52,6 +61,7 @@ export function planDurablePromptCache(input: {
   model: string;
   route: string;
   stableSystemPrompt: string;
+  messages?: readonly ChatMessage[];
   tools: readonly unknown[];
   capability: PromptCachingCapabilities;
   previousManifest?: unknown;
@@ -59,7 +69,7 @@ export function planDurablePromptCache(input: {
   now?: number;
 }): DurablePromptCachePlan {
   const retention = requestedRetention(input.capability);
-  const manifest = buildDurablePromptManifest({
+  const baseManifest = buildDurablePromptManifest({
     provider: input.provider,
     model: input.model,
     route: input.route,
@@ -71,9 +81,13 @@ export function planDurablePromptCache(input: {
   const retentionSupported = retention !== "none" && input.capability.retention.includes(retention);
   const eligible = input.capability.supported
     && retentionSupported
-    && manifest.stablePrefixTokens >= input.capability.minimumTokens;
+    && baseManifest.stablePrefixTokens >= input.capability.minimumTokens;
   const previous = PromptManifestSchema.safeParse(input.previousManifest);
   const prior = previous.success ? previous.data : null;
+  const manifest = input.messages ? {
+    ...baseManifest,
+    requestPrefix: describeRequestPrefix(input.messages, input.tools, prior),
+  } : baseManifest;
   const difference = prior ? compareDurablePromptManifests(prior, manifest) : null;
   const previousEligible = prior !== null
     && input.capability.supported
@@ -83,7 +97,9 @@ export function planDurablePromptCache(input: {
   const observedAt = input.previousObservedAt ? Date.parse(input.previousObservedAt) : Number.NaN;
   const now = input.now ?? Date.now();
   let missReason: PromptCacheMissReason | null;
-  if (!input.capability.supported) missReason = "provider_unsupported";
+  // Lack of explicit cache controls does not disable implicit provider caching.
+  // We cannot infer a provider-side miss reason from this configuration.
+  if (!input.capability.supported) missReason = "unknown";
   else if (!retentionSupported) missReason = "retention_unsupported";
   else if (manifest.stablePrefixTokens < input.capability.minimumTokens) missReason = "below_minimum_tokens";
   else if (!prior || !previousEligible) missReason = "first_request";
@@ -92,7 +108,7 @@ export function planDurablePromptCache(input: {
   else missReason = "unknown";
 
   const cacheKey = input.capability.supported && retentionSupported && input.capability.cacheKey
-    ? durableCacheKey(input.tenantId, input.sessionId, manifest.manifestHash)
+    ? durableCacheKey(input.tenantId, input.sessionId, input.provider, input.model, input.route)
     : null;
   return {
     manifest,
@@ -186,10 +202,45 @@ function requestedRetention(capability: PromptCachingCapabilities): "none" | "sh
 function durableCacheKey(
   tenantId: string,
   sessionId: string,
-  manifestHash: string,
+  provider: string,
+  model: string,
+  route: string,
 ): { value: string; hash: string } {
-  const hash = sha256(canonicalJson({ namespace: tenantId, sessionId, manifestHash }));
-  return { value: `berry_${hash}`, hash };
+  // Routing affinity belongs to the session, not to a changing tool manifest.
+  // The full hex digest also fits OpenAI's 64-character key limit.
+  const hash = sha256(canonicalJson({ namespace: tenantId, sessionId, provider, model, route }));
+  return { value: hash, hash };
+}
+
+export function canonicalToolDefinitions(tools: readonly ChatToolDefinition[]): ChatToolDefinition[] {
+  return [...tools].sort((a, b) => a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0)
+    .map((tool) => JSON.parse(canonicalJson(tool)) as ChatToolDefinition);
+}
+
+function describeRequestPrefix(
+  messages: readonly ChatMessage[],
+  tools: readonly unknown[],
+  prior: PromptManifest | null,
+): NonNullable<PromptManifest["requestPrefix"]> {
+  const current = messages.map((message) => {
+    const serialized = JSON.stringify(serializeMessage(message));
+    return { hash: sha256(serialized), characters: serialized.length };
+  });
+  const toolsHash = sha256(JSON.stringify(tools));
+  const previous = prior?.requestPrefix;
+  let reusedMessages = 0;
+  while (previous && reusedMessages < previous.messages.length
+    && previous.messages[reusedMessages]?.hash === current[reusedMessages]?.hash) reusedMessages++;
+  return {
+    toolsHash,
+    messages: current,
+    comparedToPrevious: Boolean(previous),
+    reusedMessages,
+    reusedCharacters: current.slice(0, reusedMessages).reduce((sum, message) => sum + message.characters, 0),
+    previousCharacters: previous?.messages.reduce((sum, message) => sum + message.characters, 0) ?? 0,
+    firstChangedMessage: previous && reusedMessages < previous.messages.length ? reusedMessages : null,
+    toolsChanged: Boolean(previous && previous.toolsHash !== toolsHash),
+  };
 }
 
 function canonicalJson(value: unknown): string {

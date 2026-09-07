@@ -164,6 +164,7 @@ export type SandboxDestroyInput = z.input<typeof SandboxDestroyInputSchema>;
 
 export const SandboxResumeInputSchema = z.object({
   sandbox_id: IdSchema,
+  network_policy: NetworkPolicySchema.optional(),
   reason: z.string().trim().min(1).optional(),
 }).passthrough();
 export type SandboxResumeInput = z.input<typeof SandboxResumeInputSchema>;

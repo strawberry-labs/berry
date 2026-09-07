@@ -255,14 +255,28 @@ describe("BerryAgentRuntime", () => {
       workspacePath: workspace,
       input: "run in cloud",
       permissionMode: "ask",
+      networkPolicy: { egress: "on", allowedDomains: ["s3.eu-west-1.amazonaws.com"] },
       provider,
       streamFn: textStreamFn("Cloud turn complete."),
       onEvent: collector.onEvent,
     });
     await collector.done;
-    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: session.id, taskId: task.id, workspacePath: workspace }));
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: session.id, taskId: task.id, workspacePath: workspace,
+      networkPolicy: { egress: "on", allowedDomains: ["s3.eu-west-1.amazonaws.com"] },
+    }));
+    const nextTurn = turnCollector();
+    runtime.startTurn({
+      sessionId: session.id, taskId: task.id, workspacePath: workspace,
+      input: "now offline", permissionMode: "ask", provider,
+      networkPolicy: { egress: "off", allowedDomains: [] },
+      streamFn: textStreamFn("Offline turn complete."), onEvent: nextTurn.onEvent,
+    });
+    await nextTurn.done;
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(createSession).toHaveBeenLastCalledWith(expect.objectContaining({ networkPolicy: { egress: "off", allowedDomains: [] } }));
     await runtime.dispose();
-    expect(disposeSession).toHaveBeenCalledTimes(1);
+    expect(disposeSession).toHaveBeenCalledTimes(2);
     await sandboxProvider.dispose();
     db.close();
   });
@@ -483,6 +497,45 @@ describe("BerryAgentRuntime", () => {
     });
     await runtime.dispose();
     db.close();
+  });
+
+  it.each([
+    { api: "anthropic-messages", input: 100, cacheRead: 1000, cacheWrite: 500, expectedInput: 1600 },
+    { api: "openai-completions", input: 1600, cacheRead: 1000, cacheWrite: 500, expectedInput: 1600 },
+    { api: "anthropic-messages", input: 0, cacheRead: 1000, cacheWrite: 0, expectedInput: 1000 },
+  ])("normalizes $api usage with $input input tokens at the runtime boundary", async ({ api, input, cacheRead, cacheWrite, expectedInput }) => {
+    const { db, workspace } = setup();
+    const workspaceRow = db.workspaces().open(workspace, "ws", true);
+    const { task, session } = db.tasks().create(workspaceRow.id, "Cached usage", "ask");
+    const runtime = new BerryAgentRuntime({ db });
+    const collector = turnCollector();
+    const onAssistantMessage = vi.fn();
+    const streamFn: StreamFn = (model) => {
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        const message = assistant(model, [{ type: "text", text: "done" }], "stop");
+        message.api = api;
+        message.usage = { ...message.usage, input, cacheRead, cacheWrite, output: 0, totalTokens: expectedInput };
+        stream.push({ type: "start", partial: message });
+        stream.push({ type: "done", reason: "stop", message });
+      });
+      return stream;
+    };
+    try {
+      runtime.startTurn({ sessionId: session.id, taskId: task.id, workspacePath: workspace,
+        input: "hello", permissionMode: "ask", provider, apiKey: "test-key", streamFn,
+        onEvent: collector.onEvent, onAssistantMessage });
+      const events = await collector.done;
+      expect(events.find((event) => event.kind === "usage")).toMatchObject({
+        inputTokens: expectedInput, outputTokens: 0, totalTokens: expectedInput, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite,
+      });
+      expect(db.db.prepare("SELECT input_tokens FROM usage_records WHERE session_id = ?").get(session.id))
+        .toMatchObject({ input_tokens: expectedInput });
+      expect(onAssistantMessage).toHaveBeenCalledWith(expect.objectContaining({ usage: { inputTokens: expectedInput, outputTokens: 0 } }));
+    } finally {
+      await runtime.dispose();
+      db.close();
+    }
   });
 
   it("pauses on approval, resumes on approve, and persists usage", async () => {

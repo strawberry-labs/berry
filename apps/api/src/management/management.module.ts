@@ -20,6 +20,7 @@ export class ManagementModule {
     return {
       module: ManagementModule,
       controllers: [ManagementController, PlatformController],
+      exports: [MANAGEMENT_SERVICE],
       providers: [
         { provide: MANAGEMENT_SERVICE, useValue: new ManagementService(options.repository ?? new InMemoryManagementRepository()) },
         identityProvider,

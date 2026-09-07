@@ -19,6 +19,7 @@ export type DestinationInput = { kind:"email"|"webhook";label:string;emailRecipi
 type PolicyInput<T extends {tenantId:string;updatedAt:string}> = Omit<T,"tenantId"|"updatedAt">;
 
 export interface ManagementRepository {
+  getConfiguredExecution(tenantId:string):Promise<ExecutionNetworkPolicy|null>;
   listViews(tenantId:string,userId:string):Promise<SavedAnalyticsView[]>; createView(tenantId:string,userId:string,input:SavedAnalyticsViewCreate):Promise<SavedAnalyticsView>;
   listSchedules(tenantId:string):Promise<ReportSchedule[]>; createSchedule(tenantId:string,input:ReportScheduleCreate):Promise<ReportSchedule>; listRuns(tenantId:string):Promise<ReportRun[]>;
   listDestinations(tenantId:string):Promise<AlertDestination[]>; createDestination(tenantId:string,input:DestinationInput):Promise<AlertDestination>;
@@ -32,6 +33,7 @@ export interface ManagementRepository {
 
 export class ManagementService {
   constructor(private readonly repository:ManagementRepository){}
+  getConfiguredExecution(t:string){return this.repository.getConfiguredExecution(t);}
   listViews(t:string,u:string){return this.repository.listViews(t,u);} createView(t:string,u:string,i:SavedAnalyticsViewCreate){return this.repository.createView(t,u,i);}
   listSchedules(t:string){return this.repository.listSchedules(t);} createSchedule(t:string,i:ReportScheduleCreate){return this.repository.createSchedule(t,i);} listRuns(t:string){return this.repository.listRuns(t);}
   listDestinations(t:string){return this.repository.listDestinations(t);} createDestination(t:string,i:DestinationInput){return this.repository.createDestination(t,i);}
@@ -48,6 +50,7 @@ export class ManagementService {
 
 export class InMemoryManagementRepository implements ManagementRepository {
   private rows=new Map<string,unknown[]>(); private policies=new Map<string,unknown>();
+  async getConfiguredExecution(t:string){const row=this.policies.get(`${t}:execution`);return row===undefined?null:ExecutionNetworkPolicySchema.parse(row);}
   private list<T>(t:string,k:string){return (this.rows.get(`${t}:${k}`)??[]) as T[];} private add<T>(t:string,k:string,row:T){this.rows.set(`${t}:${k}`,[...this.list<T>(t,k),row]);return row;}
   async listViews(t:string,u:string){return this.list<SavedAnalyticsView>(t,"views").filter((r)=>r.visibility==="tenant"||r.ownerUserId===u);} async createView(t:string,u:string,i:SavedAnalyticsViewCreate){const n=now();return this.add(t,"views",SavedAnalyticsViewSchema.parse({...i,id:randomUUID(),tenantId:t,ownerUserId:u,createdAt:n,updatedAt:n}));}
   async listSchedules(t:string){return this.list<ReportSchedule>(t,"schedules");} async createSchedule(t:string,i:ReportScheduleCreate){const n=now();return this.add(t,"schedules",ReportScheduleSchema.parse({...i,id:randomUUID(),tenantId:t,status:"active",nextRunAt:n,lastRunAt:null,createdAt:n,updatedAt:n}));} async listRuns(t:string){return this.list<ReportRun>(t,"runs");}
@@ -63,6 +66,7 @@ export class InMemoryManagementRepository implements ManagementRepository {
 
 export class PostgresManagementRepository implements ManagementRepository {
   constructor(private readonly database:CloudDatabaseService){}
+  getConfiguredExecution(t:string){return this.getJsonPolicy<ExecutionNetworkPolicy|null>(t,"execution_network_policies",ExecutionNetworkPolicySchema,null);}
   listViews(t:string,u:string){return this.database.withTenant(t,async db=>(await db.query<any>("SELECT * FROM saved_analytics_views WHERE tenant_id=$1::uuid AND (visibility='tenant' OR owner_user_id=$2::uuid) ORDER BY updated_at DESC",[t,u])).map(viewRow));}
   createView(t:string,u:string,i:SavedAnalyticsViewCreate){return this.database.withTenant(t,async db=>viewRow((await db.query<any>("INSERT INTO saved_analytics_views (tenant_id,owner_user_id,name,filters,visibility) VALUES ($1::uuid,$2::uuid,$3,$4::jsonb,$5) RETURNING *",[t,u,i.name,JSON.stringify(i.filters),i.visibility]))[0]));}
   listSchedules(t:string){return this.database.withTenant(t,async db=>(await db.query<any>("SELECT * FROM report_schedules WHERE tenant_id=$1::uuid ORDER BY updated_at DESC",[t])).map(scheduleRow));}

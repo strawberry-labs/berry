@@ -1631,6 +1631,9 @@ Result:
                     "type": "integer",
                     "minimum": 0
                   },
+                  "cacheReadReported": {
+                    "type": "boolean"
+                  },
                   "cacheWriteTokens": {
                     "type": "integer",
                     "minimum": 0
@@ -1735,6 +1738,74 @@ Result:
                       "manifestHash": {
                         "type": "string",
                         "minLength": 1
+                      },
+                      "requestPrefix": {
+                        "type": "object",
+                        "properties": {
+                          "toolsHash": {
+                            "type": "string"
+                          },
+                          "messages": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "hash": {
+                                  "type": "string"
+                                },
+                                "characters": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                }
+                              },
+                              "required": [
+                                "hash",
+                                "characters"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "comparedToPrevious": {
+                            "type": "boolean"
+                          },
+                          "reusedMessages": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "reusedCharacters": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "previousCharacters": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "firstChangedMessage": {
+                            "anyOf": [
+                              {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "toolsChanged": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "toolsHash",
+                          "messages",
+                          "comparedToPrevious",
+                          "reusedMessages",
+                          "reusedCharacters",
+                          "previousCharacters",
+                          "firstChangedMessage",
+                          "toolsChanged"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "required": [
@@ -1764,6 +1835,12 @@ Result:
                     ]
                   },
                   "cacheMissComponentId": {
+                    "type": "string"
+                  },
+                  "routerRequestId": {
+                    "type": "string"
+                  },
+                  "providerResponseId": {
                     "type": "string"
                   },
                   "model": {

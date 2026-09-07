@@ -34,6 +34,34 @@ async function run(tools: Map<string, AgentTool>, name: string, params: Record<s
 }
 
 describe("CloudSandboxProvider", () => {
+  it.each([false, true])("enforces the admitted policy on create and resume (update failure: %s)", async (updateFails) => {
+    const fixture = new FixtureSandboxProvider();
+    const create = vi.fn(fixture.create.bind(fixture));
+    const exec = vi.fn(fixture.exec.bind(fixture));
+    const resume = vi.fn(async () => {
+      if (updateFails) throw new Error("Network policy update failed; no command was run");
+      return await create.mock.results[0]!.value;
+    });
+    const contractProvider: ContractSandboxProvider = {
+      kind: "e2b", files: fixture.files, create, exec, resume,
+      exposePort: fixture.exposePort.bind(fixture),
+      destroy: fixture.destroy.bind(fixture),
+    };
+    const provider = new CloudSandboxProvider({ provider: contractProvider, tenantId, image: "berry/python:3.12" });
+    const networkPolicy = { egress: "on" as const, allowedDomains: ["s3.eu-west-1.amazonaws.com"] };
+    const session = await provider.createSession({
+      sessionId: "sess_policy", taskId: "task_policy", workspacePath: "/unused",
+      policy: { tier: "danger-full-access" }, networkPolicy, enforceEscalated: false,
+    });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ network_policy: networkPolicy }));
+    expect(session.status.network).toBe("on");
+    const result = await session.env.exec("echo hello");
+    expect(resume).toHaveBeenCalledWith(expect.objectContaining({ network_policy: networkPolicy }));
+    expect(result.ok).toBe(!updateFails);
+    expect(exec).toHaveBeenCalledTimes(updateFails ? 0 : 1);
+    await provider.dispose();
+  });
+
   it("explicitly resumes durable compute before an active session operation", async () => {
     const fixture = new FixtureSandboxProvider();
     let sandbox: Awaited<ReturnType<typeof fixture.create>> | null = null;

@@ -947,6 +947,7 @@ export class BerryAgentRuntime {
       taskId: options.taskId,
       workspacePath: options.workspacePath,
       policy: sandboxPolicy,
+      networkPolicy,
       enforceEscalated: Boolean(options.sandboxPolicy && sandboxPolicy.tier !== "danger-full-access"),
     });
     let mcp: McpToolSource | undefined;
@@ -1136,6 +1137,7 @@ export class BerryAgentRuntime {
       taskId: parent.taskId,
       workspacePath: parent.workspacePath,
       policy: childPolicy,
+      networkPolicy: parent.networkPolicy ?? networkPolicyForSandbox(childPolicy),
       enforceEscalated: false,
     });
     const { env, escalatedEnv } = childSandboxSession;
@@ -1580,6 +1582,11 @@ export class BerryAgentRuntime {
 
   #handleAssistantEnd(active: ActiveTurn, message: AssistantMessage): void {
     const messageId = active.currentMessageId ?? createId("msg");
+    // Anthropic reports fresh input separately; Berry events and records use
+    // total input so cache reads and writes can be priced exactly once.
+    const inputTokens = message.api === "anthropic-messages"
+      ? message.usage.input + message.usage.cacheRead + message.usage.cacheWrite
+      : message.usage.input;
     if (message.stopReason === "error" && message.errorMessage) {
       this.#emit(active, { kind: "error", message: message.errorMessage });
     }
@@ -1590,9 +1597,9 @@ export class BerryAgentRuntime {
       const cache = berryMessage.berryPromptCache;
       this.#emit(active, {
         kind: "usage",
-        inputTokens: message.usage.input,
+        inputTokens,
         outputTokens: message.usage.output,
-        totalTokens: message.usage.totalTokens,
+        totalTokens: Math.max(message.usage.totalTokens, inputTokens + message.usage.output),
         cacheReadTokens: message.usage.cacheRead,
         cacheWriteTokens: message.usage.cacheWrite,
         ...(cache ? {
@@ -1619,7 +1626,7 @@ export class BerryAgentRuntime {
           taskId: active.taskId,
           sessionId: active.sessionId,
           model: message.model,
-          inputTokens: message.usage.input,
+          inputTokens,
           outputTokens: message.usage.output,
         });
       } catch (error) {
@@ -1653,8 +1660,8 @@ export class BerryAgentRuntime {
         model: message.model,
         generationMs,
       };
-      if (message.usage.input > 0 || message.usage.output > 0) {
-        payload.usage = { inputTokens: message.usage.input, outputTokens: message.usage.output };
+      if (inputTokens > 0 || message.usage.output > 0) {
+        payload.usage = { inputTokens, outputTokens: message.usage.output };
       }
       active.onAssistantMessage?.(payload);
     }

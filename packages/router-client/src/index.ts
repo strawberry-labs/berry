@@ -55,6 +55,8 @@ export interface ChatCompletionUsage {
   outputTokens: number;
   totalTokens: number;
   cacheReadTokens?: number;
+  /** False means the provider omitted its cache counter, rather than reporting a miss. */
+  cacheReadReported?: boolean;
   cacheWriteTokens?: number;
   cacheCreationTokens1h?: number;
   cacheCreationTokens5m?: number;
@@ -719,7 +721,12 @@ export class OpenAIChatCompletionsClient {
         const toolCalls = normalizeToolCallDeltas(choice?.delta?.tool_calls);
         if (toolCalls) chunk.toolCalls = toolCalls;
         const usage = normalizeUsage(payload.usage);
-        const finalUsage = usage ?? (choice?.finish_reason ? headerUsage : undefined);
+        const observedUsage = usage ?? (choice?.finish_reason ? headerUsage : undefined);
+        // Some providers send totals in a later chunk without repeating cache
+        // details. Preserve the measured counter; an explicit zero still wins.
+        const finalUsage = observedUsage?.cacheReadReported === false && lastUsage?.cacheReadReported
+          ? { ...observedUsage, cacheReadTokens: lastUsage.cacheReadTokens ?? 0, cacheReadReported: true }
+          : observedUsage;
         if (finalUsage) {
           chunk.usage = finalUsage;
           lastUsage = finalUsage;
@@ -798,6 +805,8 @@ export class OpenAIChatCompletionsClient {
         : {}),
       max_tokens: options.maxTokens,
       stream: options.stream,
+      ...(options.stream && (this.#provider.kind === "openai" || this.#provider.kind === "berry-router")
+        ? { stream_options: { include_usage: true } } : {}),
     };
     if (options.reasoningEffort) {
       if (usesKimiThinking) body.thinking = { type: "enabled" };
@@ -1092,7 +1101,7 @@ export class AnthropicMessagesClient {
   }
 }
 
-function serializeMessage(message: ChatMessage): Record<string, unknown> {
+export function serializeMessage(message: ChatMessage): Record<string, unknown> {
   const wire: Record<string, unknown> = { role: message.role, content: message.content };
   if (message.role === "assistant" && message.reasoningContent) {
     wire.reasoning_content = message.reasoningContent;
@@ -1285,8 +1294,9 @@ function normalizeUsage(usage: OpenAIUsage | undefined): ChatCompletionUsage | u
   const cacheReadTokens = usage.prompt_tokens_details?.cached_tokens
     ?? usage.input_tokens_details?.cached_tokens
     ?? usage.cache_read_input_tokens
-    ?? 0;
-  const cacheWriteTokens = usage.cache_creation_input_tokens ?? 0;
+    ?? usage.prompt_cache_hit_tokens
+    ?? usage.cached_tokens;
+  const cacheWriteTokens = usage.cache_creation_input_tokens ?? usage.prompt_tokens_details?.cache_write_tokens ?? 0;
   const inputTokens = usage.prompt_tokens ?? usage.input_tokens ?? 0;
   const explicitOutputTokens = usage.completion_tokens ?? usage.output_tokens ?? 0;
   const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens
@@ -1297,7 +1307,8 @@ function normalizeUsage(usage: OpenAIUsage | undefined): ChatCompletionUsage | u
     inputTokens,
     outputTokens,
     totalTokens: Math.max(usage.total_tokens ?? 0, inputTokens + outputTokens),
-    cacheReadTokens,
+    cacheReadTokens: cacheReadTokens ?? 0,
+    cacheReadReported: cacheReadTokens !== undefined,
     cacheWriteTokens,
     cacheCreationTokens1h: usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
     cacheCreationTokens5m: usage.cache_creation?.ephemeral_5m_input_tokens ?? 0,
@@ -1319,6 +1330,7 @@ function normalizeUsageHeaders(headers: Headers): ChatCompletionUsage | undefine
     totalTokens: totalTokens ?? input + output,
     cacheReadTokens: cacheReadTokens ?? 0,
     cacheWriteTokens: cacheWriteTokens ?? 0,
+    cacheReadReported: cacheReadTokens !== undefined,
     cacheCreationTokens1h: 0,
     cacheCreationTokens5m: 0,
   };
@@ -1560,7 +1572,9 @@ interface OpenAIUsage {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
-  prompt_tokens_details?: { cached_tokens?: number };
+  prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+  prompt_cache_hit_tokens?: number;
+  cached_tokens?: number;
   input_tokens_details?: { cached_tokens?: number };
   completion_tokens_details?: { reasoning_tokens?: number };
   output_tokens_details?: { reasoning_tokens?: number };

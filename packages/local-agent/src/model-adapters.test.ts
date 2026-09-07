@@ -95,9 +95,16 @@ describe("OpenAIResponsesAdapter", () => {
       { cacheRetention: "long", sessionId: "session_1" },
     ));
     expect(supportedCapture.body).toMatchObject({
-      prompt_cache_key: expect.stringMatching(/^berry_[a-f0-9]{64}$/),
+      prompt_cache_key: expect.stringMatching(/^[a-f0-9]{64}$/),
       prompt_cache_retention: "24h",
     });
+    const originalCacheKey = supportedCapture.body?.prompt_cache_key;
+    await collect(supported.stream(
+      createBerryModel(supportedProvider),
+      { systemPrompt: "updated context", messages: [{ role: "user", content: "next question", timestamp: 2 }] },
+      { cacheRetention: "long", sessionId: "session_1" },
+    ));
+    expect(supportedCapture.body?.prompt_cache_key).toBe(originalCacheKey);
 
     const unsupportedCapture: { body?: Record<string, unknown> } = {};
     const unsupported = new OpenAIResponsesAdapter({

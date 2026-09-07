@@ -1115,10 +1115,11 @@ function usageCostFromPrices(
   },
 ): number {
   const cacheReadTokens = Math.min(event.inputTokens, event.cacheReadTokens ?? 0);
-  const regularInputTokens = Math.max(0, event.inputTokens - cacheReadTokens);
+  const cacheWriteTokens = Math.min(Math.max(0, event.inputTokens - cacheReadTokens), event.cacheWriteTokens ?? 0);
+  const regularInputTokens = Math.max(0, event.inputTokens - cacheReadTokens - cacheWriteTokens);
   const input = regularInputTokens * (cost.input ?? 0);
   const cacheRead = cacheReadTokens * (cost.cacheRead ?? cost.input ?? 0);
-  const cacheWrite = (event.cacheWriteTokens ?? 0) * (cost.cacheWrite ?? 0);
+  const cacheWrite = cacheWriteTokens * (cost.cacheWrite ?? cost.input ?? 0);
   const output = event.outputTokens * (cost.output ?? 0);
   return Math.ceil(input + cacheRead + cacheWrite + output);
 }

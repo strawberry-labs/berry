@@ -228,6 +228,17 @@ describe("BudgetService", () => {
     expect(usageCostMicros(usage, 99n, {})).toBe(99n);
   });
 
+  it("prices fresh input, cache reads, and cache writes once each", () => {
+    const usage = { kind: "usage" as const, inputTokens: 900, outputTokens: 100, cacheReadTokens: 500, cacheWriteTokens: 200 };
+    expect(usageCostMicros(usage, 0n, { cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 2 } })).toBe(750n);
+    expect(usageCostMicros(usage, 0n, { cost: { input: 1, output: 1, cacheRead: 0.1 } })).toBe(550n);
+  });
+
+  it("retains cache-write charges for normalized Anthropic usage when cached input exceeds fresh input", () => {
+    const usage = { kind: "usage" as const, inputTokens: 1600, outputTokens: 0, cacheReadTokens: 1000, cacheWriteTokens: 500 };
+    expect(usageCostMicros(usage, 0n, { cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 2 } })).toBe(1200n);
+  });
+
   it("computes anchored monthly cycles in the organization timezone", () => {
     const window = allowanceCycleWindow(
       { timezone: "Asia/Dubai", anchorDay: 15 },

@@ -133,9 +133,9 @@ export function buildPromptManifest(input: {
   });
 }
 
-export function cacheKeyFor(namespace: string, sessionId: string, manifestHash: string): { value: string; hash: string } {
-  const hash = sha256(canonicalJson({ namespace, sessionId, manifestHash }));
-  return { value: `berry_${hash}`, hash };
+export function cacheKeyFor(namespace: string, sessionId: string, routeIdentity: string): { value: string; hash: string } {
+  const hash = sha256(canonicalJson({ namespace, sessionId, routeIdentity }));
+  return { value: hash, hash };
 }
 
 export class PromptCacheTracker {
@@ -171,7 +171,7 @@ export class PromptCacheTracker {
     const difference = previous ? compareManifests(previous.manifest, manifest) : null;
     let missReason: PromptCacheMissReason | null = null;
     const missComponentId: string | null = difference?.componentId ?? null;
-    if (!input.capability.supported) missReason = "provider_unsupported";
+    if (!input.capability.supported) missReason = "unknown";
     else if (!retentionSupported) missReason = "retention_unsupported";
     else if (manifest.stablePrefixTokens < input.capability.minimumTokens) missReason = "below_minimum_tokens";
     else if (!previous?.eligible) missReason = "first_request";
@@ -179,7 +179,7 @@ export class PromptCacheTracker {
     else if (now - previous.observedAt > retentionMillis(retention)) missReason = "cache_expired";
     else missReason = "unknown";
     const key = input.capability.supported && retentionSupported && input.capability.cacheKey
-      ? cacheKeyFor(input.namespace, input.sessionId, manifest.manifestHash)
+      ? cacheKeyFor(input.namespace, input.sessionId, canonicalJson({ provider: input.provider, model: input.model, route: input.route }))
       : null;
     this.#previous.set(input.sessionId, { manifest, eligible, observedAt: now });
     return {

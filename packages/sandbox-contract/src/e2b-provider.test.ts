@@ -15,6 +15,25 @@ import { SandboxPausedError, collectSandboxExecEvents, exerciseSandboxProviderCo
 const TENANT_ID = "00000000-0000-4000-8000-000000000001";
 
 describe("E2BSandboxProvider", () => {
+  it("updates reused sandbox permissions without losing files and skips unchanged policies", async () => {
+    const client = new FakeE2BClient();
+    const provider = new E2BSandboxProvider({ apiKey: "test", client });
+    const first = await provider.create({ request_id: "network", tenant_id: TENANT_ID, image: "base", network_policy: { egress: "on", allowedDomains: ["connect.aesg.com"] } });
+    await provider.files.write({ sandbox_id: first.sandbox_id, path: "/workspace/keep.txt", content: "retained" });
+    const sandbox = client.sandboxes.get(first.sandbox_id)!.sandbox;
+    const policy = { egress: "on" as const, allowedDomains: ["connect.aesg.com", "s3.eu-west-1.amazonaws.com"] };
+    await provider.resume({ sandbox_id: first.sandbox_id, network_policy: policy });
+    expect(sandbox.networkUpdates).toEqual([{ allowInternetAccess: true, allowOut: policy.allowedDomains, denyOut: ["0.0.0.0/0"] }]);
+    await provider.resume({ sandbox_id: first.sandbox_id, network_policy: { ...policy, allowedDomains: [...policy.allowedDomains].reverse() } });
+    expect(sandbox.networkUpdates).toHaveLength(1);
+    // A new worker cannot rely on an in-memory policy cache.
+    const restarted = new E2BSandboxProvider({ apiKey: "test", client });
+    await restarted.resume({ sandbox_id: first.sandbox_id, network_policy: { egress: "off", allowedDomains: [] } });
+    expect(sandbox.networkUpdates.at(-1)).toEqual({ allowInternetAccess: false, denyOut: ["0.0.0.0/0"] });
+    expect((await restarted.files.read({ sandbox_id: first.sandbox_id, path: "/workspace/keep.txt", encoding: "utf8" })).content).toBe("retained");
+    sandbox.updateNetwork = async () => { throw new Error("provider unavailable"); };
+    await expect(restarted.resume({ sandbox_id: first.sandbox_id, network_policy: policy })).rejects.toThrow("Unable to apply the current organization network policy");
+  });
   it("implements the sandbox contract directly through the E2B client", async () => {
     const client = new FakeE2BClient();
     const provider = new E2BSandboxProvider({
@@ -608,6 +627,8 @@ class FakeE2BClient implements E2BSandboxClient {
 }
 
 class FakeSandbox implements E2BSandboxLike {
+  readonly networkUpdates: Array<Parameters<NonNullable<E2BSandboxLike["updateNetwork"]>>[0]> = [];
+  async updateNetwork(network: Parameters<NonNullable<E2BSandboxLike["updateNetwork"]>>[0]): Promise<void> { this.networkUpdates.push(network); }
   readonly filesByPath = new Map<string, { content: Uint8Array; modifiedTime: Date }>();
   readonly timeoutUpdates: number[] = [];
   readonly timeoutOptions: E2BRequestOptions[] = [];

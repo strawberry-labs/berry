@@ -81,6 +81,7 @@ export interface E2BFileInfoLike {
 
 export interface E2BSandboxLike {
   readonly sandboxId: string;
+  updateNetwork?(network: { allowInternetAccess: boolean; allowOut?: string[] | undefined; denyOut?: string[] | undefined }, options?: E2BRequestOptions): Promise<void>;
   readonly trafficAccessToken?: string | undefined;
   readonly files: {
     read(path: string, options: { format: "text" | "bytes" } & E2BRequestOptions): Promise<string | Uint8Array>;
@@ -184,6 +185,7 @@ export interface E2BSandboxProviderOptions {
 }
 
 type SandboxRecord = {
+  networkPolicyKey?: string;
   sandbox: E2BSandboxLike;
   handle: SandboxHandle;
   resources: SandboxResourceLimits;
@@ -196,6 +198,9 @@ const DEFAULT_RECONNECT_TTL_SECONDS = 900;
 const ACTIVE_EXPIRY_SAFETY_MS = 2_000;
 const MAX_KEEPALIVE_INTERVAL_MS = 60_000;
 const MAX_CHMOD_COMMAND_BYTES = 32 * 1024;
+export class SandboxNetworkPolicyUpdateError extends Error {
+  override name = "SandboxNetworkPolicyUpdateError";
+}
 const DEFAULT_AMBIGUOUS_CREATE_RECOVERY_TIMEOUT_MS = 5_000;
 
 /** Direct, server-side E2B implementation of Berry's provider-neutral sandbox contract. */
@@ -273,6 +278,7 @@ export class E2BSandboxProvider implements SandboxProvider {
         options.signal?.throwIfAborted();
         const handle = this.#handleFromInfo(existing, parsed);
         this.#remember(sandbox, handle, parsed.resources, parsed.ttl_seconds);
+        await this.#applyNetworkPolicy(this.#sandboxes.get(sandbox.sandboxId)!, parsed.network_policy, options);
         return handle;
       }
     }
@@ -338,6 +344,7 @@ export class E2BSandboxProvider implements SandboxProvider {
       },
     });
     this.#remember(sandbox, handle, parsed.resources, parsed.ttl_seconds);
+    this.#sandboxes.get(sandbox.sandboxId)!.networkPolicyKey = networkPolicyKey(parsed.network_policy);
     return handle;
   }
 
@@ -478,10 +485,12 @@ export class E2BSandboxProvider implements SandboxProvider {
       // timeout-update request for a healthy local handle; the normal data
       // plane path refreshes near expiry and command keep-alives remain active.
       if (remainingMs > keepAliveIntervalMs(current.ttlSeconds) + ACTIVE_EXPIRY_SAFETY_MS) {
+        await this.#applyNetworkPolicy(current, parsed.network_policy, options);
         return current.handle;
       }
       if (remainingMs > ACTIVE_EXPIRY_SAFETY_MS) {
         await this.#refreshTimeout(current, options);
+        await this.#applyNetworkPolicy(current, parsed.network_policy, options);
         return current.handle;
       }
     }
@@ -501,7 +510,24 @@ export class E2BSandboxProvider implements SandboxProvider {
       expires_at: new Date(this.#now().getTime() + ttlSeconds * 1_000).toISOString(),
     });
     this.#remember(sandbox, handle, current?.resources ?? resourcesFromMetadata(info.metadata.berry_resources_json), ttlSeconds);
+    await this.#applyNetworkPolicy(this.#sandboxes.get(sandbox.sandboxId)!, parsed.network_policy, options);
     return handle;
+  }
+
+  async #applyNetworkPolicy(record: SandboxRecord, policy: ParsedCreateInput["network_policy"] | undefined, options: SandboxOperationOptions): Promise<void> {
+    if (!policy) return;
+    const key = networkPolicyKey(policy);
+    if (record.networkPolicyKey === key) return;
+    try {
+      if (!record.sandbox.updateNetwork) throw new Error("The sandbox SDK cannot update network rules");
+      const { allowPublicTraffic: _publicTraffic, ...network } = networkOptions(policy.egress, policy.allowedDomains);
+      await this.#observe("updateNetwork", options.signal, () => record.sandbox.updateNetwork!(
+        { ...network, allowInternetAccess: policy.egress !== "off" }, this.#requestOptions(options),
+      ), record.sandbox.sandboxId);
+      record.networkPolicyKey = key;
+    } catch (error) {
+      throw new SandboxNetworkPolicyUpdateError("Unable to apply the current organization network policy. No command was run; retry after the sandbox connection recovers.", { cause: error });
+    }
   }
 
   async destroy(input: SandboxDestroyInput): Promise<SandboxDestroyResult> {
@@ -968,6 +994,10 @@ function networkOptions(egress: "on" | "off" | "unrestricted", allowedDomains: s
     };
   }
   return { allowPublicTraffic: false };
+}
+
+function networkPolicyKey(policy: ParsedCreateInput["network_policy"]): string {
+  return JSON.stringify({ egress: policy.egress, allowedDomains: [...new Set(policy.allowedDomains)].sort() });
 }
 
 function commandString(command: string[] | undefined, code: string | undefined, language: string | undefined): string {

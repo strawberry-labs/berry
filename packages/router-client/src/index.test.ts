@@ -457,6 +457,38 @@ describe("router client", () => {
     expect(cached.usage).toMatchObject({ cacheReadTokens: 1_500, cacheWriteTokens: 0 });
   });
 
+  it.each([
+    {},
+    { prompt_cache_hit_tokens: 800 },
+    { cached_tokens: 800 },
+    { prompt_tokens_details: { cached_tokens: 800 } },
+  ])("preserves provider cache field variants and inclusive input accounting: %j", async (cacheFields) => {
+    const baseUrl = await withServer((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ id: "usage-variants", choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100, ...cacheFields } }));
+    });
+    const client = new OpenAIChatCompletionsClient({ provider: { baseUrl, defaultModel: "test", name: "Test", kind: "openai" } });
+    const reported = Object.keys(cacheFields).length > 0;
+    expect((await client.complete({ messages: [{ role: "user", content: "hi" }] })).usage)
+      .toMatchObject({ inputTokens: 1000, cacheReadTokens: reported ? 800 : 0, cacheReadReported: reported, totalTokens: 1100 });
+  });
+
+  it.each([false, true])("preserves a cache counter omitted by later streaming usage (explicit zero: %s)", async (explicitZero) => {
+    const baseUrl = await withServer((_request, response) => {
+      response.setHeader("Content-Type", "text/event-stream");
+      response.end([
+        `data: ${JSON.stringify({ id: "cache-stream", choices: [], usage: { prompt_tokens: 1000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 800 } } })}`,
+        `data: ${JSON.stringify({ id: "cache-stream", choices: [], usage: { prompt_tokens: 1000, completion_tokens: 10, ...(explicitZero ? { prompt_tokens_details: { cached_tokens: 0 } } : {}) } })}`,
+        "data: [DONE]",
+      ].join("\n\n"));
+    });
+    const client = new OpenAIChatCompletionsClient({ provider: { baseUrl, defaultModel: "test", name: "Test", kind: "openai" } });
+    const chunks = [];
+    for await (const chunk of client.stream({ messages: [{ role: "user", content: "hi" }] })) chunks.push(chunk);
+    expect(chunks.at(-1)?.usage).toMatchObject({ inputTokens: 1000, outputTokens: 10, cacheReadTokens: explicitZero ? 0 : 800, cacheReadReported: true });
+  });
+
   it("streams SSE deltas", async () => {
     const baseUrl = await withServer((_request, response) => {
       response.setHeader("Content-Type", "text/event-stream");

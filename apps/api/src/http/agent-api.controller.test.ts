@@ -23,9 +23,29 @@ import { InMemoryEnterpriseIdentityRepository, type EnterpriseIdentityRepository
 import { apiRuntimeMetrics } from "../runtime/runtime-metrics.ts";
 import { AgentApiController, durableAdmissionPreparationTimeoutMs, durableTaskReconciliationStatus, networkPolicyWithApprovedMcpDomains, normalizeImprovedPrompt, preservePromptSkillTokens, PROMPT_IMPROVEMENT_MODEL, promptImprovementModelInput, promptImprovementSkills, turnAdmissionFingerprint } from "./agent-api.controller.ts";
 import { SupportViewController } from "./support-view.controller.ts";
+import { MANAGEMENT_SERVICE, ManagementService } from "../management/management.service.ts";
 
 describe("AgentApiController", () => {
   let app: INestApplication | null = null;
+
+  it.each([false, true])("applies saved network policy at admission (durable: %s)", async (durable) => {
+    const startTurn = vi.fn((_input: StartTurnOptions) => ({ turnId: "network-turn" }));
+    const admit = vi.fn(async (input: DurableTurnAdmission) => ({ runId: "network-run", sessionId: input.sessionId }));
+    app = await createApp(fakeSessionHost({ startTurn }), { runtimeConfig: chatRuntimeConfig(),
+      ...(durable ? { durableTurns: { enabled: true, replayAdmission: async () => null, admit } } : {}),
+    });
+    const management = app.get<ManagementService>(MANAGEMENT_SERVICE);
+    const policy = await management.getExecution(SELF_HOST_TENANT_ID);
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Network policy" }).expect(201);
+    for (const allowedDomains of [["connect.aesg.com", "s3.eu-west-1.amazonaws.com"], []]) {
+      await management.setExecution(SELF_HOST_TENANT_ID, { ...policy, allowedDomains });
+      await request(app.getHttpServer()).post(`/v1/sessions/${created.body.session.id}/turns`).set(authHeader())
+        .send({ input: "Check network", workspacePath: "/workspace" }).expect(201);
+      const received = durable ? admit.mock.calls.at(-1)?.[0].runtimeRequest : startTurn.mock.calls.at(-1)?.[0];
+      expect(received).toMatchObject({ networkPolicy: { egress: allowedDomains.length ? "on" : "off", allowedDomains } });
+    }
+  });
 
   it("wires support-view delegation in the production module", async () => {
     app = await createApp(fakeSessionHost());

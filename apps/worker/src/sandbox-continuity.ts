@@ -9,6 +9,7 @@ import {
 import {
   DockerSandboxProvider,
   E2BSandboxProvider,
+  SandboxNetworkPolicyUpdateError,
   createSandboxProviderFromConfig,
   sandboxProviderConfigFromEnv,
   type DockerCommandExecutor,
@@ -31,6 +32,8 @@ import {
   sourceRevisionFromEnv,
   type AgentStreamEvent,
   type JsonValue,
+  networkDomainAllowed,
+  type NetworkPolicy,
 } from "@berry/shared";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
@@ -1307,6 +1310,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
       const truncated = output.result();
       const rawOutput = truncated.content;
+      const networkFailure = sandboxNetworkFailureHint(command, networkPolicy(snapshot.runtimeRequest.networkPolicy), exitCode, rawOutput);
+      if (networkFailure) throw new Error(networkFailure);
       const hasMeaningfulOutput = rawOutput.trim().length > 0;
       let text = hasMeaningfulOutput
         ? rawOutput
@@ -1681,6 +1686,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             const resumeInput = {
               sandbox_id: snapshot.sandboxId!,
               reason: "Durable turn requested sandbox access",
+              ...(this.provider.kind === "e2b" ? { network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy) } : {}),
             } as const;
             const resumed = signal
               ? await this.provider.resume?.(resumeInput, { signal })
@@ -1714,6 +1720,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         });
       } catch (error) {
         if (signal?.aborted) throw error;
+        if (error instanceof SandboxNetworkPolicyUpdateError) throw error;
         // Restore from the newest complete archive below.
       }
     }
@@ -1741,6 +1748,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             const resumeInput = {
               sandbox_id: continuity.sandboxId!,
               reason: "Follow-up turn requested the prior sandbox",
+              ...(this.provider.kind === "e2b" ? { network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy) } : {}),
             } as const;
             const resumed = signal
               ? await this.provider.resume?.(resumeInput, { signal })
@@ -1771,6 +1779,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         });
       } catch (error) {
         if (signal?.aborted) throw error;
+        if (error instanceof SandboxNetworkPolicyUpdateError) throw error;
         // The previous turn's sandbox expired. Restore its durable archive below.
       }
     }
@@ -4340,6 +4349,21 @@ function objectValue(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+export function sandboxNetworkFailureHint(command: string, policy: NetworkPolicy, exitCode: number | null, output: string): string | null {
+  const tlsFailure = (exitCode === 35 && /\bcurl\b/.test(command))
+    || /(?:SSL:|SSL_connect|TLS handshake|UNEXPECTED_EOF_WHILE_READING)/i.test(output);
+  if (!tlsFailure) return null;
+  const blocked = new Set<string>();
+  for (const match of command.matchAll(/https?:\/\/[^\s'"<>\\`]+/g)) {
+    try {
+      const host = new URL(match[0]).hostname;
+      if (policy.egress === "off" || !networkDomainAllowed(host, policy.allowedDomains)) blocked.add(host);
+    } catch { /* The command may contain a URL expression rather than a URL. */ }
+  }
+  if (!blocked.size) return null;
+  return `Network access to ${[...blocked].join(", ")} is blocked by this task's sandbox policy. An organization admin must allow the hostname in Execution & network, then retry in a new turn. Certificate verification is not the cause; do not retry with curl -k or disable TLS checks. Signed URL parameters have been omitted.`;
 }
 
 function networkPolicy(value: unknown): {
