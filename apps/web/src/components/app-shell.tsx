@@ -30,6 +30,7 @@ import { FileSearch as FileSearchIcon } from "lucide-react";
 import { AtSign, Brain, Check, CircleHelp, ChevronDown, Ellipsis, FileText, GitBranch, Hand, Hash, ImagePlus, NotebookPen, PencilLine, Pin, PinOff, ShieldCheck, SlashSquare, Zap } from "@berry/desktop-ui/lib/icons";
 import { fixtureMessages, message } from "@/lib/fixtures";
 import { confirmOptimisticMessage, OPTIMISTIC_MESSAGE_ID_PREFIX, reconcileDurableEventCursor, reconcileFetchedSessionMessages, type DurableEventSequences } from "@/lib/message-reconciliation";
+import { useModelCatalog } from "@/lib/model-catalog";
 import { WebConfigSchema } from "@/lib/config";
 import type { ShellData } from "@/lib/shell-data";
 import { parseCloudShellLocation, type ArtifactLibraryTab, type UserSettingsTab } from "@/lib/cloud-shell-state";
@@ -1214,18 +1215,30 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     };
   }, [client, hasInProgressTasks, inProgressTaskIdsKey, tasksLoaded]);
 
+  const catalogQuery = useModelCatalog(client, [
+    initial.config.apiBaseUrl, user?.id, activeOrganizationId,
+    supportView?.tenantId, supportView?.userId,
+  ], tasksLoaded);
+
   React.useEffect(() => {
-    if (!client || !tasksLoaded) return;
+    if (!client || !tasksLoaded || supportView) return;
     let cancelled = false;
-    const organizationsRequest = supportView ? Promise.resolve([]) : client.listOrganizations();
-    void Promise.allSettled([client.modelCatalog(), organizationsRequest])
-      .then(([catalogResult, organizationsResult]) => {
+    void client.listOrganizations().then((organizations) => {
+      if (cancelled || organizations.length === 0) return;
+      setConfig((current) => WebConfigSchema.parse({ ...current, organizations }));
+      setActiveOrganizationId((current) => organizations.some((organization) => organization.id === current) ? current : organizations[0]!.id);
+    }).catch((cause) => {
+      if (!cancelled) setResourceError("tasks", cause instanceof Error ? cause.message : "Unable to load organizations");
+    });
+    return () => { cancelled = true; };
+  }, [client, supportView, tasksLoaded]);
+
+  React.useEffect(() => {
+    if (!client || !tasksLoaded || catalogQuery.isPending) return;
+    let cancelled = false;
+    void Promise.allSettled([catalogQuery.error ? Promise.reject(catalogQuery.error) : Promise.resolve(catalogQuery.data)])
+      .then(([catalogResult]) => {
         if (cancelled) return;
-        if (organizationsResult.status === "fulfilled" && organizationsResult.value.length > 0) {
-          const organizations = organizationsResult.value;
-          setConfig((current) => WebConfigSchema.parse({ ...current, organizations }));
-          setActiveOrganizationId((current) => organizations.some((organization) => organization.id === current) ? current : organizations[0]!.id);
-        }
         if (catalogResult.status === "fulfilled" && catalogResult.value) {
           const catalog = catalogResult.value;
           setImageGenerationCapability(catalog.capabilities.imageGeneration);
@@ -1275,13 +1288,13 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
             message: "Image generation is not configured for this deployment.",
           });
         }
-        const errors = [catalogResult, organizationsResult]
+        const errors = [catalogResult]
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => result.reason instanceof Error ? result.reason.message : "Unable to load deployment metadata");
         if (errors.length > 0) setResourceError("tasks", errors.join(". "));
       });
     return () => { cancelled = true; };
-  }, [applyModelSelection, client, supportView, tasksLoaded]);
+  }, [applyModelSelection, client, supportView, tasksLoaded, catalogQuery.data, catalogQuery.error, catalogQuery.isPending]);
 
   React.useEffect(() => {
     const sessionId = activeTask?.activeSessionId;

@@ -67,6 +67,7 @@ export const ADMIN_AREAS: readonly AdminArea[] = [
       { id: "providers", label: "Providers", permission: "models:read" },
       { id: "models", label: "Models", permission: "models:read" },
       { id: "connectors", label: "Connectors", permission: "mcp:read" },
+      { id: "mcp-approvals", label: "MCP approvals", permission: "mcp:read" },
       { id: "skills-mcp", label: "Skills & MCP", permission: "org:read" },
       { id: "feature-access", label: "Feature access", permission: "feature_flags:read" },
       { id: "execution-network", label: "Execution & network", permission: "guardrails:read" },

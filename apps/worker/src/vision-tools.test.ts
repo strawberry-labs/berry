@@ -26,6 +26,18 @@ describe("DurableVisionToolExecutor", () => {
     } as never)).toBe(true);
   });
 
+  it("passes labelled pixels directly to a native vision model without an adapter", async () => {
+    const parts = [
+      { type: "text" as const, text: 'Workspace image 1: "/workspace/rendered/page-1.png"' },
+      { type: "image_url" as const, image_url: { url: "data:image/png;base64,aGVsbG8=" } },
+    ];
+    const snapshot = visionSnapshot();
+    const { vision: _vision, ...runtime } = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
+    snapshot.runtimeRequest = { ...runtime, modelAcceptsImages: true, builtInTools: runtime.builtInTools.filter((tool) => tool !== "inspect_images") };
+    const executor = new DurableVisionToolExecutor({ modelContent: async () => parts, execute: vi.fn() }, new MemoryVisionCache());
+    await expect(executor.modelContent(snapshot)).resolves.toEqual(parts);
+  });
+
   it("withholds images from a text-only model when no approved adapter is available", async () => {
     const base: DurableTurnToolExecutor = {
       modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useRefreshModelCatalog } from "@/lib/model-catalog";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
@@ -130,6 +131,7 @@ export function PersonalSkillsScreen({
   tenantId,
 }: ManagementScreenProps) {
   const navigate = useNavigate();
+  const refreshCatalog = useRefreshModelCatalog();
   const [query, setQuery] = React.useState("");
   const [draft, setDraft] = React.useState(emptyDraft);
   const [creating, setCreating] = React.useState(false);
@@ -173,6 +175,7 @@ export function PersonalSkillsScreen({
       setDraft(emptyDraft);
       setMessage("Skill imported and enabled for your account.");
       resource.retry();
+      refreshCatalog();
     } catch (cause) {
       setImportError(
         cause instanceof Error ? cause.message : "Skill import failed",
@@ -195,6 +198,7 @@ export function PersonalSkillsScreen({
       current?.key === skill.key ? { ...current, enabled } : current,
     );
     resource.retry();
+    refreshCatalog();
   }
 
   async function remove(skill: PersonalSkill) {
@@ -202,6 +206,7 @@ export function PersonalSkillsScreen({
     await client.deletePersonalSkill(skill.id);
     setSelected(null);
     resource.retry();
+    refreshCatalog();
   }
 
   async function selectFile(file: File | undefined) {

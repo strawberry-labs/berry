@@ -34,6 +34,7 @@ const AnalyticsScreen = React.lazy(async () => ({
 const ReportsAlertsScreen = React.lazy(async () => ({
   default: (await import("./reports-alerts-screen")).ReportsAlertsScreen,
 }));
+const AdminMcpApprovalsScreen = React.lazy(async () => ({ default: (await import("./admin-mcp-approvals-screen")).AdminMcpApprovalsScreen }));
 const AdminConnectorsScreen = React.lazy(async () => ({
   default: (await import("./admin-connectors-screen")).AdminConnectorsScreen,
 }));
@@ -87,6 +88,7 @@ export function AdminScreen({
   else if (["execution-network", "authentication", "data-governance"].includes(resolvedTab)) {
     screen = <AdminPolicyScreen kind={resolvedTab === "execution-network" ? "execution" : resolvedTab === "authentication" ? "authentication" : "data"} {...p} />;
   } else if (resolvedTab === "service-accounts") screen = <AdminServiceAccountsScreen {...p} />;
+  else if (resolvedTab === "mcp-approvals") screen = <AdminMcpApprovalsScreen {...p} />;
   else if (resolvedTab === "connectors") screen = <AdminConnectorsScreen {...p} />;
   else if (resolvedTab === "profile-domains") screen = <OrganizationProfileScreen {...p} />;
   else if (resolvedTab === "roles") screen = <AdminRolesScreen {...p} />;
@@ -139,6 +141,7 @@ export function permissionFor(tab: string) {
     "data-governance": "data_policy:read",
     "service-accounts": "service_accounts:read",
     connectors: "mcp:read",
+    "mcp-approvals": "mcp:read",
     "profile-domains": "org_settings:read",
     "feature-access": "feature_flags:read",
     "sso-scim": "sso:read",

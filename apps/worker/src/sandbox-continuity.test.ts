@@ -741,7 +741,7 @@ describe("SandboxContinuityManager", () => {
       },
     }];
 
-    await expect(manager.modelContent(current)).resolves.toEqual([{
+    await expect(manager.modelContent(current)).resolves.toEqual([{ type: "text", text: 'Workspace image 1: "/workspace/inputs/connector-download/brent.png"' }, {
       type: "image_url",
       image_url: { url: `data:image/png;base64,${image.toString("base64")}` },
     }]);
@@ -789,10 +789,10 @@ describe("SandboxContinuityManager", () => {
 
     const content = await manager.modelContent(current);
 
-    expect(content).toEqual(paths.map((path) => ({
-      type: "image_url",
-      image_url: { url: `data:image/png;base64,${Buffer.from(path.split("/").at(-1)!).toString("base64")}` },
-    })));
+    expect(content).toEqual(paths.flatMap((path, index) => [
+      { type: "text", text: `Workspace image ${index + 1}: ${JSON.stringify(path)}` },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from(path.split("/").at(-1)!).toString("base64")}` } },
+    ]));
     expect(maxActiveReads).toBe(3);
     expect(read.mock.calls.map(([input]) => input.path)).toEqual(paths);
   });
@@ -848,10 +848,10 @@ describe("SandboxContinuityManager", () => {
 
     const content = await manager.modelContent(current);
 
-    expect(content).toEqual([2, 3, 4, 5, 6].map((value) => ({
-      type: "image_url",
-      image_url: { url: `data:image/png;base64,${Buffer.from([value]).toString("base64")}` },
-    })));
+    expect(content).toEqual([2, 3, 4, 5, 6].flatMap((value, index) => [
+      { type: "text", text: `Workspace image ${index + 1}: "/workspace/inputs/image-${value}/image-${value}.png"` },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from([value]).toString("base64")}` } },
+    ]));
     expect(getSource).toHaveBeenCalledTimes(5);
     expect(getSource).not.toHaveBeenCalledWith("objects/image-1.png", undefined);
     expect(writeStream).toHaveBeenCalledTimes(6);
@@ -1985,10 +1985,12 @@ describe("SandboxContinuityManager", () => {
     }];
 
     await expect(manager.modelContent(current)).resolves.toEqual([
+      { type: "text", text: 'Workspace image 1: "/workspace/outputs/chart.png"' },
       {
         type: "image_url",
         image_url: { url: `data:image/png;base64,${generated.toString("base64")}` },
       },
+      { type: "text", text: 'Workspace image 2: "/workspace/inputs/00000000-0000-7000-8000-000000000090/reference.png"' },
       {
         type: "image_url",
         image_url: { url: `data:image/png;base64,${attached.toString("base64")}` },

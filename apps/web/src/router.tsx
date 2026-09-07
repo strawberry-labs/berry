@@ -1,6 +1,7 @@
 import { createRouter } from "@tanstack/react-router";
 import { createIsomorphicFn } from "@tanstack/react-start";
 import { routeTree } from "./routeTree.gen";
+import { installChunkLoadRecovery } from "./lib/chunk-load-recovery";
 import { serverCspNonce } from "./router-csp.server";
 
 const getServerCspNonce = createIsomorphicFn()
@@ -8,6 +9,7 @@ const getServerCspNonce = createIsomorphicFn()
   .server(serverCspNonce);
 
 export function getRouter() {
+  installChunkLoadRecovery();
   const nonce = typeof window === "undefined" ? getServerCspNonce() : undefined;
   return createRouter({
     routeTree,

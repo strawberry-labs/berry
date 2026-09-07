@@ -1,4 +1,6 @@
 import * as React from "react";
+import { useRefreshModelCatalog } from "@/lib/model-catalog";
+import { McpApprovalsLink } from "./admin-mcp-approvals-screen";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
@@ -35,6 +37,7 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
@@ -70,6 +73,7 @@ import {
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 export function PersonalMcpScreen({ client, config, permissions }: ManagementScreenProps) {
+  const refreshCatalog = useRefreshModelCatalog();
   const [query, setQuery] = React.useState("");
   const [creating, setCreating] = React.useState(false);
   const [draftAuth, setDraftAuth] = React.useState<PersonalMcpServer["auth"]>("none");
@@ -80,6 +84,10 @@ export function PersonalMcpScreen({ client, config, permissions }: ManagementScr
   const [message, setMessage] = React.useState("");
   const [connectionError, setConnectionError] = React.useState("");
   const [busyServerId, setBusyServerId] = React.useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = React.useState<PersonalMcpServer | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
+  const [deleteError, setDeleteError] = React.useState("");
+  const deleteInFlight = React.useRef(false);
   const canApprove = permissions.includes("mcp:write");
   const resource = useResource(
     "personal-mcp",
@@ -180,6 +188,7 @@ export function PersonalMcpScreen({ client, config, permissions }: ManagementScr
       setMessage("Server saved. Test its connection before trusting it.");
     }
     resource.retry();
+    refreshCatalog();
   }
 
   async function test(server: PersonalMcpServer) {
@@ -213,12 +222,37 @@ export function PersonalMcpScreen({ client, config, permissions }: ManagementScr
     }
   }
 
+  async function deleteServer() {
+    if (!client || !pendingDelete || deleteInFlight.current) return;
+    const server = pendingDelete;
+    deleteInFlight.current = true;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      const result = await client.deletePersonalMcpServer(server.id);
+      if (!result.ok) throw new Error("The server could not be deleted. Please try again.");
+      resource.setData((servers) => servers.filter((item) => item.id !== server.id));
+      setSelected((current) => current?.id === server.id ? null : current);
+      setPendingDelete(null);
+      setConnectionError("");
+      setMessage(`Removed ${server.name} from your MCP servers.`);
+      resource.invalidate();
+      refreshCatalog();
+    } catch (cause) {
+      setDeleteError(errorMessage(cause));
+    } finally {
+      deleteInFlight.current = false;
+      setDeleting(false);
+    }
+  }
+
   return (
     <ManagementPage
       title="MCP servers"
       description="Connect approved Streamable HTTP MCP servers and inspect their authorization state."
       eyebrow="Tools & connections"
-      actions={
+      actions={<>
+        <McpApprovalsLink permissions={permissions} />
         <Button disabled={!client} onClick={() => {
           setDraftAuth("none");
           setDraftCredential("");
@@ -227,7 +261,7 @@ export function PersonalMcpScreen({ client, config, permissions }: ManagementScr
           <Plus />
           Add server
         </Button>
-      }
+      </>}
     >
       <Toolbar>
         <SearchInput
@@ -374,18 +408,44 @@ export function PersonalMcpScreen({ client, config, permissions }: ManagementScr
             >
               {oauth?.health ?? server.health}
             </StatusPill>,
+            <div className="flex items-center gap-2">
             <Button
               variant="secondary"
-              disabled={!client || action.disabled || busy}
+              disabled={!client || action.disabled || busy || deleting}
               onClick={() => action.kind === "test" ? void test(server) : void connect(server)}
             >
               {busy ? <LoaderCircle className="animate-spin" /> : action.kind === "test" ? <FlaskConical /> : action.kind === "pending" ? <Clock3 /> : <PlugZap />}
               {busy ? "Connecting…" : action.label}
-            </Button>,
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon-sm" aria-label={`More options for ${server.name}`} disabled={!client || busy || deleting}><EllipsisVertical /></Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuGroup>
+                  <DropdownMenuItem variant="destructive" onSelect={() => { setDeleteError(""); setPendingDelete(server); }}><Trash2 />Delete server</DropdownMenuItem>
+                </DropdownMenuGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            </div>,
             ];
           })}
         />
       </AsyncState>
+      <ManagementDialog
+        open={Boolean(pendingDelete)}
+        onOpenChange={(open) => { if (!open && !deleteInFlight.current) { setPendingDelete(null); setDeleteError(""); } }}
+        title={`Delete ${pendingDelete?.name ?? "MCP server"}?`}
+        description="Remove this saved server and its stored server credentials from your account. You can add the server again later."
+        size="sm"
+        footer={<>
+          <Button variant="outline" disabled={deleting} onClick={() => { setPendingDelete(null); setDeleteError(""); }}>Cancel</Button>
+          <Button variant="destructive" aria-label="Confirm delete MCP server" disabled={!client || deleting} onClick={() => void deleteServer()}>{deleting ? "Deleting…" : "Delete server"}</Button>
+        </>}
+      >
+        <p className="break-all text-xs text-muted-foreground">{pendingDelete?.url}</p>
+        {deleteError ? <p role="alert" className="mt-3 text-xs text-[var(--berry-danger)]">{deleteError}</p> : null}
+      </ManagementDialog>
       {selected ? (() => {
         const connector = connectorForServer(connectorResource.data, selected);
         const oauth = selected.auth === "oauth" ? personalMcpOAuthStatus(connector) : null;

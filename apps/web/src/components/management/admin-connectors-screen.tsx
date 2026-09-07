@@ -1,8 +1,8 @@
 import * as React from "react";
+import { McpApprovalQueue } from "./admin-mcp-approvals-screen";
 import type { Connector, GoogleConnectorConfiguration } from "@berry/shared";
 import {
   CalendarDays,
-  Check,
   ExternalLink,
   FileText,
   HardDrive,
@@ -167,33 +167,18 @@ export function AdminConnectorsScreen({ client, tenantId, permissions }: Managem
       resource.retry();
     } catch (cause) { toast.error(message(cause)); } finally { setBusy(null); }
   };
-  const reviewRequest = async (connector: Connector, decision: "approve" | "reject") => {
-    if (!client) return;
-    setBusy(`${connector.id}:${decision}`);
-    try {
-      if (decision === "approve") await client.approveOrganizationConnectorRequest(tenantId, connector.id);
-      else await client.rejectOrganizationConnectorRequest(tenantId, connector.id);
-      toast.success(decision === "approve" ? `${connector.name} is now available to the organization` : `${connector.name} was not approved`);
-      resource.retry();
-    } catch (cause) { toast.error(message(cause)); } finally { setBusy(null); }
-  };
 
   return <ManagementPage title="Connectors" eyebrow="Organization administration" description="Configure native apps and publish reviewed MCP servers to everyone in your organization." actions={<>
     <Button variant="outline" disabled={!canConfigure} onClick={() => setSetupOpen(true)}><KeyRound />Google OAuth</Button>
     <Button disabled={!canWrite} onClick={() => setCustomOpen(true)}><Plus />Custom MCP</Button>
   </>}>
+    <McpApprovalQueue client={client} tenantId={tenantId} permissions={permissions} />
     <AsyncState loading={resource.loading} error={resource.error} onRetry={resource.retry}>
       <div className="grid gap-3 sm:grid-cols-3" aria-label="Connector status summary">
         <ConnectorSummary label="Native apps enabled" value={`${googleApps.filter((connector) => connector.enabled).length} of ${googleApps.length}`} detail={googleConfigured ? "Google OAuth is configured" : "Google OAuth setup required"} tone={googleConfigured ? "good" : "warning"} />
         <ConnectorSummary label="Custom MCP published" value={String(approvedCustom.filter((connector) => connector.publicationStatus === "published" && connector.enabled).length)} detail={`${approvedCustom.length} approved server${approvedCustom.length === 1 ? "" : "s"}`} tone="neutral" />
         <ConnectorSummary label="Approval requests" value={String(pendingRequests.length)} detail={pendingRequests.length ? "Waiting for an administrator" : "Queue is clear"} tone={pendingRequests.length ? "warning" : "good"} />
       </div>
-      <Section title="MCP approval requests" description="Review member-submitted Streamable HTTP servers. Approval adds the server to the organization catalog; each user still authorizes their own account.">
-        {pendingRequests.length ? <div className="grid gap-2">{pendingRequests.map((connector) => <div key={connector.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2.5">
-          <span className="flex min-w-0 items-center gap-3"><ConnectorIcon connector={connector} /><span className="min-w-0"><span className="flex items-center gap-2"><b className="truncate text-sm font-medium">{connector.name}</b><StatusPill tone="warning">Pending</StatusPill></span><small className="block truncate text-xs text-muted-foreground">{connector.url}</small><small className="mt-0.5 block text-[11px] text-muted-foreground">Streamable HTTP · OAuth · Per-user authorization</small></span></span>
-          <div className="flex items-center gap-1.5"><Button size="sm" variant="ghost" disabled={!canWrite || Boolean(busy)} onClick={() => void reviewRequest(connector, "reject")}>Reject</Button><Button size="sm" disabled={!canWrite || Boolean(busy)} onClick={() => void reviewRequest(connector, "approve")}><Check />{busy === `${connector.id}:approve` ? "Approving…" : "Approve"}</Button></div>
-        </div>)}</div> : <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center"><Check className="mx-auto size-5 text-muted-foreground" /><b className="mt-2 block text-sm font-medium">No requests waiting</b><p className="mt-1 text-xs text-muted-foreground">New member requests will appear here.</p></div>}
-      </Section>
       <Section title="Google apps" description="The OAuth app is configured once. Each user then connects their own Google account.">
         {canReadGoogleConfiguration ? <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2.5">
           <span><b className="block text-sm font-medium">Google OAuth client</b><small className="text-xs text-muted-foreground">{resource.data.google.configured ? `${resource.data.google.status} · ${resource.data.google.clientId}` : "Not configured"}</small></span>

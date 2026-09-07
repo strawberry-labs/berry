@@ -1,4 +1,6 @@
 import * as React from "react";
+import { useRefreshModelCatalog } from "@/lib/model-catalog";
+import { McpApprovalsLink } from "./admin-mcp-approvals-screen";
 import {
   Activity,
   Check,
@@ -99,6 +101,7 @@ export function AdminSkillsMcpScreen({
   tenantId,
   permissions,
 }: ManagementScreenProps) {
+  const refreshCatalog = useRefreshModelCatalog();
   const canWriteSkills = permissions.includes("skills:write");
   const canWriteMcp = permissions.includes("mcp:write");
   const r = useResource(
@@ -178,6 +181,7 @@ export function AdminSkillsMcpScreen({
         c.id === capability.id ? { ...c, allowUserDisable: allow } : c,
       ),
     );
+    refreshCatalog();
     setMessage("Capability updated and recorded in the audit log.");
   };
   const setAssignmentValue = async (capability: any, value: string) => {
@@ -194,6 +198,7 @@ export function AdminSkillsMcpScreen({
         c.id === capability.id ? { ...c, assignment: value } : c,
       ),
     );
+    refreshCatalog();
     setMessage("Capability assignment updated and recorded in the audit log.");
   };
   const discardSkillArchive = (fileId = skillArchiveFileId) => {
@@ -325,6 +330,7 @@ export function AdminSkillsMcpScreen({
         config: { content: skillDraft.content },
         resourceFiles: skillDraft.resourceFiles,
       });
+      refreshCatalog();
       r.setData([saved, ...r.data.filter((item: any) => !(item.kind === saved.kind && item.capabilityId === saved.capabilityId))]);
       if (uploadedFileId) await client.removeFileFromLibrary(uploadedFileId).catch(() => undefined);
       setAdding(false);
@@ -357,6 +363,7 @@ export function AdminSkillsMcpScreen({
         allowUserDisable: mcpDraft.assignment === "required" || mcpDraft.assignment === "blocked" ? false : mcpDraft.allowUserDisable,
         config: { url: url.toString(), transport: "streamable-http" },
       });
+      refreshCatalog();
       r.setData([saved, ...r.data.filter((item: any) => !(item.kind === saved.kind && item.capabilityId === saved.capabilityId))]);
       setAdding(false);
       setMcpDraft({ name: "", description: "", url: "", assignment: "available", allowUserDisable: true });
@@ -368,6 +375,7 @@ export function AdminSkillsMcpScreen({
   const removeCapability = async (capability: any) => {
     if (!client) return;
     await client.deleteOrganizationCapability(tenantId, capability.id);
+    refreshCatalog();
     r.setData(r.data.filter((item: any) => item.id !== capability.id));
     setActive(null);
     setMessage(`${capability.name} was removed from the organization catalog.`);
@@ -380,6 +388,7 @@ export function AdminSkillsMcpScreen({
     policy.setData(
       await client.updateOrganizationCapabilitySettings(tenantId, next),
     );
+    refreshCatalog();
     setMessage("Personal capability policy saved.");
   };
   return (
@@ -387,8 +396,9 @@ export function AdminSkillsMcpScreen({
       title="Skills & MCP"
       description="Choose organization capabilities and how they are assigned to members."
       eyebrow="AI controls"
-      actions={
-        canWrite ? (
+      actions={<>
+        <McpApprovalsLink permissions={permissions} />
+        {canWrite ? (
           <Button
             onClick={() => {
               setAdding(true);
@@ -399,8 +409,8 @@ export function AdminSkillsMcpScreen({
             <Plus aria-hidden />
             {tab === "skill" ? "Add organization skill" : "Add MCP server"}
           </Button>
-        ) : null
-      }
+        ) : null}
+      </>}
     >
       <MetricGrid
         items={[

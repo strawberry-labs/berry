@@ -1,4 +1,6 @@
 import * as React from "react";
+import { isChunkLoadError, recoverChunkLoadError } from "@/lib/chunk-load-recovery";
+import type { ErrorComponentProps } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { createRootRoute, HeadContent, Scripts, useRouter } from "@tanstack/react-router";
 import { AuthBoundary } from "@/components/shell/auth-boundary";
@@ -28,6 +30,8 @@ export const Route = createRootRoute({
     ],
   }),
   component: RootComponent,
+  shellComponent: RootDocument,
+  errorComponent: RootError,
 });
 
 function RootComponent() {
@@ -54,11 +58,7 @@ function RootComponent() {
       )}
     </AuthBoundary>
   );
-  return (
-    <RootDocument>
-      {content}
-    </RootDocument>
-  );
+  return content;
 }
 
 function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
@@ -81,4 +81,30 @@ function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
 function WebQueryBoundary({ children }: Readonly<{ children: ReactNode }>) {
   const [client] = React.useState(createWebQueryClient);
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+function RootError({ error, reset }: ErrorComponentProps) {
+  const chunkError = isChunkLoadError(error);
+  const [reloading, setReloading] = React.useState(false);
+  React.useEffect(() => {
+    setReloading(recoverChunkLoadError(error));
+  }, [error]);
+  return (
+    <main className="auth-shell">
+      <section className="max-w-md space-y-3 p-6 text-sm" role="alert">
+        <h1 className="text-lg font-semibold">{reloading ? "Updating Berry…" : chunkError ? "Berry needs a refresh" : "Something went wrong"}</h1>
+        <p className="text-[var(--berry-text-secondary)]">
+          {reloading ? "Loading the latest version. Your task will reopen here."
+            : chunkError ? "A part of the app could not load. This can happen after an update or a connection interruption. Check your connection, then refresh."
+            : "Please try again. If the problem continues, refresh the page."}
+        </p>
+        {!reloading && (
+          <div className="flex gap-2">
+            {!chunkError && <button type="button" className="rounded-md border border-[var(--berry-border)] px-3 py-2 focus-visible:outline" onClick={reset}>Try again</button>}
+            <button type="button" className="rounded-md border border-[var(--berry-border)] px-3 py-2 focus-visible:outline" onClick={() => window.location.reload()}>Refresh page</button>
+          </div>
+        )}
+      </section>
+    </main>
+  );
 }

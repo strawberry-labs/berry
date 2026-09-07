@@ -565,15 +565,17 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 
     const parts: ChatContentPart[] = [];
     let totalBytes = 0;
-    const append = (mediaType: string, bytes: Uint8Array): boolean => {
+    let imageCount = 0;
+    const append = (path: string, mediaType: string, bytes: Uint8Array): boolean => {
       if (
-        parts.length >= MAX_MODEL_IMAGES
+        imageCount >= MAX_MODEL_IMAGES
         || bytes.byteLength === 0
         || bytes.byteLength > MAX_MODEL_IMAGE_BYTES
         || totalBytes + bytes.byteLength > MAX_MODEL_IMAGE_TOTAL_BYTES
       ) {
         return false;
       }
+      parts.push({ type: "text", text: `Workspace image ${imageCount + 1}: ${JSON.stringify(path)}` });
       parts.push({
         type: "image_url",
         image_url: {
@@ -581,6 +583,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         },
       });
       totalBytes += bytes.byteLength;
+      imageCount += 1;
       return true;
     };
 
@@ -640,7 +643,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         throw new Error(`inspect_images could not load the exact requested image path${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`);
       }
       for (const source of sources) {
-        if (!append(source.mediaType, source.bytes)) {
+        if (!append(source.path, source.mediaType, source.bytes)) {
           throw new Error("The selected images exceed the per-image or 50 MB combined inspection limit");
         }
       }
@@ -648,7 +651,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
 
     const sandboxSources = await loadSandboxSources(requestedSandboxImages);
-    for (const source of sandboxSources) append(source.mediaType, source.bytes);
+    for (const source of sandboxSources) append(source.path, source.mediaType, source.bytes);
 
     // Choose attachments only after sandbox images are validated. This keeps
     // concurrent reads while allowing later valid files to backfill slots left
@@ -656,14 +659,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const attachmentFiles: SandboxInputFile[] = [];
     let plannedTotalBytes = totalBytes;
     for (const file of selectedAttachments) {
-      if (attachmentFiles.length >= MAX_MODEL_IMAGES - parts.length) break;
+      if (attachmentFiles.length >= MAX_MODEL_IMAGES - imageCount) break;
       if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) continue;
       if (plannedTotalBytes + file.sizeBytes > MAX_MODEL_IMAGE_TOTAL_BYTES) continue;
       attachmentFiles.push(file);
       plannedTotalBytes += file.sizeBytes;
     }
     const attachmentSources = await loadAttachmentSources(attachmentFiles);
-    for (const source of attachmentSources) append(source.mediaType, source.bytes);
+    for (const source of attachmentSources) append(source.path, source.mediaType, source.bytes);
     return parts;
   }
 

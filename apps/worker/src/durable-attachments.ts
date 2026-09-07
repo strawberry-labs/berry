@@ -35,7 +35,7 @@ export function durableAttachmentPrompt(attachment: DurableAttachmentReference, 
         : isOfficeDocument
           ? "Use read on this document path for extracted text. Use the matching document skill when layout, formatting, formulas, or editing matter."
       : mediaType.startsWith("image/")
-        ? "This is a binary image. read returns safe metadata; use an image-capable skill/tool when visual inspection is required."
+        ? "For visual inspection, use the image pixels supplied by Berry. If they are not already attached, read this path once for a vision-capable model, or use inspect_images when that adapter is available. Do not repeat a metadata-only read."
         : "",
   ].filter(Boolean).join("\n");
 }

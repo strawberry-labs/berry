@@ -2746,6 +2746,37 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("delivers read image pixels after tool results without rewriting the original user message", async () => {
+    let request: ChatCompletionOptions | undefined;
+    const model = new RouterDurableTurnModel({
+      stream: async function* (options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
+        request = options;
+        yield { id: "vision-response", model: "vision-model", delta: "Layout checked.", finishReason: "stop", raw: {} };
+      },
+    }, "vision-model", {
+      provider: "router", route: "/chat/completions",
+      capabilityForModel: () => ({ supported: false, cacheKey: false, cacheControl: false, retention: [], minimumTokens: 1024 }),
+    });
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.entries.push({
+      entryId: "read-pages", parentEntryId: current.entries[0]!.entryId, entryType: "message", sequence: 2,
+      payload: { type: "message", message: { role: "toolResult", toolCallId: "read-page", toolName: "read", content: [{ type: "text", text: "Identified page-1.png as a binary image/png file" }] } },
+    });
+    const original = modelMessages(current).messages.find((message) => message.role === "user")!.content;
+    const pixels = { type: "image_url" as const, image_url: { url: "data:image/png;base64,AQID" } };
+    await model.call(current, modelStep("pending", 1), {
+      messageId: randomUUID(), tools: [],
+      additionalUserContent: [{ type: "text", text: 'Workspace image 1: "/workspace/rendered/page-1.png"' }, pixels],
+      emitDelta: async () => {},
+      policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
+    });
+    expect(request!.messages.find((message) => message.role === "user")!.content).toEqual(original);
+    expect(request!.messages.at(-2)).toMatchObject({ role: "tool", toolCallId: "read-page" });
+    expect(request!.messages.at(-1)).toMatchObject({ role: "user", content: expect.arrayContaining([pixels]) });
+    expect(JSON.stringify(request!.messages.at(-1)!.content)).toContain("page-1.png");
+    expect(JSON.stringify(current.entries)).not.toContain("base64");
+  });
+
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
     let request: ChatCompletionOptions | undefined;
     const client = {
