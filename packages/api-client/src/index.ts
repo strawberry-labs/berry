@@ -651,10 +651,10 @@ export class BerryApiClient {
   async listPersonalSkills(): Promise<PersonalSkill[]> { return this.#request("/v1/me/skills", z.array(PersonalSkillSchema)); }
   async reviewPersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[]; resourceFiles?: SkillPackageFile[] }): Promise<PersonalSkillReview> { return this.#request("/v1/me/skills/review", PersonalSkillReviewSchema, { method: "POST", body: input }); }
   async savePersonalSkill(input: { name?: string; description?: string; content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; version?: string | null; packageFiles?: string[]; resourceFiles?: SkillPackageFile[]; enabled?: boolean }): Promise<PersonalSkill> { return this.#request("/v1/me/skills", PersonalSkillSchema, { method: "POST", body: input }); }
-  async installPersonalSkillArchive(fileId: string): Promise<PersonalSkill> { return this.#request("/v1/me/skills/packages", PersonalSkillSchema, { method: "POST", body: { fileId } }); }
+  async installPersonalSkillArchive(fileId: string, signal?: AbortSignal): Promise<PersonalSkill> { return this.#requestVerifiedArchive("/v1/me/skills/packages", PersonalSkillSchema, { method: "POST", body: { fileId }, ...(signal ? { signal } : {}) }); }
   async memberSkills(tenantId: string, userId: string) { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/skills`, z.object({ personal: z.array(PersonalSkillSchema), effective: z.array(EffectiveCapabilitySchema) })); }
   async saveMemberSkill(tenantId: string, userId: string, input: Parameters<BerryApiClient["savePersonalSkill"]>[0]) { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/skills`, PersonalSkillSchema, { method: "POST", body: input }); }
-  async installMemberSkillArchive(tenantId: string, userId: string, fileId: string) { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/skills/packages`, PersonalSkillSchema, { method: "POST", body: { fileId } }); }
+  async installMemberSkillArchive(tenantId: string, userId: string, fileId: string, signal?: AbortSignal) { return this.#requestVerifiedArchive(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/skills/packages`, PersonalSkillSchema, { method: "POST", body: { fileId }, ...(signal ? { signal } : {}) }); }
   async updateMemberSkill(tenantId: string, userId: string, id: string, enabled: boolean) { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/skills/${encodeURIComponent(id)}`, PersonalSkillSchema, { method: "PATCH", body: { enabled } }); }
   async deleteMemberSkill(tenantId: string, userId: string, id: string) { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}/skills/${encodeURIComponent(id)}`, z.object({ ok: z.boolean() }), { method: "DELETE" }); }
   async personalSkillPackage(id: string): Promise<PersonalSkillPackage> { return this.#request(`/v1/me/skills/${encodeURIComponent(id)}/package`, PersonalSkillPackageSchema); }
@@ -692,8 +692,8 @@ export class BerryApiClient {
   async listOrganizationCapabilities(tenantId: string): Promise<OrgCapability[]> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, z.array(OrgCapabilitySchema)); }
   async upsertOrganizationCapability(tenantId: string, input: { kind: "skill" | "mcp"; capabilityId: string; name: string; description?: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean; contentHash?: string | null; config?: Record<string, unknown>; resourceFiles?: SkillPackageFile[] }): Promise<OrgCapability> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities`, OrgCapabilitySchema, { method: "POST", body: input }); }
   async reviewOrganizationSkill(tenantId: string, input: { content?: string; source?: "text" | "upload" | "git"; sourceUrl?: string | null; packageFiles?: string[]; resourceFiles?: SkillPackageFile[] }): Promise<PersonalSkillReview> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/review`, PersonalSkillReviewSchema, { method: "POST", body: input }); }
-  async reviewOrganizationSkillArchive(tenantId: string, fileId: string): Promise<PersonalSkillReview> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/packages/review`, PersonalSkillReviewSchema, { method: "POST", body: { fileId } }); }
-  async installOrganizationSkillArchive(tenantId: string, input: { fileId: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean }): Promise<OrgCapability> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/packages`, OrgCapabilitySchema, { method: "POST", body: input }); }
+  async reviewOrganizationSkillArchive(tenantId: string, fileId: string): Promise<PersonalSkillReview> { return this.#requestVerifiedArchive(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/packages/review`, PersonalSkillReviewSchema, { method: "POST", body: { fileId } }); }
+  async installOrganizationSkillArchive(tenantId: string, input: { fileId: string; assignment: "required" | "default-on" | "available" | "blocked"; allowUserDisable?: boolean }): Promise<OrgCapability> { return this.#requestVerifiedArchive(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/packages`, OrgCapabilitySchema, { method: "POST", body: input }); }
   async organizationSkillPackage(tenantId: string, id: string): Promise<PersonalSkillPackage> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/${encodeURIComponent(id)}/package`, PersonalSkillPackageSchema); }
   async organizationSkillPackageFile(tenantId: string, id: string, path: string): Promise<SkillPackageFile> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/skills/${encodeURIComponent(id)}/package/file?path=${encodeURIComponent(path)}`, SkillPackageFileSchema); }
   async deleteOrganizationCapability(tenantId: string, id: string): Promise<{ ok: boolean }> { return this.#request(`/v1/orgs/${encodeURIComponent(tenantId)}/capabilities/${encodeURIComponent(id)}`, z.object({ ok: z.boolean() }), { method: "DELETE" }); }
@@ -1859,6 +1859,26 @@ export class BerryApiClient {
       }
     };
     return source;
+  }
+
+  // Only this explicit pre-install response is retryable: no mutation has occurred yet.
+  async #requestVerifiedArchive<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string; body?: unknown; signal?: AbortSignal }): Promise<z.output<TSchema>> {
+    for (let attempt = 0; ; attempt += 1) {
+      init.signal?.throwIfAborted();
+      try { return await this.#request(path, schema, init); }
+      catch (error) {
+        const pending = error instanceof BerryApiError && error.status === 409
+          && typeof error.body === "object" && error.body !== null
+          && (error.body as { code?: string }).code === "file_verification_pending";
+        if (!pending || attempt >= 150) throw error;
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => { clearTimeout(timer); reject(init.signal?.reason ?? new Error("Upload cancelled")); };
+          const timer = setTimeout(() => { init.signal?.removeEventListener("abort", onAbort); resolve(); }, 2000);
+          init.signal?.addEventListener("abort", onAbort, { once: true });
+          if (init.signal?.aborted) onAbort();
+        });
+      }
+    }
   }
 
   async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {

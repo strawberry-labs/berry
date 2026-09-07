@@ -42,8 +42,8 @@ export function SkillImportDialog({ client, tenantId, ownerId, open, onOpenChang
         uploadedId = uploaded.id;
         if (controller.signal.aborted) return;
         setPhase("installing");
-        if (ownerId) await client.installMemberSkillArchive(tenantId, ownerId, uploaded.id);
-        else await client.installPersonalSkillArchive(uploaded.id);
+        if (ownerId) await client.installMemberSkillArchive(tenantId, ownerId, uploaded.id, controller.signal);
+        else await client.installPersonalSkillArchive(uploaded.id, controller.signal);
       } else {
         const input = { content: source === "upload" && file ? await file.text() : content, source, sourceUrl: source === "git" ? url : null, enabled: true };
         if (controller.signal.aborted) return;
@@ -69,7 +69,7 @@ export function SkillImportDialog({ client, tenantId, ownerId, open, onOpenChang
       </fieldset>
       {busy ? <div className="flex items-center gap-3 text-sm" role="status">
         {phase === "uploading" ? <svg width="32" height="32" viewBox="0 0 36 36" role="progressbar" aria-label="Uploading skill" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" opacity=".15" strokeWidth="3" /><circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" strokeWidth="3" pathLength="100" strokeDasharray={`${progress} 100`} transform="rotate(-90 18 18)" /></svg> : <LoaderCircle className="size-6 motion-safe:animate-spin" />}
-        {phase === "uploading" ? `Uploading… ${progress}%` : "Validating and installing…"}
+        {phase === "uploading" ? `Uploading… ${progress}%` : "Verifying and installing…"}
       </div> : null}
       {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
       <div className="flex justify-end gap-2"><Button type="button" variant="secondary" disabled={busy} onClick={() => onOpenChange(false)}>Cancel</Button><Button type="submit" disabled={busy || !client || (source === "upload" && !file)}>{busy ? "Importing…" : "Import and enable"}</Button></div>

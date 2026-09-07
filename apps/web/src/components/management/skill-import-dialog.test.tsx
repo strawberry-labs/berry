@@ -16,7 +16,7 @@ describe("skill import", () => {
     expect(client.uploadFile).toHaveBeenCalledTimes(1);
     expect(renderer.root.findByProps({ role: "progressbar" }).props["aria-valuenow"]).toBe(50);
     await act(async () => { complete({ id: "uploaded" }); await pending; });
-    expect(client.installMemberSkillArchive).toHaveBeenCalledWith("tenant", "member", "uploaded");
+    expect(client.installMemberSkillArchive).toHaveBeenCalledWith("tenant", "member", "uploaded", expect.any(AbortSignal));
     expect(success).toHaveBeenCalledTimes(1);
     await act(async () => renderer.unmount());
   });

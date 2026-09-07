@@ -3,6 +3,25 @@ import type { ManagedPolicyBundle } from "@berry/shared";
 import { BerryApiClient, BerryApiError } from "./index.ts";
 
 describe("BerryApiClient", () => {
+  it("waits for upload verification before retrying an archive import", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ code: "file_verification_pending", message: "Verifying" }), { status: 409, headers: { "content-type": "application/json" } }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ message: "Forbidden" }), { status: 403, headers: { "content-type": "application/json" } }));
+      const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+      const result = client.installPersonalSkillArchive("file-id").catch((error) => error);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await result).toMatchObject({ status: 403 });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+  it("does not retry generic conflicts or potentially completed mutations", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: "other_conflict" }), { status: 409, headers: { "content-type": "application/json" } }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+    await expect(client.installPersonalSkillArchive("file-id")).rejects.toMatchObject({ status: 409 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps MCP OAuth callbacks on the screen that started the connection", async () => {
     const response = {
       connectorId: "connector_mcp_figma",

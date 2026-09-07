@@ -247,7 +247,12 @@ export class FilePlatformService {
     const config = this.requireConfig();
     const file = await this.get(tenantId, userId, fileId);
     if (file.status !== "available" && file.status !== "processing") throw new NotFoundException("File is not available");
-    requireVerifiedStorage(file, "File is not available");
+    if (!hasVerifiedStorage(file)) {
+      if (file.resolved_verification_status === "unverified" || file.resolved_verification_status === "verifying") {
+        throw new ConflictException({ code: "file_verification_pending", message: "Upload complete. Waiting for file verification." });
+      }
+      throw new BadRequestException("File verification failed. Upload the package again.");
+    }
     const declaredBytes = Number(file.size_bytes);
     if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0 || declaredBytes > maxBytes) {
       throw new BadRequestException(`File exceeds the ${maxBytes} byte limit`);

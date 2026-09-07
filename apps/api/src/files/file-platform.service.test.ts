@@ -324,6 +324,8 @@ describe("FilePlatformService.streamContent", () => {
     await expect(service.streamContent(TENANT_ID, USER_ID, fileId, undefined, response as never))
       .rejects.toThrow("File is not available");
 
+    await expect(service.downloadContentToFile(TENANT_ID, USER_ID, fileId, 1024, "/tmp/not-created-pending-skill"))
+      .rejects.toMatchObject({ response: { code: "file_verification_pending" }, status: 409 });
     expect(client.send).not.toHaveBeenCalled();
     expect(response.write).not.toHaveBeenCalled();
     expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", INVALID_FILE_CACHE_CONTROL);
