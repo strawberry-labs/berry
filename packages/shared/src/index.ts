@@ -2926,8 +2926,8 @@ export const PersonalSkillSchema = z.object({
 export type PersonalSkill = z.infer<typeof PersonalSkillSchema>;
 
 export const SKILL_PACKAGE_MAX_FILES = 500;
-export const PERSONAL_SKILL_PACKAGE_MAX_BYTES = 5 * 1024 * 1024;
-export const ORGANIZATION_SKILL_PACKAGE_MAX_BYTES = 100 * 1024 * 1024;
+export const PERSONAL_SKILL_PACKAGE_MAX_BYTES = 500 * 1024 * 1024;
+export const ORGANIZATION_SKILL_PACKAGE_MAX_BYTES = 500 * 1024 * 1024;
 
 export const SkillPackageFileSchema = z.object({
   path: z.string().trim().min(1).max(512),

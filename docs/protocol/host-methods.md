@@ -18075,6 +18075,10 @@ Result:
               "additionalProperties": false
             }
           },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
           "inputTokens": {
             "type": "number",
             "default": 0

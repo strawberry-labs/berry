@@ -15,6 +15,7 @@ import {
 import { parseMemberImportCsv, type MemberImportRow } from "../../lib/member-import";
 import { memberAccessStatusOptions, memberStatusUpdate } from "../../lib/member-administration";
 import { startSupportView } from "../../lib/support-view";
+const MemberSkillsDialog = React.lazy(async () => ({ default: (await import("./member-skills-dialog")).MemberSkillsDialog }));
 export function AdminMembersScreen({
   client,
   config,
@@ -23,6 +24,7 @@ export function AdminMembersScreen({
   permissions,
 }: ManagementScreenProps) {
   const navigate = useNavigate();
+  const [skillsMember, setSkillsMember] = React.useState<{ userId: string; name: string } | null>(null);
   const [query, setQuery] = React.useState(""),
     [addMode, setAddMode] = React.useState<"choose" | "manual" | "bulk" | null>(null),
     [message, setMessage] = React.useState("");
@@ -528,11 +530,13 @@ export function AdminMembersScreen({
                   <Eye /> View as user
                 </Button>
               ) : null}
+              {permissions.includes("org:admin") && permissions.includes("skills:read") ? <Button variant="secondary" onClick={() => setSkillsMember({ userId: m.userId, name: m.name || m.email })}>Skills</Button> : null}
               {permissions.includes("members:write") ? <Button variant="secondary" onClick={() => openMember(m)}>Manage</Button> : null}
             </div>,
           ])}
         />
       </AsyncState>
+      {skillsMember ? <React.Suspense fallback={<p role="status" className="text-xs text-muted-foreground">Loading member skills…</p>}><MemberSkillsDialog client={client} tenantId={tenantId} member={skillsMember} canWrite={permissions.includes("skills:write")} onClose={() => setSkillsMember(null)} /></React.Suspense> : null}
     </ManagementPage>
   );
 }

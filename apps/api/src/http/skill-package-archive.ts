@@ -41,7 +41,7 @@ export type OrganizationSkillArchive = {
  */
 export async function readOrganizationSkillArchive(bytes: Uint8Array): Promise<OrganizationSkillArchive> {
   if (bytes.byteLength > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES) {
-    throw new BadRequestException("Organization skill archives are limited to 100 MB");
+    throw new BadRequestException("Organization skill archives are limited to 500 MB");
   }
   const temporaryRoot = await mkdtemp(join(tmpdir(), "berry-skill-read-"));
   try {
@@ -156,7 +156,7 @@ async function extractEntries(archivePath: string, extractionRoot: string): Prom
         throw new BadRequestException(`Skill packages may contain at most ${SKILL_PACKAGE_MAX_FILES} resource files`);
       }
       if (entry.uncompressedSize > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES - extractedBytes) {
-        throw new BadRequestException("Organization skill packages are limited to 100 MB extracted");
+        throw new BadRequestException("Organization skill packages are limited to 500 MB extracted");
       }
       const absolutePath = join(extractionRoot, `${String(files.length).padStart(4, "0")}-${randomUUID()}`);
       const digest = createHash("sha256");
@@ -165,7 +165,7 @@ async function extractEntries(archivePath: string, extractionRoot: string): Prom
         transform(chunk: Buffer, _encoding, callback) {
           written += chunk.byteLength;
           if (written > entry.uncompressedSize || written > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES - extractedBytes) {
-            callback(new BadRequestException("Organization skill packages are limited to 100 MB extracted"));
+            callback(new BadRequestException("Organization skill packages are limited to 500 MB extracted"));
             return;
           }
           digest.update(chunk);

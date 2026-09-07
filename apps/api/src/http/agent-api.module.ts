@@ -1,3 +1,4 @@
+import { MemberSkillsController } from "./member-skills.controller.ts";
 import { Module, type DynamicModule, type FactoryProvider, type Provider } from "@nestjs/common";
 import type { SessionHost } from "@berry/local-agent";
 import { AuditModule, type AuditModuleOptions } from "../audit/audit.module.ts";
@@ -96,7 +97,7 @@ export class AgentApiModule {
         ...(durableContextEnabled ? [MemoryModule] : []),
         SessionHostModule.register(options.sessionHost),
       ],
-      controllers: [AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
+      controllers: [MemberSkillsController, AgentApiController, SupportViewController, PersonalCapabilitiesController, OrganizationCapabilitiesController, ConnectorsController, OrganizationConnectorsController],
       providers: [
         // SupportViewController delegates member-scoped operations through the
         // existing API surface. Register the controller as a provider as well

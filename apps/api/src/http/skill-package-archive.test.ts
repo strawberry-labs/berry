@@ -63,7 +63,7 @@ describe("readOrganizationSkillArchive", () => {
     const root = await mkdtemp(join(tmpdir(), "berry-skill-archive-test-"));
     try {
       const archive = new JSZip();
-      const resource = Buffer.alloc(2 * 1024 * 1024, 0x5a);
+      const resource = Buffer.alloc(6 * 1024 * 1024, 0x5a);
       archive.file("branding/SKILL.md", "---\nname: branding\ndescription: Brand files\n---\n");
       archive.file("branding/assets/template.pptx", resource);
       const archivePath = join(root, "branding.skill");

@@ -3471,3 +3471,20 @@ input.berry-command-search-input:focus-visible {
     flex-wrap: wrap;
   }
 }
+
+/* Web preference: focus keeps the caret and interaction state, without rings.
+   Override shared Tailwind ring utilities and native/component outlines. */
+html body :is(:focus, :focus-visible, :focus-within) {
+  outline: none !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+  --tw-ring-offset-shadow: 0 0 #0000 !important;
+  --tw-inset-ring-shadow: 0 0 #0000 !important;
+}
+
+html body :is(button, input, textarea, select, [role="button"], [role="switch"]):is(:focus, :focus-visible) {
+  box-shadow: none !important;
+}
+
+html body .berry-onboarding-connector-toggle input:focus-visible + span {
+  outline: none !important;
+}

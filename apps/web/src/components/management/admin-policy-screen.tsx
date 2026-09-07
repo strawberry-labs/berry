@@ -1,8 +1,9 @@
+import { toast } from "sonner";
 import { actionErrorMessage } from "@/lib/action-error";
 import { PolicyListInput } from "./policy-list-input";
 import * as React from "react";
 import { Save } from "lucide-react";
-import { AsyncState, Button, FormSelect, Input, Section, ManagementPage, SuccessMessage, Switch } from "./management-primitives";
+import { AsyncState, Button, FormSelect, Input, Section, ManagementPage, Switch } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
 export function AdminPolicyScreen({
   kind,
@@ -39,23 +40,21 @@ export function AdminPolicyScreen({
     dirty.current = true;
     draftRef.current = next;
     setDraft(next);
-    setMessage("");
   }
-  const [message, setMessage] = React.useState("");
   const [saveError, setSaveError] = React.useState("");
   const [saving, setSaving] = React.useState(false);
   const saveInFlight = React.useRef(false);
   const save = async () => {
     if (!client || !draftRef.current || saveInFlight.current || !permissions.includes(write as any)) return;
     const submitted = draftRef.current;
-    saveInFlight.current = true; setSaving(true); setSaveError(""); setMessage("");
+    saveInFlight.current = true; setSaving(true); setSaveError("");
     try {
     if (kind === "execution")
       await client.updateExecutionPolicy(tenantId, strip(submitted));
     else if (kind === "authentication")
       await client.updateAuthenticationPolicy(tenantId, strip(submitted));
     else await client.updateDataGovernancePolicy(tenantId, strip(submitted));
-    setMessage("Policy saved and added to the organization audit log.");
+    toast.success("Policy saved", { description: "Added to the organization audit log." });
     if (draftRef.current === submitted) dirty.current = false;
     r.retry();
     } catch (cause) { setSaveError(actionErrorMessage(cause, "Could not save the policy. Please try again. Your edits are still here.")); }
@@ -114,7 +113,6 @@ export function AdminPolicyScreen({
               <PolicyFieldsGrid value={draft} disabled={!permissions.includes(write as any)} onChange={updateDraft} />
             )}
             {saveError && <p role="alert" className="mt-4 text-sm text-[var(--berry-danger)]">{saveError}</p>}
-            {message ? <SuccessMessage>{message}</SuccessMessage> : null}
           </Section></form>
         ) : null}
       </AsyncState>

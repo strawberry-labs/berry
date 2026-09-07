@@ -131,6 +131,7 @@ export function AdminSkillsMcpScreen({
   const [skillUploadProgress, setSkillUploadProgress] = React.useState(0);
   const [skillOperation, setSkillOperation] = React.useState<"uploading" | "reviewing" | "saving" | null>(null);
   const skillOperationGeneration = React.useRef(0);
+  const skillOperationLock = React.useRef(false);
   const skillUploadController = React.useRef<AbortController | null>(null);
   const [skillDraft, setSkillDraft] = React.useState({
     content: "",
@@ -205,6 +206,7 @@ export function AdminSkillsMcpScreen({
     skillUploadController.current?.abort();
     skillUploadController.current = null;
     skillOperationGeneration.current += 1;
+    skillOperationLock.current = false;
     setSkillOperation(null);
     setSkillArchiveFile(null);
     setSkillArchiveFileId(null);
@@ -218,12 +220,13 @@ export function AdminSkillsMcpScreen({
     setImportError("");
   };
   const requestCloseSkillDialog = () => {
-    if (skillOperation === "reviewing" || skillOperation === "saving") return;
+    if (skillOperationLock.current && !skillUploadController.current) return;
     closeSkillDialog();
   };
   const reviewSkill = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!client || skillOperation) return;
+    if (!client || skillOperationLock.current) return;
+    skillOperationLock.current = true;
     const generation = ++skillOperationGeneration.current;
     setImportError("");
     try {
@@ -266,19 +269,23 @@ export function AdminSkillsMcpScreen({
       );
     } finally {
       if (generation === skillOperationGeneration.current) {
+        skillOperationLock.current = false;
         skillUploadController.current = null;
         setSkillOperation(null);
       }
     }
   };
   const selectSkillFile = async (file: File | undefined) => {
-    if (!file || skillOperation) return;
+    if (!file || skillOperationLock.current) return;
     discardSkillArchive();
+    const generation = skillOperationGeneration.current;
+    skillOperationLock.current = true;
+    setSkillOperation("reviewing");
     setImportError("");
     setReview(null);
     try {
       if (/\.(skill|zip)$/i.test(file.name)) {
-        if (file.size > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES) throw new Error("Organization skill archives are limited to 100 MB");
+        if (file.size > ORGANIZATION_SKILL_PACKAGE_MAX_BYTES) throw new Error("Organization skill archives are limited to 500 MB");
         setSkillArchiveFile(file);
         setSkillArchiveFileId(null);
         setSkillUploadProgress(0);
@@ -287,6 +294,7 @@ export function AdminSkillsMcpScreen({
         return;
       }
       const imported = await readBrowserSkillImport(file);
+      if (generation !== skillOperationGeneration.current) return;
       setSkillArchiveFile(null);
       setSkillArchiveFileId(null);
       setSkillUploadProgress(0);
@@ -304,10 +312,16 @@ export function AdminSkillsMcpScreen({
           ? cause.message
           : "Could not read this skill package",
       );
+    } finally {
+      if (generation === skillOperationGeneration.current) {
+        skillOperationLock.current = false;
+        setSkillOperation(null);
+      }
     }
   };
   const saveSkill = async () => {
-    if (!client || !review || skillOperation) return;
+    if (!client || !review || skillOperationLock.current) return;
+    skillOperationLock.current = true;
     setImportError("");
     setSkillOperation("saving");
     try {
@@ -343,6 +357,7 @@ export function AdminSkillsMcpScreen({
     } catch (cause) {
       setImportError(cause instanceof Error ? cause.message : "Could not add this skill to the organization.");
     } finally {
+      skillOperationLock.current = false;
       setSkillOperation(null);
     }
   };
@@ -495,7 +510,7 @@ export function AdminSkillsMcpScreen({
                 <Upload aria-hidden />
                 <span className="grid gap-0.5">
                   <b>{skillDraft.fileName || "Choose or drop a .skill package"}</b>
-                  <small>.skill or .zip up to 100 MB · SKILL.md up to 256 KB</small>
+                  <small>.skill or .zip up to 500 MB · SKILL.md up to 256 KB</small>
                   {skillUploadProgress > 0 && skillUploadProgress < 1 ? <small>Uploading {Math.round(skillUploadProgress * 100)}%</small> : null}
                 </span>
               </label>

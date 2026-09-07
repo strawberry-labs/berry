@@ -1,3 +1,5 @@
+import { SkillImportDialog } from "./skill-import-dialog";
+import { toast } from "sonner";
 import * as React from "react";
 import { useRefreshModelCatalog } from "@/lib/model-catalog";
 import { useNavigate } from "@tanstack/react-router";
@@ -19,7 +21,6 @@ import {
   MessageCircle,
   Plus,
   Trash2,
-  Upload,
   X,
 } from "lucide-react";
 import { BerryApiError, type BerryApiClient } from "@berry/api-client";
@@ -49,21 +50,18 @@ import type {
   PersonalMcpServer,
   PersonalSkill,
 } from "@berry/shared";
-import { createBrowserSkillExport, readBrowserSkillImport } from "@/lib/skill-import";
+import { createBrowserSkillExport } from "@/lib/skill-import";
 import {
   AsyncState,
   Button,
   DataTable,
   DetailDrawer,
-  FormSelect,
   Input,
-  ManagementDialog,
   ManagementPage,
   ManagementSwitch,
   SearchInput,
   StatusPill,
   SuccessMessage,
-  Textarea,
   Toolbar,
 } from "./management-primitives";
 import { useResource, type ManagementScreenProps } from "./management-context";
@@ -89,15 +87,6 @@ const emptySkillResource = {
   personal: [] as PersonalSkill[],
   effective: [] as EffectiveCapability[],
 };
-const emptyDraft = {
-  content: "",
-  sourceUrl: "",
-  source: "upload" as "text" | "upload" | "git",
-  packageFiles: [] as string[],
-  resourceFiles: [] as Array<{ path: string; contentBase64: string; mode?: number | undefined }>,
-  fileName: "",
-};
-
 export async function loadPersonalSkillResource(
   client: Pick<BerryApiClient, "listPersonalSkills" | "effectiveCapabilities">,
   tenantId: string,
@@ -133,11 +122,9 @@ export function PersonalSkillsScreen({
   const navigate = useNavigate();
   const refreshCatalog = useRefreshModelCatalog();
   const [query, setQuery] = React.useState("");
-  const [draft, setDraft] = React.useState(emptyDraft);
   const [creating, setCreating] = React.useState(false);
   const [selected, setSelected] = React.useState<SkillCatalogRow | null>(null);
   const [message, setMessage] = React.useState("");
-  const [importError, setImportError] = React.useState("");
   const resource = useResource(
     `personal-skills:${tenantId}`,
     async () =>
@@ -157,31 +144,6 @@ export function PersonalSkillsScreen({
       ),
     [resource.data, config.skills, query],
   );
-
-  async function install(event: React.FormEvent) {
-    event.preventDefault();
-    if (!client) return;
-    setImportError("");
-    try {
-      await client.savePersonalSkill({
-        content: draft.content,
-        source: draft.source,
-        sourceUrl: draft.sourceUrl || null,
-        packageFiles: draft.packageFiles,
-        resourceFiles: draft.resourceFiles,
-        enabled: true,
-      });
-      setCreating(false);
-      setDraft(emptyDraft);
-      setMessage("Skill imported and enabled for your account.");
-      resource.retry();
-      refreshCatalog();
-    } catch (cause) {
-      setImportError(
-        cause instanceof Error ? cause.message : "Skill import failed",
-      );
-    }
-  }
 
   async function toggle(skill: SkillCatalogRow, enabled: boolean) {
     if (!client) return;
@@ -209,28 +171,6 @@ export function PersonalSkillsScreen({
     refreshCatalog();
   }
 
-  async function selectFile(file: File | undefined) {
-    if (!file) return;
-    setImportError("");
-    try {
-      const imported = await readBrowserSkillImport(file);
-      setDraft({
-        content: imported.content,
-        packageFiles: imported.packageFiles,
-        resourceFiles: imported.resourceFiles,
-        fileName: imported.fileName,
-        source: "upload",
-        sourceUrl: "",
-      });
-    } catch (cause) {
-      setImportError(
-        cause instanceof Error
-          ? cause.message
-          : "Could not read this skill package",
-      );
-    }
-  }
-
   function tryInChat(skill: SkillCatalogRow) {
     window.localStorage.setItem("berry.web.pendingPrompt", `$${skill.capabilityId} `);
     setSelected(null);
@@ -247,7 +187,6 @@ export function PersonalSkillsScreen({
           disabled={!client}
           onClick={() => {
             setCreating(true);
-            setImportError("");
           }}
         >
           <Plus />
@@ -264,114 +203,7 @@ export function PersonalSkillsScreen({
         />
       </Toolbar>
       {message ? <SuccessMessage>{message}</SuccessMessage> : null}
-      <ManagementDialog
-        open={creating}
-        onOpenChange={setCreating}
-        title="Import a skill"
-        description="Import a skill package, paste SKILL.md, or load a GitHub SKILL.md URL. Valid skills are enabled for your account immediately."
-        size="lg"
-      >
-        <form
-          className="grid gap-3 sm:grid-cols-2 [&>label]:grid [&>label]:gap-1.5 [&>label]:text-xs [&>label]:font-medium [&>label]:text-muted-foreground"
-          onSubmit={install}
-        >
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-              Source
-              <FormSelect
-                value={draft.source}
-                onChange={(source) => {
-                  setImportError("");
-                  setDraft({
-                    ...emptyDraft,
-                    source: source as typeof draft.source,
-                  });
-                }}
-                options={[
-                  { value: "upload", label: "Skill package" },
-                  { value: "text", label: "Paste SKILL.md" },
-                  { value: "git", label: "GitHub URL" },
-                ]}
-              />
-            </label>
-            {draft.source === "upload" ? (
-              <label
-                className="settings-skill-dropzone"
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  void selectFile(event.dataTransfer.files[0]);
-                }}
-              >
-                <input
-                  type="file"
-                  accept=".skill,.zip,.md,text/markdown,application/zip"
-                  onChange={(event) =>
-                    void selectFile(event.currentTarget.files?.[0])
-                  }
-                />
-                <Upload aria-hidden />
-                <span>
-                  <b>{draft.fileName || "Choose or drop a .skill package"}</b>
-                  <small>.skill, .zip, or SKILL.md · up to 5 MB</small>
-                </span>
-              </label>
-            ) : null}
-            {draft.source === "text" ? (
-              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
-                SKILL.md
-                <Textarea
-                  className="min-h-32 resize-y"
-                  required
-                  value={draft.content}
-                  onChange={(event) =>
-                    setDraft({ ...draft, content: event.currentTarget.value })
-                  }
-                  placeholder={
-                    "---\nname: my-skill\ndescription: What this skill does and when to use it\n---\n\nInstructions…"
-                  }
-                />
-              </label>
-            ) : null}
-            {draft.source === "git" ? (
-              <label className="grid gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
-                GitHub SKILL.md URL
-                <Input
-                  type="url"
-                  required
-                  value={draft.sourceUrl}
-                  onChange={(event) =>
-                    setDraft({ ...draft, sourceUrl: event.currentTarget.value })
-                  }
-                  placeholder="https://github.com/org/repo/blob/main/skill/SKILL.md"
-                />
-              </label>
-            ) : null}
-            {importError ? (
-              <div
-                className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-                role="alert"
-              >
-                {importError}
-              </div>
-            ) : null}
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => {
-                setCreating(false);
-                setDraft(emptyDraft);
-                setImportError("");
-              }}
-            >
-              <X />
-              Cancel
-            </Button>
-            <Button type="submit">
-              <Check />
-              Import and enable
-            </Button>
-          </form>
-      </ManagementDialog>
+      <SkillImportDialog client={client} tenantId={tenantId} open={creating} onOpenChange={setCreating} onSuccess={() => { toast.success("Skill imported and enabled"); resource.retry(); refreshCatalog(); }} />
       <AsyncState
         loading={resource.loading}
         error={resource.error}
