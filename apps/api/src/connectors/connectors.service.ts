@@ -1,3 +1,4 @@
+import { mcpOAuthStartError } from "./mcp-oauth-error.ts";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { BadRequestException, ConflictException, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import {
@@ -683,7 +684,7 @@ export class ConnectorsService {
     const endpoint = await safeRemoteUrl(row.endpoint_url, this.env.NODE_ENV !== "production");
     const state = randomBytes(32).toString("base64url"); const stateDigest = sha256(state); const config = customConfig(row.config); const callbackUrl = this.mcpCallbackUrl();
     const clientMetadataUrl = this.mcpClientMetadataUrl();
-    const started = await startRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl, requestState: state, ...(config.oauthScope ? { scope: config.oauthScope } : {}), ...(clientMetadataUrl ? { clientMetadataUrl } : {}) });
+    const started = await startRemoteMcpOAuth({ serverUrl: endpoint, callbackUrl, requestState: state, ...(config.oauthScope ? { scope: config.oauthScope } : {}), ...(clientMetadataUrl ? { clientMetadataUrl } : {}) }).catch((cause: unknown) => { throw mcpOAuthStartError(cause, endpoint); });
     const envelope = await this.#seal(JSON.stringify({ type: "mcp", state: started.state }), oauthStateContext(tenantId, stateDigest));
     const expiresAt = new Date(Date.now() + 10 * 60_000);
     await this.database.withTenant(tenantId, async (db) => {

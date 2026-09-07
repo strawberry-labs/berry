@@ -1,3 +1,4 @@
+import { actionErrorMessage } from "@/lib/action-error";
 import * as React from "react";
 import { useRefreshModelCatalog } from "@/lib/model-catalog";
 import { McpApprovalsLink } from "./admin-mcp-approvals-screen";
@@ -537,7 +538,7 @@ function comparableUrl(value: string): string {
 }
 
 function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : "MCP connection failed";
+  return actionErrorMessage(cause, "Could not complete the MCP request. Please try again. If it continues, contact your administrator.");
 }
 
 function Detail({

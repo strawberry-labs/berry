@@ -1,3 +1,4 @@
+import { actionErrorMessage } from "@/lib/action-error";
 import * as React from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { BerryApiClient } from "@berry/api-client";
@@ -32,7 +33,7 @@ export function useResource<T>(
   return {
     data: query.data ?? fallback,
     loading: query.isPending || (query.isFetching && query.dataUpdatedAt === 0),
-    error: query.error ? (query.error instanceof Error ? query.error.message : "Unable to load data") : null,
+    error: query.error ? actionErrorMessage(query.error, "Could not load this page. Please try again.") : null,
     retry: () => { void query.refetch(); },
     invalidate: () => {
       void queryClient.invalidateQueries({ queryKey: managementQueryKeys.resource(key) });

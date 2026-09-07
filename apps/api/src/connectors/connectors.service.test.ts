@@ -212,6 +212,27 @@ describe("ConnectorsService custom MCP credential lifecycle", () => {
     expect(executions.filter(({ sql }) => sql.includes("pg_advisory_xact_lock"))).toHaveLength(2);
   });
 
+  it("reuses the organization approval when a second member adds the same server", async () => {
+    const { service, executions, requesters } = serviceHarness(null);
+    const input = { url: "http://localhost:5000/mcp" };
+    const first = await service.requestCustom(TENANT_ID, USER_ID, input);
+    await service.reviewCustomRequest(TENANT_ID, USER_ID, first.id, "approved");
+
+    const second = await service.requestCustom(TENANT_ID, SECOND_USER_ID, input);
+
+    expect(second).toMatchObject({
+      id: first.id,
+      approvalStatus: "approved",
+      publicationStatus: "published",
+      enabled: true,
+      authStrategy: "personal",
+      credentialConfigured: false,
+    });
+    expect(executions.filter(({ sql }) => sql.includes("INSERT INTO organization_connectors"))).toHaveLength(1);
+    expect(executions.filter(({ sql }) => sql.includes("INSERT INTO connector_approval_requests"))).toHaveLength(1);
+    expect(requesters.has(SECOND_USER_ID)).toBe(false);
+  });
+
   it("does not create a duplicate when an approved server is currently unavailable", async () => {
     const { service, executions } = serviceHarness(customRow({
       endpoint_url: "http://localhost:5000/mcp",
