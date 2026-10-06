@@ -23,6 +23,7 @@ import {
   PermissionModeSchema,
   PromptImprovementRequestSchema,
   ReasoningLevelSchema,
+  ScheduleTimezoneSchema,
   resolveModelCapabilities,
   safeOperationalLog,
   sealDurableSecret,
@@ -250,6 +251,7 @@ async function retryInlineFinalization(write: () => Promise<void>): Promise<void
 }
 
 const StartTurnRequestSchema = z.object({
+  timezone: ScheduleTimezoneSchema.optional(),
   operationId: z.string().uuid().optional(),
   input: z.string().min(1).optional(),
   messageInput: z.string().min(1).optional(),
@@ -1907,6 +1909,7 @@ export class AgentApiController {
         });
         const runtimeRequest = DurableTurnRuntimeRequestSchema.parse({
           capabilityVersion: 1,
+          ...(request.timezone ? { timezone: request.timezone } : {}),
           admissionFingerprint: operationFingerprint,
           ...(request.intent ? { intent: request.intent } : {}),
           providerId,

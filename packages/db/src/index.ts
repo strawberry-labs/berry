@@ -1,3 +1,7 @@
+import { SCHEDULED_TASKS_MIGRATION } from "./scheduled-tasks-migration.ts";
+export { SCHEDULED_TASKS_MIGRATION } from "./scheduled-tasks-migration.ts";
+export * from "./task-schedule.ts";
+export * from "./scheduled-tasks.ts";
 import { sql } from "drizzle-orm";
 import {
   bigint,
@@ -5674,4 +5678,5 @@ export const cloudMigrations = [
     sql: MEMORY_ITEM_VERSION_SOURCE_MESSAGE_PROVENANCE_MIGRATION,
     transactional: false,
   },
+  { id: 71, name: "scheduled_agent_tasks_v1", sql: SCHEDULED_TASKS_MIGRATION },
 ] as const;
