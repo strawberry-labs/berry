@@ -1,3 +1,4 @@
+import { ScheduleTimezoneSchema } from "./scheduled-tasks.ts";
 import { z } from "zod";
 import { WorkflowCategorySchema, WORKFLOW_CATEGORY_VERSION } from "./workflow-routing.ts";
 
@@ -648,6 +649,7 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   provider: DurableProviderTransportSchema,
   model: z.string().min(1).nullable(),
   conversationKind: z.enum(["chat", "code"]).default("chat"),
+  timezone: ScheduleTimezoneSchema.optional(),
   workspacePath: z.string().min(1),
   workspaceId: z.string().min(1),
   permissionMode: z.string().min(1),

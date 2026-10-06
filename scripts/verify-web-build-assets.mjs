@@ -38,6 +38,7 @@ const routeBudgets = {
       { name: "connectors", directPrefixes: ["personal-connectors-screen-"] },
       { name: "skills", directPrefixes: ["personal-skills-screen-"] },
       { name: "mcp", directPrefixes: ["personal-mcp-screen-"] },
+      { name: "schedules", directPrefixes: ["scheduled-tasks-screen-"] },
       { name: "usage", directPrefixes: ["personal-usage-screen-"] },
       { name: "archived", directPrefixes: ["archived-chats-screen-"] },
     ],

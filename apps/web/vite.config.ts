@@ -12,6 +12,10 @@ export default defineConfig({
         // which makes the root bundle import that chunk on every refresh.
         manualChunks(id) {
           if (id.includes("vite/preload-helper")) return "vite-preload-helper";
+          // These shared toolbar icons recur across the shell and lazy screens.
+          // Keep them together so each new screen does not add tiny requests.
+          if (id.includes("/lucide-react/") && /\/icons\/(calendar-clock|calendar-days|clock-3|history|pause|pencil|play|plus|trash-2)\.js$/.test(id)) return "action-icons";
+          if (id.includes("/packages/desktop-ui/") && /\/ui\/(badge|button)\.tsx$/.test(id)) return "ui-controls";
         },
       },
     },

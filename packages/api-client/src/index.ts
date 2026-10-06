@@ -1,3 +1,4 @@
+import { ScheduledTaskSchema, ScheduledTaskRunSchema, type ScheduledTask, type ScheduledTaskCreate, type ScheduledTaskUpdate, type ScheduledTaskRun } from "@berry/shared";
 import {
   AgentStreamEventSchema,
   ApprovalRequestSchema,
@@ -316,6 +317,7 @@ export interface UpdateTaskRequest {
 }
 
 interface StartTurnRequestBase {
+  timezone?: string | undefined;
   /** Stable key for retrying this exact turn admission without duplicating work or spend. */
   operationId?: string | undefined;
   workspacePath: string;
@@ -1213,11 +1215,31 @@ export class BerryApiClient {
     input: StartTurnRequest,
     options: { signal?: AbortSignal } = {},
   ): Promise<StartTurnResponse> {
+    const timezone = input.timezone ?? (typeof window !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : undefined);
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/turns`, StartTurnResponseSchema, {
       method: "POST",
-      body: input,
+      body: { ...input, ...(timezone ? { timezone } : {}) },
       ...options,
     });
+  }
+
+  async listScheduledTasks(options: { signal?: AbortSignal } = {}): Promise<ScheduledTask[]> {
+    return this.#request("/v1/scheduled-tasks", z.array(ScheduledTaskSchema), options);
+  }
+  async createScheduledTask(input: ScheduledTaskCreate): Promise<ScheduledTask> {
+    return this.#request("/v1/scheduled-tasks", ScheduledTaskSchema, { method: "POST", body: input });
+  }
+  async updateScheduledTask(id: string, changes: ScheduledTaskUpdate, operationId?: string): Promise<ScheduledTask> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, ScheduledTaskSchema, { method: "PATCH", body: { changes, ...(operationId ? { operationId } : {}) } });
+  }
+  async deleteScheduledTask(id: string): Promise<{ removed: boolean }> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, z.object({ removed: z.boolean() }), { method: "DELETE" });
+  }
+  async runScheduledTask(id: string, operationId: string): Promise<ScheduledTaskRun> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, ScheduledTaskRunSchema, { method: "POST", body: { operationId } });
+  }
+  async listScheduledTaskRuns(id: string, limit = 30, options: { signal?: AbortSignal } = {}): Promise<ScheduledTaskRun[]> {
+    return this.#request(`/v1/scheduled-tasks/${encodeURIComponent(id)}/runs?limit=${encodeURIComponent(limit)}`, z.array(ScheduledTaskRunSchema), options);
   }
 
   async listQueuedFollowUps(sessionId: string, input: { cursor?: string; limit?: number } = {}): Promise<QueuedFollowUpPage> {

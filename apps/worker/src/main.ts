@@ -1,3 +1,4 @@
+import { DurableScheduledTaskToolExecutor } from "./schedules/tools.ts";
 import { lookup } from "node:dns/promises";
 import { hostname, networkInterfaces } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -152,7 +153,8 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<v
     durableConfig.memoryEnabled,
   );
   const personalSkillTools = new DurablePersonalSkillToolExecutor(memoryTools, executor);
-  const durableTools = createDurableTurnToolsFromEnv(env, personalSkillTools);
+  const scheduledTaskTools = new DurableScheduledTaskToolExecutor(personalSkillTools, executor);
+  const durableTools = createDurableTurnToolsFromEnv(env, scheduledTaskTools);
   const fileDeleter = S3FileObjectDeleter.fromEnv(env, new SqlFileDeletionReceiptStore(executor));
   const fileBlobs = SqlFileBlobProcessor.fromEnv(env, executor);
   const dependencies: Parameters<typeof createBerryWorker>[0] = {

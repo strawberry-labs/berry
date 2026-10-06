@@ -1175,6 +1175,33 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     return () => { cancelled = true; };
   }, [client, fixtureWorkspace, supportView]);
 
+  // Discover chats created by server schedules while the workspace is open.
+  // Refresh one bounded page and retain older chats already loaded by the user.
+  React.useEffect(() => {
+    if (!client || !tasksLoaded || supportView) return;
+    const abort = new AbortController();
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing || abort.signal.aborted || document.visibilityState !== "visible") return;
+      refreshing = true;
+      try {
+        const page = await client.listTaskPage({ state: "all", limit: 100 }, { signal: abort.signal });
+        if (!abort.signal.aborted) setTasks((current) => mergeTaskSnapshots(current, page.items));
+      } catch {
+        // Retry discovery on the next poll or when the window is focused.
+      } finally { refreshing = false; }
+    };
+    const interval = window.setInterval(() => { void refresh(); }, 30_000);
+    const onFocus = () => { void refresh(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      abort.abort(); window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [client, tasksLoaded, supportView]);
+
   // A task can finish while its route is closed or while an EventSource is
   // reconnecting. Poll only while a task claims to be active, then stop as
   // soon as the durable task projection reaches a terminal state.
@@ -3315,6 +3342,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
               onBack: navigateBackToWorkspace,
             } : null}
             onSkills={() => navigateToSettings("skills")}
+            onSchedules={() => navigateToSettings("schedules")}
             onLibrary={() => navigateToLibrary("all")}
             onUsage={() => navigateToSettings("usage")}
             onSettings={() => navigateToSettings("general")}
