@@ -37,7 +37,7 @@ with an implementation adapted to the enterprise web platform.
 
 Migration 71 adds `scheduled_tasks`, `scheduled_task_runs`, and
 `scheduled_task_operations` in one transaction. It changes no existing task or
-message data. Schedules require `BERRY_DURABLE_TURN_RUNNER_ENABLED=true` and
+message data. Schedules require `BERRY_DURABLE_RUNNER_ENABLED=true` and
 PostgreSQL. No additional scheduler service or broker is required.
 
 The API polls every ten seconds, creates up to twenty due occurrences per poll,
