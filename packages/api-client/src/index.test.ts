@@ -513,6 +513,18 @@ describe("BerryApiClient", () => {
     }));
   });
 
+  it("reads task-wide token usage with abort support and support-view routing", async () => {
+    const totals = { taskId: "task_1", inputTokens: 8_000, cachedInputTokens: 6_000, uncachedInputTokens: 2_000, outputTokens: 250, totalTokens: 8_250, cacheHitRate: 0.75 };
+    const fetchImpl = vi.fn(async () => json(totals));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const controller = new AbortController();
+    await expect(client.taskTokenUsage("session_1", { signal: controller.signal })).resolves.toEqual(totals);
+    expect(fetchImpl).toHaveBeenCalledWith("https://api.berry.test/v1/sessions/session_1/task-token-usage", expect.objectContaining({ signal: controller.signal }));
+    const support = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl: fetchImpl as unknown as typeof fetch, supportView: { tenantId: "tenant_1", userId: "user_1" } });
+    await expect(support.taskTokenUsage("session_1")).resolves.toEqual(totals);
+    expect(fetchImpl).toHaveBeenLastCalledWith("https://api.berry.test/v1/orgs/tenant_1/support/users/user_1/sessions/session_1/task-token-usage", expect.anything());
+  });
+
   it("queues steering input for an active turn", async () => {
     const messageId = "46df263a-3453-4d22-9b65-fb585ba71c9b";
     const message = {

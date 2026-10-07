@@ -9,6 +9,7 @@ import {
   ApprovalDecisionSchema,
   AttachmentInputSchema,
   ContextStatsSchema,
+  TaskTokenUsageSchema,
   ConversationKindSchema,
   classifyWorkflowCategory,
   DURABLE_BASE_BUILT_IN_TOOLS,
@@ -1439,6 +1440,12 @@ export class AgentApiController {
       source: runtimeStats.source,
       thresholdState: contextThresholdState(percentUsed),
     });
+  }
+
+  @Get("/sessions/:sessionId/task-token-usage")
+  async taskTokenUsage(@Req() httpRequest: AuthenticatedRequest, @Param("sessionId") sessionId: string) {
+    const { task } = await this.ownedSession(httpRequest, sessionId);
+    return TaskTokenUsageSchema.parse(await this.usageRepository.taskTokenUsage(tenantIdFromRequest(httpRequest), task.id));
   }
 
   @Post("/sessions/:sessionId/messages")

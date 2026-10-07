@@ -902,6 +902,7 @@ export const turnRuns = pgTable("turn_runs", {
 }, (table) => [
   index("turn_runs_claim_idx").on(table.tenantId, table.state, table.leaseExpiresAt),
   index("turn_runs_session_idx").on(table.tenantId, table.sessionId, table.createdAt),
+  index("turn_runs_tenant_task_idx").on(table.tenantId, table.taskId),
   uniqueIndex("turn_runs_tenant_request_unique").on(table.tenantId, table.requestId),
   index("turn_runs_terminal_sandbox_cleanup_idx")
     .on(table.tenantId, table.updatedAt)
@@ -1300,6 +1301,7 @@ export const usageEvents = pgTable("usage_events", {
 }, (table) => [
   uniqueIndex("usage_events_tenant_request_unique").on(table.tenantId, table.requestId),
   index("usage_events_tenant_ts_idx").on(table.tenantId, table.ts),
+  index("usage_events_tenant_task_idx").on(table.tenantId, table.taskId),
   index("usage_events_tenant_feature_ts_idx").on(table.tenantId, table.feature, table.ts),
   index("usage_events_tenant_user_ts_idx").on(table.tenantId, table.userId, table.ts),
   index("usage_events_tenant_department_ts_idx").on(table.tenantId, table.departmentId, table.ts),
@@ -3142,6 +3144,15 @@ export const ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS = [
      WHERE deleted_at IS NULL`,
 ] as const;
 export const ENTERPRISE_COLLECTION_PAGINATION_MIGRATION = ENTERPRISE_COLLECTION_PAGINATION_STATEMENTS.join(";\n");
+
+/** Keep task token reads scoped to the task as tenant usage history grows. */
+export const TASK_TOKEN_USAGE_INDEX_STATEMENTS = [
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS usage_events_tenant_task_idx
+     ON usage_events (tenant_id, task_id)`,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS turn_runs_tenant_task_idx
+     ON turn_runs (tenant_id, task_id)`,
+] as const;
+export const TASK_TOKEN_USAGE_INDEX_MIGRATION = TASK_TOKEN_USAGE_INDEX_STATEMENTS.join(";\n");
 
 export const SANDBOX_WORKSPACES_MIGRATION = `
 CREATE TABLE IF NOT EXISTS sandbox_workspaces (
@@ -5679,4 +5690,12 @@ export const cloudMigrations = [
     transactional: false,
   },
   { id: 71, name: "scheduled_agent_tasks_v1", sql: SCHEDULED_TASKS_MIGRATION },
+  {
+    id: 72,
+    name: "task_token_usage_indexes_v1",
+    sql: TASK_TOKEN_USAGE_INDEX_MIGRATION,
+    transactional: false,
+    onlineIndexNames: ["usage_events_tenant_task_idx", "turn_runs_tenant_task_idx"],
+    onlineSql: TASK_TOKEN_USAGE_INDEX_STATEMENTS,
+  },
 ] as const;
