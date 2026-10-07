@@ -2117,6 +2117,18 @@ export const ContextStatsSchema = z.object({
 });
 export type ContextStats = z.infer<typeof ContextStatsSchema>;
 
+export const TaskTokenUsageSchema = z.object({
+  taskId: z.string().min(1),
+  inputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative(),
+  uncachedInputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  /** Cached input tokens divided by all input tokens; null before any usage. */
+  cacheHitRate: z.number().min(0).max(1).nullable(),
+});
+export type TaskTokenUsage = z.infer<typeof TaskTokenUsageSchema>;
+
 export const GitChangedFileSchema = z.object({
   path: z.string(),
   indexStatus: z.string(),

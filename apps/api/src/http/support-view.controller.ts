@@ -310,6 +310,18 @@ export class SupportViewController {
     }, (scoped) => this.requireAgentApi().contextStats(scoped, sessionId, body));
   }
 
+  @Get("/sessions/:sessionId/task-token-usage")
+  async taskTokenUsage(
+    @Req() request: AuthenticatedRequest,
+    @Param("tenantId") tenantId: string,
+    @Param("userId") userId: string,
+    @Param("sessionId") sessionId: string,
+  ) {
+    return this.subjectRead(request, tenantId, userId, {
+      targetType: "task_token_usage", targetId: sessionId, sessionId,
+    }, (scoped) => this.requireAgentApi().taskTokenUsage(scoped, sessionId));
+  }
+
   @Post("/sessions/:sessionId/messages")
   async appendMessage(
     @Req() request: AuthenticatedRequest,

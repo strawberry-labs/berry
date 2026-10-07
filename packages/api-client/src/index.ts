@@ -4,6 +4,7 @@ import {
   ApprovalRequestSchema,
   ArtifactLibraryItemSchema,
   ContextStatsSchema,
+  TaskTokenUsageSchema,
   MultipartUploadInitiateSchema,
   MultipartUploadPartUrlsSchema,
   StoredFilePageSchema,
@@ -202,6 +203,7 @@ import {
   type CloudGitState,
   type CloudPreview,
   type ContextStats,
+  type TaskTokenUsage,
   type PersonalSkill,
   type PersonalSkillReview,
   type PersonalSkillPackage,
@@ -1203,6 +1205,10 @@ export class BerryApiClient {
     });
   }
 
+  async taskTokenUsage(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<TaskTokenUsage> {
+    return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/task-token-usage`, TaskTokenUsageSchema, options);
+  }
+
   async appendMessage(sessionId: string, input: { messageId?: string | undefined; role?: "system" | "user" | "assistant" | "tool" | undefined; parts: Array<{ kind: string; content: unknown }> }): Promise<Message> {
     return this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, MessageSchema, {
       method: "POST",
@@ -1988,7 +1994,7 @@ function isSupportPath(pathname: string): boolean {
   if (/^\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
   if (pathname === "/v1/tasks" || pathname === "/v1/tasks/page" || pathname === "/v1/tasks/summary") return true;
   if (/^\/v1\/tasks\/[^/]+(?:\/restore|\/sessions|\/events)?$/.test(pathname)) return true;
-  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
+  if (/^\/v1\/sessions\/[^/]+(?:\/messages(?:\/[^/]+)?|\/context-stats|\/task-token-usage|\/turns|\/turn-state|\/cancel|\/steer|\/events|\/follow-ups)?$/.test(pathname)) return true;
   if (/^\/v1\/follow-ups\/[^/]+$/.test(pathname)) return true;
   if (/^\/v1\/(?:approvals|questions\/[^/]+\/answer|runs\/[^/]+\/recovery)$/.test(pathname)) return true;
   if (/^\/v1\/approvals\/[^/]+\/decision$/.test(pathname)) return true;

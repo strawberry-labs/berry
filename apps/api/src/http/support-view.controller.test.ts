@@ -97,6 +97,17 @@ async function controllerFor(role: "owner" | "admin" | "member", agentApi?: unkn
 }
 
 describe("SupportViewController", () => {
+  it("audits task usage reads as the selected member and rejects non-administrators", async () => {
+    const agentApi = { taskTokenUsage: vi.fn(async () => ({ taskId,totalTokens:100 })) };
+    const { audit,controller } = await controllerFor("admin",agentApi);
+    await expect(controller.taskTokenUsage(requestFor(actorId),SELF_HOST_TENANT_ID,subjectId,sessionId)).resolves.toEqual({ taskId,totalTokens:100 });
+    expect(agentApi.taskTokenUsage).toHaveBeenCalledWith(expect.objectContaining({ auth:expect.objectContaining({ user:expect.objectContaining({ id:subjectId }) }) }),sessionId);
+    expect(audit.append).toHaveBeenCalledWith(expect.objectContaining({ action:"support-view-read",targetType:"task_token_usage" }));
+    const denied = await controllerFor("member",agentApi);
+    await expect(denied.controller.taskTokenUsage(requestFor(actorId),SELF_HOST_TENANT_ID,subjectId,sessionId)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(agentApi.taskTokenUsage).toHaveBeenCalledTimes(1);
+  });
+
   it("scopes task reads to the selected organization member", async () => {
     const { audit, controller, store } = await controllerFor("admin");
 

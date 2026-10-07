@@ -9,7 +9,7 @@ import { firstValueFrom, take } from "rxjs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentApiModule } from "./agent-api.module.ts";
 import { CloudDatabaseModule } from "../db/cloud-database.module.ts";
-import { InMemoryCloudTaskStore, type CloudTaskStore } from "./cloud-task-store.ts";
+import { CLOUD_TASK_STORE, InMemoryCloudTaskStore, type CloudTaskStore } from "./cloud-task-store.ts";
 import { ApiEventStreamService } from "./event-stream.service.ts";
 import type { BerryAuthRuntime } from "../auth/auth-runtime.ts";
 import { BudgetService, InMemoryBudgetHotCounters, InMemoryBudgetRepository } from "../budget/budget.service.ts";
@@ -661,6 +661,32 @@ describe("AgentApiController", () => {
         });
       });
     expect(observedInput).toBe("Continue this task");
+  });
+
+  it("reports all-time token usage for the owned task across its sessions", async () => {
+    const usage = new InMemoryUsageRepository();
+    app = await createApp(fakeSessionHost(), { usageRepository: usage });
+    const created = await request(app.getHttpServer()).post("/v1/tasks").set(authHeader())
+      .send({ workspaceId: "workspace_cloud", title: "Token usage" }).expect(201);
+    const store = app.get<CloudTaskStore>(CLOUD_TASK_STORE);
+    const second = await store.createSession({ taskId: created.body.task.id });
+    for (const [sessionId, requestId, cached] of [[created.body.session.id, "first", 400], [second.id, "second", 600]] as const) {
+      await usage.ingestInternal(SELF_HOST_TENANT_ID, {
+        requestId, taskId: created.body.task.id, sessionId, feature: "model.turn",
+        tokensIn: 1_000, tokensOut: 100, tokensCached: cached, cacheReadTokens: cached,
+        cacheWriteTokens: 0, cacheCreationTokens1h: 0, cacheCreationTokens5m: 0,
+        cacheEligible: true, sandboxUsage: {}, costRawMicros: "0", costBilledMicros: "0", status: "completed", metadata: {},
+      });
+    }
+    const expected = { taskId: created.body.task.id, totalTokens: 2_200, inputTokens: 2_000, cachedInputTokens: 1_000, uncachedInputTokens: 1_000, outputTokens: 200, cacheHitRate: 0.5 };
+    for (const sessionId of [created.body.session.id, second.id]) {
+      await request(app.getHttpServer()).get(`/v1/sessions/${sessionId}/task-token-usage`).set(authHeader()).expect(200)
+        .expect(({ body }) => expect(body).toEqual(expected));
+    }
+    await request(app.getHttpServer()).get(`/v1/sessions/${second.id}/task-token-usage`).expect(401);
+    const read = vi.spyOn(usage, "taskTokenUsage");
+    await request(app.getHttpServer()).get(`/v1/sessions/${second.id}/task-token-usage`).set(authHeader("berry-other-session")).expect(404);
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("updates and removes a user-owned project", async () => {
