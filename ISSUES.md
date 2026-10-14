@@ -56,7 +56,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-028 | P1 | Changed artifacts suppressed as duplicate publications | Observed + code finding | Open; content-aware regression needed |
 | H-029 | P1 | Unsupported authorship and verification guarantees | Observed conversation | Open; behavior evaluation needed |
 | H-030 | P1 | Legitimate asynchronous polling triggers loop termination | Observed raw trace + matching code | Open; bounded polling regression needed |
-| H-031 | P0 | Blob deletion receipt fails SQL parameter inference | Production stack traces + read-only PREPARE reproduction | Unresolved on current worker; no repair applied |
+| H-031 | P0 | Blob deletion receipt fails SQL parameter inference | Production stack traces + read-only PREPARE reproduction | Fix committed locally (not deployed); backlog reconciliation needs a separate reviewed plan |
 | H-032 | P1 | Cache metrics obscure low token coverage | Complete final-window usage + code + prior audit | Final-window 17.81% token coverage; stable-prefix loss attribution open |
 | H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Unresolved; 1,924 runs marked unknown |
 | H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending |
@@ -425,6 +425,8 @@ Deployment and rollback details: [deployment record](output/rewrite-prompt-2026-
 - Status: active current-worker defect. Audit executed no deletion or receipt mutation.
 - Proposal: type the receipt parameter, test the real PostgreSQL transaction, then separately review bounded reconciliation with immutable object version, live references, tenant and lease checks.
 - Acceptance: null/cancel notes, duplicate delivery, lost lease, reference race, already-missing S3 object and crash after remote deletion; durable receipt without deleting newly live content. Estimate 1–2 days plus reconciliation review.
+
+- **Implementation (14 October):** reproduced with a local PostgreSQL 16 PREPARE; the nullable note is now typed `$4::text`. A real-PostgreSQL regression (`scripts/test-blob-receipt.mjs`) fails with the production error on the old SQL and passes now. Not deployed. Historical dead letters were not touched.
 
 ### H-032 — Prefix cache token coverage and measurement
 

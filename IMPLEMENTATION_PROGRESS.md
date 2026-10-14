@@ -46,7 +46,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `eda27eb` | H-014 (Continue intent) | None (prompt assembly only). |
 | `f2bace0` | H-046/H-060/H-071 | None. |
 | `91208bc` | H-009 (text-only finalisation) | None. |
-| _pending_ | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
+| `d95b252` | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
+| _pending_ | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
@@ -79,7 +80,8 @@ No pre-existing failures were observed in these suites.
 | H-014 (phase-aware Continue) | Committed — partial | `eda27eb` | Not deployed (worker) |
 | H-046 / H-060 / H-071 (image path lifetime and selection) | Committed | `f2bace0` | Not deployed (worker) |
 | H-009 (text-only finalisation) | Committed — partial | `91208bc` | Not deployed (worker) |
-| H-075 (internal connector session lifetime) | Committed | _pending_ | Not deployed (API only) |
+| H-075 (internal connector session lifetime) | Committed | `d95b252` | Not deployed (API only) |
+| H-031 (blob-deletion receipt SQL) | Committed | _pending_ | Not deployed (worker); backlog reconciliation not started |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -540,3 +542,28 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** A per-run credential refresh in the worker would also cover runs longer
   than 24 hours; not needed for the observed incident. Safe-read auto-retry after a
   transient connector error is separate (H-003).
+- **Commit.** `d95b252`.
+
+### H-031 — Blob-deletion receipt fails PostgreSQL parameter inference (P0 maintenance)
+
+- **Evidence.** 834 monthly `file.delete-blob` dead letters; ≥4,805 matching failures in
+  the latest 5,000 retained Redis failed jobs; stack traces reach `acknowledgeBlobOutbox`
+  after the remote deletion; read-only PREPARE in production reproduced it.
+- **Reproduced locally.** `PREPARE` of the exact statement on PostgreSQL 16:
+  `ERROR: could not determine data type of parameter $4` (the nullable note appears both
+  as `last_error = $4` and in `CASE WHEN $4 IS NULL`).
+- **Fix.** Type the parameter (`$4::text`) in both places. A repository-wide scan for the
+  same untyped `$n IS NULL` pattern found one other statement
+  (`cloud-task-store.ts`), whose parameters are already typed earlier in the statement —
+  not a defect.
+- **Files.** `apps/worker/src/file-blobs.ts` (cast + export for the test),
+  `scripts/test-blob-receipt.mjs` (real PostgreSQL regression).
+- **Verification (isolated snapshot).** Worker typecheck pass; file-blobs/file-deletion/
+  outbox 41/41; PostgreSQL 4/4 (successful deletion with null note, cancelled with note
+  and category, duplicate delivery idempotent, lost lease still rejected). With the
+  previous SQL the same script fails with `could not determine data type of parameter $4`.
+- **Deployment.** Not deployed (worker). New deletions will record receipts once
+  deployed.
+- **Not done (needs its own reviewed plan).** Reconciling the historical dead-letter
+  backlog: the remote objects may already be deleted, so replay must check immutable
+  object version, live references, tenant and lease; no production rows were touched.
