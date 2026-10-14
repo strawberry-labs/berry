@@ -159,9 +159,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const result = signal || reportProgress
       ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
       : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
-    let text = result.content.flatMap((part) =>
+    let text = boundedMcpText(result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
-    ).join("\n").slice(0, 120_000);
+    ).join("\n"), record(result.details)?.structuredContent);
     const artifact = connectorArtifact(result.details);
     const staged = artifact && this.base.stageAssociatedInputFiles
       ? await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId], {
@@ -766,6 +766,65 @@ function documentProcessingHint(name: string, mediaType: string, indexed: boolea
 
 function jsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
+}
+
+const MCP_MODEL_TEXT_LIMIT = 120_000;
+const CURSOR_KEYS = ["nextPageToken", "nextCursor", "next_cursor", "nextPage", "cursor"] as const;
+
+/**
+ * Bound a tool result for the model without breaking it: JSON stays valid
+ * (the largest top-level list is shortened), top-level fields such as the
+ * next-page cursor are kept, and every cut is disclosed with counts (H-070).
+ */
+export function boundedMcpText(text: string, structured?: unknown, limit = MCP_MODEL_TEXT_LIMIT): string {
+  if (text.length <= limit) return text;
+  const cursor = cursorFrom(structured);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  const container = Array.isArray(parsed) ? { items: parsed } : record(parsed);
+  if (container) {
+    const lists = Object.entries(container).filter((entry): entry is [string, unknown[]] => Array.isArray(entry[1]));
+    const [field, items] = lists.sort((left, right) => JSON.stringify(right[1]).length - JSON.stringify(left[1]).length)[0] ?? [];
+    if (field && items) {
+      const render = (kept: number) => JSON.stringify({
+        ...container,
+        [field]: items.slice(0, kept),
+        ...(cursor && !Object.values(container).includes(cursor) ? { nextPageToken: cursor } : {}),
+        berryTruncation: {
+          field,
+          returnedItems: kept,
+          totalItems: items.length,
+          originalCharacters: text.length,
+          note: `Only the first ${kept} of ${items.length} ${field} fit in this result. Request a smaller page or narrower query for the rest; any page cursor above is exact.`,
+        },
+      });
+      let low = 0;
+      let high = items.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (render(middle).length <= limit) low = middle;
+        else high = middle - 1;
+      }
+      const fitted = render(low);
+      if (fitted.length <= limit) return fitted;
+    }
+  }
+  const marker = `\n[Berry truncated this tool result: showing ${limit.toLocaleString("en-US")} of ${text.length.toLocaleString("en-US")} characters. Request a narrower range or a smaller page.${cursor ? ` Exact next-page cursor: ${cursor}` : ""}]`;
+  return `${text.slice(0, Math.max(0, limit - marker.length))}${marker}`;
+}
+
+function cursorFrom(value: unknown): string | null {
+  const object = record(value);
+  if (!object) return null;
+  for (const key of CURSOR_KEYS) {
+    const cursor = object[key];
+    if (typeof cursor === "string" && cursor.trim()) return cursor;
+  }
+  return null;
 }
 
 const MCP_JOURNAL_STRING_LIMIT = 120_000;

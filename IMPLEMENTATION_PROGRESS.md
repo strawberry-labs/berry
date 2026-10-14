@@ -51,7 +51,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `3a27931` | H-032 (diagnostics) | None. |
 | `9eecde6` | H-032 (prompt layout) | None (prompt assembly only). |
 | `f2923b2` | H-068 | None. |
-| _pending_ | H-076 | None. |
+| `920a84c` | H-076 | None. |
+| _pending_ | H-070 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -103,7 +104,8 @@ No pre-existing failures were observed in these suites.
 | H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | `f6f9074` | Not deployed (worker) |
 | H-068 (import readiness) | Committed | `f2923b2` | Not deployed (worker) |
 | H-069 (temporary imports kept out of Library) | Committed | `3104547` | Not deployed (API) |
-| H-076 (shared-drive scope) | Committed | _pending_ | Not deployed (API) |
+| H-076 (shared-drive scope) | Committed | `920a84c` | Not deployed (API) |
+| H-070 (bounded MCP results keep structure and cursors) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -870,3 +872,28 @@ No pre-existing failures were observed in these suites.
 - **Deployment.** Not deployed (API).
 - **Remaining.** Ancestry-aware scope for a *file* (not folder) selected via the picker is
   not inferred; no live Google verification was possible here.
+- **Commit.** `920a84c`.
+
+### H-070 — Large MCP results silently cut, cursors lost
+
+- **Evidence.** 86 of 4,137 completed MCP outputs in the month (2.08%) hit exactly 120,000
+  characters; 58 were JSON made invalid by the cut; 11 had a next-page token only in
+  structured metadata. Task 1189 then invented a page token (HTTP 400) and repeated the
+  first page.
+- **Root cause (confirmed).** The worker joined MCP text and applied `.slice(0, 120_000)`
+  with no receipt; the model only sees that text.
+- **Fix.** `boundedMcpText` keeps results within the same 120,000-character budget but:
+  JSON stays valid by shortening the largest top-level list (binary search on item
+  count), every other top-level field — including the cursor — is kept, a cursor present
+  only in structured metadata is restored, and a `berryTruncation` receipt states the
+  field, returned/total items and original size. Non-JSON text gets an explicit marker
+  with character counts and the exact cursor. Results within the limit are unchanged.
+- **Files.** `apps/worker/src/mcp-tools.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 982 /
+  6 skipped. New tests use the audit's shape (100 metadata-heavy Drive records,
+  233,454 characters, 444-character cursor): output ≤120,000 characters, parses as JSON,
+  exact cursor kept, identifiers are the leading items, cut disclosed.
+- **Deployment.** Not deployed (worker).
+- **Remaining (H-070 stays open).** Compact per-tool projections (e.g. Drive listings
+  without full capability blocks) to fit more items, retrievable handles for omitted
+  content, and the journal sanitizer's silent 256-item/128-key limits on stored details.

@@ -5,6 +5,7 @@ import type { ChatToolDefinition } from "@berry/router-client";
 import { describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
 import {
+  boundedMcpText,
   connectorArtifactText,
   DurableMcpToolExecutor,
   durableMcpToolPolicy,
@@ -704,3 +705,44 @@ function admittedRuntimeRequest(
     attachments: [],
   } as DurableTurnSnapshot["runtimeRequest"];
 }
+
+describe("bounded MCP results", () => {
+  const cursor = `~!!~${"A".repeat(440)}`;
+  const files = Array.from({ length: 100 }, (_, index) => ({
+    id: `file-${index}`,
+    name: `Tender appendix ${index}.pdf`,
+    mimeType: "application/pdf",
+    capabilities: Object.fromEntries(Array.from({ length: 40 }, (_unused, key) => [`canDoThing${key}`, key % 2 === 0])),
+    contentRestrictions: [{ readOnly: false, reason: "x".repeat(1_300) }],
+    owners: [{ displayName: "Owner", emailAddress: "owner@example.com" }],
+  }));
+  const listing = JSON.stringify({ files, nextPageToken: cursor, incompleteSearch: false });
+
+  it("keeps a metadata-heavy Drive page valid JSON with its exact cursor and a disclosed cut", () => {
+    expect(listing.length).toBeGreaterThan(200_000);
+    const bounded = boundedMcpText(listing, { files, nextPageToken: cursor });
+    expect(bounded.length).toBeLessThanOrEqual(120_000);
+    const parsed = JSON.parse(bounded) as { files: Array<{ id: string }>; nextPageToken: string; berryTruncation: { returnedItems: number; totalItems: number; field: string } };
+    expect(parsed.nextPageToken).toBe(cursor);
+    expect(parsed.berryTruncation).toMatchObject({ field: "files", totalItems: 100 });
+    expect(parsed.berryTruncation.returnedItems).toBe(parsed.files.length);
+    expect(parsed.files.map((file) => file.id)).toEqual(files.slice(0, parsed.files.length).map((file) => file.id));
+  });
+
+  it("restores a cursor that exists only in structured metadata", () => {
+    const withoutCursor = JSON.stringify({ files });
+    const parsed = JSON.parse(boundedMcpText(withoutCursor, { files, nextPageToken: cursor })) as { nextPageToken: string };
+    expect(parsed.nextPageToken).toBe(cursor);
+  });
+
+  it("marks a cut in non-JSON text with counts and the exact cursor", () => {
+    const bounded = boundedMcpText("line\n".repeat(40_000), { nextCursor: "cursor-2" });
+    expect(bounded.length).toBeLessThanOrEqual(120_000);
+    expect(bounded).toContain("[Berry truncated this tool result: showing 120,000 of 200,000 characters.");
+    expect(bounded).toContain("Exact next-page cursor: cursor-2]");
+  });
+
+  it("leaves results within the limit unchanged", () => {
+    expect(boundedMcpText(JSON.stringify({ files: files.slice(0, 2), nextPageToken: cursor }))).toBe(JSON.stringify({ files: files.slice(0, 2), nextPageToken: cursor }));
+  });
+});
