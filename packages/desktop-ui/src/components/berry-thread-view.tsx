@@ -2,6 +2,7 @@ import * as React from "react";
 import { MessageAttachmentContentSchema, type ImageAspectRatio, type Message, type MessageAttachmentContent, type MessageDraft, type MessagePart } from "@berry/shared";
 import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, Search, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
+import { copyText } from "@berry/desktop-ui/lib/copy-text";
 
 import {
   Accordion,
@@ -1133,10 +1134,7 @@ const BerryHistoricalUserMessage = React.memo(function BerryHistoricalUserMessag
             variant="ghost"
             size="icon-sm"
             aria-label="Copy message"
-            onClick={() => {
-              void navigator.clipboard.writeText(fullUserText(message));
-              toast.success("Copied");
-            }}
+            onClick={() => copyText(fullUserText(message))}
           >
             <Copy />
           </Button>
@@ -1315,10 +1313,7 @@ export const BerryAssistantTurnGroup = React.memo(function BerryAssistantTurnGro
               variant="ghost"
               size="icon-sm"
               aria-label="Copy message"
-              onClick={() => {
-                void navigator.clipboard.writeText(textContent);
-                toast.success("Copied");
-              }}
+              onClick={() => copyText(textContent)}
             >
               <Copy />
             </Button>

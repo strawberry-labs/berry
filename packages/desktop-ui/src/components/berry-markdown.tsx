@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { toast } from "sonner";
+import { copyText } from "@berry/desktop-ui/lib/copy-text";
 import type { BundledLanguage, BundledTheme, ThemedToken } from "shiki";
 import type { HighlightResponse } from "./berry-markdown-highlight.worker";
 
@@ -540,10 +540,7 @@ function CodeBlock({
           aria-label="Copy code"
           title="Copy code"
           className="shrink-0 cursor-pointer rounded-md p-1 opacity-0 transition-opacity hover:bg-muted/40 focus-visible:opacity-100 group-hover:opacity-100"
-          onClick={() => {
-            void navigator.clipboard.writeText(code);
-            toast.success("Copied");
-          }}
+          onClick={() => copyText(code)}
         >
           <Copy className="size-3.5" />
         </button>

@@ -69,7 +69,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Worker fix committed locally (not deployed): metadata from returned bytes plus mismatch notes; provider-aware sizes and local paths open |
 | H-042 | P1 | Transparent text image misclassified as blank | Original source pixels + full production trace | Fix committed locally (not deployed): transparent previews flattened onto a contrasting matte |
 | H-043 | P1 | Inherited presentation fonts require manual repair | 60 gate-failure steps / 36 tasks; full latest trace + local template/code | Confirmed current published-package inheritance gap |
-| H-044 | P2 | Email copy workflow and failure feedback | User complaint + local copy implementation | Plain copy exists; reported rich-copy cause unverified |
+| H-044 | P2 | Email copy workflow and failure feedback | User complaint + local copy implementation | Copy feedback fixed locally (not deployed): success shown only after the write, failures reported; rich-copy cause unverified |
 | H-045 | P1 | Generated reusable skills need independent domain validation | Installed skill + primary sources + current content hashes | Confirmed current skill; proposal pending review |
 | H-046 | P1 | Image paths outlive files and abort model preparation | 26-run read/generation symptom scan; four complete lifetime traces + deployed code | Fix committed locally (not deployed): existence-checked reads, missing history images become notices |
 | H-047 | P2 | Arabic and English mixing makes answers difficult to read | Explicit user correction + local renderer review | User-reported friction; browser/deployment reproduction pending |
@@ -547,6 +547,7 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Current writing-block button already writes plain text and has a fallback; do not duplicate it. Assistant-message Copy separately shows success before the clipboard promise resolves, a local code gap with no verified production occurrence.
 - Proposal: clearer existing copy control/guidance, awaited success/error feedback everywhere, and supported-email-client reproduction of selection/button copy before deciding on rich-copy normalization. Approximately0.5–1day plus client checks.
 - Acceptance: light/dark mode paste remains free of display background through documented control; denied clipboard access shows an actionable failure rather than Copied.
+- **Implementation (14 October):** message and code-block Copy now report "Copied" only after the clipboard write succeeds and show an actionable error when access is denied or unavailable. Not deployed. The rich-paste background report is still unreproduced.
 
 ### Additional verified artifact and preparation evidence — task710
 

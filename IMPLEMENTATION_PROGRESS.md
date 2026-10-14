@@ -76,7 +76,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `a7118a4` | H-023 | None. |
 | `747f510` | H-067 | None (in-memory only). |
 | `5b6e7b0` | H-063 | None (skill guidance text). |
-| _pending_ | H-010 | None. Prevents late snapshot rows from being written after a timeout. |
+| `2235bfd` | H-010 | None. Prevents late snapshot rows from being written after a timeout. |
+| _pending_ | H-044 | None (UI). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -167,7 +168,9 @@ fixture; this is fixed in `54c9255`.
 | H-023 (current date given to the model) | Committed — partial | `a7118a4` | Not deployed (worker) |
 | H-067 (Office pagination re-extracts the whole file) | Committed — partial | `747f510` | Not deployed (worker) |
 | H-063 (quadratic read-only spreadsheet access) | Committed — guidance | `5b6e7b0` | Not published (organization `xlsx` skill package) |
-| H-010 (timed-out snapshot keeps writing after cleanup) | Committed | _pending_ | Not deployed (worker) |
+| H-010 (timed-out snapshot keeps writing after cleanup) | Committed | `2235bfd` | Not deployed (worker) |
+| H-044 (Copy reports success before the clipboard write) | Committed — partial | _pending_ | Not deployed (web, via desktop-ui) |
+| H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1716,3 +1719,39 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** In-flight sandbox file reads inside the capture still run to their own
   deadline (they cannot write state).
+- **Commit.** `2235bfd`.
+
+### H-024 — Connector download to sandbox handoff (revalidated; no separate change)
+
+- Task `2743dd77…` read a Drive file successfully, then searched for the downloaded bytes
+  and asked for a re-upload. This is the no-path receipt pattern H-068 fixed for the
+  verification-timing cause (`f2923b2`: bounded wait, then an explicit pending status
+  instead of a silent no-path success). This task's raw connector receipt could not be
+  inspected without production access, so whether it hit the timing cause or the
+  already-verified-blob counterexample is unconfirmed. Counted as left.
+
+### H-044 — Copy reports "Copied" before the clipboard write finishes
+
+- **Evidence.** Task 888: a user could not get a usable email paste and remained confused
+  after three follow-ups (the rich-copy cause is unverified). Code finding: the
+  assistant-message, user-message and code-block Copy buttons called
+  `navigator.clipboard.writeText` without waiting and showed "Copied" immediately, and
+  never reported a denied or missing clipboard.
+- **Fix.** A small `copyText` helper (`@berry/desktop-ui/lib/copy-text`) shows "Copied" only
+  after the write resolves and otherwise shows "Couldn't copy. Allow clipboard access, or
+  select the text and copy it manually." A missing clipboard API counts as a failure
+  rather than throwing. The three buttons use it; the writing-block copy, which already
+  awaited the write, is unchanged.
+- **Files.** `packages/desktop-ui/src/lib/copy-text.ts` (+test, new),
+  `packages/desktop-ui/src/components/berry-markdown.tsx`, and three hunks of
+  `packages/desktop-ui/src/components/berry-thread-view.tsx` (its other uncommitted
+  edits were left unstaged).
+- **Verification (isolated snapshot).** desktop-ui typecheck pass and tests 72/72;
+  `@berry/web...` typecheck and build pass. The helper's tests: success only after the
+  write resolves; denied and missing clipboard show the error and never "Copied". There
+  is no pre-fix run because the helper is new; the old handlers showed success before
+  the promise settled.
+- **Deployment.** Not deployed (web, via the shared desktop-ui package; desktop builds
+  get it too).
+- **Remaining.** The reported dark-background rich paste needs a supported-email-client
+  reproduction before any rich-copy change.
