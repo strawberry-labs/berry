@@ -361,6 +361,16 @@ export class SqlKnowledgeRepository {
           AND wf.tenant_id = ks.tenant_id AND wf.workspace_id = ks.workspace_id
           AND wf.file_id::text = ks.source_id AND wf.deleted_at IS NULL
       `, [tenantId, sourceId]);
+      // The stored file is intact; only search preparation failed. Release it
+      // from 'processing' as the success path does, so it stays usable (H-062).
+      await executor.execute(`
+        UPDATE files f SET status = 'available', updated_at = now()
+        FROM knowledge_sources ks
+        WHERE ks.tenant_id = $1::uuid AND ks.id = $2::uuid AND ks.source_type = 'file'
+          AND ks.source_revision = $3 AND ks.tombstoned_at IS NULL
+          AND f.tenant_id = ks.tenant_id AND f.id::text = ks.source_id
+          AND f.status = 'processing' AND f.deleted_at IS NULL
+      `, [tenantId, sourceId, revision]);
     });
   }
 

@@ -65,7 +65,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `375f8dd` | H-040 (Mem0 input) | None. Changes only what new turns send to Mem0; existing memories are untouched (removing contaminated ones needs user controls or a reviewed plan). |
 | `54c9255` | H-041 test fixture | None (test only). |
 | `b9200f0` | H-057 | None. |
-| _pending_ | H-049 | None. |
+| `f6433f9` | H-049 | None. |
+| _pending_ | H-062 | No schema change. New index failures set the file's own row from `processing` to `available`; the 249 existing rows are untouched (reconciliation proposed below, not run). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -139,7 +140,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-040 (assistant text kept out of personal memory extraction) | Committed — partial | `375f8dd` | Not deployed (worker) |
 | H-041 fixture (typecheck) | Committed | `54c9255` | Test only |
 | H-057 (malformed question batches) | Committed | `b9200f0` | Not deployed (worker) |
-| H-049 (PDF pages without text reported as unreviewed) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-049 (PDF pages without text reported as unreviewed) | Committed — partial | `f6433f9` | Not deployed (worker) |
+| H-062 (failed indexing leaves files processing) | Committed — worker state; UI open | _pending_ | Not deployed (worker); backlog not reconciled |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1387,3 +1389,36 @@ verification script deletes compiled tests first and counts are source-only.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Automatic selective page rendering/OCR with bounded cost, and a
   "fully reviewed" claim check; whether OCR recovers every affected page is unmeasured.
+- **Commit.** `f6433f9`.
+
+### H-062 — Failed search indexing leaves stored files "processing"
+
+- **Evidence.** 249 of 6,744 undeleted files created in the month are
+  `files.status='processing'` while their knowledge source is `index_status='failed'`
+  (39 users; newest 13 October). Example: task 60's screenshot `02ce5556…` is intact and
+  was used successfully through vision, but its index failed with "Document extraction
+  produced no text".
+- **Root cause (confirmed in code).** `SqlKnowledgeRepository.markFailed` updated the
+  source and the workspace index state but not the file row, while the success path
+  (`markTextReady`) sets `files.status='available'`. Beyond display, sandbox outputs and
+  generated images promoted to knowledge are only staged into later turns when
+  `available`, so a failed index could strand them.
+- **Fix.** `markFailed` also moves the file from `processing` to `available` (bytes are
+  stored; only search preparation failed), but only for a file source of the current
+  revision that is not tombstoned. Other states such as `quarantined` during blob
+  verification are left alone. The workspace and source rows keep `failed` and the
+  failure reason.
+- **Files.** `apps/worker/src/knowledge/repository.ts`;
+  `scripts/test-index-failure-file-state.mjs` (real PostgreSQL).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 521 passed / 3
+  skipped; PostgreSQL script 3/3 (failed index → file available, source and workspace
+  failed; stale revision → unchanged; quarantined → unchanged). **Pre-fix:** the first
+  scenario leaves the file `processing`, the production state.
+- **Data impact.** Only rows touched by new failures. The existing 249 rows are not
+  changed. A reconciliation, proposed only and needing its own reviewed plan with a dry
+  run and counts first, would set `status='available'` for undeleted files in
+  `processing` whose current, non-tombstoned file sources are all `failed`.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Showing "Stored; not searchable" with the reason and the existing retry
+  API in the Library and task file surfaces (web, currently mid-refactor in uncommitted
+  work), and selective OCR for textless scans.
