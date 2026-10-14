@@ -74,7 +74,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `8f966ed` | H-038 | None. |
 | `6b635da` | H-008 | None. |
 | `a7118a4` | H-023 | None. |
-| _pending_ | H-067 | None (in-memory only). |
+| `747f510` | H-067 | None (in-memory only). |
+| _pending_ | H-063 | None (skill guidance text). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -163,7 +164,8 @@ fixture; this is fixed in `54c9255`.
 | H-038 (streamed tool calls merged when indices restart) | Committed — worker path | `8f966ed` | Not deployed (worker) |
 | H-008 (workspace outputs/ and tmp/ guaranteed) | Committed — partial | `6b635da` | Not deployed (worker) |
 | H-023 (current date given to the model) | Committed — partial | `a7118a4` | Not deployed (worker) |
-| H-067 (Office pagination re-extracts the whole file) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-067 (Office pagination re-extracts the whole file) | Committed — partial | `747f510` | Not deployed (worker) |
+| H-063 (quadratic read-only spreadsheet access) | Committed — guidance | _pending_ | Not published (organization `xlsx` skill package) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1667,3 +1669,28 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Measure transfer versus extraction time; a durable verified-hash cache
   if transfer dominates; per-call cache-hit diagnostics.
+- **Commit.** `747f510`.
+
+### H-063 — Read-only spreadsheet cell access in loops wastes the tool budget
+
+- **Evidence.** Task 836: two generated scripts opened a workbook with
+  `read_only=True` and looped `ws.cell(row=r, …)` over every row (1,416 s and 500 s);
+  the next call hit the cumulative tool budget and the user got no timeline.
+- **Root cause (confirmed).** In openpyxl 3.1.5 each read-only `cell()` call starts a new
+  streaming parse of the sheet, so a row loop is quadratic. Local measurement on 2,000
+  rows of one column: 29.5 s for the `cell()` loop versus 0.03 s for
+  `iter_rows(values_only=True)` (975 times faster). The xlsx guide had no analysis route.
+- **Fix (guidance).** The xlsx `SKILL.md`, which the runtime injects automatically when a
+  spreadsheet is attached, now has a short "Analysing an existing workbook" section: read
+  each sheet in one pass (`iter_rows(values_only=True)` or `pandas.read_excel(...,
+  sheet_name=None)`), never `cell()`/`ws["A1"]` in a loop on a read-only sheet, stop at
+  the last row with values rather than `max_row`, and print row counts first. The tool
+  budget is unchanged.
+- **Files.** `deploy/skills/xlsx/SKILL.md`.
+- **Verification.** The API skill-sync test still validates the packages (1/1, isolated
+  snapshot); the xlsx geometry tests pass. The guidance's effect on model behaviour is
+  not evaluated (no model calls).
+- **Deployment.** Not published; needs the organization `xlsx` package sync (see the H-059
+  note on syncing alongside the published AESG packages).
+- **Remaining.** A tested analysis helper, and slow-tool-call diagnostics that show the
+  model why a call is slow before the budget runs out.

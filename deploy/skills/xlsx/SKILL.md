@@ -13,6 +13,16 @@ The General Template transfer pack contains no XLSX file. It improves the Word
 and PowerPoint routes but does not replace this privacy-safe generated workbook
 system.
 
+## Analysing an existing workbook
+
+Read each sheet in one pass. With
+`load_workbook(path, read_only=True, data_only=True)`, loop over
+`ws.iter_rows(values_only=True)`, or use `pandas.read_excel(path, sheet_name=None)`.
+Never call `ws.cell(...)` or `ws["A1"]` inside a loop on a read-only sheet: each
+call re-reads the sheet from the top, so a few thousand rows can take many minutes
+(2,000 rows: 29 s versus 0.03 s). `max_row` also counts formatted empty rows, so
+stop at the last row that has values. Print per-sheet row counts before computing.
+
 ## Canonical workflow
 
 Create `/workspace/tmp/xlsx/spec.json`:
