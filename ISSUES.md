@@ -220,6 +220,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 
 - **Source alignment (14 October):** the deployed 30 September late-result fix (known outcome of a non-abortable mutation kept after its deadline) is now committed unchanged with its four regression cases. Byte parity with the deployed module hash could not be reproduced from Git plus the two recorded hotfixes, so diff production source before a Git deployment. Operation-specific recovery UX remains open.
 
+- **Continue intent (14 October):** continuation instructions are now phase-aware (no response yet / partial text / after completed tools); with no response the pending request is answered instead of "continuing" an older answer (task 176). Unit regressions fail on the old source. Not deployed.
+
 ### H-015 — Expired queued text
 
 - Evidence: 12 weekly queue entries expired. Current queue listing excludes expired items; expiry is 24 hours by default.

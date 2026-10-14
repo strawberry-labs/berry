@@ -43,7 +43,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `d481431` | H-014 | None. |
 | `39d02c8` | H-011 | None (worker dependency only). |
 | `e6b2fa8` | H-051/H-072 | None. New JSON keys in `turn_runs.runtime_request` for new continuation runs only. |
-| _pending_ | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
+| _pending_ | H-014 (Continue intent) | None (prompt assembly only). |
+| `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
 ## Status legend
@@ -71,7 +72,8 @@ No pre-existing failures were observed in these suites.
 | H-011 (image payload guard) | Committed — partial | `39d02c8` | Not deployed (worker image; needs Sharp's Linux binary from the frozen lockfile) |
 | H-051 / H-072 (Continue workspace lineage) | Committed | `e6b2fa8` | Not deployed (API + worker; either order is compatible) |
 | H-066 (recovery budget generation) | Committed | `2a7af6b` | Not deployed (API + worker together; see entry) |
-| H-048 (provider errors in history) | Committed | _pending_ | Not deployed (API + worker; either order safe) |
+| H-048 (provider errors in history) | Committed | `49815ef` | Not deployed (API + worker; either order safe) |
+| H-014 (phase-aware Continue) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -392,3 +394,33 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** Compaction's fallback summary can still quote failed-projection text;
   a "no answer" outcome state for responses that only restate a platform error is not
   added.
+- **Commit.** `49815ef`.
+
+### H-014 — Continue answers the pending request (phase-aware continuation)
+
+- **Evidence.** Audit finding 5 / task 176: a new "focus on remote monitoring" request
+  failed with Gemini HTTP 400 before any output; Continue kept the correct
+  `request_message_id` but replied with a pointer to an old comment and no revised draft.
+  The continuation run always added the system line "Continue the interrupted assistant
+  response from the persisted partial output…" and a synthetic user turn "Continue the
+  interrupted response from where it stopped", even when no response to the latest
+  request had begun. (The exact wire request for task 176 is not retained; causal
+  contribution is rated medium by the audit.)
+- **Cause (code-confirmed).** `modelMessages` emitted the same partial-output
+  continuation instructions regardless of what the interrupted attempt produced, so with
+  no partial output the nearest "interrupted response" in history was an earlier answer.
+- **Fix.** Derive the continuation phase from the journal after the continued request
+  message: `no_response` (nothing, or only failed-provider projections — see H-048),
+  `partial_response` (assistant text), or `after_tools` (tool calls/results). For
+  `no_response` the instruction says to answer the latest message and no synthetic
+  "continue" user turn is added (the pending request stays the last message); the
+  partial-output wording is unchanged; after tools, the model is told to finish from the
+  completed results. Unknown anchors keep the historic wording.
+- **Files.** `apps/worker/src/turn-runner.ts`, `apps/worker/src/turn-runner.test.ts`.
+- **Verification (isolated snapshot).** Worker typecheck pass; turn-runner + compaction
+  138/138. The new no-response and after-tools tests fail against the previous source;
+  the partial-output test passes on both (preserved behaviour).
+- **Deployment.** Not deployed (worker only).
+- **Remaining (H-014 stays open).** Live model evaluation of the Continue wording;
+  operation-specific recovery UX; distinguishing completed vs unknown external outcomes
+  in the Continue instruction (recovery-required runs use operator recovery instead).

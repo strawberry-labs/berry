@@ -120,6 +120,45 @@ describe("durable turn runner", () => {
     expect(history.filter((message) => message.role === "assistant")).toHaveLength(1);
   });
 
+  describe("explicit Continue", () => {
+    const continued = (after: Array<Record<string, unknown>>) => {
+      const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+      current.runtimeRequest = { ...current.runtimeRequest, continueInterruptedTurn: true };
+      const push = (id: string, message: Record<string, unknown>) => current.entries.push({
+        entryId: id, parentEntryId: current.entries.at(-1)?.entryId ?? null, entryType: "message", sequence: current.entries.length + 1,
+        payload: { type: "message", id, parentId: current.entries.at(-1)?.entryId ?? null, message },
+      });
+      push("earlier-answer", { role: "assistant", content: [{ type: "text", text: "Comment 4 covers the old cable routing." }], stopReason: "stop" });
+      push("latest-request", { role: "user", content: "Now refocus the comments on remote monitoring." });
+      current.requestMessageId = "latest-request";
+      after.forEach((message, index) => push(`after-${index}`, message));
+      const built = modelMessages(current);
+      return { system: String(built.messages[0]?.content), last: built.messages.at(-1) };
+    };
+
+    it("answers the pending request when the interrupted attempt produced nothing", () => {
+      const { system, last } = continued([]);
+      expect(system).toContain("failed before producing any response to the user's latest message");
+      expect(system).not.toContain("from the persisted partial output");
+      expect(last).toMatchObject({ role: "user", content: "Now refocus the comments on remote monitoring." });
+    });
+
+    it("still continues genuine partial output without repeating it", () => {
+      const { system, last } = continued([{ role: "assistant", content: [{ type: "text", text: "Remote monitoring: 1." }], stopReason: "failed" }]);
+      expect(system).toContain("from the persisted partial output");
+      expect(last).toMatchObject({ role: "user", content: "Continue the interrupted response from where it stopped. Do not repeat the completed portion." });
+    });
+
+    it("continues from completed tool results without redoing them", () => {
+      const { system, last } = continued([
+        { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" },
+        { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 7: remote monitoring requirements" },
+      ]);
+      expect(system).toContain("completed the tool work shown above");
+      expect(JSON.stringify(last)).toContain("Continue from the completed tool results above");
+    });
+  });
+
   it("keeps a queued prompt's billing identity across delivery retries", () => {
     const runtime = queuedFollowUpRuntimeRequest({ queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true }, {
       id: "row-id", attempt_count: 3, input: "Rewrite this email", intent: null, attachments: [],
