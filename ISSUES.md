@@ -52,7 +52,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-024 | P1 | Connector files unavailable to sandbox tools | Observed; cause verification noted below | Open |
 | H-025 | P1 | Technical claims persist without source verification | Observed; cause verification noted below | Open |
 | H-026 | P1 | Platform capability and privacy answers lack tenant facts | Observed unsupported claims | Verify configuration and prompt gap |
-| H-027 | P1 | Folder uploads accepted as empty files | Observed zero-byte attachments | Reproduce upload path |
+| H-027 | P1 | Folder uploads accepted as empty files | Observed zero-byte attachments | Composer fix committed locally (not deployed): 0-byte drops are refused with folder/ZIP guidance; other upload surfaces open |
 | H-028 | P1 | Changed artifacts suppressed as duplicate publications | Observed + code finding | Fix committed locally (not deployed): republication after a change is allowed; identical bytes return the earlier receipt |
 | H-029 | P1 | Unsupported authorship and verification guarantees | Observed conversation | Open; behavior evaluation needed |
 | H-030 | P1 | Legitimate asynchronous polling triggers loop termination | Observed raw trace + matching code | Fix committed locally (not deployed): pending-job repeats are bounded polling |
@@ -345,6 +345,7 @@ These examples establish historical occurrence. Current production remediation r
 - User impact: repeated reattachments and requests produce no review; the assistant invents a sync-stub explanation and extrapolates coverage gaps from folder-like names.
 - Proposal: distinguish directory drops from files, recursively import supported folders or offer ZIP guidance, and show empty-file diagnostics before submission. Preserve relative paths and report upload counts/bytes. Empty inputs must not become substantive negative findings.
 - Acceptance: folder drag/drop, cloud placeholders, legitimate empty text files, failed uploads and nested ZIPs have distinct tested outcomes.
+- **Implementation (14 October):** the task composer no longer uploads 0-byte files; untyped ones are explained as folders or online-only placeholders (attach the contents or a ZIP), typed ones as empty. Not deployed. Recursive folder import and the other upload dialogs remain.
 
 ### Additional evidence from the complete-history review
 

@@ -77,7 +77,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `747f510` | H-067 | None (in-memory only). |
 | `5b6e7b0` | H-063 | None (skill guidance text). |
 | `2235bfd` | H-010 | None. Prevents late snapshot rows from being written after a timeout. |
-| _pending_ | H-044 | None (UI). |
+| `f02396f` | H-044 | None (UI). |
+| _pending_ | H-027 | None (UI). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -169,7 +170,8 @@ fixture; this is fixed in `54c9255`.
 | H-067 (Office pagination re-extracts the whole file) | Committed — partial | `747f510` | Not deployed (worker) |
 | H-063 (quadratic read-only spreadsheet access) | Committed — guidance | `5b6e7b0` | Not published (organization `xlsx` skill package) |
 | H-010 (timed-out snapshot keeps writing after cleanup) | Committed | `2235bfd` | Not deployed (worker) |
-| H-044 (Copy reports success before the clipboard write) | Committed — partial | _pending_ | Not deployed (web, via desktop-ui) |
+| H-044 (Copy reports success before the clipboard write) | Committed — partial | `f02396f` | Not deployed (web, via desktop-ui) |
+| H-027 (dropped folders attached as empty files) | Committed — partial | _pending_ | Not deployed (web) |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
@@ -1755,3 +1757,29 @@ fixture; this is fixed in `54c9255`.
   get it too).
 - **Remaining.** The reported dark-background rich paste needs a supported-email-client
   reproduction before any rich-copy change.
+- **Commit.** `f02396f`.
+
+### H-027 — Dropped folders become empty attachments
+
+- **Evidence.** Task `32717ccc…`: seven zero-byte attachments, twice, while the user was
+  trying to provide folders; production metadata and sandbox checks agree they are
+  empty. The model then invented a "sync stub" explanation and drew conclusions from the
+  folder names.
+- **Root cause (confirmed in code).** The composer's `addFiles` uploads every file it is
+  given. Browsers hand a dropped folder (and online-only placeholders) over as a 0-byte
+  file with no type, so empty inputs reached the task as if they had content.
+- **Fix.** `splitEmptyUploads` (new, `apps/web/src/lib/empty-uploads.ts`) keeps files with
+  content and returns a message for 0-byte ones. Untyped files are treated as
+  folders or placeholders ("attach the files inside, or a .zip of the folder"); typed ones
+  are reported as empty. The composer attaches the rest and shows the message in its
+  existing upload-error line.
+- **Files.** `apps/web/src/lib/empty-uploads.ts` (+test, new) and two hunks of
+  `apps/web/src/components/tasks/web-composer.tsx` (its other uncommitted edits were left
+  unstaged).
+- **Verification (isolated snapshot).** `@berry/web...` typecheck and build pass; web tests
+  295/295 including three new cases (folder dropped with a real file, empty typed file,
+  ordinary upload unchanged). The helper is new, so there is no pre-fix run; the old path
+  uploaded 0-byte files unconditionally.
+- **Deployment.** Not deployed (web).
+- **Remaining.** Recursive folder import, the question-overlay and project-upload dialogs,
+  and a browser drag-and-drop check.

@@ -12,6 +12,7 @@ import { reduceStream, type QuestionPrompt } from "@berry/desktop-ui/components/
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { AtSign, Brain, Check, ChevronDown, FileText, Hash, ImagePlus, SlashSquare } from "@berry/desktop-ui/lib/icons";
 import type { WebConfig } from "@/lib/config";
+import { splitEmptyUploads } from "@/lib/empty-uploads";
 import { MentionMenu, useStaticMentions } from "../mention-menu";
 import { PromptEditor, type PromptEditorHandle, type PromptMentionConfig } from "../prompt-editor";
 import { ProjectSwitcher } from "../projects/project-switcher";
@@ -631,7 +632,9 @@ export function Composer({
     if (!files?.length) return;
     setUploadError("");
     try {
-      const selected = Array.from(files);
+      const { accepted: selected, message: emptyUploads } = splitEmptyUploads(Array.from(files));
+      if (emptyUploads) setUploadError(emptyUploads);
+      if (selected.length === 0) return;
       if (attachments.length + pendingUploads.length + selected.length > 100) throw new Error("Attach no more than 100 files to one message.");
       const queued = selected.map((file, index): PendingFileUpload => ({
         id: globalThis.crypto.randomUUID(),
