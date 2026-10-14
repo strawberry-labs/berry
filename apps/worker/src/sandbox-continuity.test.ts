@@ -1534,6 +1534,26 @@ describe("SandboxContinuityManager", () => {
     expect(failure.stdout).toBe("failure");
   });
 
+  it("lists commands that failed before a final success without changing the status (H-016)", () => {
+    const run = (command: string) => spawnSync("bash", ["-c", PI_BASH_WRAPPER_SCRIPT, "berry-bash", command, "/dev/null"], { encoding: "utf8" });
+    // Task 48f28292: curl failed (exit 35) and a trailing echo made the call look successful.
+    const masked = run("printf downloading; false; echo done");
+    expect(masked.status, masked.stderr).toBe(0);
+    expect(masked.stdout).toContain("done");
+    expect(masked.stdout).toContain("these commands exited non-zero earlier");
+    expect(masked.stdout).toContain("exit 1: false");
+    // The status the command reports, conditionals and successful runs are unchanged.
+    expect(run('false; echo "status=$?"').stdout).toContain("status=1");
+    for (const command of ["printf success", "if false; then :; fi; printf ok", "grep -q missing /dev/null || printf none"]) {
+      const result = run(command);
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toContain("exited non-zero");
+    }
+    const failed = run("false; exit 9");
+    expect(failed.status).toBe(9);
+    expect(failed.stdout).not.toContain("exited non-zero");
+  });
+
   it("preserves line boundaries when the rolling bash tail spans chunks", async () => {
     const firstChunk = `${Array.from({ length: 2_001 }, (_, index) => `line ${index + 1}`).join("\n")}\n`;
     const manager = managerWithProvider(

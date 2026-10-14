@@ -68,7 +68,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f6433f9` | H-049 | None. |
 | `f4f2b1e` | H-062 | No schema change. New index failures set the file's own row from `processing` to `available`; the 249 existing rows are untouched (reconciliation proposed below, not run). |
 | `e241a6b` | H-028 | None. Publication receipts gain a `sha256` field for new publications only. |
-| _pending_ | H-036 | None. |
+| `37285db` | H-036 | None. |
+| _pending_ | H-016 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -151,7 +152,8 @@ fixture; this is fixed in `54c9255`.
 | H-049 (PDF pages without text reported as unreviewed) | Committed — partial | `f6433f9` | Not deployed (worker) |
 | H-062 (failed indexing leaves files processing) | Committed — worker state; UI open | `f4f2b1e` | Not deployed (worker); backlog not reconciled |
 | H-028 (rebuilt files suppressed as duplicate publications) | Committed | `e241a6b` | Not deployed (worker) |
-| H-036 (tool results past the history budget sent empty) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-036 (tool results past the history budget sent empty) | Committed — partial | `37285db` | Not deployed (worker) |
+| H-016 (earlier shell failures masked by a final success) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1489,3 +1491,34 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Preferring the latest decisive result over older ones would conflict
   with prefix caching and needs measurement; compaction remains the main bound.
+- **Commit.** `37285db`.
+
+### H-016 — An earlier failed shell command is masked by a later success
+
+- **Evidence.** Task `48f28292…`, call `1eab87f3…`: `curl` failed with exit 35, a trailing
+  `echo` left the shell status at 0, and the tool reported success. Pipelines ending in
+  `tail` show the same effect (H-043, H-059 and task 517 evidence).
+- **Root cause (confirmed).** The bash wrapper reports the script's final status, which
+  is only that of the last command; failures earlier in the script, or upstream in a
+  pipeline, leave no trace.
+- **Fix (diagnostic, not a reinterpretation).** The wrapper installs an ERR trap in the
+  model's shell that records each command exiting non-zero (outside conditions and `&&`/`||`
+  lists) to a temporary file. When the final status is 0 and something was recorded, it
+  appends "the command finished with status 0, but these commands exited non-zero
+  earlier; check that their work succeeded", listing up to ten `exit N: command` lines.
+  The exit status, the tee'd full-output log and the command's own `$?` are unchanged; a
+  model-defined ERR trap takes precedence.
+- **Why not `pipefail`.** Turning it on for the model's commands would change their meaning
+  and produce false failures (SIGPIPE in `… | head`, `find / … | head` returning 1), which
+  the issue explicitly warns against.
+- **Files.** `apps/worker/src/sandbox-continuity.ts` (`PI_BASH_WRAPPER_SCRIPT`, +test).
+- **Verification.** Real bash (local 3.2): a masked failure is listed; `$?` stays 1 inside
+  the script; success, `if false`, `||` lists and a final `exit 9` add no note and keep
+  their status; no temporary files remain. The multi-line wrapper also survives the E2B
+  provider's argument quoting. Isolated snapshot: worker typecheck pass; worker suite 526
+  passed / 3 skipped; the new case fails on the previous source and the existing
+  exit-status test passes on both.
+- **Deployment.** Not deployed (worker). Bash 5 in the sandbox supports everything used.
+- **Remaining.** Upstream failures inside a pipeline (`producer | tail`) are still not
+  detected without changing pipeline semantics; structured helpers for downloads and
+  conversions remain the issue's longer-term proposal.

@@ -41,7 +41,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-013 | P2 | Repeated preparation and snapshot work | Code finding + performance proposals | Open; benchmark before claiming gains |
 | H-014 | P1 | Recovery-required runs need clearer continuation | Observed + proposal | Open; preserve uncertain external outcomes |
 | H-015 | P2 | Expired queued text is hard to recover | Observed expiry + code finding | Open; explicit recovery UX needed |
-| H-016 | P1 | Shell success masks failed operations | Observed; cause verification noted below | Open |
+| H-016 | P1 | Shell success masks failed operations | Observed; cause verification noted below | Partly fixed locally (not deployed): earlier non-zero commands are listed when the final status is 0; pipelines open |
 | H-017 | P1 | Source freshness and verification claims | Observed; cause verification noted below | Open |
 | H-018 | P1 | Skill save validation discovery | Observed; cause verification noted below | Open |
 | H-019 | P1 | Structural versus visual validation | Observed; cause verification noted below | Open |
@@ -242,6 +242,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Observed: task `48f28292-369f-4424-a0ac-61fe3bb5ea9e`, run `e33ca1ee-bddb-480d-9347-b05d5fcc82aa`, shell call `1eab87f3-b252-4f2e-ad14-cbeeb65b8d5b`: curl fails with exit 35 but a trailing echo leaves shell exit 0 and the tool reports completed.
 - Proposal: structured execution helpers for common download/extraction operations; require checking produced files and each pipeline status. Avoid claiming all shell command strings can be safely reinterpreted.
 - Status: observed; current fix unverified.
+- **Implementation (14 October):** the bash wrapper records commands that exit non-zero and, when the final status is still 0, appends them to the tool output; exit statuses are unchanged and `pipefail` is deliberately not imposed. Not deployed. Upstream pipeline failures remain undetected.
 
 ### H-017 — Source freshness and answer claims diverge
 

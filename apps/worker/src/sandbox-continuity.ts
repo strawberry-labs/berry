@@ -111,7 +111,11 @@ with zipfile.ZipFile(archive) as source:
                 raise RuntimeError(f"ZIP entry exceeds the {max_ratio:g}:1 compression-ratio limit: {name}")
     print(json.dumps({"entryCount": len(infos), "totalBytes": total}))
 `;
-export const PI_BASH_WRAPPER_SCRIPT = 'mkdir -p -- "$(dirname "$2")" || exit; set -o pipefail; bash -lc "$1" 2>&1 | tee -- "$2"; pipeline_status=("${PIPESTATUS[@]}"); [ "${pipeline_status[0]}" -ne 0 ] && exit "${pipeline_status[0]}"; exit "${pipeline_status[1]}"';
+// Runs the model's command and tees its output. An ERR trap records commands
+// that exit non-zero; when the final status is still 0 their exits are
+// appended, so `curl ...; echo done` cannot pass as success. The exit status
+// itself is unchanged (H-016).
+export const PI_BASH_WRAPPER_SCRIPT = "mkdir -p -- \"$(dirname \"$2\")\" || exit\nexits=$(mktemp 2>/dev/null) || exits=/dev/null\nset -o pipefail\nBERRY_EXITS=\"$exits\" bash -lc \"trap 'printf \\\"%s\\\\t%s\\\\n\\\" \\\"\\$?\\\" \\\"\\${BASH_COMMAND:0:240}\\\" >> \\\"\\$BERRY_EXITS\\\" 2>/dev/null' ERR; $1\" 2>&1 | tee -- \"$2\"\npipeline_status=(\"${PIPESTATUS[@]}\")\nstatus=${pipeline_status[0]}\n[ \"$status\" -eq 0 ] && status=${pipeline_status[1]}\nif [ \"$status\" -eq 0 ] && [ -s \"$exits\" ]; then\n  printf '\\n[Berry: the command finished with status 0, but these commands exited non-zero earlier; check that their work succeeded:]\\n'\n  head -n 10 -- \"$exits\" | while IFS=\"$(printf '\\t')\" read -r code command; do printf '  exit %s: %s\\n' \"$code\" \"$command\"; done\nfi\n[ \"$exits\" = /dev/null ] || rm -f -- \"$exits\"\nexit \"$status\"";
 export const DURABLE_IMAGE_REQUEST_TIMEOUT_MS = 15 * 60_000;
 export const DURABLE_IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
