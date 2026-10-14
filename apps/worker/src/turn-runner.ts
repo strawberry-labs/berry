@@ -1775,7 +1775,7 @@ export class DurableTurnRunner {
         throw error;
       }
       const failureUsage = error instanceof DurableToolExecutionError ? error.usage : undefined;
-      const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000);
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
       const repairAttempt = priorRepairAttempts + 1;
       const timedOut = error instanceof DurableToolTimeoutError;
       const failureDurationMs = Math.max(0, Date.now() - toolStartedAt);
@@ -1867,6 +1867,7 @@ export class DurableTurnRunner {
       });
       return remaining ? "executing_tool" : "calling_model";
     }
+    result = journalSafeToolResult(result);
     const toolDurationMs = Math.max(0, Date.now() - toolStartedAt);
     const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
     const progressAssessment = assessToolProgress(snapshot, step, resultFingerprint);
@@ -2167,7 +2168,7 @@ export class DurableTurnRunner {
       const toolCallId = toolCallIdForStep(step);
       const durationMs = Math.max(0, Date.now() - startedAt);
       if (outcome.status === "fulfilled") {
-        const result = outcome.value;
+        const result = journalSafeToolResult(outcome.value);
         const resultFingerprint = resultFingerprintForToolResult(snapshot, result);
         const assessmentSnapshot: DurableTurnSnapshot = {
           ...snapshot,
@@ -2256,7 +2257,7 @@ export class DurableTurnRunner {
       const failureUsage = outcome.reason instanceof DurableToolExecutionError
         ? outcome.reason.usage
         : undefined;
-      const message = (outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)).slice(0, 4_000);
+      const message = (outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
       const repeatGuardAssessment = repeatAssessments.get(step.id)!;
       mutations.push({
         ...step,
@@ -4925,6 +4926,25 @@ function reportsPendingJobState(output: unknown): boolean {
   if (output === null || output === undefined) return false;
   const text = typeof output === "string" ? output : JSON.stringify(output);
   return PENDING_JOB_STATE.test(text.slice(0, 20_000));
+}
+
+/**
+ * PostgreSQL JSONB cannot store U+0000, so one NUL in any tool output used to
+ * fail the whole run ("unsupported Unicode escape sequence"). Replace it (H-011).
+ */
+export function journalSafeToolResult(result: TurnToolResult): TurnToolResult {
+  if (!JSON.stringify(result).includes("\\u0000")) return result;
+  const clean = (value: unknown): unknown => {
+    if (typeof value === "string") return value.replace(/\u0000/g, "\uFFFD");
+    if (Array.isArray(value)) return value.map(clean);
+    const prototype = value && typeof value === "object" ? Object.getPrototypeOf(value) : undefined;
+    // Only plain JSON objects; leave typed arrays and class instances untouched.
+    if (prototype === Object.prototype || prototype === null) {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key.replace(/\u0000/g, "\uFFFD"), clean(item)]));
+    }
+    return value;
+  };
+  return clean(result) as TurnToolResult;
 }
 
 /** Sequence of the latest completed write/edit of a file this call's arguments name, or -1. */

@@ -218,13 +218,39 @@ const consume = (text) => {
     }
   }
 };
+// Like git, a NUL in the first 8000 bytes means binary, unless the NULs follow
+// the UTF-16LE pattern of mostly-ASCII text (H-011).
+const sniffEncoding = (chunk) => {
+  if (chunk.length >= 2 && chunk[0] === 0xff && chunk[1] === 0xfe) return "utf16le";
+  const sample = chunk.subarray(0, 8000);
+  let nuls = 0;
+  let oddNuls = 0;
+  for (let index = 0; index < sample.length; index += 1) {
+    if (sample[index] !== 0) continue;
+    nuls += 1;
+    if (index % 2 === 1) oddNuls += 1;
+  }
+  if (nuls === 0) return "utf8";
+  return nuls >= sample.length * 0.3 && oddNuls >= nuls * 0.9 ? "utf16le" : null;
+};
 (async () => {
-  const decoder = new StringDecoder("utf8");
-  for await (const chunk of fs.createReadStream(filePath)) consume(decoder.write(chunk));
-  consume(decoder.end());
+  let decoder = null;
+  let encoding = "utf8";
+  for await (const chunk of fs.createReadStream(filePath)) {
+    if (!decoder) {
+      encoding = sniffEncoding(chunk);
+      if (!encoding) {
+        process.stdout.write(JSON.stringify({ binary: true, sizeBytes: fs.statSync(filePath).size }));
+        return;
+      }
+      decoder = new StringDecoder(encoding);
+    }
+    consume(decoder.write(chunk));
+  }
+  if (decoder) consume(decoder.end());
   if (sawContent && !endedWithLineBreak) finishLine();
   const sizeBytes = fs.statSync(filePath).size;
-  const details = {};
+  const details = encoding === "utf16le" ? { encoding: "utf-16le" } : {};
   let content;
   if (totalLines === 0) {
     content = "[File is empty.]";
@@ -1057,6 +1083,21 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         signal,
         reportProgress,
       );
+      if (result.binary) {
+        // NUL bytes that are not UTF-16 text: never pass them on (H-011).
+        return {
+          output: {
+            path,
+            binary: true,
+            mediaType: "application/octet-stream",
+            sizeBytes: result.sizeBytes,
+            content: "This file contains binary data, so it was not decoded as text. Use a document-capable skill/tool, or bash with an appropriate inspection utility (for example unzip -l for a ZIP-based package).",
+            ...inputRepairDetails,
+          },
+          summary: `Identified ${path} as binary data`,
+          sandbox,
+        };
+      }
       return {
         output: { path, content: result.content, sizeBytes: result.sizeBytes, ...result.details, ...inputRepairDetails },
         summary: `Read ${path}`,
@@ -3257,7 +3298,7 @@ async function readSandboxText(
   cwd: string,
   signal?: AbortSignal,
   reportProgress?: () => void,
-): Promise<{ content: string; details: Record<string, JsonValue>; sizeBytes: number }> {
+): Promise<{ content: string; details: Record<string, JsonValue>; sizeBytes: number; binary?: true }> {
   const offset = numberValue(args.offset) ?? 1;
   const limit = numberValue(args.limit) ?? 0;
   const result = await sandboxCommandOutput(provider, sandboxId, requestId, [
@@ -3277,8 +3318,11 @@ async function readSandboxText(
   } catch {
     throw new Error(`The bounded read helper returned invalid output for ${path}`);
   }
-  const content = stringValue(parsed.content, true);
   const sizeBytes = numberValue(parsed.sizeBytes);
+  if (parsed.binary === true && sizeBytes !== null && Number.isSafeInteger(sizeBytes) && sizeBytes >= 0) {
+    return { content: "", details: {}, sizeBytes, binary: true };
+  }
+  const content = stringValue(parsed.content, true);
   if (content === null || sizeBytes === null || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0) {
     throw new Error(`The bounded read helper returned incomplete output for ${path}`);
   }
@@ -4530,7 +4574,19 @@ function binaryMediaType(path: string): string | null {
     xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
     ppt: "application/vnd.ms-powerpoint",
     pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    // Office macro/template/slideshow variants share the same packages.
+    docm: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    dotx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xltx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    pptm: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    potx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ppsx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     zip: "application/zip",
+    // ZIP-based packages: skills, Power BI and EPUB are listed and extracted safely.
+    skill: "application/zip",
+    pbix: "application/zip",
+    pbit: "application/zip",
+    epub: "application/zip",
     gz: "application/gzip",
     mp3: "audio/mpeg",
     wav: "audio/wav",

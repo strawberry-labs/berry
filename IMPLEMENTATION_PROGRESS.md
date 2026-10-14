@@ -55,7 +55,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `430d396` | H-070 | None. |
 | `b7b1e94` | H-053 | None. |
 | `1df00a9` | H-030 | None. |
-| _pending_ | H-054 | None. |
+| `e4bc64b` | H-054 | None. |
+| _pending_ | H-011 (binary reads) | None. Only new tool results are sanitised; existing journal rows are untouched. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -111,7 +112,9 @@ No pre-existing failures were observed in these suites.
 | H-070 (bounded MCP results keep structure and cursors) | Committed — partial | `430d396` | Not deployed (worker) |
 | H-053 (repeat guard after source edits) | Committed | `b7b1e94` | Not deployed (worker) |
 | H-030 (bounded polling of running jobs) | Committed | `1df00a9` | Not deployed (worker) |
-| H-054 (vision retry by failure class) | Committed | _pending_ | Not deployed (worker) |
+| H-054 (vision retry by failure class) | Committed | `e4bc64b` | Not deployed (worker) |
+| H-011 (binary and UTF-16 reads; NUL-safe journal) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -983,3 +986,66 @@ No pre-existing failures were observed in these suites.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Retry backoff/provider retry-after handling, and explicit 413/401/402
   recovery guidance in the error text.
+- **Commit.** `e4bc64b`.
+
+### H-011 — Binary and UTF-16 reads fail the run in the JSONB journal
+
+- **Evidence.** Month: 15 terminal `unsupported Unicode escape sequence` runs / 13 tasks /
+  7 users. Reviewed run `05c124d3…` reads a `.skill` ZIP; PPSX reads take the same path.
+  On real PostgreSQL, `SELECT '{"content":"PK\u0003\u0004\u0000"}'::jsonb` fails with
+  exactly that error, while U+FFFD is accepted.
+- **Root cause (confirmed).** `read` sends any file whose extension is not in
+  `binaryMediaType` through the in-sandbox UTF-8 line reader. Binary bytes decode to text
+  containing U+0000, the tool result is journaled as JSONB, the write is rejected and the
+  run fails. `.skill`, `.pbix`, `.epub` and Office variants such as `.ppsx` were missing
+  from the extension map; UTF-16LE text (Windows exports) carried NULs the same way.
+- **Fix.**
+  1. The in-sandbox reader sniffs the first chunk. A UTF-16LE BOM, or the UTF-16LE NUL
+     pattern of mostly-ASCII text, decodes as UTF-16LE (correct lines, CRLF and offsets;
+     `encoding: "utf-16le"` in the details). Any other NUL in the first 8000 bytes (git's
+     rule) returns `{ binary, sizeBytes }` without content, and the worker answers with a
+     binary receipt and inspection guidance instead of text.
+  2. `.skill`, `.pbix`, `.pbit` and `.epub` use the existing safe ZIP extraction;
+     `.docm`, `.dotx`, `.xltx`, `.pptm`, `.potx` and `.ppsx` use the existing document
+     extractor.
+  3. Backstop: `journalSafeToolResult` replaces U+0000 with U+FFFD in any tool result
+     (values and keys) before it is journaled, and tool-failure messages get the same
+     replacement, so a NUL from bash, an MCP server or a later chunk cannot fail a run.
+- **Files.** `apps/worker/src/sandbox-continuity.ts`, `apps/worker/src/turn-runner.ts` and
+  their tests; `scripts/test-binary-tool-output.mjs` (real PostgreSQL).
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 995
+  passed / 6 skipped (989 before; six new cases: reader decoding UTF-16LE with and without
+  a BOM and reporting ZIP bytes as binary, UTF-8 unchanged; worker binary receipt;
+  `.skill`/`.ppsx` routing; NUL in a tool result and in a tool error; clean results
+  returned unchanged). PostgreSQL script 1/1: a tool returning `PK\u0003\u0004\u0000…`
+  completes and the stored step output holds U+FFFD. **Pre-fix:** with the previous worker
+  source the same script's run ends `failed` with `unsupported Unicode escape sequence`
+  (the production error), and all six unit cases fail.
+- **Deployment.** Not deployed (worker). No API, web or schema change.
+- **Remaining (H-011 stays open).** Malformed tool-argument JSON and HTTP 400 schema
+  failures need their own tracing; XML-spreadsheet content with an `.xls` extension
+  (task `08285ac9…`, shared with H-008) still selects the extractor by extension;
+  UTF-16BE and BOM-less UTF-16LE in non-Latin scripts are reported as binary rather than
+  decoded (previously they failed the run).
+
+### H-004 — Repair loops across changed arguments (revalidated; no change)
+
+- **Code finding (confirmed).** `matchingToolFailureCount` counts consecutive failures of
+  the same tool type with the same argument fingerprint and error identity, so changing a
+  path or quoting starts a new count.
+- **Existing bounds that still apply.** The no-progress budget (warning at 3, stop at 5
+  repeated signature/result pairs), the 200-iteration model limit, per-tool deadlines and
+  spend limits. H-053, H-030 and H-054 (committed above) relaxed these guards only for
+  specific, evidenced cases, each still bounded.
+- **Not established.** The three weekly terminal duplicate-loop failures were ended by the
+  existing guard; no trace shows a long loop sustained *because* arguments changed. The
+  reviewed long repairs (tasks 538, 539, 523, 80, 748, 1214) mostly succeed after
+  argument changes that were genuine repairs, and their errors often embed the changing
+  path, so a cross-argument counter would need semantic error normalisation to work at
+  all and would risk stopping valid iterative work.
+- **Decision.** No change. A safe design needs a targeted reproduction plus a measured
+  normalisation of error category and target identity, designed together with
+  H-028/H-053 rather than another blanket counter.
+- **Next action.** Reproduce one cosmetic-variation loop (for example task 523's mistyped
+  file ID) as a fixture, then decide between guidance after repeated equivalent failures
+  and a hard stop.

@@ -24,6 +24,7 @@ import {
   SqlDurableTurnRepository,
   createDurableTurnModel,
   durableImageToolSelectionPrompt,
+  journalSafeToolResult,
   durableBuiltInToolDefinitions,
   durableToolManifestMetrics,
   queuedFollowUpRuntimeRequest,
@@ -2351,6 +2352,35 @@ describe("durable turn runner", () => {
       const { repository, executions } = await runPolls(["RUNNING"], 12);
       expect(repository.current.error).toBe("no_progress_budget");
       expect(executions).toBeLessThanOrEqual(6);
+    });
+  });
+
+  describe("binary tool output (H-011)", () => {
+    it("journals a tool result containing NUL characters instead of failing the run", async () => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), readOnlyToolStep("read", 1, "/workspace/inputs/bundle.skill")]));
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => ({ output: { path: "/workspace/inputs/bundle.skill", content: "PK\u0003\u0004\u0000\u0000SKILL.md", meta: { "ke\u0000y": ["a\u0000"] } }, summary: "Read bundle.skill" }),
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      const read = repository.current.steps.find((step) => step.type === "tool.read");
+      expect(read?.state).toBe("completed");
+      expect(read?.output).toEqual({ path: "/workspace/inputs/bundle.skill", content: "PK\u0003\u0004\uFFFD\uFFFDSKILL.md", meta: { "ke\uFFFDy": ["a\uFFFD"] } });
+      expect(JSON.stringify(repository.mutations)).not.toContain("\\u0000");
+    });
+
+    it("journals a tool failure whose message contains NUL characters", async () => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), readOnlyToolStep("read", 1, "/workspace/inputs/data.bin")]));
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => { throw new Error("Unexpected bytes PK\u0003\u0004\u0000"); },
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      expect(repository.current.steps.find((step) => step.type === "tool.read")?.error).toContain("PK\u0003\u0004\uFFFD");
+      expect(JSON.stringify(repository.mutations)).not.toContain("\\u0000");
+    });
+
+    it("returns clean results unchanged", () => {
+      const result: TurnToolResult = { output: { content: "Name,Total\nAlpha,12", bytes: [0, 1] }, summary: "Read export.csv" };
+      expect(journalSafeToolResult(result)).toBe(result);
     });
   });
 

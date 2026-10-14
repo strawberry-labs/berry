@@ -36,7 +36,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Current directory guarantee gap; template contents require verification |
 | H-009 | P1 | Sandbox operation recovery and error classification | Observed missing-sandbox failures + code findings | Reconnect-after-pause fix committed (not deployed); typed classification/fault injection open |
 | H-010 | P1 | Snapshot timeout does not cancel underlying work | Code finding | Open; production consequence unproven |
-| H-011 | P1 | Encoding, oversized inputs and malformed tool arguments | Observed | Open; classify and reproduce separately |
+| H-011 | P1 | Encoding, oversized inputs and malformed tool arguments | Observed | Image payload guard and binary/UTF-16 reads committed locally (not deployed); tool-argument/HTTP 400 failures open |
 | H-012 | P1 | Generated files and numerical content can be incorrect | Observed user reports | Open; reproduce against source artifacts |
 | H-013 | P2 | Repeated preparation and snapshot work | Code finding + performance proposals | Open; benchmark before claiming gains |
 | H-014 | P1 | Recovery-required runs need clearer continuation | Observed + proposal | Open; preserve uncertain external outcomes |
@@ -142,6 +142,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Proposal: count repeated underlying failures and lack of useful progress across cosmetic argument changes; give one bounded repair followed by an evidence-based strategy change or blocker.
 - Acceptance: changing paths/quoting without resolving the same failure cannot sustain a long repair loop; valid iterative work remains possible.
 
+- **Revalidation (14 October):** the code finding holds (the identical-failure counter keys on argument fingerprint), but the no-progress budget, 200-iteration limit, deadlines and spend limits still bound runs, and no trace shows a loop sustained because arguments changed; the reviewed long repairs mostly succeed. No change without a targeted reproduction; see IMPLEMENTATION_PROGRESS.md.
+
 ### H-005 — Provider availability
 
 - Evidence: HTTP 402 caused 22 failed runs / 7 users / 11 tasks, all on the audited current revision. Exact upstream billing cause was not recorded. Image creation separately had 20 failed tool steps / 4 users explicitly reporting insufficient quota or exhausted credits.
@@ -198,6 +200,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - **Monthly revalidation:** 15 terminal Unicode runs / 13 tasks / 7 users and 36 HTTP413 runs / 17 tasks / 4 users. Reviewed `.skill` ZIP and PPSX reads take a UTF-8 path; compiled extension detection lacks those types. Read by verified format/MIME/signature, handle binary diagnostics safely and review the prepared image guard, which is not deployed. HTTP400/schema failures require their own tracing; do not combine all input failures into one cause.
 
 - **Implementation (14 October):** the prepared model-image guard (bounded previews, omission notices, final 4 MiB serialized-request gate, explicit 413 message) is committed with a lockfile regenerated for the worker's `sharp` dependency only. Not deployed. Encoding/binary dispatch and malformed tool arguments remain open.
+
+- **Implementation (14 October, binary reads):** confirmed cause: unknown-extension and missing-type reads (`.skill`, `.ppsx`) went through the UTF-8 reader, and the resulting U+0000 made the JSONB journal write fail (reproduced on PostgreSQL with the production error). The in-sandbox reader now decodes UTF-16LE (BOM or NUL pattern) and reports other NUL-bearing files as binary; ZIP-based packages and Office variants use the existing extractors; and every tool result or tool error replaces U+0000 with U+FFFD before journaling. Not deployed. UTF-16BE, non-Latin BOM-less UTF-16, content-sniffed `.xls` and malformed tool arguments remain open.
 
 ### H-012 — Deliverable correctness
 

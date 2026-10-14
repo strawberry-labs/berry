@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import sharp from "sharp";
 import { MODEL_IMAGE_LIMITS } from "./model-image.js";
 import { describe, expect, it, vi } from "vitest";
@@ -1420,6 +1423,36 @@ describe("SandboxContinuityManager", () => {
     expect(Buffer.byteLength(result.stdout)).toBeLessThan(10 * 1024);
   });
 
+  it("decodes UTF-16LE text and reports binary data inside the sandbox read helper (H-011)", () => {
+    const directory = mkdtempSync(join(tmpdir(), "berry-read-"));
+    try {
+      const read = (name: string, bytes: Buffer, offset = 1) => {
+        const path = join(directory, name);
+        writeFileSync(path, bytes);
+        const result = spawnSync(process.execPath, ["-e", PI_READ_STREAM_SCRIPT, path, String(offset), "0", "2000", String(50 * 1024), "2000"], {
+          encoding: "utf8",
+        });
+        expect(result.status, result.stderr).toBe(0);
+        return JSON.parse(result.stdout) as Record<string, unknown>;
+      };
+      const csv = "Name,Total\r\nAlpha,12\r\nBeta,7\r\n";
+      expect(read("bom.csv", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(csv, "utf16le")]))).toMatchObject({
+        content: "Name,Total\nAlpha,12\nBeta,7",
+        details: { encoding: "utf-16le" },
+      });
+      expect(read("export.csv", Buffer.from(csv, "utf16le"), 2)).toMatchObject({
+        content: "Alpha,12\nBeta,7",
+        details: { encoding: "utf-16le" },
+      });
+      const zip = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00]), Buffer.from("SKILL.md")]);
+      expect(read("bundle.dat", zip)).toEqual({ binary: true, sizeBytes: zip.byteLength });
+      const text = Buffer.from("café\r\nnaïve\n");
+      expect(read("notes.txt", text)).toEqual({ content: "café\nnaïve", details: {}, sizeBytes: text.byteLength });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("parses a grep JSON record larger than one megabyte before bounding its rendered line", () => {
     const event = JSON.stringify({
       type: "match",
@@ -1901,6 +1934,67 @@ describe("SandboxContinuityManager", () => {
     expect(commands.some((command) => command[0] === "mkdir" && command[1] === "-p")).toBe(true);
     expect(commands.some((command) => command[0] === "python" && command[1] === "-c")).toBe(true);
     expect(commands.some((command) => command[0] === "unzip" && command.includes("-d"))).toBe(true);
+  });
+
+  it("returns a binary receipt instead of NUL text when the read helper reports binary data (H-011)", async () => {
+    const manager = new SandboxContinuityManager({
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-contract", provider: "e2b", status: "running" })),
+      exec: async function* (input: { command: string[] }) {
+        if (input.command[2] === PI_READ_STREAM_SCRIPT) yield { kind: "stdout", data: JSON.stringify({ binary: true, sizeBytes: 18 }) };
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
+      files: { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+    } as unknown as SandboxProvider, {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    }, null, { image: "berry-sandbox" });
+
+    const result = await manager.execute(snapshot(), toolStep("read", { path: "/workspace/inputs/file-id/bundle.dat" }));
+    expect(result.output).toMatchObject({ binary: true, mediaType: "application/octet-stream", sizeBytes: 18 });
+    expect(JSON.stringify(result.output)).not.toContain("\\u0000");
+  });
+
+  it("routes skill packages to safe ZIP extraction and slideshows to the document extractor (H-011)", async () => {
+    const list = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      entries: input.path.includes("/tmp/archives/") ? [{ path: `${input.path}/SKILL.md`, type: "file", size_bytes: 120 }] : [],
+    }));
+    const bytes = Buffer.from("binary ppsx bytes");
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path,
+      encoding: "base64" as const,
+      content: bytes.toString("base64"),
+      size_bytes: bytes.byteLength,
+      mtime: null,
+    }));
+    const documentTextExtractor = vi.fn(async () => "Quarterly review\nSlide 2: Risks");
+    const manager = managerWithProvider({ read, write: vi.fn(), list }, async function* (input: { command: string[] }) {
+      if (input.command[0] === "python" && input.command[1] === "-c") {
+        yield { kind: "stdout", data: JSON.stringify({ entryCount: 1, totalBytes: 120 }) };
+      }
+      yield { kind: "exit", exit_code: 0, signal: null };
+    }, { documentTextExtractor });
+
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/bundle.skill",
+    }))).resolves.toMatchObject({
+      output: { mediaType: "application/zip", extractedArchive: true, entryCount: 1, content: expect.stringContaining("SKILL.md") },
+    });
+    await expect(manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/review.ppsx",
+    }))).resolves.toMatchObject({
+      output: {
+        content: "Quarterly review\nSlide 2: Risks",
+        mediaType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        extractedText: true,
+      },
+    });
   });
 
   it("applies bounded pagination to page-numbered PDF text", async () => {
