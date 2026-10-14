@@ -6292,8 +6292,12 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
         type: "object",
         additionalProperties: false,
         properties: {
-          mode: { type: "string", enum: ["overview", "focused"], default: "overview" },
-          question: { type: "string", minLength: 1, maxLength: 4_000 },
+          mode: {
+            type: "string",
+            enum: ["overview", "focused"],
+            description: "focused answers the question; overview returns a general reusable digest and does not send the question. Defaults to focused when a question is given, otherwise overview.",
+          },
+          question: { type: "string", minLength: 1, maxLength: 4_000, description: "The visual question to answer. Required for focused mode." },
           paths: {
             type: "array",
             minItems: 1,

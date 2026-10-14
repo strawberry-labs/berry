@@ -57,7 +57,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `1df00a9` | H-030 | None. |
 | `e4bc64b` | H-054 | None. |
 | `c4f419b` | H-011 (binary reads) | None. Only new tool results are sanitised; existing journal rows are untouched. |
-| _pending_ | H-039 | No schema change and no deletion. The prompt-version bump stops reuse of existing `vision_observation_cache` rows; the existing retention job removes them once unused. |
+| `2bd8ff5` | H-039 | No schema change and no deletion. The prompt-version bump stops reuse of existing `vision_observation_cache` rows; the existing retention job removes them once unused. |
+| _pending_ | H-061 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -123,7 +124,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-030 (bounded polling of running jobs) | Committed | `1df00a9` | Not deployed (worker) |
 | H-054 (vision retry by failure class) | Committed | `e4bc64b` | Not deployed (worker) |
 | H-011 (binary and UTF-16 reads; NUL-safe journal) | Committed — partial | `c4f419b` | Not deployed (worker) |
-| H-039 (truncated vision observations) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-039 (truncated vision observations) | Committed — partial | `2bd8ff5` | Not deployed (worker) |
+| H-061 (questions dropped by overview mode) | Committed | _pending_ | Not deployed (worker) |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1095,3 +1097,33 @@ verification script deletes compiled tests first and counts are source-only.
 - **Remaining.** Measured adaptive budget or targeted continuation for truncated
   answers; coverage for multi-page inspections ("stopped on page five"); H-061 (overview
   mode replaces the supplied question).
+- **Commit.** `2bd8ff5`.
+
+### H-061 — `inspect_images` silently discards the model's question
+
+- **Evidence.** Month: 703 completed calls in 447 runs / 296 tasks / 100 users passed a
+  non-empty question but ran as overview (685 explicit overview, 18 with no mode); task
+  142's four exact-text questions all came back as generic digests. Exposure, not a
+  wrong-answer count.
+- **Root cause (confirmed in code).** The executor treated anything except
+  `mode: "focused"` as overview and then sent the fixed digest prompt, and the tool
+  schema gave no hint that the question is ignored outside focused mode.
+- **Fix.** A question with no mode is answered as a focused question. Explicit overview
+  keeps its reusable digest and cache behaviour, but the result now says
+  `questionSent: false` and tells the model to call focused mode if the digest does not
+  answer it. The same effective-mode rule feeds the H-054 failure signature. The tool
+  schema now describes both fields (and drops the misleading `default: "overview"`).
+- **Deliberately not changed.** Explicit overview is not silently converted to focused:
+  that would lose digest reuse and use the smaller focused output cap for broad
+  requests (the audit's caution); the focused cache identity stays as described under
+  H-039.
+- **Files.** `apps/worker/src/vision-tools.ts` (+test), `apps/worker/src/turn-runner.ts`
+  (tool schema text only).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 511 passed / 3
+  skipped. New cases check the actual provider request: no mode + question sends the
+  question with the focused cap; explicit overview + question does not send it and says
+  so; the questionless overview is unchanged. The first two fail on the previous source.
+- **Deployment.** Not deployed (worker). The changed tool-schema text alters the cached
+  tool prefix once after deployment (expected cold cache, see H-032).
+- **Remaining.** Measure digest-versus-focused accuracy and repeat inspections for
+  explicit-overview questions before deciding whether overview should answer them.

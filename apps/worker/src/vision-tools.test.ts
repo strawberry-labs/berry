@@ -461,6 +461,50 @@ describe("DurableVisionToolExecutor", () => {
     });
   });
 
+  describe("question handling by mode (H-061)", () => {
+    const run = async (argumentsValue: Record<string, unknown>) => {
+      const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
+        id: "vision-response",
+        model: "minimax-m3",
+        choices: [{ message: { content: "Figure 3: Site plan" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+      vi.stubGlobal("fetch", fetchMock);
+      const base: DurableTurnToolExecutor = {
+        modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
+        execute: async () => { throw new Error("unexpected base execution"); },
+      };
+      const result = await new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" })
+        .execute(visionSnapshot(), visionStep(argumentsValue));
+      const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body)) as { max_tokens: number; messages: Array<{ content: unknown }> };
+      return { result, body, prompt: JSON.stringify(body.messages.at(-1)?.content) };
+    };
+    const question = "What is the figure number under the site plan?";
+
+    it("answers a question with no mode as a focused question", async () => {
+      const { result, body, prompt } = await run({ question });
+      expect(prompt).toContain(question);
+      expect(body.max_tokens).toBe(1_024);
+      expect(result.output).toMatchObject({ vision: { mode: "focused" } });
+      expect((result.output as { content: string }).content).not.toContain("was not sent");
+    });
+
+    it("says so when explicit overview mode does not send the question", async () => {
+      const { result, prompt } = await run({ mode: "overview", question });
+      expect(prompt).not.toContain(question);
+      expect(result.output).toMatchObject({ vision: { mode: "overview", questionSent: false } });
+      expect((result.output as { content: string }).content).toContain("your question was not sent");
+    });
+
+    it("keeps the questionless overview digest unchanged", async () => {
+      const { result, prompt } = await run({});
+      expect(prompt).toContain("comprehensive reusable observation");
+      expect(result.output).toMatchObject({ vision: { mode: "overview" } });
+      expect(result.output).not.toMatchObject({ vision: { questionSent: false } });
+      expect((result.output as { content: string }).content).not.toContain("was not sent");
+    });
+  });
+
   describe("retry after a failed inspection (task 843)", () => {
     const ok = () => new Response(JSON.stringify({
       id: "vision-response", model: "minimax-m3",

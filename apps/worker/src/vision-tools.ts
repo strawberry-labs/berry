@@ -201,8 +201,10 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
     if (!runtime.vision) throw new Error("Vision inspection was not admitted for this turn");
     const args = record(step.input.arguments);
-    const mode = args?.mode === "focused" ? "focused" : "overview";
+    const mode = effectiveVisionMode(args);
     const question = stringValue(args?.question)?.trim();
+    // Overview sends a generic digest prompt; say so instead of dropping the question (H-061).
+    const questionNotSent = mode === "overview" && Boolean(question);
     const paths = requestedImagePaths(args?.paths);
     if (mode === "focused" && !question) {
       throw new Error("Focused image inspection requires a question");
@@ -235,7 +237,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
     const cached = await this.cache.get(snapshot.tenantId, cacheKey);
     if (cached) {
       return {
-        output: visionOutput(cached, runtime.vision.providerId, runtime.vision.model, images.length, mode, true, [], paths?.length ?? 0),
+        output: visionOutput(cached, runtime.vision.providerId, runtime.vision.model, images.length, mode, true, [], paths?.length ?? 0, true, questionNotSent),
         summary: `Reused cached ${mode} vision observation for ${images.length} image${images.length === 1 ? "" : "s"}`,
       };
     }
@@ -355,6 +357,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         attempts,
         paths?.length ?? 0,
         complete,
+        questionNotSent,
       ),
       summary: `Inspected ${images.length} image${images.length === 1 ? "" : "s"} with ${runtime.vision.model}${complete ? "" : " (incomplete: output limit reached)"}`,
       usage,
@@ -421,9 +424,10 @@ function visionOutput(
   diagnostics: readonly VisionAttemptDiagnostic[] = [],
   requestedPathCount = 0,
   complete = true,
+  questionNotSent = false,
 ): JsonValue {
   return {
-    content: `<untrusted_vision_observation>\n${observation}\n</untrusted_vision_observation>${complete ? "" : "\n[Incomplete observation: the vision model stopped at its output limit, so the text above may end before the answer does. Do not treat it as a complete check. For anything it does not cover, ask a narrower focused question.]"}`,
+    content: `<untrusted_vision_observation>\n${observation}\n</untrusted_vision_observation>${complete ? "" : "\n[Incomplete observation: the vision model stopped at its output limit, so the text above may end before the answer does. Do not treat it as a complete check. For anything it does not cover, ask a narrower focused question.]"}${questionNotSent ? "\n[Overview mode returned a general digest; your question was not sent to the vision model. If the digest does not answer it, call inspect_images with mode \"focused\" and the question.]" : ""}`,
     vision: {
       providerId,
       model,
@@ -431,6 +435,7 @@ function visionOutput(
       mode,
       cacheHit,
       complete,
+      ...(questionNotSent ? { questionSent: false } : {}),
       promptVersion: VISION_PROMPT_VERSION,
       requestedPathCount,
       ...(diagnostics.length > 0 ? {
@@ -590,9 +595,15 @@ function inspectImagesArgumentFingerprint(value: unknown): string | null {
   } catch {
     return null;
   }
-  const mode = args.mode === "focused" ? "focused" : "overview";
+  const mode = effectiveVisionMode(args);
   const question = normalizeQuestion(stringValue(args.question) ?? "");
   return JSON.stringify({ mode, question, paths: paths ?? [] });
+}
+
+/** A question with no explicit mode asks for a focused answer (H-061). */
+function effectiveVisionMode(args: Record<string, unknown> | null): "overview" | "focused" {
+  if (args?.mode === "focused") return "focused";
+  return args?.mode === undefined && stringValue(args?.question)?.trim() ? "focused" : "overview";
 }
 
 function providerFailureMessage(error: unknown): string {
