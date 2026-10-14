@@ -1379,8 +1379,24 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
 
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     if (!snapshot.sandboxId || !this.objects) return [];
-    const sandbox = await this.ensureSandbox(snapshot);
-    return this.finalizeSandboxOutputs(snapshot, sandbox);
+    try {
+      const sandbox = await this.ensureSandbox(snapshot);
+      return await this.finalizeSandboxOutputs(snapshot, sandbox);
+    } catch (error) {
+      // The answer is already delivered. A run that executed nothing able to
+      // write files cannot have produced new outputs, so an unavailable
+      // sandbox must not turn it into a failure. Earlier unpublished outputs
+      // stay in the sandbox/snapshot for the next scan; runs that did write
+      // files still fail visibly when their outputs cannot be reached.
+      if (runMayHaveWrittenFiles(snapshot)) throw error;
+      emitWorkerOperationalEvent("sandbox.operation", "unknown", "unknown", {
+        operation: "finalize.output_scan",
+        outcome: "skipped_sandbox_unavailable",
+        category: error instanceof Error ? error.name : "unknown",
+        runId: snapshot.id,
+      });
+      return [];
+    }
   }
 
   private async finalizeSandboxOutputs(
@@ -2079,6 +2095,22 @@ function requestedInspectionImagePaths(snapshot: DurableTurnSnapshot, workspaceR
     throw new Error(`inspect_images paths must contain between 1 and ${MAX_MODEL_IMAGES} image paths`);
   }
   return [...new Set(paths)];
+}
+
+// Tools that cannot create or change files in the workspace outputs. Unknown
+// tools (MCP, skills, future built-ins) are treated as possibly writing.
+const NON_WRITING_TOOLS = new Set([
+  "read", "find", "ls", "grep", "activate_skill", "ask_user_question", "compose_message",
+  "inspect_images", "persist_artifact", "create_image", "save_personal_skill",
+  "remember_memory", "forget_memory",
+]);
+
+function runMayHaveWrittenFiles(snapshot: DurableTurnSnapshot): boolean {
+  return snapshot.steps.some((step) => {
+    if (!step.type.startsWith("tool.")) return false;
+    const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
+    return !NON_WRITING_TOOLS.has(toolName);
+  });
 }
 
 /** Find one sandbox file through its parent listing; null when absent. */

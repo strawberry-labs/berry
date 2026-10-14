@@ -2376,6 +2376,49 @@ describe("SandboxContinuityManager", () => {
     expect(repository.persistOutput).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["a text-only answer", [] as string[], "completes"],
+    ["a run that only read and drafted", ["read", "compose_message"], "completes"],
+    ["a run that executed bash", ["read", "bash"], "fails"],
+  ] as const)("finalizes %s when its sandbox can no longer be resumed", async (_label, tools, expected) => {
+    const unavailable = Object.assign(new Error("The sandbox was not found"), { name: "SandboxNotFoundError" });
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => { throw new Error("Sandbox capacity is unavailable"); }),
+      resume: vi.fn(async () => { throw unavailable; }),
+      exec: vi.fn(),
+      files: { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = { put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn() } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-gone";
+    current.sandboxProvider = "e2b";
+    current.sandboxState = "paused";
+    current.steps = tools.map((name, index) => ({
+      ...toolStep(name, {}),
+      id: `00000000-0000-7000-8000-${String(200 + index).padStart(12, "0")}`,
+      sequence: index + 1,
+      state: "completed" as const,
+    }));
+
+    if (expected === "completes") {
+      await expect(manager.finalize(current)).resolves.toEqual([]);
+    } else {
+      await expect(manager.finalize(current)).rejects.toThrow();
+    }
+    expect(objects.putArtifact).not.toHaveBeenCalled();
+  });
+
   it("surfaces terminal output listing failures and records finalization failure", async () => {
     const base = snapshot();
     const provider = {

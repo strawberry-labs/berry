@@ -181,6 +181,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 
 - **Implementation (14 October):** the diagnosed cached-handle-after-pause reconnect fix is committed (force reconnect for follow-ups and inactive persisted state); new provider/attachment-staging regressions fail on the old sources and pass with the fix. Not deployed. Other missing-sandbox variants and typed lifecycle classification remain open. See IMPLEMENTATION_PROGRESS.md.
 
+- **Text-only finalisation (14 October):** when the sandbox cannot be ensured at finalisation and the run executed no file-writing tool, the delivered answer now completes instead of failing (task 176); runs that wrote files still fail visibly. Not deployed.
+
 ### H-010 — Snapshot timeout cancellation
 
 - Evidence: `withTimeout()` in `apps/worker/src/sandbox-continuity.ts` rejects a wrapper promise without cancelling the underlying operation. Preservation cleanup can proceed while that operation is outstanding.

@@ -44,7 +44,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `39d02c8` | H-011 | None (worker dependency only). |
 | `e6b2fa8` | H-051/H-072 | None. New JSON keys in `turn_runs.runtime_request` for new continuation runs only. |
 | `eda27eb` | H-014 (Continue intent) | None (prompt assembly only). |
-| _pending_ | H-046/H-060/H-071 | None. |
+| `f2bace0` | H-046/H-060/H-071 | None. |
+| _pending_ | H-009 (text-only finalisation) | None. |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
@@ -75,7 +76,8 @@ No pre-existing failures were observed in these suites.
 | H-066 (recovery budget generation) | Committed | `2a7af6b` | Not deployed (API + worker together; see entry) |
 | H-048 (provider errors in history) | Committed | `49815ef` | Not deployed (API + worker; either order safe) |
 | H-014 (phase-aware Continue) | Committed — partial | `eda27eb` | Not deployed (worker) |
-| H-046 / H-060 / H-071 (image path lifetime and selection) | Committed | _pending_ | Not deployed (worker) |
+| H-046 / H-060 / H-071 (image path lifetime and selection) | Committed | `f2bace0` | Not deployed (worker) |
+| H-009 (text-only finalisation) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -472,3 +474,32 @@ No pre-existing failures were observed in these suites.
 - **Deployment.** Not deployed (worker only).
 - **Remaining.** Same-path overwrite/version binding (H-046 task 956 note) and splitting
   oversized batches into multiple inspection groups automatically.
+- **Commit.** `f2bace0`.
+
+### H-009 — A delivered text answer must not fail on an unavailable sandbox
+
+- **Evidence.** Audit finding 4 / task 176 run `87582f47…`: the run delivered its text and
+  editable draft, then failed with sandbox-not-found although no file was requested. The
+  exact throw site is not retained.
+- **Cause (code-confirmed).** `SandboxContinuityManager.finalize` ensures (resumes or
+  restores) the run's associated sandbox and scans `outputs/` whenever the run has any
+  sandbox id — including one inherited from an earlier turn. If ensuring fails, the
+  exception propagates through `DurableTurnRunner.finalize` and the completed answer is
+  recorded as a failed run.
+- **Fix (conservative).** Behaviour is unchanged whenever the sandbox is reachable (the
+  scan still publishes any unpublished outputs). If ensuring or scanning fails *and the
+  run executed no tool able to write files* (only read/find/ls/grep, skill activation,
+  questions, compose, image inspection/creation, explicit publication or memory/skill
+  saves), finalisation completes without the scan and emits a
+  `sandbox.operation` event (`finalize.output_scan` / `skipped_sandbox_unavailable`).
+  Unknown tools (MCP, skills, future built-ins) count as possibly writing. Runs that ran
+  bash/write/edit still fail visibly, so genuinely lost outputs are never hidden.
+- **Files.** `apps/worker/src/sandbox-continuity.ts`, `apps/worker/src/sandbox-continuity.test.ts`.
+- **Verification (isolated snapshot).** Worker typecheck pass; sandbox-continuity +
+  turn-runner 227/227. New cases: text-only and read/draft-only runs complete when the
+  sandbox cannot be resumed (both fail on the previous source); a run that executed bash
+  still fails.
+- **Deployment.** Not deployed (worker only).
+- **Remaining.** Skipping the resume entirely for text-only follow-ups would save
+  latency/cost but changes when leftover outputs are published; it needs measurement
+  first (audit H-013). Snapshot-timeout cancellation is H-010.
