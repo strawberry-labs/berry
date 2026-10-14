@@ -44,7 +44,7 @@ type QueueRow = {
 export class QueuedFollowUpService {
   constructor(@Inject(CloudDatabaseService) private readonly database: CloudDatabaseService) {}
 
-  async enqueue(tenantId: string, userId: string, sessionId: string, value: QueuedFollowUpCreate): Promise<ServerQueuedFollowUp> {
+  async enqueue(tenantId: string, userId: string, sessionId: string, value: QueuedFollowUpCreate, reserveBudget?: (runtime: Record<string, unknown>, requestId: string) => Promise<boolean>): Promise<ServerQueuedFollowUp> {
     const input = QueuedFollowUpCreateSchema.parse(value);
     const attachments = durableAttachments(input.attachments);
     return this.database.withTenant(tenantId, async (executor) => {
@@ -58,7 +58,7 @@ export class QueuedFollowUpService {
         [tenantId, input.idempotencyKey],
       );
       if (existing[0]) {
-        if (existing[0].owner_user_id !== userId) throw new ConflictException("The idempotency key belongs to another user");
+        if (existing[0].owner_user_id !== userId || existing[0].session_id !== sessionId) throw new ConflictException("The idempotency key belongs to another user");
         return mapQueueRow(existing[0]);
       }
 
@@ -81,12 +81,20 @@ export class QueuedFollowUpService {
            AND r.state NOT IN ('completed','failed','cancelled','recovery_required')
          ORDER BY r.created_at DESC
          LIMIT 1
-         FOR UPDATE OF t,s,r`,
+         FOR NO KEY UPDATE OF t,s`,
         [tenantId, input.taskId, sessionId, userId, input.workspaceId],
       );
       const run = active[0];
       if (!run) throw new ConflictException("Follow-ups can only be queued for an active task turn");
 
+      const replay = await executor.query<QueueRow>(
+        `SELECT * FROM queued_follow_up_items WHERE tenant_id=$1::uuid AND idempotency_key=$2 LIMIT 1`,
+        [tenantId, input.idempotencyKey],
+      );
+      if (replay[0]) {
+        if (replay[0].owner_user_id !== userId || replay[0].session_id !== sessionId) throw new ConflictException("The idempotency key belongs to another queue");
+        return mapQueueRow(replay[0]);
+      }
       const countRows = await executor.query<{ count: number | string }>(
         `SELECT count(*)::integer AS count FROM queued_follow_up_items
          WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND status = ANY($3::text[])
@@ -102,6 +110,15 @@ export class QueuedFollowUpService {
          WHERE tenant_id=$1::uuid AND session_id=$2::uuid`,
         [tenantId, run.session_id],
       );
+      // A stable budget identity survives delivery retries. Reserve through
+      // normal API admission checks before making the row visible to workers.
+      const budgetRequestId = `queued:${input.idempotencyKey}`;
+      const runtime = run.runtime_request && typeof run.runtime_request === "object" && !Array.isArray(run.runtime_request)
+        ? run.runtime_request as Record<string, unknown> : {};
+      const budgetRequired = reserveBudget ? await reserveBudget(runtime, budgetRequestId) : false;
+      if (runtime.budgetReservationRequired === true && !reserveBudget) {
+        throw new ConflictException("Budget admission is required before queueing this prompt");
+      }
       const id = randomUUID();
       const expiresAt = new Date(Date.now() + (input.ttlSeconds ?? DEFAULT_TTL_SECONDS) * 1000).toISOString();
       const inserted = await executor.query<QueueRow>(
@@ -125,7 +142,7 @@ export class QueuedFollowUpService {
           input.input,
           input.intent ?? null,
           JSON.stringify(attachments),
-          JSON.stringify(run.runtime_request ?? {}),
+          JSON.stringify({ ...runtime, queuedBudgetRequestId: budgetRequestId, budgetReservationRequired: budgetRequired }),
           JSON.stringify(run.grounding_context ?? {}),
           JSON.stringify(run.prompt_manifest ?? {}),
           input.idempotencyKey,

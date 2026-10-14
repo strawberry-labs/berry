@@ -234,6 +234,8 @@ export function Composer({
   const uploadControllersRef = React.useRef(new Map<string, AbortController>());
   const promptImprovementControllerRef = React.useRef<AbortController | null>(null);
   const latestTextRef = React.useRef(text);
+  const followUpSubmittingRef = React.useRef(false);
+  const pendingQueueSubmissionRef = React.useRef<QueuedFollowUp | null>(null);
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[]; createImageMode: boolean } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
   const editingFollowUpRef = React.useRef<QueuedFollowUp | null>(null);
@@ -534,18 +536,30 @@ export function Composer({
     }
     if (working && activeTask?.activeSessionId) {
       if (submitIntent === "queue") {
-        await onQueuedFollowUp(createQueuedFollowUp({
-          taskId: activeTask.id,
-          sessionId: activeTask.activeSessionId,
-          ordinal: queuedFollowUps.length,
-          input,
-          ...(intent ? { intent } : {}),
-          attachments,
-        }));
-        setComposerText("");
-        setCreateImageMode(false);
-        editorRef.current?.clear();
-        setAttachments([]);
+        if (followUpSubmittingRef.current) return;
+        followUpSubmittingRef.current = true;
+        setUploadError("");
+        const previous = pendingQueueSubmissionRef.current;
+        const followUp = previous && previous.sessionId === activeTask.activeSessionId
+          && previous.input === input && previous.intent === intent
+          && JSON.stringify(previous.attachments) === JSON.stringify(attachments)
+          ? previous : createQueuedFollowUp({
+            taskId: activeTask.id, sessionId: activeTask.activeSessionId,
+            ordinal: queuedFollowUps.length, input, ...(intent ? { intent } : {}), attachments,
+          });
+        pendingQueueSubmissionRef.current = followUp;
+        try {
+          await onQueuedFollowUp(followUp);
+          pendingQueueSubmissionRef.current = null;
+          setComposerText("");
+          setCreateImageMode(false);
+          editorRef.current?.clear();
+          setAttachments([]);
+        } catch (cause) {
+          setUploadError("Unable to queue this prompt. Your text is still here; retry to send it.");
+        } finally {
+          followUpSubmittingRef.current = false;
+        }
         return;
       }
 
@@ -556,6 +570,8 @@ export function Composer({
         setAttachments([]);
         return;
       }
+      if (followUpSubmittingRef.current) return;
+      followUpSubmittingRef.current = true;
       try {
         await onSteerMessage(activeTask, input, attachments, intent);
         setComposerText("");
@@ -564,6 +580,8 @@ export function Composer({
         setAttachments([]);
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : "Unable to steer the running task");
+      } finally {
+        followUpSubmittingRef.current = false;
       }
       return;
     }

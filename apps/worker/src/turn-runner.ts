@@ -3644,9 +3644,7 @@ WHERE turn_finalizations.status IN ('pending','failed','partial')
         || mutation.nextState === "recovery_required") {
         await finalizeUsageAndBudget(executor, snapshot, mutation.nextState);
       }
-      if (mutation.nextState === "completed") {
-        await promoteQueuedFollowUp(executor, snapshot);
-      } else if (mutation.nextState === "failed"
+      if (mutation.nextState === "failed"
         || mutation.nextState === "cancelled"
         || mutation.nextState === "recovery_required") {
         // A user-visible failure/cancellation pauses the queue. The next item
@@ -3686,6 +3684,9 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
           [snapshot.tenantId, snapshot.sessionId, snapshot.id, mutation.nextState, snapshot.id, projectionSourceSequence, leafId ?? null, snapshot.createdAt],
         );
       }
+      // Promote after the predecessor projection so its terminal state cannot
+      // overwrite the new run or the new user-message leaf.
+      if (mutation.nextState === "completed") await promoteQueuedFollowUpSafely(executor, snapshot);
       for (const step of mutation.steps ?? []) {
         const eventType = step.type.startsWith("tool.") ? "tool.attempt" : "phase.transition";
         await persistWorkerOperationalEvent(executor, {
@@ -6455,6 +6456,69 @@ RETURNING entry_id
   return appended;
 }
 
+/** The caller owns a transaction. A bad queued input must not undo a completed answer. */
+export async function promoteQueuedFollowUpSafely(
+  executor: SqlExecutor,
+  snapshot: Pick<DurableTurnSnapshot, "tenantId" | "sessionId" | "userId" | "id">,
+): Promise<void> {
+  await executor.execute("SAVEPOINT queued_follow_up_promotion");
+  try {
+    await promoteQueuedFollowUp(executor, snapshot);
+    await executor.execute("RELEASE SAVEPOINT queued_follow_up_promotion");
+  } catch (cause) {
+    await executor.execute("ROLLBACK TO SAVEPOINT queued_follow_up_promotion");
+    await executor.execute("RELEASE SAVEPOINT queued_follow_up_promotion");
+    // Preserve the input and require an explicit retry; do not retry a
+    // deterministic persistence failure on every completion or poll.
+    await executor.execute(
+      `UPDATE queued_follow_up_items SET status='failed',
+         last_error='The queued prompt could not start. Your previous answer is saved. Retry this prompt.',
+         updated_at=now()
+       WHERE tenant_id=$1::uuid AND id=(
+         SELECT id FROM queued_follow_up_items WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+           AND status='queued' AND expires_at>now() ORDER BY ordinal LIMIT 1
+       )`,
+      [snapshot.tenantId, snapshot.sessionId],
+    );
+    emitWorkerOperationalEvent("outbox.transition", "unknown", "unknown", {
+      outcome: "queued_follow_up_failed", runId: snapshot.id,
+      errorCode: typeof cause === "object" && cause !== null && "code" in cause ? String(cause.code) : "unknown",
+    });
+  }
+}
+
+/** Resume/retry must progress even when there is no active turn left to finish. */
+export async function promoteIdleQueuedFollowUps(executor: SqlExecutor, tenantId: string): Promise<void> {
+  // Release admission quota for prompts that will never be delivered. Queue
+  // reservations start at zero cost; charged/running work is excluded.
+  await executor.execute(
+    `UPDATE budget_reservations b SET status='released',actual_cost_micros=0,updated_at=now()
+     FROM queued_follow_up_items q
+     WHERE b.tenant_id=$1::uuid AND q.tenant_id=b.tenant_id
+       AND b.request_id=q.runtime_request->>'queuedBudgetRequestId'
+       AND q.status IN ('cancelled','expired') AND b.status='reserved' AND b.reserved_micros=0`,
+    [tenantId],
+  );
+  const candidates = await executor.query<{ session_id: string; owner_user_id: string; run_id: string }>(
+    `SELECT DISTINCT q.session_id,q.owner_user_id,r.id AS run_id
+     FROM queued_follow_up_items q
+     JOIN LATERAL (
+       SELECT id FROM turn_runs WHERE tenant_id=q.tenant_id AND session_id=q.session_id
+       ORDER BY created_at DESC LIMIT 1
+     ) r ON true
+     WHERE q.tenant_id=$1::uuid AND q.status='queued' AND q.expires_at>now() AND q.next_attempt_at<=now()
+       AND NOT EXISTS (SELECT 1 FROM turn_runs active
+         WHERE active.tenant_id=q.tenant_id AND active.session_id=q.session_id
+           AND active.state NOT IN ('completed','failed','cancelled','recovery_required'))
+     LIMIT 25`, [tenantId],
+  );
+  for (const row of candidates) {
+    await promoteQueuedFollowUpSafely(executor, {
+      tenantId, sessionId: row.session_id, userId: row.owner_user_id, id: row.run_id,
+    });
+  }
+}
+
 /**
  * Promote exactly one server-owned follow-up in the same transaction that
  * settles its predecessor. The queue row, user projection, journal entry,
@@ -6462,7 +6526,17 @@ RETURNING entry_id
  * back. A worker crash cannot lose a prompt between "delivered" and the new
  * durable run, and a duplicate terminal event cannot deliver it twice.
  */
-async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTurnSnapshot): Promise<void> {
+export async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: Pick<DurableTurnSnapshot, "tenantId" | "sessionId" | "userId" | "id">): Promise<void> {
+  await executor.query(
+    `SELECT t.id FROM tasks t JOIN sessions s ON s.task_id=t.id AND s.tenant_id=t.tenant_id
+     WHERE t.tenant_id=$1::uuid AND s.id=$2::uuid FOR NO KEY UPDATE OF t`,
+    [snapshot.tenantId, snapshot.sessionId],
+  );
+  const sessions = await executor.query<{ id: string }>(
+    `SELECT id FROM sessions WHERE tenant_id=$1::uuid AND id=$2::uuid AND deleted_at IS NULL FOR UPDATE`,
+    [snapshot.tenantId, snapshot.sessionId],
+  );
+  if (!sessions[0]) return;
   // A worker can be restarted after a queue row is claimed but before the
   // terminal transaction finishes. Recover old leases and make access changes
   // fail closed instead of leaving a prompt stuck forever.
@@ -6491,11 +6565,16 @@ async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTur
        JOIN tasks t ON t.tenant_id=q.tenant_id AND t.id=q.task_id
        WHERE q.tenant_id=$1::uuid AND q.session_id=$2::uuid
          AND q.status='queued' AND q.next_attempt_at<=now() AND q.expires_at>now()
+         AND NOT EXISTS (
+           SELECT 1 FROM queued_follow_up_items earlier
+           WHERE earlier.tenant_id=q.tenant_id AND earlier.session_id=q.session_id
+             AND earlier.ordinal<q.ordinal AND earlier.expires_at>now()
+             AND earlier.status IN ('queued','delivering','paused','failed')
+         )
          AND t.deleted_at IS NULL AND t.user_id=$3::uuid
          AND NOT EXISTS (
            SELECT 1 FROM turn_runs active
            WHERE active.tenant_id=q.tenant_id AND active.session_id=q.session_id
-             AND active.id<>$4::uuid
              AND active.state NOT IN ('completed','failed','cancelled','recovery_required')
          )
        ORDER BY q.ordinal ASC,q.id ASC
@@ -6509,7 +6588,7 @@ async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTur
      WHERE q.tenant_id=$1::uuid AND q.id=candidate.id
      RETURNING q.id,q.workspace_id,q.task_id,q.session_id,q.owner_user_id,q.ordinal,q.input,q.intent,
                q.attachments,q.runtime_request,q.grounding_context,q.prompt_manifest,q.attempt_count,q.delivery_key`,
-    [snapshot.tenantId, snapshot.sessionId, snapshot.userId, snapshot.id],
+    [snapshot.tenantId, snapshot.sessionId, snapshot.userId],
   );
   const queued = rows[0];
   if (!queued) {
@@ -6566,6 +6645,27 @@ async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTur
     );
   }
 
+  await executor.execute(
+    `INSERT INTO turn_runs (
+       id,tenant_id,user_id,workspace_id,task_id,session_id,request_id,request_message_id,
+       state,next_action,runtime_request,grounding_context,prompt_manifest
+     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8::uuid,
+       'queued','Assemble durable context',$9::jsonb,$10::jsonb,$11::jsonb)`,
+    [
+      runId,
+      snapshot.tenantId,
+      queued.owner_user_id,
+      queued.workspace_id,
+      queued.task_id,
+      queued.session_id,
+      requestId,
+      requestMessageId,
+      JSON.stringify(runtime),
+      JSON.stringify(queued.grounding_context ?? {}),
+      JSON.stringify(queued.prompt_manifest ?? {}),
+    ],
+  );
+
   const leaf = await executor.query<{ entry_id: string | null }>(
     `SELECT entry_id FROM session_entries
      WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
@@ -6604,26 +6704,6 @@ async function promoteQueuedFollowUp(executor: SqlExecutor, snapshot: DurableTur
     ],
   );
 
-  await executor.execute(
-    `INSERT INTO turn_runs (
-       id,tenant_id,user_id,workspace_id,task_id,session_id,request_id,request_message_id,
-       state,next_action,runtime_request,grounding_context,prompt_manifest
-     ) VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8::uuid,
-       'queued','Assemble durable context',$9::jsonb,$10::jsonb,$11::jsonb)`,
-    [
-      runId,
-      snapshot.tenantId,
-      queued.owner_user_id,
-      queued.workspace_id,
-      queued.task_id,
-      queued.session_id,
-      requestId,
-      requestMessageId,
-      JSON.stringify(runtime),
-      JSON.stringify(queued.grounding_context ?? {}),
-      JSON.stringify(queued.prompt_manifest ?? {}),
-    ],
-  );
   await executor.execute(
     `INSERT INTO turn_steps (
        id,tenant_id,run_id,sequence,step_type,state,input,output,retry_class,idempotency_key,attempt,started_at,completed_at
@@ -6671,11 +6751,11 @@ export function queuedFollowUpRuntimeRequest(
   const { intent: _previousIntent, ...runtime } = record(previousRuntime) ?? {};
   return {
     ...runtime,
-    requestId: `queued:${queued.id}:${queued.attempt_count}`,
+    requestId: typeof runtime.queuedBudgetRequestId === "string" ? runtime.queuedBudgetRequestId : `queued:${queued.id}:${queued.attempt_count}`,
     input: queued.input,
     ...(queued.intent ? { intent: queued.intent } : {}),
     continueInterruptedTurn: false,
-    budgetReservationRequired: true,
+    budgetReservationRequired: runtime.budgetReservationRequired === true,
     attachments: Array.isArray(queued.attachments) ? queued.attachments : [],
   };
 }

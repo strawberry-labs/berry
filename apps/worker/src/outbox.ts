@@ -1,3 +1,4 @@
+import { promoteIdleQueuedFollowUps } from "./turn-runner.js";
 import {
   BerryWorkerJobNameSchema,
   SandboxSnapshotJobPayloadSchema,
@@ -83,6 +84,7 @@ export class RuntimeOutboxDispatcher {
       const runTerminalCleanup = this.terminalCleanupDue();
       for (const tenantId of tenantIds) {
         await this.withTenant(tenantId, (executor) => this.recoverExpiredAdmissions(executor, tenantId));
+        await this.withTenant(tenantId, (executor) => promoteIdleQueuedFollowUps(executor, tenantId));
         if (this.options.enableWaitExpiry) {
           await this.withTenant(tenantId, (executor) => this.superviseWaits(executor, tenantId));
         }

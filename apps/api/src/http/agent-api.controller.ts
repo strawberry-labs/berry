@@ -1490,7 +1490,22 @@ export class AgentApiController {
     const attachments = parsed.attachments.length > 0
       ? await this.files.runtimeAttachments(tenantIdFromRequest(request), request.auth!.user.id, parsed.attachments, { taskId: task.id, sessionId })
       : [];
-    return this.queuedFollowUps.enqueue(tenantIdFromRequest(request), request.auth!.user.id, sessionId, { ...parsed, attachments });
+    const tenantId = tenantIdFromRequest(request);
+    const userId = request.auth!.user.id;
+    const departmentId = await this.#primaryDepartmentId(tenantId, userId);
+    return this.queuedFollowUps.enqueue(tenantId, userId, sessionId, { ...parsed, attachments }, async (runtime, requestId) => {
+      const check = await this.budgets.reserve({
+        tenantId, userId, departmentId, taskId: task.id, sessionId, requestId,
+        feature: "model", provider: typeof runtime.providerId === "string" ? runtime.providerId : null,
+        model: typeof runtime.model === "string" ? runtime.model : null,
+        // The worker reserves the actual next-call estimate before calling a
+        // provider. Queue admission still checks billing health and quotas.
+        estimatedCostMicros: 0,
+        estimatedTokens: typeof runtime.maxTokens === "number" ? runtime.maxTokens : 4000,
+        metadata: { workspaceId: task.workspaceId, queuedFollowUp: true },
+      });
+      return Boolean(check.reservation);
+    });
   }
 
   @Patch("/follow-ups/:followUpId")

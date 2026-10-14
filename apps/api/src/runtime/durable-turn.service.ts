@@ -2141,6 +2141,13 @@ async function cancelActiveDurableRun(
   tenantId: string,
   active: { id: string; task_id: string; session_id: string; request_message_id: string | null; sandbox_id: string | null },
 ): Promise<void> {
+  await transaction.execute(
+    `UPDATE queued_follow_up_items
+     SET status='paused',last_error='Queue paused because the active turn was cancelled',updated_at=now()
+     WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+       AND status IN ('queued','delivering') AND expires_at>now()`,
+    [tenantId, active.session_id],
+  );
   const ambiguousRows = await transaction.query<{ step_id: string; tool_call_id: string }>(
     `
 SELECT s.id AS step_id,tc.id AS tool_call_id

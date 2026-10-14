@@ -26,7 +26,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 
 | ID | Priority | Issue | Evidence | Status |
 |---|---|---|---|---|
-| H-001 | P0 | Queue delivery and steering | Observed + reproduced locally | Local fixes tested; not deployed |
+| H-001 | P0 | Queue delivery and steering | Observed + reproduced locally | Committed locally (see IMPLEMENTATION_PROGRESS.md); not deployed |
 | H-002 | P0 | Rewrite changes voice, sender or intent | Observed conversations + synthetic model evaluation | Prompt deployed; monthly semantic drift confirmed |
 | H-003 | P0 | Tool errors lack consistent recovery classification | Code finding + proposal | Open; validate incident mapping |
 | H-004 | P0 | Repair loops can survive argument changes | Code finding; production loops observed separately | Open; targeted reproduction needed |
@@ -114,6 +114,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Additional local findings/fixes: projection ordering, completed-answer rollback on promotion failure, idle resume, stream reattachment, actual queued-item steering, duplicate retry protection, budget admission and reservation identity.
 - Verification: 8 PostgreSQL scenarios and 4 Chromium scenarios passed; focused tests, type checks and web build passed. Browser tests use a deterministic model and local HTTP adapter.
 - Remaining: deploy corresponding API/worker/web changes together and verify synthetic production queue/steering flows. Do not replay expired historical requests automatically.
+- **Implementation (14 October):** FK failure reproduced against `99964f1` with real PostgreSQL and the real worker (completed run rewritten to `failed`, queue row `paused` with `attempt_count=0`, no follow-up run). Prepared fix reviewed and committed: run row inserted before its journal entry, promotion after the predecessor projection inside a savepoint, strict FIFO, idle promotion, stable queue budget identity, session-bound idempotency, pause-on-cancel, and web retry/steer fixes. Isolated verification: typechecks, 126 focused unit tests, 8 PostgreSQL and 4 Chromium scenarios. Status: committed locally, **not deployed**; API, worker and web must ship together. See [IMPLEMENTATION_PROGRESS.md](IMPLEMENTATION_PROGRESS.md#h-001--queue-delivery-and-steering-p0).
 - **Monthly revalidation (13 October):** 83 terminal FK errors / 67 tasks / 42 users. Running compiled promotion still writes the journal before the next run exists. Of 107 retained monthly queue records, zero delivered; 56 expired, 49 cancelled, 2 paused. Stored attempt zero can result from rollback and does not prove no delivery was attempted. Do not count all cancellations as failures. Prepared local queue changes remain undeployed. See [monthly plan](output/platform-audit-2026-10-13/report.md).
 
 ### H-002 — Rewrite changes voice, sender or intent

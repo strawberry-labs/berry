@@ -1925,8 +1925,11 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
                 // that newer pending turn.
                 if (!state.active && activeSessionsRef.current.has(sessionId)) return;
                 applyDurableState(sessionId, state);
-                if (state.active) activeSessionsRef.current.add(sessionId);
-                else resetSessionStream(sessionId);
+                if (state.active) {
+                  activeSessionsRef.current.add(sessionId);
+                  trackedSessionsRef.current.add(sessionId);
+                  void connect(0).catch(() => undefined);
+                } else resetSessionStream(sessionId);
               })
               .catch((cause) => {
                 if (attempt < 2) {
@@ -2700,13 +2703,14 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       const mapped = page.items.map(serverQueuedFollowUpToClient);
       followUpsBySessionRef.current = { ...followUpsBySessionRef.current, [sessionId]: mapped };
       setFollowUpsBySession((state) => ({ ...state, [sessionId]: mapped }));
+      await attachSessionStream(sessionId);
       return;
     }
     updateSessionFollowUps(sessionId, (current) => current.map((followUp) => followUp.status === "paused"
       ? { ...followUp, status: "queued", pausedReason: null, error: null, updatedAt: new Date().toISOString() }
       : followUp));
     window.setTimeout(() => sendNextQueuedFollowUpRef.current(sessionId), 0);
-  }, [client, updateSessionFollowUps]);
+  }, [attachSessionStream, client, updateSessionFollowUps]);
 
   /**
    * A steer is an interruption, not an inline instruction to the old turn.
@@ -2857,11 +2861,24 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
     // browser only changes the durable queue state; the worker promotes the
     // next item in the same transaction that completes the active turn.
     if (client) {
-      const persisted = await client.updateQueuedFollowUp(requestedFollowUp.id, { status: "queued" });
+      const sessionId = requestedFollowUp.sessionId;
+      if (activeSessionsRef.current.has(sessionId)) {
+        await client.cancelTurn(sessionId);
+        stopSessionConnection(sessionId);
+        activeSessionsRef.current.delete(sessionId);
+        resetSessionStream(sessionId);
+        await refreshSessionMessages(sessionId);
+      }
+      const page = await client.listQueuedFollowUps(sessionId, { limit: 100 });
+      const persisted = await client.updateQueuedFollowUp(requestedFollowUp.id, {
+        status: "queued",
+        orderedIds: [requestedFollowUp.id, ...page.items.filter((item) => item.id !== requestedFollowUp.id).map((item) => item.id)],
+      });
       updateSessionFollowUps(requestedFollowUp.sessionId, (current) => [
         ...current.filter((item) => item.id !== persisted.id),
         serverQueuedFollowUpToClient(persisted),
       ].sort((left, right) => left.ordinal - right.ordinal));
+      await attachSessionStream(sessionId);
       return;
     }
     const deliverCurrent = async () => {
@@ -2883,7 +2900,7 @@ function CloudShell({ initial, user, onSignedOut }: { initial: ShellData; user: 
       return;
     }
     await locks.request(`berry.web.queueDelivery:${requestedFollowUp.sessionId}`, { mode: "exclusive" }, deliverCurrent);
-  }, [client, deliverFollowUp, updateSessionFollowUps]);
+  }, [attachSessionStream, client, deliverFollowUp, refreshSessionMessages, resetSessionStream, stopSessionConnection, updateSessionFollowUps]);
 
   const retryFollowUp = React.useCallback(async (followUp: QueuedFollowUp) => {
     const queued = { ...followUp, status: "queued" as const, error: null, pausedReason: null, updatedAt: new Date().toISOString() };

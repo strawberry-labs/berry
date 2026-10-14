@@ -85,6 +85,13 @@ describe("durable turn runner", () => {
     expect(prompt.stableSystemPrompt).toContain("outputs directory");
   });
 
+  it("keeps a queued prompt's billing identity across delivery retries", () => {
+    const runtime = queuedFollowUpRuntimeRequest({ queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true }, {
+      id: "row-id", attempt_count: 3, input: "Rewrite this email", intent: null, attachments: [],
+    });
+    expect(runtime).toMatchObject({ requestId: "queued:browser-key", budgetReservationRequired: true, continueInterruptedTurn: false });
+  });
+
   it("guides ordinary image-edit turns toward the admitted image tool", () => {
     expect(durableImageToolSelectionPrompt([...DURABLE_BASE_BUILT_IN_TOOLS, "create_image"]))
       .toBe(DURABLE_IMAGE_TOOL_SELECTION_PROMPT);
