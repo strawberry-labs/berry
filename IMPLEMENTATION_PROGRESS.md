@@ -47,7 +47,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f2bace0` | H-046/H-060/H-071 | None. |
 | `91208bc` | H-009 (text-only finalisation) | None. |
 | `d95b252` | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
-| _pending_ | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
+| _pending_ | H-033 | None. |
+| `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
@@ -81,7 +82,8 @@ No pre-existing failures were observed in these suites.
 | H-046 / H-060 / H-071 (image path lifetime and selection) | Committed | `f2bace0` | Not deployed (worker) |
 | H-009 (text-only finalisation) | Committed — partial | `91208bc` | Not deployed (worker) |
 | H-075 (internal connector session lifetime) | Committed | `d95b252` | Not deployed (API only) |
-| H-031 (blob-deletion receipt SQL) | Committed | _pending_ | Not deployed (worker); backlog reconciliation not started |
+| H-031 (blob-deletion receipt SQL) | Committed | `f30b651` | Not deployed (worker); backlog reconciliation not started |
+| H-033 (revision provenance) | Committed — partial | _pending_ | Not deployed (shared package; API + worker rebuild) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -567,3 +569,21 @@ No pre-existing failures were observed in these suites.
 - **Not done (needs its own reviewed plan).** Reconciling the historical dead-letter
   backlog: the remote objects may already be deleted, so replay must check immutable
   object version, live references, tenant and lease; no production rows were touched.
+- **Commit.** `f30b651`.
+
+### H-033 — Deployed revision rejected by the telemetry validator
+
+- **Evidence.** 1,924 monthly runs record revision `unknown`; every inspected worker
+  environment uses a build revision containing `+production-hotfixes`.
+- **Root cause (confirmed).** `sourceRevisionFromEnv` and the operational-log field filter
+  both accepted only `[A-Za-z0-9._/-]`, so any revision with `+` build metadata became
+  `unknown`.
+- **Fix.** One shared pattern that also allows `+`; spaces/shell metacharacters are still
+  rejected.
+- **Files.** `packages/shared/src/operational-telemetry.ts` (+test).
+- **Verification (isolated snapshot).** shared/worker/API typecheck pass; shared suite
+  122/122; the new `<sha>+production-hotfixes` assertions fail on the previous source.
+- **Deployment.** Not deployed; takes effect when API and worker are rebuilt.
+- **Remaining (H-033 stays open).** Unique provider-attempt identities and an immutable
+  release/hotfix manifest belong with the cache instrumentation (H-032). Note that the
+  revision string itself cannot prove what code runs (see the H-014 parity finding).

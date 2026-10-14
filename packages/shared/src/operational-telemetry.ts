@@ -81,6 +81,10 @@ const SAFE_FIELDS = new Set([
   "sourceRevision",
 ]);
 
+// `+` carries build metadata such as `<sha>+production-hotfixes`; rejecting it
+// made every production run report an unknown revision.
+const SOURCE_REVISION_PATTERN = /^[A-Za-z0-9._/+-]+$/;
+
 const DURABLE_REFERENCE_FIELDS = new Set(["runId", "stepId", "outboxId"]);
 
 export type OperationalScalar = string | number | boolean | null;
@@ -100,7 +104,7 @@ export function safeOperationalFields(fields: Record<string, unknown>): Record<s
       if (key === "workerRole") {
         result[key] = normalizeWorkerRole(bounded);
       } else if (key === "sourceRevision") {
-        result[key] = /^[A-Za-z0-9._/-]+$/.test(bounded) ? bounded : "unknown";
+        result[key] = SOURCE_REVISION_PATTERN.test(bounded) ? bounded : "unknown";
       } else {
         result[key] = bounded;
       }
@@ -139,7 +143,7 @@ export function sourceRevisionFromEnv(env: Record<string, string | undefined>): 
   ].find((value) => typeof value === "string" && value.trim());
   if (!candidate) return "unknown";
   const normalized = candidate.trim().slice(0, 128);
-  return /^[A-Za-z0-9._/-]+$/.test(normalized) ? normalized : "unknown";
+  return SOURCE_REVISION_PATTERN.test(normalized) ? normalized : "unknown";
 }
 
 export type OperationalLogPolicy = {

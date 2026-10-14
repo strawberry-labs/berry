@@ -58,7 +58,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-030 | P1 | Legitimate asynchronous polling triggers loop termination | Observed raw trace + matching code | Open; bounded polling regression needed |
 | H-031 | P0 | Blob deletion receipt fails SQL parameter inference | Production stack traces + read-only PREPARE reproduction | Fix committed locally (not deployed); backlog reconciliation needs a separate reviewed plan |
 | H-032 | P1 | Cache metrics obscure low token coverage | Complete final-window usage + code + prior audit | Final-window 17.81% token coverage; stable-prefix loss attribution open |
-| H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Unresolved; 1,924 runs marked unknown |
+| H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Validator fix committed locally (not deployed); attempt IDs/release manifest open |
 | H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending |
 | H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified |
 | H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Production occurrence not established |
@@ -443,6 +443,8 @@ Deployment and rollback details: [deployment record](output/rewrite-prompt-2026-
 - Acceptance: actual production identifiers survive validation; new runs link to exact release. Estimate 0.5–1 day.
 
 Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,243 groups/468 runs have multiple reports and1,174 eventually succeed. This is model-call recovery, not task completion. There are1,382 repeated run/logical/ordinal keys and one exact duplicated aborted payload, so2,622 additional reports cannot be called exact physical retries. Same-route stream-to-buffer fallback is also reported as fallback. Extend H-033 with unique provider-request attempt IDs, retry-layer/transport/actual route, and reconciliation tests (1–2 additional days). Do not blindly deduplicate ordinal collisions.
+
+- **Implementation (14 October):** the shared revision pattern now accepts `+` build metadata, so `<sha>+production-hotfixes` is recorded instead of `unknown`. Not deployed.
 
 ### H-034 — Unsupported refusal counted as completion
 
