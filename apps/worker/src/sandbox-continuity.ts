@@ -119,6 +119,10 @@ const DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS = 60_000;
 const DEFAULT_TERMINAL_SUSPEND_TIMEOUT_MS = 70_000;
 const DEFAULT_INPUT_AVAILABILITY_TIMEOUT_MS = 75_000;
 const DEFAULT_INPUT_AVAILABILITY_POLL_MS = 1_000;
+// A connector import returns before its blob is verified (observed 73-472 ms
+// races); wait briefly and poll quickly rather than report a missing path.
+const DEFAULT_IMPORT_AVAILABILITY_TIMEOUT_MS = 30_000;
+const DEFAULT_IMPORT_AVAILABILITY_POLL_MS = 250;
 const MAX_SNAPSHOT_FILES = 5_000;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
@@ -520,6 +524,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       terminalSuspendTimeoutMs?: number;
       inputAvailabilityTimeoutMs?: number;
       inputAvailabilityPollMs?: number;
+      importAvailabilityTimeoutMs?: number;
+      importAvailabilityPollMs?: number;
       enableTerminalFinalization?: boolean;
       documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
       imageGeneration?: {
@@ -709,8 +715,19 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const sandbox = await this.ensureSandbox(snapshot, options.signal);
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const selected = new Set(fileIds.map((fileId) => fileId.toLowerCase()));
-    const files = (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
+    const readSelected = async () => (await this.repository.inputFiles(snapshot.tenantId, snapshot.id))
       .filter((file) => selected.has(file.fileId.toLowerCase()));
+    let files = await readSelected();
+    // Only verified blobs are listed. A just-imported file appears once its
+    // verification job finishes; staging must not read unverified bytes.
+    const timeoutMs = Math.max(0, this.options.importAvailabilityTimeoutMs ?? DEFAULT_IMPORT_AVAILABILITY_TIMEOUT_MS);
+    const pollMs = Math.max(1, this.options.importAvailabilityPollMs ?? DEFAULT_IMPORT_AVAILABILITY_POLL_MS);
+    const deadline = Date.now() + timeoutMs;
+    while (files.length < selected.size && Date.now() < deadline) {
+      await waitForInputAvailability(Math.min(pollMs, Math.max(1, deadline - Date.now())), options.signal);
+      files = await readSelected();
+      options.reportProgress?.();
+    }
     options.signal?.throwIfAborted();
     await this.stageInputFiles(snapshot, sandbox.id, this.repository, selected, options.signal, options.reportProgress, files);
     return files.map((file) => ({

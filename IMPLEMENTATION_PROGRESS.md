@@ -50,7 +50,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `52c0260` | H-033 | None. |
 | `3a27931` | H-032 (diagnostics) | None. |
 | `9eecde6` | H-032 (prompt layout) | None (prompt assembly only). |
-| _pending_ | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
+| _pending_ | H-068 | None. |
+| `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
@@ -97,7 +98,8 @@ No pre-existing failures were observed in these suites.
 | H-032 (cache metric truth) | Committed — partial | `29dd951` | Not deployed (worker + API + web) |
 | H-032 (served backend + retention diagnostics) | Committed — partial | `3a27931` | Not deployed (worker) |
 | H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | `9eecde6` | Not deployed (worker) |
-| H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | _pending_ | Not deployed (worker) |
+| H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | `f6f9074` | Not deployed (worker) |
+| H-068 (import readiness) | Committed | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -776,3 +778,31 @@ No pre-existing failures were observed in these suites.
   is a skill-package sync, not a code deployment. Against the working-tree packages the
   manifests resolve every helper for all four Office entry points without staging
   templates, and every staged script compiles.
+- **Commit.** `f6f9074`.
+
+### H-068 — Connector import reports ready before the file can be used
+
+- **Evidence.** 217 of 270 first Drive-import receipts in the month (80.37%) returned no
+  sandbox path (49 tasks / 14 users); task 559 then probed the filesystem three times;
+  timestamp correlations in tasks 1191 (75 ms), 1172 (472 ms), 1189 (~73 ms) and 1217
+  (~351 ms) show the receipt completing before blob verification. One counterexample
+  (an already verified blob) shows timing is not the only cause.
+- **Root cause (code-confirmed).** `importConnectorArtifact` returns before its blob is
+  verified; the worker's `stageAssociatedInputFiles` read the verified-only input list
+  once and returned an empty list; the MCP wrapper then reported a successful download
+  ("stored as a task-scoped Berry artifact") with no path or next step. Attachments
+  already have a bounded verification wait; imports did not use it.
+- **Fix.** Imports wait for verification with a 30 s bound and 250 ms polls (attachments
+  keep 75 s / 1 s), never reading unverified bytes. If still unverified, the receipt says
+  so explicitly ("still verifying… call this import again for the same file… do not
+  search the filesystem") and carries `stagingStatus: "pending_verification"` (or
+  `"ready"`). Executors without staging keep the previous wording.
+- **Files.** `apps/worker/src/sandbox-continuity.ts`, `apps/worker/src/mcp-tools.ts`, and tests.
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 963 /
+  6 skipped. New: an import verified on the second poll is staged; one still unverified
+  at the deadline returns no path without staging; pending receipt wording. Two of
+  these fail on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** The audit's counterexample (missing path with an already-verified blob)
+  and the API-side typed pending state are not addressed; H-069 (Library persistence)
+  is separate.

@@ -169,10 +169,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           ...(reportProgress ? { reportProgress } : {}),
         })
       : [];
-    if (artifact) {
-      const stagedArtifact = staged.find((item) => item.fileId === artifact.fileId);
-      text = connectorArtifactText(artifact, stagedArtifact);
-    }
+    const stagedArtifact = artifact ? staged.find((item) => item.fileId === artifact.fileId) : undefined;
+    if (artifact) text = connectorArtifactText(artifact, stagedArtifact, Boolean(this.base.stageAssociatedInputFiles));
     const parts = sanitizeMcpJournalValue(result.content);
     return {
       output: {
@@ -181,6 +179,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         details: sanitizeMcpJournalValue(result.details),
         parts,
         ...(staged.length ? { artifacts: staged.map((item) => ({ ...item })) } : {}),
+        ...(artifact && this.base.stageAssociatedInputFiles
+          ? { stagingStatus: stagedArtifact ? "ready" : "pending_verification" }
+          : {}),
       },
       summary: text ? `${toolName} returned results` : `${toolName} completed`,
     };
@@ -719,17 +720,22 @@ function connectorArtifact(value: unknown): ConnectorArtifact | null {
 export function connectorArtifactText(
   artifact: ConnectorArtifact,
   staged: StagedConnectorArtifact | undefined,
+  stagingAvailable = true,
 ): string {
   const disposition = artifact.library === true
     ? `Saved ${artifact.name} to the Berry Library.`
     : artifact.library === false
       ? `Downloaded ${artifact.name} for temporary use in this task.`
       : `Imported ${artifact.name} into Berry.`;
+  // Without a sandbox path the file is not usable yet; say so explicitly so the
+  // model neither assumes a path nor searches the filesystem for it.
   const storage = staged
     ? `Sandbox path: ${staged.path}`
-    : artifact.library === false
-      ? "The file is stored as a task-scoped Berry artifact."
-      : "The file is stored as a Berry artifact.";
+    : stagingAvailable
+      ? `Berry is still verifying ${artifact.name}, so it is not in the sandbox yet. Call this import again for the same file to stage it; it reuses this Berry file. Do not search the filesystem for it.`
+      : artifact.library === false
+        ? "The file is stored as a task-scoped Berry artifact."
+        : "The file is stored as a Berry artifact.";
   const persistence = artifact.library === false
     ? "It was not added to the Berry Library or project knowledge."
     : "";

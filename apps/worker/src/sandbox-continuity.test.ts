@@ -3057,6 +3057,52 @@ describe("SandboxContinuityManager", () => {
     expect(writeStream).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    ["verifies within the wait", 2, 1],
+    ["is still unverified at the deadline", Number.POSITIVE_INFINITY, 0],
+  ] as const)("stages a connector import that %s", async (_label, verifiedOnCall, expected) => {
+    const file = {
+      fileId: "00000000-0000-7000-8000-000000000123",
+      name: "rfp.pdf",
+      mediaType: "application/pdf",
+      sizeBytes: 4,
+      objectKey: "objects/rfp.pdf",
+    };
+    let calls = 0;
+    const writeStream = vi.fn(async (input: { path: string }) => ({ path: input.path, size_bytes: 4, mtime: null }));
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-import", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: { read: vi.fn(), write: vi.fn(), writeStream, list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })) },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      // The verification job finishes after the import returned (task 1191: 75 ms later).
+      inputFiles: vi.fn(async () => (++calls >= verifiedOnCall ? [file] : [])),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn(),
+      streamSource: vi.fn(async function* () { yield new Uint8Array([1, 2, 3, 4]); }),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox", importAvailabilityPollMs: 1, importAvailabilityTimeoutMs: 50,
+    });
+    const current = snapshot();
+    current.steps = [];
+
+    const staged = await manager.stageAssociatedInputFiles(current, [file.fileId]);
+
+    expect(staged).toHaveLength(expected);
+    expect(writeStream).toHaveBeenCalledTimes(expected);
+    if (expected) expect(staged[0]?.path).toBe("/workspace/inputs/00000000-0000-7000-8000-000000000123/rfp.pdf");
+  });
+
   it("does not stage task attachments for an unrelated sandbox operation", async () => {
     const writeStream = vi.fn();
     const provider = {

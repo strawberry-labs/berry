@@ -587,6 +587,24 @@ describe("connector artifact staging", () => {
     expect(text).not.toContain("Searchable extraction is queued");
   });
 
+  it("says a just-imported file is still verifying instead of implying a usable path", () => {
+    const text = connectorArtifactText(
+      { fileId: "file-1", name: "rfp.pdf", mediaType: "application/pdf", library: false },
+      undefined,
+    );
+
+    expect(text).toContain("Berry is still verifying rfp.pdf, so it is not in the sandbox yet");
+    expect(text).toContain("Call this import again for the same file");
+    expect(text).toContain("Do not search the filesystem");
+    expect(text).not.toContain("Sandbox path");
+  });
+
+  it("keeps the artifact wording where sandbox staging is not available", () => {
+    const text = connectorArtifactText({ fileId: "file-1", name: "rfp.pdf", mediaType: "application/pdf", library: false }, undefined, false);
+    expect(text).toContain("The file is stored as a task-scoped Berry artifact.");
+    expect(text).not.toContain("still verifying");
+  });
+
   it("labels intentionally persisted Drive downloads as Library files", () => {
     const text = connectorArtifactText(
       { fileId: "file-1", name: "brief.pdf", mediaType: "application/pdf", library: true },
