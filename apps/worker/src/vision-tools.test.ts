@@ -128,6 +128,43 @@ describe("DurableVisionToolExecutor", () => {
     expect(requestBody).not.toHaveProperty("reasoning_effort");
   });
 
+  it("passes resize and omission notes to the vision model and invalidates stale cached selections", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
+      id: "vision-notes", model: "minimax-m3",
+      choices: [{ message: { content: "One readable page." }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    let note = "[Image not sent: broken.png; create a smaller PNG/JPEG copy and read it.]";
+    const executor = new DurableVisionToolExecutor({
+      modelContent: async () => [
+        { type: "text", text: "Workspace image 1: page.png [Preview: 4000x2000 to 2000x1000]" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } },
+        { type: "text", text: note },
+      ], execute: vi.fn(),
+    }, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" });
+    const current = visionSnapshot();
+    const first = await executor.execute(current, visionStep());
+    expect(JSON.stringify(first.output)).toContain(note);
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body)).toContain("4000x2000 to 2000x1000");
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body)).toContain(note);
+    note = "[Image not sent: another.png; crop the relevant region.]";
+    const second = await executor.execute(current, visionStep());
+    expect(second.output).toMatchObject({ vision: { cacheHit: false } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns image recovery guidance without a provider call when every image was omitted", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const executor = new DurableVisionToolExecutor({
+      modelContent: async () => [{ type: "text", text: "[Image not sent: large.png; create a smaller PNG/JPEG copy or crop, then read it.]" }],
+      execute: vi.fn(),
+    }, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" });
+    await expect(executor.execute(visionSnapshot(), visionStep())).rejects.toThrow("create a smaller PNG/JPEG copy or crop");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("retries one empty reasoning-only response and persists sanitized attempt diagnostics", async () => {
     let call = 0;
     const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => {

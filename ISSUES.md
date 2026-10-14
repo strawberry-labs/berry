@@ -195,6 +195,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Acceptance: representative reproductions fail early with useful diagnostics or recover without submitting the same invalid/oversized payload again. Do not classify every HTTP 400 as the same root cause.
 - **Monthly revalidation:** 15 terminal Unicode runs / 13 tasks / 7 users and 36 HTTP413 runs / 17 tasks / 4 users. Reviewed `.skill` ZIP and PPSX reads take a UTF-8 path; compiled extension detection lacks those types. Read by verified format/MIME/signature, handle binary diagnostics safely and review the prepared image guard, which is not deployed. HTTP400/schema failures require their own tracing; do not combine all input failures into one cause.
 
+- **Implementation (14 October):** the prepared model-image guard (bounded previews, omission notices, final 4 MiB serialized-request gate, explicit 413 message) is committed with a lockfile regenerated for the worker's `sharp` dependency only. Not deployed. Encoding/binary dispatch and malformed tool arguments remain open.
+
 ### H-012 — Deliverable correctness
 
 - User-report evidence: task `a2a2e640-1c61-4995-9282-db827787e4f9` reports missing costs/circular references; `2a486b91-d8d4-4687-b970-b4d90bdc9302` reports 180 days changed to 28; `a5b1958b-0d84-4662-a8ac-d15803b33626` and `f8051092-76c7-4ca2-bced-166ee8f52cce` report opening problems.

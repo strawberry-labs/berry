@@ -45,7 +45,8 @@ No pre-existing failures were observed in these suites.
 | --- | --- | --- | --- |
 | H-001 | Committed | `d7a806a` | Not deployed (API + worker + web must ship together) |
 | H-009 (reconnect after cross-worker pause) | Committed — partial | `0cfe1d4` | Not deployed (worker + sandbox-contract) |
-| H-014 (prerequisite: late mutation receipts) | Committed — source of the already-deployed hotfix | _pending_ | Deployed 2026-09-30 per record; exact production byte parity not reproducible (see entry) |
+| H-014 (prerequisite: late mutation receipts) | Committed — source of the already-deployed hotfix | `d481431` | Deployed 2026-09-30 per record; exact production byte parity not reproducible (see entry) |
+| H-011 (image payload guard) | Committed — partial | _pending_ | Not deployed (worker image; needs Sharp's Linux binary from the frozen lockfile) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -196,3 +197,40 @@ No pre-existing failures were observed in these suites.
 - **Files.** `apps/worker/src/turn-runner.ts` (four hunks), `apps/worker/src/turn-runner.test.ts`.
 - **Remaining (H-014 stays open).** Operation-specific recovery actions/UX and
   metadata-only bash classification.
+- **Commit.** `d481431`.
+
+### H-011 — Image payload guard before provider submission
+
+- **Evidence.** Task `ebb508e9…`, run `17fe4e71…` (`output/model-image-guard-2026-09-29/README.md`):
+  after two image reads the message content grew from 3.95 M to 6.32 M characters and
+  the route returned HTTP 413 in ~0.5 s with no usage. Audit finding 7: tasks 65, 84,
+  85, 131 and 75 also end with terminal 413s; the month has 36 HTTP 413 runs / 17 tasks.
+  The guard was prepared on 29 September and held back only because deployment was
+  deferred; it is absent from all six deployed workers.
+- **Root cause.** Model requests accumulated full-resolution image bytes from workspace
+  reads/attachments with only a per-file 20 MiB and 50 MiB combined *source* limit, and
+  no final check of the serialized request size. The rejecting component's exact byte
+  ceiling is not retained, so the 4 MiB target is conservative rather than measured.
+- **Decision.** Commit the prepared guard unchanged (it addresses the cause without
+  touching durable history or user files): Sharp-based previews (EXIF-corrected, ≤2000 px,
+  ≤600 KiB base64 each, ≤3 MiB combined, ≤5 images), content-keyed preview cache,
+  actionable omission notices instead of throws, and a final gate in both model
+  transports that counts UTF-8 text, tool schemas and JSON framing and replaces the
+  oldest image parts with notices when the request would exceed 4 MiB. HTTP 413 now
+  explains payload size. Vision inspection shares the preprocessing and keys its cache
+  on omission notes.
+- **Dependency.** `sharp@0.35.5` for the worker. The lockfile in this commit was
+  regenerated with `pnpm install --lockfile-only --offline` against exactly the
+  committed manifests (+307 lines, sharp and its platform packages only), not copied
+  from the dirty lockfile that also carries mobile-app dependencies.
+- **Files.** `apps/worker/src/model-image.ts` (+test), `sandbox-continuity.ts` (image
+  collection), `vision-tools.ts`, `turn-runner.ts` (final gate + 413 message) and their
+  tests, `apps/worker/package.json` (sharp only), `pnpm-lock.yaml`.
+- **Verification (isolated snapshot, frozen lockfile install).** `@berry/worker...`
+  typecheck pass; model-image + sandbox-continuity + vision-tools + turn-runner
+  240/240; worker build pass.
+- **Deployment.** Not deployed. Worker image must be built from the frozen lockfile so
+  Sharp's Linux binaries are present. No API/web/schema change.
+- **Remaining (H-011 stays open).** Binary/text decoding (BOM-less UTF-16, PBIX/ZIP/PPSX
+  NUL bytes), malformed tool JSON and per-route measured limits are separate. H-042
+  (transparent PNG previews keep alpha) is handled as its own change on top of this.

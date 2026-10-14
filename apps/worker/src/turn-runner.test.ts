@@ -552,6 +552,20 @@ describe("durable turn runner", () => {
     );
   });
 
+  it("explains an HTTP 413 as a payload-size failure without leaking provider content", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const repository = new FakeTurnRepository(current);
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("private response", 413, "private image payload", { code: "request_too_large" }); },
+    }, noTools(), { owner: "worker-image-budget" });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(repository.current.error).toContain("payload size limit (HTTP 413)");
+    expect(repository.current.error).toContain("Reduce the image sizes");
+    expect(repository.current.error).not.toContain("configuration");
+    expect(JSON.stringify(repository.events)).not.toContain("private");
+    expect(repository.releasedRetryDiagnostics).toBeUndefined();
+  });
+
   it("terminally fails provider HTTP 409 instead of releasing it for a BullMQ retry", async () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     const repository = new FakeTurnRepository(current);

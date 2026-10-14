@@ -211,9 +211,12 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         ? existingSteps.map((candidate) => candidate.id === step.id ? { ...candidate, state: "running" } : candidate)
         : [...existingSteps, { ...step, state: "running" }],
     };
-    const images = (await (this.base.modelContent?.(inspectionSnapshot, signal, reportProgress) ?? []))
-      .flatMap((part) => part.type === "image_url" ? [part] : []);
-    if (images.length === 0) throw new Error("No inspectable images are available in this turn");
+    const imageContent = await (this.base.modelContent?.(inspectionSnapshot, signal, reportProgress) ?? []);
+    const images = imageContent.flatMap((part) => part.type === "image_url" ? [part] : []);
+    const imageNotes = imageContent.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
+    if (images.length === 0) {
+      throw new Error(`No inspectable images are available in this turn.${imageNotes ? ` ${imageNotes}` : ""}`);
+    }
 
     const focusIdentity = mode === "focused"
       ? focusedCacheIdentity(snapshot, runtime.input, question!)
@@ -224,6 +227,7 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       images,
       mode,
       focusIdentity,
+      imageNotes,
     );
     const cached = await this.cache.get(snapshot.tenantId, cacheKey);
     if (cached) {
@@ -239,10 +243,8 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       apiKey,
     });
     const prompt = mode === "focused" ? question! : DEFAULT_OVERVIEW_QUESTION;
-    const content: ChatContentPart[] = images.flatMap((image, index) => [
-      { type: "text" as const, text: `Image ${index + 1}:` },
-      image,
-    ]);
+    // Keep labels, resize dimensions, and omission notices alongside pixels.
+    const content: ChatContentPart[] = [...imageContent];
     content.push({
       type: "text",
       text: mode === "overview"
@@ -314,6 +316,10 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         ),
       );
     }
+    const omissionNotes = imageContent.flatMap((part) =>
+      part.type === "text" && part.text.startsWith("[Image not sent:") ? [part.text] : [],
+    ).join("\n").slice(0, 4_000);
+    if (omissionNotes) observation = `${omissionNotes}\n\n${observation}`;
     await this.cache.put({
       tenantId: snapshot.tenantId,
       cacheKey,
@@ -357,6 +363,7 @@ function visionCacheKey(
   images: readonly Extract<ChatContentPart, { type: "image_url" }>[],
   mode: "overview" | "focused",
   focusIdentity: { scope: "turn-intent" | "question"; value: string } | undefined,
+  imageNotes: string,
 ): string {
   const hash = createHash("sha256");
   hash.update(VISION_PROMPT_VERSION);
@@ -366,6 +373,8 @@ function visionCacheKey(
   hash.update(model);
   hash.update("\0");
   hash.update(mode);
+  hash.update("\0");
+  hash.update(imageNotes);
   for (const image of images) {
     hash.update("\0");
     hash.update(image.image_url.url);

@@ -35,6 +35,7 @@ import {
   networkDomainAllowed,
   type NetworkPolicy,
 } from "@berry/shared";
+import { MODEL_IMAGE_LIMITS, modelImageOmission, prepareModelImage } from "./model-image.js";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
@@ -50,9 +51,8 @@ import type {
 } from "./turn-runner.js";
 
 const MAX_SNAPSHOT_ARCHIVE_BYTES = 384 * 1024 * 1024;
-const MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024;
-const MAX_MODEL_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024;
-const MAX_MODEL_IMAGES = 5;
+const MAX_MODEL_IMAGE_BYTES = MODEL_IMAGE_LIMITS.maxSourceBytes;
+const MAX_MODEL_IMAGES = MODEL_IMAGE_LIMITS.maxCount;
 const PI_TOOL_MAX_LINES = 2_000;
 const PI_TOOL_MAX_BYTES = 50 * 1024;
 const PI_READ_MAX_LINE_LENGTH = 2_000;
@@ -567,27 +567,33 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (requestedSandboxImages.length === 0 && selectedAttachments.length === 0) return [];
 
     const parts: ChatContentPart[] = [];
-    let totalBytes = 0;
+    let totalBase64Bytes = 0;
     let imageCount = 0;
-    const append = (path: string, mediaType: string, bytes: Uint8Array): boolean => {
-      if (
-        imageCount >= MAX_MODEL_IMAGES
-        || bytes.byteLength === 0
-        || bytes.byteLength > MAX_MODEL_IMAGE_BYTES
-        || totalBytes + bytes.byteLength > MAX_MODEL_IMAGE_TOTAL_BYTES
-      ) {
-        return false;
+    const omit = (path: string, reason: string) => {
+      parts.push({ type: "text", text: modelImageOmission(path, reason) });
+    };
+    const append = async (path: string, bytes: Uint8Array): Promise<void> => {
+      if (imageCount >= MAX_MODEL_IMAGES) {
+        omit(path, "the five-image inspection limit has been reached");
+        return;
       }
-      parts.push({ type: "text", text: `Workspace image ${imageCount + 1}: ${JSON.stringify(path)}` });
-      parts.push({
-        type: "image_url",
-        image_url: {
-          url: `data:${mediaType};base64,${Buffer.from(bytes).toString("base64")}`,
-        },
-      });
-      totalBytes += bytes.byteLength;
+      const image = await prepareModelImage(bytes, signal);
+      reportProgress?.();
+      if (!image.ok) {
+        omit(path, image.reason);
+        return;
+      }
+      if (totalBase64Bytes + image.data.length > MODEL_IMAGE_LIMITS.maxTotalBase64Bytes) {
+        omit(path, "the combined encoded image budget has been reached; inspect fewer images at once");
+        return;
+      }
+      const note = image.transformed
+        ? ` [Preview: ${image.originalWidth}x${image.originalHeight} to ${image.width}x${image.height}; ${image.mediaType}. The original is unchanged. Crop and read a detail if text is too small.${image.firstFrameOnly ? " Only the first frame is shown." : ""}]`
+        : "";
+      parts.push({ type: "text", text: `Workspace image ${imageCount + 1}: ${JSON.stringify(path)}${note}` });
+      parts.push({ type: "image_url", image_url: { url: `data:${image.mediaType};base64,${image.data}` } });
+      totalBase64Bytes += image.data.length;
       imageCount += 1;
-      return true;
     };
 
     const loadSandboxSources = async (paths: readonly string[]) => {
@@ -611,6 +617,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!objects) throw new Error("Input image object storage is not configured");
       return Promise.all(files.map(async (file) => {
         signal?.throwIfAborted();
+        if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
+          return { path: durableAttachmentPath(file, workspaceRoot), mediaType: file.mediaType, bytes: new Uint8Array() };
+        }
         const bytes = await objects.getSource(file.objectKey, file.objectVersionId, signal);
         signal?.throwIfAborted();
         reportProgress?.();
@@ -626,11 +635,6 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     };
 
     if (explicitPaths) {
-      for (const file of selectedAttachments) {
-        if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
-          throw new Error(`Image exceeds the ${MAX_MODEL_IMAGE_BYTES} byte inspection limit: ${file.name}`);
-        }
-      }
       const [sandboxSources, attachmentSources] = await Promise.all([
         loadSandboxSources(requestedSandboxImages),
         loadAttachmentSources(selectedAttachments),
@@ -645,31 +649,27 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         const missing = explicitPaths.filter((path) => !loadedPaths.has(path));
         throw new Error(`inspect_images could not load the exact requested image path${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`);
       }
-      for (const source of sources) {
-        if (!append(source.path, source.mediaType, source.bytes)) {
-          throw new Error("The selected images exceed the per-image or 50 MB combined inspection limit");
-        }
-      }
+      for (const source of sources) await append(source.path, source.bytes);
       return parts;
     }
 
     const sandboxSources = await loadSandboxSources(requestedSandboxImages);
-    for (const source of sandboxSources) append(source.path, source.mediaType, source.bytes);
+    for (const source of sandboxSources) await append(source.path, source.bytes);
 
     // Choose attachments only after sandbox images are validated. This keeps
     // concurrent reads while allowing later valid files to backfill slots left
     // by oversized or over-budget candidates.
     const attachmentFiles: SandboxInputFile[] = [];
-    let plannedTotalBytes = totalBytes;
     for (const file of selectedAttachments) {
       if (attachmentFiles.length >= MAX_MODEL_IMAGES - imageCount) break;
-      if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) continue;
-      if (plannedTotalBytes + file.sizeBytes > MAX_MODEL_IMAGE_TOTAL_BYTES) continue;
+      if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
+        omit(durableAttachmentPath(file, workspaceRoot), "the source is empty or exceeds the 20 MiB image inspection limit");
+        continue;
+      }
       attachmentFiles.push(file);
-      plannedTotalBytes += file.sizeBytes;
     }
     const attachmentSources = await loadAttachmentSources(attachmentFiles);
-    for (const source of attachmentSources) append(source.path, source.mediaType, source.bytes);
+    for (const source of attachmentSources) await append(source.path, source.bytes);
     return parts;
   }
 

@@ -1,3 +1,4 @@
+import { limitModelImagePayload } from "./model-image.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   DEFAULT_COMPACTION_SETTINGS,
@@ -3850,12 +3851,13 @@ export class RouterDurableTurnModel implements DurableTurnModel {
     step: DurableTurnStep,
     context: DurableModelCallContext,
   ): Promise<TurnModelResult> {
-    const { messages, stableSystemPrompt } = modelMessages(
+    const { messages: rawMessages, stableSystemPrompt } = modelMessages(
       snapshot,
       context.additionalUserContent,
     );
     const model = stringValue(snapshot.runtimeRequest.model) ?? this.modelName;
     const tools = canonicalToolDefinitions(context.tools);
+    const messages = limitModelImagePayload(rawMessages, tools);
     const currentManifest = PromptManifestSchema.safeParse(snapshot.promptManifest);
     const cachePlan = planDurablePromptCache({
       tenantId: snapshot.tenantId,
@@ -4126,15 +4128,16 @@ async function callProviderStream(
     forceImages: true,
   });
   const built = modelMessages(snapshot, context.additionalUserContent);
+  const messages = limitModelImagePayload(built.messages, context.tools);
   const streamFn = createProviderStreamFn(providerInfo, apiKey, { cacheNamespace: snapshot.tenantId });
-  const completeSystemPrompt = built.messages
+  const completeSystemPrompt = messages
     .filter((message) => message.role === "system")
     .map((message) => contentText(message.content))
     .filter(Boolean)
     .join("\n\n") || built.stableSystemPrompt;
   const piContext: Parameters<BerryStreamFn>[1] = {
     systemPrompt: completeSystemPrompt,
-    messages: built.messages.flatMap((message) => chatMessageToPi(message, model)),
+    messages: messages.flatMap((message) => chatMessageToPi(message, model)),
     tools: context.tools.map((tool) => ({
       name: tool.function.name,
       description: tool.function.description ?? "",
@@ -4468,6 +4471,9 @@ function providerFailureDiagnostics(
 function publicProviderFailureMessage(
   failure: ReturnType<typeof classifyProviderFailure>,
 ): string {
+  if (failure.status === 413) {
+    return "The model request exceeded the provider's payload size limit (HTTP 413). Reduce the image sizes or number of images, or shorten the conversation before retrying.";
+  }
   const base = {
     aborted: "The model provider request was aborted",
     connection: "Berry could not connect to the model provider",

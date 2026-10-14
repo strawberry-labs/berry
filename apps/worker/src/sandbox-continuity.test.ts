@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import sharp from "sharp";
+import { MODEL_IMAGE_LIMITS } from "./model-image.js";
 import { describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { SandboxNetworkPolicyUpdateError, type SandboxProvider } from "@berry/sandbox-contract";
@@ -18,6 +20,10 @@ import {
 } from "./sandbox-continuity.js";
 import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+
+async function testPng(seed: number): Promise<Buffer> {
+  return sharp({ create: { width: 2, height: 1, channels: 3, background: { r: seed, g: 40, b: 70 } } }).png().toBuffer();
+}
 
 describe("SandboxContinuityManager", () => {
   it("identifies blocked S3 downloads without exposing signed URL credentials", () => {
@@ -715,7 +721,7 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("exposes an image read from a connector-created sandbox input path", async () => {
-    const image = Buffer.from("connector-image");
+    const image = await testPng(1);
     const provider = {
       kind: "e2b",
       files: {
@@ -771,7 +777,7 @@ describe("SandboxContinuityManager", () => {
       maxActiveReads = Math.max(maxActiveReads, activeReads);
       await Promise.resolve();
       activeReads -= 1;
-      const bytes = Buffer.from(input.path.split("/").at(-1) ?? "");
+      const bytes = await testPng(Number(/page-(\d+)/.exec(input.path)?.[1] ?? 0));
       return { path: input.path, content: bytes.toString("base64"), size_bytes: bytes.byteLength, mtime: null };
     });
     const provider = {
@@ -800,20 +806,22 @@ describe("SandboxContinuityManager", () => {
 
     const content = await manager.modelContent(current);
 
+    const images = await Promise.all(paths.map((path) => testPng(Number(/page-(\d+)/.exec(path)?.[1] ?? 0))));
     expect(content).toEqual(paths.flatMap((path, index) => [
       { type: "text", text: `Workspace image ${index + 1}: ${JSON.stringify(path)}` },
-      { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from(path.split("/").at(-1)!).toString("base64")}` } },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${images[index]!.toString("base64")}` } },
     ]));
     expect(maxActiveReads).toBe(3);
     expect(read.mock.calls.map(([input]) => input.path)).toEqual(paths);
   });
 
   it("backfills image slots after oversized attachment candidates are skipped", async () => {
+    const images = await Promise.all([1, 2, 3, 4, 5, 6].map(testPng));
     const inputFiles = Array.from({ length: 6 }, (_, index) => ({
       fileId: `image-${index + 1}`,
       name: `image-${index + 1}.png`,
       mediaType: "image/png",
-      sizeBytes: index === 0 ? 20 * 1024 * 1024 + 1 : 1,
+      sizeBytes: index === 0 ? 20 * 1024 * 1024 + 1 : images[index]!.byteLength,
       objectKey: `objects/image-${index + 1}.png`,
     }));
     const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array> }) => {
@@ -840,9 +848,7 @@ describe("SandboxContinuityManager", () => {
       persist: vi.fn(),
       recordSandbox: vi.fn(),
     } satisfies SandboxSnapshotRepository;
-    const getSource = vi.fn(async (key: string) => new Uint8Array([
-      Number(/image-(\d+)/.exec(key)?.[1] ?? 0),
-    ]));
+    const getSource = vi.fn(async (key: string) => images[Number(/image-(\d+)/.exec(key)?.[1] ?? 0) - 1]!);
     const objects = {
       put: vi.fn(),
       putArtifact: vi.fn(),
@@ -859,13 +865,39 @@ describe("SandboxContinuityManager", () => {
 
     const content = await manager.modelContent(current);
 
-    expect(content).toEqual([2, 3, 4, 5, 6].flatMap((value, index) => [
+    expect(content[0]).toEqual({ type: "text", text: expect.stringContaining("Image not sent:") });
+    expect(content.slice(1)).toEqual([2, 3, 4, 5, 6].flatMap((value, index) => [
       { type: "text", text: `Workspace image ${index + 1}: "/workspace/inputs/image-${value}/image-${value}.png"` },
-      { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from([value]).toString("base64")}` } },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${images[value - 1]!.toString("base64")}` } },
     ]));
     expect(getSource).toHaveBeenCalledTimes(5);
     expect(getSource).not.toHaveBeenCalledWith("objects/image-1.png", undefined);
     expect(writeStream).toHaveBeenCalledTimes(6);
+  });
+
+  it("compresses image batches before sending pixels and gives recoverable notices for corrupt files", async () => {
+    const image = await sharp({ create: { width: 4_000, height: 3_000, channels: 3, background: "white" } }).png().toBuffer();
+    const paths = ["/workspace/one.png", "/workspace/broken.png", "/workspace/three.png", "/workspace/four.png", "/workspace/five.png"];
+    const provider = { kind: "e2b", files: {
+      read: vi.fn(async ({ path }: { path: string }) => ({ path, content: (path.includes("broken") ? Buffer.from("broken") : image).toString("base64") })),
+    } } as unknown as SandboxProvider;
+    const repository = { inputFiles: vi.fn(async () => []), latest: vi.fn(), continuity: vi.fn(), recordSandbox: vi.fn() } as unknown as SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.sandboxId = "sandbox-image-budget";
+    current.sandboxProvider = "e2b";
+    current.steps = [{ ...toolStep("inspect_images", { paths }), state: "running" }];
+    const content = await manager.modelContent(current);
+    const pixels = content.flatMap((part) => part.type === "image_url" ? [part.image_url.url] : []);
+    expect(pixels).toHaveLength(4);
+    expect(pixels.reduce((total, url) => total + url.split(",")[1]!.length, 0)).toBeLessThanOrEqual(MODEL_IMAGE_LIMITS.maxTotalBase64Bytes);
+    for (const url of pixels) {
+      const meta = await sharp(Buffer.from(url.split(",")[1]!, "base64")).metadata();
+      expect(meta.width).toBe(2_000);
+      expect(meta.height).toBe(1_500);
+    }
+    expect(content).toContainEqual({ type: "text", text: expect.stringContaining("Use bash to create a smaller PNG/JPEG copy") });
+    expect(content).toContainEqual({ type: "text", text: expect.stringContaining("4000x3000 to 2000x1500") });
   });
 
   it("does not let an older terminal cleanup pause a sandbox claimed by a follow-up run", async () => {
@@ -1922,8 +1954,8 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("supplies task attachments and requested sandbox images as model vision content", async () => {
-    const generated = Buffer.from([9, 8, 7]);
-    const attached = Buffer.from([1, 2, 3, 4]);
+    const generated = await testPng(9);
+    const attached = await testPng(1);
     const provider = {
       kind: "e2b",
       create: vi.fn(),
