@@ -80,7 +80,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f02396f` | H-044 | None (UI). |
 | `f5ec9f5` | H-027 | None (UI). |
 | `887c64a` | H-018 | None. |
-| _pending_ | H-005 | None. |
+| `220767a` | H-005 | None. |
+| _pending_ | H-052 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -175,7 +176,8 @@ fixture; this is fixed in `54c9255`.
 | H-044 (Copy reports success before the clipboard write) | Committed — partial | `f02396f` | Not deployed (web, via desktop-ui) |
 | H-027 (dropped folders attached as empty files) | Committed — partial | `f5ec9f5` | Not deployed (web) |
 | H-018 (skill save reveals problems one at a time) | Committed | `887c64a` | Not deployed (shared package: API and worker rebuild) |
-| H-005 (credit/quota exhaustion presented as a model problem) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-005 (credit/quota exhaustion presented as a model problem) | Committed — partial | `220767a` | Not deployed (worker) |
+| H-052 (requested short skill name not resolved) | Committed — partial (hint; behaviour unevaluated) | _pending_ | Not deployed (worker) |
 | H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
@@ -1849,3 +1851,31 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Router-level route readiness and circuit breaking across runs, and an
   administrator-facing health view (outside this repository's worker).
+- **Commit.** `220767a`.
+
+### H-052 — A requested skill is reported missing although it is enabled
+
+- **Evidence.** Task 1164: "use BSBG on the attached CV" while the admitted catalog held the
+  enabled, model-invocable `bsbg-cv-converter`. Berry searched the workspace and
+  protected skill folders, never called `activate_skill`, and told the user no BSBG skill
+  was installed.
+- **Root cause (confirmed in code).** The catalog and activation enum list only canonical
+  names; nothing connects a short name the user types to them, and filesystem absence was
+  read as catalog absence.
+- **Fix.** When the request explicitly asks to use a term ("use/using/apply/run/with X",
+  "X skill") that equals an enabled skill's name or its distinctive first segment (three
+  or more characters), the per-turn context says so: one match → "Activate it with
+  activate_skill before searching files; enabled skills are not workspace files";
+  several → list them and choose by description or ask. Skills already activated in the
+  run are skipped. It is a hint, never an automatic activation; plain mentions such as
+  "email the AESG team" add nothing. It lives in the per-turn context, so the cached
+  prefix is unaffected.
+- **Files.** `apps/worker/src/turn-runner.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 534 passed / 3
+  skipped. New case: task 1164's request points at `bsbg-cv-converter`; a plain mention
+  gives no hint; an ambiguous term lists both skills; an activated skill is skipped. It
+  fails on the previous source. Whether the model now activates the skill first is not
+  evaluated (no model calls).
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Configured aliases in skill metadata, and the model evaluation in the
+  issue's acceptance criteria.

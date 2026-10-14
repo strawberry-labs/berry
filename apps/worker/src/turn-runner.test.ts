@@ -145,6 +145,26 @@ describe("durable turn runner", () => {
       { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" },
     ];
 
+    it("points an explicitly requested short skill name at the enabled skill (H-052)", () => {
+      const skill = (name: string, description: string) => ({
+        name, description, content: `# ${name}`, filePath: `/personal-skills/${name}/SKILL.md`, disableModelInvocation: false, resources: [],
+      });
+      const turnContext = (input: string, skills: ReturnType<typeof skill>[], steps: DurableTurnStep[] = []) => {
+        const current = turn({}, ["read", "activate_skill"], [{ role: "user", content: input }]);
+        current.runtimeRequest = { ...current.runtimeRequest, input, extraSkills: skills };
+        current.steps = [...current.steps, ...steps];
+        return String(modelMessages(current).messages.find((message) => String(message.content).startsWith("<berry_turn_context>"))?.content);
+      };
+      // Task 1164: "BSBG" with bsbg-cv-converter enabled.
+      const bsbg = skill("bsbg-cv-converter", "Convert CVs to the BSBG format.");
+      expect(turnContext("Please use BSBG on the attached CV", [bsbg])).toContain('asks to use "bsbg", which matches the enabled skill bsbg-cv-converter');
+      expect(turnContext("Write an email to the AESG team", [skill("aesg-branding", "AESG brand rules.")])).not.toContain("matches the enabled skill");
+      expect(turnContext("Use AESG for this deck", [skill("aesg-branding", "AESG brand rules."), skill("aesg-cv", "AESG CVs.")]))
+        .toContain("matches several enabled skills: aesg-branding, aesg-cv");
+      const activated = { ...toolStep("completed", "read_only", false), type: "tool.activate_skill", input: { toolCallId: "a", toolName: "activate_skill", arguments: { name: "bsbg-cv-converter" }, requiresApproval: false, approvalKind: "file-edit" } } as DurableTurnStep;
+      expect(turnContext("Please use BSBG on the attached CV", [bsbg], [activated])).not.toContain("matches the enabled skill");
+    });
+
     it("states the run's start date in the turn context and keeps it stable across calls (H-023)", () => {
       const current = turn({}, ["read"], firstTurn);
       current.createdAt = "2026-10-14T21:30:00.000Z";

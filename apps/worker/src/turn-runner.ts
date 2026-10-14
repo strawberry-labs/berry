@@ -5775,8 +5775,10 @@ export function modelMessages(
   // across follow-ups (H-032). A user-role message is used because several
   // chat templates hoist every system message to the front of the prompt.
   const dateContext = currentDateContext(snapshot);
+  const skillHint = requestedSkillHint(snapshot);
   const turnContext = [
     dateContext,
+    skillHint,
     builtInGuidance,
     intentInstruction,
     imageToolSelection,
@@ -5797,6 +5799,7 @@ export function modelMessages(
     // original single-system-message layout unchanged.
     : [stableSystemPrompt, [
         dateContext,
+        skillHint,
         builtInGuidance,
         intentInstruction,
         imageToolSelection,
@@ -5991,6 +5994,39 @@ function currentDateContext(snapshot: DurableTurnSnapshot): string {
     timeZone, weekday: "long", day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
   }).format(startedAt);
   return `Current date and time when this turn started: ${formatted} (${timeZone}). Resolve relative dates such as today, tomorrow or next Friday from this date and check weekdays against it. Dates in documents and earlier messages are their own dates, not today's.`;
+}
+
+/**
+ * "Use BSBG on this CV" named the enabled skill bsbg-cv-converter, yet the model
+ * searched the filesystem and said no BSBG skill was installed (H-052). When the
+ * request explicitly asks to use a term that matches an enabled skill's name or
+ * distinctive first segment, point the model at it. A hint, never an activation.
+ */
+function requestedSkillHint(snapshot: DurableTurnSnapshot): string {
+  const input = stringValue(snapshot.runtimeRequest.input) ?? "";
+  const requested = new Set([
+    ...[...input.matchAll(/\b(?:use|using|apply|run|with)\s+(?:the\s+|my\s+|our\s+)?([a-z0-9][a-z0-9-]{1,63})/gi)].map((match) => match[1]!.toLowerCase()),
+    ...[...input.matchAll(/\b([a-z0-9][a-z0-9-]{1,63})\s+skill\b/gi)].map((match) => match[1]!.toLowerCase()),
+  ]);
+  if (requested.size === 0) return "";
+  const activated = new Set(snapshot.steps.flatMap((step) =>
+    step.state === "completed" && toolNameForStep(step) === "activate_skill"
+      ? [stringValue(record(step.input.arguments)?.name)?.toLowerCase() ?? ""]
+      : []));
+  const hints: string[] = [];
+  for (const term of requested) {
+    const matches = durableSkills(snapshot).filter((skill) => {
+      const name = skill.name.toLowerCase();
+      const first = name.split("-")[0]!;
+      return !activated.has(name) && (name === term || (first.length >= 3 && first !== name && first === term));
+    });
+    if (matches.length === 1) {
+      hints.push(`The request asks to use "${term}", which matches the enabled skill ${matches[0]!.name}. Activate it with activate_skill before searching files; enabled skills are not workspace files, so do not conclude it is missing.`);
+    } else if (matches.length > 1) {
+      hints.push(`The request asks to use "${term}", which matches several enabled skills: ${matches.map((skill) => skill.name).join(", ")}. Choose by their descriptions, or ask the user which one, before searching files.`);
+    }
+  }
+  return hints.join("\n");
 }
 
 function boundedToolResultContext(entryId: string, content: string, remainingBudget: number): string {
