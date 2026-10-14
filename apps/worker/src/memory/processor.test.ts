@@ -46,10 +46,33 @@ describe("MemoryProcessor with self-hosted Mem0", () => {
     expect(projectOperations.map((candidate) => candidate.scope)).toEqual(["project"]);
     expect(captured.mem0Input?.messages).toEqual([
       { role: "user", content: "Please remember that I prefer concise answers." },
-      { role: "assistant", content: "Understood." },
     ]);
     expect(captured.mem0Input?.idempotencyKey).toContain("memory-extractor-v1");
     expect(result).toEqual({ applied: 1, noops: 1 });
+  });
+
+  it("never offers an assistant estimate to Mem0 as something the user said (H-040, task 978)", async () => {
+    let mem0Input: Parameters<PersonalMemoryProvider["ingestConversation"]>[0] | undefined;
+    const personalMemory = {
+      async ingestConversation(input: Parameters<PersonalMemoryProvider["ingestConversation"]>[0]) {
+        mem0Input = input;
+        return { items: [], replayed: false };
+      },
+    } as unknown as PersonalMemoryProvider;
+    const repository = {
+      async settings() { return { memoryEnabled: true, implicitMemoryEnabled: true }; },
+      async apply() { return { applied: 0, noops: 0 }; },
+    } as unknown as SqlWorkerMemoryRepository;
+
+    await new MemoryProcessor(repository, { async generate() { return []; } }, personalMemory).process({
+      ...payload(),
+      userText: "it is few mm",
+      assistantText: "You confirmed the gap is 3-8 mm, so I will use 5 mm.",
+    });
+
+    expect(mem0Input?.messages).toEqual([{ role: "user", content: "it is few mm" }]);
+    expect(JSON.stringify(mem0Input)).not.toContain("5 mm");
+    expect(mem0Input?.source.messageId).toBe(payload().userMessageId);
   });
 
   it("does not extract memories when implicit memory is disabled for the user", async () => {

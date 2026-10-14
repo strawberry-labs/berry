@@ -61,7 +61,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `03d4682` | H-061 | None. |
 | `5cd4189` | H-042 | None (in-memory model previews only; user files untouched). |
 | `c94340b` | H-041 | None. New generated files are stored under their real format; existing files and rows are untouched. |
-| _pending_ | H-059 | None (skill script). Publishing it is a skill-package sync, not a database migration. |
+| `67a22fa` | H-059 | None (skill script). Publishing it is a skill-package sync, not a database migration. |
+| _pending_ | H-040 (Mem0 input) | None. Changes only what new turns send to Mem0; existing memories are untouched (removing contaminated ones needs user controls or a reviewed plan). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -131,7 +132,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-061 (questions dropped by overview mode) | Committed | `03d4682` | Not deployed (worker) |
 | H-042 (transparent images seen as blank) | Committed | `5cd4189` | Not deployed (worker) |
 | H-041 (generated image metadata from returned bytes) | Committed — worker path | `c94340b` | Not deployed (worker) |
-| H-059 (XLSX rows sized to wrapped text) | Committed | _pending_ | Not published (organization `xlsx` skill package) |
+| H-059 (XLSX rows sized to wrapped text) | Committed | `67a22fa` | Not published (organization `xlsx` skill package) |
+| H-040 (assistant text kept out of personal memory extraction) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1232,3 +1234,37 @@ verification script deletes compiled tests first and counts are source-only.
 - **Remaining.** Missing-logo reporting (`add_logo` silently skips a missing file; task
   529) belongs with the H-064 dependency work; Excel-specific glyph metrics are estimated,
   not measured.
+- **Commit.** `67a22fa`.
+
+### H-040 — Assistant statements become personal memories under the user's provenance
+
+- **Evidence.** Task 973 guesses a 5 mm measurement and later admits it does not know;
+  task 978 then retrieves memory `16fd6cfb…` saying the user confirmed 3–8 mm / 5 mm,
+  although the linked user message only says "it is few mm". The memory is still live in
+  production Mem0 (confidence 0.75, no expiry).
+- **Root cause (confirmed in code).** `MemoryProcessor.ingestPersonal` sends both the
+  user message and the assistant's final answer to Mem0 with `infer: true` and the
+  user message as provenance. mem0ai 3.1.2's extraction prompt explicitly extracts from
+  both roles ("You extract from BOTH user and assistant messages"), so the service's own
+  custom instruction against storing assistant speculation is not enough; this is why a
+  prompt-only restatement was ruled out.
+- **Fix.** Personal (Mem0) inference now receives only the sanitised user message, so
+  every implicit personal memory is supported by the user's own words. Explicit
+  memories (the `remember` path, `infer: false`) are unchanged, and project-scope
+  extraction by Berry's own generator is unchanged.
+- **Trade-off.** A short user confirmation of an assistant proposal ("yes, always do it
+  like that") no longer has the proposal as extraction input, so such preferences are
+  captured only when stated explicitly or saved through the explicit path. This is the
+  audit's "user-supported durable-memory extraction" direction.
+- **Files.** `apps/worker/src/memory/processor.ts` (+test). The existing test asserted
+  that the assistant reply was sent; it now asserts the user message alone. A new case
+  reproduces task 978's shape.
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 517 passed / 3
+  skipped; both cases fail on the previous source.
+- **Data impact.** None. Existing memories (including `16fd6cfb…`) are not modified;
+  users can delete them in memory settings, and any bulk cleanup needs its own reviewed
+  plan.
+- **Deployment.** Not deployed (worker).
+- **Remaining (H-040 stays open).** Retrieval relevance thresholds and raw-similarity
+  telemetry, task-outcome source authority, pasted/quoted content inside user messages,
+  and expiry for task-specific memories.
