@@ -71,7 +71,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `37285db` | H-036 | None. |
 | `f027f27` | H-016 | None. |
 | `6c46724` | H-050 | None. |
-| _pending_ | H-038 | None. |
+| `8f966ed` | H-038 | None. |
+| _pending_ | H-008 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -157,7 +158,8 @@ fixture; this is fixed in `54c9255`.
 | H-036 (tool results past the history budget sent empty) | Committed — partial | `37285db` | Not deployed (worker) |
 | H-016 (earlier shell failures masked by a final success) | Committed — partial | `f027f27` | Not deployed (worker) |
 | H-050 (ready optional capability discarded at the admission deadline) | Committed — partial | `6c46724` | Not deployed (API) |
-| H-038 (streamed tool calls merged when indices restart) | Committed — worker path | _pending_ | Not deployed (worker) |
+| H-038 (streamed tool calls merged when indices restart) | Committed — worker path | `8f966ed` | Not deployed (worker) |
+| H-008 (workspace outputs/ and tmp/ guaranteed) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1579,3 +1581,29 @@ fixture; this is fixed in `54c9255`.
 - **Remaining.** `packages/local-agent/src/model.ts` (desktop) has the same index-based
   accumulation (lower priority per AGENTS.md); calls without ids that restart indices
   cannot be told apart; the remote gateway build is unverified.
+- **Commit.** `8f966ed`.
+
+### H-008 — The workspace's outputs/ and tmp/ directories are not guaranteed
+
+- **Evidence.** Task 1211 (12 October): the first document run failed a runtime probe only
+  because the standard outputs directory was missing; python-docx, LibreOffice and
+  Verdana were all available. Prompts and skills use `<root>/outputs` and `<root>/tmp`
+  throughout.
+- **Root cause (confirmed in code).** Sandbox creation makes only the workspace root (the
+  E2B provider calls `makeDir(cwd)`), and snapshot restore excludes `tmp/`.
+- **Fix.** The bash wrapper, which already creates its log directory
+  `<root>/.berry-tool-output`, now also runs `mkdir -p` for `<root>/outputs` and
+  `<root>/tmp` before each command. It does this only when the log path has that conventional
+  form and never fails because of it. This adds no provider round trip, so the tests that pin
+  "no shell-command amplification" stay unchanged. A first attempt that added an exec at
+  sandbox creation broke three of those tests and was dropped. It also covers resumed
+  sandboxes and a model that deleted the folders.
+- **Files.** `apps/worker/src/sandbox-continuity.ts` (`PI_BASH_WRAPPER_SCRIPT`, +test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 528 passed / 3
+  skipped. New case in a temporary workspace: the command sees `outputs/` and `tmp/`; a
+  non-conventional log path creates nothing. It fails on the previous source. (A manual
+  prototype run briefly created an empty `outputs/probe.txt` in the repository's ignored
+  `outputs/` folder; it was removed, and the committed test uses a temporary directory.)
+- **Deployment.** Not deployed (worker).
+- **Remaining.** The issue's execution contract (verified interpreter, packages and skill
+  paths; missing import versus unstaged module diagnostics).

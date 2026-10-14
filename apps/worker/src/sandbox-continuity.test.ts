@@ -1554,6 +1554,25 @@ describe("SandboxContinuityManager", () => {
     expect(failed.stdout).not.toContain("exited non-zero");
   });
 
+  it("creates the workspace outputs and tmp directories before a command runs (H-008)", () => {
+    const root = mkdtempSync(join(tmpdir(), "berry-workspace-"));
+    try {
+      const result = spawnSync("bash", ["-c", PI_BASH_WRAPPER_SCRIPT, "berry-bash", "test -d outputs && test -d tmp && printf ready", join(root, ".berry-tool-output", "bash-1.log")], {
+        cwd: root,
+        encoding: "utf8",
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("ready");
+      // Only the conventional log location implies a workspace root.
+      const other = join(root, "other");
+      const elsewhere = spawnSync("bash", ["-c", PI_BASH_WRAPPER_SCRIPT, "berry-bash", "printf ok", join(other, "logs", "bash-2.log")], { cwd: root, encoding: "utf8" });
+      expect(elsewhere.status).toBe(0);
+      expect(spawnSync("test", ["-e", join(other, "outputs")]).status).not.toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("preserves line boundaries when the rolling bash tail spans chunks", async () => {
     const firstChunk = `${Array.from({ length: 2_001 }, (_, index) => `line ${index + 1}`).join("\n")}\n`;
     const manager = managerWithProvider(

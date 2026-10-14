@@ -33,7 +33,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-005 | P1 | Provider billing/quota availability and recovery | Observed | October 6–8 incident; no later monthly 402; recovery UX open |
 | H-006 | P0 | MCP approval, network policy and authentication failures | Observed + code review | Current production resolution unverified |
 | H-007 | P1 | Skill entry points omit sibling dependencies | Monthly failures + activation/recovery traces + code | Confirmed current renderer staging defect |
-| H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Current directory guarantee gap; template contents require verification |
+| H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Directory guarantee committed locally (not deployed); execution diagnostics open |
 | H-009 | P1 | Sandbox operation recovery and error classification | Observed missing-sandbox failures + code findings | Reconnect-after-pause fix committed (not deployed); typed classification/fault injection open |
 | H-010 | P1 | Snapshot timeout does not cancel underlying work | Code finding | Open; production consequence unproven |
 | H-011 | P1 | Encoding, oversized inputs and malformed tool arguments | Observed | Image payload guard and binary/UTF-16 reads committed locally (not deployed); tool-argument/HTTP 400 failures open |
@@ -172,6 +172,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Proposal: return the verified interpreter, package capabilities, working directory and skill paths; distinguish missing package from unstaged skill module before recommending installation.
 - Status: no blanket claim that Python execution is broken. Verify remaining production failures and exact image/skill versions before implementation.
 - Acceptance: missing import, syntax error and bad input receive different diagnostics; entry points execute in the actual published runtime.
+- **Implementation (14 October):** every bash command now runs with `<root>/outputs` and `<root>/tmp` present (created idempotently by the wrapper), removing task 1211's missing-directory failure. Not deployed. Interpreter/package/skill-path diagnostics remain.
 
 ### H-009 — Sandbox recovery
 
