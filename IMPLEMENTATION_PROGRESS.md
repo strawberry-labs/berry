@@ -67,7 +67,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `b9200f0` | H-057 | None. |
 | `f6433f9` | H-049 | None. |
 | `f4f2b1e` | H-062 | No schema change. New index failures set the file's own row from `processing` to `available`; the 249 existing rows are untouched (reconciliation proposed below, not run). |
-| _pending_ | H-028 | None. Publication receipts gain a `sha256` field for new publications only. |
+| `e241a6b` | H-028 | None. Publication receipts gain a `sha256` field for new publications only. |
+| _pending_ | H-036 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -149,7 +150,8 @@ fixture; this is fixed in `54c9255`.
 | H-057 (malformed question batches) | Committed | `b9200f0` | Not deployed (worker) |
 | H-049 (PDF pages without text reported as unreviewed) | Committed — partial | `f6433f9` | Not deployed (worker) |
 | H-062 (failed indexing leaves files processing) | Committed — worker state; UI open | `f4f2b1e` | Not deployed (worker); backlog not reconciled |
-| H-028 (rebuilt files suppressed as duplicate publications) | Committed | _pending_ | Not deployed (worker) |
+| H-028 (rebuilt files suppressed as duplicate publications) | Committed | `e241a6b` | Not deployed (worker) |
+| H-036 (tool results past the history budget sent empty) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1464,3 +1466,26 @@ fixture; this is fixed in `54c9255`.
   made before deployment lack. If the user deleted the earlier file mid-run,
   republishing identical bytes returns that deleted file's receipt (rare; a new name
   publishes a fresh copy).
+- **Commit.** `e241a6b`.
+
+### H-036 — Tool results past the shared history budget are sent empty
+
+- **Evidence.** Code finding only: `boundedToolResultContext` returned `""` once the
+  shared tool-result budget was spent (and a cut-off reference when little remained). No
+  production occurrence has been established.
+- **Root cause (confirmed in code).** The history builder spends the budget oldest-first,
+  so every later result in a long turn became an empty tool message, indistinguishable
+  from a tool that returned nothing.
+- **Fix.** An exhausted (or too small) budget now yields the full durable reference plus
+  "It was omitted here to stay within the model's context limit." The oldest-first order
+  is deliberately kept: it leaves earlier history byte-stable for the H-032 prefix cache,
+  and the marker depends only on the entry ID. The overrun is about 200 characters per
+  omitted result.
+- **Files.** `apps/worker/src/turn-runner.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 525 passed / 3
+  skipped. New case: two 200,000-character results in a 32k window; the second now
+  carries the omission marker instead of `""`. It fails on the previous source; the
+  existing bounding test passes on both.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Preferring the latest decisive result over older ones would conflict
+  with prefix caching and needs measurement; compaction remains the main bound.

@@ -61,7 +61,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Validator fix committed locally (not deployed); attempt IDs/release manifest open |
 | H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending |
 | H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified |
-| H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Production occurrence not established |
+| H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Fix committed locally (not deployed): omitted results carry an explicit marker; production occurrence still not established |
 | H-037 | P1 | Search operators removed before upstream search | Production query/output + matching local BerryCrawl code | Remote BerryCrawl revision unverified |
 | H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker path present; remote gateway revision unverified |
 | H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Fix committed locally (not deployed): truncated observations marked incomplete and never cached; adaptive budget open |
@@ -473,6 +473,7 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Evidence: deployed `boundedToolResultContext` can return an empty string once the shared tool-result budget is exhausted. A monthly production occurrence is not yet proved.
 - Proposal: preserve a structured durable reference and latest relevant result; expose truncation explicitly, with source version/ACL checks. Avoid simply increasing context without measurement.
 - Acceptance: threshold multi-tool histories retain retrievable decisive results and accurate answers inside provider limits. Estimate 1–2 days if reproduced.
+- **Implementation (14 October):** a result past the budget is no longer sent as an empty string; it carries its durable reference and says it was omitted for the context limit. The cache-friendly oldest-first allocation is unchanged. Not deployed.
 
 ### H-037 — Search query operators lost
 

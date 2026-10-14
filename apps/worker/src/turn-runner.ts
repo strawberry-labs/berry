@@ -5955,9 +5955,11 @@ function durableToolResultText(output: JsonValue): string {
 function boundedToolResultContext(entryId: string, content: string, remainingBudget: number): string {
   const reference = `[durable-result:${entryId}] The complete tool result is persisted; rerun the tool with a narrower scope if more detail is needed.`;
   const budget = Math.max(0, Math.floor(remainingBudget));
-  if (budget === 0) return "";
-  if (!content) return reference.slice(0, budget);
-  if (budget <= reference.length) return reference.slice(0, budget);
+  // Once the shared budget is spent, say the result was omitted rather than
+  // sending an empty (or cut-off) result that reads as "the tool returned
+  // nothing". The marker is stable, so earlier history stays cacheable (H-036).
+  if (budget <= reference.length) return `${reference} It was omitted here to stay within the model's context limit.`;
+  if (!content) return reference;
   if (content.length <= budget) return content;
   const marker = "\n…[result content bounded]…\n";
   const available = budget - reference.length - 1 - marker.length;

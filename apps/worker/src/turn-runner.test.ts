@@ -1140,6 +1140,30 @@ describe("durable turn runner", () => {
     expect(String(toolMessage?.content)).toContain("[result content bounded]");
   });
 
+  it("marks results past the shared tool budget as omitted instead of sending them empty (H-036)", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest.contextWindowTokens = 32_000;
+    for (const index of [1, 2]) {
+      current.entries.push({
+        entryId: `large-tool-entry-${index}`,
+        parentEntryId: current.entries.at(-1)?.entryId ?? null,
+        entryType: "message",
+        sequence: current.entries.length + 1,
+        payload: {
+          type: "message",
+          id: `large-tool-entry-${index}`,
+          message: { role: "toolResult", toolCallId: `large-tool-call-${index}`, toolName: "connector_search", content: [{ type: "text", text: "y".repeat(200_000) }] },
+        },
+      });
+    }
+
+    const [first, second] = modelMessages(current).messages.filter((message) => message.role === "tool");
+    expect(String(first?.content)).toContain("[result content bounded]");
+    // The first result used the whole budget; the second used to be "".
+    expect(String(second?.content)).toContain("[durable-result:large-tool-entry-2]");
+    expect(String(second?.content)).toContain("omitted here to stay within the model's context limit");
+  });
+
   it("reclaims an expired lease from the persisted pending model step", async () => {
     const pending = modelStep("pending", 1);
     const state = snapshot("calling_model", [admittedStep(), pending]);
