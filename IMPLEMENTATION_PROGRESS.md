@@ -69,7 +69,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f4f2b1e` | H-062 | No schema change. New index failures set the file's own row from `processing` to `available`; the 249 existing rows are untouched (reconciliation proposed below, not run). |
 | `e241a6b` | H-028 | None. Publication receipts gain a `sha256` field for new publications only. |
 | `37285db` | H-036 | None. |
-| _pending_ | H-016 | None. |
+| `f027f27` | H-016 | None. |
+| _pending_ | H-050 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -153,7 +154,8 @@ fixture; this is fixed in `54c9255`.
 | H-062 (failed indexing leaves files processing) | Committed — worker state; UI open | `f4f2b1e` | Not deployed (worker); backlog not reconciled |
 | H-028 (rebuilt files suppressed as duplicate publications) | Committed | `e241a6b` | Not deployed (worker) |
 | H-036 (tool results past the history budget sent empty) | Committed — partial | `37285db` | Not deployed (worker) |
-| H-016 (earlier shell failures masked by a final success) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-016 (earlier shell failures masked by a final success) | Committed — partial | `f027f27` | Not deployed (worker) |
+| H-050 (ready optional capability discarded at the admission deadline) | Committed — partial | _pending_ | Not deployed (API) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1522,3 +1524,31 @@ fixture; this is fixed in `54c9255`.
 - **Remaining.** Upstream failures inside a pipeline (`producer | tail`) are still not
   detected without changing pipeline semantics; structured helpers for downloads and
   conversions remain the issue's longer-term proposal.
+- **Commit.** `f027f27`.
+
+### H-050 — A ready optional capability is discarded at the admission deadline
+
+- **Evidence.** Code finding with a deployed-function fixture: once the shared two-second
+  admission deadline has passed, `resolveOptionalAdmissionPreparation` returned the
+  fallback (and logged a timeout) without checking whether the work had already
+  succeeded. Related: 54 rejected `inspect_images` calls in 36 runs where the adapter was
+  missing from the turn (causes not captured; not all deadline losses).
+- **Root cause (confirmed in code).** An early `remainingMs === 0` return skipped the
+  race altogether.
+- **Fix.** The work is always raced first against the deadline; when the deadline has
+  already passed, the race is against an already-resolved timeout, so work that settled
+  earlier wins and only work still pending falls back. The two-second SLA, the
+  rejection fallback and the logging are unchanged.
+- **Files.** `apps/api/src/http/agent-api.controller.ts` (function now exported for its
+  test; only these hunks staged, other uncommitted controller edits left alone);
+  `apps/api/src/http/admission-preparation.test.ts` (new).
+- **Verification (isolated snapshot).** API typecheck pass; API suite 450 passed / 24
+  failed (exactly the 24 pre-existing DI failures; HEAD without the change: 447 / 24).
+  One earlier full run also showed one failure each in `artifact.controller.test.ts` and
+  `agent-api.controller.test.ts`. These did not recur in two reruns or in isolation, with or
+  without this change, so they are recorded as load-related flakiness. Pre-fix (old
+  function, export added): the ready-before-deadline case fails and both fallback
+  cases pass.
+- **Deployment.** Not deployed (API).
+- **Remaining.** Persisting a scoped availability reason and telling the model when a
+  capability changes between turns.

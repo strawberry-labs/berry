@@ -341,24 +341,25 @@ async function resolveAdmissionPreparation<T>(work: ObservedAdmissionPreparation
   return result.value;
 }
 
-async function resolveOptionalAdmissionPreparation<T>(
+export async function resolveOptionalAdmissionPreparation<T>(
   work: ObservedAdmissionPreparation<T>,
   fallback: T,
   deadlineAt: number,
   label: string,
 ): Promise<T> {
   const remainingMs = Math.max(0, deadlineAt - Date.now());
-  if (remainingMs === 0) {
-    logAdmissionPreparationDegraded(label, "timeout");
-    return fallback;
-  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  // Work that already settled is used even when it is read after the deadline;
+  // only work still pending then falls back. `work` is raced first, so a
+  // settled result wins over the immediate timeout (H-050).
   const result = await Promise.race([
     work,
-    new Promise<{ status: "timeout" }>((resolve) => {
-      timeout = setTimeout(() => resolve({ status: "timeout" }), remainingMs);
-      timeout.unref?.();
-    }),
+    remainingMs === 0
+      ? Promise.resolve({ status: "timeout" as const })
+      : new Promise<{ status: "timeout" }>((resolve) => {
+          timeout = setTimeout(() => resolve({ status: "timeout" }), remainingMs);
+          timeout.unref?.();
+        }),
   ]);
   if (timeout) clearTimeout(timeout);
   if (result.status === "timeout") {
