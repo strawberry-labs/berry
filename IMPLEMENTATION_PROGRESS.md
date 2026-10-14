@@ -88,7 +88,7 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `6469a9d` | H-065 | None. Draft images are written only inside the sandbox workspace. |
 | `ec134cc` | H-045 | No schema change. New assistant-saved skills get one string in the existing `personal_skills.diagnostics` array; existing skills (including the task 756 calculator) are not modified. |
 | `6655e89` | H-047 | None (rendering and test harness only). |
-| _pending_ | H-004 | None. Failure text gains an optional suffix inside the existing prefix; stored step errors keep parsing. |
+| `80559b3` | H-004 | None. Failure text gains an optional suffix inside the existing prefix; stored step errors keep parsing. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -195,7 +195,7 @@ fixture; this is fixed in `54c9255`.
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
-| H-004 (repair loops across changed arguments) | Committed — partial (re-spelt paths stop; other changed arguments get guidance) | _pending_ | Not deployed (worker) |
+| H-004 (repair loops across changed arguments) | Committed — partial (re-spelt paths stop; other changed arguments get guidance) | `80559b3` | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Remaining issues (23 of 76) and what each needs
@@ -203,8 +203,10 @@ fixture; this is fixed in `54c9255`.
 53 of the 76 registered issues have committed fixes (24 full, 29 partial). None is
 deployed. The other 23 are not done for the reasons below; no code was changed for them.
 
-**Needs a live model evaluation** (behavioural; no billable model calls were authorised
-in this session; prompt changes are behaviour changes and need measured evidence):
+**Needs a live model evaluation** (behavioural; prompt changes need measured evidence).
+`scripts/run-behaviour-evals.sh <base-url> <model...>` runs the 28-case suite for each prompt
+variant with a key from `BERRY_EVAL_API_KEY` (verified offline against a fake endpoint);
+reading a key from local files was refused by the tool permission policy, so no live run yet:
 
 | ID | What is ready / what is missing |
 | --- | --- |
@@ -220,7 +222,10 @@ in this session; prompt changes are behaviour changes and need measured evidence
 | H-034 | Benign file conversion refused. |
 
 **Needs production evidence or a reproduction** (cause not established; a change now would
-be speculative):
+be speculative). `scripts/aws-read-only-evidence.sh <aws-profile> <hostname> [since]` collects
+it over SSM in one read-only transaction (`scripts/remaining-issue-evidence.sql`, validated
+on a migrated disposable database); production access from this session was refused by the
+tool permission policy, so it has not been run:
 
 | ID | Missing evidence |
 | --- | --- |
