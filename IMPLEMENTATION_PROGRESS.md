@@ -56,7 +56,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `b7b1e94` | H-053 | None. |
 | `1df00a9` | H-030 | None. |
 | `e4bc64b` | H-054 | None. |
-| _pending_ | H-011 (binary reads) | None. Only new tool results are sanitised; existing journal rows are untouched. |
+| `c4f419b` | H-011 (binary reads) | None. Only new tool results are sanitised; existing journal rows are untouched. |
+| _pending_ | H-039 | No schema change and no deletion. The prompt-version bump stops reuse of existing `vision_observation_cache` rows; the existing retention job removes them once unused. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -84,6 +85,14 @@ No pre-existing failures were observed in these suites.
 | Suite | Failure | Evidence |
 | --- | --- | --- |
 | `apps/api/src/usage/usage.controller.test.ts` | 4 tests: "Nest can't resolve dependencies of the QueuedFollowUpService (?) … CloudDatabaseService at index [0]" | Same 4 failures on a clean checkout of `99964f1` and of `52c0260`; test-module DI wiring, untouched by these commits. |
+| `apps/api` controller suites: `audit` (3), `billing` (2), `identity` (9), `model-governance` (4), `policy-distribution` (2), plus `usage` (4) above | 24 tests in total, same Nest DI error | Found with a full API run on 14 October: identical 24 failures on clean checkouts of `99964f1` and `c4f419b`. Earlier entries cited only the `usage` suite. |
+
+**Correction to recorded worker test counts.** Vitest 4 also collects compiled
+`dist/*.test.js` files, and the verification tree's `apps/worker/dist` held compiled
+tests from earlier builds. Worker totals recorded up to `c4f419b` (908 → 995) therefore
+double-count; their pass/fail results stand, since both copies passed. Source-only counts:
+base `99964f1` 433 passed / 3 skipped; `c4f419b` 506 / 3. From H-039 on, the
+verification script deletes compiled tests first and counts are source-only.
 
 ## Summary
 
@@ -113,7 +122,8 @@ No pre-existing failures were observed in these suites.
 | H-053 (repeat guard after source edits) | Committed | `b7b1e94` | Not deployed (worker) |
 | H-030 (bounded polling of running jobs) | Committed | `1df00a9` | Not deployed (worker) |
 | H-054 (vision retry by failure class) | Committed | `e4bc64b` | Not deployed (worker) |
-| H-011 (binary and UTF-16 reads; NUL-safe journal) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-011 (binary and UTF-16 reads; NUL-safe journal) | Committed — partial | `c4f419b` | Not deployed (worker) |
+| H-039 (truncated vision observations) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1027,6 +1037,7 @@ No pre-existing failures were observed in these suites.
   (task `08285ac9…`, shared with H-008) still selects the extractor by extension;
   UTF-16BE and BOM-less UTF-16LE in non-Latin scripts are reported as binary rather than
   decoded (previously they failed the run).
+- **Commit.** `c4f419b`.
 
 ### H-004 — Repair loops across changed arguments (revalidated; no change)
 
@@ -1049,3 +1060,38 @@ No pre-existing failures were observed in these suites.
 - **Next action.** Reproduce one cosmetic-variation loop (for example task 523's mistyped
   file ID) as a fixture, then decide between guidance after repeated equivalent failures
   and a hard stop.
+
+### H-039 — Vision observations cut off at the output limit are accepted and cached
+
+- **Evidence.** Month: 1,535 completed `inspect_images` steps end with
+  `finishReason=length` (362 tasks / 106 users; 51.3% of completed cache-miss
+  observations with diagnostics; a truncation rate, not a wrong-answer rate). Task 977
+  lists 16 of 35 claimed employees before stopping; task 110 accepts a focused answer
+  that ended at the limit.
+- **Root cause (confirmed in code).** The adapter accepted any non-empty content as the
+  observation, cached it, and returned it with no completeness signal; a cache hit then
+  served the partial text as a finished answer, and `ON CONFLICT` never replaced it.
+- **Fix.** A final finish reason of `length`/`max_tokens` marks the observation
+  incomplete: the result carries `vision.complete: false`, a Berry notice after the
+  untrusted observation tells the model not to treat it as a complete check and to ask
+  a narrower focused question for the rest, the summary says so, and it is **not
+  cached**. Complete observations are cached and reused as before (hits report
+  `complete: true`). The prompt version moves to `vision-observation-v4` so v3 entries
+  of unknown completeness are no longer served.
+- **Deliberately not changed.** The first focused call's stable-intent cache key
+  (commit `5b334f3`, with its own test) stays: the audit's collision case is a
+  code-proven risk with no observed wrong answer, and question-only keys would remove a
+  working reuse path. No automatic larger-budget retry: it changes vision cost and
+  latency for about half of all inspections and needs a live measurement first.
+- **Files.** `apps/worker/src/vision-tools.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite (source-only)
+  508 passed / 3 skipped. New cases: a length-stopped focused answer is reported
+  incomplete, not cached, and recomputed on repeat; a complete answer is still cached
+  and the hit reports `complete: true`. Both fail on the previous source.
+- **Data impact.** No schema change and nothing deleted. Existing cache rows simply stop
+  matching and are removed by the existing `vision_observations` retention phase once
+  unused; expect a one-time re-inspection cost for images asked about again.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Measured adaptive budget or targeted continuation for truncated
+  answers; coverage for multi-page inspections ("stopped on page five"); H-061 (overview
+  mode replaces the supplied question).

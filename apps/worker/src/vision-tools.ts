@@ -25,10 +25,13 @@ import {
   type TurnToolResult,
 } from "./turn-runner.js";
 
-const VISION_PROMPT_VERSION = "vision-observation-v3";
+// v4: observations cut off at the output limit are no longer cached, so v3
+// entries of unknown completeness are not reused (they age out) (H-039).
+const VISION_PROMPT_VERSION = "vision-observation-v4";
 const DEFAULT_OVERVIEW_QUESTION = "Produce a comprehensive reusable observation of these images.";
 const FOCUSED_MAX_OUTPUT_TOKENS = 1_024;
 const MAX_OBSERVATION_CHARACTERS = 24_000;
+const OUTPUT_LIMIT_FINISH = /^(?:length|max_tokens|max_output_tokens)$/i;
 
 interface VisionAttemptDiagnostic {
   attempt: number;
@@ -320,14 +323,19 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       part.type === "text" && part.text.startsWith("[Image not sent:") ? [part.text] : [],
     ).join("\n").slice(0, 4_000);
     if (omissionNotes) observation = `${omissionNotes}\n\n${observation}`;
-    await this.cache.put({
-      tenantId: snapshot.tenantId,
-      cacheKey,
-      providerId: runtime.vision.providerId,
-      model: runtime.vision.model,
-      imageCount: images.length,
-      observation,
-    });
+    // An observation cut off at the output limit is partial evidence: report
+    // it as such and never cache it as a reusable answer (H-039).
+    const complete = !OUTPUT_LIMIT_FINISH.test(results.at(-1)?.finishReason ?? "");
+    if (complete) {
+      await this.cache.put({
+        tenantId: snapshot.tenantId,
+        cacheKey,
+        providerId: runtime.vision.providerId,
+        model: runtime.vision.model,
+        imageCount: images.length,
+        observation,
+      });
+    }
     const usage = visionUsageEvent(
       aggregateVisionUsage(results),
       runtime.vision.modelPricing,
@@ -346,8 +354,9 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
         false,
         attempts,
         paths?.length ?? 0,
+        complete,
       ),
-      summary: `Inspected ${images.length} image${images.length === 1 ? "" : "s"} with ${runtime.vision.model}`,
+      summary: `Inspected ${images.length} image${images.length === 1 ? "" : "s"} with ${runtime.vision.model}${complete ? "" : " (incomplete: output limit reached)"}`,
       usage,
     };
   }
@@ -411,15 +420,17 @@ function visionOutput(
   cacheHit: boolean,
   diagnostics: readonly VisionAttemptDiagnostic[] = [],
   requestedPathCount = 0,
+  complete = true,
 ): JsonValue {
   return {
-    content: `<untrusted_vision_observation>\n${observation}\n</untrusted_vision_observation>`,
+    content: `<untrusted_vision_observation>\n${observation}\n</untrusted_vision_observation>${complete ? "" : "\n[Incomplete observation: the vision model stopped at its output limit, so the text above may end before the answer does. Do not treat it as a complete check. For anything it does not cover, ask a narrower focused question.]"}`,
     vision: {
       providerId,
       model,
       imageCount,
       mode,
       cacheHit,
+      complete,
       promptVersion: VISION_PROMPT_VERSION,
       requestedPathCount,
       ...(diagnostics.length > 0 ? {

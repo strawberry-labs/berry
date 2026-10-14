@@ -417,6 +417,50 @@ describe("DurableVisionToolExecutor", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  describe("observations cut off at the output limit (H-039)", () => {
+    const respond = (content: string, finishReason: string) => vi.fn(async (..._args: Parameters<typeof fetch>) => new Response(JSON.stringify({
+      id: "vision-response",
+      model: "minimax-m3",
+      choices: [{ message: { content }, finish_reason: finishReason }],
+      usage: { prompt_tokens: 10, completion_tokens: 1_024, total_tokens: 1_034 },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const base: DurableTurnToolExecutor = {
+      modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
+      execute: async () => { throw new Error("unexpected base execution"); },
+    };
+    const question = { mode: "focused", question: "List every employee name in the table." };
+
+    it("reports a length-stopped observation as incomplete and does not cache it", async () => {
+      const fetchMock = respond("1. Amal Haddad\n2. Bilal Khan\n3. Chen", "length");
+      vi.stubGlobal("fetch", fetchMock);
+      const cache = new MemoryVisionCache();
+      const executor = new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" });
+
+      const first = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(first.output).toMatchObject({ vision: { complete: false, cacheHit: false, diagnostics: [{ finishReason: "length" }] } });
+      expect((first.output as { content: string }).content).toContain("Incomplete observation");
+      expect(first.summary).toContain("incomplete");
+      expect(cache.values.size).toBe(0);
+
+      const repeated = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(repeated.output).toMatchObject({ vision: { complete: false, cacheHit: false } });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("still caches and reuses a complete observation", async () => {
+      const fetchMock = respond("1. Amal Haddad\n2. Bilal Khan", "stop");
+      vi.stubGlobal("fetch", fetchMock);
+      const executor = new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" });
+
+      const first = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(first.output).toMatchObject({ vision: { complete: true, cacheHit: false, promptVersion: "vision-observation-v4" } });
+      expect((first.output as { content: string }).content).not.toContain("Incomplete observation");
+      const repeated = await executor.execute(visionSnapshot(), visionStep(question));
+      expect(repeated.output).toMatchObject({ vision: { complete: true, cacheHit: true } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("retry after a failed inspection (task 843)", () => {
     const ok = () => new Response(JSON.stringify({
       id: "vision-response", model: "minimax-m3",

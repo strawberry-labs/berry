@@ -64,7 +64,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Production occurrence not established |
 | H-037 | P1 | Search operators removed before upstream search | Production query/output + matching local BerryCrawl code | Remote BerryCrawl revision unverified |
 | H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker path present; remote gateway revision unverified |
-| H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Confirmed current completeness gap |
+| H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Fix committed locally (not deployed): truncated observations marked incomplete and never cached; adaptive budget open |
 | H-040 | P1 | Irrelevant task outcomes and temporary memories replace missing source | Traced conversation + stored grounding + deployed retrieval | Current safeguards insufficient; stale memory remains available |
 | H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Confirmed current contract defect |
 | H-042 | P1 | Transparent text image misclassified as blank | Original source pixels + full production trace | Confirmed failed recovery; current alpha handling needs regression |
@@ -494,6 +494,8 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Current focused cap is 1,024 tokens. Any nonempty text is accepted and cached; cache hits lack completeness metadata. Task 977 lists only 16 of its claimed 35 employees before truncation; the count itself needs source verification. At least three same-image workflow tasks contain independently verified digit errors, which are not automatically attributed to truncation.
 - Proposed fix: explicit completeness/coverage, concise structured extraction, bounded adaptive budget or targeted continuation, and cache only results whose completeness is established. Cache-format migration needs deliberate handling of older entries.
 - Acceptance: long lists, cropped/blurred identifiers and forced length finishes; no silent partial success or cached partial result. Measure extraction accuracy, recovery cost and latency. See [monthly plan](output/platform-audit-2026-10-13/report.md).
+
+- **Implementation (14 October):** a final `length` finish now returns `vision.complete: false` with an explicit incomplete-observation notice, and such observations are never cached; complete ones are cached as before. The prompt version moved to v4 so older entries of unknown completeness are not reused (no deletion; existing retention ages them out). The stable-intent focused key was kept (unobserved collision risk). Not deployed. Adaptive budget/targeted continuation still needs live measurement.
 
 ### H-040 — Memory and retrieval contamination
 
