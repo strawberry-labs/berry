@@ -35,7 +35,7 @@ import {
   networkDomainAllowed,
   type NetworkPolicy,
 } from "@berry/shared";
-import { MODEL_IMAGE_LIMITS, modelImageOmission, prepareModelImage } from "./model-image.js";
+import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageOmission, prepareModelImage } from "./model-image.js";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
@@ -1298,6 +1298,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         ? Buffer.from(first.b64_json, "base64")
         : await downloadGeneratedImage(first.url, signal);
       if (bytes.byteLength === 0) throw new Error("The image provider returned an empty image");
+      // Describe what was returned; never assume it from the request (H-041).
+      const actual = await describeImageBytes(bytes);
+      if (!actual) throw new Error("The image provider returned data that is not a readable PNG, JPEG, WebP or GIF image");
       // Image generation happens outside the sandbox and may outlive its
       // provider TTL. Reconnect/resume before the first post-generation
       // sandbox operation, including turns that created the sandbox earlier
@@ -1308,8 +1311,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sandboxId: sandbox.id,
         sandboxState: sandbox.state,
       }, signal);
-      const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp)$/i, "");
-      const path = `${workspaceRoot}/outputs/${title}.png`;
+      const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp|gif)$/i, "");
+      const name = `${title}.${actual.extension}`;
+      const path = `${workspaceRoot}/outputs/${name}`;
       const writeInput = { sandbox_id: writableSandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
       await (signal
         ? this.provider.files.write(writeInput, { signal })
@@ -1317,15 +1321,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!this.objects) throw new Error("Artifact object storage is not configured");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const stored = await this.objects.putArtifact(
-        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${title}.png`,
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${name}`,
         bytes,
-        "image/png",
+        actual.mediaType,
       );
       const output = await this.repository.persistOutput({
         snapshot,
         fileId: step.id,
-        name: `${title}.png`,
-        mediaType: "image/png",
+        name,
+        mediaType: actual.mediaType,
         sizeBytes: bytes.byteLength,
         sha256,
         bucket: stored.bucket,
@@ -1335,7 +1339,6 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         origin: "image_generation",
         sourcePath: path,
       });
-      const dimensions = imageDimensions(stringValue(args.size) ?? imageSizeForAspectRatio(stringValue(args.aspect_ratio)));
       const image = {
         src: `/v1/files/${output.fileId}/content`,
         downloadUrl: `/v1/files/${output.fileId}/content`,
@@ -1343,17 +1346,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         title,
         prompt,
         ...(first.revised_prompt ? { revisedPrompt: first.revised_prompt } : {}),
-        aspectRatio: stringValue(args.aspect_ratio) ?? "1:1",
-        width: dimensions.width,
-        height: dimensions.height,
-        mimeType: "image/png",
+        // The shared schema allows five presets; label the one nearest the actual shape.
+        aspectRatio: nearestAspectRatioPreset(actual.width, actual.height),
+        width: actual.width,
+        height: actual.height,
+        mimeType: actual.mediaType,
         sizeBytes: output.sizeBytes,
-        transparentBackground: args.transparent_background === true,
+        transparentBackground: args.transparent_background === true && actual.transparent,
         generationId: step.id,
       };
+      const shape = `${actual.width}x${actual.height}${exactAspectRatio(actual.width, actual.height)}`;
+      const notes = generatedImageMismatchNotes(args, actual);
       return {
-        output: { text: `Generated ${title}.png`, image, visionPath: path, artifact: { kind: "file", path: image.src, fileId: output.fileId, name: output.name, mediaType: output.mediaType, size: output.sizeBytes } },
-        summary: `Generated ${title}.png`,
+        output: { text: `Generated ${name} (${shape}).${notes ? ` ${notes}` : ""}`, image, visionPath: path, artifact: { kind: "file", path: image.src, fileId: output.fileId, name: output.name, mediaType: output.mediaType, size: output.sizeBytes } },
+        summary: `Generated ${name} (${shape})`,
         sandbox: writableSandbox,
       };
     }
@@ -3423,12 +3429,36 @@ function imageSizeForAspectRatio(value: string | null): string {
   return "1024x1024";
 }
 
-function imageDimensions(value: string): { width: number; height: number } {
-  const match = /^(\d+)x(\d+)$/.exec(value);
-  return {
-    width: Number(match?.[1] ?? 1024),
-    height: Number(match?.[2] ?? 1024),
-  };
+const ASPECT_RATIO_PRESETS = { "1:1": 1, "3:4": 3 / 4, "4:3": 4 / 3, "9:16": 9 / 16, "16:9": 16 / 9 } as const;
+
+function nearestAspectRatioPreset(width: number, height: number): keyof typeof ASPECT_RATIO_PRESETS {
+  const actual = Math.log(width / height);
+  return (Object.keys(ASPECT_RATIO_PRESETS) as Array<keyof typeof ASPECT_RATIO_PRESETS>).reduce((best, preset) =>
+    Math.abs(Math.log(ASPECT_RATIO_PRESETS[preset]) - actual) < Math.abs(Math.log(ASPECT_RATIO_PRESETS[best]) - actual) ? preset : best);
+}
+
+/** ", 3:2" for small whole-number ratios, otherwise "". */
+function exactAspectRatio(width: number, height: number): string {
+  const divisor = (a: number, b: number): number => b === 0 ? a : divisor(b, a % b);
+  const common = divisor(width, height);
+  return width / common <= 32 && height / common <= 32 ? `, ${width / common}:${height / common}` : "";
+}
+
+/** Requested-versus-returned differences the model must not paper over (H-041). */
+function generatedImageMismatchNotes(
+  args: Record<string, unknown>,
+  actual: { width: number; height: number; transparent: boolean },
+): string {
+  const notes: string[] = [];
+  const ratio = stringValue(args.aspect_ratio);
+  const requested = ratio && ratio in ASPECT_RATIO_PRESETS ? ASPECT_RATIO_PRESETS[ratio as keyof typeof ASPECT_RATIO_PRESETS] : null;
+  if (requested && Math.abs(Math.log(requested) - Math.log(actual.width / actual.height)) > 0.02) {
+    notes.push(`${ratio} was requested, but the image model returned this shape. If the exact ratio matters, crop or pad a copy deterministically and check that no essential content is lost.`);
+  }
+  const size = stringValue(args.size);
+  if (size && size !== `${actual.width}x${actual.height}`) notes.push(`Size ${size} was requested; the returned image is ${actual.width}x${actual.height}.`);
+  if (args.transparent_background === true && !actual.transparent) notes.push("A transparent background was requested, but the returned image has no transparent pixels.");
+  return notes.join(" ");
 }
 
 function excludedSnapshotPath(path: string, root: string): boolean {

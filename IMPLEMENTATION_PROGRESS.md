@@ -59,7 +59,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `c4f419b` | H-011 (binary reads) | None. Only new tool results are sanitised; existing journal rows are untouched. |
 | `2bd8ff5` | H-039 | No schema change and no deletion. The prompt-version bump stops reuse of existing `vision_observation_cache` rows; the existing retention job removes them once unused. |
 | `03d4682` | H-061 | None. |
-| _pending_ | H-042 | None (in-memory model previews only; user files untouched). |
+| `5cd4189` | H-042 | None (in-memory model previews only; user files untouched). |
+| _pending_ | H-041 | None. New generated files are stored under their real format; existing files and rows are untouched. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -127,7 +128,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-011 (binary and UTF-16 reads; NUL-safe journal) | Committed — partial | `c4f419b` | Not deployed (worker) |
 | H-039 (truncated vision observations) | Committed — partial | `2bd8ff5` | Not deployed (worker) |
 | H-061 (questions dropped by overview mode) | Committed | `03d4682` | Not deployed (worker) |
-| H-042 (transparent images seen as blank) | Committed | _pending_ | Not deployed (worker) |
+| H-042 (transparent images seen as blank) | Committed | `5cd4189` | Not deployed (worker) |
+| H-041 (generated image metadata from returned bytes) | Committed — worker path | _pending_ | Not deployed (worker) |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1161,3 +1163,36 @@ verification script deletes compiled tests first and counts are source-only.
 - **Remaining.** Provider-side behaviour across vision models and the alpha-unaware
   shell recovery seen in the task (the model converted to RGB and ignored Pillow's warning)
   remain behavioural; no cross-model evaluation was run.
+- **Commit.** `5cd4189`.
+
+### H-041 — Generated image metadata is taken from the request, not the returned bytes
+
+- **Evidence.** 234 completed image calls / 71 tasks report dimensions inconsistent with
+  the requested ratio; task 333's image `c67cb377…` is 1536×1024 (3:2) but labelled 16:9;
+  task 166 returns 1024×1536 (2:3) while the tool and final answer say 3:4.
+- **Root cause (confirmed in code).** `create_image` derived `width`/`height` from the
+  request mapping (3:4 and 9:16 → 1024×1536, 4:3 and 16:9 → 1536×1024), echoed the
+  requested `aspectRatio`, and always stored the bytes as `.png`/`image/png` with the
+  requested transparency flag, without looking at what the provider returned.
+- **Fix.** The returned bytes are inspected with sharp: width, height, format and real
+  transparency. Metadata, file extension and stored media type follow them; the
+  `aspectRatio` label is the preset nearest the actual shape (the strict shared schema
+  only allows five presets), and `transparentBackground` is true only when transparency
+  was requested *and* present. The tool text gives the actual size and ratio and states
+  each mismatch (ratio, explicit size, transparency) with deterministic crop/pad guidance
+  that warns against losing content. Bytes that are not a readable image are rejected
+  instead of being published.
+- **Files.** `apps/worker/src/sandbox-continuity.ts`, `apps/worker/src/model-image.ts`
+  (`describeImageBytes`), `apps/worker/src/sandbox-continuity.test.ts`.
+- **Tests.** The existing create_image test used a 4-byte PNG signature and asserted the
+  request-derived 1536×1024; it now uses a real 1536×1024 PNG and also asserts the
+  nearest preset and the 16:9 mismatch note. New cases: a JPEG returned for a transparent
+  16:9 request is stored as `.jpg`/`image/jpeg` with actual 1024×1024, `1:1`, no
+  transparency and both notes; a matching transparent PNG gets no note; non-image bytes
+  are rejected.
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 516 passed / 3
+  skipped. The three new cases fail on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Provider-aware ratio support (choosing a supported size per model rather
+  than the fixed three), and the desktop/local-agent and API legacy paths that repeat the
+  mapping (lower priority per AGENTS.md).

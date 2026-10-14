@@ -66,7 +66,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker path present; remote gateway revision unverified |
 | H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Fix committed locally (not deployed): truncated observations marked incomplete and never cached; adaptive budget open |
 | H-040 | P1 | Irrelevant task outcomes and temporary memories replace missing source | Traced conversation + stored grounding + deployed retrieval | Current safeguards insufficient; stale memory remains available |
-| H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Confirmed current contract defect |
+| H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Worker fix committed locally (not deployed): metadata from returned bytes plus mismatch notes; provider-aware sizes and local paths open |
 | H-042 | P1 | Transparent text image misclassified as blank | Original source pixels + full production trace | Fix committed locally (not deployed): transparent previews flattened onto a contrasting matte |
 | H-043 | P1 | Inherited presentation fonts require manual repair | 60 gate-failure steps / 36 tasks; full latest trace + local template/code | Confirmed current published-package inheritance gap |
 | H-044 | P2 | Email copy workflow and failure feedback | User complaint + local copy implementation | Plain copy exists; reported rich-copy cause unverified |
@@ -511,6 +511,7 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Current worker maps several distinct ratios to identical native sizes and assumes returned dimensions from the request. Shared/local paths repeat the mapping.
 - Proposed fix: provider-aware shape support, actual byte/MIME/dimension/alpha inspection, requested-versus-actual metadata, explicit unsupported-ratio recovery. Do not silently crop engineering references.
 - Acceptance: all advertised ratios, explicit size override, provider size mismatch, MIME mismatch, transparency and edit references; metadata must match returned bytes.
+- **Implementation (14 October):** the worker's `create_image` now reads width, height, format and transparency from the returned bytes, stores the file under its real format, labels the nearest allowed preset, reports ratio/size/transparency mismatches to the model and rejects non-image data. Not deployed. Provider-aware size selection and the desktop/local-agent paths remain.
 
 - **H-026/H-006 capability example:** task `f66812f6-432b-446f-97cc-22f2e10d3626` asks to add a calendar event. Discovery exposes only read tools, and list_events fails expired OAuth. The final says it tried to add and promises creation after reconnect. No creation call occurred. Show read/write connector capabilities and report the actual attempted operation; reconnection alone does not establish write access.
 

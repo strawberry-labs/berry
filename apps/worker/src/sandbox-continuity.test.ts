@@ -2627,7 +2627,7 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("resumes the sandbox after image generation before registering the image", async () => {
-    const bytes = Buffer.from([137, 80, 78, 71]);
+    const bytes = await sharp({ create: { width: 1_536, height: 1_024, channels: 3, background: "purple" } }).png().toBuffer();
     let paused = false;
     let resumeCount = 0;
     const provider = {
@@ -2723,8 +2723,12 @@ describe("SandboxContinuityManager", () => {
             title: "Berry icon",
             width: 1536,
             height: 1024,
+            // 16:9 was requested; 4:3 is the preset nearest the returned 3:2 (H-041).
+            aspectRatio: "4:3",
+            mimeType: "image/png",
             revisedPrompt: "A revised prompt",
           },
+          text: expect.stringContaining("16:9 was requested"),
           visionPath: "/workspace/outputs/Berry icon.png",
         },
       });
@@ -2756,6 +2760,79 @@ describe("SandboxContinuityManager", () => {
       origin: "image_generation",
       sourcePath: "/workspace/outputs/Berry icon.png",
     }));
+  });
+
+  describe("generated image metadata comes from the returned bytes (H-041)", () => {
+    const generate = async (returned: Buffer, argumentsValue: Record<string, unknown>) => {
+      const provider = {
+        kind: "e2b",
+        create: vi.fn(async () => ({ sandbox_id: "sandbox-image", provider: "e2b", status: "running" })),
+        exec: vi.fn(),
+        files: {
+          read: vi.fn(),
+          write: vi.fn(async (input: { path: string; content: string }) => ({ path: input.path, size_bytes: Buffer.from(input.content, "base64").byteLength, mtime: null })),
+          list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })),
+        },
+      } as unknown as SandboxProvider;
+      const repository = {
+        loadRun: vi.fn(),
+        continuity: vi.fn(async () => null),
+        latest: vi.fn(async () => null),
+        inputFiles: vi.fn(async () => []),
+        persistOutput: vi.fn(async (input: { fileId: string; name: string; mediaType: string; sizeBytes: number; objectKey: string }) => ({
+          fileId: input.fileId, name: input.name, mediaType: input.mediaType, sizeBytes: input.sizeBytes, objectKey: input.objectKey,
+        })),
+        persist: vi.fn(),
+        recordSandbox: vi.fn(async () => undefined),
+      } satisfies SandboxSnapshotRepository;
+      const objects = {
+        put: vi.fn(),
+        putArtifact: vi.fn(async (key: string) => ({ bucket: "berry", key, etag: "etag" })),
+        get: vi.fn(),
+        getSource: vi.fn(),
+      } satisfies SandboxSnapshotObjectStore;
+      const manager = new SandboxContinuityManager(provider, repository, objects, {
+        image: "berry-sandbox",
+        imageGeneration: { endpoint: "https://images.example.test/v1/images/generations", apiKey: "test-key", model: "gpt-image-1", responseFormat: "b64_json" },
+      });
+      const current = snapshot();
+      current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ model: "gpt-image-1", data: [{ b64_json: returned.toString("base64") }] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      })));
+      try {
+        const result = await manager.execute(current, { ...toolStep("create_image", { prompt: "A site logo", title: "Site logo", ...argumentsValue }), retryClass: "non_idempotent_manual" as const });
+        return { result, repository, objects };
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    };
+
+    it("labels a JPEG as JPEG and reports a missed ratio and transparency", async () => {
+      const jpeg = await sharp({ create: { width: 1_024, height: 1_024, channels: 3, background: "white" } }).jpeg().toBuffer();
+      const { result, repository, objects } = await generate(jpeg, { aspect_ratio: "16:9", transparent_background: true });
+      expect(result.output).toMatchObject({
+        image: { width: 1024, height: 1024, aspectRatio: "1:1", mimeType: "image/jpeg", transparentBackground: false },
+        visionPath: "/workspace/outputs/Site logo.jpg",
+      });
+      const text = (result.output as { text: string }).text;
+      expect(text).toContain("(1024x1024, 1:1)");
+      expect(text).toContain("16:9 was requested");
+      expect(text).toContain("no transparent pixels");
+      expect(objects.putArtifact).toHaveBeenCalledWith(expect.stringContaining("/original/Site logo.jpg"), jpeg, "image/jpeg");
+      expect(repository.persistOutput).toHaveBeenCalledWith(expect.objectContaining({ name: "Site logo.jpg", mediaType: "image/jpeg" }));
+    });
+
+    it("adds no mismatch note when the returned image matches the request", async () => {
+      const png = await sharp({ create: { width: 1_024, height: 1_024, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toBuffer();
+      const { result } = await generate(png, { aspect_ratio: "1:1", transparent_background: true });
+      expect(result.output).toMatchObject({ image: { aspectRatio: "1:1", mimeType: "image/png", transparentBackground: true } });
+      expect((result.output as { text: string }).text).toBe("Generated Site logo.png (1024x1024, 1:1).");
+    });
+
+    it("rejects provider data that is not a readable image instead of publishing it", async () => {
+      await expect(generate(Buffer.from([137, 80, 78, 71]), {})).rejects.toThrow("not a readable");
+    });
   });
 
   it("streams only the attachment referenced by the current tool through one native file write", async () => {

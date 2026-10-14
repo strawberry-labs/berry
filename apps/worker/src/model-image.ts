@@ -150,6 +150,36 @@ async function transparencyMatte(source: () => Sharp): Promise<"#ffffff" | "#000
   return weight > 0 && luminance / weight > 0.6 ? "#000000" : "#ffffff";
 }
 
+/**
+ * Actual format, size and transparency of image bytes, for metadata that must
+ * describe what was returned rather than what was requested (H-041). Null
+ * when the bytes are not a readable PNG, JPEG, WebP or GIF image.
+ */
+export async function describeImageBytes(input: Uint8Array): Promise<{
+  mediaType: string;
+  extension: string;
+  width: number;
+  height: number;
+  transparent: boolean;
+} | null> {
+  const bytes = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+  const image = () => sharp(bytes, { limitInputPixels: MODEL_IMAGE_LIMITS.maxInputPixels, animated: false }).timeout({ seconds: 5 });
+  try {
+    const meta = await image().metadata();
+    if (!meta.width || !meta.height || !["png", "jpeg", "webp", "gif"].includes(meta.format ?? "")) return null;
+    const swap = (meta.orientation ?? 1) >= 5;
+    return {
+      mediaType: `image/${meta.format}`,
+      extension: meta.format === "jpeg" ? "jpg" : meta.format!,
+      width: swap ? meta.height : meta.width,
+      height: swap ? meta.width : meta.height,
+      transparent: meta.hasAlpha === true && !(await image().stats()).isOpaque,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function modelImageOmission(path: string, reason: string): string {
   return `[Image not sent: ${JSON.stringify(path)}; ${reason}. The original file is unchanged. Use bash to create a smaller PNG/JPEG copy or crop the relevant region, then read that new path. Do not repeat read on this unchanged image or claim to have seen its pixels.]`;
 }
