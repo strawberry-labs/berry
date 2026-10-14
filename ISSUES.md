@@ -43,7 +43,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-015 | P2 | Expired queued text is hard to recover | Observed expiry + code finding | Open; explicit recovery UX needed |
 | H-016 | P1 | Shell success masks failed operations | Observed; cause verification noted below | Partly fixed locally (not deployed): earlier non-zero commands are listed when the final status is 0; pipelines open |
 | H-017 | P1 | Source freshness and verification claims | Observed; cause verification noted below | Open |
-| H-018 | P1 | Skill save validation discovery | Observed; cause verification noted below | Open |
+| H-018 | P1 | Skill save validation discovery | Observed; cause verification noted below | Fix committed locally (not deployed): all SKILL.md problems reported together with a valid example |
 | H-019 | P1 | Structural versus visual validation | Observed; cause verification noted below | Open |
 | H-020 | P1 | Unnecessary tools for text edits | Observed; cause verification noted below | Open |
 | H-021 | P1 | Long model retries strand work | Observed; cause verification noted below | Open |
@@ -258,6 +258,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Observed: task `042494ca-3a93-4c37-8204-58c51ddf34ef` needs four save attempts: missing YAML, missing name, invalid name, then success.
 - Proposal: provide a valid scaffold and validate the complete skill schema before saving; return all actionable validation errors together.
 - Status: observed; exact deployed validator and current fix need verification.
+- **Implementation (14 October):** the shared SKILL.md parser now reports every frontmatter problem in one error and shows a valid header example for structural mistakes; single problems keep their wording. Not deployed.
 
 ### H-019 — Validation claims do not distinguish structural and visual checks
 

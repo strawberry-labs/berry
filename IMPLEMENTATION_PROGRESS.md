@@ -78,7 +78,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `5b6e7b0` | H-063 | None (skill guidance text). |
 | `2235bfd` | H-010 | None. Prevents late snapshot rows from being written after a timeout. |
 | `f02396f` | H-044 | None (UI). |
-| _pending_ | H-027 | None (UI). |
+| `f5ec9f5` | H-027 | None (UI). |
+| _pending_ | H-018 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -171,7 +172,9 @@ fixture; this is fixed in `54c9255`.
 | H-063 (quadratic read-only spreadsheet access) | Committed — guidance | `5b6e7b0` | Not published (organization `xlsx` skill package) |
 | H-010 (timed-out snapshot keeps writing after cleanup) | Committed | `2235bfd` | Not deployed (worker) |
 | H-044 (Copy reports success before the clipboard write) | Committed — partial | `f02396f` | Not deployed (web, via desktop-ui) |
-| H-027 (dropped folders attached as empty files) | Committed — partial | _pending_ | Not deployed (web) |
+| H-027 (dropped folders attached as empty files) | Committed — partial | `f5ec9f5` | Not deployed (web) |
+| H-018 (skill save reveals problems one at a time) | Committed | _pending_ | Not deployed (shared package: API and worker rebuild) |
+| H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
@@ -1783,3 +1786,33 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (web).
 - **Remaining.** Recursive folder import, the question-overlay and project-upload dialogs,
   and a browser drag-and-drop check.
+- **Commit.** `f5ec9f5`.
+
+### H-018 — Saving a skill reveals validation problems one at a time
+
+- **Evidence.** Task `042494ca…` needed four `save_personal_skill` attempts: missing YAML,
+  then a missing name, then an invalid name, then success.
+- **Root cause (confirmed in code).** The shared `parseAgentSkillMarkdown` (used by the
+  API and the worker) threw at the first problem and its structural errors gave no
+  example of a valid header.
+- **Fix.** Structural errors (no frontmatter, unterminated, not a mapping) now include a
+  short valid example with the name and description rules. Once the YAML parses, every
+  field problem (required name/description, name pattern, metadata, optional field
+  limits) is collected and reported together as "SKILL.md has N problems: …". A single
+  problem keeps its exact previous message.
+- **Files.** `packages/shared/src/agent-skill-content.ts` (+test, new).
+- **Verification (isolated snapshot, shared dist rebuilt).** Shared tests 128/128; worker
+  typecheck and 531 passed / 3 skipped; API typecheck and 450 passed / 24 failed (the
+  known pre-existing DI failures); web typecheck and build pass. Two of the three new
+  cases fail on the previous parser; the single-problem case passes on both.
+- **Deployment.** Not deployed (shared package: API and worker must be rebuilt).
+- **Remaining.** A scaffold returned by the save tool for package directories (scripts and
+  resources) beyond the header.
+
+### Blocked: H-047 — Arabic/English presentation
+
+- The shared Markdown renderer sets no text direction and uses left-specific list, quote
+  and table styles. The issue says this is a plausible contributor, not the established
+  cause, and requires a browser reproduction that separates model language choice from
+  layout before any change. A correct fix would also need logical (start/end) spacing,
+  not only `dir="auto"`. Deferred until that reproduction is done.
