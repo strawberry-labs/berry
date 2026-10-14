@@ -63,7 +63,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified |
 | H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Fix committed locally (not deployed): omitted results carry an explicit marker; production occurrence still not established |
 | H-037 | P1 | Search operators removed before upstream search | Production query/output + matching local BerryCrawl code | Remote BerryCrawl revision unverified |
-| H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker path present; remote gateway revision unverified |
+| H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker fix committed locally (not deployed): calls separated by id when indices restart; desktop adapter and remote gateway open |
 | H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Fix committed locally (not deployed): truncated observations marked incomplete and never cached; adaptive budget open |
 | H-040 | P1 | Irrelevant task outcomes and temporary memories replace missing source | Traced conversation + stored grounding + deployed retrieval | Partly fixed locally (not deployed): personal memory extraction sees only the user's words; retrieval relevance and existing memories open |
 | H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Worker fix committed locally (not deployed): metadata from returned bytes plus mismatch notes; provider-aware sizes and local paths open |
@@ -490,6 +490,7 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Status: implementation defect and production symptom confirmed; raw historical chunks and remote gateway build not verified. No model call or production mutation made.
 - Proposal: stable stream-wide call IDs/indices, protocol-aware field normalization and validation before durable dispatch; avoid guessing/splitting merged mutations.
 - Acceptance: split events, parallel calls, repeats, fragments, interleaving, missing indices, signatures and ending usage fixtures through both adapters; one correct dispatch per intended call. Estimate 2–3 days.
+- **Implementation (14 October):** the worker's stream accumulator starts a new call when a different id arrives with a name on an occupied index, and no longer doubles a repeated id; ordinary fragmented streams are unchanged. Not deployed. The desktop local-agent accumulator still needs the same change.
 
 ### H-039 — Vision truncation is silently accepted
 

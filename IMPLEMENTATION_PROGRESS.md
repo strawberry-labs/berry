@@ -70,7 +70,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `e241a6b` | H-028 | None. Publication receipts gain a `sha256` field for new publications only. |
 | `37285db` | H-036 | None. |
 | `f027f27` | H-016 | None. |
-| _pending_ | H-050 | None. |
+| `6c46724` | H-050 | None. |
+| _pending_ | H-038 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -155,7 +156,8 @@ fixture; this is fixed in `54c9255`.
 | H-028 (rebuilt files suppressed as duplicate publications) | Committed | `e241a6b` | Not deployed (worker) |
 | H-036 (tool results past the history budget sent empty) | Committed — partial | `37285db` | Not deployed (worker) |
 | H-016 (earlier shell failures masked by a final success) | Committed — partial | `f027f27` | Not deployed (worker) |
-| H-050 (ready optional capability discarded at the admission deadline) | Committed — partial | _pending_ | Not deployed (API) |
+| H-050 (ready optional capability discarded at the admission deadline) | Committed — partial | `6c46724` | Not deployed (API) |
+| H-038 (streamed tool calls merged when indices restart) | Committed — worker path | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1552,3 +1554,28 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (API).
 - **Remaining.** Persisting a scoped availability reason and telling the model when a
   capability changes between turns.
+- **Commit.** `6c46724`.
+
+### H-038 — Streamed tool calls merge when a gateway restarts indices
+
+- **Evidence.** 12 concatenated native-tool failures across 5 Gemini tasks; task
+  `fe764378…` repeats `activate_skillread` four times. A local synthetic stream
+  reproduces the merged name and concatenated JSON.
+- **Root cause (confirmed in code).** The worker accumulated streamed tool calls by
+  provider index and appended every `id`, `name` and `arguments` fragment. The Google
+  gateway restarts the index at 0 for each event, so separate calls were merged (and a
+  repeated identical id was doubled).
+- **Fix.** Calls are kept per arrival slot. A delta that carries both an id and a name,
+  arriving on an index that already holds a named call with a different id, starts a new
+  call. A repeated identical id is not appended again. Fragments without a new id and
+  name still extend the current call, so ordinary OpenAI-style streams are unchanged.
+  Results are ordered by provider index, then arrival.
+- **Files.** `apps/worker/src/turn-runner.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 527 passed / 3
+  skipped. The new case (two calls each at index 0 plus a call whose id repeats on every
+  fragment) yields three correct calls; on the previous source it yields one merged call.
+  The existing fragmented-stream test passes on both.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** `packages/local-agent/src/model.ts` (desktop) has the same index-based
+  accumulation (lower priority per AGENTS.md); calls without ids that restart indices
+  cannot be told apart; the remote gateway build is unverified.

@@ -3313,6 +3313,40 @@ describe("durable turn runner", () => {
     expect(changed.at(-1)).toMatchObject({ role: "user", content: expect.arrayContaining(supplemental) });
   });
 
+  it("keeps tool calls separate when a gateway restarts the index for each event (H-038)", async () => {
+    const events: ChatCompletionChunk[] = [
+      // Task fe764378: activate_skill and read arrived as "activate_skillread".
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_a", function: { name: "activate_skill", arguments: "{\"name\":\"docx\"}" } }] },
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_b", function: { name: "read", arguments: "{\"path\":\"/workspace/inputs/brief.docx\"}" } }] },
+      // A provider that repeats the same id on every fragment of one call.
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: null, raw: {},
+        toolCalls: [{ index: 0, id: "call_c", function: { name: "ls", arguments: "{\"pa" } }] },
+      { id: "gemini-1", model: "gemini", delta: "", finishReason: "tool_calls", raw: {},
+        toolCalls: [{ index: 0, id: "call_c", function: { arguments: "th\":\"/workspace\"}" } }] },
+    ];
+    const client = {
+      stream: async function* (): AsyncGenerator<ChatCompletionChunk> { yield* events; },
+    } as unknown as OpenAIChatCompletionsClient;
+    const model = new RouterDurableTurnModel(client, "gemini", {
+      provider: "router",
+      route: "/chat/completions",
+      capabilityForModel: () => ({ supported: false, cacheKey: false, cacheControl: false, retention: [], minimumTokens: 1_024 }),
+    });
+    const result = await model.call(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]), modelStep("pending", 1), {
+      messageId: randomUUID(),
+      tools: ["activate_skill", "read", "ls"].map((name) => ({ type: "function" as const, function: { name, description: name, parameters: { type: "object" } } })),
+      emitDelta: async () => undefined,
+      policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
+    });
+    expect(result.toolCalls.map((call) => [call.providerCallId, call.name, call.input])).toEqual([
+      ["call_a", "activate_skill", { name: "docx" }],
+      ["call_b", "read", { path: "/workspace/inputs/brief.docx" }],
+      ["call_c", "ls", { path: "/workspace" }],
+    ]);
+  });
+
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
     let request: ChatCompletionOptions | undefined;
     const client = {

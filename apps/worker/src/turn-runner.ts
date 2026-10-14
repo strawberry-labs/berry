@@ -3915,12 +3915,16 @@ export class RouterDurableTurnModel implements DurableTurnModel {
         ? snapshot.promptManifestObservedAt
         : snapshot.previousPromptManifestObservedAt,
     });
+    // Keyed by arrival slot rather than provider index: some gateways restart
+    // tool indices for every event, which used to merge separate calls (H-038).
     const streamedToolCalls = new Map<number, {
+      index: number;
       id: string;
       name: string;
       arguments: string;
       extraContent?: JsonValue;
     }>();
+    const slotForIndex = new Map<number, number>();
     let rawText = "";
     let rawReasoning = "";
     let emittedText = "";
@@ -3995,16 +3999,22 @@ export class RouterDurableTurnModel implements DurableTurnModel {
         await context.emitDelta(chunk.reasoningDelta, "reasoning");
       }
       for (const delta of chunk.toolCalls ?? []) {
-        const current = streamedToolCalls.get(delta.index) ?? {
-          id: "",
-          name: "",
-          arguments: "",
-        };
-        if (delta.id) current.id += delta.id;
+        let slot = slotForIndex.get(delta.index);
+        const existing = slot === undefined ? undefined : streamedToolCalls.get(slot);
+        // A call starts with its id and name. A different id that arrives with
+        // a name on an index already holding a named call is a new call.
+        const startsNewCall = existing !== undefined && Boolean(delta.id && delta.function?.name)
+          && existing.name.length > 0 && existing.id.length > 0 && delta.id !== existing.id;
+        if (existing === undefined || startsNewCall) {
+          slot = streamedToolCalls.size;
+          slotForIndex.set(delta.index, slot);
+          streamedToolCalls.set(slot, { index: delta.index, id: "", name: "", arguments: "" });
+        }
+        const current = streamedToolCalls.get(slot!)!;
+        if (delta.id && delta.id !== current.id) current.id += delta.id;
         if (delta.function?.name) current.name += delta.function.name;
         if (delta.function?.arguments) current.arguments += delta.function.arguments;
         if (delta.extraContent !== undefined) current.extraContent = delta.extraContent;
-        streamedToolCalls.set(delta.index, current);
       }
       if (chunk.usage) finalUsage = chunk.usage;
     }
@@ -4016,9 +4026,9 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       await emitVisibleText(bufferedText);
     }
     const nativeToolCalls: ChatToolCall[] = [...streamedToolCalls.entries()]
-      .sort(([left], [right]) => left - right)
-      .flatMap(([index, call]) => call.name ? [{
-        id: call.id || `call_${index}`,
+      .sort(([leftSlot, left], [rightSlot, right]) => left.index - right.index || leftSlot - rightSlot)
+      .flatMap(([slot, call]) => call.name ? [{
+        id: call.id || `call_${slot}`,
         type: "function" as const,
         function: {
           name: call.name,
