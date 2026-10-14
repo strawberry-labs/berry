@@ -86,7 +86,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `966d9a1` | H-035 | None (UI). |
 | `1650581` | Behaviour evaluation harness (test) | None. |
 | `6469a9d` | H-065 | None. Draft images are written only inside the sandbox workspace. |
-| _pending_ | H-045 | No schema change. New assistant-saved skills get one string in the existing `personal_skills.diagnostics` array; existing skills (including the task 756 calculator) are not modified. |
+| `ec134cc` | H-045 | No schema change. New assistant-saved skills get one string in the existing `personal_skills.diagnostics` array; existing skills (including the task 756 calculator) are not modified. |
+| _pending_ | H-047 | None (rendering and test harness only). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -187,8 +188,8 @@ fixture; this is fixed in `54c9255`.
 | H-035 (duplicate task from a second Enter) | Committed — partial | `966d9a1` | Not deployed (web) |
 | Behaviour evaluation harness (H-002, H-012, H-017, H-019, H-020, H-022, H-025, H-026, H-029, H-034) | Committed — runs pending credentials | `1650581` | Test only |
 | H-065 (unfinished image bases published as finals) | Committed — partial | `6469a9d` | Not deployed (worker) |
-| H-045 (assistant-saved skills look domain-verified) | Committed — partial | _pending_ | Not deployed (worker + web) |
-| H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
+| H-045 (assistant-saved skills look domain-verified) | Committed — partial | `ec134cc` | Not deployed (worker + web) |
+| H-047 (mixed Arabic/English laid out left-to-right) | Committed — partial (layout fixed; language adherence awaits evaluation) | _pending_ | Not deployed (web, via desktop-ui) |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
@@ -196,10 +197,10 @@ fixture; this is fixed in `54c9255`.
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
-## Remaining issues (28 of 76) and what each needs
+## Remaining issues (24 of 76) and what each needs
 
-48 of the 76 registered issues have committed fixes (24 full, 24 partial). None is
-deployed. The other 28 are not done for the reasons below; no code was changed for them.
+52 of the 76 registered issues have committed fixes (24 full, 28 partial). None is
+deployed. The other 24 are not done for the reasons below; no code was changed for them.
 
 **Needs a live model evaluation** (behavioural; no billable model calls were authorised
 in this session; prompt changes are behaviour changes and need measured evidence):
@@ -228,8 +229,6 @@ be speculative):
 | H-013 | Benchmarks of preparation and snapshot work. |
 | H-021 | Retry and model timing for the stranded-work cases. |
 | H-024 | The task's raw connector receipt (same symptom as H-068, fixed in `f2923b2`). |
-| H-035 | Whether duplicate submissions are a UI race or intentional resubmission. |
-| H-047 | A browser reproduction separating language choice from layout. |
 
 **Owned elsewhere or outside this repository:**
 
@@ -241,8 +240,10 @@ be speculative):
 | H-055, H-073, H-074 | The user's personal `cv-creator-new` package in the production database; none of the cited production hashes match this repository's `cv-creator`. |
 | H-056, H-058 (and the H-064 AESG manifests) | Prepared, already-published AESG sources that are not committed (see "Blocked: prepared AESG skill sources"). |
 
-**Needs a design decision** (multi-day, cross-surface): H-045 (domain-verified generated
-skills) and H-065 (draft versus final image publication).
+**Design decisions taken (14 October):** H-065 drafts stay unpublished under `drafts/`
+(`6469a9d`); H-045 assistant-saved skills carry an unverified-rules status (`ec134cc`). H-035
+reproduced as a UI race and fixed (`966d9a1`); H-047 reproduced as a layout fault and fixed (see
+its entry).
 
 ## Final verification (14 October)
 
@@ -2079,3 +2080,82 @@ AESG packages.
 - **Deployment.** Not deployed (worker + web).
 - **Remaining.** Source-backed creation with expected-output fixtures for consequential
   calculators, and an explicit "mark reviewed" control.
+
+### H-047 — Mixed Arabic/English answers laid out left-to-right
+
+- **Evidence.** Task 847: the user said mixing Arabic and English made the answer wrong
+  and asked for everything in Arabic. The next answer switched language and transliterated
+  product names.
+- **Reproduction.** A Playwright check against an in-memory API
+  (`scripts/bidi-browser-server.mjs`) renders a synthetic Arabic answer containing:
+  - English product names and a URL;
+  - a bullet list, a numbered list and a quote;
+  - a table, inline code and a code block;
+  - an English paragraph.
+
+  The page also shows a streaming answer and an Arabic prompt. On HEAD every Arabic block is
+  laid out left-to-right:
+  - In "تعمل منصة Berry مع Microsoft 365 لتلخيص الملفات." the first word is drawn left of the
+    last, so the clauses around each English name read in reverse order.
+  - Bullets, numbers and the quote bar stay on the left.
+  - The live surface and the prompt bubble behave the same way.
+- **Cause (established).** Layout. No element in the thread sets a direction, and lists, quotes
+  and table headers use left-specific spacing. The model's switch to all-Arabic worked around a
+  display fault. Whether the model keeps a stated language preference is a separate question
+  (see "Model side").
+- **Fix.** `packages/desktop-ui/src/lib/text-direction.ts` sets direction from the script most
+  of a block's words are written in. Code spans, URLs, e-mail addresses and paths are ignored.
+  - A clear majority (70% or more) settles a block. Mixed blocks follow the message, and a
+    mixed message follows its first word.
+  - The browser's first-strong rule (`dir="auto"`) was rejected. Arabic sentences often open
+    with a product name ("Berry Workspace هو ..."), and that rule lays them out left-to-right.
+
+  Where it applies:
+  - **Settled Markdown.** The container gets the message direction. A rehype plugin marks
+    paragraphs, headings, lists, items, quotes and cells whose own words settle the other
+    direction. An item that differs from its list keeps its bullet inside.
+  - **Streaming surface.** Each line gets the same rule; counts for finished lines are cached.
+  - **Submitted prompts.** The same per-line rendering, through `DirectedText`.
+  - **Styling.** Left-specific classes become logical ones (`ps-*`, `border-s-2`, `text-start`).
+    Code blocks, inline code and KaTeX stay left-to-right, links are isolated (`dir="auto"`),
+    and table scroll masks follow the table's direction.
+- **Files.**
+  - `packages/desktop-ui/src/lib/text-direction.ts` (+test)
+  - `packages/desktop-ui/src/components/berry-markdown.tsx` (+test)
+  - `packages/desktop-ui/src/components/berry-thread-view.tsx` (three lines)
+  - `scripts/bidi-browser-server.mjs`
+  - `apps/web/playwright.bidi.config.ts`
+  - `apps/web/tests/bidi-rendering.spec.ts`
+- **Verification (isolated snapshot).**
+  - Web typecheck and build pass; web 295 and desktop-ui 83 tests pass (11 new).
+  - **Chromium browser check.** On HEAD all 13 right-to-left probes fail. With the change,
+    every Arabic block has the right direction, word order and right alignment; English text
+    and code stay left-to-right.
+  - **WebKit.** It cannot load the http dev server: the app's CSP upgrades insecure requests,
+    and unlike Chromium, WebKit does not exempt loopback. The fake-API pages therefore run in
+    Chromium only. A static check passes in both engines: the prompt keeps its line clamp and
+    each line keeps its own direction.
+- **Expected bidi behaviour (recorded, not a defect).** A negative amount in an Arabic cell
+  shows its minus sign right of the digits ("1,250.50-"), which reads correctly from right to
+  left. Numbered markers render as ".1".
+- **Comparison with DeepSeek's harness (requested 14 October).** `deepseek-ai/deepseek-harness`
+  (master, MIT) has no direction handling. A repository-wide search finds no `dir="auto"`,
+  `dir="rtl"`, `unicode-bidi` or `direction: rtl`. Its Markdown CSS uses `padding-left` and
+  `border-left`, and none of its 48 Markdown DOM fixtures is right-to-left. Adopting it would
+  not fix this issue.
+
+  Two of its features are separate candidates: its incremental streaming renderer (formatted
+  Markdown while streaming) and `\(…\)`/`\[…\]` math delimiters.
+- **Model side.** `h047-keeps-requested-arabic` joins the behaviour suite, with a new
+  `minRtlWordShare` check. After the user asks for everything in Arabic, a later answer must be
+  at least 85% Arabic words and call no tools; product names may keep their Latin spelling. It
+  runs with the other evaluation cases once credentials are available.
+- **Data impact.** None.
+- **Deployment.** Not deployed (web; desktop-ui is bundled into web and desktop).
+- **Remaining.**
+  - Language-preference adherence needs the evaluation run.
+  - The drafts editor (a `<textarea>` in `writing-block.tsx`, which has others' uncommitted
+    work) is unchanged.
+  - The composer uses Lexical's `dir="auto"`, so a sentence opening with a product name is
+    left-to-right while typing; the sent bubble shows it right-to-left.
+  - Screen-reader language (`lang`) is not set.

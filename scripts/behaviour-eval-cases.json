@@ -580,5 +580,36 @@
     "size": 352118
    }
   ]
+ },
+ {
+  "id": "h047-keeps-requested-arabic",
+  "issue": "H-047",
+  "note": "Task 847: after the user asks for everything in Arabic, later answers stay in Arabic; product names may keep their Latin spelling.",
+  "history": [
+   {
+    "role": "user",
+    "content": "اشرح لي باختصار كيف أشارك ملفاً من Google Drive مع فريقي."
+   },
+   {
+    "role": "assistant",
+    "content": "لمشاركة ملف من Google Drive: افتح الملف، اضغط Share، ثم أضف عناوين البريد الإلكتروني لفريقك واختر صلاحية Viewer أو Editor."
+   },
+   {
+    "role": "user",
+    "content": "خلط العربية والإنجليزية يجعل الرد خاطئاً. اكتب كل شيء بالعربية من فضلك."
+   },
+   {
+    "role": "assistant",
+    "content": "لمشاركة ملف من جوجل درايف: افتح الملف، واضغط زر المشاركة، ثم أضف عناوين البريد الإلكتروني لأعضاء فريقك واختر صلاحية العرض أو التحرير."
+   },
+   {
+    "role": "user",
+    "content": "وكيف أسحب الصلاحية من شخص لاحقاً؟"
+   }
+  ],
+  "checks": {
+   "minRtlWordShare": 0.85,
+   "toolsNone": true
+  }
  }
 ]

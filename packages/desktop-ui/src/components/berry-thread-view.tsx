@@ -25,7 +25,7 @@ import {
 import { cn } from "@berry/desktop-ui/lib/utils";
 import { FileTypeIcon } from "@berry/desktop-ui/lib/file-icons";
 import { useSquircle } from "@berry/desktop-ui/lib/squircle";
-import { Markdown } from "@berry/desktop-ui/components/berry-markdown";
+import { DirectedText, Markdown } from "@berry/desktop-ui/components/berry-markdown";
 import { ApprovalEvidence } from "@berry/desktop-ui/components/approval-evidence";
 import { ConversationNavigator, type NavigatorItem } from "@berry/desktop-ui/components/conversation-navigator";
 import {
@@ -1942,11 +1942,11 @@ export function BerryMessagePartBody({ part, plain = false }: { part: MessagePar
           <ImagePlus className="size-3.5 shrink-0" />
           <span className="truncate">Create image</span>
         </span>
-        <span className="whitespace-pre-wrap">{content.slice("Create image\n".length)}</span>
+        <DirectedText text={content.slice("Create image\n".length)} />
       </span>
     );
   }
-  if (plain) return <span className="whitespace-pre-wrap">{content}</span>;
+  if (plain) return <DirectedText text={content} />;
   return <Markdown>{content}</Markdown>;
 }
 
