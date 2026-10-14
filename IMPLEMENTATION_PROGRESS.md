@@ -62,7 +62,7 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `5cd4189` | H-042 | None (in-memory model previews only; user files untouched). |
 | `c94340b` | H-041 | None. New generated files are stored under their real format; existing files and rows are untouched. |
 | `67a22fa` | H-059 | None (skill script). Publishing it is a skill-package sync, not a database migration. |
-| _pending_ | H-040 (Mem0 input) | None. Changes only what new turns send to Mem0; existing memories are untouched (removing contaminated ones needs user controls or a reviewed plan). |
+| `375f8dd` | H-040 (Mem0 input) | None. Changes only what new turns send to Mem0; existing memories are untouched (removing contaminated ones needs user controls or a reviewed plan). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -133,7 +133,10 @@ verification script deletes compiled tests first and counts are source-only.
 | H-042 (transparent images seen as blank) | Committed | `5cd4189` | Not deployed (worker) |
 | H-041 (generated image metadata from returned bytes) | Committed — worker path | `c94340b` | Not deployed (worker) |
 | H-059 (XLSX rows sized to wrapped text) | Committed | `67a22fa` | Not published (organization `xlsx` skill package) |
-| H-040 (assistant text kept out of personal memory extraction) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-040 (assistant text kept out of personal memory extraction) | Committed — partial | `375f8dd` | Not deployed (worker) |
+| H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
+| H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
+| H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1194,8 +1197,11 @@ verification script deletes compiled tests first and counts are source-only.
   16:9 request is stored as `.jpg`/`image/jpeg` with actual 1024×1024, `1:1`, no
   transparency and both notes; a matching transparent PNG gets no note; non-image bytes
   are rejected.
-- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 516 passed / 3
-  skipped. The three new cases fail on the previous source.
+- **Verification (isolated snapshot).** Worker suite 516 passed / 3 skipped; the three new
+  cases fail on the previous source. **Correction:** the worker typecheck *failed* on this
+  commit. The new test fixture omitted `editsEndpoint`, and the check's output, piped
+  through `tail -1`, was misread. The fixture is fixed in the commit that follows
+  H-040; the verification script no longer pipes the typecheck.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Provider-aware ratio support (choosing a supported size per model rather
   than the fixed three), and the desktop/local-agent and API legacy paths that repeat the
@@ -1259,8 +1265,9 @@ verification script deletes compiled tests first and counts are source-only.
 - **Files.** `apps/worker/src/memory/processor.ts` (+test). The existing test asserted
   that the assistant reply was sent; it now asserts the user message alone. A new case
   reproduces task 978's shape.
-- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 517 passed / 3
-  skipped; both cases fail on the previous source.
+- **Verification (isolated snapshot).** Worker suite 517 passed / 3 skipped; both cases fail
+  on the previous source. The worker typecheck failed here only because of the H-041
+  fixture above; it passes once that fixture is fixed.
 - **Data impact.** None. Existing memories (including `16fd6cfb…`) are not modified;
   users can delete them in memory settings, and any bulk cleanup needs its own reviewed
   plan.
@@ -1268,3 +1275,59 @@ verification script deletes compiled tests first and counts are source-only.
 - **Remaining (H-040 stays open).** Retrieval relevance thresholds and raw-similarity
   telemetry, task-outcome source authority, pasted/quoted content inside user messages,
   and expiry for task-specific memories.
+- **Commit.** `375f8dd`.
+
+### Blocked: prepared AESG skill sources (H-064 manifests, H-056, H-058)
+
+- **Finding.** The working tree's AESG skill files are byte-identical to the packages
+  production has published: `docx/scripts/create_aesg_docx.py` (`a496e98a…`, 72,381
+  bytes) and `aesg-branding/scripts/validate_artifact.py` (`d1420967…`) match the
+  audit's SSM hashes. HEAD still has older versions (`create_aesg_docx.py` 53,492 bytes;
+  `report_structure.py` absent). These are the prepared, user-confirmed memo fixes, made
+  outside this session and never committed.
+- **Why blocked.** The H-064 dependency manifests
+  (`deploy/skills/docx/skill-dependencies.json`, `deploy/skills/pdf/skill-dependencies.json`,
+  written in this session, uncommitted) name `report_structure.py`, which exists only in
+  those uncommitted sources; at HEAD they would fail activation. H-056 (strict
+  `json.loads` with a duplicate-key hook at the generator's spec parse) and H-058
+  (anchored placeholder patterns in `validate_artifact.py`) are edits inside the same
+  prepared files. Committing them means committing another owner's work, and their
+  Python suite needs python-docx/python-pptx, which are not installed here (no network
+  installs in this session).
+- **Risk to note.** `deploy/e2b-aesg/sync-skills.sh` republishes every organization
+  package from the server checkout. A Git-based checkout of HEAD followed by a sync would
+  replace the published AESG packages with the older committed versions and undo the
+  memo fixes.
+- **Decision needed.** Commit the prepared AESG sources as their own provenance commit
+  (unchanged, hash-checked against production). The manifests (with the saved
+  published-package test) and the H-056/H-058 fixes can then follow as small commits.
+
+### Blocked: H-015 — expired queued text
+
+- **Finding (confirmed).** `QueuedFollowUpService.list` returns only active statuses with
+  `expires_at > now()`, so expired text (56 items in the month) stays in the database but
+  disappears from the UI. The shared schema already allows `expired`.
+- **Why blocked.** The fix needs the API listing *and* a UI state together: the current
+  client mapping (`serverQueuedFollowUpToClient`) turns unknown statuses into `queued`, so
+  an API-only change would show expired items as still pending. The working tree is
+  moving that client model into the untracked `packages/client-core`
+  (`apps/web/src/lib/queued-follow-ups.ts` is now a re-export, and its tests are deleted).
+  Changing HEAD's file would create merge work for that refactor.
+- **Design for when it lands.** List expired items from (say) the last seven days, never
+  re-deliver them, and show "Expired — not sent" with Copy, Restore to composer (manual
+  send) and Remove, where Remove moves the item to `cancelled`.
+
+### Blocked: H-043 — presentation font inheritance
+
+- **Finding (confirmed).** The General Presentation template's theme uses Arial for
+  major and minor fonts, and its slide-number field (`<a:fld type="slidenum">`) has no
+  run properties, so it inherits Arial. The sandbox has no Arial, LibreOffice substitutes
+  Liberation Sans, and the font gate fails. `create_aesg_pptx.py` sets only the field text.
+- **Why blocked.** The generator cannot run here (python-pptx is not installed and the
+  local worker images have no Python), so a fix could not be executed or rendered.
+  Fixing the template instead would change a file whose hash is pinned in
+  `aesg-branding/assets/template-manifest.json`, which has prepared uncommitted edits.
+- **Design.** In the generator (a clean package), after filling the slides set the output
+  theme's major and minor `a:latin` to Verdana, and give each slide-number field an
+  explicit Verdana `a:rPr`. This is the repair the model applied by hand in task 1228 before
+  publishing successfully. Verify with a production-image render of every supported layout.

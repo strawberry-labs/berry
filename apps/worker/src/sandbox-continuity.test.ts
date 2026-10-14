@@ -2793,7 +2793,13 @@ describe("SandboxContinuityManager", () => {
       } satisfies SandboxSnapshotObjectStore;
       const manager = new SandboxContinuityManager(provider, repository, objects, {
         image: "berry-sandbox",
-        imageGeneration: { endpoint: "https://images.example.test/v1/images/generations", apiKey: "test-key", model: "gpt-image-1", responseFormat: "b64_json" },
+        imageGeneration: {
+          endpoint: "https://images.example.test/v1/images/generations",
+          editsEndpoint: "https://images.example.test/v1/images/edits",
+          apiKey: "test-key",
+          model: "gpt-image-1",
+          responseFormat: "b64_json",
+        },
       });
       const current = snapshot();
       current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
