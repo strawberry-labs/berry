@@ -44,7 +44,8 @@ No pre-existing failures were observed in these suites.
 | ID | Status | Commit | Deployment |
 | --- | --- | --- | --- |
 | H-001 | Committed | `d7a806a` | Not deployed (API + worker + web must ship together) |
-| H-009 (reconnect after cross-worker pause) | Committed — partial | _pending_ | Not deployed (worker + sandbox-contract) |
+| H-009 (reconnect after cross-worker pause) | Committed — partial | `0cfe1d4` | Not deployed (worker + sandbox-contract) |
+| H-014 (prerequisite: late mutation receipts) | Committed — source of the already-deployed hotfix | _pending_ | Deployed 2026-09-30 per record; exact production byte parity not reproducible (see entry) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -165,3 +166,33 @@ No pre-existing failures were observed in these suites.
   missing-sandbox variants (operation failure after handle acquisition, policy/auth vs
   true disappearance) and fault-injection coverage across expiry during model wait.
   Text-only finalisation that still requires a sandbox is tracked under H-013/task 176.
+- **Commit.** `0cfe1d4`.
+
+### H-014 prerequisite — commit the deployed late-result recovery hotfix
+
+- **Evidence.** `output/kate-recovery-2026-09-30/README.md`: a non-idempotent LibreOffice
+  recalculation was deliberately awaited past its deadline; it succeeded, but
+  `withHeartbeat` re-threw the already-fired timeout, so a known outcome became
+  `recovery_required` (three red messages, manual recovery). The patch was deployed to
+  the five foreground workers on 2026-09-30 with patched JS SHA-256 `c030d2ca…`, which
+  is also the worker turn-runner hash the 2026-10-14 audit observed on all six
+  workers. The source change was never committed. The audit explicitly says not to
+  reopen this fixed cause.
+- **Decision.** Commit the prepared source unchanged so a Git deployment cannot regress
+  production: a fulfilled result of a non-abortable `non_idempotent_manual` tool is
+  kept after its idle/wall deadline; rejections, lease loss, cancellation and
+  abortable/read-only timeouts keep their existing guards.
+- **Verification (isolated snapshot).** Worker typecheck pass; `turn-runner.test.ts`
+  114/114 including the four late-receipt cases (idle and wall deadline preserved,
+  rejection after deadline still requires recovery, late receipt after lease loss
+  rejected).
+- **Production parity check — not established.** Building `99964f1` + the rewriting
+  hotfix + this patch gives `dist/turn-runner.js` SHA-256 `81e4025d…`, not the deployed
+  `c030d2ca…`. The recorded `turn-runner.before.ts` is the local dirty copy (it contains
+  queue and image-guard edits), not production source. Production therefore may carry
+  further undocumented differences (consistent with the `+production-hotfixes`
+  revision in H-033). **Before any Git-based worker deployment, diff the production
+  `/opt/berry/apps/worker/src` tree against the branch being deployed.**
+- **Files.** `apps/worker/src/turn-runner.ts` (four hunks), `apps/worker/src/turn-runner.test.ts`.
+- **Remaining (H-014 stays open).** Operation-specific recovery actions/UX and
+  metadata-only bash classification.

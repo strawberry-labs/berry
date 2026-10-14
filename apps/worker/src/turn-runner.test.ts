@@ -817,6 +817,61 @@ describe("durable turn runner", () => {
     await expect(execution).resolves.toMatchObject({ state: "cancelled" });
   });
 
+  it.each(["idle", "wall"] as const)("preserves a confirmed mutation result after its %s deadline", async (deadline) => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const receipt = { output: { exitCode: 0, content: "Verified workbook totals" }, summary: "Recalculation completed" };
+    const execute = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return receipt;
+    });
+    const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
+      toolIdleTimeoutMs: deadline === "idle" ? 5 : 1_000,
+      toolMaxDurationMs: deadline === "wall" ? 5 : 1_000,
+    });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "calling_model" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "completed", output: receipt.output,
+    });
+    expect(repository.current.error).toBeNull();
+    expect(repository.events.some((event) => event.kind === "error")).toBe(false);
+  });
+
+  it("still requires recovery when a mutation rejects after its deadline without a receipt", async () => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    const execute = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      throw new Error("Connection lost before receiving the command result");
+    });
+    const runner = new DurableTurnRunner(repository, unusedModel(), { execute }, {
+      toolIdleTimeoutMs: 5, toolMaxDurationMs: 1_000,
+    });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "recovery_required" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(repository.current.steps.find((step) => step.id === tool.id)).toMatchObject({
+      state: "recovery_required", outcomeCertainty: "unknown",
+    });
+  });
+
+  it("does not accept a late mutation receipt after losing its lease", async () => {
+    const tool = toolStep("pending", "non_idempotent_manual", false);
+    const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));
+    vi.spyOn(repository, "heartbeat").mockResolvedValue(false);
+    const runner = new DurableTurnRunner(repository, unusedModel(), {
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { output: { accepted: true }, summary: "Late receipt" };
+      },
+    }, { heartbeatMs: 5, toolIdleTimeoutMs: 10, toolMaxDurationMs: 1_000 });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "recovery_required" });
+    expect(repository.current.steps.find((step) => step.id === tool.id)?.state).toBe("recovery_required");
+  });
+
   it("moves an ignored cancellation during mutation to recovery without replaying it", async () => {
     const tool = toolStep("pending", "non_idempotent_manual", false);
     const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), tool]));

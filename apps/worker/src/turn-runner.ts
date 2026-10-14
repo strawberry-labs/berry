@@ -1719,6 +1719,7 @@ export class DurableTurnRunner {
         ? await this.withHeartbeat(snapshot, toolOperation, {
             label: `${toolName} tool`,
             abortable: toolAbortable,
+            preserveResultAfterTimeout: step.retryClass === "non_idempotent_manual",
             operation: "tool",
             idleTimeoutMs: toolLimits.idleTimeoutMs,
             maxDurationMs: toolLimits.maxDurationMs,
@@ -1727,6 +1728,7 @@ export class DurableTurnRunner {
           ?? await this.withHeartbeat(snapshot, toolOperation, {
               label: `${toolName} tool`,
               abortable: toolAbortable,
+              preserveResultAfterTimeout: step.retryClass === "non_idempotent_manual",
               operation: "tool",
               idleTimeoutMs: toolLimits.idleTimeoutMs,
               maxDurationMs: toolLimits.maxDurationMs,
@@ -2844,6 +2846,7 @@ export class DurableTurnRunner {
     limits: {
       label?: string;
       abortable?: boolean;
+      preserveResultAfterTimeout?: boolean;
       idleTimeoutMs?: number;
       maxDurationMs?: number;
       operation?: "tool" | "model" | "model_preparation" | "compaction" | "finalization" | "generic";
@@ -2959,7 +2962,13 @@ export class DurableTurnRunner {
         }
         throw error;
       }
-      if (timeoutFailure) throw timeoutFailure;
+      // Mutating tools retain their lease until they settle. A late receipt is
+      // still a known outcome: discarding it would falsely require recovery
+      // and could lead an operator to repeat an already completed mutation.
+      // Rejections, lease loss, and cancellation still follow their guards.
+      if (timeoutFailure && !(limits.preserveResultAfterTimeout && !limits.abortable)) {
+        throw timeoutFailure;
+      }
       if (heartbeatFailure) {
         throw heartbeatFailure instanceof DurableTurnRetryableError
           ? heartbeatFailure

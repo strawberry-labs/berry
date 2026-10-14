@@ -216,6 +216,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Acceptance: each recovery state has an actionable explanation; simulated response loss after an external mutation cannot cause duplicate execution.
 - **Monthly revalidation:** 31 recovery-required runs / 25 tasks / 22 users. Metadata-only bash can inherit broad non-idempotent classification. Deployed web assets route generic continuation to retry and replace the specific error with an interrupted-response label. Use operation-specific Retry/Reconnect/Change input/Admin/Wait actions; a modal is appropriate for uncertain external writes, with exact operation evidence and mark-complete/cancel options.
 
+- **Source alignment (14 October):** the deployed 30 September late-result fix (known outcome of a non-abortable mutation kept after its deadline) is now committed unchanged with its four regression cases. Byte parity with the deployed module hash could not be reproduced from Git plus the two recorded hotfixes, so diff production source before a Git deployment. Operation-specific recovery UX remains open.
+
 ### H-015 — Expired queued text
 
 - Evidence: 12 weekly queue entries expired. Current queue listing excludes expired items; expiry is 24 hours by default.
