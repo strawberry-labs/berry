@@ -73,7 +73,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `6c46724` | H-050 | None. |
 | `8f966ed` | H-038 | None. |
 | `6b635da` | H-008 | None. |
-| _pending_ | H-023 | None. |
+| `a7118a4` | H-023 | None. |
+| _pending_ | H-067 | None (in-memory only). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -161,7 +162,8 @@ fixture; this is fixed in `54c9255`.
 | H-050 (ready optional capability discarded at the admission deadline) | Committed — partial | `6c46724` | Not deployed (API) |
 | H-038 (streamed tool calls merged when indices restart) | Committed — worker path | `8f966ed` | Not deployed (worker) |
 | H-008 (workspace outputs/ and tmp/ guaranteed) | Committed — partial | `6b635da` | Not deployed (worker) |
-| H-023 (current date given to the model) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-023 (current date given to the model) | Committed — partial | `a7118a4` | Not deployed (worker) |
+| H-067 (Office pagination re-extracts the whole file) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1639,3 +1641,29 @@ fixture; this is fixed in `54c9255`.
 - **Remaining.** The user's or organisation's time zone for normal chat turns (users
   near midnight UTC see the UTC date); stale dates in a run resumed after a long wait;
   deadline and weekday checks in answers remain behavioural.
+- **Commit.** `a7118a4`.
+
+### H-067 — Paginated Office reads repeat the whole extraction
+
+- **Evidence.** Task 983: six reads of one unchanged 11.2 MB DOCX at successive offsets,
+  each 20.5–20.9 s (124 s in total, 103 s after the first). Month: 62 repeated
+  task/path groups with 100 reads after their first (15% of 661 Office reads are
+  repeat candidates).
+- **Root cause (confirmed in code).** The Office read path transfers all the bytes and
+  calls the Tika extractor before applying the offset and limit, with no reuse between
+  calls.
+- **Fix (smallest step).** The manager keeps extracted text in an in-process LRU keyed by
+  tenant, media type and the SHA-256 of the bytes it just transferred, so a later page
+  of the same content skips extraction. Changed bytes give a new key, concurrent reads
+  share one in-flight extraction, failures are not kept, and the cache is capped at
+  32M characters. No new provider call is made. The byte transfer is still repeated,
+  and the audit's durable shared cache (surviving worker changes) was not built, because
+  transfer-versus-extraction time has not been measured.
+- **Files.** `apps/worker/src/sandbox-continuity.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 530 passed / 3
+  skipped. New case: two pages → one extraction; changed bytes after a failed attempt →
+  the failure is not reused and the retry extracts again. It fails on the previous
+  source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Measure transfer versus extraction time; a durable verified-hash cache
+  if transfer dominates; per-call cache-hit diagnostics.

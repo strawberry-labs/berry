@@ -1919,6 +1919,30 @@ describe("SandboxContinuityManager", () => {
     }));
   });
 
+  it("reuses one Office extraction across paginated reads of unchanged bytes (H-067)", async () => {
+    let bytes = Buffer.from("docx bytes v1");
+    const read = vi.fn(async (input: { path: string }) => ({
+      path: input.path, encoding: "base64" as const, content: bytes.toString("base64"), size_bytes: bytes.byteLength, mtime: null,
+    }));
+    let failNext = false;
+    const documentTextExtractor = vi.fn(async (input: { bytes: Uint8Array }) => {
+      if (failNext) { failNext = false; throw new Error("Tika timed out"); }
+      return Array.from({ length: 40 }, (_, index) => `Line ${index + 1} of ${Buffer.from(input.bytes).toString()}`).join("\n");
+    });
+    const manager = managerWithProvider({ read, write: vi.fn(), list: vi.fn() }, undefined, { documentTextExtractor });
+    const page = (offset: number) => manager.execute(snapshot(), toolStep("read", { path: "/workspace/inputs/file-id/spec.docx", offset, limit: 10 }));
+
+    await expect(page(1)).resolves.toMatchObject({ output: { content: expect.stringContaining("Line 1 of docx bytes v1") } });
+    await expect(page(11)).resolves.toMatchObject({ output: { content: expect.stringContaining("Line 11 of docx bytes v1") } });
+    expect(documentTextExtractor).toHaveBeenCalledTimes(1);
+
+    bytes = Buffer.from("docx bytes v2");
+    failNext = true;
+    await expect(page(1)).rejects.toThrow("Tika timed out");
+    await expect(page(1)).resolves.toMatchObject({ output: { content: expect.stringContaining("Line 1 of docx bytes v2") } });
+    expect(documentTextExtractor).toHaveBeenCalledTimes(3);
+  });
+
   it("extracts macro-enabled Excel through the shared document extractor", async () => {
     const bytes = Buffer.from("binary xlsm bytes");
     const read = vi.fn(async () => ({

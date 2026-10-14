@@ -129,6 +129,7 @@ const DEFAULT_INPUT_AVAILABILITY_POLL_MS = 1_000;
 const DEFAULT_IMPORT_AVAILABILITY_TIMEOUT_MS = 30_000;
 const DEFAULT_IMPORT_AVAILABILITY_POLL_MS = 250;
 const MAX_SNAPSHOT_FILES = 5_000;
+const OFFICE_TEXT_CACHE_MAX_CHARACTERS = 32 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
@@ -540,6 +541,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   // Concurrent activations in one worker share an in-flight transfer of the
   // same package revision file instead of writing it twice.
   readonly #skillFileTransfers = new Map<string, Promise<void>>();
+  // Paginated reads of an unchanged Office file re-ran the whole extraction for
+  // every offset (H-067). Keyed by tenant, type and content hash; bounded LRU.
+  readonly #officeText = new Map<string, { text: Promise<string>; characters: number }>();
 
   constructor(
     private readonly provider: SandboxProvider,
@@ -1038,7 +1042,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (bytes.byteLength !== source.size_bytes) {
           throw new Error(`Document read was incomplete: expected ${source.size_bytes} bytes, received ${bytes.byteLength}`);
         }
-        const content = await this.options.documentTextExtractor({ bytes, mediaType });
+        const content = await this.#extractOfficeText(snapshot.tenantId, bytes, mediaType);
         reportProgress?.();
         const formatted = piReadContent(content, args);
         return {
@@ -1826,6 +1830,34 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       operationKey: `${run.runId}:finalization`,
       reason,
     });
+  }
+
+  /** Extracted text of these exact bytes, reused across paginated reads; failures are not kept. */
+  async #extractOfficeText(tenantId: string, bytes: Buffer, mediaType: string): Promise<string> {
+    const key = `${tenantId}:${mediaType}:${createHash("sha256").update(bytes).digest("hex")}`;
+    const cached = this.#officeText.get(key);
+    if (cached) {
+      this.#officeText.delete(key);
+      this.#officeText.set(key, cached);
+      return cached.text;
+    }
+    const entry = { text: this.options.documentTextExtractor!({ bytes, mediaType }), characters: 0 };
+    this.#officeText.set(key, entry);
+    try {
+      const text = await entry.text;
+      entry.characters = text.length;
+    } catch (error) {
+      if (this.#officeText.get(key) === entry) this.#officeText.delete(key);
+      throw error;
+    }
+    let total = [...this.#officeText.values()].reduce((sum, item) => sum + item.characters, 0);
+    for (const [candidate, item] of this.#officeText) {
+      if (total <= OFFICE_TEXT_CACHE_MAX_CHARACTERS || candidate === key) break;
+      if (item.characters === 0) continue;
+      this.#officeText.delete(candidate);
+      total -= item.characters;
+    }
+    return entry.text;
   }
 
   private async ensureSandbox(
