@@ -2427,6 +2427,51 @@ describe("durable turn runner", () => {
     });
   });
 
+  describe("republishing a rebuilt file (H-028)", () => {
+    const publish = (state: DurableTurnStep["state"], sequence: number): DurableTurnStep => ({
+      ...toolStep(state, "idempotent", false),
+      sequence,
+      type: "tool.persist_artifact",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "persist_artifact",
+        arguments: { path: "/workspace/outputs/schedule.docx" },
+        requiresApproval: false,
+        approvalKind: "file-edit",
+        repeatPolicy: "block_after_success",
+      },
+      ...(state === "completed" ? { output: { text: "Persisted artifact: schedule.docx", sha256: "a".repeat(64) } } : {}),
+    });
+    const republish = async (between: DurableTurnStep[]) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), publish("completed", 1), ...between, publish("pending", 9)]));
+      let executions = 0;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          executions += 1;
+          return { output: { text: "Persisted artifact: schedule.docx", sha256: "b".repeat(64) }, summary: "Persisted schedule.docx" };
+        },
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      return { repository, executions };
+    };
+
+    it("publishes again after a command rebuilt the file", async () => {
+      const rebuild = { ...runCommandStep("completed", 3, "python build_schedule.py --output /workspace/outputs/schedule.docx"), output: { exitCode: 0 } };
+      const { repository, executions } = await republish([rebuild]);
+      expect(executions).toBe(1);
+      expect(repository.current.steps.find((step) => step.sequence === 9)?.state).toBe("completed");
+    });
+
+    it("still suppresses a repeat with no change in between, and says nothing new was published", async () => {
+      const unrelated = { ...runCommandStep("completed", 3, "ls /workspace/tmp"), output: { exitCode: 0 } };
+      const { repository, executions } = await republish([unrelated]);
+      expect(executions).toBe(0);
+      const suppressed = repository.current.steps.find((step) => step.sequence === 9);
+      expect(suppressed?.error).toBe("duplicate_tool_call_suppressed");
+      expect(JSON.stringify(repository.mutations)).toContain("no new version was created");
+    });
+  });
+
   it("finishes the remaining sequential tools before giving the model a correction turn", async () => {
     const first = { ...runCommandStep("completed", 1, "printf same"), output: { command: "printf same", output: "" } as const };
     const second = { ...runCommandStep("completed", 2, "printf same"), output: { command: "printf same", output: "" } as const };

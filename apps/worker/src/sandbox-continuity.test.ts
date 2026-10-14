@@ -2346,6 +2346,52 @@ describe("SandboxContinuityManager", () => {
     }))).rejects.toThrow("Artifacts must be created under /workspace/outputs");
   });
 
+  it("returns the earlier receipt for identical bytes and publishes changed bytes (H-028)", async () => {
+    let content = Buffer.from("schedule v1");
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-publish", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(async (input: { path: string }) => ({ path: input.path, content: content.toString("base64"), size_bytes: content.byteLength, mtime: null })),
+        write: vi.fn(),
+        list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(async (input: { fileId: string; name: string; mediaType: string; sizeBytes: number; objectKey: string }) => ({
+        fileId: input.fileId, name: input.name, mediaType: input.mediaType, sizeBytes: input.sizeBytes, objectKey: input.objectKey,
+      })),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(async (key: string) => ({ bucket: "berry", key, etag: "etag" })),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    const publish = (sequence: number) => ({ ...toolStep("persist_artifact", { path: "/workspace/outputs/schedule.txt" }), id: `publish-${sequence}`, sequence });
+
+    const first = await manager.execute(current, publish(1));
+    current.steps = [{ ...publish(1), state: "completed", output: first.output }];
+    const repeated = await manager.execute(current, publish(3));
+    expect(repeated.output).toMatchObject({ unchanged: true, artifact: (first.output as { artifact: unknown }).artifact });
+    expect(objects.putArtifact).toHaveBeenCalledTimes(1);
+
+    content = Buffer.from("schedule v2");
+    const changed = await manager.execute(current, publish(5));
+    expect(changed.output).not.toHaveProperty("unchanged");
+    expect((changed.output as { sha256: string }).sha256).not.toBe((first.output as { sha256: string }).sha256);
+    expect(objects.putArtifact).toHaveBeenCalledTimes(2);
+  });
+
   it("automatically publishes unpersisted files from the output directory", async () => {
     const bytes = Buffer.from("automatic artifact");
     const provider = {

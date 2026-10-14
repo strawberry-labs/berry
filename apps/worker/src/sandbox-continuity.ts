@@ -1384,6 +1384,16 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       });
       const name = safeArtifactName(artifactDisplayName(path, requestedName, mediaType));
       const sha256 = createHash("sha256").update(bytes).digest("hex");
+      // Identical bytes of the same file return the earlier receipt rather
+      // than a second copy; changed bytes publish a new version (H-028).
+      const earlier = earlierPublication(snapshot, step, { path, name, mediaType }, workspaceRoot);
+      if (earlier?.sha256 === sha256) {
+        return {
+          output: { ...earlier.output, text: `${name} is unchanged since it was published earlier in this task; that file is current.`, unchanged: true },
+          summary: `Unchanged ${name}`,
+          sandbox,
+        };
+      }
       const stored = await this.objects.putArtifact(
         `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/${step.id}/${sha256}/original/${name}`,
         bytes,
@@ -1416,6 +1426,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             fileId: output.fileId,
           },
           path: `/v1/files/${output.fileId}/content`,
+          sha256,
         },
         summary: `Persisted ${name}`,
         sandbox,
@@ -3416,6 +3427,33 @@ async function generateDurableImage(
   const payload = await response.json() as ImageGenerationResult;
   if (!Array.isArray(payload.data)) throw new Error("Image provider response did not include data");
   return payload;
+}
+
+/** The latest completed publication of the same file, name and type earlier in this run. */
+function earlierPublication(
+  snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
+  target: { path: string; name: string; mediaType: string },
+  workspaceRoot: string,
+): { sha256: string; output: Record<string, JsonValue> } | null {
+  const candidates = (snapshot.steps ?? [])
+    .filter((candidate) => candidate.id !== step.id && candidate.sequence < step.sequence && candidate.state === "completed"
+      && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "persist_artifact")
+    .sort((left, right) => right.sequence - left.sequence);
+  for (const candidate of candidates) {
+    let path: string;
+    try {
+      path = safeOutputPath(stringValue(objectValue(candidate.input.arguments).path) ?? "", workspaceRoot);
+    } catch {
+      continue;
+    }
+    const output = objectValue(candidate.output) as Record<string, JsonValue>;
+    const artifact = objectValue(output.artifact);
+    if (path !== target.path || artifact.name !== target.name || artifact.mediaType !== target.mediaType) continue;
+    const sha256 = stringValue(output.sha256);
+    return sha256 ? { sha256, output } : null;
+  }
+  return null;
 }
 
 function timeoutSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {

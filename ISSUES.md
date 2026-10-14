@@ -53,7 +53,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-025 | P1 | Technical claims persist without source verification | Observed; cause verification noted below | Open |
 | H-026 | P1 | Platform capability and privacy answers lack tenant facts | Observed unsupported claims | Verify configuration and prompt gap |
 | H-027 | P1 | Folder uploads accepted as empty files | Observed zero-byte attachments | Reproduce upload path |
-| H-028 | P1 | Changed artifacts suppressed as duplicate publications | Observed + code finding | Open; content-aware regression needed |
+| H-028 | P1 | Changed artifacts suppressed as duplicate publications | Observed + code finding | Fix committed locally (not deployed): republication after a change is allowed; identical bytes return the earlier receipt |
 | H-029 | P1 | Unsupported authorship and verification guarantees | Observed conversation | Open; behavior evaluation needed |
 | H-030 | P1 | Legitimate asynchronous polling triggers loop termination | Observed raw trace + matching code | Fix committed locally (not deployed): pending-job repeats are bounded polling |
 | H-031 | P0 | Blob deletion receipt fails SQL parameter inference | Production stack traces + read-only PREPARE reproduction | Fix committed locally (not deployed); backlog reconciliation needs a separate reviewed plan |
@@ -373,6 +373,7 @@ These observations are historical evidence. Current deployment status and precis
 - Proposal: bind publication identity to source content/version and destination metadata; preserve idempotency for identical bytes, allow changed bytes to produce a new artifact version, and return explicit published-version provenance. Do not solve this by weakening protection for unrelated external mutations.
 - Acceptance: publish A, modify the same path to B, publish B, and download the latest artifact to confirm B. Repeating B must remain idempotent. Suppressed/failed publication must not produce a new-version-ready claim.
 - Status: observed production sequence and matching local code; not implemented or deployed in this audit.
+- **Implementation (14 October):** the repeat guard lets a publication through after a later write/edit/command names the file; the executor returns the earlier receipt for identical bytes (`unchanged: true`) and publishes changed bytes as a new version; suppressed publications now say no new version was created. Not deployed.
 
 
 ### Complete-history evidence update (371/384 reviewed)

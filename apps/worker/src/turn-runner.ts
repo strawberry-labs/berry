@@ -2368,7 +2368,13 @@ export class DurableTurnRunner {
     const toolName = toolNameForStep(step);
     const entryId = randomUUID();
     const iteration = modelIteration(snapshot.steps) + 1;
-    const message = assessment.policy === "block_after_success"
+    const message = toolName === "persist_artifact"
+      ? [
+          "Duplicate publication suppressed.",
+          "This file was already published in this task, and no later write, edit or shell command names it, so no new version was created.",
+          "The earlier published file is current. Do not say a new or rebuilt version was published; if the file should have changed, rebuild it and publish it again.",
+        ].join("\n\n")
+      : assessment.policy === "block_after_success"
       ? [
           "Duplicate tool call suppressed.",
           "This external operation already completed successfully once.",
@@ -4872,9 +4878,13 @@ function assessRepeatedToolCall(
   const signature = toolRepeatSignature(step);
   const policy = repeatPolicyForStep(step);
   // An observation repeated after an edit of a file it uses is a new
-  // observation (render -> edit -> render). External writes and publication
-  // keep their dedup: they never reach this reset (H-053).
-  const freshSince = policy === "compare_result" ? lastEditOfReferencedFile(snapshot, step) : -1;
+  // observation (render -> edit -> render) (H-053). Publishing a file again
+  // after a write, edit or command that names it may publish new bytes; the
+  // executor still returns the earlier receipt for identical bytes (H-028).
+  // Other external writes keep their dedup.
+  const freshSince = policy === "compare_result"
+    ? lastEditOfReferencedFile(snapshot, step)
+    : toolNameForStep(step) === "persist_artifact" ? lastChangeOfPublishedFile(snapshot, step) : -1;
   const relevant = snapshot.steps
     .filter((candidate) => candidate.id !== step.id
       && candidate.sequence < step.sequence
@@ -4949,6 +4959,25 @@ export function journalSafeToolResult(result: TurnToolResult): TurnToolResult {
     return value;
   };
   return clean(result) as TurnToolResult;
+}
+
+/** Sequence of the latest completed write, edit or shell command naming the file being published, or -1. */
+function lastChangeOfPublishedFile(snapshot: DurableTurnSnapshot, step: DurableTurnStep): number {
+  const path = stringValue(record(step.input.arguments)?.path)?.trim();
+  if (!path) return -1;
+  const basename = path.split("/").filter(Boolean).at(-1) ?? "";
+  const names = (text: string) => text.includes(path) || (basename.includes(".") && text.includes(basename));
+  let latest = -1;
+  for (const candidate of snapshot.steps) {
+    if (candidate.state !== "completed" || candidate.sequence >= step.sequence || candidate.sequence <= latest) continue;
+    const toolName = toolNameForStep(candidate);
+    const args = record(candidate.input.arguments);
+    const text = toolName === "bash" ? stringValue(args?.command)
+      : toolName === "write" || toolName === "edit" ? stringValue(args?.path)
+        : undefined;
+    if (text && names(text)) latest = candidate.sequence;
+  }
+  return latest;
 }
 
 /** Sequence of the latest completed write/edit of a file this call's arguments name, or -1. */

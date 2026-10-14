@@ -66,7 +66,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `54c9255` | H-041 test fixture | None (test only). |
 | `b9200f0` | H-057 | None. |
 | `f6433f9` | H-049 | None. |
-| _pending_ | H-062 | No schema change. New index failures set the file's own row from `processing` to `available`; the 249 existing rows are untouched (reconciliation proposed below, not run). |
+| `f4f2b1e` | H-062 | No schema change. New index failures set the file's own row from `processing` to `available`; the 249 existing rows are untouched (reconciliation proposed below, not run). |
+| _pending_ | H-028 | None. Publication receipts gain a `sha256` field for new publications only. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -102,6 +103,12 @@ tests from earlier builds. Worker totals recorded up to `c4f419b` (908 → 995) 
 double-count; their pass/fail results stand, since both copies passed. Source-only counts:
 base `99964f1` 433 passed / 3 skipped; `c4f419b` 506 / 3. From H-039 on, the
 verification script deletes compiled tests first and counts are source-only.
+
+**Per-commit typecheck sweep (14 October).** Every commit from `b317990` to `54c9255`
+was checked out in a separate worktree; package dependencies were rebuilt, then
+`@berry/worker` and `@berry/api` were type-checked. All pass except `c94340b`,
+`67a22fa` and `375f8dd`, which fail worker typecheck only because of the H-041 test
+fixture; this is fixed in `54c9255`.
 
 ## Summary
 
@@ -141,7 +148,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-041 fixture (typecheck) | Committed | `54c9255` | Test only |
 | H-057 (malformed question batches) | Committed | `b9200f0` | Not deployed (worker) |
 | H-049 (PDF pages without text reported as unreviewed) | Committed — partial | `f6433f9` | Not deployed (worker) |
-| H-062 (failed indexing leaves files processing) | Committed — worker state; UI open | _pending_ | Not deployed (worker); backlog not reconciled |
+| H-062 (failed indexing leaves files processing) | Committed — worker state; UI open | `f4f2b1e` | Not deployed (worker); backlog not reconciled |
+| H-028 (rebuilt files suppressed as duplicate publications) | Committed | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1422,3 +1430,37 @@ verification script deletes compiled tests first and counts are source-only.
 - **Remaining.** Showing "Stored; not searchable" with the reason and the existing retry
   API in the Library and task file surfaces (web, currently mid-refactor in uncommitted
   work), and selective OCR for textless scans.
+- **Commit.** `f4f2b1e`.
+
+### H-028 — Rebuilt files are suppressed as duplicate publications
+
+- **Evidence.** Task `f8051092…` rebuilt two files after the user reported they would
+  not open, then got "Duplicate tool call suppressed" on both publications and still
+  told the user the rebuilt files were ready.
+- **Root cause (confirmed in code).** `persist_artifact` uses `block_after_success`, keyed
+  on tool name and arguments only, so publishing the same path again was suppressed
+  however the bytes had changed. H-053 deliberately left publication out of its
+  freshness reset.
+- **Fix.**
+  1. The runner lets a publication of the same path through when a later completed
+     write, edit or shell command names the file (its path, or a distinctive basename).
+  2. The executor still keeps publication idempotent by content: when the bytes, path,
+     name and type match the run's latest earlier publication, it returns that receipt
+     marked `unchanged: true` and creates nothing new. Changed bytes publish a new
+     version. Receipts now carry `sha256`.
+  3. A publication that is still suppressed gets an explicit message: no new version
+     was created, the earlier file is current, and the model must not claim a rebuilt
+     version was published.
+- **Files.** `apps/worker/src/turn-runner.ts`, `apps/worker/src/sandbox-continuity.ts` and
+  their tests.
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 524 passed / 3
+  skipped. New cases: publish, rebuild via a command naming the file, publish → executes;
+  publish, unrelated command, publish → suppressed with the new message; executor:
+  identical bytes → earlier receipt and no new upload, changed bytes → new version.
+  All three fail on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Limits.** A rebuild by a script that never names the output file is still treated as
+  unchanged by the runner; identical-bytes reuse relies on `sha256`, which publications
+  made before deployment lack. If the user deleted the earlier file mid-run,
+  republishing identical bytes returns that deleted file's receipt (rare; a new name
+  publishes a fresh copy).
