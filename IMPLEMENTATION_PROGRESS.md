@@ -43,7 +43,8 @@ No pre-existing failures were observed in these suites.
 
 | ID | Status | Commit | Deployment |
 | --- | --- | --- | --- |
-| H-001 | Committed | _pending_ | Not deployed (API + worker + web must ship together) |
+| H-001 | Committed | `d7a806a` | Not deployed (API + worker + web must ship together) |
+| H-002 (prerequisite) | Committed — source of the already-deployed hotfix | _pending_ | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
 
@@ -105,3 +106,30 @@ No pre-existing failures were observed in these suites.
   requests must not be replayed.
 - **Next action.** Deploy API/worker/web together; run a synthetic queue + steer flow
   in production.
+
+- **Commit.** `d7a806a`.
+
+### H-002 prerequisite — commit the deployed faithful-rewriting hotfix
+
+- **Evidence.** `output/rewrite-prompt-2026-09-24/deployment.md`: the faithful
+  copy-editing instruction was deployed to all six workers on 2026-09-24 as a
+  source/image hotfix over `99964f1`, with prompt SHA-256 `de72fe1a…f6255`, and "a
+  later Git deployment must include this amendment to retain it". It was still only in
+  the uncommitted working tree.
+- **Risk addressed.** Any Git-based worker deployment from this branch would have
+  silently removed a prompt that is live in production (a regression), so this is
+  committed before further prompt work.
+- **Verification.** The `DURABLE_REWRITING_PROMPT` string in source hashes to
+  `de72fe1a79f0dc81c18f34fd2cb6dbe9266c019c6d24b2515c2af74b2e9f6255`, identical to the
+  recorded deployed hash and to `output/rewrite-prompt-2026-09-24/prompt.txt`. Isolated
+  snapshot: worker typecheck pass; `turn-runner.test.ts` 110/110 including the test that
+  the instruction reaches the actual provider system messages.
+- **Files.** `apps/worker/src/turn-runner.ts` (constant + stable-prompt entry),
+  `apps/worker/src/turn-runner.test.ts`, `scripts/eval-rewriting.mjs`,
+  `scripts/rewrite-eval-cases.json` (synthetic-only evaluation harness used for the
+  deployment; reads credentials from the environment and never prints them).
+- **Deployment.** Already deployed (hash-verified in the record); this commit only
+  aligns Git with production. No behaviour change relative to production.
+- **Remaining.** The H-002 meaning-drift findings (could→can, personal→company
+  responsibility, requirement→compliance) are *not* addressed by this commit; see the
+  H-002 entry once prompt evaluation work starts.

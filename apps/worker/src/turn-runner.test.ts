@@ -17,6 +17,7 @@ import {
   DurableTurnRetryableError,
   DurableToolExecutionError,
   DURABLE_IMAGE_TOOL_SELECTION_PROMPT,
+  DURABLE_REWRITING_PROMPT,
   DURABLE_TOOL_DEFINITIONS,
   RouterDurableTurnModel,
   SnapshotProviderDurableTurnModel,
@@ -83,6 +84,13 @@ describe("durable turn runner", () => {
     expect(prompt.stableSystemPrompt).toContain("tool_search");
     expect(prompt.stableSystemPrompt).toContain("remote file id");
     expect(prompt.stableSystemPrompt).toContain("outputs directory");
+  });
+
+  it("includes faithful rewriting instructions in the actual provider system prompt", () => {
+    const prompt = modelMessages(providerSnapshot("openai-responses"));
+    expect(prompt.stableSystemPrompt).toContain(DURABLE_REWRITING_PROMPT);
+    expect(prompt.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n"))
+      .toContain(DURABLE_REWRITING_PROMPT);
   });
 
   it("keeps a queued prompt's billing identity across delivery retries", () => {

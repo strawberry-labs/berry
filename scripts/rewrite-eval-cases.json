@@ -1,0 +1,114 @@
+[
+  {
+    "id": "first-person-recommendation",
+    "input": "Rewrite my email: I suggest offering Alex 187,500 inclusive of superannuation. I think 308,000 for Robin is reasonable, but I am concerned about the deal risk.",
+    "checks": {
+      "contains": [
+        "187,500",
+        "308,000"
+      ],
+      "firstPerson": true,
+      "forbidden": [
+        "please confirm",
+        "please advise",
+        "is considered reasonable",
+        "approved"
+      ]
+    }
+  },
+  {
+    "id": "reply-as-user",
+    "input": "I am Jordan. Write my reply to this forwarded email from Marina: 'Hi team, can you help with facade design?' Say I can help with the facade design and would like to arrange a call.",
+    "checks": {
+      "contains": [
+        "facade"
+      ],
+      "firstPerson": true,
+      "forbidden": [
+        "Jordan can",
+        "Marina can",
+        "Jordan would"
+      ]
+    }
+  },
+  {
+    "id": "preserve-team-voice",
+    "input": "Make this email more confident and professional: We may need two more days. We have not approved the budget. We will update you on Friday.",
+    "checks": {
+      "contains": [
+        "may",
+        "two",
+        "Friday",
+        "not approved"
+      ],
+      "firstPerson": true,
+      "forbidden": [
+        "budget has been approved",
+        "budget is approved",
+        "please approve",
+        "expect to",
+        "within the next two days",
+        "thank you for your patience"
+      ]
+    }
+  },
+  {
+    "id": "explicit-third-person",
+    "input": "Rewrite in third person for a report: I reviewed the drawings and I recommend another inspection.",
+    "checks": {
+      "contains": [
+        "inspection"
+      ],
+      "firstPerson": false,
+      "forbidden": []
+    }
+  },
+  {
+    "id": "preserve-removed-request",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Polish my email: I suggest a call on Monday. Please confirm approval."
+      },
+      {
+        "role": "assistant",
+        "content": "I suggest scheduling a call on Monday. Please confirm your approval."
+      },
+      {
+        "role": "user",
+        "content": "Remove the approval request and make it warmer. Keep this as my suggestion, not a confirmed meeting."
+      }
+    ],
+    "input": "Revise my email",
+    "checks": {
+      "contains": [
+        "Monday"
+      ],
+      "firstPerson": true,
+      "forbidden": [
+        "approval",
+        "work around your schedule",
+        "let me know",
+        "confirmed"
+      ]
+    }
+  },
+  {
+    "id": "preserve-placeholders",
+    "input": "Humanize this email without adding anything: Hi [Name], I have not received the drawings. Could you send them by [date]? Thanks, Daria.",
+    "checks": {
+      "contains": [
+        "[Name]",
+        "[date]",
+        "Daria",
+        "drawings"
+      ],
+      "firstPerson": true,
+      "forbidden": [
+        "followed up",
+        "chased",
+        "attached"
+      ]
+    }
+  }
+]

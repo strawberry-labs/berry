@@ -406,6 +406,8 @@ Faithful copy-editing instruction deployed to ai.aesg.com through AWS SSM on all
 
 Deployment and rollback details: [deployment record](output/rewrite-prompt-2026-09-24/deployment.md). This is a prompt-only hotfix over the existing production revision; local source changes remain uncommitted and must be included in future Git deployments. H-001 queue fixes were not included. Broader runtime, skill and artifact issues remain separate.
 
+**Source alignment (14 October):** the deployed hotfix constant was still uncommitted; it is now committed unchanged (source hash `de72fe1a…f6255` matches the deployment record), so a Git deployment cannot drop it. Meaning-drift fixes remain open under H-002.
+
 ### H-031 — Blob deletion receipt inference failure
 
 - Evidence: 834 monthly deletion outbox dead letters; at least 4,805 matching failures within the window among the latest 5,000 retained Redis failed jobs. Live Redis trimming means this is a lower bound.
