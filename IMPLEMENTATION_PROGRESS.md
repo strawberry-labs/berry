@@ -60,7 +60,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `2bd8ff5` | H-039 | No schema change and no deletion. The prompt-version bump stops reuse of existing `vision_observation_cache` rows; the existing retention job removes them once unused. |
 | `03d4682` | H-061 | None. |
 | `5cd4189` | H-042 | None (in-memory model previews only; user files untouched). |
-| _pending_ | H-041 | None. New generated files are stored under their real format; existing files and rows are untouched. |
+| `c94340b` | H-041 | None. New generated files are stored under their real format; existing files and rows are untouched. |
+| _pending_ | H-059 | None (skill script). Publishing it is a skill-package sync, not a database migration. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -129,7 +130,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-039 (truncated vision observations) | Committed — partial | `2bd8ff5` | Not deployed (worker) |
 | H-061 (questions dropped by overview mode) | Committed | `03d4682` | Not deployed (worker) |
 | H-042 (transparent images seen as blank) | Committed | `5cd4189` | Not deployed (worker) |
-| H-041 (generated image metadata from returned bytes) | Committed — worker path | _pending_ | Not deployed (worker) |
+| H-041 (generated image metadata from returned bytes) | Committed — worker path | `c94340b` | Not deployed (worker) |
+| H-059 (XLSX rows sized to wrapped text) | Committed | _pending_ | Not published (organization `xlsx` skill package) |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1196,3 +1198,37 @@ verification script deletes compiled tests first and counts are source-only.
 - **Remaining.** Provider-aware ratio support (choosing a supported size per model rather
   than the fixed three), and the desktop/local-agent and API legacy paths that repeat the
   mapping (lower priority per AGENTS.md).
+- **Commit.** `c94340b`.
+
+### H-059 — XLSX generator clips wrapped text with fixed row heights
+
+- **Evidence.** Task 529's published workbook (SHA-256 `ed112870…`) stores all 153
+  source items but gives every data row 19.5 points with wrap on, and the requested
+  65-character comment column was clamped to 45; a rendered copy clips several comments.
+  Task 517 needed a manual 118.5-point repair. The production script matches the local
+  file (`cff9548f…`), which had no uncommitted changes.
+- **Root cause (confirmed).** `create_aesg_xlsx.py` clamped every width to 8–45 without
+  saying so and set a fixed 19.5-point height on every data row (24.75 for the header)
+  regardless of wrapped text.
+- **Fix.** Requested widths are kept up to 100 (8 minimum); anything outside that range is
+  set to the limit and reported in a new `warnings` list in the generator's JSON receipt.
+  Header and data rows are sized from their wrapped line count (conservative estimate for
+  Verdana; explicit line breaks counted), keeping the old heights as minimums, so short
+  rows look the same. Heights above Excel's 409-point limit are capped with a warning to
+  split the text or widen the column. Cell text is never shortened.
+- **Files.** `deploy/skills/xlsx/scripts/create_aesg_xlsx.py`;
+  `deploy/tests/test_aesg_xlsx_geometry.py` (new; runs with the system openpyxl).
+- **Verification.** `python3 -B -m unittest deploy/tests/test_aesg_xlsx_geometry.py`:
+  2/2 on the isolated snapshot; both fail on the previous script (width 45 instead of 65,
+  and 45 instead of 100 with no warning). LibreOffice renders of the same spec, compared
+  visually: the old script clips the 311-character comment to about two partial lines
+  and the three-line cell to one; the new one shows every line, with roughly one spare
+  line on the long comment. A text-extraction check was dropped because clipped glyphs
+  stay in the PDF, so it passed on the old script too. No Excel desktop rendering.
+- **Deployment.** Not published. The organization `xlsx` skill package must be synced for
+  this to take effect (`deploy/e2b-aesg/sync-skills.sh` syncs every package from the
+  server checkout, so run it only from a checkout that also carries the currently
+  published AESG packages; see the H-064 note on those uncommitted sources).
+- **Remaining.** Missing-logo reporting (`add_logo` silently skips a missing file; task
+  529) belongs with the H-064 dependency work; Excel-specific glyph metrics are estimated,
+  not measured.
