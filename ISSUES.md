@@ -60,7 +60,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-032 | P1 | Cache metrics obscure low token coverage | Complete final-window usage + code + prior audit | Metric, diagnostics and per-turn prefix layout committed locally (not deployed); live coverage evaluation and MCP tool-surface/provider affinity open |
 | H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Validator fix committed locally (not deployed); attempt IDs/release manifest open |
 | H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending; not fixed: needs a model evaluation |
-| H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified; not fixed: UI cause still unverified |
+| H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | Partly fixed locally (not deployed): composer double-submit race confirmed in a browser and closed; server idempotency open |
 | H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Fix committed locally (not deployed): omitted results carry an explicit marker; production occurrence still not established |
 | H-037 | P1 | Search operators removed before upstream search | Production query/output + matching local BerryCrawl code | Remote BerryCrawl revision unverified; not fixed: remote BerryCrawl |
 | H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker fix committed locally (not deployed): calls separated by id when indices restart; desktop adapter and remote gateway open |
@@ -474,6 +474,7 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Evidence: five same-user/text/attachment pairs within five seconds, including five image tasks created within thirteen seconds. Intentional resubmission versus frontend race is not established.
 - Proposal: trace per-submit intent/idempotency keys, show immediate admission progress and preserve intentional reruns. No automatic merge of distinct user tasks.
 - Acceptance: double-click, lost response and reconnect create one task for one intent; intentional rerun creates another. Estimate 1–2 days if UI cause confirmed.
+- **Implementation (14 October):** a browser test confirmed the race (a second Enter during task creation made a second task) and an in-flight guard now closes it for new tasks and slash commands. Not deployed. Lost-response retries still need server-side idempotency.
 
 ### H-036 — Tool result omitted after shared history budget
 

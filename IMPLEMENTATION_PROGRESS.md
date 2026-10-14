@@ -83,6 +83,7 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `220767a` | H-005 | None. |
 | `36022d9` | H-052 | None. |
 | `d65df09` | H-048 script (test) | None. |
+| _pending_ | H-035 | None (UI). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -180,6 +181,7 @@ fixture; this is fixed in `54c9255`.
 | H-005 (credit/quota exhaustion presented as a model problem) | Committed — partial | `220767a` | Not deployed (worker) |
 | H-052 (requested short skill name not resolved) | Committed — partial (hint; behaviour unevaluated) | `36022d9` | Not deployed (worker) |
 | H-048 script follows the per-turn context layout | Committed | `d65df09` | Test only |
+| H-035 (duplicate task from a second Enter) | Committed — partial | _pending_ | Not deployed (web) |
 | H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
@@ -1965,3 +1967,29 @@ AESG packages.
 - **Remaining.** Configured aliases in skill metadata, and the model evaluation in the
   issue's acceptance criteria.
 - **Commit.** `36022d9`.
+
+### H-035 — A second Enter creates a duplicate task
+
+- **Evidence.** Five same-user, same-text, same-attachment task pairs created within five
+  seconds, including five image tasks within thirteen seconds. Whether users resubmitted
+  on purpose was not established from production data (production access was not
+  available in this pass).
+- **Root cause (confirmed in code and in a browser).** For a new task, the composer's
+  `submit` awaited `onCreateTask(...)` before setting `busy` or clearing the text, and the
+  `/image` command path awaited task creation the same way. A second Enter or click during
+  that request passed every guard and created a second task with the same text. Follow-ups
+  already had an in-flight guard; new tasks and commands did not.
+- **Fix.** One `submitInFlightRef` guard covers new-task submission and slash commands
+  until the first attempt finishes; it is released on success, failure or a null task.
+  Intentional resubmission after the first request finishes still works.
+- **Files.** Seven hunks of `apps/web/src/components/tasks/web-composer.tsx` (its other
+  uncommitted edits left unstaged); browser check: `scripts/duplicate-submit-browser-server.mjs`
+  (in-memory API, task creation held for 1.2 s), `apps/web/playwright.duplicate-submit.config.ts`,
+  `apps/web/tests/duplicate-submit.spec.ts`.
+- **Verification (isolated snapshot).** `@berry/web...` build and typecheck pass (typecheck
+  needs the dependency build first in a fresh worktree); web tests 295/295. Playwright
+  (Chromium, real web app): with the fix, Enter twice during task creation creates one task
+  and one turn. **Pre-fix:** the same test fails with two task creations.
+- **Deployment.** Not deployed (web).
+- **Remaining.** Server-side idempotency for task creation, so a lost response and
+  reconnect cannot create a second task.

@@ -236,6 +236,9 @@ export function Composer({
   const promptImprovementControllerRef = React.useRef<AbortController | null>(null);
   const latestTextRef = React.useRef(text);
   const followUpSubmittingRef = React.useRef(false);
+  // A new task or a command such as /image is still being created; a second
+  // Enter or click used to create a duplicate task with the same text (H-035).
+  const submitInFlightRef = React.useRef(false);
   const pendingQueueSubmissionRef = React.useRef<QueuedFollowUp | null>(null);
   const queueEditDraftRef = React.useRef<{ text: string; attachments: AttachmentInput[]; createImageMode: boolean } | null>(null);
   const queueEditIndexRef = React.useRef<number | null>(null);
@@ -524,6 +527,8 @@ export function Composer({
     if (submitIntent === "ignore") return;
     const command = submitIntent === "send" ? parseSlashCommand(input) : null;
     if (command) {
+      if (submitInFlightRef.current) return;
+      submitInFlightRef.current = true;
       setUploadError("");
       try {
         await onCommand(command.name, command.args);
@@ -532,6 +537,8 @@ export function Composer({
         editorRef.current?.clear();
       } catch (cause) {
         setUploadError(cause instanceof Error ? cause.message : `Unable to run /${command.name}`);
+      } finally {
+        submitInFlightRef.current = false;
       }
       return;
     }
@@ -586,45 +593,50 @@ export function Composer({
       }
       return;
     }
-    if (working) return;
-    const task = activeTask ?? await onCreateTask({ title: input.slice(0, 42) });
-    if (!task?.activeSessionId) return;
-    const sessionId = task.activeSessionId;
-    const profileContext = variant === "home" ? personalizationRuntimeContext(personalization) : "";
-    const runtimeInput = profileContext ? `${input}\n\nExplicit user profile context:\n${profileContext}` : input;
-    setBusy(true);
-    setUploadError("");
-    const requestMessageId = globalThis.crypto.randomUUID();
-    onUserMessage(input, sessionId, task.id, attachments, requestMessageId);
-    setComposerText("");
-    setCreateImageMode(false);
-    editorRef.current?.clear();
+    if (working || submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
     try {
-      if (client) {
-        const sent = attachments;
-        setAttachments([]);
-        await runTurn(task, {
-          input: runtimeInput,
-          ...(intent ? { intent } : {}),
-          ...(runtimeInput !== input ? { messageInput: input } : {}),
-          requestMessageId,
-          ...(sent.length > 0 ? { attachments: sent } : {}),
-        });
-      } else {
-        onEvent(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
-        const turnId = `turn_${Date.now()}`;
-        onEvent(sessionId, { kind: "turn.start", turnId });
-        onEvent(sessionId, { kind: "message.start", messageId: `msg_live_${turnId}`, role: "assistant" });
-        onEvent(sessionId, { kind: "tool.start", toolCallId: `tool_${turnId}`, name: "sandbox.exec", title: "Fixture sandbox" });
-        onEvent(sessionId, { kind: "tool.end", toolCallId: `tool_${turnId}`, status: "completed", summary: "ready" });
-        onEvent(sessionId, { kind: "message.delta", messageId: `msg_live_${turnId}`, delta: "Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", channel: "text" });
-        onEvent(sessionId, { kind: "turn.end", turnId, status: "completed" });
-        window.setTimeout(() => onAssistantMessage("Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", sessionId, task.id), 60);
+      const task = activeTask ?? await onCreateTask({ title: input.slice(0, 42) });
+      if (!task?.activeSessionId) return;
+      const sessionId = task.activeSessionId;
+      const profileContext = variant === "home" ? personalizationRuntimeContext(personalization) : "";
+      const runtimeInput = profileContext ? `${input}\n\nExplicit user profile context:\n${profileContext}` : input;
+      setBusy(true);
+      setUploadError("");
+      const requestMessageId = globalThis.crypto.randomUUID();
+      onUserMessage(input, sessionId, task.id, attachments, requestMessageId);
+      setComposerText("");
+      setCreateImageMode(false);
+      editorRef.current?.clear();
+      try {
+        if (client) {
+          const sent = attachments;
+          setAttachments([]);
+          await runTurn(task, {
+            input: runtimeInput,
+            ...(intent ? { intent } : {}),
+            ...(runtimeInput !== input ? { messageInput: input } : {}),
+            requestMessageId,
+            ...(sent.length > 0 ? { attachments: sent } : {}),
+          });
+        } else {
+          onEvent(sessionId, { kind: "turn.start", turnId: `pending_${Date.now()}` });
+          const turnId = `turn_${Date.now()}`;
+          onEvent(sessionId, { kind: "turn.start", turnId });
+          onEvent(sessionId, { kind: "message.start", messageId: `msg_live_${turnId}`, role: "assistant" });
+          onEvent(sessionId, { kind: "tool.start", toolCallId: `tool_${turnId}`, name: "sandbox.exec", title: "Fixture sandbox" });
+          onEvent(sessionId, { kind: "tool.end", toolCallId: `tool_${turnId}`, status: "completed", summary: "ready" });
+          onEvent(sessionId, { kind: "message.delta", messageId: `msg_live_${turnId}`, delta: "Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", channel: "text" });
+          onEvent(sessionId, { kind: "turn.end", turnId, status: "completed" });
+          window.setTimeout(() => onAssistantMessage("Fixture sandbox ready. In demo mode this stays in the browser; set `BERRY_WEB_API_BASE_URL` to run it through the Phase 8 API/SSE surface.", sessionId, task.id), 60);
+        }
+      } catch (cause) {
+        setUploadError(cause instanceof Error ? cause.message : "Unable to complete the turn");
+      } finally {
+        setBusy(false);
       }
-    } catch (cause) {
-      setUploadError(cause instanceof Error ? cause.message : "Unable to complete the turn");
     } finally {
-      setBusy(false);
+      submitInFlightRef.current = false;
     }
   }, [activeTask, attachments, client, continueInterruptedTurn, createImageMode, editingFollowUp, onAssistantMessage, onCommand, onCreateTask, onEditingFollowUpChange, onEvent, onQueuedFollowUp, onSteerMessage, onUpdateFollowUp, onUserMessage, onUserMessagePersisted, pendingUploads, personalization, queuedFollowUps.length, runTurn, savingQueuedEdit, setComposerText, text, variant, working]);
 
