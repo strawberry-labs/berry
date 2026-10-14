@@ -4866,9 +4866,14 @@ function assessRepeatedToolCall(
 ): ToolRepeatAssessment {
   const signature = toolRepeatSignature(step);
   const policy = repeatPolicyForStep(step);
+  // An observation repeated after an edit of a file it uses is a new
+  // observation (render -> edit -> render). External writes and publication
+  // keep their dedup: they never reach this reset (H-053).
+  const freshSince = policy === "compare_result" ? lastEditOfReferencedFile(snapshot, step) : -1;
   const relevant = snapshot.steps
     .filter((candidate) => candidate.id !== step.id
       && candidate.sequence < step.sequence
+      && candidate.sequence > freshSince
       && isToolStep(candidate)
       && toolRepeatSignature(candidate) === signature)
     .sort((left, right) => left.sequence - right.sequence)
@@ -4904,6 +4909,25 @@ function assessRepeatedToolCall(
     priorSuppressionCount: suppressions.length,
     decision,
   };
+}
+
+/** Sequence of the latest completed write/edit of a file this call's arguments name, or -1. */
+function lastEditOfReferencedFile(snapshot: DurableTurnSnapshot, step: DurableTurnStep): number {
+  const argumentsText = JSON.stringify(step.input.arguments ?? {});
+  let latest = -1;
+  for (const candidate of snapshot.steps) {
+    if (candidate.state !== "completed" || candidate.sequence >= step.sequence || candidate.sequence <= latest) continue;
+    const toolName = toolNameForStep(candidate);
+    if (toolName !== "write" && toolName !== "edit") continue;
+    const path = stringValue(record(candidate.input.arguments)?.path)?.trim();
+    if (!path) continue;
+    const basename = path.split("/").filter(Boolean).at(-1);
+    // A bare basename only counts when it is distinctive enough to name a file.
+    if (argumentsText.includes(path) || (basename && basename.includes(".") && argumentsText.includes(basename))) {
+      latest = candidate.sequence;
+    }
+  }
+  return latest;
 }
 
 function canonicalizeToolArguments(value: unknown): unknown {

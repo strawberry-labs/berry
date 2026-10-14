@@ -52,7 +52,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `9eecde6` | H-032 (prompt layout) | None (prompt assembly only). |
 | `f2923b2` | H-068 | None. |
 | `920a84c` | H-076 | None. |
-| _pending_ | H-070 | None. |
+| `430d396` | H-070 | None. |
+| _pending_ | H-053 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -105,7 +106,8 @@ No pre-existing failures were observed in these suites.
 | H-068 (import readiness) | Committed | `f2923b2` | Not deployed (worker) |
 | H-069 (temporary imports kept out of Library) | Committed | `3104547` | Not deployed (API) |
 | H-076 (shared-drive scope) | Committed | `920a84c` | Not deployed (API) |
-| H-070 (bounded MCP results keep structure and cursors) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-070 (bounded MCP results keep structure and cursors) | Committed — partial | `430d396` | Not deployed (worker) |
+| H-053 (repeat guard after source edits) | Committed | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -897,3 +899,31 @@ No pre-existing failures were observed in these suites.
 - **Remaining (H-070 stays open).** Compact per-tool projections (e.g. Drive listings
   without full capability blocks) to fit more items, retrievable handles for omitted
   content, and the journal sanitizer's silent 256-item/128-key limits on stored details.
+- **Commit.** `430d396`.
+
+### H-053 — Repeat guard blocks a renderer after its source file changes
+
+- **Evidence.** Task 718: the diagram script was edited between renderer runs that each
+  printed the same "saved …" line; the guard suppressed the third run, a cosmetic `ls`
+  bypassed it once, and the next identical run ended the task with
+  `duplicate_tool_call_loop` (the image was never published). The audit reproduced this
+  with the deployed functions. Month: 64 guard steps / 37 tasks, of which 10 steps / 9
+  tasks had an intervening write/edit of a file the blocked command referenced
+  (condition cohort, not all false positives).
+- **Root cause (confirmed).** `assessRepeatedToolCall` counted every earlier identical
+  call (same tool + arguments) and its identical result, regardless of edits made to the
+  files the command uses in between; once suppressed, the next identical call terminated.
+- **Fix.** For `compare_result` tools (bash, read, grep, find, ls, image inspection,
+  read-only MCP), earlier identical calls made *before* the latest completed `write`/`edit`
+  of a path named in the call's arguments (full path, or a distinctive basename) no longer
+  count. `block_after_success` tools (external writes, publication) are untouched, and
+  edits of unrelated files reset nothing.
+- **Files.** `apps/worker/src/turn-runner.ts`, `apps/worker/src/turn-runner.test.ts`.
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 984 /
+  6 skipped. New task-718 regression (render → edit → render ×3 with identical stdout)
+  runs all four renders; with only unrelated edits the existing bound still suppresses and
+  terminates; the existing "third identical bash suppressed, fourth terminates" test is
+  unchanged. The regression fails on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Edits made through bash (e.g. `sed -i`) are not tracked as mutations;
+  H-030 (async polling) and H-054 (vision failure classes) are separate fixes.

@@ -2307,6 +2307,49 @@ describe("durable turn runner", () => {
       .toMatchObject({ state: "failed", error: "duplicate_tool_call_loop" });
   });
 
+  describe("repeat guard after file edits (task 718)", () => {
+    const render = (sequence: number) => runCommandStep("pending", sequence, "cd /workspace/tmp && python diagram.py");
+    const edit = (sequence: number, path: string): DurableTurnStep => ({
+      ...toolStep("completed", "idempotent", false),
+      sequence,
+      type: "tool.edit",
+      input: { toolCallId: randomUUID(), toolName: "edit", arguments: { path, edits: [{ oldText: "a", newText: "b" }] }, requiresApproval: false, approvalKind: "file-edit" },
+      output: { path, applied: 1 },
+    });
+    const runRenders = async (editPath: string) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), render(1)]));
+      let executions = 0;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          executions += 1;
+          // The renderer prints the same acknowledgement whatever it drew.
+          return { output: { exitCode: 0, output: "saved /workspace/outputs/diagram.png" }, summary: "Command completed" };
+        },
+      });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      let sequence = 2;
+      for (let round = 0; round < 3; round += 1) {
+        repository.current.steps.push(edit(sequence++, editPath));
+        queueToolForExecution(repository, render(sequence++));
+        await runner.execute({ tenantId, runId, reason: "continue" });
+      }
+      return { repository, executions };
+    };
+
+    it("re-runs a renderer after its source file was edited, even with identical output", async () => {
+      const { repository, executions } = await runRenders("/workspace/tmp/diagram.py");
+      expect(executions).toBe(4);
+      expect(repository.current.error).toBeNull();
+      expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_suppressed" || step.error === "duplicate_tool_call_loop")).toBe(false);
+    });
+
+    it("still bounds identical renders when only an unrelated file changed", async () => {
+      const { repository, executions } = await runRenders("/workspace/notes/todo.md");
+      expect(executions).toBe(2);
+      expect(repository.current.error).toBe("duplicate_tool_call_loop");
+    });
+  });
+
   it("finishes the remaining sequential tools before giving the model a correction turn", async () => {
     const first = { ...runCommandStep("completed", 1, "printf same"), output: { command: "printf same", output: "" } as const };
     const second = { ...runCommandStep("completed", 2, "printf same"), output: { command: "printf same", output: "" } as const };
