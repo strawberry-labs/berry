@@ -313,8 +313,9 @@ FOR UPDATE
       if (!input.continueInterruptedTurn && input.replaceFromMessageId) {
         await rewindProjectionForEdit(executor, input);
       }
-      const requestMessageId = input.continueInterruptedTurn
-        ? await continuableRequestMessageId(executor, input)
+      const continuation = input.continueInterruptedTurn ? await continuableRequest(executor, input) : null;
+      const requestMessageId = continuation
+        ? continuation.requestMessageId
         : await ensureUserMessage(executor, input);
       await syncMessageJournal(executor, input);
       if (!input.continueInterruptedTurn) {
@@ -364,6 +365,10 @@ INSERT INTO turn_runs (
             admissionFingerprint: input.operationFingerprint,
             budgetReservationRequired: input.budgetReservationRequired,
             continueInterruptedTurn: input.continueInterruptedTurn === true,
+            ...(continuation ? {
+              continuationSourceRunId: continuation.sourceRunId,
+              ...(continuation.headEntryId ? { continuationHeadEntryId: continuation.headEntryId } : {}),
+            } : {}),
             input: input.input,
           }),
           JSON.stringify(input.groundingContext),
@@ -2585,24 +2590,48 @@ function nullableIso(value: Date | string | null): string | null {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
-async function continuableRequestMessageId(
+async function continuableRequest(
   executor: SqlExecutor,
   input: DurableTurnAdmission,
-): Promise<string> {
-  const rows = await executor.query<{ request_message_id: string | null }>(
+): Promise<{ requestMessageId: string; sourceRunId: string; headEntryId: string | null }> {
+  // The continued run's own journal entries descend from the shared request
+  // message. Record the current leaf as the continuation head only when it is
+  // on that request's branch, so workspace recovery follows the same branch as
+  // the conversation instead of the request message's ancestors alone.
+  const rows = await executor.query<{ id: string; request_message_id: string | null; head_entry_id: string | null }>(
     `
-SELECT request_message_id
-FROM turn_runs
-WHERE tenant_id=$1::uuid AND session_id=$2::uuid
-  AND state IN ('failed','cancelled')
-ORDER BY created_at DESC
-LIMIT 1
+WITH RECURSIVE source AS (
+  SELECT id,request_message_id
+  FROM turn_runs
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid
+    AND state IN ('failed','cancelled')
+  ORDER BY created_at DESC
+  LIMIT 1
+), leaf AS (
+  SELECT entry_id,parent_entry_id
+  FROM session_entries
+  WHERE tenant_id=$1::uuid AND session_id=$2::uuid AND is_leaf_marker=true
+  ORDER BY sequence DESC
+  LIMIT 1
+), leaf_branch AS (
+  SELECT entry_id,parent_entry_id FROM leaf
+  UNION ALL
+  SELECT parent.entry_id,parent.parent_entry_id
+  FROM session_entries parent
+  JOIN leaf_branch child ON child.parent_entry_id=parent.entry_id
+  WHERE parent.tenant_id=$1::uuid AND parent.session_id=$2::uuid
+)
+SELECT source.id,source.request_message_id,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM leaf_branch WHERE leaf_branch.entry_id=source.request_message_id::text
+  ) THEN (SELECT entry_id FROM leaf) END AS head_entry_id
+FROM source
     `.trim(),
     [input.tenantId, input.sessionId],
   );
-  const requestMessageId = rows[0]?.request_message_id;
-  if (!requestMessageId) throw new Error("No failed or cancelled durable turn can be continued");
-  return requestMessageId;
+  const source = rows[0];
+  if (!source?.request_message_id) throw new Error("No failed or cancelled durable turn can be continued");
+  return { requestMessageId: source.request_message_id, sourceRunId: source.id, headEntryId: source.head_entry_id };
 }
 
 async function ensureUserMessage(

@@ -76,7 +76,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-048 | P1 | Provider errors replay as ordinary assistant history | One fully reviewed false completion + offline reproduction + deployed code | Confirmed current history-contract gap; exact failed-request cause open |
 | H-049 | P1 | Mixed PDF image pages counted as fully reviewed text | One verified source omission + 102 input-read symptoms / 34 tasks / 22 users + deployed code | Confirmed current coverage-contract gap; broader content impact unmeasured |
 | H-050 | P2 | Ready optional capabilities discarded at admission deadline | Deployed-function offline reproduction; related guarded calls | Current code gap; monthly causal frequency unestablished |
-| H-051 | P1 | Continue excludes the checkpoint of interrupted work | Exact deployed SQL replay + full task trace; 53/129 lookup conditions | Confirmed current branch-anchor defect |
+| H-051 | P1 | Continue excludes the checkpoint of interrupted work | Exact deployed SQL replay + full task trace; 53/129 lookup conditions | Fix committed locally (not deployed); PostgreSQL regression added |
 | H-052 | P1 | Requested skills missed despite an enabled catalog entry | Frozen admitted BSBG skill + complete task trace + current prompt/tool code | Confirmed incorrect availability claim; resolution improvement |
 | H-053 | P1 | Changed generator sources ignored by duplicate-call guard | Fully traced task + exact deployed-function replay; nine condition candidates | Confirmed current guard/input-version defect |
 | H-054 | P1 | Vision retries blocked without failure classification or recovery state | Exact deployed replay + nine monthly guard events; two fully reviewed tasks | Confirmed current guard gap; fresh SSM hash verified |
@@ -99,7 +99,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 
 | H-070 | P1 | Large MCP text is silently cut and loses pagination cursors | 86 limit outputs /49 tasks;11 hidden cursors /7 tasks; whole trace and deployed fixture | Confirmed current contract defect; outcome frequency still under review |
 | H-071 | P1 | Successful image reads can be omitted from model input | Observed + current code | Confirmed; image eligibility/reprioritization unresolved |
-| H-072 | P1 | Continue excludes preserved sandbox state of interrupted run | Native snapshot + current lineage code | Confirmed; exposure count is not proven file-loss count |
+| H-072 | P1 | Continue excludes preserved sandbox state of interrupted run | Native snapshot + current lineage code | Same cause as H-051; fix committed locally (not deployed) |
 | H-073 | P1 | CV parser treats project-title year as a date | Task85 + live skill function reproduction | Confirmed current; literal structured names needed |
 | H-074 | P1 | CV workflow requires unused photos and lacks blank/unknown input states | Tasks65/118/131 + live skill contract | Confirmed current; format-aware input requirements needed |
 | H-075 | P1 | Internal connector session expires while worker caches it | Task139 + deployed API/worker parity | Confirmed current mismatch; exact incident token age unretained |
@@ -892,6 +892,8 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 **Task 682 validation and bounded repair:** the ultimately delivered PNG has the same 1478×716 dimensions and RGBA mode as the immutable original. Independent SHA-verified comparison finds 3,022 changed pixels, all inside the requested legend patch, with **zero changed pixels elsewhere**; the new DOO/DOF text was visually checked. This is a positive deterministic-preservation example. PNG DPI/sRGB/gamma metadata was not retained, so this proof covers decoded pixels, not every file property or print workflow. The earlier Pillow \`ImageDraw.getbbox\` typo is corrected in one retry; it is not evidence Python execution is unavailable. Font probing and two silent download failures consume avoidable preparation time; an installed-font capability map would help H-007/H-013 without requiring another global font installation.
 
 Private evidence: \`task682-snapshot-timeline.json\`, \`task682-request-branch-anchors.json\`, \`task682-deployed-continuity-query-proof.json\`, \`monthly-continuation-branch-eligibility.json\`, its summary and explicit-flag verification, and \`task682-exact-preservation-proof.json\`. No production state, sandbox or application code was changed.
+
+**Implementation (14 October, H-051/H-072):** Continue admission now records the source run and a verified journal head; the worker anchors workspace recovery at that head for continuation runs only. A real-PostgreSQL regression (`scripts/test-continue-lineage.mjs`) fails on the old lookup and passes with the fix; edits and unrelated branches remain excluded. Not deployed.
 
 ### H-052 — Requested skill is missed despite being enabled in the admitted catalog
 

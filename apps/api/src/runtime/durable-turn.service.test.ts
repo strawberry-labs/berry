@@ -956,8 +956,8 @@ describe("DurableTurnService", () => {
       execute: async (sql, params = []) => { executions.push({ sql, params }); },
       query: async <T>(sql: string) => {
         if (sql.includes("FROM sessions s")) return [{ session_id: sessionId }] as T[];
-        if (sql.includes("SELECT request_message_id") && sql.includes("state IN ('failed','cancelled')")) {
-          return [{ request_message_id: userId }] as T[];
+        if (sql.includes("SELECT source.id,source.request_message_id") && sql.includes("state IN ('failed','cancelled')")) {
+          return [{ id: "interrupted-run", request_message_id: userId, head_entry_id: "interrupted-leaf" }] as T[];
         }
         return [] as T[];
       },
@@ -981,7 +981,11 @@ describe("DurableTurnService", () => {
     });
 
     const runInsert = executions.find(({ sql }) => sql.startsWith("INSERT INTO turn_runs"));
-    expect(JSON.parse(String(runInsert?.params[8]))).toMatchObject({ continueInterruptedTurn: true });
+    expect(JSON.parse(String(runInsert?.params[8]))).toMatchObject({
+      continueInterruptedTurn: true,
+      continuationSourceRunId: "interrupted-run",
+      continuationHeadEntryId: "interrupted-leaf",
+    });
     const startEvent = executions.find(({ sql }) => sql.includes("'turn.start'"));
     expect(JSON.parse(String(startEvent?.params[3]))).toEqual({
       kind: "turn.start",

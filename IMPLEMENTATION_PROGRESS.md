@@ -46,7 +46,8 @@ No pre-existing failures were observed in these suites.
 | H-001 | Committed | `d7a806a` | Not deployed (API + worker + web must ship together) |
 | H-009 (reconnect after cross-worker pause) | Committed — partial | `0cfe1d4` | Not deployed (worker + sandbox-contract) |
 | H-014 (prerequisite: late mutation receipts) | Committed — source of the already-deployed hotfix | `d481431` | Deployed 2026-09-30 per record; exact production byte parity not reproducible (see entry) |
-| H-011 (image payload guard) | Committed — partial | _pending_ | Not deployed (worker image; needs Sharp's Linux binary from the frozen lockfile) |
+| H-011 (image payload guard) | Committed — partial | `39d02c8` | Not deployed (worker image; needs Sharp's Linux binary from the frozen lockfile) |
+| H-051 / H-072 (Continue workspace lineage) | Committed | _pending_ | Not deployed (API + worker; either order is compatible) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -234,3 +235,45 @@ No pre-existing failures were observed in these suites.
 - **Remaining (H-011 stays open).** Binary/text decoding (BOM-less UTF-16, PBIX/ZIP/PPSX
   NUL bytes), malformed tool JSON and per-route measured limits are separate. H-042
   (transparent PNG previews keep alpha) is handled as its own change on top of this.
+- **Commit.** `39d02c8`.
+
+### H-051 / H-072 — Continue recovers the interrupted run's workspace
+
+- **Evidence.** H-051 task 682: the edited graphic and preview were written, the run was
+  cancelled, a complete checkpoint finished at 08:34:54.267, and Continue (08:34:55.462)
+  started in a new sandbox without the preview; the audit replayed the exact deployed
+  SQL and got neither prior sandbox nor snapshot. H-072 task 676: an unpublished amended
+  NDA exists in the interrupted snapshot but Continue excludes it. Month: 129 explicit
+  Continue runs; 53 runs / 42 tasks have no eligible prior sandbox or snapshot (lookup
+  conditions, not proved file losses).
+- **Root cause (confirmed).** Continue admission reuses the interrupted request message
+  (`continuableRequestMessageId`) and leaves the journal leaf on the interrupted run's
+  entries, so the *conversation* resumes from that work. The worker's
+  `SqlSandboxSnapshotRepository.continuity` built its eligible branch from the ancestors
+  of `request_message_id`; the user entry carries no `run_id` and the interrupted run's
+  own entries/checkpoint leaf are descendants, so neither its sandbox nor its snapshot
+  qualified. Conversation and filesystem continued on different branches. H-051 and
+  H-072 are the same defect.
+- **Fix.** At Continue admission the API records `continuationSourceRunId` and, only if
+  the current journal leaf descends from (or is) the continued request message,
+  `continuationHeadEntryId`. For runs flagged `continueInterruptedTurn` the worker
+  anchors the eligible branch at that head (otherwise at the request message, so normal
+  turns, edits and legacy rows behave exactly as before). No unscoped "latest
+  checkpoint" fallback; ownership, tenant scope, timestamps and branch checks are
+  unchanged.
+- **Files.** `apps/api/src/runtime/durable-turn.service.ts`, `apps/worker/src/sandbox-continuity.ts`,
+  their unit tests (SQL-text fixtures updated and strengthened to assert the recorded
+  source/head), `scripts/test-continue-lineage.mjs` (new real-PostgreSQL regression).
+- **Verification.** Real PostgreSQL (isolated snapshot): 4/4 — Continue restores the
+  cancelled run's sandbox *and* checkpoint; Continue after a failure before any output
+  still restores earlier completed work (healthy path); editing an earlier message
+  never inherits descendant workspace state; a head on an unrelated branch is not
+  trusted. **Regression proof:** scenario 1 against the pre-fix build fails with
+  "continuation must see the interrupted workspace". API runtime suite 61/61, worker
+  `sandbox-continuity` + `turn-runner` 213/213, API/worker typecheck pass; queue suite
+  still 8/8.
+- **Deployment.** Not deployed. Compatible in either order: an old API writes no head
+  (worker falls back to the request message); an old worker ignores the new fields.
+- **Remaining.** Missing historical image paths still abort model preparation (H-046);
+  phase-aware Continue instructions and exhausted allowances are H-048/H-066/task 176.
+  Recovery for continuation runs admitted before deployment uses the old lookup.

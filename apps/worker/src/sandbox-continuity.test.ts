@@ -3164,7 +3164,10 @@ describe("SandboxContinuityManager", () => {
     });
 
     expect(continuitySql).toContain("WITH RECURSIVE current_run");
-    expect(continuitySql).toContain("entry.entry_id=current_run_row.request_message_id::text");
+    // Continue anchors at its verified journal head; other runs keep the
+    // request message (scripts/test-continue-lineage.mjs covers real rows).
+    expect(continuitySql).toContain("entry.entry_id=COALESCE(current_run_row.continuation_head_entry_id,current_run_row.request_message_id::text)");
+    expect(continuitySql).toContain("WHEN runtime_request->>'continueInterruptedTurn'='true'");
     expect(continuitySql).toContain("s.created_at<current_run_row.created_at");
     expect(continuitySql).toContain("s.session_leaf_id IS NOT NULL");
     expect(continuitySql).toContain("branch_entry.entry_id=s.session_leaf_id");

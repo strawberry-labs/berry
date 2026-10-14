@@ -2123,7 +2123,12 @@ WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
     const rows = await this.executor.query<SessionContinuityRow>(
       `
 WITH RECURSIVE current_run AS (
-  SELECT tenant_id,id,session_id,request_message_id,created_at
+  -- Continue reuses the interrupted request message, whose ancestors exclude
+  -- the interrupted run's own entries. Admission records the verified journal
+  -- head being continued; anchor the workspace branch there instead.
+  SELECT tenant_id,id,session_id,request_message_id,created_at,
+         CASE WHEN runtime_request->>'continueInterruptedTurn'='true'
+           THEN NULLIF(runtime_request->>'continuationHeadEntryId','') END AS continuation_head_entry_id
   FROM turn_runs
   WHERE tenant_id=$1::uuid AND id=$2::uuid
 ), target_branch AS (
@@ -2132,7 +2137,7 @@ WITH RECURSIVE current_run AS (
   JOIN session_entries entry
     ON entry.tenant_id=current_run_row.tenant_id
    AND entry.session_id=current_run_row.session_id
-   AND entry.entry_id=current_run_row.request_message_id::text
+   AND entry.entry_id=COALESCE(current_run_row.continuation_head_entry_id,current_run_row.request_message_id::text)
   UNION ALL
   SELECT parent.tenant_id,parent.session_id,parent.entry_id,parent.parent_entry_id,parent.run_id
   FROM session_entries parent
