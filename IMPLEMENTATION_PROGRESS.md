@@ -51,7 +51,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `3a27931` | H-032 (diagnostics) | None. |
 | `9eecde6` | H-032 (prompt layout) | None (prompt assembly only). |
 | `f2923b2` | H-068 | None. |
-| _pending_ | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
+| _pending_ | H-076 | None. |
+| `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
@@ -101,7 +102,8 @@ No pre-existing failures were observed in these suites.
 | H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | `9eecde6` | Not deployed (worker) |
 | H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | `f6f9074` | Not deployed (worker) |
 | H-068 (import readiness) | Committed | `f2923b2` | Not deployed (worker) |
-| H-069 (temporary imports kept out of Library) | Committed | _pending_ | Not deployed (API) |
+| H-069 (temporary imports kept out of Library) | Committed | `3104547` | Not deployed (API) |
+| H-076 (shared-drive scope) | Committed | _pending_ | Not deployed (API) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -841,3 +843,30 @@ No pre-existing failures were observed in these suites.
 - **Not done (needs its own reviewed plan).** Historical temporary imports already in
   users' Libraries are not removed; later deliberate saves cannot be distinguished
   safely from current membership alone.
+- **Commit.** `3104547`.
+
+### H-076 — Shared-drive scope lost during discovery and traversal
+
+- **Evidence.** Task 139: a filename search was empty until the known shared-drive ID was
+  supplied; tasks 86/101/114 show related discovery friction. Deployed `google-tools.js`
+  matches local source (audit).
+- **Root cause (confirmed).** `drive_search_files` used `corpora=user` unless a `driveId`
+  was passed — Google's `user` corpus covers files the user created, opened or was
+  directly shared, not every file of their shared drives — and `drive_list_children`
+  could neither accept nor infer the folder's drive, so shared-drive folders were listed
+  in the wrong corpus. `supportsAllDrives` does not carry drive identity.
+- **Fix.** Child listing infers the folder's `driveId` with one metadata call (skipped when
+  supplied) and lists within that drive; the result returns `driveId` for pagination. An
+  unscoped search whose first page is empty retries once with `corpora=allDrives`
+  (bounded; Google applies the user's own permissions). Results report `searchScope`
+  (`user` / `allDrives` / `drive`) and `incompleteSearch` explicitly; continuation pages
+  never widen.
+- **Files.** `apps/api/src/connectors/google-tools.ts` (+test).
+- **Verification (isolated snapshot).** API typecheck pass; connectors suites 44/44. New
+  fetch-mocked cases: shared-drive folder listed in its drive; supplied drive ID kept
+  through pagination; empty unscoped search retried across drives with
+  `incompleteSearch` surfaced; non-empty and continuation searches not widened; named
+  drive searched alone. The first three fail on the previous source.
+- **Deployment.** Not deployed (API).
+- **Remaining.** Ancestry-aware scope for a *file* (not folder) selected via the picker is
+  not inferred; no live Google verification was possible here.

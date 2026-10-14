@@ -103,7 +103,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-073 | P1 | CV parser treats project-title year as a date | Task85 + live skill function reproduction | Confirmed current; literal structured names needed |
 | H-074 | P1 | CV workflow requires unused photos and lacks blank/unknown input states | Tasks65/118/131 + live skill contract | Confirmed current; format-aware input requirements needed |
 | H-075 | P1 | Internal connector session expires while worker caches it | Task139 + deployed API/worker parity | Fix committed locally (not deployed): active-run lease with per-call access checks |
-| H-076 | P1 | Shared-drive scope is lost during discovery and traversal | Task139 and related traces + deployed Google tools | Confirmed current scope limitation |
+| H-076 | P1 | Shared-drive scope is lost during discovery and traversal | Task139 and related traces + deployed Google tools | Fix committed locally (not deployed); live Google check pending |
 
 ## Details
 
@@ -2941,3 +2941,5 @@ SSM code-only verification at2026-10-14T08:15:37Z: deployed API connector SHA `a
 **Proposed fix/benefit/effort:** accept/pass/infer driveId from selected file/folder ancestry, retain it through listing/pagination/search, expose incompleteSearch, and perform a bounded permission-aware fallback after an empty search. About1–2 days. Benefit: fewer empty-search loops and false missing-file reports. Tradeoffs: discovery cost and incomplete visibility; no unbounded all-drive enumeration or access broadening.
 
 **Acceptance:** selected shared-drive file/folder is found via identical scoped query and children listing; next-page retains drive identity; incomplete search is explicit; revoked/unavailable scope stays restricted. Measure useful-file time and repeated searches. Private evidence: `group3-current-connector-module-proof.json`, `group3-current-connector-trace.md`.
+
+**Implementation (14 October):** child listing now infers and keeps the folder's shared-drive ID, and an empty unscoped search retries once across the user's drives; results report `searchScope` and `incompleteSearch`. Not deployed.

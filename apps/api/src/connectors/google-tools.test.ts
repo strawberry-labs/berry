@@ -238,3 +238,75 @@ describe("Google connector tool policy", () => {
     expect(emitted).toBe(11);
   });
 });
+
+describe("Google Drive shared-drive scope", () => {
+  const DRIVE_READ = "https://www.googleapis.com/auth/drive.readonly";
+  const file = (id: string) => ({ id, name: `${id}.pdf`, mimeType: "application/pdf", trashed: false, capabilities: { canAccessViaGenAi: true } });
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  const requested = (fetchMock: ReturnType<typeof vi.fn>) => fetchMock.mock.calls.map(([url]) => new URL(String(url)));
+  const run = (name: string, input: Record<string, unknown>) => executeGoogleTool("google-workspace", "read", name, "token", input, null, [DRIVE_READ]);
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("lists a shared-drive folder within that drive when the drive ID is not supplied", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(json({ id: "folder-1", driveId: "0AShared" }))
+      .mockResolvedValueOnce(json({ files: [file("spec")], nextPageToken: "page-2" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(run("drive_list_children", { folderId: "folder-1" })).resolves.toMatchObject({
+      files: [{ id: "spec" }], searchScope: "drive", driveId: "0AShared", nextPageToken: "page-2",
+    });
+    const [metadata, listing] = requested(fetchMock);
+    expect(metadata!.pathname).toContain("/files/folder-1");
+    expect(listing!.searchParams.get("corpora")).toBe("drive");
+    expect(listing!.searchParams.get("driveId")).toBe("0AShared");
+    expect(listing!.searchParams.get("q")).toBe("'folder-1' in parents and trashed = false");
+  });
+
+  it("keeps the supplied drive ID through pagination without another lookup", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(json({ files: [file("page-two")] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run("drive_list_children", { folderId: "folder-1", driveId: "0AShared", pageToken: "page-2" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [listing] = requested(fetchMock);
+    expect(listing!.searchParams.get("driveId")).toBe("0AShared");
+    expect(listing!.searchParams.get("pageToken")).toBe("page-2");
+  });
+
+  it("retries an empty unscoped search once across the user's shared drives", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(json({ files: [] }))
+      .mockResolvedValueOnce(json({ files: [file("tender")], incompleteSearch: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(run("drive_search_files", { query: "name contains 'Tender'" })).resolves.toMatchObject({
+      files: [{ id: "tender" }], searchScope: "allDrives", incompleteSearch: true,
+    });
+    expect(requested(fetchMock).map((url) => url.searchParams.get("corpora"))).toEqual(["user", "allDrives"]);
+  });
+
+  it.each([
+    ["a search that already found files", { query: "name contains 'Spec'" }, [file("spec")]],
+    ["a continuation page", { query: "name contains 'Spec'", pageToken: "next" }, []],
+  ])("does not widen %s", async (_label, input, files) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(json({ files }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(run("drive_search_files", input)).resolves.toMatchObject({ searchScope: "user" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("searches only the named shared drive when a drive ID is given", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(json({ files: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(run("drive_search_files", { query: "name contains 'Spec'", driveId: "0AShared" })).resolves.toMatchObject({ searchScope: "drive", files: [] });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(requested(fetchMock)[0]!.searchParams.get("corpora")).toBe("drive");
+  });
+});
