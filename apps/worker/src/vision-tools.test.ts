@@ -417,6 +417,57 @@ describe("DurableVisionToolExecutor", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  describe("retry after a failed inspection (task 843)", () => {
+    const ok = () => new Response(JSON.stringify({
+      id: "vision-response", model: "minimax-m3",
+      choices: [{ message: { content: "A head-and-shoulders portrait photograph." }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    const base: DurableTurnToolExecutor = {
+      modelContent: async () => [{ type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }],
+      execute: async () => { throw new Error("unexpected base execution"); },
+    };
+    const failed = (sequence: number, error: string) => ({ ...visionStep(), id: `vision-failed-${sequence}`, sequence, state: "failed" as const, error });
+
+    it("allows one identical retry after a transient provider error", async () => {
+      const fetchMock = vi.fn(async () => ok());
+      vi.stubGlobal("fetch", fetchMock);
+      const snapshot = visionSnapshot();
+      snapshot.steps = [failed(1, "Vision provider returned HTTP 500: upstream error")];
+
+      await expect(new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" })
+        .execute(snapshot, { ...visionStep(), sequence: 3 }))
+        .resolves.toMatchObject({ output: { vision: { cacheHit: false } } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("blocks after a second transient failure without calling the provider", async () => {
+      const fetchMock = vi.fn(async () => ok());
+      vi.stubGlobal("fetch", fetchMock);
+      const snapshot = visionSnapshot();
+      snapshot.steps = [failed(1, "Vision provider returned HTTP 500"), failed(3, "Vision provider returned HTTP 504")];
+
+      await expect(new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" })
+        .execute(snapshot, { ...visionStep(), sequence: 5 }))
+        .rejects.toThrow("no new image was exposed");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("lets a later successful inspection resolve an earlier failure", async () => {
+      const fetchMock = vi.fn(async () => ok());
+      vi.stubGlobal("fetch", fetchMock);
+      const snapshot = visionSnapshot();
+      snapshot.steps = [
+        failed(1, "Vision provider returned HTTP 400: invalid request"),
+        { ...visionStep(), id: "vision-ok", sequence: 3, state: "completed" as const, output: { vision: { observation: "ok" } } },
+      ];
+
+      await expect(new DurableVisionToolExecutor(base, new MemoryVisionCache(), { VISION_TEST_KEY: "secret" })
+        .execute(snapshot, { ...visionStep(), sequence: 5 })).resolves.toBeDefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("finds the latest matching failure even when another image selection failed afterward", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

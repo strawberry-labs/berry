@@ -54,7 +54,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `920a84c` | H-076 | None. |
 | `430d396` | H-070 | None. |
 | `b7b1e94` | H-053 | None. |
-| _pending_ | H-030 | None. |
+| `1df00a9` | H-030 | None. |
+| _pending_ | H-054 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -109,7 +110,8 @@ No pre-existing failures were observed in these suites.
 | H-076 (shared-drive scope) | Committed | `920a84c` | Not deployed (API) |
 | H-070 (bounded MCP results keep structure and cursors) | Committed — partial | `430d396` | Not deployed (worker) |
 | H-053 (repeat guard after source edits) | Committed | `b7b1e94` | Not deployed (worker) |
-| H-030 (bounded polling of running jobs) | Committed | _pending_ | Not deployed (worker) |
+| H-030 (bounded polling of running jobs) | Committed | `1df00a9` | Not deployed (worker) |
+| H-054 (vision retry by failure class) | Committed | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -956,3 +958,28 @@ No pre-existing failures were observed in these suites.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** No preserved job handle/recovery action when the budget ends polling;
   backoff is left to the model.
+- **Commit.** `1df00a9`.
+
+### H-054 — Vision retry guard ignores the cause of the previous failure
+
+- **Evidence.** Task 843: a provider HTTP 500 on a headshot inspection; the identical retry
+  was rejected locally in 0.01 s with no provider attempt, and the model then claimed a
+  real headshot from file metadata alone. Month: 9 guard events (four 500s, one 504, two
+  fetch errors, two 413s). The audit also found that a completed inspection did not clear
+  an older matching failure.
+- **Root cause (confirmed).** `latestUnresolvedVisionFailure` blocked any retry of the same
+  normalised selection after *any* failure, cleared only by a new image exposure.
+- **Fix.** Failures are classified: after a single transient failure (5xx, 408, 429,
+  timeouts, connection resets, fetch/network errors, overload, rate limit) one identical
+  retry is allowed; a second failure, or any deterministic failure (invalid input, other
+  4xx, exhausted empty observations), still blocks. A later successful inspection of the
+  same selection, or a newly exposed image, resolves earlier failures.
+- **Files.** `apps/worker/src/vision-tools.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 989 /
+  6 skipped. New cases: 500 → one retry reaches the provider; 500 + 504 → blocked without
+  a provider call; a completed inspection resolves an earlier 400. Existing guard tests
+  (empty observation blocks; latest matching failure) unchanged. Two of the new cases fail
+  on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Retry backoff/provider retry-after handling, and explicit 413/401/402
+  recovery guidance in the error text.

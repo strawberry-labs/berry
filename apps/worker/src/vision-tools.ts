@@ -466,28 +466,37 @@ function normalizeQuestion(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+// Provider/network failures that a single identical retry can clear (H-054).
+const TRANSIENT_VISION_FAILURE = /\b(?:HTTP\s*)?(?:5\d\d|408|429)\b|timed? ?out|timeout|fetch failed|ECONNRESET|ECONNREFUSED|socket hang up|network error|temporarily unavailable|overloaded|rate limit/i;
+
 function latestUnresolvedVisionFailure(snapshot: DurableTurnSnapshot, currentStep: DurableTurnStep): string | null {
   const beforeSequence = currentStep.sequence;
   const currentFingerprint = inspectImagesArgumentFingerprint(currentStep.input.arguments);
   if (!currentFingerprint) return null;
-  const failure = [...(snapshot.steps ?? [])].reverse().find((candidate) => {
+  const matching = (snapshot.steps ?? []).filter((candidate) => {
     const toolName = stringValue(candidate.input.toolName) ?? candidate.type.slice(5);
     return candidate.sequence < beforeSequence
-      && candidate.state === "failed"
       && toolName === "inspect_images"
-      && typeof candidate.error === "string"
-      && candidate.error.length > 0
       && inspectImagesArgumentFingerprint(candidate.input.arguments) === currentFingerprint;
-  });
-  if (!failure) return null;
-  const newImage = (snapshot.steps ?? []).some((candidate) => {
-    if (candidate.sequence <= failure.sequence || candidate.sequence >= beforeSequence || candidate.state !== "completed") {
-      return false;
-    }
+  }).sort((left, right) => left.sequence - right.sequence);
+  // A later successful inspection of the same selection resolves earlier failures.
+  const resolvedAt = Math.max(-1, ...matching.filter((candidate) => candidate.state === "completed").map((candidate) => candidate.sequence));
+  // So does exposing a new image after the failure.
+  const exposedAt = Math.max(-1, ...(snapshot.steps ?? []).filter((candidate) => {
+    if (candidate.sequence >= beforeSequence || candidate.state !== "completed") return false;
     const output = record(candidate.output);
     return typeof output?.visionPath === "string" && output.visionPath.length > 0;
-  });
-  return newImage ? null : failure.error!.slice(0, 1_000);
+  }).map((candidate) => candidate.sequence));
+  const unresolved = matching.filter((candidate) => candidate.state === "failed"
+    && typeof candidate.error === "string"
+    && candidate.error.length > 0
+    && candidate.sequence > resolvedAt
+    && candidate.sequence > exposedAt);
+  if (unresolved.length === 0) return null;
+  // One identical retry is allowed after a transient provider failure; a
+  // second failure, or any deterministic one, still blocks the loop.
+  if (unresolved.length === 1 && TRANSIENT_VISION_FAILURE.test(unresolved[0]!.error!)) return null;
+  return unresolved.at(-1)!.error!.slice(0, 1_000);
 }
 
 function requestedImagePaths(value: unknown): string[] | undefined {
