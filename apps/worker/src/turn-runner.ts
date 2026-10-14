@@ -5770,7 +5770,9 @@ export function modelMessages(
   // request, so the system message and all earlier turns stay byte-identical
   // across follow-ups (H-032). A user-role message is used because several
   // chat templates hoist every system message to the front of the prompt.
+  const dateContext = currentDateContext(snapshot);
   const turnContext = [
+    dateContext,
     builtInGuidance,
     intentInstruction,
     imageToolSelection,
@@ -5790,6 +5792,7 @@ export function modelMessages(
     // Without the request anchor (legacy or compacted history) keep the
     // original single-system-message layout unchanged.
     : [stableSystemPrompt, [
+        dateContext,
         builtInGuidance,
         intentInstruction,
         imageToolSelection,
@@ -5960,6 +5963,30 @@ function durableToolResultText(output: JsonValue): string {
     if (typeof text === "string") return text;
   }
   return JSON.stringify(output);
+}
+
+/**
+ * The date the model resolves "today" and "tomorrow" against. It is fixed to
+ * the run's start, so every model call in the turn renders the same turn
+ * context (H-032), and uses the request's time zone when one is valid (H-023).
+ */
+function currentDateContext(snapshot: DurableTurnSnapshot): string {
+  const startedAt = new Date(snapshot.createdAt);
+  if (Number.isNaN(startedAt.getTime())) return "";
+  let timeZone = "UTC";
+  const requested = stringValue(snapshot.runtimeRequest.timezone);
+  if (requested) {
+    try {
+      new Intl.DateTimeFormat("en-GB", { timeZone: requested });
+      timeZone = requested;
+    } catch {
+      // Not a valid IANA zone: keep UTC.
+    }
+  }
+  const formatted = new Intl.DateTimeFormat("en-GB", {
+    timeZone, weekday: "long", day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(startedAt);
+  return `Current date and time when this turn started: ${formatted} (${timeZone}). Resolve relative dates such as today, tomorrow or next Friday from this date and check weekdays against it. Dates in documents and earlier messages are their own dates, not today's.`;
 }
 
 function boundedToolResultContext(entryId: string, content: string, remainingBudget: number): string {

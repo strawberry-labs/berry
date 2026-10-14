@@ -72,7 +72,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f027f27` | H-016 | None. |
 | `6c46724` | H-050 | None. |
 | `8f966ed` | H-038 | None. |
-| _pending_ | H-008 | None. |
+| `6b635da` | H-008 | None. |
+| _pending_ | H-023 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -159,7 +160,8 @@ fixture; this is fixed in `54c9255`.
 | H-016 (earlier shell failures masked by a final success) | Committed — partial | `f027f27` | Not deployed (worker) |
 | H-050 (ready optional capability discarded at the admission deadline) | Committed — partial | `6c46724` | Not deployed (API) |
 | H-038 (streamed tool calls merged when indices restart) | Committed — worker path | `8f966ed` | Not deployed (worker) |
-| H-008 (workspace outputs/ and tmp/ guaranteed) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-008 (workspace outputs/ and tmp/ guaranteed) | Committed — partial | `6b635da` | Not deployed (worker) |
+| H-023 (current date given to the model) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1607,3 +1609,33 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** The issue's execution contract (verified interpreter, packages and skill
   paths; missing import versus unstaged module diagnostics).
+- **Commit.** `6b635da`.
+
+### H-023 — The model is never told the current date
+
+- **Evidence.** Task `f0fc3e37…` (7 September) called a 4 September deadline "tomorrow";
+  task `66f28986…` (8 September) produced a 5 September cover date for a presentation due
+  "tomorrow". Task 880 (6 October) treated an elapsed 30 September deadline as upcoming.
+- **Root cause (confirmed in code).** Neither the worker's prompt assembly nor the API's
+  grounding includes the current date, so relative dates were resolved against whatever
+  dates appeared in the conversation or documents.
+- **Fix.** The per-turn context (the H-032 message after the user's request) now begins
+  with the date and time the turn started, for example "Wednesday, 14 October 2026 at
+  21:30 (UTC)", and asks the model to resolve relative dates from it and check weekdays,
+  noting that dates in documents and earlier messages are their own. It is fixed to the
+  run's `createdAt`, so every model call in the turn renders the same text. The time zone
+  is UTC unless the request carries a valid IANA `timezone`; HEAD never sends one (a
+  `timezone` field exists only in uncommitted scheduling work), so today it is always UTC.
+- **Cache check.** The offline harness with a distinct start time per turn gives the
+  same Berry-side reuse as without dates (realistic scenario 90.8% overall, 94.8% for
+  later calls, 69.3% vs 69.4% for first calls of later turns). The system prompt carries
+  no date.
+- **Files.** `apps/worker/src/turn-runner.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 529 passed / 3
+  skipped. New case: the date line is present and identical across calls; Asia/Dubai
+  renders the next local day; an invalid zone falls back to UTC; the system message
+  has no date. It fails on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** The user's or organisation's time zone for normal chat turns (users
+  near midnight UTC see the UTC date); stale dates in a run resumed after a long wait;
+  deadline and weekday checks in answers remain behavioural.

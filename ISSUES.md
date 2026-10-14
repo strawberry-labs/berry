@@ -48,7 +48,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-020 | P1 | Unnecessary tools for text edits | Observed; cause verification noted below | Open |
 | H-021 | P1 | Long model retries strand work | Observed; cause verification noted below | Open |
 | H-022 | P1 | Corrections and constraints missed | Observed; cause verification noted below | Open |
-| H-023 | P1 | Current date and deadline anchoring | Observed; cause verification noted below | Open |
+| H-023 | P1 | Current date and deadline anchoring | Observed; cause verification noted below | Partly fixed locally (not deployed): the turn context now states the current date; user time zone open |
 | H-024 | P1 | Connector files unavailable to sandbox tools | Observed; cause verification noted below | Open |
 | H-025 | P1 | Technical claims persist without source verification | Observed; cause verification noted below | Open |
 | H-026 | P1 | Platform capability and privacy answers lack tenant facts | Observed unsupported claims | Verify configuration and prompt gap |
@@ -305,6 +305,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Observed: task `f0fc3e37-70b0-441b-b64c-6fb2786cea01` on September 7 described a September 4 deadline as tomorrow. Task `66f28986-22f1-44c8-b9eb-95ef1d24f0f6` on September 8 requested a presentation for tomorrow; final output reported a September 5 cover date.
 - Proposal: provide current date/time per resumed turn; distinguish source document dates, issue dates and user deadlines. Check relative dates against the current turn and flag inconsistent weekdays.
 - Verification needed: inspect rendered dates and prompt date injection on the deployed revision. Historical conversation discrepancies are confirmed; deployment cause is not.
+- **Implementation (14 October):** confirmed that no prompt carried the current date. The per-turn context now states the date and time the turn started (UTC unless a valid request time zone is supplied), stable across the turn's model calls so the cached prefix is unaffected. Not deployed.
 
 ### H-024 — Connector download to sandbox handoff
 

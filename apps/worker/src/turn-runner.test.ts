@@ -145,6 +145,21 @@ describe("durable turn runner", () => {
       { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" },
     ];
 
+    it("states the run's start date in the turn context and keeps it stable across calls (H-023)", () => {
+      const current = turn({}, ["read"], firstTurn);
+      current.createdAt = "2026-10-14T21:30:00.000Z";
+      const turnContext = () => String(modelMessages(current).messages.find((message) => String(message.content).startsWith("<berry_turn_context>"))?.content);
+      const first = turnContext();
+      expect(first).toContain("Current date and time when this turn started: Wednesday, 14 October 2026 at 21:30 (UTC)");
+      expect(turnContext()).toBe(first);
+      current.runtimeRequest = { ...current.runtimeRequest, timezone: "Asia/Dubai" };
+      expect(turnContext()).toContain("Thursday, 15 October 2026 at 01:30 (Asia/Dubai)");
+      current.runtimeRequest = { ...current.runtimeRequest, timezone: "Mars/Olympus" };
+      expect(turnContext()).toContain("at 21:30 (UTC)");
+      // The cached system prefix carries no date.
+      expect(String(modelMessages(current).messages[0]?.content)).not.toContain("Current date");
+    });
+
     it("keeps the system message and earlier turns identical when grounding and routed tools change", () => {
       const last = modelMessages(turn({ memory: "project uses NFPA 20" }, ["read"], firstAnswer)).messages;
       const next = modelMessages(turn({ memory: "pumps were replaced in 2025" }, ["read", "bash"], [
