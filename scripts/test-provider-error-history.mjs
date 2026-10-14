@@ -67,8 +67,12 @@ try {
     const history = modelMessages(snapshot).messages;
     const assistant = history.filter((message) => message.role === "assistant").map((message) => JSON.stringify(message.content)).join("\n");
     assert(!assistant.includes(visibleError), `assistant history must not contain the platform error: ${assistant}`);
-    assert.equal(history.at(-1).role, "user");
-    assert.match(JSON.stringify(history.at(-1).content), /registration fees/);
+    // The request may be followed only by Berry's per-turn context (H-032 layout).
+    const tail = history.at(-1);
+    const request = JSON.stringify(tail.content).includes("<berry_turn_context>") ? history.at(-2) : tail;
+    assert.equal(tail.role, "user");
+    assert.equal(request.role, "user");
+    assert.match(JSON.stringify(request.content), /registration fees/);
   });
 
   console.log(`${passed} PostgreSQL provider-error history scenarios passed`);
