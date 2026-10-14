@@ -352,6 +352,49 @@ describe("E2BSandboxProvider", () => {
     expect(client.connectCount).toBe(connectsBeforeRead + 1);
   });
 
+  it("reconnects a prior sandbox paused by another worker before streaming attachments", async () => {
+    const client = new FakeE2BClient();
+    const foreground = new E2BSandboxProvider({ apiKey: "e2b_test", client, requestTimeoutMs: 24_000 });
+    const background = new E2BSandboxProvider({ apiKey: "e2b_test", client });
+    const handle = await foreground.create({
+      request_id: "cross-worker-pause",
+      tenant_id: TENANT_ID,
+      image: "base",
+      ttl_seconds: 300,
+    });
+    const stored = client.sandboxes.get(handle.sandbox_id)!;
+    stored.sandbox.filesByPath.set("/workspace/keep.txt", { content: Buffer.from("retained"), modifiedTime: new Date() });
+    const write = stored.sandbox.files.write;
+    stored.sandbox.files.write = (async (...args: Parameters<typeof write>) => {
+      if (stored.info.state === "paused") {
+        throw new Error("The sandbox was not found: This error is likely due to sandbox timeout.");
+      }
+      return write(...args);
+    }) as typeof write;
+    await background.suspend({ sandbox_id: handle.sandbox_id, reason: "Previous turn cleanup" });
+    expect(stored.info.state).toBe("paused");
+    const controller = new AbortController();
+
+    await foreground.resume({
+      sandbox_id: handle.sandbox_id,
+      force_reconnect: true,
+      reason: "Follow-up turn claimed the prior sandbox",
+    }, { signal: controller.signal });
+    await expect(foreground.files.writeStream!({
+      sandbox_id: handle.sandbox_id,
+      path: "/workspace/input.txt",
+      content: new ReadableStream({ start(stream) { stream.enqueue(Buffer.from("input")); stream.close(); } }),
+      size_bytes: 5,
+    }, { signal: controller.signal })).resolves.toMatchObject({ size_bytes: 5 });
+
+    expect(client.connectCount).toBe(1);
+    expect(client.lastConnectOptions).toMatchObject({ timeoutMs: 300_000, requestTimeoutMs: 24_000, signal: controller.signal });
+    expect((await foreground.files.read({ sandbox_id: handle.sandbox_id, path: "/workspace/keep.txt" })).content).toBe("retained");
+    await foreground.resume({ sandbox_id: handle.sandbox_id, reason: "Same active turn" });
+    expect(client.connectCount).toBe(1);
+    expect(stored.sandbox.timeoutUpdates).toEqual([]);
+  });
+
   it("evicts a cached handle when E2B reports a sandbox timeout as a generic error", async () => {
     const client = new FakeE2BClient();
     const provider = new E2BSandboxProvider({ apiKey: "e2b_test", client });

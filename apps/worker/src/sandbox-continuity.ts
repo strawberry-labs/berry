@@ -1686,7 +1686,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             const resumeInput = {
               sandbox_id: snapshot.sandboxId!,
               reason: "Durable turn requested sandbox access",
-              ...(this.provider.kind === "e2b" ? { network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy) } : {}),
+              ...(this.provider.kind === "e2b" ? {
+                network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy),
+                ...(snapshot.sandboxState !== "running" ? { force_reconnect: true } : {}),
+              } : {}),
             } as const;
             const resumed = signal
               ? await this.provider.resume?.(resumeInput, { signal })
@@ -1748,7 +1751,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
             const resumeInput = {
               sandbox_id: continuity.sandboxId!,
               reason: "Follow-up turn requested the prior sandbox",
-              ...(this.provider.kind === "e2b" ? { network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy) } : {}),
+              // Terminal cleanup runs in another worker, so a cached SDK
+              // handle cannot prove the prior turn's sandbox is still active.
+              ...(this.provider.kind === "e2b" ? {
+                network_policy: networkPolicy(snapshot.runtimeRequest.networkPolicy),
+                force_reconnect: true,
+              } : {}),
             } as const;
             const resumed = signal
               ? await this.provider.resume?.(resumeInput, { signal })

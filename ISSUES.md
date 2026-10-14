@@ -34,7 +34,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-006 | P0 | MCP approval, network policy and authentication failures | Observed + code review | Current production resolution unverified |
 | H-007 | P1 | Skill entry points omit sibling dependencies | Monthly failures + activation/recovery traces + code | Confirmed current renderer staging defect |
 | H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Current directory guarantee gap; template contents require verification |
-| H-009 | P1 | Sandbox operation recovery and error classification | Observed missing-sandbox failures + code findings | Open; fault-injection tests needed |
+| H-009 | P1 | Sandbox operation recovery and error classification | Observed missing-sandbox failures + code findings | Reconnect-after-pause fix committed (not deployed); typed classification/fault injection open |
 | H-010 | P1 | Snapshot timeout does not cancel underlying work | Code finding | Open; production consequence unproven |
 | H-011 | P1 | Encoding, oversized inputs and malformed tool arguments | Observed | Open; classify and reproduce separately |
 | H-012 | P1 | Generated files and numerical content can be incorrect | Observed user reports | Open; reproduce against source artifacts |
@@ -178,6 +178,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Action: classify lifecycle failures, invalidate stale handles, reconnect/restore and restage required inputs; bounded retry only for safe operations. Test expiry during model waits and follow-ups.
 - Acceptance: injected disappearance and transient timeout yield different handling; no blind replay of uncertain shell/external operations.
 - **Monthly revalidation:** 48 plain-message sandbox-not-found runs and 15 bracketed unavailable runs, with overlap not yet unioned. Existing ensure/resume/restore paths are present. The diagnosed cached-handle-after-pause reconnect change from October 7 remains local, not deployed. Verify actual operations after reconnect and distinguish policy/auth/transient errors from true disappearance. Image-only attachment preparation currently stages a sandbox unnecessarily; speed benefit remains to be measured.
+
+- **Implementation (14 October):** the diagnosed cached-handle-after-pause reconnect fix is committed (force reconnect for follow-ups and inactive persisted state); new provider/attachment-staging regressions fail on the old sources and pass with the fix. Not deployed. Other missing-sandbox variants and typed lifecycle classification remain open. See IMPLEMENTATION_PROGRESS.md.
 
 ### H-010 — Snapshot timeout cancellation
 

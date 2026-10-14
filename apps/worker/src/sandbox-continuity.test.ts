@@ -2933,6 +2933,64 @@ describe("SandboxContinuityManager", () => {
     expect(writeStream).not.toHaveBeenCalled();
   });
 
+  it.each(["prior-turn", "paused-current-turn"])("reconnects a %s sandbox before staging model attachments", async (mode) => {
+    let paused = true;
+    const resume = vi.fn(async (input: { force_reconnect?: boolean }) => {
+      if (input.force_reconnect) paused = false;
+      return { sandbox_id: "sandbox-paused-remotely", provider: "e2b", status: "running" };
+    });
+    const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array> }) => {
+      if (paused) throw new Error("The sandbox was not found: This error is likely due to sandbox timeout.");
+      const bytes = await new Response(input.content).arrayBuffer();
+      return { path: input.path, size_bytes: bytes.byteLength, mtime: null };
+    });
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      resume,
+      files: { writeStream, read: vi.fn(), write: vi.fn(), list: vi.fn() },
+    } as unknown as SandboxProvider;
+    const file = {
+      fileId: "00000000-0000-7000-8000-000000000099",
+      name: "tracker.xlsx",
+      mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      sizeBytes: 4,
+      objectKey: "objects/tracker.xlsx",
+    };
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => ({ provider: "e2b", sandboxId: "sandbox-paused-remotely", snapshot: null })),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => [file]),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(),
+      get: vi.fn(),
+      getSource: vi.fn(async () => new Uint8Array([1, 2, 3, 4])),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+    const current = snapshot();
+    current.steps = [];
+    if (mode === "paused-current-turn") {
+      current.sandboxId = "sandbox-paused-remotely";
+      current.sandboxState = "paused";
+    }
+    const controller = new AbortController();
+
+    await expect(manager.modelContent(current, controller.signal)).resolves.toEqual([]);
+
+    expect(resume).toHaveBeenCalledWith(expect.objectContaining({
+      sandbox_id: "sandbox-paused-remotely",
+      force_reconnect: true,
+    }), { signal: controller.signal });
+    expect(writeStream).toHaveBeenCalledTimes(1);
+    expect(provider.create).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("applies policy before reusing a follow-up sandbox (update failure: %s)", async (updateFails) => {
     const provider = {
       kind: "e2b",
@@ -2988,6 +3046,7 @@ describe("SandboxContinuityManager", () => {
       sandbox_id: "sandbox-from-previous-turn",
       reason: "Follow-up turn requested the prior sandbox",
       network_policy: { egress: "off", allowedDomains: [] },
+      force_reconnect: true,
     });
     expect(repository.recordSandbox.mock.calls.map(([input]) => input.state)).toEqual([
       "resume_requested",

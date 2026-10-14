@@ -44,7 +44,8 @@ No pre-existing failures were observed in these suites.
 | ID | Status | Commit | Deployment |
 | --- | --- | --- | --- |
 | H-001 | Committed | `d7a806a` | Not deployed (API + worker + web must ship together) |
-| H-002 (prerequisite) | Committed — source of the already-deployed hotfix | _pending_ | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
+| H-009 (reconnect after cross-worker pause) | Committed — partial | _pending_ | Not deployed (worker + sandbox-contract) |
+| H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
 
@@ -133,3 +134,34 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** The H-002 meaning-drift findings (could→can, personal→company
   responsibility, requirement→compliance) are *not* addressed by this commit; see the
   H-002 entry once prompt evaluation work starts.
+- **Commit.** `d5b9138`.
+
+### H-009 — Sandbox recovery: reconnect a sandbox paused by another worker
+
+- **Evidence.** Diagnosed production incident (`output/sandbox-task-25207229-2026-10-07/diagnosis.json`,
+  task `25207229…`, run `c32778e8…`): worker-foreground-11 connected at 07:30:14,
+  worker-1 paused the sandbox at 07:30:18 during terminal cleanup, and the foreground
+  worker's attachment `file.writeStream` failed at 07:30:25 with "The sandbox was not
+  found" without reconnecting; zero model attempts were made and a later run reused the
+  same sandbox. The audit confirms the reconnect repair is absent from all six deployed
+  workers and that the month has 48 + 15 missing/unavailable sandbox variants (not
+  unioned; not all attributable to this cause).
+- **Root cause (confirmed for this variant).** `E2BSandboxProvider.resume` took a fast
+  path for a cached handle whose *local* lease had not expired, skipping `connect`, so
+  operations targeted compute another worker had paused.
+- **Decision.** Commit the prepared, previously validated fix unchanged: an optional
+  `force_reconnect` on the resume contract; follow-up turns always reconnect the prior
+  E2B sandbox, and a resumed run reconnects when its persisted state is not `running`.
+  Active phases keep cheap handle reuse; no replacement on generic errors.
+- **Files.** `packages/sandbox-contract/src/{schemas,e2b-provider}.ts` (+test),
+  `apps/worker/src/sandbox-continuity.ts` (two resume inputs only) + test,
+  `docs/durable-sandbox-lifecycle.md`.
+- **Verification (isolated snapshot).** sandbox-contract/worker/API typecheck pass;
+  `e2b-provider.test.ts` 25/25; `sandbox-continuity.test.ts` + `turn-runner.test.ts`
+  207/207. Regression proof: with the pre-fix provider and continuity sources the new
+  tests fail (1 provider test, 2 attachment-staging tests) and pass with the fix.
+- **Deployment.** Not deployed.
+- **Remaining (H-009 stays open).** Typed lifecycle classification for other
+  missing-sandbox variants (operation failure after handle acquisition, policy/auth vs
+  true disappearance) and fault-injection coverage across expiry during model wait.
+  Text-only finalisation that still requires a sandbox is tracked under H-013/task 176.

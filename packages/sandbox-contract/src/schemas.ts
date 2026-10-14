@@ -164,6 +164,9 @@ export type SandboxDestroyInput = z.input<typeof SandboxDestroyInputSchema>;
 
 export const SandboxResumeInputSchema = z.object({
   sandbox_id: IdSchema,
+  // A new lifecycle owner must reconnect: another worker may have paused
+  // the sandbox while this provider still holds a locally valid lease.
+  force_reconnect: z.boolean().optional(),
   network_policy: NetworkPolicySchema.optional(),
   reason: z.string().trim().min(1).optional(),
 }).passthrough();
