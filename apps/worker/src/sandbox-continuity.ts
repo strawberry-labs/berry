@@ -552,7 +552,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
-    const requestedSandboxImages = (explicitPaths ?? exposedSandboxImagePaths(snapshot, workspaceRoot))
+    const exposed = explicitPaths ? null : exposedSandboxImages(snapshot);
+    const requestedSandboxImages = (explicitPaths ?? exposed!.selected)
       .filter((path) => {
         const attachmentId = sandboxAttachmentId(path, workspaceRoot);
         return !attachmentId || !attachedImageIds.has(attachmentId);
@@ -564,7 +565,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           return file ? [file] : [];
         })
       : attachedImages;
-    if (requestedSandboxImages.length === 0 && selectedAttachments.length === 0) return [];
+    const withheld = exposed?.withheld ?? [];
+    if (requestedSandboxImages.length === 0 && selectedAttachments.length === 0 && withheld.length === 0) return [];
 
     const parts: ChatContentPart[] = [];
     let totalBase64Bytes = 0;
@@ -604,11 +606,18 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         const mediaType = binaryMediaType(path);
         if (!mediaType?.startsWith("image/")) throw new Error(`inspect_images only accepts image paths: ${path}`);
         const readInput = { sandbox_id: sandbox.id, path, encoding: "base64" } as const;
-        const source = await (signal
-          ? this.provider.files.read(readInput, { signal })
-          : this.provider.files.read(readInput));
-        reportProgress?.();
-        return { path, mediaType, bytes: Buffer.from(source.content, "base64") };
+        try {
+          const source = await (signal
+            ? this.provider.files.read(readInput, { signal })
+            : this.provider.files.read(readInput));
+          reportProgress?.();
+          return { path, mediaType, bytes: Buffer.from(source.content, "base64") };
+        } catch (error) {
+          // A file read earlier in the turn may since have been moved or
+          // deleted. That is a per-image gap, not a reason to fail the turn.
+          if (!isMissingSandboxPath(error)) throw error;
+          return { path, mediaType, bytes: null };
+        }
       }));
     };
     const loadAttachmentSources = async (files: readonly SandboxInputFile[]) => {
@@ -639,7 +648,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         loadSandboxSources(requestedSandboxImages),
         loadAttachmentSources(selectedAttachments),
       ]);
-      const loadedSources = [...sandboxSources, ...attachmentSources];
+      // An explicitly requested image that is missing stays a reported error.
+      const loadedSources = [
+        ...sandboxSources.flatMap((source) => source.bytes ? [{ ...source, bytes: source.bytes }] : []),
+        ...attachmentSources,
+      ];
       const sources = explicitPaths.flatMap((path) => {
         const source = loadedSources.find((candidate) => candidate.path === path);
         return source ? [source] : [];
@@ -653,8 +666,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return parts;
     }
 
+    for (const path of withheld) {
+      omit(path, `only the ${MAX_MODEL_IMAGES} most recently read images are sent per request; read this image again on its own or in a batch of at most ${MAX_MODEL_IMAGES} to inspect it`);
+    }
     const sandboxSources = await loadSandboxSources(requestedSandboxImages);
-    for (const source of sandboxSources) await append(source.path, source.bytes);
+    for (const source of sandboxSources) {
+      if (source.bytes) await append(source.path, source.bytes);
+      else omit(source.path, "the file no longer exists at this path (it was moved or deleted after it was read); read its current path if you still need it");
+    }
 
     // Choose attachments only after sandbox images are validated. This keeps
     // concurrent reads while allowing later valid files to backfill slots left
@@ -936,6 +955,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           summary: `Extracted text from ${path}`,
           sandbox,
         };
+      }
+      if (mediaType?.startsWith("image/")) {
+        // The receipt promises pixels on the next request; a typo or a file
+        // that does not exist must be a repairable read error instead.
+        const entry = await sandboxFileEntry(this.provider, sandbox.id, path, signal);
+        reportProgress?.();
+        if (!entry || entry.type !== "file") throw new Error(`File not found: ${path}. List its directory to find the correct path before reading again.`);
+        if (entry.size_bytes === 0) throw new Error(`Image file is empty: ${path}`);
       }
       if (mediaType) {
         return {
@@ -2054,17 +2081,56 @@ function requestedInspectionImagePaths(snapshot: DurableTurnSnapshot, workspaceR
   return [...new Set(paths)];
 }
 
-function exposedSandboxImagePaths(snapshot: DurableTurnSnapshot, workspaceRoot = "/workspace"): string[] {
+/** Find one sandbox file through its parent listing; null when absent. */
+async function sandboxFileEntry(
+  provider: SandboxProvider,
+  sandboxId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<{ type: string; size_bytes: number } | null> {
+  const normalized = path.replace(/\/+$/, "");
+  const parent = normalized.slice(0, normalized.lastIndexOf("/")) || "/";
+  const input = { sandbox_id: sandboxId, path: parent, recursive: false } as const;
+  try {
+    const listing = await (signal ? provider.files.list(input, { signal }) : provider.files.list(input));
+    return listing.entries.find((entry) => entry.path.replace(/\/+$/, "") === normalized) ?? null;
+  } catch (error) {
+    if (isMissingSandboxPath(error)) return null;
+    throw error;
+  }
+}
+
+/**
+ * Images read or generated in this run, newest last. `withheld` lists images
+ * read since the last model call that do not fit the per-request window; the
+ * model was promised their pixels, so they must be disclosed, not dropped.
+ */
+function exposedSandboxImages(snapshot: DurableTurnSnapshot): { selected: string[]; withheld: string[] } {
+  const lastModelCall = Math.max(-1, ...snapshot.steps
+    .filter((step) => step.type === "model.call" && step.state === "completed")
+    .map((step) => step.sequence));
+  const recent = new Set<string>();
   const paths = snapshot.steps.flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read" && toolName !== "create_image") return [];
     const output = objectValue(step.output);
     const path = stringValue(output.visionPath);
-    if (!path) return [];
-    return binaryMediaType(path)?.startsWith("image/") ? [path] : [];
+    if (!path || !binaryMediaType(path)?.startsWith("image/")) return [];
+    if (step.sequence > lastModelCall) recent.add(path);
+    return [path];
   });
-  return [...new Set(paths)].slice(-MAX_MODEL_IMAGES);
+  // Rank by most recent read: re-reading an older image must make it eligible
+  // for the next request rather than keeping its first-read position.
+  const latest = new Set<string>();
+  for (const path of paths) {
+    latest.delete(path);
+    latest.add(path);
+  }
+  const ordered = [...latest];
+  const selected = ordered.slice(-MAX_MODEL_IMAGES);
+  const withheld = ordered.slice(0, -MAX_MODEL_IMAGES).filter((path) => recent.has(path));
+  return { selected, withheld };
 }
 
 function sandboxAttachmentId(path: string, workspaceRoot = "/workspace"): string | null {

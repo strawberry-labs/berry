@@ -1937,7 +1937,10 @@ describe("SandboxContinuityManager", () => {
     const manager = managerWithProvider({
       read,
       write: vi.fn(),
-      list: vi.fn(),
+      list: vi.fn(async () => ({
+        path: "/workspace/tmp/rendered",
+        entries: [{ path: "/workspace/tmp/rendered/page-1.png", type: "file", size_bytes: 68, mtime: null }],
+      })),
     });
 
     await expect(manager.execute(snapshot(), toolStep("read", {
@@ -1951,6 +1954,99 @@ describe("SandboxContinuityManager", () => {
       },
     });
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("rejects reading an image path that does not exist instead of promising its pixels", async () => {
+    const list = vi.fn(async () => ({ path: "/workspace/outputs", entries: [{ path: "/workspace/outputs/contact-sheet.png", type: "file", size_bytes: 10, mtime: null }] }));
+    const manager = managerWithProvider({ read: vi.fn(), write: vi.fn(), list });
+
+    await expect(manager.execute(snapshot(), toolStep("read", { path: "/workspace/outputs/contact_sheet.png" })))
+      .rejects.toThrow("File not found: /workspace/outputs/contact_sheet.png");
+    expect(list).toHaveBeenCalledWith(expect.objectContaining({ path: "/workspace/outputs", recursive: false }));
+  });
+
+  describe("images read earlier in the turn", () => {
+    const completedRead = (path: string, sequence: number): DurableTurnStep => ({
+      ...toolStep("read", { path }),
+      id: `00000000-0000-7000-8000-${String(100 + sequence).padStart(12, "0")}`,
+      sequence,
+      state: "completed",
+      output: { path, binary: true, mediaType: "image/png", visionPath: path },
+    });
+    const managerFor = async (missing: ReadonlySet<string>) => {
+      const png = await testPng(7);
+      const read = vi.fn(async (input: { path: string }) => {
+        if (missing.has(input.path)) {
+          throw Object.assign(new Error(`path not found: ${input.path}`), { name: "FileNotFoundError" });
+        }
+        return { path: input.path, content: png.toString("base64"), size_bytes: png.byteLength, mtime: null };
+      });
+      const provider = {
+        kind: "e2b",
+        create: vi.fn(),
+        resume: vi.fn(async () => ({ sandbox_id: "sandbox-images", provider: "e2b", status: "running" })),
+        files: { read, write: vi.fn(), list: vi.fn() },
+      } as unknown as SandboxProvider;
+      const repository = {
+        loadRun: vi.fn(), continuity: vi.fn(), latest: vi.fn(), inputFiles: vi.fn(async () => []),
+        persistOutput: vi.fn(), persist: vi.fn(), recordSandbox: vi.fn(),
+      } satisfies SandboxSnapshotRepository;
+      return { manager: new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox" }), read };
+    };
+    const current = (steps: DurableTurnStep[]) => {
+      const value = snapshot();
+      value.sandboxId = "sandbox-images";
+      value.sandboxProvider = "e2b";
+      value.sandboxState = "running";
+      value.steps = steps;
+      return value;
+    };
+
+    it("turns a moved or deleted earlier image into a notice instead of failing model preparation", async () => {
+      const { manager } = await managerFor(new Set(["/workspace/tmp/contact-sheet.png"]));
+      const content = await manager.modelContent(current([
+        completedRead("/workspace/tmp/contact-sheet.png", 1),
+        completedRead("/workspace/outputs/final.png", 2),
+      ]));
+
+      expect(content[0]).toEqual({ type: "text", text: expect.stringContaining("no longer exists at this path") });
+      expect(content[0]).toEqual({ type: "text", text: expect.stringContaining("/workspace/tmp/contact-sheet.png") });
+      expect(content.filter((part) => part.type === "image_url")).toHaveLength(1);
+      expect(content).toContainEqual({ type: "text", text: 'Workspace image 1: "/workspace/outputs/final.png"' });
+    });
+
+    it("makes a re-read older image eligible for the next request", async () => {
+      const { manager, read } = await managerFor(new Set());
+      const paths = [1, 2, 3, 4, 5, 6].map((index) => `/workspace/photos/candidate-${index}.png`);
+      await manager.modelContent(current([
+        ...paths.map((path, index) => completedRead(path, index + 1)),
+        completedRead(paths[0]!, 7),
+      ]));
+
+      expect(read.mock.calls.map(([input]) => input.path)).toEqual([...paths.slice(2), paths[0]]);
+    });
+
+    it("discloses images from the latest batch that do not fit the five-image window", async () => {
+      const { manager, read } = await managerFor(new Set());
+      const delivered = completedRead("/workspace/pages/cover.png", 1);
+      const modelCall = { ...toolStep("unused", {}), id: "00000000-0000-7000-8000-000000000150", sequence: 2, type: "model.call", state: "completed" } as DurableTurnStep;
+      const batch = [1, 2, 3, 4, 5, 6, 7].map((page) => completedRead(`/workspace/pages/page-${page}.png`, page + 2));
+      const content = await manager.modelContent(current([delivered, modelCall, ...batch]));
+
+      expect(read.mock.calls.map(([input]) => input.path)).toEqual([3, 4, 5, 6, 7].map((page) => `/workspace/pages/page-${page}.png`));
+      const notices = content.flatMap((part) => part.type === "text" && part.text.startsWith("[Image not sent:") ? [part.text] : []);
+      expect(notices).toHaveLength(2);
+      expect(notices[0]).toContain("/workspace/pages/page-1.png");
+      expect(notices[1]).toContain("/workspace/pages/page-2.png");
+      expect(notices.join("\n")).not.toContain("cover.png");
+    });
+
+    it("still reports an explicitly requested missing image as an inspection error", async () => {
+      const { manager } = await managerFor(new Set(["/workspace/tmp/missing.png"]));
+      await expect(manager.modelContent(current([
+        { ...toolStep("inspect_images", { mode: "focused", paths: ["/workspace/tmp/missing.png"], question: "What is shown?" }), state: "running" },
+      ]))).rejects.toThrow("inspect_images could not load the exact requested image path: /workspace/tmp/missing.png");
+    });
   });
 
   it("supplies task attachments and requested sandbox images as model vision content", async () => {

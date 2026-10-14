@@ -43,7 +43,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `d481431` | H-014 | None. |
 | `39d02c8` | H-011 | None (worker dependency only). |
 | `e6b2fa8` | H-051/H-072 | None. New JSON keys in `turn_runs.runtime_request` for new continuation runs only. |
-| _pending_ | H-014 (Continue intent) | None (prompt assembly only). |
+| `eda27eb` | H-014 (Continue intent) | None (prompt assembly only). |
+| _pending_ | H-046/H-060/H-071 | None. |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
@@ -73,7 +74,8 @@ No pre-existing failures were observed in these suites.
 | H-051 / H-072 (Continue workspace lineage) | Committed | `e6b2fa8` | Not deployed (API + worker; either order is compatible) |
 | H-066 (recovery budget generation) | Committed | `2a7af6b` | Not deployed (API + worker together; see entry) |
 | H-048 (provider errors in history) | Committed | `49815ef` | Not deployed (API + worker; either order safe) |
-| H-014 (phase-aware Continue) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-014 (phase-aware Continue) | Committed — partial | `eda27eb` | Not deployed (worker) |
+| H-046 / H-060 / H-071 (image path lifetime and selection) | Committed | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -424,3 +426,49 @@ No pre-existing failures were observed in these suites.
 - **Remaining (H-014 stays open).** Live model evaluation of the Continue wording;
   operation-specific recovery UX; distinguishing completed vs unknown external outcomes
   in the Continue instruction (recovery-required runs use operator recovery instead).
+- **Commit.** `eda27eb`.
+
+### H-046 / H-060 / H-071 — Historical image paths, re-read recency and silent omission
+
+- **Evidence.** H-046: tasks 1103 (temp image deleted), 774 (moved to `tmp`) and 956
+  (first generation removed) each fail at the *next* model preparation in 0.2–0.8 s
+  although the replacement work was already delivered; 26 monthly runs / 21 tasks match a
+  missing path to a completed same-run read or generation. Tasks 100/103/114: nonexistent
+  or mistyped image paths reported as successful reads. H-060: task 219 and 658 re-read
+  older images that stay excluded, forcing filename copies. H-071: task 1217 reads 7–8
+  images per batch; the first ones are silently dropped although each receipt promised
+  attachment (13 over-five exposures / 9 tasks in the month).
+- **Root causes (code-confirmed, worker `sandbox-continuity.ts`).**
+  1. The `read` image branch returned success from the file extension alone.
+  2. `exposedSandboxImagePaths` kept every completed read/generation path and
+     deduplicated with `new Set`, i.e. by *first* occurrence, then kept the last five —
+     a re-read never renewed recency and a large batch silently lost its first images.
+  3. `modelContent` loaded those historical paths with an uncaught `Promise.all`; one
+     moved or deleted file rejected the whole model preparation and failed the run.
+- **Fix.**
+  1. Image reads confirm the file exists and is non-empty via a parent-directory listing
+     (no byte transfer) and otherwise fail with a repairable "File not found: … list its
+     directory" error.
+  2. Selection ranks by most recent read; images read since the last completed model call
+     that do not fit the five-image window are reported as `[Image not sent: …; read this
+     image again on its own or in a batch of at most 5]`. Older, already-delivered images
+     rotate out silently as before (no notice noise).
+  3. A historical image that no longer exists becomes `[Image not sent: …; the file no
+     longer exists at this path…]` instead of an exception; other images still load.
+     Explicit `inspect_images` requests for a missing path still fail with "could not load
+     the exact requested image path" (never a silent visual check). Non-missing provider
+     errors still propagate.
+- **Not done (deliberately).** Persisting immutable image bytes at read time (the audit's
+  fuller proposal) would add storage, retention and ACL design; the omission notice meets
+  the acceptance criterion ("preserves acquired content *or* clearly reports omission
+  without a terminal crash").
+- **Files.** `apps/worker/src/sandbox-continuity.ts`, `apps/worker/src/sandbox-continuity.test.ts`
+  (existing binary-read fixture now returns a directory listing; its assertion that image
+  bytes never go through the UTF-8 reader is unchanged).
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 922
+  passed / 6 skipped (baseline 908). The five new tests (missing path read, moved/deleted
+  earlier image, re-read recency, 7-image batch disclosure, explicit missing inspection)
+  all fail against the previous source.
+- **Deployment.** Not deployed (worker only).
+- **Remaining.** Same-path overwrite/version binding (H-046 task 956 note) and splitting
+  oversized batches into multiple inspection groups automatically.
