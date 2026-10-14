@@ -2957,6 +2957,27 @@ describe("durable turn runner", () => {
     expect(JSON.stringify(current.entries)).not.toContain("base64");
   });
 
+  it("records the router-attributed serving backend on the usage event", async () => {
+    const model = new RouterDurableTurnModel({
+      stream: async function* (): AsyncGenerator<ChatCompletionChunk> {
+        yield {
+          id: "served", model: "deepseek-v4-flash", delta: "ok", finishReason: "stop", raw: {},
+          attribution: { requestedModel: "deepseek-v4-flash", servedProvider: "canopywave", servedModel: "deepseek/deepseek-v4-flash" },
+          usage: { inputTokens: 100, outputTokens: 2, totalTokens: 102, cacheReadTokens: 64, cacheReadReported: true },
+        };
+      },
+    }, "deepseek-v4-flash", {
+      provider: "router", route: "/chat/completions",
+      capabilityForModel: () => ({ supported: false, cacheKey: false, cacheControl: false, retention: [], minimumTokens: 1024 }),
+    });
+    const result = await model.call(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]), modelStep("pending", 1), {
+      messageId: randomUUID(), tools: [], emitDelta: async () => {},
+      policyForTool: () => ({ retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "file-edit" }),
+    });
+
+    expect(result.usage).toMatchObject({ servedProvider: "canopywave", servedModel: "deepseek/deepseek-v4-flash", cacheReadTokens: 64, cacheEligible: false });
+  });
+
   it("appends text-only tool context without changing the original user prefix", () => {
     const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
     current.entries.push({ entryId: "image-read", parentEntryId: current.entries[0]!.entryId, entryType: "message", sequence: 2,

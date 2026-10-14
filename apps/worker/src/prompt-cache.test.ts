@@ -31,6 +31,17 @@ describe("durable prompt cache planning", () => {
     expect(plan.missReason).toBe("first_request");
   });
 
+  it("judges long-retention expiry against the 24h retention actually requested", () => {
+    const first = planned();
+    const now = Date.parse("2026-10-14T12:00:00.000Z");
+    const twoHoursLater = planned({ previousManifest: first.manifest, previousObservedAt: "2026-10-14T10:00:00.000Z", now });
+    const nextDay = planned({ previousManifest: first.manifest, previousObservedAt: "2026-10-13T11:00:00.000Z", now });
+
+    expect(twoHoursLater.retention).toBe("long");
+    expect(twoHoursLater.missReason).toBe("unknown");
+    expect(nextDay.missReason).toBe("cache_expired");
+  });
+
   it("classifies a route change without hashing dynamic context", () => {
     const first = planned();
     const second = planned({

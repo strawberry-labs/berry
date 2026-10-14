@@ -267,7 +267,8 @@ function estimateTokens(value: string): number {
 }
 
 function retentionMillis(retention: "none" | "short" | "long"): number {
-  if (retention === "long") return 60 * 60 * 1_000;
+  // Matches the wire request: long retention is sent as prompt_cache_retention=24h.
+  if (retention === "long") return 24 * 60 * 60 * 1_000;
   if (retention === "short") return 5 * 60 * 1_000;
   return 0;
 }

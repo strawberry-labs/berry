@@ -48,7 +48,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `91208bc` | H-009 (text-only finalisation) | None. |
 | `d95b252` | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
 | `52c0260` | H-033 | None. |
-| _pending_ | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
+| _pending_ | H-032 (diagnostics) | None. |
+| `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
@@ -91,7 +92,8 @@ No pre-existing failures were observed in these suites.
 | H-075 (internal connector session lifetime) | Committed | `d95b252` | Not deployed (API only) |
 | H-031 (blob-deletion receipt SQL) | Committed | `f30b651` | Not deployed (worker); backlog reconciliation not started |
 | H-033 (revision provenance) | Committed — partial | `52c0260` | Not deployed (shared package; API + worker rebuild) |
-| H-032 (cache metric truth) | Committed — partial | _pending_ | Not deployed (worker + API + web) |
+| H-032 (cache metric truth) | Committed — partial | `29dd951` | Not deployed (worker + API + web) |
+| H-032 (served backend + retention diagnostics) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -621,3 +623,28 @@ No pre-existing failures were observed in these suites.
   the 4 pre-existing `usage.controller.test.ts` failures listed in the baseline section.
 - **Deployment.** Not deployed.
 - **Remaining.** See H-032 part 2 (prompt-prefix stability) below.
+- **Commit.** `29dd951`.
+
+### H-032 (part 2) — Diagnostics needed to split cache misses by route
+
+- **Findings (code-confirmed).**
+  1. `RouterDurableTurnModel` ignored `chunk.attribution`, so usage events never carried
+     the router-attributed serving provider (and only the response `model` for the
+     served model). The audit's unresolved split (394 severe drops with unchanged
+     tracked prefixes) needs exactly this to compare backends/affinity.
+  2. The miss classifier judged `long` retention against 1 hour while the wire request
+     asks for `prompt_cache_retention=24h`, so 1–24 h gaps were mislabelled
+     `cache_expired`.
+  3. Already correct, no change: the router client keeps a measured cache-read count when
+     a later stream chunk omits it (in `99964f1`); tool definitions are sorted
+     canonically; per-message request-prefix hashes are recorded.
+- **Fix.** Record `servedProvider` and the attributed `servedModel` from router
+  attribution when present; long retention uses 24 h.
+- **Files.** `apps/worker/src/turn-runner.ts` (attribution hunks only), `apps/worker/src/prompt-cache.ts`, and tests.
+- **Verification (isolated snapshot).** Worker typecheck pass; prompt-cache + turn-runner
+  130/130 (new: 2 h after a long-retention call is `unknown`, 25 h is `cache_expired`;
+  attribution reaches the usage event).
+- **Deployment.** Not deployed (worker).
+- **Out of scope here.** The hosted Berry Router (separate product/repository) and the
+  upstream provider's cache routing/affinity cannot be changed or verified from this
+  repository; served-route header names emitted by the hosted Router remain unverified.

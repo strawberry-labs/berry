@@ -3917,6 +3917,9 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       cacheCreationTokens5m?: number;
     } | undefined;
     let servedModel = model;
+    // Router attribution is the only record of which backend served a call;
+    // cache misses cannot be split by route/affinity without it (H-032).
+    let servedProvider: string | undefined;
     let finishReason: string | null = null;
     let providerResponseId: string | undefined;
     let routerRequestId: string | undefined;
@@ -3961,7 +3964,8 @@ export class RouterDurableTurnModel implements DurableTurnModel {
       ...(cachePlan.retention !== "none" ? { promptCacheRetention: cachePlan.retention } : {}),
     })) {
       context.reportProgress?.();
-      servedModel = chunk.model || servedModel;
+      servedModel = chunk.attribution?.servedModel || chunk.model || servedModel;
+      if (chunk.attribution?.servedProvider) servedProvider = chunk.attribution.servedProvider;
       if (chunk.id) providerResponseId = chunk.id;
       if (chunk.requestId) routerRequestId = chunk.requestId;
       if (chunk.finishReason) finishReason = chunk.finishReason;
@@ -4056,6 +4060,7 @@ export class RouterDurableTurnModel implements DurableTurnModel {
           ...(providerResponseId ? { providerResponseId } : {}),
           model: servedModel,
           servedModel,
+          ...(servedProvider ? { servedProvider } : {}),
         }) as Extract<AgentStreamEvent, { kind: "usage" }>
       : undefined;
     return {
