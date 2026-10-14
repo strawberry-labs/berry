@@ -924,6 +924,15 @@ export class FilePlatformService {
         `, [fileId, tenantId, userId, blobId, name, input.contentType || "application/octet-stream", stored.size, stored.sha256, config.bucket, objectKey, stored.etag, stored.versionId, shouldIndex ? "processing" : "available", JSON.stringify(metadata)]);
         if (!created) throw new Error("Unable to register the Drive artifact");
         if (input.saveToLibrary) await reviveLibraryEntry(executor, tenantId, userId, fileId);
+        else {
+          // The legacy files_library_after_insert_compat trigger adds every new
+          // owned file to the Library. A temporary task import must not appear
+          // there; this removes only the row created for this new file (H-069).
+          await executor.execute(
+            "DELETE FROM file_library_entries WHERE tenant_id=$1::uuid AND user_id=$2::uuid AND file_id=$3::uuid",
+            [tenantId, userId, fileId],
+          );
+        }
         await associate(executor, { tenantId, fileId, taskId: input.taskId, sessionId: input.sessionId, role: "input", userId });
         if (input.saveToLibrary) {
           await linkWorkspaceFile(executor, { tenantId, workspaceId: task.workspace_id, fileId, taskId: input.taskId, userId });

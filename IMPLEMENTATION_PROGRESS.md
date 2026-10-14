@@ -50,7 +50,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `52c0260` | H-033 | None. |
 | `3a27931` | H-032 (diagnostics) | None. |
 | `9eecde6` | H-032 (prompt layout) | None (prompt assembly only). |
-| _pending_ | H-068 | None. |
+| `f2923b2` | H-068 | None. |
+| _pending_ | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
@@ -99,7 +100,8 @@ No pre-existing failures were observed in these suites.
 | H-032 (served backend + retention diagnostics) | Committed — partial | `3a27931` | Not deployed (worker) |
 | H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | `9eecde6` | Not deployed (worker) |
 | H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | `f6f9074` | Not deployed (worker) |
-| H-068 (import readiness) | Committed | _pending_ | Not deployed (worker) |
+| H-068 (import readiness) | Committed | `f2923b2` | Not deployed (worker) |
+| H-069 (temporary imports kept out of Library) | Committed | _pending_ | Not deployed (API) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -806,3 +808,36 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** The audit's counterexample (missing path with an already-verified blob)
   and the API-side typed pending state are not addressed; H-069 (Library persistence)
   is separate.
+- **Commit.** `f2923b2`.
+
+### H-069 — Temporary connector imports silently added to Library
+
+- **Evidence.** 261 of 270 first Drive-import receipts said `library=false`, yet every one of
+  those files had an active Library entry created at file-insert time (54 tasks / 17 users;
+  1.5 GB logical size, not proven safe to delete). Task 1191's repeat import then reported
+  `library=true`, revealing the existing entry.
+- **Reproduced locally.** Real PostgreSQL with the production migrations: a temporary
+  import through `FilePlatformService.importConnectorArtifact` leaves one Library row
+  (`scripts/test-connector-import-library.mjs` fails with actual 1, expected 0 on the old
+  code). The existing unit test could not see this because the row comes from a trigger.
+- **Root cause (confirmed).** Migration 44's `files_library_after_insert_compat` trigger
+  inserts a Library entry for every new owned file regardless of origin; the API's
+  connector path correctly only calls `reviveLibraryEntry` for `saveToLibrary=true`, but
+  the trigger overrides that choice.
+- **Decision.** The audit suggests narrowing the trigger through a reviewed migration. I
+  chose the smaller change with no DDL: in the same transaction that creates a *new*
+  temporary connector import, delete the Library row the trigger just created for that
+  file (no FKs or triggers depend on Library rows; nothing else is touched). Explicit
+  saves still upsert their entry. This avoids a migration that would also collide with
+  the uncommitted migrations 71–73 in this checkout. Narrowing the trigger remains the
+  cleaner long-term option.
+- **Files.** `apps/api/src/files/file-platform.service.ts` (one hunk), its unit test (one
+  hunk), `scripts/test-connector-import-library.mjs`.
+- **Verification (isolated snapshot).** API typecheck pass; files suites 59/59; PostgreSQL
+  3/3 (temporary import has no Library row and is still a task input, repeat import stays
+  temporary; explicit save adds exactly one entry; saving a previously temporary import
+  adds it). Old code fails the first scenario.
+- **Deployment.** Not deployed (API).
+- **Not done (needs its own reviewed plan).** Historical temporary imports already in
+  users' Libraries are not removed; later deliberate saves cannot be distinguished
+  safely from current membership alone.

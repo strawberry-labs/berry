@@ -971,6 +971,9 @@ describe("FilePlatformService.importConnectorArtifact", () => {
 
     expect(executions.some(({ sql }) => sql.includes("INSERT INTO file_associations"))).toBe(true);
     expect(executions.some(({ sql }) => sql.includes("INSERT INTO file_library_entries"))).toBe(false);
+    // Undo the legacy insert trigger's Library row for this new temporary file.
+    expect(executions.find(({ sql }) => sql.startsWith("DELETE FROM file_library_entries"))?.params)
+      .toEqual([TENANT_ID, USER_ID, expect.stringMatching(/^[0-9a-f-]{36}$/)]);
     expect(executions.some(({ sql }) => sql.includes("INSERT INTO workspace_files"))).toBe(false);
     expect(executions.some(({ sql }) => sql.includes("'knowledge.extract'"))).toBe(false);
   });
