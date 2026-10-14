@@ -2307,6 +2307,53 @@ describe("durable turn runner", () => {
       .toMatchObject({ state: "failed", error: "duplicate_tool_call_loop" });
   });
 
+  describe("asynchronous job polling (task 917)", () => {
+    const poll = (sequence: number): DurableTurnStep => ({
+      ...toolStep("pending", "read_only", false),
+      sequence,
+      type: "tool.mcp__BerryCrawl__get_extract_status",
+      input: {
+        toolCallId: randomUUID(),
+        toolName: "mcp__BerryCrawl__get_extract_status",
+        arguments: { id: "extract-job-1" },
+        requiresApproval: false,
+        approvalKind: "mcp",
+        repeatPolicy: "compare_result",
+      },
+    });
+    const runPolls = async (results: string[], maxPolls: number) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), poll(1)]));
+      let executions = 0;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async () => {
+          const status = results[Math.min(executions, results.length - 1)]!;
+          executions += 1;
+          return { output: { content: JSON.stringify({ success: true, status, data: status === "COMPLETED" ? { title: "Spec" } : null }) }, summary: "Job status" };
+        },
+      });
+      let result = await runner.execute({ tenantId, runId, reason: "continue" });
+      // Tool steps are spaced by the model-call step the runner adds after each.
+      for (let polls = 2; polls <= maxPolls && result.state !== "failed"; polls += 1) {
+        queueToolForExecution(repository, poll(polls * 2 - 1));
+        result = await runner.execute({ tenantId, runId, reason: "continue" });
+      }
+      return { repository, executions, result };
+    };
+
+    it("keeps polling a job that reports RUNNING until it completes", async () => {
+      const { repository, executions } = await runPolls(["RUNNING", "RUNNING", "RUNNING", "COMPLETED"], 4);
+      expect(executions).toBe(4);
+      expect(repository.current.error).toBeNull();
+      expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_suppressed")).toBe(false);
+    });
+
+    it("still stops a job that never leaves RUNNING on the no-progress budget", async () => {
+      const { repository, executions } = await runPolls(["RUNNING"], 12);
+      expect(repository.current.error).toBe("no_progress_budget");
+      expect(executions).toBeLessThanOrEqual(6);
+    });
+  });
+
   describe("repeat guard after file edits (task 718)", () => {
     const render = (sequence: number) => runCommandStep("pending", sequence, "cd /workspace/tmp && python diagram.py");
     const edit = (sequence: number, path: string): DurableTurnStep => ({

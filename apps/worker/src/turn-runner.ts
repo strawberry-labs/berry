@@ -4892,10 +4892,16 @@ function assessRepeatedToolCall(
       consecutiveSameResultCount += 1;
     }
   }
+  // Re-reading an asynchronous job that still reports a non-terminal state is
+  // polling, not a loop. The no-progress budget still bounds it (H-030).
+  const polling = policy === "compare_result" && completed.length > 0
+    && reportsPendingJobState(completed.at(-1)!.output);
   const decision = suppressions.length > 0
     ? "terminate"
     : policy === "block_after_success" && completed.length > 0
       ? "suppress"
+      : polling
+        ? "allow"
       : policy === "compare_result" && consecutiveSameResultCount >= 2
         ? "suppress"
         : policy === "compare_result" && consecutiveSameResultCount === 1
@@ -4909,6 +4915,16 @@ function assessRepeatedToolCall(
     priorSuppressionCount: suppressions.length,
     decision,
   };
+}
+
+// Matches `status: running`, `"state":"PENDING"` and the escaped form inside
+// a JSON string field (`\"status\":\"RUNNING\"`).
+const PENDING_JOB_STATE = /\b(?:status|state|job_?status)\\?["']?\s*[:=]\s*\\?["']?(?:running|pending|queued|processing|in[_ -]?progress|started|scraping|waiting)\b/i;
+
+function reportsPendingJobState(output: unknown): boolean {
+  if (output === null || output === undefined) return false;
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  return PENDING_JOB_STATE.test(text.slice(0, 20_000));
 }
 
 /** Sequence of the latest completed write/edit of a file this call's arguments name, or -1. */
