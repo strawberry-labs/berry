@@ -2832,6 +2832,64 @@ describe("durable turn runner", () => {
     expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
   });
 
+  describe("malformed question batches (H-057)", () => {
+    const askStep = (argumentsValue: Record<string, unknown>) => ({
+      ...toolStep("pending", "read_only", false),
+      type: "tool.ask_user_question",
+      input: {
+        toolCallId: "question_call_h057",
+        toolName: "ask_user_question",
+        arguments: argumentsValue,
+        requiresApproval: false,
+        approvalKind: "file-edit",
+      },
+    }) satisfies DurableTurnStep;
+    const run = async (argumentsValue: Record<string, unknown>) => {
+      const repository = new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), askStep(argumentsValue)]));
+      const runner = new DurableTurnRunner(repository, unusedModel(), noTools(), { owner: "worker-question-h057" });
+      const result = await runner.execute({ tenantId, runId, reason: "continue" });
+      return { repository, result };
+    };
+
+    it("returns a repair error instead of a reduced question for task 1105's label-only batch", async () => {
+      const { repository, result } = await run({
+        question: "Tell me about the event",
+        questions: [
+          { label: "Which slide format?", options: [{ label: "Single slide" }, { label: "Poster" }] },
+          { label: "Which style?", options: [{ label: "Spooky" }, { label: "Playful" }] },
+          { label: "Which event details?", options: [{ label: "Costume competition" }] },
+        ],
+      });
+      expect(result.state).not.toBe("waiting");
+      expect(repository.events.some((event) => event.kind === "question.request")).toBe(false);
+      const failed = repository.current.steps.find((step) => step.type === "tool.ask_user_question");
+      expect(failed?.state).toBe("failed");
+      expect(failed?.error).toContain('questions[0] needs a non-empty "question" string (received: label, options)');
+    });
+
+    it("rejects a batch with one invalid entry rather than dropping it", async () => {
+      const { repository } = await run({
+        questions: [
+          { question: "Which tone?", options: [{ label: "Formal" }, { description: "missing label" }] },
+          { question: "When?" },
+        ],
+      });
+      expect(repository.events.some((event) => event.kind === "question.request")).toBe(false);
+      expect(repository.current.steps.find((step) => step.type === "tool.ask_user_question")?.error)
+        .toContain('questions[0].options[1] needs a non-empty "label" string');
+    });
+
+    it("still accepts a legacy single question with options", async () => {
+      const { repository, result } = await run({ question: "Which tone?", options: [{ label: "Formal" }, { label: "Warm" }] });
+      expect(result.state).toBe("waiting");
+      expect(repository.events).toContainEqual(expect.objectContaining({
+        kind: "question.request",
+        question: "Which tone?",
+        options: [{ label: "Formal" }, { label: "Warm" }],
+      }));
+    });
+  });
+
   it("persists requested question batches and emits the popup event before waiting", async () => {
     const questionStep = {
       ...toolStep("pending", "read_only", false),

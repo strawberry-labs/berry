@@ -1484,7 +1484,8 @@ export class DurableTurnRunner {
         return this.suppressRepeatedToolCall(snapshot, step, repeatAssessment);
       }
     }
-    if (toolName === "ask_user_question") {
+    const questionProblem = toolName === "ask_user_question" ? questionBatchProblem(step.input.arguments) : null;
+    if (toolName === "ask_user_question" && !questionProblem) {
       const questions = durableQuestionItems(step.input.arguments);
       const first = questions[0];
       if (!first) throw new DurableTurnTerminalError("ask_user_question requires at least one valid question");
@@ -1719,6 +1720,9 @@ export class DurableTurnRunner {
       && this.tools.supportsAbort?.(snapshot, step) === true;
     let result: TurnToolResult;
     try {
+      // A malformed question batch is a repairable argument error, never a
+      // silently reduced question shown to the user (H-057).
+      if (questionProblem) throw new Error(questionProblem);
       if (toolName === "create_image") {
         const imageCost = durableRuntimeRequest(snapshot)?.imageGeneration?.costMicros;
         if (!imageCost) throw new Error("Image generation was not admitted for this turn");
@@ -5411,6 +5415,34 @@ interface DurableQuestionItem {
   question: string;
   options: Array<{ label: string; description?: string }>;
   multi: boolean;
+}
+
+/** Field-level problem with ask_user_question arguments, or null when the schema is met. */
+function questionBatchProblem(value: unknown): string | null {
+  const input = record(value) ?? {};
+  const optionsProblem = (options: unknown, field: string): string | null => {
+    if (options === undefined) return null;
+    if (!Array.isArray(options) || options.length > 12) return `${field} must be an array of at most 12 {label, description?} objects.`;
+    const index = options.findIndex((option) => !stringValue(record(option)?.label)?.trim());
+    return index >= 0 ? `${field}[${index}] needs a non-empty "label" string.` : null;
+  };
+  if (input.questions === undefined) {
+    if (!stringValue(input.question)?.trim()) return 'ask_user_question needs "questions": [{question, options?, multi?}] (or a single "question").';
+    return optionsProblem(input.options, "options");
+  }
+  if (!Array.isArray(input.questions) || input.questions.length === 0 || input.questions.length > 5) {
+    return 'ask_user_question "questions" must be an array of 1-5 {question, options?, multi?} objects; ask the most important ones first.';
+  }
+  for (const [index, candidate] of input.questions.entries()) {
+    const item = record(candidate);
+    if (!stringValue(item?.question)?.trim()) {
+      const received = item ? Object.keys(item).slice(0, 8).join(", ") || "no fields" : typeof candidate;
+      return `ask_user_question questions[${index}] needs a non-empty "question" string (received: ${received}). Put the question text in "question" and each choice in options[].label; nothing was shown to the user.`;
+    }
+    const problem = optionsProblem(item!.options, `questions[${index}].options`);
+    if (problem) return `ask_user_question ${problem}`;
+  }
+  return null;
 }
 
 function durableQuestionItems(value: unknown): DurableQuestionItem[] {

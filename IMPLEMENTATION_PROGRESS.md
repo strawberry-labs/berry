@@ -63,6 +63,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `c94340b` | H-041 | None. New generated files are stored under their real format; existing files and rows are untouched. |
 | `67a22fa` | H-059 | None (skill script). Publishing it is a skill-package sync, not a database migration. |
 | `375f8dd` | H-040 (Mem0 input) | None. Changes only what new turns send to Mem0; existing memories are untouched (removing contaminated ones needs user controls or a reviewed plan). |
+| `54c9255` | H-041 test fixture | None (test only). |
+| _pending_ | H-057 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -134,6 +136,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-041 (generated image metadata from returned bytes) | Committed — worker path | `c94340b` | Not deployed (worker) |
 | H-059 (XLSX rows sized to wrapped text) | Committed | `67a22fa` | Not published (organization `xlsx` skill package) |
 | H-040 (assistant text kept out of personal memory extraction) | Committed — partial | `375f8dd` | Not deployed (worker) |
+| H-041 fixture (typecheck) | Committed | `54c9255` | Test only |
+| H-057 (malformed question batches) | Committed | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1200,8 +1204,8 @@ verification script deletes compiled tests first and counts are source-only.
 - **Verification (isolated snapshot).** Worker suite 516 passed / 3 skipped; the three new
   cases fail on the previous source. **Correction:** the worker typecheck *failed* on this
   commit. The new test fixture omitted `editsEndpoint`, and the check's output, piped
-  through `tail -1`, was misread. The fixture is fixed in the commit that follows
-  H-040; the verification script no longer pipes the typecheck.
+  through `tail -1`, was misread. The fixture is fixed in `54c9255`; the verification
+  script no longer pipes the typecheck.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Provider-aware ratio support (choosing a supported size per model rather
   than the fixed three), and the desktop/local-agent and API legacy paths that repeat the
@@ -1331,3 +1335,29 @@ verification script deletes compiled tests first and counts are source-only.
   theme's major and minor `a:latin` to Verdana, and give each slide-number field an
   explicit Verdana `a:rPr`. This is the repair the model applied by hand in task 1228 before
   publishing successfully. Verify with a production-image render of every supported layout.
+
+### H-057 — Malformed question batches silently lose questions and choices
+
+- **Evidence.** Task 1105, step `bcf7d580…`: three batch items used `label` instead of
+  `question`; Berry dropped all three and showed one legacy open question with no
+  choices, and the user had to repeat details already supplied. One malformed batch out
+  of 305 in the month.
+- **Root cause (confirmed in code).** `durableQuestionItems` silently skipped invalid
+  items, fell back to the root `question`, and sliced batches above five questions and
+  twelve options, although the tool schema declares those limits. A call with no valid
+  question at all ended the run with a terminal error.
+- **Fix.** `questionBatchProblem` checks the arguments against the declared schema
+  (1–5 questions, each with non-empty `question`; up to 12 options, each with a
+  non-empty `label`). A problem now fails the tool step with a field-specific message
+  (for example `questions[0] needs a non-empty "question" string (received: label,
+  options)`), so nothing is shown to the user and the model repairs the call within the
+  existing bounded repair budget. Legacy root `question`/`options` calls without a batch
+  are unchanged; normalisation still trims overlong text.
+- **Files.** `apps/worker/src/turn-runner.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass (checked without a pipe);
+  worker suite 520 passed / 3 skipped. New cases: task 1105's payload gives a repair
+  error with no question event or waiting state; a batch with one invalid option is
+  rejected rather than reduced; a legacy single question still waits. The first two fail
+  on the previous source; the existing batch test still passes.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** A shared validation boundary for other built-in tool arguments.
