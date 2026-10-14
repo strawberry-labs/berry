@@ -47,7 +47,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f2bace0` | H-046/H-060/H-071 | None. |
 | `91208bc` | H-009 (text-only finalisation) | None. |
 | `d95b252` | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
-| _pending_ | H-033 | None. |
+| `52c0260` | H-033 | None. |
+| _pending_ | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
@@ -67,6 +68,12 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 
 No pre-existing failures were observed in these suites.
 
+**Pre-existing failures found later (present at base `99964f1`, not caused by this work):**
+
+| Suite | Failure | Evidence |
+| --- | --- | --- |
+| `apps/api/src/usage/usage.controller.test.ts` | 4 tests: "Nest can't resolve dependencies of the QueuedFollowUpService (?) … CloudDatabaseService at index [0]" | Same 4 failures on a clean checkout of `99964f1` and of `52c0260`; test-module DI wiring, untouched by these commits. |
+
 ## Summary
 
 | ID | Status | Commit | Deployment |
@@ -83,7 +90,8 @@ No pre-existing failures were observed in these suites.
 | H-009 (text-only finalisation) | Committed — partial | `91208bc` | Not deployed (worker) |
 | H-075 (internal connector session lifetime) | Committed | `d95b252` | Not deployed (API only) |
 | H-031 (blob-deletion receipt SQL) | Committed | `f30b651` | Not deployed (worker); backlog reconciliation not started |
-| H-033 (revision provenance) | Committed — partial | _pending_ | Not deployed (shared package; API + worker rebuild) |
+| H-033 (revision provenance) | Committed — partial | `52c0260` | Not deployed (shared package; API + worker rebuild) |
+| H-032 (cache metric truth) | Committed — partial | _pending_ | Not deployed (worker + API + web) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -587,3 +595,29 @@ No pre-existing failures were observed in these suites.
 - **Remaining (H-033 stays open).** Unique provider-attempt identities and an immutable
   release/hotfix manifest belong with the cache instrumentation (H-032). Note that the
   revision string itself cannot prove what code runs (see the H-014 parity finding).
+- **Commit.** `52c0260`.
+
+### H-032 (part 1) — Cache metrics that do not overstate savings
+
+- **Evidence.** Final window: 87.41% of main calls read *some* cached input, but only
+  17.81% of input tokens were served from cache. The admin dashboards preferred a
+  "Cache hit rate" computed as `hit ∧ eligible / eligible`.
+- **Root cause (code-confirmed).** The worker recorded `cacheEligible = plan.eligible ||
+  cacheReadTokens > 0` (and the prompt-improvement path `cacheEligible = cacheReadTokens > 0`),
+  so every observed hit was also "eligible"; for routes without declared cache
+  capability the dashboard's hit rate was effectively hits/hits. The analytics query
+  also only counted hits that were flagged eligible.
+- **Fix.** Record declared eligibility only; count requests with any cache read
+  independently of eligibility; make **cached input-token share** the primary
+  dashboard metric (correct on historical rows, which are not rewritten), with the
+  any-hit request count as a hint; the request hit rate is only a fallback when token
+  totals are missing.
+- **Files.** `apps/worker/src/turn-runner.ts` (one line), `apps/api/src/http/agent-api.controller.ts`
+  (prompt-improvement hunk only), `apps/api/src/usage/usage.repository.ts` (two analytics
+  hunks only), `apps/web/src/components/management/usage-controls.tsx` (+test).
+- **Verification (isolated snapshot).** worker/API/web typecheck pass; worker
+  turn-runner 121/121; web usage-controls 5/5 (new: the audit's 87%-any-hit / 17.8%-token
+  shape reports 17.8% token share); API usage repository + controller suites pass except
+  the 4 pre-existing `usage.controller.test.ts` failures listed in the baseline section.
+- **Deployment.** Not deployed.
+- **Remaining.** See H-032 part 2 (prompt-prefix stability) below.

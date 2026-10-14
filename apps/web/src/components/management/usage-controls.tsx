@@ -134,24 +134,32 @@ export type CacheMetric = {
   hint: string;
 };
 
+/**
+ * The share of input tokens served from cache is the primary cache metric: a
+ * request with any cached token counts as a "hit" even when most of its input
+ * was uncached, so a request hit rate overstates savings (H-032).
+ */
 export function calculateCacheMetric(input: {
   inputTokens: number;
   cacheReadTokens: number;
   cacheEligibleRequests: number;
   cacheHitRequests: number;
 }): CacheMetric {
-  if (input.cacheEligibleRequests > 0) {
-    return {
-      label: "Cache hit rate",
-      value: input.cacheHitRequests / input.cacheEligibleRequests,
-      hint: `${input.cacheHitRequests} of ${input.cacheEligibleRequests} eligible requests`,
-    };
-  }
   if (input.inputTokens > 0 && input.cacheReadTokens >= 0) {
+    const tokens = `${new Intl.NumberFormat().format(input.cacheReadTokens)} cache-read tokens`;
     return {
       label: "Cached input-token share",
       value: Math.min(1, input.cacheReadTokens / input.inputTokens),
-      hint: `${new Intl.NumberFormat().format(input.cacheReadTokens)} cache-read tokens`,
+      hint: input.cacheHitRequests > 0
+        ? `${tokens}; ${new Intl.NumberFormat().format(input.cacheHitRequests)} requests read some cached input`
+        : tokens,
+    };
+  }
+  if (input.cacheEligibleRequests > 0) {
+    return {
+      label: "Cache hit rate",
+      value: Math.min(1, input.cacheHitRequests / input.cacheEligibleRequests),
+      hint: `${input.cacheHitRequests} of ${input.cacheEligibleRequests} eligible requests`,
     };
   }
   return { label: "Cache hit rate", value: null, hint: "No cache telemetry for this period" };

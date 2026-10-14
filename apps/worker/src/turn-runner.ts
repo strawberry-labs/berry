@@ -4039,7 +4039,9 @@ export class RouterDurableTurnModel implements DurableTurnModel {
           cacheWriteTokens: finalUsage.cacheWriteTokens ?? 0,
           cacheCreationTokens1h: finalUsage.cacheCreationTokens1h ?? 0,
           cacheCreationTokens5m: finalUsage.cacheCreationTokens5m ?? 0,
-          cacheEligible: cachePlan.eligible || (finalUsage.cacheReadTokens ?? 0) > 0,
+          // Declared eligibility only. Folding observed hits in made every hit
+          // "eligible" and turned eligible hit rate into hits/hits (H-032).
+          cacheEligible: cachePlan.eligible,
           cacheProvider: cachePlan.provider,
           ...(cachePlan.cacheKeyHash ? { cacheKeyHash: cachePlan.cacheKeyHash } : {}),
           promptManifestHash: cachePlan.manifest.manifestHash,

@@ -3062,7 +3062,8 @@ function promptImprovementUsageEvent(input: {
     cacheWriteTokens: input.usage.cacheWriteTokens ?? 0,
     cacheCreationTokens1h: input.usage.cacheCreationTokens1h ?? 0,
     cacheCreationTokens5m: input.usage.cacheCreationTokens5m ?? 0,
-    cacheEligible: cacheReadTokens > 0,
+    // No cache plan is made for prompt improvement; a hit is not eligibility.
+    cacheEligible: false,
     cacheProvider: cacheReadTokens > 0 ? input.provider : null,
     cacheKeyHash: null,
     promptManifestHash: null,

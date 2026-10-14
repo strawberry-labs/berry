@@ -436,6 +436,8 @@ Deployment and rollback details: [deployment record](output/rewrite-prompt-2026-
 - Separate cache: vision-observation hits are 13/3,005 successful inspections (0.43%), with no focused-mode hits; unique images lower the attainable total. Evaluate content/question keys and concurrent coalescing without stale answers or cross-tenant reuse.
 - Acceptance: reconcile raw provider usage per physical call, actual backend, warm/cold cohorts, prompt/tool/image hashes, TTFT/cost and task quality. Estimate 2 days instrumentation +3–5 days experiments/design; no guaranteed savings yet.
 
+- **Implementation part 1 (14 October):** `cacheEligible` no longer ORs in observed hits; hit counts are independent of eligibility; dashboards lead with cached input-token share. Not deployed. Prefix-stability work continues below.
+
 ### H-033 — Release provenance lost in telemetry
 
 - Evidence: 1,924 monthly runs say revision unknown. All inspected worker environments use a build revision containing `+production-hotfixes`; `sourceRevisionFromEnv` rejects `+`.
