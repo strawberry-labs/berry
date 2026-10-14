@@ -2152,6 +2152,87 @@ describe("durable turn runner", () => {
     expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
   });
 
+  describe("repair loops across changed arguments (H-004)", () => {
+    // A scripted model keeps calling read with a new path each turn; the tool
+    // fails every time, naming the path it was given.
+    async function driveFailingRead(pathFor: (attempt: number) => string, errorFor: (path: string) => string, attempts: number) {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      let modelCalls = 0;
+      const executed: string[] = [];
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => {
+          modelCalls += 1;
+          if (modelCalls > attempts) return { text: "I could not open the file.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+          return {
+            text: "",
+            inputTokens: 1,
+            outputTokens: 1,
+            toolCalls: [{
+              id: `call-${modelCalls}`,
+              name: "read",
+              input: { path: pathFor(modelCalls) },
+              retryClass: "read_only",
+              repeatPolicy: "compare_result",
+              idempotencyKey: null,
+              requiresApproval: false,
+              approvalKind: "file-edit",
+            }],
+          };
+        },
+      }, {
+        execute: async (_snapshot, step) => {
+          const path = String((step.input.arguments as { path?: unknown } | null)?.path);
+          executed.push(path);
+          throw new Error(errorFor(path));
+        },
+      });
+      let state: string = "calling_model";
+      for (let turn = 0; turn < attempts * 3 && (state === "calling_model" || state === "executing_tool"); turn += 1) {
+        state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
+      }
+      const failures = repository.current.steps.filter((step) => step.type === "tool.read").map((step) => String(step.error ?? ""));
+      return { state, executed, failures, error: repository.current.error };
+    }
+    const missing = (path: string) => `ENOENT: no such file or directory, open '${path}'`;
+
+    it("treats re-spelt paths to the same file as the same call and stops the loop", async () => {
+      const spellings = [
+        "outputs/Q3-report.docx",
+        "./outputs/Q3-report.docx",
+        "/workspace/outputs/Q3-report.docx",
+        "outputs//Q3-report.docx",
+        "/workspace/./outputs/Q3-report.docx",
+        "outputs/Q3-report.docx/",
+      ];
+      const result = await driveFailingRead((attempt) => spellings[(attempt - 1) % spellings.length]!, missing, 12);
+
+      expect(result.executed).toHaveLength(5);
+      expect(result.state).toBe("failed");
+      expect(result.error).toContain("failed 5 times with identical arguments and error");
+      expect(result.failures.slice(0, 5).map((failure) => /repair attempt (\d)\/5/.exec(failure)?.[1])).toEqual(["1", "2", "3", "4", "5"]);
+    });
+
+    it("tells the model when different arguments keep producing the same error", async () => {
+      const ids = ["8f3a1c", "8f3a1e", "8f3b1c", "8e3a1c", "9f3a1c", "8f3a2c"];
+      const result = await driveFailingRead((attempt) => `/workspace/attachments/cv-${ids[attempt - 1]}.pdf`, missing, ids.length);
+
+      expect(result.executed).toHaveLength(ids.length);
+      expect(result.failures[1]).not.toContain("same error");
+      expect(result.failures[2]).toContain("same error 3 times in a row with changed arguments");
+      expect(result.failures[5]).toContain("same error 6 times in a row with changed arguments");
+      // Guidance only: distinct guesses are not stopped by this counter.
+      expect(result.state).toBe("finalizing");
+    });
+
+    it("does not add guidance while each attempt fails differently", async () => {
+      const errors = ["SyntaxError: invalid syntax", "NameError: name 'total' is not defined", "TypeError: unsupported operand type"];
+      const result = await driveFailingRead((attempt) => `/workspace/scripts/build-${attempt}.py`, (path) => `${errors[Number(/build-(\d)/.exec(path)?.[1]) - 1]}`, 3);
+
+      expect(result.executed).toHaveLength(3);
+      expect(result.failures.some((failure) => failure.includes("same error"))).toBe(false);
+    });
+  });
+
   it("stops repeated unknown skill resources even when other activations succeed between failures", async () => {
     const badArguments = { name: "aesg-branding", resources: ["scripts/create_aesg_docx.py"] };
     const error = "Unknown aesg-branding resource: scripts/create_aesg_docx.py";

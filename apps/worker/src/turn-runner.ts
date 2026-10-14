@@ -1789,7 +1789,13 @@ export class DurableTurnRunner {
         toolMs: failureDurationMs,
         toolRepairAttempts: 1,
       });
-      const typedRepairMessage = `Tool failed (repair attempt ${repairAttempt}/${repairBudget}). ${message}`;
+      // Different arguments that keep failing the same way are reported as one
+      // run, so the model does not read each guess as a first attempt (H-004).
+      const sameError = sameErrorRun(snapshot, step, message);
+      const sameErrorGuidance = sameError >= 3 && sameError > repairAttempt
+        ? `; same error ${sameError} times in a row with changed arguments: check that the target exists and the input is valid, change approach, or tell the user what is blocking`
+        : "";
+      const typedRepairMessage = `Tool failed (repair attempt ${repairAttempt}/${repairBudget}${sameErrorGuidance}). ${message}`;
       const entryId = randomUUID();
       const remaining = snapshot.steps.some((candidate) =>
         candidate.id !== step.id && isRunnableToolStep(candidate)
@@ -4614,16 +4620,16 @@ function modelIteration(steps: readonly DurableTurnStep[]): number {
 
 function repeatedToolFailure(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string | null {
   const failureLimit = identicalToolFailureLimit(step);
-  const fingerprint = toolArgumentFingerprint(step.input.arguments);
+  const fingerprint = failureArgumentFingerprint(snapshot, step);
   const precedingToolSteps = snapshot.steps
     .filter((candidate) => candidate.sequence < step.sequence
       && candidate.type === step.type
-      && toolArgumentFingerprint(candidate.input.arguments) === fingerprint)
+      && failureArgumentFingerprint(snapshot, candidate) === fingerprint)
     .sort((left, right) => right.sequence - left.sequence);
   let repeatedError: string | null = null;
   let repeatedFailures = 0;
   for (const candidate of precedingToolSteps) {
-    const error = toolFailureIdentity(candidate.error);
+    const error = failureIdentity(snapshot, candidate.error);
     if (candidate.state !== "failed"
       || !error
       || (repeatedError !== null && error !== repeatedError)) {
@@ -4644,20 +4650,79 @@ function identicalToolFailureLimit(step: DurableTurnStep): number {
 
 function toolFailureIdentity(value: unknown): string {
   if (typeof value !== "string") return "";
-  return value.trim().replace(/^Tool failed \(repair attempt \d+\/\d+\)\.\s*/i, "");
+  return value.trim().replace(/^Tool failed \(repair attempt \d+\/\d+[^)]*\)\.\s*/i, "");
+}
+
+// Re-spelling a path ("./a", "/workspace/a", "a//b/") is not a repair: the
+// failure counters compare these spellings as one path, in the arguments and
+// in error text that quotes them (H-004).
+const PATH_ARGUMENT_KEY = /(?:path|file|dir|directory|cwd|target|source|destination|src|dest)s?$/i;
+
+function cosmeticPath(value: string, workspaceRoot: string): string {
+  const trimmed = value.trim();
+  if (/\s/.test(trimmed) || /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed)) return value;
+  let path = trimmed.replace(/\/{2,}/g, "/").replace(/\/\.(?=\/|$)/g, "").replace(/^\.\//, "");
+  if (path === workspaceRoot || path.startsWith(`${workspaceRoot}/`)) path = path.slice(workspaceRoot.length + 1);
+  return path.length > 1 ? path.replace(/\/$/, "") : path;
+}
+
+function cosmeticArguments(value: unknown, workspaceRoot: string, key = ""): unknown {
+  if (typeof value === "string") return PATH_ARGUMENT_KEY.test(key) ? cosmeticPath(value, workspaceRoot) : value;
+  if (Array.isArray(value)) return value.map((item) => cosmeticArguments(item, workspaceRoot, key));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, item]) => [name, cosmeticArguments(item, workspaceRoot, name)]));
+  }
+  return value;
+}
+
+function failureArgumentFingerprint(snapshot: DurableTurnSnapshot, step: DurableTurnStep): string {
+  return toolArgumentFingerprint(cosmeticArguments(step.input.arguments, durableWorkspacePath(snapshot)));
+}
+
+function failureIdentity(snapshot: DurableTurnSnapshot, value: unknown): string {
+  const workspaceRoot = durableWorkspacePath(snapshot);
+  return toolFailureIdentity(value).replace(
+    /(['"`]?)([^\s'"`]*\/[^\s'"`]*)\1/g,
+    (_match, quote: string, path: string) => `${quote}${cosmeticPath(path, workspaceRoot)}${quote}`,
+  );
+}
+
+/** The error with names, paths and numbers masked, so different guesses compare equal. */
+function maskedFailure(value: unknown): string {
+  return toolFailureIdentity(value)
+    .replace(/(['"`])[^'"`\n]*\1/g, "<quoted>")
+    .replace(/[^\s'"`]*\/[^\s'"`]*/g, "<path>")
+    .replace(/\b[0-9a-f]{6,}\b|\d+/gi, "<n>")
+    .toLowerCase();
+}
+
+/** Consecutive failures of this tool, including `message`, with the same masked error. */
+function sameErrorRun(snapshot: DurableTurnSnapshot, step: DurableTurnStep, message: string): number {
+  const masked = maskedFailure(message);
+  const preceding = snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence && candidate.type === step.type)
+    .sort((left, right) => right.sequence - left.sequence);
+  let count = 1;
+  for (const candidate of preceding) {
+    if (candidate.state !== "failed" || maskedFailure(candidate.error) !== masked) break;
+    count += 1;
+  }
+  return count;
 }
 
 function matchingToolFailureCount(snapshot: DurableTurnSnapshot, step: DurableTurnStep): number {
-  const fingerprint = toolArgumentFingerprint(step.input.arguments);
+  const fingerprint = failureArgumentFingerprint(snapshot, step);
   const precedingToolSteps = snapshot.steps
     .filter((candidate) => candidate.sequence < step.sequence
       && candidate.type === step.type
-      && toolArgumentFingerprint(candidate.input.arguments) === fingerprint)
+      && failureArgumentFingerprint(snapshot, candidate) === fingerprint)
     .sort((left, right) => right.sequence - left.sequence);
   let count = 0;
   let error: string | null = null;
   for (const candidate of precedingToolSteps) {
-    const candidateError = toolFailureIdentity(candidate.error);
+    const candidateError = failureIdentity(snapshot, candidate.error);
     if (candidate.state !== "failed"
       || !candidateError
       || (error !== null && candidateError !== error)) break;

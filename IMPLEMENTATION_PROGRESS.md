@@ -87,7 +87,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `1650581` | Behaviour evaluation harness (test) | None. |
 | `6469a9d` | H-065 | None. Draft images are written only inside the sandbox workspace. |
 | `ec134cc` | H-045 | No schema change. New assistant-saved skills get one string in the existing `personal_skills.diagnostics` array; existing skills (including the task 756 calculator) are not modified. |
-| _pending_ | H-047 | None (rendering and test harness only). |
+| `6655e89` | H-047 | None (rendering and test harness only). |
+| _pending_ | H-004 | None. Failure text gains an optional suffix inside the existing prefix; stored step errors keep parsing. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -189,18 +190,18 @@ fixture; this is fixed in `54c9255`.
 | Behaviour evaluation harness (H-002, H-012, H-017, H-019, H-020, H-022, H-025, H-026, H-029, H-034) | Committed — runs pending credentials | `1650581` | Test only |
 | H-065 (unfinished image bases published as finals) | Committed — partial | `6469a9d` | Not deployed (worker) |
 | H-045 (assistant-saved skills look domain-verified) | Committed — partial | `ec134cc` | Not deployed (worker + web) |
-| H-047 (mixed Arabic/English laid out left-to-right) | Committed — partial (layout fixed; language adherence awaits evaluation) | _pending_ | Not deployed (web, via desktop-ui) |
+| H-047 (mixed Arabic/English laid out left-to-right) | Committed — partial (layout fixed; language adherence awaits evaluation) | `6655e89` | Not deployed (web, via desktop-ui) |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
-| H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
+| H-004 (repair loops across changed arguments) | Committed — partial (re-spelt paths stop; other changed arguments get guidance) | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
-## Remaining issues (24 of 76) and what each needs
+## Remaining issues (23 of 76) and what each needs
 
-52 of the 76 registered issues have committed fixes (24 full, 28 partial). None is
-deployed. The other 24 are not done for the reasons below; no code was changed for them.
+53 of the 76 registered issues have committed fixes (24 full, 29 partial). None is
+deployed. The other 23 are not done for the reasons below; no code was changed for them.
 
 **Needs a live model evaluation** (behavioural; no billable model calls were authorised
 in this session; prompt changes are behaviour changes and need measured evidence):
@@ -224,7 +225,6 @@ be speculative):
 | ID | Missing evidence |
 | --- | --- |
 | H-003 | Incident-to-category mapping for tool errors. |
-| H-004 | A targeted reproduction of a cosmetic-argument loop (see the H-004 entry). |
 | H-006 | Exact remote MCP/BerryCrawl error strings, current manifests and allowlist. |
 | H-013 | Benchmarks of preparation and snapshot work. |
 | H-021 | Retry and model timing for the stranded-work cases. |
@@ -2159,3 +2159,37 @@ AESG packages.
   - The composer uses Lexical's `dir="auto"`, so a sentence opening with a product name is
     left-to-right while typing; the sent bubble shows it right-to-left.
   - Screen-reader language (`lang`) is not set.
+
+### H-004 — Repair loops across changed arguments (implemented after reproduction)
+
+- **Reproduction.** A scripted model in the worker's runner tests keeps calling `read`
+  for a missing file, and the tool fails each time, naming the path it was given.
+  - **Six spellings of one path** (`outputs/x`, `./outputs/x`, `/workspace/outputs/x`,
+    `outputs//x`, `/workspace/./outputs/x`, `outputs/x/`) ran all 12 capped attempts. Each
+    spelling had its own counter, so the 5-failure stop would only trip after about 30 calls.
+  - **Six different wrong IDs** (task 523's pattern) each failed as "repair attempt 1/5", so
+    the model was told every guess was a first attempt.
+  - **Other bounds.** Tool failures never count as no-progress, so these loops are bounded
+    only by the 200-iteration limit, deadlines and spend.
+- **Fix** (`apps/worker/src/turn-runner.ts`):
+  - **Re-spelt paths are the same call.** Path arguments (`path`, `file`, `dir` and similar
+    keys) are compared after collapsing `//`, `/./`, a leading `./`, the workspace root and a
+    trailing `/`. Paths quoted in error text are normalised the same way. Re-spelling a path
+    now counts towards the existing 5-failure stop.
+  - **Different arguments, same error.** Names, paths, IDs and numbers are masked in the
+    error. From the third consecutive failure of the same tool with the same masked error,
+    the failure prefix reports the run: "same error N times in a row with changed
+    arguments: check that the target exists and the input is valid, change approach, or tell
+    the user what is blocking". This is guidance only. Distinct guesses are not stopped,
+    because masked errors also match valid iterative fixes.
+  - **Unchanged.** Shell commands are not normalised, so quoting variants are not merged.
+    The identical-failure stop keeps its message and limit.
+- **Verification (isolated snapshot).** Worker typecheck pass; 541 passed / 3 skipped (3
+  new). The two behaviour tests fail on the previous source (12 executions instead of 5; no
+  run count); the control (a different error each time, no guidance) passes on both.
+- **Data impact.** None. Stored step errors keep their prefix; the identity parser accepts
+  the old and new forms.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Whether models act on the guidance is unevaluated. Shell quoting variants
+  are not merged. A per-path "did you mean" hint after a missing-file error would address
+  task 523's typo directly.

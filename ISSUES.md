@@ -29,7 +29,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-001 | P0 | Queue delivery and steering | Observed + reproduced locally | Committed locally (see IMPLEMENTATION_PROGRESS.md); not deployed |
 | H-002 | P0 | Rewrite changes voice, sender or intent | Observed conversations + synthetic model evaluation | Prompt deployed; monthly semantic drift confirmed; not fixed in the 14 October pass: needs the paired model evaluation (prompt proposal and eval harness ready) |
 | H-003 | P0 | Tool errors lack consistent recovery classification | Code finding + proposal | Open; validate incident mapping; not fixed: incident mapping still to validate |
-| H-004 | P0 | Repair loops can survive argument changes | Code finding; production loops observed separately | Open; targeted reproduction needed; revalidated 14 October, no change: needs a targeted reproduction |
+| H-004 | P0 | Repair loops can survive argument changes | Code finding + local reproduction | Partly fixed locally (not deployed): re-spelt paths count as one call for the 5-failure stop; repeated equivalent errors are reported to the model as one run |
 | H-005 | P1 | Provider billing/quota availability and recovery | Observed | Partly fixed locally (not deployed): 402/quota failures named as account blockers; image calls stop after one; route circuit breaking open |
 | H-006 | P0 | MCP approval, network policy and authentication failures | Observed + code review | Current production resolution unverified; not fixed: needs the remote MCP error strings and current manifests/allowlist |
 | H-007 | P1 | Skill entry points omit sibling dependencies | Monthly failures + activation/recovery traces + code | Confirmed current renderer staging defect |
@@ -143,6 +143,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Acceptance: changing paths/quoting without resolving the same failure cannot sustain a long repair loop; valid iterative work remains possible.
 
 - **Revalidation (14 October):** the code finding holds (the identical-failure counter keys on argument fingerprint), but the no-progress budget, 200-iteration limit, deadlines and spend limits still bound runs, and no trace shows a loop sustained because arguments changed; the reviewed long repairs mostly succeed. No change without a targeted reproduction; see IMPLEMENTATION_PROGRESS.md.
+- **Implementation (14 October):** a runner reproduction showed six spellings of one missing path running 12 of 12 capped attempts, and distinct wrong IDs each reported as "repair attempt 1/5". Path spellings now compare as one call, so the existing stop applies after 5 failures. From the third consecutive failure with the same masked error, the model is told the run length and to verify the target or change approach; this is guidance, not a stop. Not deployed; model uptake unevaluated.
 
 ### H-005 — Provider availability
 
