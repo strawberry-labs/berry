@@ -3697,7 +3697,11 @@ describe("SandboxContinuityManager", () => {
     expect(first.filePath).not.toBe(second.filePath);
     expect(first.resources).toHaveLength(1);
     expect(second.resources).toEqual([]);
-    expect(cached).toEqual(second);
+    const { transfer: cachedTransfer, ...cachedResult } = cached;
+    const { transfer: secondTransfer, ...secondResult } = second;
+    expect(cachedResult).toEqual(secondResult);
+    expect(secondTransfer).toMatchObject({ files: 1, bytes: Buffer.byteLength("version two") });
+    expect(cachedTransfer).toMatchObject({ files: 0, bytes: 0 });
     expect(first.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
     expect(second.filePath).toMatch(/runtime-skills\/memo-[a-f0-9]{16}\/SKILL\.md$/);
     expect(write).toHaveBeenCalledTimes(3);
@@ -3730,7 +3734,14 @@ describe("SandboxContinuityManager", () => {
     expect(writeBytes.mock.calls[1]?.[0].content).toBe(large);
     expect(write).not.toHaveBeenCalled();
     expect(staged.filePath).toMatch(/^\/workspace\/runtime-skills\//);
-    expect(exec).not.toHaveBeenCalled();
+    // The only command is a read-only content-hash check for reuse; bytes are
+    // never pushed through a shell command.
+    expect(exec).toHaveBeenCalledTimes(1);
+    const hashCheck = (exec.mock.calls[0] as unknown[] | undefined)?.[0];
+    expect(hashCheck).toMatchObject({ command: expect.arrayContaining(["sh", "-c"]) });
+    expect(JSON.stringify(hashCheck)).toContain("sha256sum");
+    expect(JSON.stringify(hashCheck).length).toBeLessThan(1_000);
+    expect(staged.transfer).toMatchObject({ files: 2, reusedFiles: 0 });
   });
 
   it("stages a fresh explicit resource with SKILL.md in one batch and no probes", async () => {

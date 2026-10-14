@@ -47,6 +47,7 @@ import type {
   DurableTurnToolExecutor,
   DurableSkillPackageFile,
   DurableSkillPackageStageOptions,
+  SkillStagingTransfer,
   TurnToolResult,
 } from "./turn-runner.js";
 
@@ -501,6 +502,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   readonly #stagedInputFileIds = new Map<string, Set<string>>();
   readonly #inputFileStages = new Map<string, Promise<void>>();
   readonly #sandboxStarts = new Map<string, Promise<{ provider: string; id: string; state: string }>>();
+  // Concurrent activations in one worker share an in-flight transfer of the
+  // same package revision file instead of writing it twice.
+  readonly #skillFileTransfers = new Map<string, Promise<void>>();
 
   constructor(
     private readonly provider: SandboxProvider,
@@ -751,7 +755,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     packageId: string,
     files: readonly DurableSkillPackageFile[],
     options: DurableSkillPackageStageOptions = {},
-  ): Promise<{ filePath: string; resources: string[]; stagedResources: string[]; stagingSandboxId: string }> {
+  ): Promise<{ filePath: string; resources: string[]; stagedResources: string[]; stagingSandboxId: string; transfer: SkillStagingTransfer }> {
     const sandbox = await this.ensureSandbox(snapshot, options.signal);
     options.signal?.throwIfAborted();
     options.reportProgress?.();
@@ -795,14 +799,72 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
     const targetPaths = new Set(["SKILL.md", ...selectedResourcePaths]);
     const stagedPaths = durablyStagedSkillPackagePaths(snapshot, root, sandbox.id);
-    const missingFiles = normalizedFiles.filter((file) => targetPaths.has(file.path) && !stagedPaths.has(file.path));
-    const lazyPaths = missingFiles.filter((file) => !file.bytes).map((file) => file.path);
+    let missingFiles = normalizedFiles.filter((file) => targetPaths.has(file.path) && !stagedPaths.has(file.path));
+    const reused: typeof normalizedFiles = [];
+    // A sandbox reused by a later run may already hold this revision's large
+    // templates. Reuse only files whose bytes still hash to the package
+    // revision: partial writes, edits and deletions are transferred again.
+    if (missingFiles.reduce((total, file) => total + file.sizeBytes, 0) >= SKILL_REUSE_CHECK_MIN_BYTES) {
+      const present = await verifiedSandboxHashes(this.provider, sandbox.id, root, missingFiles.map((file) => file.path), options.signal);
+      for (const file of missingFiles) {
+        if (present.get(file.path) !== file.sha256) continue;
+        reused.push(file);
+        stagedPaths.add(file.path);
+      }
+      missingFiles = missingFiles.filter((file) => !stagedPaths.has(file.path));
+    }
+    const pending: Promise<void>[] = [];
+    missingFiles = missingFiles.filter((file) => {
+      const inFlight = this.#skillFileTransfers.get(`${sandbox.id}\0${root}\0${file.path}`);
+      if (!inFlight) return true;
+      pending.push(inFlight);
+      return false;
+    });
+    const transferKeys = missingFiles.map((file) => `${sandbox.id}\0${root}\0${file.path}`);
+    const transfer = this.#transferSkillFiles(sandbox.id, root, missingFiles, options);
+    for (const key of transferKeys) this.#skillFileTransfers.set(key, transfer);
+    try {
+      await transfer;
+    } finally {
+      for (const key of transferKeys) {
+        if (this.#skillFileTransfers.get(key) === transfer) this.#skillFileTransfers.delete(key);
+      }
+    }
+    // Another activation was already writing these files; they are ready only
+    // once that transfer succeeds.
+    await Promise.all(pending);
+    for (const file of normalizedFiles) if (targetPaths.has(file.path)) stagedPaths.add(file.path);
+    return {
+      filePath: `${root}/SKILL.md`,
+      resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
+      stagedResources: normalizedFiles
+        .filter((file) => file.path !== "SKILL.md" && stagedPaths.has(file.path))
+        .map((file) => `${root}/${file.path}`),
+      stagingSandboxId: sandbox.id,
+      transfer: {
+        files: missingFiles.length,
+        bytes: missingFiles.reduce((total, file) => total + file.sizeBytes, 0),
+        reusedFiles: reused.length,
+        reusedBytes: reused.reduce((total, file) => total + file.sizeBytes, 0),
+      },
+    };
+  }
+
+  /** Write verified package bytes; rejects (and stages nothing as ready) on any mismatch or failure. */
+  async #transferSkillFiles(
+    sandboxId: string,
+    root: string,
+    files: ReadonlyArray<DurableSkillPackageFile & { path: string; bytes: Buffer | null; sizeBytes: number; sha256: string }>,
+    options: DurableSkillPackageStageOptions,
+  ): Promise<void> {
+    if (files.length === 0) return;
+    const lazyPaths = files.filter((file) => !file.bytes).map((file) => file.path);
     const loaded = lazyPaths.length > 0 && options.loadContentBytes
       ? await options.loadContentBytes(lazyPaths)
       : new Map<string, Uint8Array>();
     options.reportProgress?.();
     options.signal?.throwIfAborted();
-    const prepared = await mapWithConcurrency(missingFiles, 4, async (file) => {
+    const prepared = await mapWithConcurrency(files, 4, async (file) => {
       const loadedBytes = loaded.get(file.path);
       const bytes = file.bytes ?? (loadedBytes
         ? Buffer.from(loadedBytes.buffer, loadedBytes.byteOffset, loadedBytes.byteLength)
@@ -812,39 +874,27 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
       return {
         path: `${root}/${file.path}`,
-        relativePath: file.path,
         content: bytes,
         mode: file.mode ?? (file.path.startsWith("scripts/") ? 0o755 : 0o644),
       };
     });
-    if (prepared.length > 0) {
-      if (this.provider.files.writeManyBytes) {
-        await this.provider.files.writeManyBytes({
-          sandbox_id: sandbox.id,
-          files: prepared.map(({ path, content, mode }) => ({ path, content, mode })),
-        }, { signal: options.signal });
-      } else {
-        await mapWithConcurrency(prepared, 4, async ({ path, content, mode }) => {
-          options.signal?.throwIfAborted();
-          if (this.provider.files.writeBytes) {
-            await this.provider.files.writeBytes({ sandbox_id: sandbox.id, path, content, mode }, { signal: options.signal });
-          } else {
-            await this.provider.files.write({ sandbox_id: sandbox.id, path, content: content.toString("base64"), encoding: "base64", mode }, { signal: options.signal });
-          }
-        });
-      }
-      options.signal?.throwIfAborted();
-      options.reportProgress?.();
-      for (const file of prepared) stagedPaths.add(file.relativePath);
+    if (this.provider.files.writeManyBytes) {
+      await this.provider.files.writeManyBytes({
+        sandbox_id: sandboxId,
+        files: prepared.map(({ path, content, mode }) => ({ path, content, mode })),
+      }, { signal: options.signal });
+    } else {
+      await mapWithConcurrency(prepared, 4, async ({ path, content, mode }) => {
+        options.signal?.throwIfAborted();
+        if (this.provider.files.writeBytes) {
+          await this.provider.files.writeBytes({ sandbox_id: sandboxId, path, content, mode }, { signal: options.signal });
+        } else {
+          await this.provider.files.write({ sandbox_id: sandboxId, path, content: content.toString("base64"), encoding: "base64", mode }, { signal: options.signal });
+        }
+      });
     }
-    return {
-      filePath: `${root}/SKILL.md`,
-      resources: normalizedFiles.filter((file) => file.path !== "SKILL.md").map((file) => `${root}/${file.path}`),
-      stagedResources: normalizedFiles
-        .filter((file) => file.path !== "SKILL.md" && stagedPaths.has(file.path))
-        .map((file) => `${root}/${file.path}`),
-      stagingSandboxId: sandbox.id,
-    };
+    options.signal?.throwIfAborted();
+    options.reportProgress?.();
   }
 
   supportsAbort(_snapshot: DurableTurnSnapshot, _step: DurableTurnStep): boolean {
@@ -4086,6 +4136,34 @@ async function loadSkillPackageBytes(file: DurableSkillPackageFile): Promise<Buf
     : Buffer.from(loaded.buffer, loaded.byteOffset, loaded.byteLength);
 }
 
+const SKILL_REUSE_CHECK_MIN_BYTES = 256 * 1024;
+
+/** sha256 of each existing file under root, in one exec and without moving bytes. */
+async function verifiedSandboxHashes(
+  provider: SandboxProvider,
+  sandboxId: string,
+  root: string,
+  relativePaths: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, string>> {
+  const hashes = new Map<string, string>();
+  try {
+    const output = await sandboxCommand(provider, sandboxId, `skill-reuse-${randomUUID()}`, [
+      "sh", "-c", 'for file in "$@"; do if [ -f "$file" ]; then sha256sum -- "$file"; fi; done', "skill-reuse",
+      ...relativePaths.map((path) => `${root}/${path}`),
+    ], "/", signal);
+    for (const line of output.split("\n")) {
+      const match = /^([a-f0-9]{64}) [ *](.+)$/.exec(line.trim());
+      if (match && match[2]!.startsWith(`${root}/`)) hashes.set(match[2]!.slice(root.length + 1), match[1]!);
+    }
+  } catch (error) {
+    signal?.throwIfAborted();
+    // Verification is an optimization; transfer when it cannot run.
+    void error;
+  }
+  return hashes;
+}
+
 function durablyStagedSkillPackagePaths(
   snapshot: DurableTurnSnapshot,
   root: string,
@@ -4099,16 +4177,20 @@ function durablyStagedSkillPackagePaths(
     if (toolName !== "activate_skill") continue;
     const output = objectValue(step.output);
     if (stringValue(output.stagingSandboxId) !== stagingSandboxId) continue;
-    if (stringValue(output.location) !== skillPath) continue;
-    staged.add("SKILL.md");
-    if (!Array.isArray(output.stagedResources)) continue;
-    for (const value of output.stagedResources) {
-      if (typeof value !== "string") continue;
-      try {
-        staged.add(relativeSkillPackagePath(root, value));
-      } catch {
-        // Ignore stale or malformed tool output rather than trusting a path
-        // outside this content-addressed package root.
+    // A package can be staged directly or as another skill's declared dependency.
+    const receipts = [output, ...(Array.isArray(output.dependencies) ? output.dependencies.map(objectValue) : [])];
+    for (const receipt of receipts) {
+      if (stringValue(receipt.location) !== skillPath) continue;
+      staged.add("SKILL.md");
+      if (!Array.isArray(receipt.stagedResources)) continue;
+      for (const value of receipt.stagedResources) {
+        if (typeof value !== "string") continue;
+        try {
+          staged.add(relativeSkillPackagePath(root, value));
+        } catch {
+          // Ignore stale or malformed tool output rather than trusting a path
+          // outside this content-addressed package root.
+        }
       }
     }
   }

@@ -90,7 +90,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-062 | P2 | Failed search indexing leaves stored files processing and hides recovery | 249 files / 39 users / 73 task associations + fresh deployed handler | Confirmed current; source/browser UX distinction recorded |
 
 | H-063 | P1 | Streaming XLSX random access exhausts the tool budget | Full failed task + library source + measured single-pass fixture | Current analysis guidance gap; 9 candidate inputs / 3 tasks, 1 causal failure |
-| H-064 | P1 | Deferred skill staging omits required entry-point dependencies | Current stager/guides + Office/CV repair traces; 391 symptom steps /261 tasks | Confirmed current manifest gap; not all import symptoms adjudicated |
+| H-064 | P1 | Deferred skill staging omits required entry-point dependencies | Current stager/guides + Office/CV repair traces; 391 symptom steps /261 tasks | Closure/declared-dependency staging committed locally (not deployed); AESG manifests pending skill review |
 | H-065 | P2 | Unfinished generated bases appear as downloadable final outputs | Current publication contract + three verified base/final pairs; 63 co-occurrence runs /21 tasks | Confirmed contract mismatch; wrong-download UX impact unmeasured |
 | H-066 | P1 | Operator recovery reuses a settled budget reservation | Five exact denial runs /five tasks /four users; native ledger/current API/worker trace | Fix committed locally (not deployed); reproduced and covered by PostgreSQL regression |
 | H-067 | P2 | Office pagination repeats whole-file transfer/extraction | Six causal DOCX reads + deployed extractor; 100 repeat candidates /50 tasks /31 users | Confirmed current inefficiency; cache benefit and byte-identical cohort unmeasured |
@@ -1921,6 +1921,8 @@ Task **434** (`97ca8377-de9f-4fc3-94ee-11285bfb30a5`), September 23, has **42 me
 
 Private evidence: `task821-current-org-guides.json`, `task821-current-deferred-staging-proof.json`, `task821-provider-attempt-proof.json`, `deferred-branding-import-monthly-candidates.json`, `deferred-branding-import-monthly-summary.json`. No source, production, prompt or skill change.
 
+
+**Implementation (14 October):** activation now stages a requested script's sibling imports automatically and resources declared in `skill-dependencies.json` (including another admitted skill's helpers, returned with that skill's directory), reuses unchanged large files across runs by content hash, never trusts a partially written file, shares concurrent transfers and reports bytes moved. Metadata-only activation still touches no sandbox. End-to-end tests run the staged entry point with Python. AESG package manifests are written but held for the AESG skill-source review. Not deployed.
 
 ### Monthly audit: task802 — successful classification with an unsupported transaction date
 

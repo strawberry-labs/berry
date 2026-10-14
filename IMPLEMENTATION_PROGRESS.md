@@ -49,7 +49,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `d95b252` | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
 | `52c0260` | H-033 | None. |
 | `3a27931` | H-032 (diagnostics) | None. |
-| _pending_ | H-032 (prompt layout) | None (prompt assembly only). |
+| `9eecde6` | H-032 (prompt layout) | None (prompt assembly only). |
+| _pending_ | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
@@ -95,7 +96,8 @@ No pre-existing failures were observed in these suites.
 | H-033 (revision provenance) | Committed — partial | `52c0260` | Not deployed (shared package; API + worker rebuild) |
 | H-032 (cache metric truth) | Committed — partial | `29dd951` | Not deployed (worker + API + web) |
 | H-032 (served backend + retention diagnostics) | Committed — partial | `3a27931` | Not deployed (worker) |
-| H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | _pending_ | Not deployed (worker) |
+| H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | `9eecde6` | Not deployed (worker) |
+| H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -706,3 +708,71 @@ No pre-existing failures were observed in these suites.
   trade-offs); images re-sent at the tail each call; provider routing/affinity for the
   unchanged-prefix drops (needs the new `servedProvider` data plus hosted Router access).
   The 85–90% warm target cannot be claimed until live data exists.
+- **Commit.** `9eecde6`.
+
+### H-064 / H-007 — Stage what a skill entry point needs, progressively
+
+- **Evidence.** Task 821: activating the DOCX generator staged `create_aesg_docx.py` and
+  some branding assets but not its helpers; the run hit FileNotFoundError for
+  `report_structure.py`, then ModuleNotFoundError for `normalise_office_templates`, before
+  a third activation succeeded (generation itself took 9.83 s). Month: 391 missing-helper
+  bash-step candidates / 261 tasks / 84 users (258 `office_converter`, 83 `normalise_office_templates`,
+  51 `report_structure`) — symptom counts, not 391 proved staging defects.
+- **Current implementation (inspected before designing).** Already correct and kept:
+  metadata-only activation returns the inventory without touching a sandbox;
+  resource activation stages only requested paths plus SKILL.md; content-addressed
+  `runtime-skills/<id>-<revision>` roots invalidate changed packages; every file is
+  hash/size verified; tenant-scoped package queries. Missing: no entry-point dependency
+  closure, reuse only within one run, no protection against trusting a file left
+  partially written by an interrupted transfer, no transfer accounting.
+- **Fix (extends the existing stager).**
+  - *Sibling closure:* a requested `.py` resource also stages same-package modules it
+    imports (plain/`from`/relative/parenthesised/function-local imports, packages'
+    `__init__.py`), transitively. Standard-library/third-party names are ignored; nothing
+    is guessed outside the package.
+  - *Declared dependencies:* optional `skill-dependencies.json` (version 1) declares,
+    per entry point, extra same-package resources and resources of another skill.
+    Cross-skill resources are staged into that skill's own activated directory (only if
+    the skill is admitted to this run; otherwise an actionable error before execution),
+    with its own sibling closure; cycles/depth > 3 are rejected.
+  - *Readiness and handles:* the receipt reports `readiness: "ready"`, `addedResources`,
+    `dependencies[{skill, directory, resources}]` and a `<resolved_dependencies>` block
+    telling the model the exact directory to pass; failures name the missing piece.
+  - *Reuse and integrity:* when ≥256 KiB is still to transfer, one `sha256sum` exec over the
+    content-addressed root reuses files whose bytes still hash to the package revision
+    (later runs, same sandbox) — partial, edited or deleted files are re-sent; small
+    script-only activations skip the extra round trip. Concurrent activations in a worker
+    share one in-flight transfer. Files staged as another skill's dependency count as
+    staged for that skill within the run.
+  - *Accounting:* `transfer {files, bytes, reusedFiles, reusedBytes}` per activation.
+  - Large optional templates are never added by closure; they stage only when requested
+    or declared required.
+- **Measured (in-memory sandbox, real activation/staging code; wall time is not real E2B latency).**
+
+  | Scenario | Provider calls | Bytes transferred | Bytes reused |
+  | --- | --- | --- | --- |
+  | Metadata-only activation | 0 | 0 | 0 |
+  | Script + 2 sibling imports + declared cross-skill helper (+ its sibling) | 4 | 957 | 0 |
+  | Operation needing the 6 MiB template, cold | 3 | 6,291,539 | 0 |
+  | Same template in a later run (warm) | 2 | 0 | 6,291,539 |
+  | Changed dependency version | 4 | 960 (new directory) | 0 |
+  | Retry after an interrupted transfer | 3 | 6,291,539 | 0 (partial file not trusted) |
+  | Two concurrent activations of the template | 4 + 4 | 6,291,539 once | — |
+
+- **Files.** `apps/worker/src/personal-skills/dependencies.ts` (+test),
+  `apps/worker/src/personal-skills/tools.ts` (+test), `apps/worker/src/sandbox-continuity.ts`
+  (+test), `apps/worker/src/turn-runner.ts` (transfer type), `apps/worker/src/skill-staging.test.ts`.
+- **Verification (isolated snapshot).** Worker `...` typecheck pass; full worker suite 959
+  passed / 6 skipped. The end-to-end test executes the staged entry point with Python
+  (sibling imports + cross-skill helper resolve; output "Report Ready"). Six of the seven
+  end-to-end cases fail on the previous sources; metadata-only activation passes on both.
+- **Deployment.** Not deployed (worker).
+- **Pending (next commit for this issue).** `skill-dependencies.json` for the AESG `docx`
+  (generator and repair → `aesg-branding` `report_structure`, `normalise_office_templates`,
+  `office_converter`) and `pdf` (`create_aesg_pdf` → `office_converter`) packages are written
+  but not committed: they reference `aesg-branding/scripts/report_structure.py`, which is
+  published in production (task 821 staged it) but exists here only as an uncommitted,
+  prepared file owned by the AESG skill work. They land with that review; publishing them
+  is a skill-package sync, not a code deployment. Against the working-tree packages the
+  manifests resolve every helper for all four Office entry points without staging
+  templates, and every staged script compiles.

@@ -438,6 +438,13 @@ export interface DurableSkillPackageFile {
   mode?: number;
 }
 
+export type SkillStagingTransfer = {
+  files: number;
+  bytes: number;
+  reusedFiles: number;
+  reusedBytes: number;
+};
+
 export interface DurableSkillPackageStageOptions {
   /**
    * Relative resource paths to materialize for this activation. SKILL.md is
@@ -493,6 +500,8 @@ export interface DurableTurnToolExecutor {
     stagedResources: string[];
     /** Sandbox generation that physically contains the staged files. */
     stagingSandboxId: string;
+    /** What this call actually moved into the sandbox versus reused. */
+    transfer?: SkillStagingTransfer;
   }>;
   /** Release per-run clients or credentials without finalizing artifacts. */
   release?(snapshot: DurableTurnSnapshot): Promise<void>;

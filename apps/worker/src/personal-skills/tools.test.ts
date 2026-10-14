@@ -288,11 +288,11 @@ describe("DurablePersonalSkillToolExecutor", () => {
       reportProgress: activationProgress,
     });
     expect(stageSkillPackage).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls.filter(([sql]) => String(sql).includes("SELECT path,content"))).toHaveLength(1);
-    expect(query).toHaveBeenCalledWith(
-      expect.stringContaining("path=ANY($2::text[])"),
-      ["org-capability", ["scripts/build.py", "assets/template.docx"]],
-    );
+    // Requested scripts are read first to resolve their sibling imports; the
+    // stager then loads only the files still missing. Nothing unrequested loads.
+    const contentLoads = query.mock.calls.filter(([sql]) => String(sql).includes("SELECT path,content"));
+    expect(contentLoads.map(([, params]) => (params as unknown[])[1])).toEqual([["scripts/build.py"], ["assets/template.docx"]]);
+    expect(contentLoads.every(([, params]) => (params as unknown[])[0] === "org-capability")).toBe(true);
 
     snapshot.steps = [
       ...snapshot.steps,
