@@ -125,6 +125,9 @@ type StoredGoogleToken = {
   expiresAt: string;
   scope: string[];
 };
+const CONNECTOR_SESSION_MAX_RUN_EXTENSION_SECONDS = 24 * 60 * 60;
+const CONNECTOR_SESSION_ENDED_MESSAGE = "Berry's connector session for this task has ended. This is not a Google sign-in problem and does not require reconnecting Google; send a new message to continue.";
+
 type ConnectorSession = {
   tenantId: string;
   userId: string;
@@ -822,8 +825,11 @@ export class ConnectorsService {
     if (!isGoogleKey(connectorKey)) return { status: 404, body: rpcError(null, -32601, "Unknown connector") };
     const credential = bearer(authorization);
     if (!credential) return { status: 401, body: rpcError(null, -32001, "Connector authorization is required") };
-    const session = this.#verifySession(credential);
+    const session = this.#verifySession(credential, { allowExpired: true });
     if (session.connectorKey !== connectorKey) return { status: 403, body: rpcError(null, -32001, "Connector token audience mismatch") };
+    if (session.exp < Math.floor(Date.now() / 1000) && !(await this.#activeTaskSession(session))) {
+      throw new BadRequestException(CONNECTOR_SESSION_ENDED_MESSAGE);
+    }
     const rpc = rpcRequest(request);
     if (rpc.method === "notifications/initialized") return { status: 202 };
     if (rpc.method === "initialize") return { status: 200, body: { jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: `berry-${connectorKey}`, version: "1.0.0" } } } };
@@ -1142,7 +1148,31 @@ export class ConnectorsService {
     const signature = createHmac("sha256", Buffer.from(this.#encryptionKey(), "base64")).update(payload).digest("base64url");
     return `${payload}.${signature}`;
   }
-  #verifySession(token: string): ConnectorSession {
+  /**
+   * A task-scoped session is minted with a 20-minute lease when its turn is
+   * admitted, but the worker keeps using it for the whole run, including long
+   * model/human waits. Past the lease it stays usable only while that run is
+   * still active and the user still owns the task and belongs to the tenant
+   * (checked on every call), and never beyond a hard cap. Google access and
+   * connector policy are still checked per call below.
+   */
+  async #activeTaskSession(session: ConnectorSession): Promise<boolean> {
+    if (!session.taskId || !session.sessionId) return false;
+    if (session.exp + CONNECTOR_SESSION_MAX_RUN_EXTENSION_SECONDS < Math.floor(Date.now() / 1000)) return false;
+    const rows = await this.database.withTenant(session.tenantId, (db) => db.query<{ active: boolean }>(`
+      SELECT true AS active
+      FROM turn_runs r
+      JOIN tasks t ON t.tenant_id=r.tenant_id AND t.id=r.task_id
+      JOIN tenant_memberships m ON m.tenant_id=r.tenant_id AND m.user_id=r.user_id
+      WHERE r.tenant_id=$1::uuid AND r.task_id=$2::uuid AND r.session_id=$3::uuid AND r.user_id=$4::uuid
+        AND r.state NOT IN ('completed','failed','cancelled','recovery_required')
+        AND t.user_id=$4::uuid AND t.deleted_at IS NULL
+        AND m.status='active' AND m.deprovisioned_at IS NULL
+      LIMIT 1
+    `, [session.tenantId, session.taskId, session.sessionId, session.userId]));
+    return rows[0]?.active === true;
+  }
+  #verifySession(token: string, options: { allowExpired?: boolean } = {}): ConnectorSession {
     const [payload, signature] = token.split(".");
     if (!payload || !signature) throw new BadRequestException("Connector token is invalid");
     const expected = createHmac("sha256", Buffer.from(this.#encryptionKey(), "base64")).update(payload).digest();
@@ -1150,7 +1180,8 @@ export class ConnectorsService {
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new BadRequestException("Connector token signature is invalid");
     const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as ConnectorSession;
     const hasTaskContext = Boolean(parsed.taskId || parsed.sessionId);
-    if (!parsed.tenantId || !parsed.userId || !isGoogleKey(parsed.connectorKey) || !["read", "full"].includes(parsed.accessLevel) || parsed.exp < Math.floor(Date.now() / 1000)
+    if (!parsed.tenantId || !parsed.userId || !isGoogleKey(parsed.connectorKey) || !["read", "full"].includes(parsed.accessLevel) || typeof parsed.exp !== "number"
+      || (!options.allowExpired && parsed.exp < Math.floor(Date.now() / 1000))
       || (hasTaskContext && (!isUuid(parsed.taskId) || !isUuid(parsed.sessionId)))) throw new BadRequestException("Connector token is invalid or expired");
     return parsed;
   }

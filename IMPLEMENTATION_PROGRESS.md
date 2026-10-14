@@ -45,7 +45,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `e6b2fa8` | H-051/H-072 | None. New JSON keys in `turn_runs.runtime_request` for new continuation runs only. |
 | `eda27eb` | H-014 (Continue intent) | None (prompt assembly only). |
 | `f2bace0` | H-046/H-060/H-071 | None. |
-| _pending_ | H-009 (text-only finalisation) | None. |
+| `91208bc` | H-009 (text-only finalisation) | None. |
+| _pending_ | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
@@ -77,7 +78,8 @@ No pre-existing failures were observed in these suites.
 | H-048 (provider errors in history) | Committed | `49815ef` | Not deployed (API + worker; either order safe) |
 | H-014 (phase-aware Continue) | Committed — partial | `eda27eb` | Not deployed (worker) |
 | H-046 / H-060 / H-071 (image path lifetime and selection) | Committed | `f2bace0` | Not deployed (worker) |
-| H-009 (text-only finalisation) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-009 (text-only finalisation) | Committed — partial | `91208bc` | Not deployed (worker) |
+| H-075 (internal connector session lifetime) | Committed | _pending_ | Not deployed (API only) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -503,3 +505,38 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** Skipping the resume entirely for text-only follow-ups would save
   latency/cost but changes when leftover outputs are published; it needs measurement
   first (audit H-013). Snapshot-timeout cancellation is H-010.
+- **Commit.** `91208bc`.
+
+### H-075 — Internal connector session expires while the run still uses it
+
+- **Evidence.** Task 139 run `f6a54…`: seven invalid/expired Google connector calls after a
+  long model interval, repeated waits and advice to reconnect Google; a fresh run works
+  without reconnecting. Deployed API/worker modules match local code (audit SSM check).
+  Exact token age for the incident is not retained.
+- **Root cause (code-confirmed).** `ConnectorsService.runtime` signs a task-scoped
+  internal session with `exp = now + 20 min` at turn admission; the worker keeps that
+  credential for the whole run (`mcp-tools.ts` turn context, no renewal); and
+  `handleGoogleMcp` rejects it as "Connector token is invalid or expired" *before* the
+  Google OAuth refresh, which the model then reports as a Google reconnect problem.
+- **Fix (API only, bounded).** Past its 20-minute lease, a *task-scoped* session is
+  accepted only while its run is still active (not completed/failed/cancelled/
+  recovery_required), the user still owns the non-deleted task and is an active,
+  non-deprovisioned tenant member — re-checked on every call — and never beyond a 24-hour
+  hard cap from expiry. Signature, audience, connector enablement, Google connection
+  status, access level and scopes are still checked per call exactly as before, so
+  revoked Google authorization still fails and still needs Reconnect. Sessions without
+  task scope keep strict expiry. A non-renewable expiry now says explicitly that it is not
+  a Google sign-in problem. No longer-lived tokens are minted and the worker (and its
+  discovered-tool state) is unchanged.
+- **Files.** `apps/api/src/connectors/connectors.service.ts`, `apps/api/src/connectors/connectors.service.test.ts`.
+- **Verification (isolated snapshot).** API typecheck pass; connectors + http suites
+  168/168. Fake-clock tests on a really minted token: usable at 35 minutes and at 23 hours
+  while the run is active (one run-state lookup with tenant/task/session/user); no lookup
+  while the lease is valid; ended run / removed access, past the hard cap, and no task
+  scope all end with the explicit non-Google message; a tampered signature is still
+  rejected. The active-run cases fail on the previous source. The lookup SQL was
+  prepared and executed against the migrated PostgreSQL schema.
+- **Deployment.** Not deployed (API only; worker unchanged).
+- **Remaining.** A per-run credential refresh in the worker would also cover runs longer
+  than 24 hours; not needed for the observed incident. Safe-read auto-retry after a
+  transient connector error is separate (H-003).

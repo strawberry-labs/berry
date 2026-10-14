@@ -102,7 +102,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-072 | P1 | Continue excludes preserved sandbox state of interrupted run | Native snapshot + current lineage code | Same cause as H-051; fix committed locally (not deployed) |
 | H-073 | P1 | CV parser treats project-title year as a date | Task85 + live skill function reproduction | Confirmed current; literal structured names needed |
 | H-074 | P1 | CV workflow requires unused photos and lacks blank/unknown input states | Tasks65/118/131 + live skill contract | Confirmed current; format-aware input requirements needed |
-| H-075 | P1 | Internal connector session expires while worker caches it | Task139 + deployed API/worker parity | Confirmed current mismatch; exact incident token age unretained |
+| H-075 | P1 | Internal connector session expires while worker caches it | Task139 + deployed API/worker parity | Fix committed locally (not deployed): active-run lease with per-call access checks |
 | H-076 | P1 | Shared-drive scope is lost during discovery and traversal | Task139 and related traces + deployed Google tools | Confirmed current scope limitation |
 
 ## Details
@@ -2915,6 +2915,8 @@ SSM code-only verification at2026-10-14T08:15:37Z: deployed API connector SHA `a
 **Proposed fix/benefit/effort:** renew the task/user/tenant-scoped internal session for an active authorized run, refresh its server credential without discarding useful discovery state and classify INTERNAL_CONNECTOR_SESSION_EXPIRED separately from Google invalid_grant. Retry safe reads once after renewal; preserve write idempotency/outcome uncertainty. About1–2 days. Avoid broadening token lifetime or bypassing current permission checks. User should not be sent to Google reconnect for a Berry session expiry.
 
 **Acceptance:** controlled run crosses20 minutes and a 35-minute model/human wait, then succeeds without reauth; revoked Google authorization still requires Reconnect; removed access stays blocked; no duplicated external write. Private evidence: `group3-current-connector-module-proof.json`, `group3-current-connector-trace.md`, task139 findings.
+
+**Implementation (14 October):** past the 20-minute lease, a task-scoped session stays usable only while its run is active and the user still owns the task and belongs to the tenant (checked per call, 24-hour hard cap); Google authorization, scopes and connector policy are still checked per call. Non-renewable expiry no longer suggests reconnecting Google. Not deployed.
 
 ### H-076 — Shared-drive identity is not preserved through file discovery (P1)
 
