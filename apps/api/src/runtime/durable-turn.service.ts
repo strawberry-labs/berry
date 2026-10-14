@@ -3251,6 +3251,9 @@ function projectMessageParts(parts: Array<{ type: string; content: unknown }>): 
       return [{ type: "text", text: `[Image artifact: ${stringValue(value?.title) ?? stringValue(value?.name) ?? stringValue(value?.fileId) ?? "image"}]` }];
     }
     if (part.type === "reasoning") return [{ type: "thinking", thinking: durableProjectionText(part.content) }];
+    // A platform/provider failure is a diagnostic, not something the assistant
+    // said. Keep it typed so model history never replays it as an answer.
+    if (part.type === "error") return [{ type: "error", text: durableProjectionText(part.content) }];
     return [{ type: "text", text: durableProjectionText(part.content) }];
   });
 }

@@ -94,6 +94,32 @@ describe("durable turn runner", () => {
       .toContain(DURABLE_REWRITING_PROMPT);
   });
 
+  it("never replays a failed run's platform error as an assistant answer", () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    const providerError = "The model provider rejected this request (HTTP 400). Check the model configuration.";
+    const entry = (id: string, message: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+      entryId: id, parentEntryId: current.entries.at(-1)?.entryId ?? null, entryType: "message", sequence: current.entries.length + 1,
+      payload: { type: "message", id, parentId: current.entries.at(-1)?.entryId ?? null, ...extra, message },
+    });
+    current.entries.push(
+      // Pre-fix API projection of a failed message: the error stored as text.
+      entry("failed-legacy", { role: "assistant", content: [{ type: "text", text: providerError }], stopReason: "error" }, { projectionSource: "messages" }),
+      // Fixed projection keeps the diagnostic typed.
+      entry("failed-typed", { role: "assistant", content: [{ type: "error", text: providerError }], stopReason: "error" }, { projectionSource: "messages" }),
+      // Genuine partial output journaled by the worker itself is still context.
+      entry("partial", { role: "assistant", content: [{ type: "text", text: "Partial draft: the fee is AED 450" }], stopReason: "failed" }),
+      // A user may legitimately quote the error; user text is never filtered.
+      entry("quote", { role: "user", content: `Rewrite this error for my team: ${providerError}` }),
+    );
+
+    const history = modelMessages(current).messages;
+    const assistantText = history.filter((message) => message.role === "assistant").map((message) => JSON.stringify(message.content)).join("\n");
+    expect(assistantText).not.toContain("HTTP 400");
+    expect(assistantText).toContain("Partial draft: the fee is AED 450");
+    expect(JSON.stringify(history.at(-1)?.content)).toContain("Rewrite this error for my team");
+    expect(history.filter((message) => message.role === "assistant")).toHaveLength(1);
+  });
+
   it("keeps a queued prompt's billing identity across delivery retries", () => {
     const runtime = queuedFollowUpRuntimeRequest({ queuedBudgetRequestId: "queued:browser-key", budgetReservationRequired: true }, {
       id: "row-id", attempt_count: 3, input: "Rewrite this email", intent: null, attachments: [],

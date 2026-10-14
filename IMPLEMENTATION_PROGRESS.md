@@ -43,7 +43,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `d481431` | H-014 | None. |
 | `39d02c8` | H-011 | None (worker dependency only). |
 | `e6b2fa8` | H-051/H-072 | None. New JSON keys in `turn_runs.runtime_request` for new continuation runs only. |
-| _pending_ | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
+| _pending_ | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
+| `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 
 ## Status legend
 
@@ -69,7 +70,8 @@ No pre-existing failures were observed in these suites.
 | H-014 (prerequisite: late mutation receipts) | Committed — source of the already-deployed hotfix | `d481431` | Deployed 2026-09-30 per record; exact production byte parity not reproducible (see entry) |
 | H-011 (image payload guard) | Committed — partial | `39d02c8` | Not deployed (worker image; needs Sharp's Linux binary from the frozen lockfile) |
 | H-051 / H-072 (Continue workspace lineage) | Committed | `e6b2fa8` | Not deployed (API + worker; either order is compatible) |
-| H-066 (recovery budget generation) | Committed | _pending_ | Not deployed (API + worker together; see entry) |
+| H-066 (recovery budget generation) | Committed | `2a7af6b` | Not deployed (API + worker together; see entry) |
+| H-048 (provider errors in history) | Committed | _pending_ | Not deployed (API + worker; either order safe) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -352,3 +354,41 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** Spend-limit stops are still recorded as `completed` (outcome labelling,
   H-034/H-014); distinct user-facing actions per refusal type are not yet surfaced in the
   web UI.
+- **Commit.** `2a7af6b`.
+
+### H-048 — Provider-error placeholders replayed as assistant history
+
+- **Evidence.** Task 464: eight Gemini HTTP 400 failures; after switching to MiniMax the
+  run made a successful call (26,884 input / 24 output tokens) whose whole answer was the
+  earlier provider-configuration error; the run completed and the question went
+  unanswered. One exact-text match in the month (narrow detector, not a rate).
+- **Reproduced on `2a7af6b`** (real PostgreSQL, `scripts/test-provider-error-history.mjs`):
+  a provider 400 fails the run and leaves an assistant message with an `error` part;
+  the next admission's `syncMessageJournal` projects it into the journal and the next
+  model history contains "The model provider rejected the request (HTTP 400)…" as an
+  assistant turn.
+- **Root cause (confirmed).** `projectMessageParts` (API) mapped every non-special part,
+  including `error`, to `{type:"text"}`; the worker's `modelMessages` forwards assistant
+  text regardless of `stopReason`. The failure diagnostic therefore became something
+  "the assistant said".
+- **Fix (structural, not keyword-based).** New projections keep error parts typed
+  (`{type:"error"}`), which the history builder never forwards. For journal rows already
+  projected in the old shape, the worker skips assistant entries that are failed
+  projections (`projectionSource:"messages"` and `stopReason:"error"`) unless they carry
+  tool calls. Partial output the worker journals itself (stopReason `failed`/`cancelled`),
+  tool results and all user text — including a user quoting the error — are unchanged.
+  The UI transcript still shows the error.
+- **Files.** `apps/api/src/runtime/durable-turn.service.ts` (one branch),
+  `apps/worker/src/turn-runner.ts` (history builder), `apps/worker/src/turn-runner.test.ts`,
+  `scripts/test-provider-error-history.mjs`.
+- **Verification (isolated snapshot).** PostgreSQL 1/1 (error visible to the user, absent
+  from the next model history, pending question last); unit test covering legacy text
+  projection, typed projection, a worker partial and a user quoting the error. Both fail
+  on the pre-fix code. API runtime 61/61; worker turn-runner/compaction/sandbox 233/233;
+  recovery-budget 4/4, continue-lineage 4/4, queue 8/8; API/worker typecheck pass.
+- **Deployment.** Not deployed; API and worker are independent (either order is safe).
+  Removing these placeholders changes the serialized history of sessions that contain
+  failures once (one cache miss), which is intended.
+- **Remaining.** Compaction's fallback summary can still quote failed-projection text;
+  a "no answer" outcome state for responses that only restate a platform error is not
+  added.

@@ -5610,9 +5610,17 @@ export function modelMessages(
             }];
           })
         : [];
+      // A failed run's projected placeholder (projection source "messages",
+      // stopReason "error") carries the platform error, not assistant output;
+      // older projections stored it as plain text. Never replay it as an
+      // answer. Partial output the worker journals itself is unaffected.
+      const failedProjection = stringValue(payload?.projectionSource) === "messages"
+        && stringValue(message?.stopReason) === "error";
+      const assistantText = failedProjection ? "" : assistantContentText(message?.content);
+      if (failedProjection && toolCalls.length === 0) continue;
       messages.push({
         role: "assistant",
-        content: assistantContentText(message?.content),
+        content: assistantText,
         ...(toolCalls.length > 0 && stringValue(message?.reasoningContent)
           ? { reasoningContent: stringValue(message?.reasoningContent)! }
           : {}),
