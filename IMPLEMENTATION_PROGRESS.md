@@ -64,7 +64,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `67a22fa` | H-059 | None (skill script). Publishing it is a skill-package sync, not a database migration. |
 | `375f8dd` | H-040 (Mem0 input) | None. Changes only what new turns send to Mem0; existing memories are untouched (removing contaminated ones needs user controls or a reviewed plan). |
 | `54c9255` | H-041 test fixture | None (test only). |
-| _pending_ | H-057 | None. |
+| `b9200f0` | H-057 | None. |
+| _pending_ | H-049 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -137,7 +138,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-059 (XLSX rows sized to wrapped text) | Committed | `67a22fa` | Not published (organization `xlsx` skill package) |
 | H-040 (assistant text kept out of personal memory extraction) | Committed — partial | `375f8dd` | Not deployed (worker) |
 | H-041 fixture (typecheck) | Committed | `54c9255` | Test only |
-| H-057 (malformed question batches) | Committed | _pending_ | Not deployed (worker) |
+| H-057 (malformed question batches) | Committed | `b9200f0` | Not deployed (worker) |
+| H-049 (PDF pages without text reported as unreviewed) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1361,3 +1363,27 @@ verification script deletes compiled tests first and counts are source-only.
   on the previous source; the existing batch test still passes.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** A shared validation boundary for other built-in tool arguments.
+- **Commit.** `b9200f0`.
+
+### H-049 — PDF pages without a text layer are treated as reviewed
+
+- **Evidence.** Task 383: a 10-page RFP's page 7 holds the environmental scope extract as
+  an image; Berry read the PDF as text, said all attachments were read and asked the user
+  for the "missing" extract. Month: 102 mixed text/no-text input-PDF reads across 34
+  tasks / 22 users (candidates, not confirmed errors).
+- **Root cause (confirmed in code).** `piReadPdfContent` put "[No extractable text on
+  this page.]" in the body but counted the page in `outputPages` and returned
+  `extractedText: true` with no structured sign that coverage was partial.
+- **Fix.** For pages shown in the output whose text layer is empty, the result now
+  carries `textCoverage: "partial"` and `pagesWithoutText` (up to 50 page numbers), and
+  a notice names them and says they were not reviewed: before saying information is
+  missing, render those pages (an exact `pdftoppm` example is given) and inspect them,
+  or run OCR. Fully textual PDFs, and PDFs with no text at all (which already say so),
+  are unchanged.
+- **Files.** `apps/worker/src/sandbox-continuity.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 521 passed / 3
+  skipped. The new case (task 383's shape, page 7 empty) fails on the previous source;
+  a fully textual PDF gets no notice.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Automatic selective page rendering/OCR with bounded cost, and a
+  "fully reviewed" claim check; whether OCR recovers every affected page is unmeasured.

@@ -1771,6 +1771,21 @@ describe("SandboxContinuityManager", () => {
     ]);
   });
 
+  it("marks PDF pages without a text layer as not reviewed (H-049)", () => {
+    // Task 383: the scope extract on page 7 of the RFP was an image.
+    const pages = Array.from({ length: 10 }, (_, index) => index === 6 ? "" : `Section ${index + 1} requirements`);
+    const result = piReadPdfContent(pages.join("\f"), {});
+    expect(result.details).toMatchObject({ outputPages: 10, textCoverage: "partial", pagesWithoutText: [7] });
+    expect(result.content).toContain("--- Page 7 of 10 ---\n[No extractable text on this page.]");
+    expect(result.content).toContain("Page 7 has no extractable text");
+    expect(result.content).toContain("Before saying information is missing from this document");
+
+    const complete = piReadPdfContent("Intro\fScope\fFees", {});
+    expect(complete.details).not.toHaveProperty("textCoverage");
+    expect(complete.details).not.toHaveProperty("pagesWithoutText");
+    expect(complete.content).not.toContain("not reviewed");
+  });
+
   it("reads a requested PDF page range without making the model guess line offsets", () => {
     const result = piReadPdfContent("Page one\fPage two\fPage three", {
       page_start: 2,

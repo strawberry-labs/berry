@@ -3901,6 +3901,16 @@ export function piReadPdfContent(
     outputPages,
   };
   if (sourceRange?.sourceTruncated) details.extractionTruncated = true;
+  // Pages without a text layer were not reviewed; say so in a structured way so
+  // their content is never reported as absent from the document (H-049).
+  const pagesWithoutText = selectedPages.flatMap((page, index) => {
+    const pageNumber = actualStart + index;
+    return page.length === 0 && formatted.content.includes(`--- Page ${pageNumber} of ${totalPages} ---`) ? [pageNumber] : [];
+  });
+  if (pagesWithoutText.length > 0) {
+    details.textCoverage = "partial";
+    details.pagesWithoutText = pagesWithoutText.slice(0, 50);
+  }
   const textWasTruncated = formatted.details.truncated === true;
   if (!textWasTruncated && !sourceRange?.sourceTruncated && actualEnd < totalPages) {
     details.hasMorePages = true;
@@ -3908,7 +3918,11 @@ export function piReadPdfContent(
     details.nextPageEnd = Math.min(totalPages, actualEnd + DEFAULT_PDF_PAGE_WINDOW);
   }
   const nextOffset = numberValue(formatted.details.nextOffset);
+  const unreviewed = `${pagesWithoutText.slice(0, 20).join(", ")}${pagesWithoutText.length > 20 ? ` and ${pagesWithoutText.length - 20} more` : ""}`;
   const notices = [
+    ...(pagesWithoutText.length > 0
+      ? [`${pagesWithoutText.length === 1 ? `Page ${unreviewed} has` : `Pages ${unreviewed} have`} no extractable text (scanned content, images or blank pages) and ${pagesWithoutText.length === 1 ? "was" : "were"} not reviewed. Before saying information is missing from this document, render those pages to images (for example pdftoppm -f ${pagesWithoutText[0]} -l ${pagesWithoutText[0]} -r 150 -png) and inspect them, or run OCR.`]
+      : []),
     ...(textWasTruncated && nextOffset !== null
       ? [`This page range exceeded the read limit. Continue with page_start=${actualStart}, page_end=${actualEnd}, offset=${nextOffset}.`]
       : []),
