@@ -58,7 +58,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `e4bc64b` | H-054 | None. |
 | `c4f419b` | H-011 (binary reads) | None. Only new tool results are sanitised; existing journal rows are untouched. |
 | `2bd8ff5` | H-039 | No schema change and no deletion. The prompt-version bump stops reuse of existing `vision_observation_cache` rows; the existing retention job removes them once unused. |
-| _pending_ | H-061 | None. |
+| `03d4682` | H-061 | None. |
+| _pending_ | H-042 | None (in-memory model previews only; user files untouched). |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -125,7 +126,8 @@ verification script deletes compiled tests first and counts are source-only.
 | H-054 (vision retry by failure class) | Committed | `e4bc64b` | Not deployed (worker) |
 | H-011 (binary and UTF-16 reads; NUL-safe journal) | Committed — partial | `c4f419b` | Not deployed (worker) |
 | H-039 (truncated vision observations) | Committed — partial | `2bd8ff5` | Not deployed (worker) |
-| H-061 (questions dropped by overview mode) | Committed | _pending_ | Not deployed (worker) |
+| H-061 (questions dropped by overview mode) | Committed | `03d4682` | Not deployed (worker) |
+| H-042 (transparent images seen as blank) | Committed | _pending_ | Not deployed (worker) |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
@@ -1127,3 +1129,35 @@ verification script deletes compiled tests first and counts are source-only.
   tool prefix once after deployment (expected cold cache, see H-032).
 - **Remaining.** Measure digest-versus-focused accuracy and repeat inspections for
   explicit-overview questions before deciding whether overview should answer them.
+- **Commit.** `03d4682`.
+
+### H-042 — Transparent images reach the model unflattened and read as blank
+
+- **Evidence.** Task `f65e8afa…`, run `1d7dca12…`: a valid 4,697×131 palette PNG with
+  dark text on transparency was described as uniformly black; the original (SHA-256
+  `560661a8…`, 18 alpha levels) shows three legible paragraphs on white. One
+  source-verified task; frequency unknown.
+- **Root cause (confirmed in code).** The model-image guard (committed in `39d02c8`)
+  passed small transparent PNG/WebP files through unchanged and kept alpha when it
+  resized to PNG, so the provider decided how to composite transparency; compositing on
+  black hides dark text. Only the JPEG fallback flattened (onto white). The guard's own
+  tests asserted this alpha preservation.
+- **Fix.** Images with real transparency (`hasAlpha` and not opaque) are flattened for
+  the model derivative onto an explicit matte: white, or black when the alpha-weighted
+  visible content is light (for example a white logo), so either kind stays legible. The
+  preview note tells the model which matte was used. Fully opaque images, including RGBA
+  screenshots, still pass through byte-for-byte; original files are never modified.
+- **Files.** `apps/worker/src/model-image.ts` (+test), `apps/worker/src/sandbox-continuity.ts`
+  (preview note).
+- **Tests.** The two existing assertions of alpha preservation now assert the corrected
+  behaviour: an opaque RGBA PNG passes through byte-for-byte, and a fully transparent
+  image becomes uniformly white (still correctly blank). New cases: the incident's shape
+  (4,697×131 palette PNG, dark band) is shown dark-on-white and the source bytes are
+  unchanged; white content is shown on black.
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 513 passed / 3
+  skipped. Pre-fix: three cases fail on the previous source; the opaque passthrough passes
+  on both. A 36 MP transparent PNG prepares in about 0.4 s locally (5 s sharp timeout).
+- **Deployment.** Not deployed (worker; ships with the `39d02c8` image guard).
+- **Remaining.** Provider-side behaviour across vision models and the alpha-unaware
+  shell recovery seen in the task (the model converted to RGB and ignored Pillow's warning)
+  remain behavioural; no cross-model evaluation was run.

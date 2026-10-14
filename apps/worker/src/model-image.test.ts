@@ -6,7 +6,8 @@ import { limitModelImagePayload, MODEL_IMAGE_LIMITS, modelImageOmission, prepare
 
 describe("model image preparation", () => {
   it("preserves a small valid PNG byte-for-byte and reuses its preview", async () => {
-    const source = await sharp({ create: { width: 100, height: 50, channels: 4, background: { r: 10, g: 20, b: 30, alpha: 0.5 } } }).png().toBuffer();
+    // An RGBA PNG whose pixels are all opaque (typical screenshots) still passes through.
+    const source = await sharp({ create: { width: 100, height: 50, channels: 4, background: { r: 10, g: 20, b: 30, alpha: 1 } } }).png().toBuffer();
     const before = Buffer.from(source);
     const result = await prepareModelImage(source);
     expect(result).toMatchObject({ ok: true, data: source.toString("base64"), mediaType: "image/png", width: 100, height: 50, transformed: false });
@@ -21,7 +22,49 @@ describe("model image preparation", () => {
     expect(result).toMatchObject({ ok: true, originalWidth: 4_000, originalHeight: 2_000, width: 2_000, height: 1_000, transformed: true });
     if (!result.ok) throw new Error(result.reason);
     expect(result.data.length).toBeLessThanOrEqual(MODEL_IMAGE_LIMITS.maxBase64Bytes);
-    expect((await sharp(Buffer.from(result.data, "base64")).metadata()).hasAlpha).toBe(true);
+    // Fully transparent: flattened onto white, so it still reads as blank (H-042).
+    const flattened = await sharp(Buffer.from(result.data, "base64")).stats();
+    expect(flattened.isOpaque).toBe(true);
+    expect(flattened.channels.slice(0, 3).every((channel) => channel.min === 255 && channel.max === 255)).toBe(true);
+  });
+
+  describe("transparent images (H-042)", () => {
+    /** A transparent canvas with one opaque band of the given grey level. */
+    const banded = async (width: number, height: number, level: number, palette: boolean) => {
+      const pixels = Buffer.alloc(width * height * 4);
+      for (let y = Math.floor(height / 3); y < Math.floor((2 * height) / 3); y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const offset = (y * width + x) * 4;
+          pixels[offset] = level; pixels[offset + 1] = level; pixels[offset + 2] = level; pixels[offset + 3] = 255;
+        }
+      }
+      return sharp(pixels, { raw: { width, height, channels: 4 } }).png(palette ? { palette: true } : {}).toBuffer();
+    };
+    const pixel = async (data: string, x: number, y: number) => {
+      const { data: raw, info } = await sharp(Buffer.from(data, "base64")).raw().toBuffer({ resolveWithObject: true });
+      return raw[(y * info.width + x) * info.channels]!;
+    };
+
+    it("shows dark content on white instead of leaving the provider to composite it on black", async () => {
+      // Shape of task f65e8afa: a wide palette PNG with dark text on transparency.
+      const source = await banded(4_697, 131, 0, true);
+      const before = Buffer.from(source);
+      const result = await prepareModelImage(source);
+      expect(result).toMatchObject({ ok: true, matte: "white", transformed: true, width: 2_000 });
+      if (!result.ok) throw new Error(result.reason);
+      expect((await sharp(Buffer.from(result.data, "base64")).stats()).isOpaque).toBe(true);
+      expect(await pixel(result.data, 10, 2)).toBe(255);
+      expect(await pixel(result.data, 10, Math.floor(result.height / 2))).toBeLessThan(30);
+      expect(source.equals(before)).toBe(true);
+    });
+
+    it("shows light content such as a white logo on black", async () => {
+      const result = await prepareModelImage(await banded(120, 60, 255, false));
+      expect(result).toMatchObject({ ok: true, matte: "black", transformed: true, width: 120, height: 60 });
+      if (!result.ok) throw new Error(result.reason);
+      expect(await pixel(result.data, 5, 2)).toBe(0);
+      expect(await pixel(result.data, 5, 30)).toBe(255);
+    });
   });
 
   it("compresses noisy PNG data against its base64 size, not just pixel dimensions", async () => {

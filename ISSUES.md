@@ -67,7 +67,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Fix committed locally (not deployed): truncated observations marked incomplete and never cached; adaptive budget open |
 | H-040 | P1 | Irrelevant task outcomes and temporary memories replace missing source | Traced conversation + stored grounding + deployed retrieval | Current safeguards insufficient; stale memory remains available |
 | H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Confirmed current contract defect |
-| H-042 | P1 | Transparent text image misclassified as blank | Original source pixels + full production trace | Confirmed failed recovery; current alpha handling needs regression |
+| H-042 | P1 | Transparent text image misclassified as blank | Original source pixels + full production trace | Fix committed locally (not deployed): transparent previews flattened onto a contrasting matte |
 | H-043 | P1 | Inherited presentation fonts require manual repair | 60 gate-failure steps / 36 tasks; full latest trace + local template/code | Confirmed current published-package inheritance gap |
 | H-044 | P2 | Email copy workflow and failure feedback | User complaint + local copy implementation | Plain copy exists; reported rich-copy cause unverified |
 | H-045 | P1 | Generated reusable skills need independent domain validation | Installed skill + primary sources + current content hashes | Confirmed current skill; proposal pending review |
@@ -521,6 +521,8 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Current local image guard flattens only its JPEG branch; small PNGs can retain transparency. That guard is not deployed. Exact provider-side interpretation is unverified; the recovery's incorrect RGB-only blank test is confirmed.
 - Proposal: preserve original bytes, normalize a separate model/display derivative against an explicit background, check RGBA/transparency before declaring an image blank, and teach the model to act on diagnostic warnings. Add transparent palette/grayscale/RGBA text, genuinely blank images, extreme aspect ratio, and engineering drawings to cross-model vision regressions. Approximately 1–2 days, plus provider validation; do not silently alter user artifacts.
 - Acceptance: readable source is summarized accurately without reupload; alpha-aware diagnostics agree with visible content, genuinely blank sources remain correctly identified, and original files remain byte-identical.
+
+- **Implementation (14 October):** model/vision previews of images with real transparency are flattened onto white, or onto black when the visible content is light; opaque images still pass through byte-for-byte and originals are untouched. Not deployed. Cross-model provider behaviour and the model's alpha-unaware shell checks remain unevaluated.
 
 ### H-043 — Presentation template font inheritance and publication checks
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import sharp from "sharp";
+import sharp, { type Sharp } from "sharp";
 import type { ChatMessage, ChatToolDefinition } from "@berry/router-client";
 
 // These are encoded-payload limits, not source-file sizes. Five images leave
@@ -23,6 +23,8 @@ export type PreparedModelImage = {
   height: number;
   transformed: boolean;
   firstFrameOnly: boolean;
+  /** Background that transparent pixels were flattened onto, if any. */
+  matte?: "white" | "black";
 } | { ok: false; reason: string };
 
 // Repeated model steps re-read the same authorized sources. Cache only the
@@ -63,12 +65,19 @@ export async function prepareModelImage(
     const originalWidth = swap ? meta.height : meta.width;
     const originalHeight = swap ? meta.width : meta.height;
     const firstFrameOnly = (meta.pages ?? 1) > 1;
+    // Providers composite transparency differently (often onto black, which hides
+    // dark text), so transparent images get an explicit contrasting matte (H-042).
+    const matte = meta.hasAlpha ? await transparencyMatte(source) : null;
+    signal?.throwIfAborted();
     const result = (buffer: Buffer, mediaType: string, width: number, height: number, transformed: boolean): PreparedModelImage => {
       const data = buffer.toString("base64");
       if (data.length > MODEL_IMAGE_LIMITS.maxBase64Bytes) {
         return { ok: false, reason: "the encoded preview exceeds its image budget" };
       }
-      const prepared = { ok: true as const, data, mediaType, originalWidth, originalHeight, width, height, transformed, firstFrameOnly };
+      const prepared = {
+        ok: true as const, data, mediaType, originalWidth, originalHeight, width, height, transformed, firstFrameOnly,
+        ...(matte ? { matte: matte === "#000000" ? "black" as const : "white" as const } : {}),
+      };
       const existing = cache.get(key);
       if (existing) { cacheBytes -= existing.data.length; cache.delete(key); }
       while (cache.size > 0 && (cacheBytes + data.length > MAX_CACHE_BYTES || cache.size >= 128)) {
@@ -82,6 +91,7 @@ export async function prepareModelImage(
     };
     if (
       ["png", "jpeg", "webp"].includes(meta.format!)
+      && !matte
       && (meta.orientation ?? 1) === 1 && !firstFrameOnly
       && originalWidth <= MODEL_IMAGE_LIMITS.maxDimension
       && originalHeight <= MODEL_IMAGE_LIMITS.maxDimension
@@ -92,7 +102,10 @@ export async function prepareModelImage(
     // Retain readable dimensions before reducing them. PNG protects diagrams
     // and text; JPEG with a white matte bounds photographs and transparency.
     for (let dimension: number = MODEL_IMAGE_LIMITS.maxDimension; ; dimension = Math.max(512, Math.floor(dimension * 0.75))) {
-      const pipeline = () => source().rotate().resize({ width: dimension, height: dimension, fit: "inside", withoutEnlargement: true });
+      const pipeline = () => {
+        const resized = source().rotate().resize({ width: dimension, height: dimension, fit: "inside", withoutEnlargement: true });
+        return matte ? resized.flatten({ background: matte }) : resized;
+      };
       signal?.throwIfAborted();
       const png = await pipeline().png({ compressionLevel: 6 }).toBuffer({ resolveWithObject: true });
       signal?.throwIfAborted();
@@ -100,7 +113,7 @@ export async function prepareModelImage(
         return result(png.data, "image/png", png.info.width, png.info.height, true);
       }
       for (const quality of [88, 78, 65, 50]) {
-        const jpeg = await pipeline().flatten({ background: "#ffffff" }).jpeg({ quality, chromaSubsampling: "4:4:4" }).toBuffer({ resolveWithObject: true });
+        const jpeg = await pipeline().flatten({ background: matte ?? "#ffffff" }).jpeg({ quality, chromaSubsampling: "4:4:4" }).toBuffer({ resolveWithObject: true });
         signal?.throwIfAborted();
         if (Math.ceil(jpeg.data.byteLength / 3) * 4 <= MODEL_IMAGE_LIMITS.maxBase64Bytes) {
           return result(jpeg.data, "image/jpeg", jpeg.info.width, jpeg.info.height, true);
@@ -113,6 +126,28 @@ export async function prepareModelImage(
     signal?.throwIfAborted();
     return { ok: false, reason: "the image could not be decoded safely or resized within the processing limit" };
   }
+}
+
+/**
+ * Matte for an image with real transparency: white, or black when the visible
+ * content is itself light (for example a white logo). Null when fully opaque.
+ */
+async function transparencyMatte(source: () => Sharp): Promise<"#ffffff" | "#000000" | null> {
+  if ((await source().stats()).isOpaque) return null;
+  const { data, info } = await source()
+    .resize(128, 128, { fit: "inside" })
+    .toColourspace("srgb")
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  let weight = 0;
+  let luminance = 0;
+  for (let index = 0; index + 3 < data.length; index += info.channels) {
+    const alpha = data[index + 3]! / 255;
+    weight += alpha;
+    luminance += alpha * (0.2126 * data[index]! + 0.7152 * data[index + 1]! + 0.0722 * data[index + 2]!) / 255;
+  }
+  return weight > 0 && luminance / weight > 0.6 ? "#000000" : "#ffffff";
 }
 
 export function modelImageOmission(path: string, reason: string): string {

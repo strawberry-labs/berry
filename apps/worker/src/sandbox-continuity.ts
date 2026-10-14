@@ -626,7 +626,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         return;
       }
       const note = image.transformed
-        ? ` [Preview: ${image.originalWidth}x${image.originalHeight} to ${image.width}x${image.height}; ${image.mediaType}. The original is unchanged. Crop and read a detail if text is too small.${image.firstFrameOnly ? " Only the first frame is shown." : ""}]`
+        ? ` [Preview: ${image.originalWidth}x${image.originalHeight} to ${image.width}x${image.height}; ${image.mediaType}. The original is unchanged. Crop and read a detail if text is too small.${image.firstFrameOnly ? " Only the first frame is shown." : ""}${image.matte ? ` Transparent areas are shown on ${image.matte}.` : ""}]`
         : "";
       parts.push({ type: "text", text: `Workspace image ${imageCount + 1}: ${JSON.stringify(path)}${note}` });
       parts.push({ type: "image_url", image_url: { url: `data:${image.mediaType};base64,${image.data}` } });
