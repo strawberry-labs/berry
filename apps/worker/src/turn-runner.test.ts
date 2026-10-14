@@ -3362,6 +3362,17 @@ describe("durable turn runner", () => {
     ]);
   });
 
+  it("explains a 402 as an account credit problem rather than a model setting (H-005)", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
+    }, noTools(), { owner: "worker-credit" });
+    await runner.execute({ tenantId, runId, reason: "continue" });
+    const text = JSON.stringify([repository.current.error, repository.events, repository.mutations]);
+    expect(text).toContain("credit or quota is exhausted (HTTP 402)");
+    expect(text).toContain("choosing another model from the same provider will not help");
+  });
+
   it("uses the router streaming transport and assembles streamed tool calls", async () => {
     let request: ChatCompletionOptions | undefined;
     const client = {

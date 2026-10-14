@@ -130,6 +130,8 @@ const DEFAULT_IMPORT_AVAILABILITY_TIMEOUT_MS = 30_000;
 const DEFAULT_IMPORT_AVAILABILITY_POLL_MS = 250;
 const MAX_SNAPSHOT_FILES = 5_000;
 const OFFICE_TEXT_CACHE_MAX_CHARACTERS = 32 * 1024 * 1024;
+const IMAGE_PROVIDER_CREDIT_EXHAUSTED = /insufficient_quota|billing details|payment required|(?:out of|exhausted|insufficient) (?:your )?credits?/i;
+const IMAGE_PROVIDER_CREDIT_MESSAGE = "Image generation is unavailable: the image provider reports that its credit or quota is exhausted. An administrator must add credit or change the image provider; changing the prompt or retrying will not help. Tell the user instead of calling create_image again";
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
@@ -1277,6 +1279,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       if (!config || !stringValue(capability.model)) throw new Error("Image generation is not configured for this durable turn");
       const prompt = stringValue(args.prompt);
       if (!prompt) throw new Error("create_image requires a prompt");
+      if ((snapshot.steps ?? []).some((candidate) => candidate.state === "failed"
+        && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "create_image"
+        && candidate.error?.includes(IMAGE_PROVIDER_CREDIT_MESSAGE))) {
+        throw new Error(`${IMAGE_PROVIDER_CREDIT_MESSAGE}. (An earlier image request in this task already failed for this reason; the provider was not called again.)`);
+      }
       const references = Array.isArray(args.reference_image_paths)
         ? args.reference_image_paths.filter((value): value is string => typeof value === "string").slice(0, 16)
         : [];
@@ -3468,7 +3475,15 @@ async function generateDurableImage(
     }),
     signal: timeoutSignal(input.signal, DURABLE_IMAGE_REQUEST_TIMEOUT_MS),
   });
-  if (!response.ok) throw new Error(`Image provider request failed with ${response.status}: ${(await response.text()).slice(0, 2_000)}`);
+  if (!response.ok) {
+    const body = (await response.text()).slice(0, 2_000);
+    // Credit or quota exhaustion is an account problem: say so, so the model
+    // stops rewording prompts against it (H-005).
+    if (response.status === 402 || IMAGE_PROVIDER_CREDIT_EXHAUSTED.test(body)) {
+      throw new Error(`${IMAGE_PROVIDER_CREDIT_MESSAGE} (HTTP ${response.status}: ${body.slice(0, 300)})`);
+    }
+    throw new Error(`Image provider request failed with ${response.status}: ${body}`);
+  }
   const payload = await response.json() as ImageGenerationResult;
   if (!Array.isArray(payload.data)) throw new Error("Image provider response did not include data");
   return payload;

@@ -79,7 +79,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `2235bfd` | H-010 | None. Prevents late snapshot rows from being written after a timeout. |
 | `f02396f` | H-044 | None (UI). |
 | `f5ec9f5` | H-027 | None (UI). |
-| _pending_ | H-018 | None. |
+| `887c64a` | H-018 | None. |
+| _pending_ | H-005 | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -173,7 +174,8 @@ fixture; this is fixed in `54c9255`.
 | H-010 (timed-out snapshot keeps writing after cleanup) | Committed | `2235bfd` | Not deployed (worker) |
 | H-044 (Copy reports success before the clipboard write) | Committed — partial | `f02396f` | Not deployed (web, via desktop-ui) |
 | H-027 (dropped folders attached as empty files) | Committed — partial | `f5ec9f5` | Not deployed (web) |
-| H-018 (skill save reveals problems one at a time) | Committed | _pending_ | Not deployed (shared package: API and worker rebuild) |
+| H-018 (skill save reveals problems one at a time) | Committed | `887c64a` | Not deployed (shared package: API and worker rebuild) |
+| H-005 (credit/quota exhaustion presented as a model problem) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
@@ -1808,6 +1810,7 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (shared package: API and worker must be rebuilt).
 - **Remaining.** A scaffold returned by the save tool for package directories (scripts and
   resources) beyond the header.
+- **Commit.** `887c64a`.
 
 ### Blocked: H-047 — Arabic/English presentation
 
@@ -1816,3 +1819,33 @@ fixture; this is fixed in `54c9255`.
   cause, and requires a browser reproduction that separates model language choice from
   layout before any change. A correct fix would also need logical (start/end) spacing,
   not only `dir="auto"`. Deferred until that reproduction is done.
+
+### H-005 — Credit or quota exhaustion is presented as a model or request problem
+
+- **Evidence.** 103 terminal HTTP 402 runs across 47 tasks / 24 users (6–8 October); tasks
+  `7eb80919…` and `5bbb51be…` retried on three models and hit the same blocker. Image
+  creation had 20 failed tool steps / 4 users reporting insufficient quota or exhausted
+  credits.
+- **Root cause (confirmed in code).** A 402 is correctly non-retryable, but its message read
+  "The model provider rejected the request (HTTP 402). Check the selected model and provider
+  configuration", which invites switching models on the same route. Image-provider
+  failures surfaced as raw "Image provider request failed with N", so the model treated
+  them as repairable and kept rewording prompts. Nothing stopped repeat calls in the run.
+- **Fix.**
+  - A model-call 402 now says the account's credit or quota is exhausted, that an
+    administrator must add credit or change the route, and that retrying or picking
+    another model from the same provider will not help.
+  - An image-provider 402, or a body reporting `insufficient_quota`, billing details or
+    exhausted credits (OpenAI returns its billing exhaustion as a 429), now raises a clear
+    non-repairable message telling the model to inform the user.
+  - A later `create_image` in the same run fails immediately with that message, without
+    calling the provider. Other 429s and errors are unchanged.
+- **Files.** `apps/worker/src/turn-runner.ts`, `apps/worker/src/sandbox-continuity.ts` and
+  their tests.
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 533 passed / 3
+  skipped. New cases: an `insufficient_quota` 429 gives the credit message, a second call
+  in the run fails without a provider request, a 402 gives it too; a model-call 402
+  produces the new user message. Both fail on the previous source.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Router-level route readiness and circuit breaking across runs, and an
+  administrator-facing health view (outside this repository's worker).

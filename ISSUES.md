@@ -30,7 +30,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-002 | P0 | Rewrite changes voice, sender or intent | Observed conversations + synthetic model evaluation | Prompt deployed; monthly semantic drift confirmed |
 | H-003 | P0 | Tool errors lack consistent recovery classification | Code finding + proposal | Open; validate incident mapping |
 | H-004 | P0 | Repair loops can survive argument changes | Code finding; production loops observed separately | Open; targeted reproduction needed |
-| H-005 | P1 | Provider billing/quota availability and recovery | Observed | October 6–8 incident; no later monthly 402; recovery UX open |
+| H-005 | P1 | Provider billing/quota availability and recovery | Observed | Partly fixed locally (not deployed): 402/quota failures named as account blockers; image calls stop after one; route circuit breaking open |
 | H-006 | P0 | MCP approval, network policy and authentication failures | Observed + code review | Current production resolution unverified |
 | H-007 | P1 | Skill entry points omit sibling dependencies | Monthly failures + activation/recovery traces + code | Confirmed current renderer staging defect |
 | H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Directory guarantee committed locally (not deployed); execution diagnostics open |
@@ -150,6 +150,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Action: verify current balances/routing, expose actionable health, alert on sustained failures and avoid repeated calls to unavailable routes. Fallback must comply with tenant model/data policy.
 - Acceptance: a simulated billing/quota failure produces one clear blocker rather than repeated model-led diagnosis.
 - **Monthly revalidation:** 103 HTTP402 terminal runs / 47 tasks / 24 users, October 6–8; no later monthly occurrence. Three-model retries in tasks `7eb80919-36b0-4603-85f4-8aa1911e4446` and `5bbb51be-9111-4a38-91db-577cc8232f4f` repeat the same blocker. Current provider outage is not asserted. Add shared-route readiness/circuit breaking and an administrator-facing action; preserve prompt/files. The separate budget-initialization fix is deployed and should not be reopened.
+- **Implementation (14 October):** a model-call 402 now tells the user the provider account's credit/quota is exhausted and that another model on the same provider will not help; image credit/quota failures (including `insufficient_quota` 429s) give a non-repairable message and later image calls in the run fail fast without calling the provider. Not deployed. Router-level circuit breaking remains.
 
 ### H-006 — MCP readiness, network policy and authentication
 

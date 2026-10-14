@@ -4530,6 +4530,10 @@ function publicProviderFailureMessage(
   if (failure.status === 413) {
     return "The model request exceeded the provider's payload size limit (HTTP 413). Reduce the image sizes or number of images, or shorten the conversation before retrying.";
   }
+  if (failure.status === 402) {
+    // Retrying, or switching to another model on the same route, repeats it (H-005).
+    return "The model provider declined the request because the account's credit or quota is exhausted (HTTP 402). An administrator needs to add credit or change the provider route; retrying or choosing another model from the same provider will not help.";
+  }
   const base = {
     aborted: "The model provider request was aborted",
     connection: "Berry could not connect to the model provider",

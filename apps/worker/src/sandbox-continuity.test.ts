@@ -3010,6 +3010,49 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+  it("names an exhausted image provider account and stops calling it in the same run (H-005)", async () => {
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-credit", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: { read: vi.fn(), write: vi.fn(), list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })) },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(), continuity: vi.fn(async () => null), latest: vi.fn(async () => null), inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(), persist: vi.fn(), recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = { put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn() } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, {
+      image: "berry-sandbox",
+      imageGeneration: {
+        endpoint: "https://images.example.test/v1/images/generations",
+        editsEndpoint: "https://images.example.test/v1/images/edits",
+        apiKey: "test-key",
+        model: "gpt-image-1",
+        responseFormat: "b64_json",
+      },
+    });
+    const current = snapshot();
+    current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
+    const step = (sequence: number) => ({ ...toolStep("create_image", { prompt: "A site logo", title: "Site logo" }), id: `image-${sequence}`, sequence, retryClass: "non_idempotent_manual" as const });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { code: "insufficient_quota", message: "You exceeded your current quota, please check your plan and billing details." } }), { status: 429 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const failure = await manager.execute(current, step(1)).then(() => null, (error: Error) => error.message);
+      expect(failure).toContain("the image provider reports that its credit or quota is exhausted");
+      expect(failure).toContain("HTTP 429");
+      current.steps = [{ ...step(1), state: "failed", error: `Tool failed (repair attempt 1/3). ${failure}` }];
+      await expect(manager.execute(current, step(3))).rejects.toThrow("the provider was not called again");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      fetchMock.mockImplementation(async () => new Response("Payment Required", { status: 402 }));
+      current.steps = [];
+      await expect(manager.execute(current, step(5))).rejects.toThrow("credit or quota is exhausted");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("streams only the attachment referenced by the current tool through one native file write", async () => {
     const staged = new Map<string, Uint8Array>();
     const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array>; size_bytes: number }) => {
