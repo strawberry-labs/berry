@@ -27,52 +27,52 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | ID | Priority | Issue | Evidence | Status |
 |---|---|---|---|---|
 | H-001 | P0 | Queue delivery and steering | Observed + reproduced locally | Committed locally (see IMPLEMENTATION_PROGRESS.md); not deployed |
-| H-002 | P0 | Rewrite changes voice, sender or intent | Observed conversations + synthetic model evaluation | Prompt deployed; monthly semantic drift confirmed |
-| H-003 | P0 | Tool errors lack consistent recovery classification | Code finding + proposal | Open; validate incident mapping |
-| H-004 | P0 | Repair loops can survive argument changes | Code finding; production loops observed separately | Open; targeted reproduction needed |
+| H-002 | P0 | Rewrite changes voice, sender or intent | Observed conversations + synthetic model evaluation | Prompt deployed; monthly semantic drift confirmed; not fixed in the 14 October pass: needs the paired model evaluation (prompt proposal and eval harness ready) |
+| H-003 | P0 | Tool errors lack consistent recovery classification | Code finding + proposal | Open; validate incident mapping; not fixed: incident mapping still to validate |
+| H-004 | P0 | Repair loops can survive argument changes | Code finding; production loops observed separately | Open; targeted reproduction needed; revalidated 14 October, no change: needs a targeted reproduction |
 | H-005 | P1 | Provider billing/quota availability and recovery | Observed | Partly fixed locally (not deployed): 402/quota failures named as account blockers; image calls stop after one; route circuit breaking open |
-| H-006 | P0 | MCP approval, network policy and authentication failures | Observed + code review | Current production resolution unverified |
+| H-006 | P0 | MCP approval, network policy and authentication failures | Observed + code review | Current production resolution unverified; not fixed: needs the remote MCP error strings and current manifests/allowlist |
 | H-007 | P1 | Skill entry points omit sibling dependencies | Monthly failures + activation/recovery traces + code | Confirmed current renderer staging defect |
 | H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Directory guarantee committed locally (not deployed); execution diagnostics open |
 | H-009 | P1 | Sandbox operation recovery and error classification | Observed missing-sandbox failures + code findings | Reconnect-after-pause fix committed (not deployed); typed classification/fault injection open |
 | H-010 | P1 | Snapshot timeout does not cancel underlying work | Code finding | Fix committed locally (not deployed): late snapshot work can no longer upload or persist after a timeout |
 | H-011 | P1 | Encoding, oversized inputs and malformed tool arguments | Observed | Image payload guard and binary/UTF-16 reads committed locally (not deployed); tool-argument/HTTP 400 failures open |
-| H-012 | P1 | Generated files and numerical content can be incorrect | Observed user reports | Open; reproduce against source artifacts |
-| H-013 | P2 | Repeated preparation and snapshot work | Code finding + performance proposals | Open; benchmark before claiming gains |
+| H-012 | P1 | Generated files and numerical content can be incorrect | Observed user reports | Open; reproduce against source artifacts; not fixed: needs domain fixtures and a model evaluation |
+| H-013 | P2 | Repeated preparation and snapshot work | Code finding + performance proposals | Open; benchmark before claiming gains; not fixed: needs benchmarks |
 | H-014 | P1 | Recovery-required runs need clearer continuation | Observed + proposal | Open; preserve uncertain external outcomes |
-| H-015 | P2 | Expired queued text is hard to recover | Observed expiry + code finding | Open; explicit recovery UX needed |
+| H-015 | P2 | Expired queued text is hard to recover | Observed expiry + code finding | Open; explicit recovery UX needed; blocked 14 October: web queue model is mid-refactor in uncommitted work |
 | H-016 | P1 | Shell success masks failed operations | Observed; cause verification noted below | Partly fixed locally (not deployed): earlier non-zero commands are listed when the final status is 0; pipelines open |
-| H-017 | P1 | Source freshness and verification claims | Observed; cause verification noted below | Open |
+| H-017 | P1 | Source freshness and verification claims | Observed; cause verification noted below | Open; not fixed: needs a model evaluation |
 | H-018 | P1 | Skill save validation discovery | Observed; cause verification noted below | Fix committed locally (not deployed): all SKILL.md problems reported together with a valid example |
-| H-019 | P1 | Structural versus visual validation | Observed; cause verification noted below | Open |
-| H-020 | P1 | Unnecessary tools for text edits | Observed; cause verification noted below | Open |
-| H-021 | P1 | Long model retries strand work | Observed; cause verification noted below | Open |
-| H-022 | P1 | Corrections and constraints missed | Observed; cause verification noted below | Open |
+| H-019 | P1 | Structural versus visual validation | Observed; cause verification noted below | Open; not fixed: needs a model evaluation (placeholder false positive is H-058) |
+| H-020 | P1 | Unnecessary tools for text edits | Observed; cause verification noted below | Open; not fixed: savings must be measured first |
+| H-021 | P1 | Long model retries strand work | Observed; cause verification noted below | Open; not fixed: retry/model timing evidence needed |
+| H-022 | P1 | Corrections and constraints missed | Observed; cause verification noted below | Open; not fixed: needs a model evaluation |
 | H-023 | P1 | Current date and deadline anchoring | Observed; cause verification noted below | Partly fixed locally (not deployed): the turn context now states the current date; user time zone open |
-| H-024 | P1 | Connector files unavailable to sandbox tools | Observed; cause verification noted below | Open |
-| H-025 | P1 | Technical claims persist without source verification | Observed; cause verification noted below | Open |
-| H-026 | P1 | Platform capability and privacy answers lack tenant facts | Observed unsupported claims | Verify configuration and prompt gap |
+| H-024 | P1 | Connector files unavailable to sandbox tools | Observed; cause verification noted below | Open; revalidated 14 October: same no-path cause as H-068 (fixed locally); task receipt unchecked |
+| H-025 | P1 | Technical claims persist without source verification | Observed; cause verification noted below | Open; not fixed: needs a model evaluation |
+| H-026 | P1 | Platform capability and privacy answers lack tenant facts | Observed unsupported claims | Verify configuration and prompt gap; not fixed: needs approved tenant facts and an evaluation |
 | H-027 | P1 | Folder uploads accepted as empty files | Observed zero-byte attachments | Composer fix committed locally (not deployed): 0-byte drops are refused with folder/ZIP guidance; other upload surfaces open |
 | H-028 | P1 | Changed artifacts suppressed as duplicate publications | Observed + code finding | Fix committed locally (not deployed): republication after a change is allowed; identical bytes return the earlier receipt |
-| H-029 | P1 | Unsupported authorship and verification guarantees | Observed conversation | Open; behavior evaluation needed |
+| H-029 | P1 | Unsupported authorship and verification guarantees | Observed conversation | Open; behavior evaluation needed; not fixed: needs a model evaluation |
 | H-030 | P1 | Legitimate asynchronous polling triggers loop termination | Observed raw trace + matching code | Fix committed locally (not deployed): pending-job repeats are bounded polling |
 | H-031 | P0 | Blob deletion receipt fails SQL parameter inference | Production stack traces + read-only PREPARE reproduction | Fix committed locally (not deployed); backlog reconciliation needs a separate reviewed plan |
 | H-032 | P1 | Cache metrics obscure low token coverage | Complete final-window usage + code + prior audit | Metric, diagnostics and per-turn prefix layout committed locally (not deployed); live coverage evaluation and MCP tool-surface/provider affinity open |
 | H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Validator fix committed locally (not deployed); attempt IDs/release manifest open |
-| H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending |
-| H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified |
+| H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending; not fixed: needs a model evaluation |
+| H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified; not fixed: UI cause still unverified |
 | H-036 | P2 | Later tool results can disappear from bounded history | Deployed code finding | Fix committed locally (not deployed): omitted results carry an explicit marker; production occurrence still not established |
-| H-037 | P1 | Search operators removed before upstream search | Production query/output + matching local BerryCrawl code | Remote BerryCrawl revision unverified |
+| H-037 | P1 | Search operators removed before upstream search | Production query/output + matching local BerryCrawl code | Remote BerryCrawl revision unverified; not fixed: remote BerryCrawl |
 | H-038 | P1 | Gemini streaming merges distinct tool calls | Monthly malformed calls + local adapter-to-worker reproduction | Worker fix committed locally (not deployed): calls separated by id when indices restart; desktop adapter and remote gateway open |
 | H-039 | P1 | Truncated vision output accepted and cached as complete | 1,535 length finishes / 362 tasks / 106 users + deployed code | Fix committed locally (not deployed): truncated observations marked incomplete and never cached; adaptive budget open |
 | H-040 | P1 | Irrelevant task outcomes and temporary memories replace missing source | Traced conversation + stored grounding + deployed retrieval | Partly fixed locally (not deployed): personal memory extraction sees only the user's words; retrieval relevance and existing memories open |
 | H-041 | P1 | Image ratio and dimensions are assumed from request | 234 inconsistent metadata outputs / 71 tasks; one PNG verified | Worker fix committed locally (not deployed): metadata from returned bytes plus mismatch notes; provider-aware sizes and local paths open |
 | H-042 | P1 | Transparent text image misclassified as blank | Original source pixels + full production trace | Fix committed locally (not deployed): transparent previews flattened onto a contrasting matte |
-| H-043 | P1 | Inherited presentation fonts require manual repair | 60 gate-failure steps / 36 tasks; full latest trace + local template/code | Confirmed current published-package inheritance gap |
+| H-043 | P1 | Inherited presentation fonts require manual repair | 60 gate-failure steps / 36 tasks; full latest trace + local template/code | Confirmed current published-package inheritance gap; blocked 14 October: python-pptx unavailable here; template manifest has prepared edits (design recorded) |
 | H-044 | P2 | Email copy workflow and failure feedback | User complaint + local copy implementation | Copy feedback fixed locally (not deployed): success shown only after the write, failures reported; rich-copy cause unverified |
-| H-045 | P1 | Generated reusable skills need independent domain validation | Installed skill + primary sources + current content hashes | Confirmed current skill; proposal pending review |
+| H-045 | P1 | Generated reusable skills need independent domain validation | Installed skill + primary sources + current content hashes | Confirmed current skill; proposal pending review; not fixed: design decision needed |
 | H-046 | P1 | Image paths outlive files and abort model preparation | 26-run read/generation symptom scan; four complete lifetime traces + deployed code | Fix committed locally (not deployed): existence-checked reads, missing history images become notices |
-| H-047 | P2 | Arabic and English mixing makes answers difficult to read | Explicit user correction + local renderer review | User-reported friction; browser/deployment reproduction pending |
+| H-047 | P2 | Arabic and English mixing makes answers difficult to read | Explicit user correction + local renderer review | User-reported friction; browser/deployment reproduction pending; blocked 14 October: needs a browser reproduction |
 | H-048 | P1 | Provider errors replay as ordinary assistant history | One fully reviewed false completion + offline reproduction + deployed code | Fix committed locally (not deployed); PostgreSQL + unit regressions |
 | H-049 | P1 | Mixed PDF image pages counted as fully reviewed text | One verified source omission + 102 input-read symptoms / 34 tasks / 22 users + deployed code | Partly fixed locally (not deployed): pages without text are reported as unreviewed with inspection guidance; selective OCR open |
 | H-050 | P2 | Ready optional capabilities discarded at admission deadline | Deployed-function offline reproduction; related guarded calls | Fix committed locally (not deployed): settled results kept past the deadline; capability-change note open |
@@ -80,10 +80,10 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-052 | P1 | Requested skills missed despite an enabled catalog entry | Frozen admitted BSBG skill + complete task trace + current prompt/tool code | Hint committed locally (not deployed): explicitly requested short names point at the matching enabled skill; behaviour unevaluated |
 | H-053 | P1 | Changed generator sources ignored by duplicate-call guard | Fully traced task + exact deployed-function replay; nine condition candidates | Fix committed locally (not deployed): edits of referenced files reset observation repeats |
 | H-054 | P1 | Vision retries blocked without failure classification or recovery state | Exact deployed replay + nine monthly guard events; two fully reviewed tasks | Fix committed locally (not deployed): one retry after a transient failure; success resolves |
-| H-055 | P2 | Partial multi-output writes block recovery | Production sequence + exact current helper fixture | Confirmed current personal CV helper defect |
-| H-056 | P1 | Duplicate JSON keys silently omit substantive artifact content | Canonical published DOCX + exact spec replay + fresh production parser | Confirmed current parser gap; 3 candidate writes, 1 causal output verified |
+| H-055 | P2 | Partial multi-output writes block recovery | Production sequence + exact current helper fixture | Confirmed current personal CV helper defect; blocked: personal cv-creator-new package is not in this repository |
+| H-056 | P1 | Duplicate JSON keys silently omit substantive artifact content | Canonical published DOCX + exact spec replay + fresh production parser | Confirmed current parser gap; 3 candidate writes, 1 causal output verified; blocked 14 October: fix lies in prepared, uncommitted AESG sources |
 | H-057 | P2 | Malformed question batches silently lose questions and choices | Complete task trace + exact deployed-function replay; 1/305 monthly batches | Fix committed locally (not deployed): malformed batches return a field-specific repair error |
-| H-058 | P2 | Placeholder checks reject legitimate user content | Full task trace + current production bytes + exact offline fixture | Confirmed current validator defect; broader diagnostic impact unchecked |
+| H-058 | P2 | Placeholder checks reject legitimate user content | Full task trace + current production bytes + exact offline fixture | Confirmed current validator defect; broader diagnostic impact unchecked; blocked 14 October: fix lies in prepared, uncommitted AESG sources |
 | H-059 | P2 | Fixed XLSX row heights clip long wrapped comments | Native source/workbook comparison + visual reproduction + fresh production script hash | Fix committed locally (not published): rows sized to wrapped text; widths kept up to 100 with warnings |
 | H-060 | P2 | Repeated image reads do not renew image-selection recency | Deployed selector reproduction + task 219 recovery + 60 candidate reads / 23 native-image-admitted runs | Fix committed locally (not deployed): most-recent-read ranking |
 | H-061 | P2 | Image inspection silently discards accepted questions | 703 completed argument exposures + compiled-executor replay + current SSM hash | Fix committed locally (not deployed): no-mode questions run focused; overview says when it did not send the question |
@@ -91,7 +91,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 
 | H-063 | P1 | Streaming XLSX random access exhausts the tool budget | Full failed task + library source + measured single-pass fixture | Guidance committed locally (not published): single-pass analysis route in the xlsx skill; helper open |
 | H-064 | P1 | Deferred skill staging omits required entry-point dependencies | Current stager/guides + Office/CV repair traces; 391 symptom steps /261 tasks | Closure/declared-dependency staging committed locally (not deployed); AESG manifests pending skill review |
-| H-065 | P2 | Unfinished generated bases appear as downloadable final outputs | Current publication contract + three verified base/final pairs; 63 co-occurrence runs /21 tasks | Confirmed contract mismatch; wrong-download UX impact unmeasured |
+| H-065 | P2 | Unfinished generated bases appear as downloadable final outputs | Current publication contract + three verified base/final pairs; 63 co-occurrence runs /21 tasks | Confirmed contract mismatch; wrong-download UX impact unmeasured; not fixed: design decision needed |
 | H-066 | P1 | Operator recovery reuses a settled budget reservation | Five exact denial runs /five tasks /four users; native ledger/current API/worker trace | Fix committed locally (not deployed); reproduced and covered by PostgreSQL regression |
 | H-067 | P2 | Office pagination repeats whole-file transfer/extraction | Six causal DOCX reads + deployed extractor; 100 repeat candidates /50 tasks /31 users | Partly fixed locally (not deployed): in-process extraction reuse by content hash; durable cache and transfer reuse open |
 | H-068 | P1 | Connector import returns ready before verified sandbox hydration | Eight whole-history missing-path examples;217 no-path receipts /270 first imports /49 tasks /14 users | Bounded verification wait + explicit pending receipt committed locally (not deployed); verified-blob counterexample open |
@@ -100,8 +100,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-070 | P1 | Large MCP text is silently cut and loses pagination cursors | 86 limit outputs /49 tasks;11 hidden cursors /7 tasks; whole trace and deployed fixture | Valid-JSON bounding with exact cursor + receipt committed locally (not deployed); compact projections open |
 | H-071 | P1 | Successful image reads can be omitted from model input | Observed + current code | Fix committed locally (not deployed): recency ranking + withheld-image notices |
 | H-072 | P1 | Continue excludes preserved sandbox state of interrupted run | Native snapshot + current lineage code | Same cause as H-051; fix committed locally (not deployed) |
-| H-073 | P1 | CV parser treats project-title year as a date | Task85 + live skill function reproduction | Confirmed current; literal structured names needed |
-| H-074 | P1 | CV workflow requires unused photos and lacks blank/unknown input states | Tasks65/118/131 + live skill contract | Confirmed current; format-aware input requirements needed |
+| H-073 | P1 | CV parser treats project-title year as a date | Task85 + live skill function reproduction | Confirmed current; literal structured names needed; blocked: personal cv-creator-new package is not in this repository |
+| H-074 | P1 | CV workflow requires unused photos and lacks blank/unknown input states | Tasks65/118/131 + live skill contract | Confirmed current; format-aware input requirements needed; blocked: personal cv-creator-new package is not in this repository |
 | H-075 | P1 | Internal connector session expires while worker caches it | Task139 + deployed API/worker parity | Fix committed locally (not deployed): active-run lease with per-call access checks |
 | H-076 | P1 | Shared-drive scope is lost during discovery and traversal | Task139 and related traces + deployed Google tools | Fix committed locally (not deployed); live Google check pending |
 

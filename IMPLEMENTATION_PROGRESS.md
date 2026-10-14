@@ -81,7 +81,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f5ec9f5` | H-027 | None (UI). |
 | `887c64a` | H-018 | None. |
 | `220767a` | H-005 | None. |
-| _pending_ | H-052 | None. |
+| `36022d9` | H-052 | None. |
+| `d65df09` | H-048 script (test) | None. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -177,7 +178,8 @@ fixture; this is fixed in `54c9255`.
 | H-027 (dropped folders attached as empty files) | Committed — partial | `f5ec9f5` | Not deployed (web) |
 | H-018 (skill save reveals problems one at a time) | Committed | `887c64a` | Not deployed (shared package: API and worker rebuild) |
 | H-005 (credit/quota exhaustion presented as a model problem) | Committed — partial | `220767a` | Not deployed (worker) |
-| H-052 (requested short skill name not resolved) | Committed — partial (hint; behaviour unevaluated) | _pending_ | Not deployed (worker) |
+| H-052 (requested short skill name not resolved) | Committed — partial (hint; behaviour unevaluated) | `36022d9` | Not deployed (worker) |
+| H-048 script follows the per-turn context layout | Committed | `d65df09` | Test only |
 | H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
@@ -185,6 +187,83 @@ fixture; this is fixed in `54c9255`.
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
 | H-004 (repair loops across changed arguments) | Blocked — needs a targeted reproduction; no change | — | — |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
+
+## Remaining issues (28 of 76) and what each needs
+
+48 of the 76 registered issues have committed fixes (24 full, 24 partial). None is
+deployed. The other 28 are not done for the reasons below; no code was changed for them.
+
+**Needs a live model evaluation** (behavioural; no billable model calls were authorised
+in this session; prompt changes are behaviour changes and need measured evidence):
+
+| ID | What is ready / what is missing |
+| --- | --- |
+| H-002 | Prompt proposal in `SYSTEM_PROMPT.md`; deployed prompt and offline eval harness committed (`d5b9138`). Needs the paired multi-model evaluation with saved-draft checks. |
+| H-012 | Numerical/deliverable correctness; needs domain fixtures with deterministic checks and an evaluation. |
+| H-017 | Source freshness and verification claims; needs claim/evidence evaluation. |
+| H-019 | Structural versus visual validation claims (the placeholder false positive is H-058). |
+| H-020 | Text-only work entering the sandbox; savings must be measured first. |
+| H-022 | Explicit corrections and constraints missed. |
+| H-025 | Technical claims without source verification. |
+| H-026 | Tenant facts for platform/privacy answers; also needs approved tenant fact content. |
+| H-029 | Unsupported authorship and verification guarantees. |
+| H-034 | Benign file conversion refused. |
+
+**Needs production evidence or a reproduction** (cause not established; a change now would
+be speculative):
+
+| ID | Missing evidence |
+| --- | --- |
+| H-003 | Incident-to-category mapping for tool errors. |
+| H-004 | A targeted reproduction of a cosmetic-argument loop (see the H-004 entry). |
+| H-006 | Exact remote MCP/BerryCrawl error strings, current manifests and allowlist. |
+| H-013 | Benchmarks of preparation and snapshot work. |
+| H-021 | Retry and model timing for the stranded-work cases. |
+| H-024 | The task's raw connector receipt (same symptom as H-068, fixed in `f2923b2`). |
+| H-035 | Whether duplicate submissions are a UI race or intentional resubmission. |
+| H-047 | A browser reproduction separating language choice from layout. |
+
+**Owned elsewhere or outside this repository:**
+
+| ID | Owner / location |
+| --- | --- |
+| H-015 | Web queue model is being moved into the uncommitted `packages/client-core`. |
+| H-037 | Remote BerryCrawl revision. |
+| H-043 | Needs python-pptx (not installed; no network installs) and touches the prepared template manifest. |
+| H-055, H-073, H-074 | The user's personal `cv-creator-new` package in the production database; none of the cited production hashes match this repository's `cv-creator`. |
+| H-056, H-058 (and the H-064 AESG manifests) | Prepared, already-published AESG sources that are not committed (see "Blocked: prepared AESG skill sources"). |
+
+**Needs a design decision** (multi-day, cross-surface): H-045 (domain-verified generated
+skills) and H-065 (draft versus final image publication).
+
+## Final verification (14 October)
+
+Clean checkout of `36022d9` (and of `d65df09` for the script change), compiled tests removed from
+`dist`, package dependencies rebuilt:
+
+| Check | Result |
+| --- | --- |
+| `pnpm --filter @berry/web... typecheck` | Pass |
+| `pnpm --filter @berry/web... build` | Pass |
+| `pnpm --filter @berry/api... typecheck` | Pass |
+| `pnpm --filter @berry/worker... typecheck` | Pass |
+| Worker tests | 534 passed, 3 skipped |
+| API tests | 450 passed, 24 failed (the pre-existing DI failures in six controller suites; identical at the base commit) |
+| Web tests | 295 passed |
+| `@berry/shared` tests | 128 passed |
+| `@berry/desktop-ui` tests | 72 passed |
+| `deploy/tests/test_aesg_xlsx_geometry.py` | 2 passed |
+| PostgreSQL scripts (disposable loopback database) | All 8 pass: queue steering 8, Continue lineage 4, recovery budget 4, provider-error history 1 (after `d65df09`), blob receipt 4, connector import Library 3, binary tool output 1, index-failure file state 3 |
+| Per-commit worker/API typecheck sweep | Every commit passes except `c94340b`, `67a22fa` and `375f8dd` (H-041 test fixture; fixed in `54c9255`) |
+
+**Deployment.** Nothing has been deployed or published. Every entry above records which
+service it needs (worker, API, web, a shared-package rebuild, or an organization skill
+sync). No commit adds or changes a database migration. Historical backlog
+reconciliations (H-031 dead letters, H-062 files left `processing`, H-069 Library entries)
+are proposed only and need their own reviewed plans. Before a Git-based worker
+deployment, compare the server's `/opt/berry/apps/worker/src` with the repository (see
+H-014). Do not run the organization skill sync from a checkout that lacks the published
+AESG packages.
 
 ## Issue log
 
@@ -1657,6 +1736,12 @@ fixture; this is fixed in `54c9255`.
 - **Remaining.** The user's or organisation's time zone for normal chat turns (users
   near midnight UTC see the UTC date); stale dates in a run resumed after a long wait;
   deadline and weekday checks in answers remain behavioural.
+- **Later correction.** Because the per-turn context now always exists, the model input
+  ends with that message after the request. The H-048 PostgreSQL script assumed the
+  request came last and failed from this commit on; the final verification found it, and
+  `d65df09` updates it. It still fails on the pre-H-048 tree for the original reason.
+  Image attachments are unaffected: they are added to the request before the context is
+  inserted.
 - **Commit.** `a7118a4`.
 
 ### H-067 — Paginated Office reads repeat the whole extraction
@@ -1879,3 +1964,4 @@ fixture; this is fixed in `54c9255`.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Configured aliases in skill metadata, and the model evaluation in the
   issue's acceptance criteria.
+- **Commit.** `36022d9`.
