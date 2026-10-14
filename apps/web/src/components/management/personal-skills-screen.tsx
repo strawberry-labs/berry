@@ -570,6 +570,11 @@ function SkillDetailsDialog({
                 {descriptionExpanded ? "See less" : "See more"}
               </Button>
             ) : null}
+            {skill.personal?.diagnostics.length ? (
+              <p role="note" className="text-xs leading-5 text-[var(--berry-text-secondary)]">
+                {skill.personal.diagnostics.join(" ")}
+              </p>
+            ) : null}
             {actionError ? (
               <p role="alert" className="text-xs text-[var(--berry-danger)]">{actionError}</p>
             ) : null}

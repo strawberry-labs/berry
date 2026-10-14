@@ -6,7 +6,7 @@ import {
 } from "@berry/shared";
 import { describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnToolExecutor } from "../turn-runner.js";
-import { DurablePersonalSkillToolExecutor } from "./tools.js";
+import { ASSISTANT_SAVED_SKILL_NOTE, DurablePersonalSkillToolExecutor } from "./tools.js";
 
 describe("DurablePersonalSkillToolExecutor", () => {
   it("declares activation abort support, keeps saving non-abortable, and delegates other tools", () => {
@@ -95,6 +95,48 @@ describe("DurablePersonalSkillToolExecutor", () => {
       expect.stringContaining("trusted=true"),
       expect.arrayContaining([snapshot.tenantId, snapshot.userId, "decision-brief", content]),
     );
+  });
+
+  describe("assistant-saved skills carry an unverified-rules status (H-045)", () => {
+    it("records the status when saving and says so in the receipt", async () => {
+      const execute = vi.fn(async () => undefined);
+      const tools = new DurablePersonalSkillToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "" })) }, { execute, query: vi.fn(async () => []) });
+      // Task 756: a Singapore redundancy calculator saved after a self-test, with rules that contradict CPF and MOM guidance.
+      const content = "---\nname: sg-redundancy\ndescription: Calculate Singapore redundancy payments\n---\n\nCompensation in lieu of notice attracts CPF.";
+      const result = await tools.execute({ tenantId: "00000000-0000-7000-8000-000000000001", userId: "user_1" } as DurableTurnSnapshot, {
+        id: "save-1", type: "tool.save_personal_skill", input: { toolName: "save_personal_skill", arguments: { content } },
+      } as never);
+      expect(execute).toHaveBeenCalledWith(expect.stringContaining("diagnostics=EXCLUDED.diagnostics"), expect.arrayContaining([JSON.stringify([ASSISTANT_SAVED_SKILL_NOTE])]));
+      expect(result.output).toMatchObject({ skill: { name: "sg-redundancy", enabled: true, domainVerification: "unverified" } });
+      expect(JSON.stringify(result.output)).toContain("primary source");
+      expect(result.summary).toContain("not independently verified");
+    });
+
+    const personalSkillSnapshot = () => {
+      const snapshot = storedSkillSnapshot();
+      const runtime = snapshot.runtimeRequest as { extraSkills: Array<Record<string, unknown>> };
+      runtime.extraSkills = [{ ...runtime.extraSkills[0], name: "sg-redundancy", filePath: "/personal-skills/skill_sg/SKILL.md", resources: [] }];
+      return snapshot;
+    };
+    const activate = async (diagnostics: unknown[]) => {
+      const query = vi.fn(async (sql: string) => sql.includes("SELECT diagnostics FROM personal_skills") ? [{ diagnostics }] : []);
+      const tools = new DurablePersonalSkillToolExecutor({ execute: vi.fn(async () => ({ output: {}, summary: "" })) }, { execute: vi.fn(), query: query as never });
+      return tools.execute(personalSkillSnapshot(), {
+        id: "activate-sg", type: "tool.activate_skill", input: { toolName: "activate_skill", arguments: { name: "sg-redundancy" } },
+      } as never);
+    };
+
+    it("shows the caution whenever such a skill is activated", async () => {
+      const activated = await activate([ASSISTANT_SAVED_SKILL_NOTE]);
+      expect(activated.output).toMatchObject({ skill: "sg-redundancy", domainVerification: "unverified" });
+      expect(JSON.stringify(activated.output)).toContain("<skill_caution>");
+    });
+
+    it("shows no caution once a reviewed package replaced the status", async () => {
+      const activated = await activate([]);
+      expect(activated.output).not.toHaveProperty("domainVerification");
+      expect(JSON.stringify(activated.output)).not.toContain("<skill_caution>");
+    });
   });
 
   it("rejects invalid SKILL.md before writing", async () => {

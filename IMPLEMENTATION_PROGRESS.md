@@ -85,7 +85,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `d65df09` | H-048 script (test) | None. |
 | `966d9a1` | H-035 | None (UI). |
 | `1650581` | Behaviour evaluation harness (test) | None. |
-| _pending_ | H-065 | None. Draft images are written only inside the sandbox workspace. |
+| `6469a9d` | H-065 | None. Draft images are written only inside the sandbox workspace. |
+| _pending_ | H-045 | No schema change. New assistant-saved skills get one string in the existing `personal_skills.diagnostics` array; existing skills (including the task 756 calculator) are not modified. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -185,7 +186,8 @@ fixture; this is fixed in `54c9255`.
 | H-048 script follows the per-turn context layout | Committed | `d65df09` | Test only |
 | H-035 (duplicate task from a second Enter) | Committed — partial | `966d9a1` | Not deployed (web) |
 | Behaviour evaluation harness (H-002, H-012, H-017, H-019, H-020, H-022, H-025, H-026, H-029, H-034) | Committed — runs pending credentials | `1650581` | Test only |
-| H-065 (unfinished image bases published as finals) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-065 (unfinished image bases published as finals) | Committed — partial | `6469a9d` | Not deployed (worker) |
+| H-045 (assistant-saved skills look domain-verified) | Committed — partial | _pending_ | Not deployed (worker + web) |
 | H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
@@ -2044,3 +2046,36 @@ AESG packages.
   prefix once.
 - **Remaining.** A UI link from a finished file to its drafts, and the AESG skill's image
   instructions (prepared, uncommitted sources) should mention `purpose: "draft"`.
+- **Commit.** `6469a9d`.
+
+### H-045 — Assistant-saved skills are treated as if their domain rules were verified
+
+- **Evidence.** Task 756 saved an enabled Singapore redundancy calculator after a
+  self-test with no source lookup; its CPF rule for compensation in lieu of notice and
+  its retrenchment-notification trigger contradict official CPF Board and MOM guidance.
+  The production package still matches what was authored.
+- **Root cause (confirmed in code).** `save_personal_skill` wrote `enabled=true`,
+  `trusted=true` and empty diagnostics. Nothing distinguished a valid, runnable package
+  from one whose rules had been checked, so the skill read as authoritative in later tasks.
+- **Design and fix.** The three statuses are kept apart. Package validity is the existing
+  parse; execution trust is the unchanged `trusted` flag; domain verification is a new
+  note recorded in the existing `diagnostics` array. Effects:
+  - The save receipt carries `domainVerification: "unverified"` and asks the model to tell
+    the user and to record jurisdiction, effective date and primary sources for legal,
+    tax, payroll or safety rules.
+  - Activating such a skill puts a `<skill_caution>` before its instructions every time.
+  - The Skills dialog shows the note under the description.
+  - A user re-uploading a reviewed package through the existing upload path replaces the
+    diagnostics, so the caution disappears without a new control.
+- **Files.** `apps/worker/src/personal-skills/tools.ts` (+test),
+  `apps/web/src/components/management/personal-skills-screen.tsx`.
+- **Verification (isolated snapshot).** Worker typecheck pass and 538 passed / 3 skipped;
+  web build, typecheck and 295 tests pass. New cases: saving records the note and says so;
+  activation shows the caution while it is recorded and not after it is replaced. The first
+  two fail on the previous source; the control passes on both.
+- **Data impact.** No migration and no existing row changed. The task 756 skill keeps
+  its current diagnostics until it is re-saved or reviewed. Correcting it is a separate,
+  user-approved content change.
+- **Deployment.** Not deployed (worker + web).
+- **Remaining.** Source-backed creation with expected-output fixtures for consequential
+  calculators, and an explicit "mark reviewed" control.

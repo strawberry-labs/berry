@@ -154,10 +154,12 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
           name: metadata.name,
           description: metadata.description,
           enabled: true,
+          domainVerification: "unverified",
           resources: packageFiles.filter((file) => file.path !== "SKILL.md").map((file) => file.path),
         },
+        note: `${ASSISTANT_SAVED_SKILL_NOTE} Tell the user, and for legal, tax, payroll or safety rules state the jurisdiction, effective date and primary source in SKILL.md.`,
       },
-      summary: `Saved $${metadata.name} to the current user's Skills library with ${packageFiles.length - 1} resource file${packageFiles.length === 2 ? "" : "s"}`,
+      summary: `Saved $${metadata.name} to the current user's Skills library with ${packageFiles.length - 1} resource file${packageFiles.length === 2 ? "" : "s"}; its domain rules are not independently verified`,
     };
   }
 
@@ -174,7 +176,7 @@ export class DurablePersonalSkillToolExecutor implements DurableTurnToolExecutor
       `
 INSERT INTO personal_skills (
   id,tenant_id,user_id,name,description,content,enabled,trusted,source,source_url,version,hash,diagnostics,created_at,updated_at
-) VALUES ($1,$2::uuid,$3,$4,$5,$6,true,true,'text',NULL,$7,$8,'[]'::jsonb,now(),now())
+) VALUES ($1,$2::uuid,$3,$4,$5,$6,true,true,'text',NULL,$7,$8,$9::jsonb,now(),now())
 ON CONFLICT (id) DO UPDATE SET
   name=EXCLUDED.name,
   description=EXCLUDED.description,
@@ -185,11 +187,11 @@ ON CONFLICT (id) DO UPDATE SET
   source_url=NULL,
   version=EXCLUDED.version,
   hash=EXCLUDED.hash,
-  diagnostics='[]'::jsonb,
+  diagnostics=EXCLUDED.diagnostics,
   updated_at=now()
 WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=EXCLUDED.user_id
       `.trim(),
-      [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, content, metadata.version, hash],
+      [id, snapshot.tenantId, snapshot.userId, metadata.name, metadata.description, content, metadata.version, hash, JSON.stringify([ASSISTANT_SAVED_SKILL_NOTE])],
     );
     await executor.execute("DELETE FROM personal_skill_files WHERE skill_id=$1", [id]);
     const resources = packageFiles.filter((candidate) => candidate.path !== "SKILL.md").map((file) => {
@@ -269,6 +271,7 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const personalId = /^\/personal-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     const organizationId = /^\/organization-skills\/([^/]+)\/SKILL\.md$/.exec(skill.filePath)?.[1];
     options.signal?.throwIfAborted();
+    const caution = personalId ? await this.unverifiedSkillCaution(snapshot.tenantId, personalId) : undefined;
     const rows = await this.inTenant(snapshot.tenantId, (executor) => personalId
       ? executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM personal_skill_files WHERE skill_id=$1 ORDER BY path", [personalId])
       : executor.query<{ path: string; size_bytes: number; sha256: string; mode: number }>("SELECT path,size_bytes,sha256,mode FROM organization_skill_files WHERE organization_capability_id=$1 ORDER BY path", [organizationId]));
@@ -294,6 +297,7 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
         deferredResources: availableResources,
         stagedRelativeResources: [],
         stagedResourcePaths: [],
+        caution,
       });
     }
 
@@ -325,7 +329,18 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
       addedResources: stagedPackage.addedResources,
       dependencies: stagedPackage.dependencies,
       transfer: stagedPackage.transfer,
+      caution,
     });
+  }
+
+  /** The save-time caution for an assistant-saved personal skill, while it is still recorded (H-045). */
+  private async unverifiedSkillCaution(tenantId: string, skillId: string): Promise<string | undefined> {
+    const rows = await this.inTenant(tenantId, (executor) => executor.query<{ diagnostics: unknown }>(
+      "SELECT diagnostics FROM personal_skills WHERE id=$1",
+      [skillId],
+    ));
+    const diagnostics = rows[0]?.diagnostics;
+    return Array.isArray(diagnostics) && diagnostics.includes(ASSISTANT_SAVED_SKILL_NOTE) ? ASSISTANT_SAVED_SKILL_NOTE : undefined;
   }
 
   /**
@@ -484,6 +499,13 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
   }
 }
 
+/**
+ * Recorded in personal_skills.diagnostics when the assistant saves a skill:
+ * the package is valid and trusted to run, but nobody has checked its domain
+ * rules (H-045). A user re-uploading a reviewed package replaces it.
+ */
+export const ASSISTANT_SAVED_SKILL_NOTE = "Saved by the assistant: its domain rules (laws, rates, thresholds, formulas) have not been independently verified. Check them against primary sources before relying on its results.";
+
 export class ResourceNotStagedError extends Error {
   readonly code = "RESOURCE_NOT_STAGED";
 
@@ -507,6 +529,8 @@ interface SkillActivationState {
   /** Other skill packages staged because a requested entry point declares them. */
   dependencies?: StagedDependency[] | undefined;
   transfer?: SkillStagingTransfer | undefined;
+  /** Shown before the instructions when the skill's domain rules are unverified (H-045). */
+  caution?: string | undefined;
 }
 
 function renderActivationResult(skill: {
@@ -533,7 +557,8 @@ function renderActivationResult(skill: {
         ? `The requested resource files are materialized under ${directory}. Use only the exact paths needed for this task.`
         : "Load only resources required for the current task.");
   const dependencyState = formatResolvedDependencies(state.addedResources ?? [], state.dependencies ?? []);
-  const content = `${invocation}\n${resourceState}\n${dependencyState ? `${dependencyState}\n` : ""}${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
+  const caution = state.caution ? `<skill_caution>${state.caution}</skill_caution>\n` : "";
+  const content = `${caution}${invocation}\n${resourceState}\n${dependencyState ? `${dependencyState}\n` : ""}${DEFERRED_SKILL_RESOURCE_INSTRUCTIONS}`;
   const summary = state.requestedResources.length > 0
     ? `Loaded ${state.requestedResources.length} ${skill.name} resource file${state.requestedResources.length === 1 ? "" : "s"}`
     : `Activated ${skill.name}; ${state.availableResources.length} resource file${state.availableResources.length === 1 ? "" : "s"} available on demand`;
@@ -550,6 +575,7 @@ function renderActivationResult(skill: {
       stagedResourcePaths: state.stagedResourcePaths,
       ...(state.stagingSandboxId === undefined ? {} : { stagingSandboxId: state.stagingSandboxId }),
       ...(state.addedResources?.length ? { addedResources: state.addedResources } : {}),
+      ...(state.caution ? { domainVerification: "unverified" } : {}),
       ...(state.dependencies?.length ? { dependencies: state.dependencies } : {}),
       ...(state.requestedResources.length > 0 ? { readiness: "ready" } : {}),
       ...(state.transfer ? { transfer: state.transfer } : {}),
