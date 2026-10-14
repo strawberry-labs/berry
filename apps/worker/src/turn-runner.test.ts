@@ -120,6 +120,74 @@ describe("durable turn runner", () => {
     expect(history.filter((message) => message.role === "assistant")).toHaveLength(1);
   });
 
+  describe("prompt layout for provider prefix caching", () => {
+    const turn = (grounding: Record<string, unknown>, builtInTools: string[], history: Array<Record<string, unknown>>) => {
+      const current = providerSnapshot("openai-responses");
+      current.runtimeRequest = { ...current.runtimeRequest, builtInTools };
+      current.groundingContext = grounding;
+      current.entries = history.map((message, index) => ({
+        entryId: `entry-${index}`, parentEntryId: index ? `entry-${index - 1}` : null, entryType: "message", sequence: index + 1,
+        payload: { type: "message", id: `entry-${index}`, message },
+      }));
+      current.requestMessageId = `entry-${lastIndex(history, (message) => message.role === "user")}`;
+      return current;
+    };
+    const lastIndex = <T,>(items: readonly T[], match: (item: T) => boolean) => {
+      for (let index = items.length - 1; index >= 0; index -= 1) if (match(items[index]!)) return index;
+      return -1;
+    };
+    const firstTurn = [{ role: "user", content: "Summarise section 4." }];
+    const firstAnswer = [
+      ...firstTurn,
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" },
+      { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 4: fire pumps" },
+      { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" },
+    ];
+
+    it("keeps the system message and earlier turns identical when grounding and routed tools change", () => {
+      const last = modelMessages(turn({ memory: "project uses NFPA 20" }, ["read"], firstAnswer)).messages;
+      const next = modelMessages(turn({ memory: "pumps were replaced in 2025" }, ["read", "bash"], [
+        ...firstAnswer, { role: "user", content: "Now check section 5." },
+      ])).messages;
+
+      expect(next[0]).toEqual(last[0]);
+      expect(String(next[0]?.content)).not.toContain("untrusted_grounding");
+      expect(String(next[0]?.content)).toContain("Runtime environment:");
+      // Everything before the earlier turn's context message is reused verbatim.
+      const earlierContext = last.findIndex((message) => String(message.content).startsWith("<berry_turn_context>"));
+      expect(earlierContext).toBe(2);
+      expect(next.slice(0, earlierContext)).toEqual(last.slice(0, earlierContext));
+      const context = next.find((message, index) => index > 2 && String(message.content).startsWith("<berry_turn_context>"));
+      expect(String(context?.content)).toContain("pumps were replaced in 2025");
+      expect(next.indexOf(context!) - 1).toBe(lastIndex(next, (message) => message.content === "Now check section 5."));
+    });
+
+    it("appends within a run without rewriting the request or its context", () => {
+      const grounding = { memory: "project uses NFPA 20" };
+      const call1 = modelMessages(turn(grounding, ["read"], firstTurn)).messages;
+      const call2 = modelMessages(turn(grounding, ["read"], firstAnswer.slice(0, 3))).messages;
+      expect(call2.slice(0, call1.length)).toEqual(call1);
+    });
+
+    it("adds per-call recovery text at the end instead of changing the prefix", () => {
+      const normal = turn({ memory: "x" }, ["read"], firstAnswer.slice(0, 3));
+      const recovering = turn({ memory: "x" }, ["read"], firstAnswer.slice(0, 3));
+      recovering.steps = [...recovering.steps, { ...modelStep("pending", 2), input: { iteration: 2, recoveryReason: "empty_response" } }];
+      const before = modelMessages(normal).messages;
+      const after = modelMessages(recovering).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(after.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining("Recovery instruction") });
+    });
+
+    it("keeps the original single system message when the request anchor is unavailable", () => {
+      const current = turn({ memory: "legacy grounding" }, ["read"], firstTurn);
+      current.requestMessageId = "compacted-away";
+      const messages = modelMessages(current).messages;
+      expect(String(messages[0]?.content)).toContain("legacy grounding");
+      expect(messages.some((message) => String(message.content).startsWith("<berry_turn_context>"))).toBe(false);
+    });
+  });
+
   describe("explicit Continue", () => {
     const continued = (after: Array<Record<string, unknown>>) => {
       const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
@@ -133,28 +201,37 @@ describe("durable turn runner", () => {
       current.requestMessageId = "latest-request";
       after.forEach((message, index) => push(`after-${index}`, message));
       const built = modelMessages(current);
-      return { system: String(built.messages[0]?.content), last: built.messages.at(-1) };
+      const contextIndex = built.messages.findIndex((message) => String(message.content).startsWith("<berry_turn_context>"));
+      return {
+        system: String(built.messages[0]?.content),
+        context: String(built.messages[contextIndex]?.content),
+        beforeContext: built.messages[contextIndex - 1],
+        last: built.messages.at(-1),
+      };
     };
 
     it("answers the pending request when the interrupted attempt produced nothing", () => {
-      const { system, last } = continued([]);
-      expect(system).toContain("failed before producing any response to the user's latest message");
-      expect(system).not.toContain("from the persisted partial output");
-      expect(last).toMatchObject({ role: "user", content: "Now refocus the comments on remote monitoring." });
+      const { system, context, beforeContext, last } = continued([]);
+      expect(context).toContain("failed before producing any response to the user's latest message");
+      expect(context).not.toContain("from the persisted partial output");
+      expect(system).not.toContain("explicit continuation request");
+      // The pending request is the latest user message; no synthetic "continue" turn follows.
+      expect(beforeContext).toMatchObject({ role: "user", content: "Now refocus the comments on remote monitoring." });
+      expect(String(last?.content)).toMatch(/^<berry_turn_context>/);
     });
 
     it("still continues genuine partial output without repeating it", () => {
-      const { system, last } = continued([{ role: "assistant", content: [{ type: "text", text: "Remote monitoring: 1." }], stopReason: "failed" }]);
-      expect(system).toContain("from the persisted partial output");
+      const { context, last } = continued([{ role: "assistant", content: [{ type: "text", text: "Remote monitoring: 1." }], stopReason: "failed" }]);
+      expect(context).toContain("from the persisted partial output");
       expect(last).toMatchObject({ role: "user", content: "Continue the interrupted response from where it stopped. Do not repeat the completed portion." });
     });
 
     it("continues from completed tool results without redoing them", () => {
-      const { system, last } = continued([
+      const { context, last } = continued([
         { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" },
         { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 7: remote monitoring requirements" },
       ]);
-      expect(system).toContain("completed the tool work shown above");
+      expect(context).toContain("completed the tool work shown above");
       expect(JSON.stringify(last)).toContain("Continue from the completed tool results above");
     });
   });

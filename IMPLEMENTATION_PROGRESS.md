@@ -48,7 +48,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `91208bc` | H-009 (text-only finalisation) | None. |
 | `d95b252` | H-075 | None (read-only lookup of `turn_runs`/`tasks`/`tenant_memberships`). |
 | `52c0260` | H-033 | None. |
-| _pending_ | H-032 (diagnostics) | None. |
+| `3a27931` | H-032 (diagnostics) | None. |
+| _pending_ | H-032 (prompt layout) | None (prompt assembly only). |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
@@ -93,7 +94,8 @@ No pre-existing failures were observed in these suites.
 | H-031 (blob-deletion receipt SQL) | Committed | `f30b651` | Not deployed (worker); backlog reconciliation not started |
 | H-033 (revision provenance) | Committed — partial | `52c0260` | Not deployed (shared package; API + worker rebuild) |
 | H-032 (cache metric truth) | Committed — partial | `29dd951` | Not deployed (worker + API + web) |
-| H-032 (served backend + retention diagnostics) | Committed — partial | _pending_ | Not deployed (worker) |
+| H-032 (served backend + retention diagnostics) | Committed — partial | `3a27931` | Not deployed (worker) |
+| H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | _pending_ | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -648,3 +650,59 @@ No pre-existing failures were observed in these suites.
 - **Out of scope here.** The hosted Berry Router (separate product/repository) and the
   upstream provider's cache routing/affinity cannot be changed or verified from this
   repository; served-route header names emitted by the hosted Router remain unverified.
+- **Commit.** `3a27931`.
+
+### H-032 (part 3) — Keep per-turn context out of the stable prompt prefix
+
+- **Evidence.** Audit cause register: the first system message combined stable text with
+  per-turn grounding, routed tool guidance, intent, recovery and automatic skill
+  guidance; first-message changes were confirmed (30 calls at 1.17% coverage) and the
+  first call of every run/model covered 2.24%. The audit also notes 394 severe drops
+  with *unchanged* tracked prefixes, so this change cannot explain or fix all loss.
+- **Measured before change (offline, deterministic).** `scripts/measure-prompt-prefix.mjs`
+  renders real upstream requests (actual `modelMessages`, tool definitions and wire
+  serialisation; system text before tools as in DeepSeek/Qwen templates) for synthetic
+  sessions and reports the share of each request that is an exact prefix of an earlier
+  one — the ceiling a provider prefix cache could reach, not a provider measurement.
+  Before: within-run later calls already reuse 89–95%; the **first call of each
+  follow-up turn reuses only 6.6–19%** because grounding changes inside the system
+  message. Candidate placements were compared on a 6-turn × 6-call session: context at
+  the very end 91.8% overall / 91.7% later calls; context right after the request
+  90.7% / 94.8% (within-run reuse unchanged) — chosen as the smaller behavioural change.
+- **Fix.** The system message now holds only session-stable text (stable prompt, profile,
+  installed skills, direct-vision note, runtime environment). Per-turn items move, in
+  their original order, into a `<berry_turn_context>` **user-role** message placed right
+  after the turn's request message (user role because several chat templates hoist
+  system messages to the front). The rare empty-response recovery note is appended at
+  the end. If the request message is not in the uncompacted journal (legacy/compacted),
+  the prompt is assembled exactly as before. Continue's phase is now judged against the
+  admission-time journal head so it cannot change mid-run.
+- **Measured after (same harness, pre-change build `29dd951` vs this change).**
+
+  | Synthetic scenario | Overall reusable | Later calls | First call of follow-up turns |
+  | --- | --- | --- | --- |
+  | 6 turns × 6 calls, 4 KB grounding, 8 KB tool results | 82.0% → **90.8%** | 94.8% → 94.8% | 6.6% → **69.4%** |
+  | 3 × 4, stable tools | 73.8% → 80.4% | 89.1% → 89.2% | 18.4% → 57.1% |
+  | PDF skill guidance activates mid-run | 71.5% → 79.3% | 86.1% → 88.2% | 19.2% → 55.1% |
+  | MCP discovery adds tools mid-run | 69.6% → 75.7% | 83.9% → 83.3% | 18.3% → 57.3% |
+  | Five images re-sent at the tail | 57.4% → 62.6% | 65.6% → 65.7% | 18.4% → 57.1% |
+
+- **Files.** `apps/worker/src/turn-runner.ts` (`modelMessages`, `continuationPhase`),
+  `apps/worker/src/turn-runner.test.ts` (new layout tests; Continue tests now read the
+  instruction from the turn context), `scripts/measure-prompt-prefix.mjs`.
+- **Verification (isolated snapshot).** Worker typecheck pass; full worker suite 948
+  passed / 6 skipped; PostgreSQL suites (queue 8, continue-lineage 4, recovery-budget 4,
+  provider-error-history 1) pass. New tests: system message identical across turns when
+  grounding/routed tools change and earlier turns reused verbatim; within-run calls only
+  append; recovery text only at the end; legacy fallback unchanged.
+- **Not yet measured (blocked on authorised live access).** Provider-reported cache
+  coverage, TTFT, cost and answer quality per route (DeepSeek V4 Flash, Qwen 3.8 Flash
+  Next, MiniMax M3) with and without this change. This is a prompt-layout change:
+  grounding and tool guidance now arrive as Berry-labelled user-role context rather than
+  system text, so a paired behavioural evaluation is required before rollout. No
+  billable provider calls were made.
+- **Remaining contributors.** MCP discovery still changes tool membership mid-run (needs a
+  stable permission-scoped tool surface — a design decision with tool-selection-quality
+  trade-offs); images re-sent at the tail each call; provider routing/affinity for the
+  unchanged-prefix drops (needs the new `servedProvider` data plus hosted Router access).
+  The 85–90% warm target cannot be claimed until live data exists.

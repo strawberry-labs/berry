@@ -57,7 +57,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-029 | P1 | Unsupported authorship and verification guarantees | Observed conversation | Open; behavior evaluation needed |
 | H-030 | P1 | Legitimate asynchronous polling triggers loop termination | Observed raw trace + matching code | Open; bounded polling regression needed |
 | H-031 | P0 | Blob deletion receipt fails SQL parameter inference | Production stack traces + read-only PREPARE reproduction | Fix committed locally (not deployed); backlog reconciliation needs a separate reviewed plan |
-| H-032 | P1 | Cache metrics obscure low token coverage | Complete final-window usage + code + prior audit | Final-window 17.81% token coverage; stable-prefix loss attribution open |
+| H-032 | P1 | Cache metrics obscure low token coverage | Complete final-window usage + code + prior audit | Metric, diagnostics and per-turn prefix layout committed locally (not deployed); live coverage evaluation and MCP tool-surface/provider affinity open |
 | H-033 | P1 | Deployed revision rejected by telemetry validator | Running configuration + code + monthly metadata | Validator fix committed locally (not deployed); attempt IDs/release manifest open |
 | H-034 | P1 | Benign file conversion refused with no deliverable | Reviewed production conversation | Current outcome quality gap; model regression pending |
 | H-035 | P2 | Rapid duplicate task submissions | Observed duplicate inputs; cause hypothesis | UI/idempotency cause unverified |
@@ -437,6 +437,8 @@ Deployment and rollback details: [deployment record](output/rewrite-prompt-2026-
 - Acceptance: reconcile raw provider usage per physical call, actual backend, warm/cold cohorts, prompt/tool/image hashes, TTFT/cost and task quality. Estimate 2 days instrumentation +3–5 days experiments/design; no guaranteed savings yet.
 
 - **Implementation part 1 (14 October):** `cacheEligible` no longer ORs in observed hits; hit counts are independent of eligibility; dashboards lead with cached input-token share. Not deployed. Prefix-stability work continues below.
+
+- **Implementation parts 2–3 (14 October):** usage events now record the router-attributed serving provider/model and long retention is judged against 24 h. Per-turn context (grounding, routed tool guidance, intent, skill guidance) moved out of the system message into a Berry-labelled turn-context message after the request; an offline replay of real request assembly raises the reusable prefix of follow-up turns' first calls from 6.6% to 69.4% (realistic synthetic session) with within-run reuse unchanged. Live provider coverage/quality evaluation is pending; MCP tool-membership changes and provider affinity remain open. Not deployed.
 
 ### H-033 — Release provenance lost in telemetry
 
