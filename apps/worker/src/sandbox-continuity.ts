@@ -1329,11 +1329,28 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }, signal);
       const title = safeArtifactName(stringValue(args.title) ?? "Generated image").replace(/\.(png|jpe?g|webp|gif)$/i, "");
       const name = `${title}.${actual.extension}`;
-      const path = `${workspaceRoot}/outputs/${name}`;
+      // A draft is a working base for further editing (adding a title, logo or
+      // composite). It stays in the workspace, where snapshots keep it, and is
+      // not published as a finished image (H-065).
+      const draft = args.purpose === "draft";
+      const path = `${workspaceRoot}/${draft ? "drafts" : "outputs"}/${name}`;
       const writeInput = { sandbox_id: writableSandbox.id, path, content: bytes.toString("base64"), encoding: "base64" } as const;
       await (signal
         ? this.provider.files.write(writeInput, { signal })
         : this.provider.files.write(writeInput));
+      if (draft) {
+        const shape = `${actual.width}x${actual.height}${exactAspectRatio(actual.width, actual.height)}`;
+        const notes = generatedImageMismatchNotes(args, actual);
+        return {
+          output: {
+            text: `Generated a draft image at ${path} (${shape}). It is not published: finish it, save the final file under ${workspaceRoot}/outputs and publish that with persist_artifact.${notes ? ` ${notes}` : ""}`,
+            visionPath: path,
+            draft: { path, width: actual.width, height: actual.height, mimeType: actual.mediaType },
+          },
+          summary: `Generated draft ${name} (${shape})`,
+          sandbox: writableSandbox,
+        };
+      }
       if (!this.objects) throw new Error("Artifact object storage is not configured");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const stored = await this.objects.putArtifact(

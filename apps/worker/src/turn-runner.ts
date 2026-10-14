@@ -6453,7 +6453,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "create_image",
-      description: "Generate or materially edit an image, save it in the runtime workspace's outputs directory, and publish it into the task. Prefer this tool for image creation, background replacement, compositing, object addition/removal, and visual restyling when generative editing will produce a better result than shell-based image processing. Pass existing workspace images through reference_image_paths and express subject-preservation requirements in the prompt. The returned image is already published; do not copy, search for, or persist_artifact the same file again. Use deterministic file tools only for non-generative crop, resize, conversion, metadata, or pixel-exact transforms, or when the user forbids generative AI.",
+      description: "Generate or materially edit an image, save it in the runtime workspace's outputs directory, and publish it into the task. Prefer this tool for image creation, background replacement, compositing, object addition/removal, and visual restyling when generative editing will produce a better result than shell-based image processing. Pass existing workspace images through reference_image_paths and express subject-preservation requirements in the prompt. The returned image is already published; do not copy, search for, or persist_artifact the same file again. When the image is only a base you will edit further before delivery (for example adding a title, logo or composite), set purpose to draft: it is saved under drafts/ without being published, and you publish only the finished file with persist_artifact. Use deterministic file tools only for non-generative crop, resize, conversion, metadata, or pixel-exact transforms, or when the user forbids generative AI.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -6464,6 +6464,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
           size: { type: "string" },
           aspect_ratio: { type: "string", enum: ["1:1", "3:4", "4:3", "9:16", "16:9"] },
           transparent_background: { type: "boolean" },
+          purpose: { type: "string", enum: ["final", "draft"], description: "final (default) publishes the image; draft keeps a working base under drafts/ for further editing." },
           reference_image_paths: {
             type: "array",
             maxItems: 16,

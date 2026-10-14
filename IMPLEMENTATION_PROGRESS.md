@@ -83,7 +83,9 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `220767a` | H-005 | None. |
 | `36022d9` | H-052 | None. |
 | `d65df09` | H-048 script (test) | None. |
-| _pending_ | H-035 | None (UI). |
+| `966d9a1` | H-035 | None (UI). |
+| `1650581` | Behaviour evaluation harness (test) | None. |
+| _pending_ | H-065 | None. Draft images are written only inside the sandbox workspace. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -181,7 +183,9 @@ fixture; this is fixed in `54c9255`.
 | H-005 (credit/quota exhaustion presented as a model problem) | Committed — partial | `220767a` | Not deployed (worker) |
 | H-052 (requested short skill name not resolved) | Committed — partial (hint; behaviour unevaluated) | `36022d9` | Not deployed (worker) |
 | H-048 script follows the per-turn context layout | Committed | `d65df09` | Test only |
-| H-035 (duplicate task from a second Enter) | Committed — partial | _pending_ | Not deployed (web) |
+| H-035 (duplicate task from a second Enter) | Committed — partial | `966d9a1` | Not deployed (web) |
+| Behaviour evaluation harness (H-002, H-012, H-017, H-019, H-020, H-022, H-025, H-026, H-029, H-034) | Committed — runs pending credentials | `1650581` | Test only |
+| H-065 (unfinished image bases published as finals) | Committed — partial | _pending_ | Not deployed (worker) |
 | H-047 (Arabic/English presentation) | Blocked — needs browser reproduction; cause (language vs layout) undetermined | — | — |
 | H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
@@ -1993,3 +1997,50 @@ AESG packages.
 - **Deployment.** Not deployed (web).
 - **Remaining.** Server-side idempotency for task creation, so a lost response and
   reconnect cannot create a second task.
+- **Commit.** `966d9a1`.
+
+### Behaviour evaluation harness (for H-002, H-012, H-017, H-019, H-020, H-022, H-025, H-026, H-029, H-034)
+
+- **What it is.** `scripts/eval-behaviour.mjs` assembles each synthetic case with the
+  worker's real prompt and tool schemas (`modelMessages` plus the built-in tools, so the
+  per-turn context and date are included), sends it once to an OpenAI-compatible
+  endpoint, and checks the answer deterministically (`scripts/behaviour-eval-checks.mjs`).
+  27 cases cover the ten issues, each based on its documented failure, plus healthy
+  controls. Two candidate variants exist: `system-prompt-proposal.json` (the prepared
+  `SYSTEM_PROMPT.md` in place of today's prompt, which needs that untracked file in the
+  checkout) and `targeted-rules.json` (seven short rules appended to today's prompt).
+- **Verification.** `node --test scripts/behaviour-eval-checks.test.mjs`: 28/28, so every
+  case accepts a faithful answer and rejects the documented failure. A dry run assembles
+  all 27 cases for each variant (about 22.4K–29.4K characters per request).
+- **Not yet run.** Production credentials (`deploy/.env.production`) and the key files in
+  Downloads were both refused by the session's permission classifier, so no live results
+  exist yet. No prompt change has been made on the strength of these cases.
+- **Commit.** `1650581`.
+
+### H-065 — Unfinished image bases are published as final downloads
+
+- **Evidence.** Task 715: three finished thumbnail versions, each preceded by a published
+  base without the title or logo, gave six published images. The AESG image workflow
+  asks to publish only the final image, which the tool contract made impossible.
+  Month: 63 runs / 21 tasks / 12 users combine generation with image publication
+  (co-occurrence, not all duplicates).
+- **Root cause (confirmed in code).** `create_image` always wrote to `outputs/`, uploaded
+  the image, persisted it and returned an `image` that the journal projects as a finished
+  image part.
+- **Design and fix.** `create_image` takes an optional `purpose`. `final` (the default)
+  is unchanged. `draft` writes the image to `<root>/drafts/` and returns `visionPath` and
+  a `draft` receipt (path, actual dimensions and type) with an instruction to publish only
+  the finished file with `persist_artifact`. It makes no upload, no file record and no
+  image part. `drafts/` is outside `outputs/`, so finalisation does not auto-publish it,
+  and it is not excluded from sandbox snapshots, so the base survives recovery privately.
+  The tool description explains when to use a draft.
+- **Files.** `apps/worker/src/sandbox-continuity.ts`, `apps/worker/src/turn-runner.ts`
+  (schema and description), `apps/worker/src/sandbox-continuity.test.ts`.
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 535 passed / 3
+  skipped. New case: a draft is kept at `/workspace/drafts/…` with actual dimensions, with
+  no upload, no persisted output and no image part. It fails on the previous source; the
+  existing final-image tests are unchanged.
+- **Deployment.** Not deployed (worker). The tool description change alters the cached tool
+  prefix once.
+- **Remaining.** A UI link from a finished file to its drafts, and the AESG skill's image
+  instructions (prepared, uncommitted sources) should mention `purpose: "draft"`.

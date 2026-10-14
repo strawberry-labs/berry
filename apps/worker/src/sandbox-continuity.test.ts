@@ -3005,6 +3005,21 @@ describe("SandboxContinuityManager", () => {
       expect((result.output as { text: string }).text).toBe("Generated Site logo.png (1024x1024, 1:1).");
     });
 
+    it("keeps a draft base in the workspace without publishing it (H-065)", async () => {
+      // Task 715: each base was published next to its finished composite (six images for three versions).
+      const png = await sharp({ create: { width: 1_024, height: 1_024, channels: 3, background: "white" } }).png().toBuffer();
+      const { result, repository, objects } = await generate(png, { purpose: "draft", aspect_ratio: "1:1" });
+      expect(result.output).toMatchObject({
+        visionPath: "/workspace/drafts/Site logo.png",
+        draft: { path: "/workspace/drafts/Site logo.png", width: 1024, height: 1024, mimeType: "image/png" },
+      });
+      expect(result.output).not.toHaveProperty("image");
+      expect(result.output).not.toHaveProperty("artifact");
+      expect((result.output as { text: string }).text).toContain("It is not published");
+      expect(objects.putArtifact).not.toHaveBeenCalled();
+      expect(repository.persistOutput).not.toHaveBeenCalled();
+    });
+
     it("rejects provider data that is not a readable image instead of publishing it", async () => {
       await expect(generate(Buffer.from([137, 80, 78, 71]), {})).rejects.toThrow("not a readable");
     });
