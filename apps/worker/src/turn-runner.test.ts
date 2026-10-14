@@ -29,6 +29,7 @@ import {
   queuedFollowUpRuntimeRequest,
   modelMessages,
   usageCostMicros,
+  type BudgetReservationDecision,
   type DurableTurnModel,
   type DurableTurnMutation,
   type DurableTurnRepository,
@@ -2836,6 +2837,30 @@ describe("durable turn runner", () => {
     }));
   });
 
+  it("fails an inactive budget reservation honestly instead of completing with allowance advice", async () => {
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.runtimeRequest = { ...current.runtimeRequest, requestId: "turn_settled", budgetReservationRequired: true };
+    const repository = new FakeTurnRepository(current);
+    repository.budgetDecision = {
+      allowed: false,
+      reason: "The budget reservation for this turn is no longer active.",
+      code: "reservation_inactive",
+    };
+    let calls = 0;
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => {
+        calls += 1;
+        return { text: "unexpected", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+      },
+    }, noTools());
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+      .resolves.toMatchObject({ state: "failed" });
+    expect(calls).toBe(0);
+    expect(repository.current.error).toContain("no longer active");
+    expect(repository.current.error).not.toContain("Increase the applicable allowance");
+  });
+
   it("delivers read image pixels after tool results without rewriting the original user message", async () => {
     let request: ChatCompletionOptions | undefined;
     const model = new RouterDurableTurnModel({
@@ -3698,7 +3723,36 @@ describe("durable turn runner", () => {
       .resolves.toEqual({
         allowed: false,
         reason: "The budget reservation for this turn is no longer active.",
+        code: "reservation_inactive",
       });
+  });
+
+  it("extends a recovery generation's reservation without re-reserving settled usage", async () => {
+    const updates: Array<readonly unknown[]> = [];
+    const executor: SqlExecutor = {
+      query: async <T>(sql: string) => {
+        if (sql.includes("FROM budget_reservations")) {
+          return [{ id: randomUUID(), user_id: null, department_id: null, reserved_micros: "0", status: "reserved" }] as T[];
+        }
+        if (sql.includes("pg_advisory_xact_lock") || sql.includes("allowance_cycle_settings") || sql.includes("FROM budget_limits")) {
+          return [] as T[];
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      execute: async (sql, params = []) => {
+        if (sql.includes("UPDATE budget_reservations")) updates.push(params);
+      },
+      transaction: async <T>(callback: (transaction: SqlExecutor) => Promise<T>) => callback(executor),
+    };
+    const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
+    current.usageTotals = { ...current.usageTotals, costMicros: "5000" };
+    current.runtimeRequest.requestId = "turn_request:recovery:1";
+    current.runtimeRequest.budgetBaselineCostMicros = "5000";
+
+    await expect(new SqlDurableTurnRepository(executor).reserveNextModelCall(current, "100"))
+      .resolves.toEqual({ allowed: true, reason: null });
+    // Only the next call's estimate is added; the 5000 settled earlier is not reserved again.
+    expect(updates).toEqual([[tenantId, "turn_request:recovery:1", "100"]]);
   });
 
   it("persists retry diagnostics in the same statement that releases the lease", async () => {
@@ -3755,7 +3809,7 @@ class FakeTurnRepository implements DurableTurnRepository {
   events: AgentStreamEvent[] = [];
   outbox: Array<{ eventType: string; dedupeKey: string }> = [];
   mutations: DurableTurnMutation[] = [];
-  budgetDecision = { allowed: true, reason: null as string | null };
+  budgetDecision: BudgetReservationDecision = { allowed: true, reason: null };
   lastBudgetEstimate = "0";
   releasedError: string | undefined;
   releasedRetryDiagnostics: DurableTurnRetryDiagnostics | undefined;

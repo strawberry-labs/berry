@@ -321,10 +321,21 @@ export interface DurableTurnMutation {
   };
 }
 
+/**
+ * `inactive` means this turn's reservation lifecycle ended (for example it was
+ * settled at a recovery checkpoint); it is not an allowance problem and must
+ * not be reported as one.
+ */
+export type BudgetReservationDecision = {
+  allowed: boolean;
+  reason: string | null;
+  code?: "limit_reached" | "reservation_inactive" | "reservation_missing";
+};
+
 export interface DurableTurnRepository {
   claim(input: TurnExecuteJobPayload | TurnResumeJobPayload, owner: string, leaseSeconds: number): Promise<DurableTurnSnapshot | null>;
   heartbeat(tenantId: string, runId: string, owner: string, leaseSeconds: number, ownershipGeneration?: number): Promise<boolean>;
-  reserveNextModelCall?(snapshot: DurableTurnSnapshot, estimatedCostMicros: string): Promise<{ allowed: boolean; reason: string | null }>;
+  reserveNextModelCall?(snapshot: DurableTurnSnapshot, estimatedCostMicros: string): Promise<BudgetReservationDecision>;
   appendEvents(snapshot: DurableTurnSnapshot, events: readonly AgentStreamEvent[]): Promise<void>;
   commit(snapshot: DurableTurnSnapshot, mutation: DurableTurnMutation): Promise<void>;
   release(
@@ -943,6 +954,11 @@ export class DurableTurnRunner {
       estimateNextModelCallCost(snapshot, activeContextTokens, effectiveMaxTokens).toString(),
     );
     if (budget && !budget.allowed) {
+      if (budget.code === "reservation_inactive" || budget.code === "reservation_missing") {
+        throw new DurableTurnTerminalError(
+          `${budget.reason ?? "The budget reservation for this turn is no longer active."} Berry stopped before calling the model again; your work so far is saved. Continue the task or send a new message to start a fresh budgeted turn.`,
+        );
+      }
       await this.finishForBudget(snapshot, budget.reason ?? "Your spend limit has been reached.");
       return "completed";
     }
@@ -3138,10 +3154,10 @@ export class SqlDurableTurnRepository implements DurableTurnRepository {
   async reserveNextModelCall(
     snapshot: DurableTurnSnapshot,
     estimatedCostMicros: string,
-  ): Promise<{ allowed: boolean; reason: string | null }> {
+  ): Promise<BudgetReservationDecision> {
     const requestId = stringValue(snapshot.runtimeRequest.requestId);
     if (!requestId) return { allowed: true, reason: null };
-    const operation = async (executor: SqlExecutor) => {
+    const operation = async (executor: SqlExecutor): Promise<BudgetReservationDecision> => {
       const reservations = await executor.query<BudgetReservationGuardRow>(
         `SELECT id,user_id,department_id,reserved_micros::text,status
          FROM budget_reservations
@@ -3152,13 +3168,16 @@ export class SqlDurableTurnRepository implements DurableTurnRepository {
       const reservation = reservations[0];
       if (!reservation) {
         return snapshot.runtimeRequest.budgetReservationRequired === true
-          ? { allowed: false, reason: "The budget reservation for this turn is missing." }
+          ? { allowed: false, reason: "The budget reservation for this turn is missing.", code: "reservation_missing" }
           : { allowed: true, reason: null };
       }
       if (reservation.status !== "reserved") {
-        return { allowed: false, reason: "The budget reservation for this turn is no longer active." };
+        return { allowed: false, reason: "The budget reservation for this turn is no longer active.", code: "reservation_inactive" };
       }
-      const target = safeBigInt(snapshot.usageTotals.costMicros) + safeBigInt(estimatedCostMicros);
+      // After operator recovery this reservation covers only the new budget
+      // generation; earlier usage was already settled under its own request.
+      const generationCost = safeBigInt(snapshot.usageTotals.costMicros) - budgetBaselineCostMicros(snapshot.runtimeRequest);
+      const target = (generationCost > 0n ? generationCost : 0n) + safeBigInt(estimatedCostMicros);
       const reserved = safeBigInt(reservation.reserved_micros);
       const additional = target - reserved;
       if (additional <= 0n) return { allowed: true, reason: null };
@@ -3211,7 +3230,7 @@ export class SqlDurableTurnRepository implements DurableTurnRepository {
           hardLimit += safeBigInt(adjustments[0]?.total);
         }
         if (safeBigInt(spentRows[0]?.total) + additional > hardLimit) {
-          return { allowed: false, reason: `${limit.scope_type} spend limit has been reached.` };
+          return { allowed: false, reason: `${limit.scope_type} spend limit has been reached.`, code: "limit_reached" };
         }
       }
       await executor.execute(
@@ -7087,12 +7106,26 @@ WHERE tenant_id=$1::uuid AND aggregate_id=$2
   );
 }
 
+/** Last journal event sequence already settled by an earlier budget generation. */
+export function budgetUsageAfterSequence(runtimeRequest: Record<string, unknown>): number {
+  const value = Number(runtimeRequest.budgetUsageAfterSequence ?? 0);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function budgetBaselineCostMicros(runtimeRequest: Record<string, unknown>): bigint {
+  const value = safeBigInt(runtimeRequest.budgetBaselineCostMicros);
+  return value > 0n ? value : 0n;
+}
+
 async function finalizeUsageAndBudget(
   executor: SqlExecutor,
   snapshot: DurableTurnSnapshot,
   status: "completed" | "failed" | "cancelled" | "recovery_required",
 ): Promise<void> {
   const requestId = stringValue(snapshot.runtimeRequest.requestId) ?? `turn_${snapshot.id}`;
+  // Usage before an operator-recovery baseline is settled under the earlier
+  // budget generation's request id; never charge it twice.
+  const afterSequence = budgetUsageAfterSequence(snapshot.runtimeRequest);
   const usage = await executor.query<{
     input_tokens: number | string;
     output_tokens: number | string;
@@ -7118,9 +7151,9 @@ SELECT
   COUNT(*) FILTER (WHERE event_type='usage' AND payload->>'pricingSource'='estimated') AS estimated_pricing_count,
   COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'costRawMicros')::bigint,0) ELSE 0 END),0)::text AS exact_cost_micros
 FROM turn_events
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND sequence>$3
     `.trim(),
-    [snapshot.tenantId, snapshot.id],
+    [snapshot.tenantId, snapshot.id, afterSequence],
   );
   const totals = usage[0] ?? {
     input_tokens: 0,
@@ -7138,11 +7171,11 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
     `
 SELECT payload
 FROM turn_events
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage' AND sequence>$3
 ORDER BY sequence DESC
 LIMIT 1
     `.trim(),
-    [snapshot.tenantId, snapshot.id],
+    [snapshot.tenantId, snapshot.id, afterSequence],
   );
   const lastUsage = record(lastUsageRows[0]?.payload) ?? {};
   const modelUsageBreakdown = await executor.query<{
@@ -7163,10 +7196,10 @@ SELECT
   COUNT(*) FILTER (WHERE payload->>'pricingSource'='estimated') AS estimated_events,
   COALESCE(SUM(COALESCE((payload->>'costRawMicros')::bigint,0)),0)::text AS cost_micros
 FROM turn_events
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage' AND sequence>$3
 GROUP BY 1,2
 ORDER BY 1,2
-  `.trim(), [snapshot.tenantId, snapshot.id]);
+  `.trim(), [snapshot.tenantId, snapshot.id, afterSequence]);
   const reservation = await executor.query<{
     id: string;
     user_id: string | null;

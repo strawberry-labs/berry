@@ -2574,14 +2574,33 @@ export class AgentApiController {
     @Body() body: unknown,
   ) {
     const request = parseBody(RecoveryActionSchema, body);
-    return {
-      ok: await this.durableTurns.recover(
-        tenantIdFromRequest(httpRequest),
-        httpRequest.auth!.user.id,
-        runId,
-        request.action,
-      ),
-    };
+    const tenantId = tenantIdFromRequest(httpRequest);
+    const userId = httpRequest.auth!.user.id;
+    let renewedRequestId: string | null = null;
+    let ok = false;
+    try {
+      ok = await this.durableTurns.recover(tenantId, userId, runId, request.action, async ({ requestId, taskId, sessionId, runtimeRequest }) => {
+        // The settled reservation of the recovered generation stays settled.
+        // Admission checks billing health and limits; the worker reserves each
+        // model call's estimate before calling the provider.
+        const check = await this.budgets.reserve({
+          tenantId, userId, departmentId: await this.#primaryDepartmentId(tenantId, userId), taskId, sessionId, requestId,
+          feature: "model",
+          provider: typeof runtimeRequest.providerId === "string" ? runtimeRequest.providerId : null,
+          model: typeof runtimeRequest.model === "string" ? runtimeRequest.model : null,
+          estimatedCostMicros: 0,
+          estimatedTokens: typeof runtimeRequest.maxTokens === "number" ? runtimeRequest.maxTokens : 4000,
+          metadata: { runId, operatorRecovery: request.action },
+        });
+        renewedRequestId = check.reservation ? requestId : null;
+        return Boolean(check.reservation);
+      });
+    } finally {
+      if (!ok && renewedRequestId) {
+        await this.budgets.reconcile({ tenantId, requestId: renewedRequestId, actualCostMicros: 0n }).catch(() => undefined);
+      }
+    }
+    return { ok };
   }
 
   @Get("/devices")

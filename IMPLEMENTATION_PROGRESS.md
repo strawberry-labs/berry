@@ -24,6 +24,27 @@ prerequisites are committed separately. Issue IDs appear in every commit message
   `pgvector/pgvector:0.8.2-pg16-bookworm` database migrated with the production
   migrations (`scripts/setup-queue-test-db.mjs`). Never point them at production.
 
+## Production data safety (ai.aesg.com)
+
+Production data must not be disrupted or lost. Rules for every change in this log:
+
+- Prefer no schema change; reuse existing columns and JSON fields where they suffice.
+- If a migration is unavoidable it must be additive, idempotent (`IF NOT EXISTS`),
+  online (no long locks; `CONCURRENTLY` for indexes), and must not drop, rewrite or
+  backfill existing rows. Each one is listed in the table below with its risk.
+- Nothing here runs against production. Deployment, including any migration, happens
+  later and deliberately; historical backlog deletion needs its own reviewed plan.
+
+| Commit | Issue | Migration / data impact |
+| --- | --- | --- |
+| `d7a806a` | H-001 | None. Uses existing queue/budget tables; writes one new JSON key (`queuedBudgetRequestId`) inside `queued_follow_up_items.runtime_request` for new rows only. |
+| `d5b9138` | H-002 | None (prompt text). |
+| `0cfe1d4` | H-009 | None. |
+| `d481431` | H-014 | None. |
+| `39d02c8` | H-011 | None (worker dependency only). |
+| `e6b2fa8` | H-051/H-072 | None. New JSON keys in `turn_runs.runtime_request` for new continuation runs only. |
+| _pending_ | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
+
 ## Status legend
 
 `Revalidating` → `Confirmed` → `Implementing` → `Validated locally` → `Committed` →
@@ -47,7 +68,8 @@ No pre-existing failures were observed in these suites.
 | H-009 (reconnect after cross-worker pause) | Committed — partial | `0cfe1d4` | Not deployed (worker + sandbox-contract) |
 | H-014 (prerequisite: late mutation receipts) | Committed — source of the already-deployed hotfix | `d481431` | Deployed 2026-09-30 per record; exact production byte parity not reproducible (see entry) |
 | H-011 (image payload guard) | Committed — partial | `39d02c8` | Not deployed (worker image; needs Sharp's Linux binary from the frozen lockfile) |
-| H-051 / H-072 (Continue workspace lineage) | Committed | _pending_ | Not deployed (API + worker; either order is compatible) |
+| H-051 / H-072 (Continue workspace lineage) | Committed | `e6b2fa8` | Not deployed (API + worker; either order is compatible) |
+| H-066 (recovery budget generation) | Committed | _pending_ | Not deployed (API + worker together; see entry) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
 ## Issue log
@@ -277,3 +299,56 @@ No pre-existing failures were observed in these suites.
 - **Remaining.** Missing historical image paths still abort model preparation (H-046);
   phase-aware Continue instructions and exhausted allowances are H-048/H-066/task 176.
   Recovery for continuation runs admitted before deployment uses the old lookup.
+- **Commit.** `e6b2fa8`.
+
+### H-066 — Operator recovery reopens a turn with a settled budget
+
+- **Evidence.** Five runs / five tasks / four users (30 Sep–12 Oct) end with "The budget
+  reservation for this turn is no longer active", each right after an explicit operator
+  Retry; tasks 1187, 1158 and 983 delivered no requested answer, and all five runs were
+  recorded `completed`. All five reservations were reconciled before the retry.
+- **Reproduced on `e6b2fa8`** (real PostgreSQL + real worker, `scripts/test-recovery-budget.mjs`):
+  a budgeted run whose mutating tool loses its receipt reaches `recovery_required`; its
+  reservation is reconciled (actual 5000). After `recover(retry)` the worker refuses the
+  next model call and the run ends `completed` with "I stopped because the budget
+  reservation for this turn is no longer active. Increase the applicable allowance…" —
+  the exact production signature.
+- **Root cause (confirmed).** Terminal settlement for `recovery_required` reconciles the
+  run's reservation; `DurableTurnService.recover` reopens the same run without any budget
+  admission; `reserveNextModelCall` correctly refuses a settled reservation; and
+  `finishForBudget` reports that lifecycle refusal as an allowance problem and marks the
+  run completed.
+- **Fix (no reactivation, no double billing).**
+  - API: Retry/Mark complete reserve a new budget generation `<base request>:recovery:<n>`
+    through the normal `BudgetService.reserve` (billing health + hard limits) *before*
+    reopening, and record a baseline in the run's runtime request (last journal event
+    sequence and settled cost). The settled reservation and its ledger stay untouched.
+    The controller releases the new reservation if recovery does not go through; Cancel
+    reserves nothing and stays terminal.
+  - Worker: reservation extension subtracts the settled baseline (only the new
+    generation's usage plus the next estimate is reserved); terminal settlement (worker
+    and API paths) counts only usage events after the baseline, so each generation gets
+    exactly one `usage_events` row and one reserve/reconcile ledger pair.
+  - Inactive or missing reservations now fail the run with an accurate message ("…your
+    work so far is saved. Continue the task or send a new message…") instead of
+    `completed` + "Increase the applicable allowance". Genuine spend-limit stops are
+    unchanged.
+- **Files.** `apps/api/src/runtime/durable-turn.service.ts`, `apps/api/src/http/agent-api.controller.ts`
+  (recovery endpoint hunk only), `apps/worker/src/turn-runner.ts`, `apps/worker/src/turn-runner.test.ts`,
+  `scripts/test-recovery-budget.mjs`.
+- **Verification (isolated snapshot).** Real PostgreSQL 4/4: Retry and Mark complete each
+  reach the next model call and answer; reservations are `<req>` reconciled 5000 and
+  `<req>:recovery:1` reconciled 7000; usage rows 5000 + 7000; org ledger total 12000 over
+  exactly four entries (no duplicates/refunds); a true hard limit still blocks recovery,
+  leaves the run `recovery_required` and no active reservation; Cancel stays terminal with
+  no new reservation. Continue-lineage 4/4 and queue 8/8 still pass. Unit: worker
+  turn-runner/outbox/sandbox-continuity 232/232 (new: inactive reservation fails honestly;
+  extension excludes the settled baseline), API runtime/controller/budget 146/146;
+  API/worker typecheck pass.
+- **Deployment.** Not deployed. Deploy API and worker together: a new API with an old
+  worker would bill the whole run again at the second settlement; an old API with a new
+  worker behaves as today. Runs already stuck in `completed` with the inactive-reservation
+  message are not changed retroactively.
+- **Remaining.** Spend-limit stops are still recorded as `completed` (outcome labelling,
+  H-034/H-014); distinct user-facing actions per refusal type are not yet surfaced in the
+  web UI.

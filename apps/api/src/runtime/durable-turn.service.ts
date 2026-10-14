@@ -1784,6 +1784,7 @@ ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
     userId: string,
     runId: string,
     action: "retry" | "mark-complete" | "cancel",
+    reserveRecoveryBudget?: RecoveryBudgetReserver,
   ): Promise<boolean> {
     if (!this.enabled) return false;
     return this.database.withTenant(tenantId, async (executor) => {
@@ -1839,6 +1840,7 @@ FOR UPDATE OF r
       if (action === "mark-complete" && !recovered.tool_call_name) {
         throw new Error("Recovery-required run has no exact failed tool reference to mark complete");
       }
+      await renewRecoveryBudget(executor, tenantId, runId, recovered, reserveRecoveryBudget);
       await reopenRecoveryLifecycle(executor, tenantId, runId, recovered.sandbox_id);
       if (action === "mark-complete") {
         const entryId = randomUUID();
@@ -3407,6 +3409,77 @@ export function parseEventCursor(value: string | null | undefined): { runId: str
   return { runId: match[1]!, sequence: Number(match[2]) };
 }
 
+/** Reserves a new budget generation for a reopened recovery run; false when budgets are not enforced. */
+export type RecoveryBudgetReserver = (input: {
+  requestId: string;
+  taskId: string;
+  sessionId: string;
+  runtimeRequest: Record<string, unknown>;
+}) => Promise<boolean>;
+
+/**
+ * Terminal recovery settlement reconciles the run's reservation. Reopening the
+ * same run must not reuse that settled reservation (the worker refuses it) and
+ * must not re-bill earlier usage: reserve a new generation through normal
+ * budget admission and settle only usage recorded after this point under it.
+ */
+async function renewRecoveryBudget(
+  executor: SqlExecutor,
+  tenantId: string,
+  runId: string,
+  recovered: { task_id: string; session_id: string },
+  reserveRecoveryBudget: RecoveryBudgetReserver | undefined,
+): Promise<void> {
+  const rows = await executor.query<{
+    runtime_request: unknown;
+    reservation_status: string | null;
+    after_sequence: number | string;
+    settled_cost_micros: string;
+  }>(
+    `
+SELECT r.runtime_request,b.status AS reservation_status,
+  (SELECT COALESCE(MAX(e.sequence),0) FROM turn_events e
+   WHERE e.tenant_id=r.tenant_id AND e.run_id=r.id) AS after_sequence,
+  (SELECT COALESCE(SUM(COALESCE((e.payload->>'costRawMicros')::bigint,0)),0)::text FROM turn_events e
+   WHERE e.tenant_id=r.tenant_id AND e.run_id=r.id AND e.event_type='usage') AS settled_cost_micros
+FROM turn_runs r
+LEFT JOIN budget_reservations b
+  ON b.tenant_id=r.tenant_id AND b.request_id=r.runtime_request->>'requestId'
+WHERE r.tenant_id=$1::uuid AND r.id=$2::uuid
+    `.trim(),
+    [tenantId, runId],
+  );
+  const row = rows[0];
+  const runtimeRequest = recordValue(row?.runtime_request) ?? {};
+  const requestId = stringValue(runtimeRequest.requestId);
+  if (!row || !requestId || row.reservation_status === "reserved") return;
+  if (row.reservation_status === null && runtimeRequest.budgetReservationRequired !== true) return;
+  const generation = Math.max(0, Number(runtimeRequest.budgetGeneration ?? 0) || 0) + 1;
+  const baseRequestId = stringValue(runtimeRequest.budgetBaseRequestId) ?? requestId;
+  const nextRequestId = `${baseRequestId}:recovery:${generation}`;
+  if (!reserveRecoveryBudget) {
+    throw new ConflictException("Budget admission is required before reopening this recovery run");
+  }
+  const reserved = await reserveRecoveryBudget({
+    requestId: nextRequestId,
+    taskId: recovered.task_id,
+    sessionId: recovered.session_id,
+    runtimeRequest,
+  });
+  await executor.execute(
+    `UPDATE turn_runs SET runtime_request=runtime_request || $3::jsonb,updated_at=now()
+     WHERE tenant_id=$1::uuid AND id=$2::uuid`,
+    [tenantId, runId, JSON.stringify({
+      requestId: nextRequestId,
+      budgetBaseRequestId: baseRequestId,
+      budgetGeneration: generation,
+      budgetUsageAfterSequence: Number(row.after_sequence),
+      budgetBaselineCostMicros: row.settled_cost_micros,
+      budgetReservationRequired: reserved,
+    })],
+  );
+}
+
 async function reconcileTerminalUsage(
   executor: SqlExecutor,
   tenantId: string,
@@ -3428,6 +3501,9 @@ async function reconcileTerminalUsage(
   if (!run) return;
   const runtimeRequest = recordValue(run.runtime_request) ?? {};
   const requestId = stringValue(runtimeRequest.requestId) ?? `turn_${runId}`;
+  // Usage before an operator-recovery baseline belongs to an earlier, already
+  // settled budget generation.
+  const afterSequence = Math.max(0, Number(runtimeRequest.budgetUsageAfterSequence ?? 0) || 0);
   const usage = await executor.query<{
     input_tokens: number | string;
     output_tokens: number | string;
@@ -3451,9 +3527,9 @@ SELECT
   COUNT(*) FILTER (WHERE event_type='usage' AND payload ? 'costRawMicros') AS priced_event_count,
   COALESCE(SUM(CASE WHEN event_type='usage' THEN COALESCE((payload->>'costRawMicros')::bigint,0) ELSE 0 END),0)::text AS exact_cost_micros
 FROM turn_events
-WHERE tenant_id=$1::uuid AND run_id=$2::uuid
+WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND sequence>$3
     `.trim(),
-    [tenantId, runId],
+    [tenantId, runId, afterSequence],
   );
   const totals = usage[0] ?? {
     input_tokens: 0,
@@ -3468,9 +3544,9 @@ WHERE tenant_id=$1::uuid AND run_id=$2::uuid
   };
   const lastUsageRows = await executor.query<{ payload: unknown }>(
     `SELECT payload FROM turn_events
-     WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage'
+     WHERE tenant_id=$1::uuid AND run_id=$2::uuid AND event_type='usage' AND sequence>$3
      ORDER BY sequence DESC LIMIT 1`,
-    [tenantId, runId],
+    [tenantId, runId, afterSequence],
   );
   const lastUsage = recordValue(lastUsageRows[0]?.payload) ?? {};
   const reservations = await executor.query<{
