@@ -75,7 +75,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `6b635da` | H-008 | None. |
 | `a7118a4` | H-023 | None. |
 | `747f510` | H-067 | None (in-memory only). |
-| _pending_ | H-063 | None (skill guidance text). |
+| `5b6e7b0` | H-063 | None (skill guidance text). |
+| _pending_ | H-010 | None. Prevents late snapshot rows from being written after a timeout. |
 | `3104547` | H-069 | No schema change. Deletes only the Library row the legacy trigger creates for a *new* temporary connector import, inside the same transaction. Existing Library rows (including the 261 historical temporary imports) are untouched. |
 | `f6f9074` | H-064/H-007 (skill staging) | None. Reads existing `*_skill_files`; writes only inside sandboxes. |
 | `29dd951` | H-032 (metrics) | None. New rows record declared eligibility only; historical `cache_eligible` values are not rewritten (the dashboard no longer depends on them). |
@@ -165,7 +166,8 @@ fixture; this is fixed in `54c9255`.
 | H-008 (workspace outputs/ and tmp/ guaranteed) | Committed — partial | `6b635da` | Not deployed (worker) |
 | H-023 (current date given to the model) | Committed — partial | `a7118a4` | Not deployed (worker) |
 | H-067 (Office pagination re-extracts the whole file) | Committed — partial | `747f510` | Not deployed (worker) |
-| H-063 (quadratic read-only spreadsheet access) | Committed — guidance | _pending_ | Not published (organization `xlsx` skill package) |
+| H-063 (quadratic read-only spreadsheet access) | Committed — guidance | `5b6e7b0` | Not published (organization `xlsx` skill package) |
+| H-010 (timed-out snapshot keeps writing after cleanup) | Committed | _pending_ | Not deployed (worker) |
 | H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
 | H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
 | H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
@@ -1694,3 +1696,23 @@ fixture; this is fixed in `54c9255`.
   note on syncing alongside the published AESG packages).
 - **Remaining.** A tested analysis helper, and slow-tool-call diagnostics that show the
   model why a call is slow before the budget runs out.
+- **Commit.** `5b6e7b0`.
+
+### H-010 — A timed-out snapshot keeps writing after cleanup
+
+- **Evidence.** Code finding only: `withTimeout` rejected its wrapper without stopping
+  the snapshot; no production incident has been attributed to it.
+- **Root cause (confirmed in code).** After the timeout, the `finally` block paused or
+  stopped the sandbox while `preserve()` kept running, so a late capture could still
+  upload the archive and persist a snapshot record after cleanup.
+- **Fix.** The timeout now aborts a controller shared with `preserve()`, which checks it
+  after capture, before the object upload and before persisting the record. Late work
+  ends there; the timeout error and the cleanup path are unchanged.
+- **Files.** `apps/worker/src/sandbox-continuity.ts` (+test).
+- **Verification (isolated snapshot).** Worker typecheck pass; worker suite 531 passed / 3
+  skipped. New case: a capture released after a 5 ms terminal deadline leads to no
+  upload and no persisted record, while the sandbox is still paused once. It fails on
+  the previous source; the existing deadline test passes.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** In-flight sandbox file reads inside the capture still run to their own
+  deadline (they cannot write state).

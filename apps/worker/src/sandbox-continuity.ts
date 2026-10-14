@@ -1729,9 +1729,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const snapshotTimeoutMs = terminal || beforeWait
         ? this.options.terminalSnapshotTimeoutMs ?? DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS
         : this.options.intervalSnapshotTimeoutMs ?? DEFAULT_INTERVAL_SNAPSHOT_TIMEOUT_MS;
+      // A timed-out snapshot must not keep writing after cleanup has paused or
+      // stopped the sandbox: the timeout aborts this, and every write below
+      // checks it first (H-010).
+      const expiry = new AbortController();
       const preserve = async () => {
         if (terminal && this.options.enableTerminalFinalization) await this.finalizeTerminalRun(run);
         const archive = await this.capture(run.sandboxId!, Date.now() + snapshotTimeoutMs);
+        expiry.signal.throwIfAborted();
         const current = await repository.loadRun(payload.tenantId, payload.runId);
         if (!current.sandboxId || current.sandboxId !== run.sandboxId) {
           return { noOp: true };
@@ -1750,7 +1755,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         }
         if (!this.objects) throw new Error("Sandbox snapshot object storage is not configured");
         const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
+        expiry.signal.throwIfAborted();
         await this.objects.put(key, bytes);
+        expiry.signal.throwIfAborted();
         const record = await repository.persist({
           run: current,
           provider: current.sandboxProvider ?? this.provider.kind,
@@ -1767,6 +1774,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           preserve(),
           snapshotTimeoutMs,
           `${terminal ? "Terminal" : beforeWait ? "Waiting" : "Interval"} sandbox snapshot`,
+          expiry,
         );
       } catch (error) {
         if (!isSandboxPausedError(error)) throw error;
@@ -4810,9 +4818,13 @@ function isTimestampStrictlyBefore(
   return Number.isFinite(candidateMs) && Number.isFinite(targetMs) && candidateMs < targetMs;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string, expiry?: AbortController): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
+    const timer = setTimeout(() => {
+      const error = new Error(`${operation} timed out after ${timeoutMs}ms`);
+      expiry?.abort(error);
+      reject(error);
+    }, timeoutMs);
     timer.unref?.();
     promise.then(
       (value) => {

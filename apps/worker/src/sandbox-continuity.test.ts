@@ -590,6 +590,51 @@ describe("SandboxContinuityManager", () => {
     expect(repository.recordSandbox).toHaveBeenCalledWith(expect.objectContaining({ state: "paused" }));
   });
 
+  it("does not store a terminal snapshot that finishes after its deadline (H-010)", async () => {
+    let finishCapture: (value: { path: string; entries: [] }) => void = () => undefined;
+    const suspend = vi.fn(async () => ({ sandbox_id: "sandbox-late", destroyed: true, status: "stopped" as const }));
+    const provider = {
+      kind: "e2b",
+      suspend,
+      files: {
+        list: vi.fn(() => new Promise((resolve) => { finishCapture = resolve; })),
+        read: vi.fn(),
+        write: vi.fn(),
+      },
+    } as unknown as SandboxProvider;
+    const run = {
+      tenantId: "00000000-0000-7000-8000-000000000002",
+      runId: "00000000-0000-7000-8000-000000000001",
+      sessionId: "00000000-0000-7000-8000-000000000004",
+      taskId: "00000000-0000-7000-8000-000000000003",
+      sandboxProvider: "e2b",
+      sandboxId: "sandbox-late",
+      sandboxState: "pause_requested",
+      runState: "completed",
+      sessionLeafId: null,
+    };
+    const repository = {
+      loadRun: vi.fn(async () => run),
+      continuity: vi.fn(),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = { put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn() } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox", terminalSnapshotTimeoutMs: 5 });
+
+    await expect(manager.snapshot({ tenantId: run.tenantId, runId: run.runId, reason: "before-finalize" }))
+      .rejects.toThrow("Terminal sandbox snapshot timed out after 5ms");
+    expect(suspend).toHaveBeenCalledOnce();
+    // The capture completes after cleanup; nothing may be stored from it.
+    finishCapture({ path: "/workspace", entries: [] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(objects.put).not.toHaveBeenCalled();
+    expect(repository.persist).not.toHaveBeenCalled();
+  });
+
   it("does not let a delayed interval snapshot wake a terminal sandbox", async () => {
     const provider = {
       kind: "e2b",

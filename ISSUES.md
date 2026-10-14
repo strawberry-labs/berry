@@ -35,7 +35,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 | H-007 | P1 | Skill entry points omit sibling dependencies | Monthly failures + activation/recovery traces + code | Confirmed current renderer staging defect |
 | H-008 | P1 | Workspace paths and execution capability diagnostics | Missing outputs repairs + deployed root-only initialization | Directory guarantee committed locally (not deployed); execution diagnostics open |
 | H-009 | P1 | Sandbox operation recovery and error classification | Observed missing-sandbox failures + code findings | Reconnect-after-pause fix committed (not deployed); typed classification/fault injection open |
-| H-010 | P1 | Snapshot timeout does not cancel underlying work | Code finding | Open; production consequence unproven |
+| H-010 | P1 | Snapshot timeout does not cancel underlying work | Code finding | Fix committed locally (not deployed): late snapshot work can no longer upload or persist after a timeout |
 | H-011 | P1 | Encoding, oversized inputs and malformed tool arguments | Observed | Image payload guard and binary/UTF-16 reads committed locally (not deployed); tool-argument/HTTP 400 failures open |
 | H-012 | P1 | Generated files and numerical content can be incorrect | Observed user reports | Open; reproduce against source artifacts |
 | H-013 | P2 | Repeated preparation and snapshot work | Code finding + performance proposals | Open; benchmark before claiming gains |
@@ -192,6 +192,7 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Not established: a weekly production incident was caused by this behavior.
 - Action: propagate cancellation/deadlines to capture and storage operations; prevent late completion from racing cleanup or publishing stale state.
 - Acceptance: delayed snapshot reads/writes cannot continue to mutate state after timeout and cleanup.
+- **Implementation (14 October):** the snapshot timeout aborts the preservation work, which checks the abort before uploading or persisting, so a late capture cannot store state after cleanup. Not deployed.
 
 ### H-011 — Input and payload failures
 
