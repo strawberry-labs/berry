@@ -1,0 +1,4 @@
+{
+  "description": "The audit's full system prompt proposal (SYSTEM_PROMPT.md) in place of today's stable system prompt.",
+  "systemReplaceFile": "SYSTEM_PROMPT.md"
+}
