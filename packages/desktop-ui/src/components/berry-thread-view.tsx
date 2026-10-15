@@ -3,6 +3,7 @@ import { MessageAttachmentContentSchema, type ImageAspectRatio, type Message, ty
 import { ArrowRight02, CircleHelp, Copy, FileImage, GaugeIcon, GitFork, ImagePlus, Pencil, Search, ShieldQuestion, Trash2 } from "@berry/desktop-ui/lib/icons";
 import { toast } from "sonner";
 import { copyText } from "@berry/desktop-ui/lib/copy-text";
+import { copyMessageSelection } from "@berry/desktop-ui/lib/message-copy";
 
 import {
   Accordion,
@@ -470,6 +471,11 @@ export function shouldUseLiveMarkdown(stream: Pick<StreamState, "turnActive">): 
   return stream.turnActive;
 }
 
+/** Text selected in any message pastes into email without Berry's theme colours (H-044). */
+function copyThreadSelection(event: React.ClipboardEvent<HTMLElement>): void {
+  copyMessageSelection(event.nativeEvent, event.currentTarget, event.currentTarget.ownerDocument.getSelection());
+}
+
 /**
  * The full Berry conversation presentation: settled turn groups (user bubbles
  * + "Worked for Xs" assistant turns) and the live streaming turn, inside the
@@ -824,7 +830,7 @@ export function BerryThreadView({
         />
         <MessageScroller className="flex-1">
         <MessageScrollerViewport className="px-6" onScroll={handleHistoryScroll}>
-          <MessageScrollerContent role="feed" aria-label="Task message history" aria-busy={loadingOlderMessages || searching} data-density={density} className="berry-thread-content mx-auto w-full gap-5 py-10">
+          <MessageScrollerContent role="feed" aria-label="Task message history" aria-busy={loadingOlderMessages || searching} data-density={density} className="berry-thread-content mx-auto w-full gap-5 py-10" onCopy={copyThreadSelection}>
             {hasOlderMessages ? (
               <div className="flex justify-center pb-1">
                 {loadingOlderMessages ? <span className="sr-only" role="status" aria-live="polite">Loading older messages…</span> : null}

@@ -167,6 +167,8 @@ function linkifyFilePaths(children: ReactNode): ReactNode {
           key={`${childIndex}:${match.index}`}
           type="button"
           className="font-mono text-primary underline"
+          // The path is part of the sentence, so a selection copy keeps it as text (H-044).
+          data-copy-text=""
           onClick={() => openFilePath(path, line)}
         >
           {path}{line ? `:${line}` : ""}

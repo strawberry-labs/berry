@@ -117,3 +117,10 @@ describe("Markdown direction (H-047)", () => {
     expect(html).toContain('<span dir="ltr" class="block">Please keep it short.</span>');
   });
 });
+
+describe("Markdown selection copy (H-044)", () => {
+  it("marks a linkified file path as message text, so a selection copy keeps it", () => {
+    const html = renderToStaticMarkup(<Markdown>{"Saved to outputs/report.docx for review."}</Markdown>);
+    expect(html).toContain('data-copy-text="">outputs/report.docx</button>');
+  });
+});

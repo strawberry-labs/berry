@@ -2343,3 +2343,10 @@ AESG packages.
 - **Data impact.** None (JSON payload fields only).
 - **Deployment.** Not deployed (worker; the API needs no change).
 - **Remaining.** On the Responses/Anthropic paths the ID is created after the call, so it is not sent as a header. Vision and image generation keep their own diagnostics.
+
+### H-044 — Pasted answers carry Berry's dark background into email (selection copy)
+
+- **Fix.** One `copy` handler on the shared message list (`BerryThreadView`, used by web and desktop) handles selections inside messages: it writes the selected text as text/plain and HTML that keeps paragraphs, line breaks, lists, tables, headings, emphasis, links and code (and text direction for Arabic), dropping colours, styles, classes, data attributes and buttons. Selections outside messages, crossing out of them, or in inputs and the composer are left to the browser. Clickable file paths copy as text. The message Copy button already writes plain text.
+- **Tests.** Five copy cases and one file-path case in `packages/desktop-ui` (89 passed); light and dark themes produced identical HTML in a Chromium check against a fake API.
+- **Data impact.** None. **Deployment.** Not deployed (web).
+- **Remaining.** Not checked in real Outlook, Gmail or Safari/WebKit; Firefox selections that cross unselectable text use the browser's copy; the extension side panel is not covered.
