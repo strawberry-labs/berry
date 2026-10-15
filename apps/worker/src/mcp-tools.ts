@@ -156,21 +156,37 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const tool = context.source.listTools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error(`MCP tool ${toolName} is unavailable`);
     const callId = stringValue(step.input.toolCallId) ?? step.id;
-    const result = signal || reportProgress
-      ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
-      : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
+    // Repeating an import whose file was not staged retries staging of the
+    // Berry file already held instead of downloading it again (H-068).
+    const resumed = this.base.stageAssociatedInputFiles ? resumableConnectorImport(snapshot, step, toolName) : null;
+    const result = resumed
+      ? { content: [], details: resumed.details }
+      : signal || reportProgress
+        ? await tool.execute(callId, (record(step.input.arguments) ?? {}) as never, signal, reportProgress)
+        : await tool.execute(callId, (record(step.input.arguments) ?? {}) as never);
     let text = boundedMcpText(result.content.flatMap((part) =>
       part.type === "text" && typeof part.text === "string" ? [part.text] : []
     ).join("\n"), record(result.details)?.structuredContent);
     const artifact = connectorArtifact(result.details);
-    const staged = artifact && this.base.stageAssociatedInputFiles
-      ? await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId], {
+    let staged: Awaited<ReturnType<NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>>> = [];
+    let stagingError: string | undefined;
+    if (artifact && this.base.stageAssociatedInputFiles) {
+      try {
+        staged = await this.base.stageAssociatedInputFiles(snapshot, [artifact.fileId], {
           ...(signal ? { signal } : {}),
           ...(reportProgress ? { reportProgress } : {}),
-        })
-      : [];
+        });
+      } catch (error) {
+        // Cancellation ends the call. Any other staging failure leaves the
+        // import itself intact, so report it rather than discard the receipt.
+        if (signal?.aborted) throw error;
+        stagingError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+      }
+    }
     const stagedArtifact = artifact ? staged.find((item) => item.fileId === artifact.fileId) : undefined;
-    if (artifact) text = connectorArtifactText(artifact, stagedArtifact, Boolean(this.base.stageAssociatedInputFiles));
+    if (artifact) {
+      text = connectorArtifactText(artifact, stagedArtifact, Boolean(this.base.stageAssociatedInputFiles), stagingError);
+    }
     const parts = sanitizeMcpJournalValue(result.content);
     return {
       output: {
@@ -180,7 +196,11 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
         parts,
         ...(staged.length ? { artifacts: staged.map((item) => ({ ...item })) } : {}),
         ...(artifact && this.base.stageAssociatedInputFiles
-          ? { stagingStatus: stagedArtifact ? "ready" : "pending_verification" }
+          ? {
+              stagingStatus: stagedArtifact ? "ready" : stagingError ? "failed" : "pending_verification",
+              ...(stagingError && !stagedArtifact ? { stagingError } : {}),
+              ...(resumed ? { resumedFromStep: resumed.stepId } : {}),
+            }
           : {}),
       },
       summary: text ? `${toolName} returned results` : `${toolName} completed`,
@@ -706,6 +726,39 @@ type StagedConnectorArtifact = {
   path: string;
 };
 
+/**
+ * The latest earlier call of the same tool with the same arguments, when it
+ * imported a file that did not reach the sandbox. Its stored receipt holds the
+ * Berry file identity, so staging can be retried without the remote call.
+ */
+function resumableConnectorImport(
+  snapshot: DurableTurnSnapshot,
+  step: DurableTurnStep,
+  toolName: string,
+): { stepId: string; details: unknown } | null {
+  const argumentsKey = canonicalJson(record(step.input.arguments) ?? {});
+  const previous = snapshot.steps
+    .filter((candidate) => candidate.id !== step.id
+      && candidate.sequence < step.sequence
+      && candidate.state === "completed"
+      && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === toolName
+      && canonicalJson(record(candidate.input.arguments) ?? {}) === argumentsKey)
+    .sort((left, right) => left.sequence - right.sequence)
+    .at(-1);
+  const output = record(previous?.output);
+  if (!previous || (output?.stagingStatus !== "pending_verification" && output?.stagingStatus !== "failed")) return null;
+  return connectorArtifact(output.details) ? { stepId: previous.id, details: output.details } : null;
+}
+
+function canonicalJson(value: unknown): string {
+  const canonical = (item: unknown): unknown => Array.isArray(item)
+    ? item.map(canonical)
+    : item !== null && typeof item === "object"
+      ? Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonical(entry)]))
+      : item;
+  return JSON.stringify(canonical(value)) ?? "";
+}
+
 function connectorArtifact(value: unknown): ConnectorArtifact | null {
   const details = record(value);
   const structured = record(details?.structuredContent);
@@ -721,6 +774,7 @@ export function connectorArtifactText(
   artifact: ConnectorArtifact,
   staged: StagedConnectorArtifact | undefined,
   stagingAvailable = true,
+  stagingError?: string,
 ): string {
   const disposition = artifact.library === true
     ? `Saved ${artifact.name} to the Berry Library.`
@@ -729,13 +783,16 @@ export function connectorArtifactText(
       : `Imported ${artifact.name} into Berry.`;
   // Without a sandbox path the file is not usable yet; say so explicitly so the
   // model neither assumes a path nor searches the filesystem for it.
+  const retry = "Call this tool again with the same arguments to stage it: Berry reuses the file it already downloaded and does not download it again.";
   const storage = staged
     ? `Sandbox path: ${staged.path}`
-    : stagingAvailable
-      ? `Berry is still verifying ${artifact.name}, so it is not in the sandbox yet. Call this import again for the same file to stage it; it reuses this Berry file. Do not search the filesystem for it.`
-      : artifact.library === false
+    : !stagingAvailable
+      ? artifact.library === false
         ? "The file is stored as a task-scoped Berry artifact."
-        : "The file is stored as a Berry artifact.";
+        : "The file is stored as a Berry artifact."
+      : stagingError
+        ? `Berry could not copy ${artifact.name} (Berry file ${artifact.fileId}) into the sandbox: ${stagingError}. It is not at any sandbox path. ${retry} If it fails again, tell the user the file could not be opened. Do not search the filesystem for it.`
+        : `Berry is still verifying ${artifact.name} (Berry file ${artifact.fileId}), so it is not in the sandbox yet. ${retry} Do not search the filesystem for it.`;
   const persistence = artifact.library === false
     ? "It was not added to the Berry Library or project knowledge."
     : "";

@@ -3507,6 +3507,126 @@ describe("SandboxContinuityManager", () => {
     if (expected) expect(staged[0]?.path).toBe("/workspace/inputs/00000000-0000-7000-8000-000000000123/rfp.pdf");
   });
 
+  describe("connector import readiness (H-068)", () => {
+    // Uses the production bounds (30 s wait, 250 ms polls) under fake timers.
+    const file = {
+      fileId: "00000000-0000-7000-8000-000000000124",
+      name: "site photo.png",
+      mediaType: "image/png",
+      sizeBytes: 6,
+      objectKey: "objects/site-photo.png",
+      objectVersionId: "version-7",
+    };
+    const bytes = new Uint8Array([137, 80, 78, 71, 13, 10]);
+
+    function readinessFixture(options: { verifiedAfterMs?: number; hydrate?: () => AsyncIterable<Uint8Array> } = {}) {
+      const start = Date.now();
+      const written: number[] = [];
+      const writeStream = vi.fn(async (input: { path: string; content: ReadableStream<Uint8Array> }) => {
+        const reader = input.content.getReader();
+        for (let next = await reader.read(); !next.done; next = await reader.read()) written.push(...next.value);
+        return { path: input.path, size_bytes: written.length, mtime: null };
+      });
+      const provider = {
+        kind: "e2b",
+        create: vi.fn(async () => ({ sandbox_id: "sandbox-readiness", provider: "e2b", status: "running" })),
+        exec: vi.fn(),
+        files: { read: vi.fn(), write: vi.fn(), writeStream, list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })) },
+      } as unknown as SandboxProvider;
+      // Only verified blobs are listed, as in SqlSandboxSnapshotRepository.inputFiles.
+      const inputFiles = vi.fn(async () => (
+        options.verifiedAfterMs !== undefined && Date.now() - start >= options.verifiedAfterMs ? [file] : []
+      ));
+      const repository = {
+        loadRun: vi.fn(),
+        continuity: vi.fn(async () => null),
+        latest: vi.fn(async () => null),
+        inputFiles,
+        persistOutput: vi.fn(),
+        persist: vi.fn(),
+        recordSandbox: vi.fn(async () => undefined),
+      } satisfies SandboxSnapshotRepository;
+      const streamSource = vi.fn(options.hydrate ?? async function* () { yield bytes; });
+      const objects = {
+        put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn(), streamSource,
+      } satisfies SandboxSnapshotObjectStore;
+      const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox" });
+      const current = snapshot();
+      current.steps = [];
+      return { manager, current, written, writeStream, inputFiles, streamSource };
+    }
+
+    it.each([200, 2_000])("stages the exact bytes of a file verified %i ms after the receipt", async (delayMs) => {
+      vi.useFakeTimers();
+      try {
+        const fixture = readinessFixture({ verifiedAfterMs: delayMs });
+        const pending = fixture.manager.stageAssociatedInputFiles(fixture.current, [file.fileId]);
+        await vi.advanceTimersByTimeAsync(delayMs + 250);
+        const staged = await pending;
+
+        expect(staged).toEqual([{
+          fileId: file.fileId,
+          name: file.name,
+          mediaType: file.mediaType,
+          path: `/workspace/inputs/${file.fileId}/site photo.png`,
+        }]);
+        expect(fixture.written).toEqual([...bytes]);
+        expect(fixture.writeStream).toHaveBeenCalledTimes(1);
+        expect(fixture.streamSource).toHaveBeenCalledWith(file.objectKey, expect.any(Number), file.objectVersionId, undefined);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("stages nothing and reads no bytes while a file stays unverified past the 30 s bound", async () => {
+      vi.useFakeTimers();
+      try {
+        const fixture = readinessFixture();
+        const pending = fixture.manager.stageAssociatedInputFiles(fixture.current, [file.fileId]);
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        await expect(pending).resolves.toEqual([]);
+        expect(fixture.streamSource).not.toHaveBeenCalled();
+        expect(fixture.writeStream).not.toHaveBeenCalled();
+        expect(fixture.inputFiles.mock.calls.length).toBeGreaterThan(100);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("stops polling when the task is cancelled during the wait", async () => {
+      vi.useFakeTimers();
+      try {
+        const fixture = readinessFixture();
+        const controller = new AbortController();
+        const pending = fixture.manager.stageAssociatedInputFiles(fixture.current, [file.fileId], { signal: controller.signal });
+        const settled = expect(pending).rejects.toThrow("Task cancelled");
+        await vi.advanceTimersByTimeAsync(1_000);
+        controller.abort(new Error("Task cancelled"));
+        await settled;
+        const polls = fixture.inputFiles.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(fixture.inputFiles).toHaveBeenCalledTimes(polls);
+        expect(fixture.streamSource).not.toHaveBeenCalled();
+        expect(fixture.writeStream).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("fails instead of returning a path when a verified file cannot be hydrated", async () => {
+      const fixture = readinessFixture({
+        verifiedAfterMs: 0,
+        // eslint-disable-next-line require-yield
+        hydrate: async function* () { throw new Error("NoSuchKey: The specified key does not exist."); },
+      });
+
+      await expect(fixture.manager.stageAssociatedInputFiles(fixture.current, [file.fileId])).rejects.toThrow("NoSuchKey");
+      expect(fixture.written).toEqual([]);
+    });
+  });
+
   it("does not stage task attachments for an unrelated sandbox operation", async () => {
     const writeStream = vi.fn();
     const provider = {

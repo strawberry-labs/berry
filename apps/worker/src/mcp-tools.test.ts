@@ -1,8 +1,8 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { McpServerSpec } from "@berry/local-agent/mcp";
+import { McpToolSource, type McpServerSpec } from "@berry/local-agent/mcp";
 import type { ChatToolDefinition } from "@berry/router-client";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableTurnSnapshot, DurableTurnStep, DurableTurnToolExecutor } from "./turn-runner.js";
 import {
   boundedMcpText,
@@ -594,8 +594,9 @@ describe("connector artifact staging", () => {
       undefined,
     );
 
-    expect(text).toContain("Berry is still verifying rfp.pdf, so it is not in the sandbox yet");
-    expect(text).toContain("Call this import again for the same file");
+    expect(text).toContain("Berry is still verifying rfp.pdf (Berry file file-1), so it is not in the sandbox yet");
+    expect(text).toContain("Call this tool again with the same arguments");
+    expect(text).toContain("does not download it again");
     expect(text).toContain("Do not search the filesystem");
     expect(text).not.toContain("Sandbox path");
   });
@@ -616,6 +617,167 @@ describe("connector artifact staging", () => {
     expect(text).toContain("searchable extraction is queued through Tika");
   });
 });
+
+describe("connector import readiness receipts (H-068)", () => {
+  const toolName = "mcp__Google_Workspace__drive_read_file";
+  const fileId = "e18d2b46-19de-8e63-9d14-13045a8abb6f";
+  const path = `/workspace/inputs/${fileId}/site photo.png`;
+  const artifact = {
+    fileId, name: "site photo.png", mediaType: "image/png", size: 425382, origin: "connector_import",
+    reused: false, status: "available", library: false, sourceFileId: "drive-source-1",
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // One Drive tool whose remote call returns a connector receipt like task
+  // 2743dd77's: a Berry file id and metadata, but no sandbox path.
+  function readinessExecutor(stage: NonNullable<DurableTurnToolExecutor["stageAssociatedInputFiles"]>) {
+    const remote = vi.fn(async () => ({
+      content: [{ type: "text" as const, text: JSON.stringify({ artifact }) }],
+      details: { structuredContent: { artifact } },
+    }));
+    const listTools = McpToolSource.prototype.listTools;
+    vi.spyOn(McpToolSource.prototype, "listTools").mockImplementation(function (this: McpToolSource) {
+      return listTools.call(this).map((tool) => (tool.name === toolName ? { ...tool, execute: remote } : tool));
+    });
+    const stageAssociatedInputFiles = vi.fn(stage);
+    const tools = new DurableMcpToolExecutor({
+      execute: vi.fn(async () => ({ output: {}, summary: "base" })),
+      stageAssociatedInputFiles,
+    }, [connectorServer("workspace", "Google Workspace", true, "drive_read_file", "Read a Google Drive file and download it")], undefined);
+    return { tools, remote, stageAssociatedInputFiles };
+  }
+
+  function driveStep(sequence: number, args: Record<string, unknown> = { fileId: "drive-source-1" }) {
+    return {
+      id: `drive-read-${sequence}`,
+      sequence,
+      type: `tool.${toolName}`,
+      state: "running",
+      input: { toolName, toolCallId: `call-${sequence}`, arguments: args },
+    } as unknown as DurableTurnStep;
+  }
+
+  function driveSnapshot() {
+    return mcpSnapshot("Open the Google Drive file site photo.png and read it");
+  }
+
+  it("returns a readable path with the original file identity once staging succeeds", async () => {
+    const { tools, remote } = readinessExecutor(async () => [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }]);
+    const snapshot = driveSnapshot();
+    const step = driveStep(1);
+    snapshot.steps.push(step);
+
+    const result = await tools.execute(snapshot, step);
+
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(result.output).toMatchObject({
+      stagingStatus: "ready",
+      artifacts: [{ fileId, name: "site photo.png", mediaType: "image/png", path }],
+    });
+    expect(String(record(result.output)?.content)).toContain(`Sandbox path: ${path}`);
+  });
+
+  it("reports pending verification, then resumes staging without a second remote download", async () => {
+    let verified = false;
+    const { tools, remote, stageAssociatedInputFiles } = readinessExecutor(async () => (
+      verified ? [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }] : []
+    ));
+    const snapshot = driveSnapshot();
+    const first = driveStep(1);
+    snapshot.steps.push(first);
+
+    const pending = await tools.execute(snapshot, first);
+
+    expect(pending.output).toMatchObject({ stagingStatus: "pending_verification" });
+    expect(record(pending.output)?.artifacts).toBeUndefined();
+    const pendingText = String(record(pending.output)?.content);
+    expect(pendingText).toContain(`Berry file ${fileId}`);
+    expect(pendingText).toContain("does not download it again");
+    expect(pendingText).not.toContain("Sandbox path");
+
+    Object.assign(first, { state: "completed", output: pending.output });
+    verified = true;
+    const retry = driveStep(2);
+    snapshot.steps.push(retry);
+    const resumed = await tools.execute(snapshot, retry);
+
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(stageAssociatedInputFiles).toHaveBeenCalledTimes(2);
+    expect(stageAssociatedInputFiles.mock.calls[1]?.[1]).toEqual([fileId]);
+    expect(resumed.output).toMatchObject({ stagingStatus: "ready", resumedFromStep: first.id, artifacts: [{ fileId, path }] });
+    expect(String(record(resumed.output)?.content)).toContain("It was not added to the Berry Library");
+  });
+
+  it("turns a staging failure of a verified file into an actionable receipt and retries without downloading", async () => {
+    let attempts = 0;
+    const { tools, remote } = readinessExecutor(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("NoSuchKey: The specified key does not exist.");
+      return [{ fileId, name: artifact.name, mediaType: artifact.mediaType, path }];
+    });
+    const snapshot = driveSnapshot();
+    const first = driveStep(1);
+    snapshot.steps.push(first);
+
+    const failed = await tools.execute(snapshot, first);
+
+    expect(failed.output).toMatchObject({ stagingStatus: "failed", stagingError: "NoSuchKey: The specified key does not exist." });
+    const failedText = String(record(failed.output)?.content);
+    expect(failedText).toContain("could not copy site photo.png");
+    expect(failedText).toContain("It is not at any sandbox path");
+    expect(failedText).not.toContain("Sandbox path:");
+
+    Object.assign(first, { state: "completed", output: failed.output });
+    const retry = driveStep(2);
+    snapshot.steps.push(retry);
+    const recovered = await tools.execute(snapshot, retry);
+
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(recovered.output).toMatchObject({ stagingStatus: "ready", resumedFromStep: first.id });
+  });
+
+  it("calls the remote tool again when the arguments name a different file", async () => {
+    const { tools, remote } = readinessExecutor(async () => []);
+    const snapshot = driveSnapshot();
+    const first = driveStep(1);
+    snapshot.steps.push(first);
+    const pending = await tools.execute(snapshot, first);
+    Object.assign(first, { state: "completed", output: pending.output });
+
+    const other = driveStep(2, { fileId: "drive-source-2" });
+    snapshot.steps.push(other);
+    await tools.execute(snapshot, other);
+
+    expect(remote).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates cancellation instead of returning a receipt", async () => {
+    let staging!: () => void;
+    const stagingStarted = new Promise<void>((resolve) => { staging = resolve; });
+    // Like the manager's wait: settles only through the signal.
+    const { tools } = readinessExecutor(async (_snapshot, _fileIds, options) => new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+      staging();
+    }));
+    const snapshot = driveSnapshot();
+    const step = driveStep(1);
+    snapshot.steps.push(step);
+    const controller = new AbortController();
+
+    const pending = tools.execute(snapshot, step, controller.signal);
+    await stagingStarted;
+    controller.abort(new Error("Task cancelled"));
+
+    await expect(pending).rejects.toThrow("Task cancelled");
+  });
+});
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
 
 function connectorServers(): McpServerSpec[] {
   return [
