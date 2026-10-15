@@ -2349,13 +2349,16 @@ describe("durable turn runner", () => {
       },
     });
 
+    // Tool use stops and the model is asked for a final answer; the task does not fail (H-004).
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
-    expect(repository.current.error).toContain("before attempt 6");
-    expect(repository.current.steps.find((step) => step.id === pending.id)?.state).toBe("failed");
-    expect(repository.current.steps.find((step) => step.id === laterPending.id)?.state).toBe("failed");
+    expect(repository.current.error).toBeNull();
+    expectFinalAnswerRequested(repository, "failed 5 times with the same input and the same error");
+    expect(repository.current.steps.find((step) => step.id === pending.id))
+      .toMatchObject({ state: "failed", error: "identical_tool_failure_limit" });
+    expect(repository.current.steps.find((step) => step.id === laterPending.id))
+      .toMatchObject({ state: "cancelled", error: "tool_use_stopped" });
     const terminalMutation = repository.mutations.at(-1)!;
     expect(terminalMutation.toolResultMessages?.map((result) => result.toolCallId)).toEqual([
       pending.input.toolCallId,
@@ -2416,9 +2419,9 @@ describe("durable turn runner", () => {
     });
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
+    expectFinalAnswerRequested(repository, "write failed 5 times with the same input and the same error");
   });
 
   describe("stalled model streams (H-021)", () => {
@@ -2710,7 +2713,8 @@ describe("durable turn runner", () => {
         state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
       }
       const failures = repository.current.steps.filter((step) => step.type === "tool.read").map((step) => String(step.error ?? ""));
-      return { state, executed, failures, error: repository.current.error };
+      const answer = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage.text] : []).at(-1);
+      return { state, executed, failures, error: repository.current.error, answer };
     }
     const missing = (path: string) => `ENOENT: no such file or directory, open '${path}'`;
 
@@ -2726,15 +2730,17 @@ describe("durable turn runner", () => {
       const result = await driveFailingRead((attempt) => spellings[(attempt - 1) % spellings.length]!, missing, 12);
 
       // The first spelling runs and fails as a missing resource; every re-spelling
-      // is refused without running, and the identical refusals end the run.
+      // is refused without running, and the identical refusals end tool use.
+      // The model's last response still asks for a read, so Berry answers.
       expect(result.executed).toHaveLength(1);
-      expect(result.state).toBe("failed");
-      expect(result.error).toContain("failed 5 times with identical arguments and error");
+      expect(result.state).toBe("finalizing");
+      expect(result.error).toBeNull();
       expect(result.failures[0]).toMatch(/repair attempt 1\/5/);
       const refused = result.failures.slice(1, -1);
       expect(refused).toHaveLength(5);
       expect(refused.every((failure) => failure.startsWith("Not run: this exact call already failed"))).toBe(true);
-      expect(result.failures.at(-1)).toContain("Berry stopped the task before attempt 6");
+      expect(result.failures.at(-1)).toBe("identical_tool_failure_limit");
+      expect(result.answer).toContain("I stopped working on this because read failed 5 times with the same input and the same error.");
     });
 
     it("tells the model when different arguments keep producing the same error", async () => {
@@ -2747,6 +2753,53 @@ describe("durable turn runner", () => {
       expect(result.failures[5]).toContain("same error 6 times in a row with changed arguments");
       // Guidance only: distinct guesses are not stopped by this counter.
       expect(result.state).toBe("finalizing");
+    });
+
+    describe("final answer after tool use stops", () => {
+      const reason = "read failed 5 times with the same input and the same error. Last error: ENOENT";
+      const lateCall = {
+        id: "call-late",
+        name: "read",
+        input: { path: "/workspace/a.txt" },
+        retryClass: "read_only" as const,
+        repeatPolicy: "compare_result" as const,
+        idempotencyKey: null,
+        requiresApproval: false,
+        approvalKind: "file-edit" as const,
+      };
+      const answerWith = async (text: string) => {
+        const repository = new FakeTurnRepository(snapshot("calling_model", [
+          admittedStep(),
+          { ...modelStep("pending", 1), input: { iteration: 1, wrapUp: reason } },
+        ]));
+        let lastMessage: unknown;
+        const runner = new DurableTurnRunner(repository, {
+          call: async (current) => {
+            lastMessage = modelMessages(current).messages.at(-1);
+            return { text, inputTokens: 1, outputTokens: 1, toolCalls: [lateCall] };
+          },
+        }, { execute: async () => { throw new Error("no tool may run after tool use stopped"); } });
+        const result = await runner.execute({ tenantId, runId, reason: "continue" });
+        const assistant = repository.mutations.flatMap((mutation) => mutation.assistantMessage ? [mutation.assistantMessage] : []).at(-1);
+        return { result, repository, lastMessage, assistant };
+      };
+
+      it("asks last for an answer without tools and does not run tool calls in it", async () => {
+        const { result, repository, lastMessage, assistant } = await answerWith("I could not open a.txt because it does not exist.");
+
+        expect(result.state).toBe("finalizing");
+        expect(lastMessage).toEqual({ role: "user", content: expect.stringContaining(`Berry has stopped tool use for this task: ${reason}`) });
+        expect(String((lastMessage as { content: string }).content)).toContain("Do not call any tools");
+        expect(repository.current.steps.some((step) => step.type.startsWith("tool."))).toBe(false);
+        expect(assistant).toMatchObject({ text: "I could not open a.txt because it does not exist.", toolCalls: [] });
+      });
+
+      it("answers for the model when it returns only tool calls", async () => {
+        const { result, assistant } = await answerWith("");
+
+        expect(result.state).toBe("finalizing");
+        expect(assistant?.text).toBe(`I stopped working on this because ${reason}\n\nTell me how you would like to continue, or correct the input and ask again.`);
+      });
     });
 
     it("does not add guidance while each attempt fails differently", async () => {
@@ -2816,9 +2869,10 @@ describe("durable turn runner", () => {
     });
 
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
-    expect(repository.current.error).toContain("activate_skill exhausted its 3-attempt repair budget");
+    expectFinalAnswerRequested(repository, "activate_skill failed 3 times in a row and its repair attempts are used up");
+    expect(repository.current.steps.find((step) => step.id === pending.id)?.error).toBe("repair_budget_exhausted");
   });
 
   it("does not count changed tool arguments as a repeated failure", async () => {
@@ -2966,9 +3020,11 @@ describe("durable turn runner", () => {
     const fourth = bashStep(7, 4);
     queueToolForExecution(repository, fourth);
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(2);
-    expect(repository.current.error).toBe("duplicate_tool_call_loop");
+    expect(repository.current.error).toBeNull();
+    expectFinalAnswerRequested(repository, "the same tool call kept being repeated");
+    expect(repository.current.progress?.budgetReason).toBe("duplicate_tool_call_loop");
     expect(repository.current.steps.find((step) => step.id === fourth.id))
       .toMatchObject({ state: "failed", error: "duplicate_tool_call_loop" });
   });
@@ -2999,7 +3055,7 @@ describe("durable turn runner", () => {
       });
       let result = await runner.execute({ tenantId, runId, reason: "continue" });
       // Tool steps are spaced by the model-call step the runner adds after each.
-      for (let polls = 2; polls <= maxPolls && result.state !== "failed"; polls += 1) {
+      for (let polls = 2; polls <= maxPolls && result.state !== "failed" && !finalAnswerRequested(repository); polls += 1) {
         queueToolForExecution(repository, poll(polls * 2 - 1));
         result = await runner.execute({ tenantId, runId, reason: "continue" });
       }
@@ -3015,7 +3071,8 @@ describe("durable turn runner", () => {
 
     it("still stops a job that never leaves RUNNING on the no-progress budget", async () => {
       const { repository, executions } = await runPolls(["RUNNING"], 12);
-      expect(repository.current.error).toBe("no_progress_budget");
+      expect(repository.current.progress?.budgetReason).toBe("no_progress_budget");
+      expectFinalAnswerRequested(repository, "tool results made no progress");
       expect(executions).toBeLessThanOrEqual(6);
     });
   });
@@ -3088,7 +3145,8 @@ describe("durable turn runner", () => {
     it("still bounds identical renders when only an unrelated file changed", async () => {
       const { repository, executions } = await runRenders("/workspace/notes/todo.md");
       expect(executions).toBe(2);
-      expect(repository.current.error).toBe("duplicate_tool_call_loop");
+      expect(repository.current.steps.some((step) => step.error === "duplicate_tool_call_loop")).toBe(true);
+      expect(repository.current.error).toBeNull();
     });
   });
 
@@ -3391,7 +3449,8 @@ describe("durable turn runner", () => {
     }, { noProgressHardThreshold: 5 });
 
     await expect(alternatingRunner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
+    expectFinalAnswerRequested(alternatingRepository, "the last 5 tool results made no progress");
     expect(alternatingRepository.events).toContainEqual(expect.objectContaining({
       kind: "turn.progress",
       progressKind: "alternating_no_progress",
@@ -3413,7 +3472,7 @@ describe("durable turn runner", () => {
     }, { noProgressHardThreshold: 5 });
 
     await expect(pollingRunner.execute({ tenantId, runId, reason: "continue" }))
-      .resolves.toMatchObject({ state: "failed" });
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(pollingRepository.current.progress).toMatchObject({
       consecutiveNoProgress: 5,
       progressKind: "declared_polling",
@@ -5210,6 +5269,22 @@ function runCommandStep(
 
 function noTools(): DurableTurnToolExecutor {
   return { execute: async () => ({ output: {}, summary: "" }) };
+}
+
+function finalAnswerRequested(repository: FakeTurnRepository): boolean {
+  const modelCall = repository.current.steps
+    .filter((step) => step.type === "model.call")
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  return modelCall?.state === "pending" && typeof modelCall.input.wrapUp === "string";
+}
+
+function expectFinalAnswerRequested(repository: FakeTurnRepository, reason: string): void {
+  const modelCall = repository.current.steps
+    .filter((step) => step.type === "model.call")
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  expect(repository.current.state).toBe("calling_model");
+  expect(modelCall).toMatchObject({ state: "pending" });
+  expect(String(modelCall?.input.wrapUp)).toContain(reason);
 }
 
 function queueToolForExecution(repository: FakeTurnRepository, step: DurableTurnStep): void {

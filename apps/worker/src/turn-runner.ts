@@ -99,6 +99,23 @@ const TOOL_REPEAT_HISTORY_LIMIT = 32;
 const DUPLICATE_TOOL_CALL_SUPPRESSED = "duplicate_tool_call_suppressed";
 const UNCHANGED_RETRY_REFUSED = "unchanged_retry_refused";
 const DUPLICATE_TOOL_CALL_LOOP = "duplicate_tool_call_loop";
+const TOOL_USE_STOPPED = "tool_use_stopped";
+
+/**
+ * When a loop or budget guard trips, Berry runs no more tools and asks the
+ * model for a final answer instead of failing the task (H-004).
+ */
+function finalAnswerInstruction(reason: string): string {
+  return [
+    `Berry has stopped tool use for this task: ${reason}`,
+    "Do not call any tools. Write your final answer to the user now: what you completed, what is blocking (with the last error, if any), and what the user can do next, for example correct an input, provide a missing file or ask for a different approach.",
+  ].join("\n\n");
+}
+
+/** The answer Berry gives when the model returns nothing usable after tool use stopped. */
+function finalAnswerFallback(reason: string): string {
+  return `I stopped working on this because ${reason.charAt(0).toLowerCase()}${reason.slice(1)}\n\nTell me how you would like to continue, or correct the input and ask again.`;
+}
 
 export interface DurableTurnStep {
   id: string;
@@ -1220,6 +1237,16 @@ export class DurableTurnRunner {
       );
     }
 
+    // After a loop or budget guard stopped tool use, the response is the final
+    // answer: tool calls are not run, and an empty answer gets Berry's (H-004).
+    const wrapUpReason = stringValue(record(step.input)?.wrapUp);
+    if (wrapUpReason && (result.toolCalls.length > 0 || !result.text.trim())) {
+      result = {
+        ...result,
+        toolCalls: [],
+        text: result.text.trim() ? result.text : finalAnswerFallback(wrapUpReason),
+      };
+    }
     const emptyResponse = !result.text.trim() && result.toolCalls.length === 0;
     if (emptyResponse) {
       const emptyEvents = responseEndEvents;
@@ -1512,9 +1539,7 @@ export class DurableTurnRunner {
     const progress = progressState(snapshot);
     const cumulativeToolBudget = Math.max(60_000, this.options.maxCumulativeToolTimeMs ?? DEFAULT_CUMULATIVE_TOOL_TIME_MS);
     if (progress.cumulativeToolMs >= cumulativeToolBudget) {
-      throw new DurableTurnTerminalError(
-        "The task exceeded its cumulative tool-time budget. Berry stopped it before another tool call.",
-      );
+      return this.stopToolUse(snapshot, step, toolTimeBudgetGuard(cumulativeToolBudget));
     }
     const priorRepairAttempts = matchingToolFailureCount(snapshot, step);
     const identicalFailureLimit = identicalToolFailureLimit(step);
@@ -1523,16 +1548,14 @@ export class DurableTurnRunner {
       Math.max(1, this.options.maxToolRepairAttempts ?? identicalFailureLimit),
     );
     if (repairBudget < IDENTICAL_TOOL_FAILURE_LIMIT && priorRepairAttempts >= repairBudget) {
-      throw new DurableTurnTerminalError(
-        `${toolName} exhausted its ${repairBudget}-attempt repair budget. Berry stopped the repair loop; choose a different strategy or provide corrected input.`,
-      );
+      return this.stopToolUse(snapshot, step, {
+        error: "repair_budget_exhausted",
+        reason: `${toolName} failed ${repairBudget} times in a row and its repair attempts are used up.`,
+        progressKind: "repair_budget",
+      });
     }
     const repeatedFailure = repeatedToolFailure(snapshot, step);
-    if (repeatedFailure) {
-      throw new DurableTurnTerminalError(
-        `${toolName} failed ${identicalFailureLimit} times with identical arguments and error. Berry stopped the task before attempt ${identicalFailureLimit + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
-      );
-    }
+    if (repeatedFailure) return this.stopToolUse(snapshot, step, identicalFailureGuard(step, repeatedFailure));
     const unchangedRetry = step.state === "pending" ? unchangedFailedRetry(snapshot, step) : null;
     if (unchangedRetry) return this.refuseUnchangedRetry(snapshot, step, unchangedRetry);
     const repeatAssessment = assessRepeatedToolCall(snapshot, step);
@@ -2080,18 +2103,11 @@ export class DurableTurnRunner {
     const currentProgress = progressState(snapshot);
     const cumulativeToolBudget = Math.max(60_000, this.options.maxCumulativeToolTimeMs ?? DEFAULT_CUMULATIVE_TOOL_TIME_MS);
     if (currentProgress.cumulativeToolMs >= cumulativeToolBudget) {
-      throw new DurableTurnTerminalError(
-        "The task exceeded its cumulative tool-time budget. Berry stopped it before another tool batch.",
-      );
+      return this.stopToolUse(snapshot, steps[0]!, toolTimeBudgetGuard(cumulativeToolBudget));
     }
     for (const step of steps) {
       const repeatedFailure = repeatedToolFailure(snapshot, step);
-      if (repeatedFailure) {
-        const failureLimit = identicalToolFailureLimit(step);
-        throw new DurableTurnTerminalError(
-          `${toolNameForStep(step)} failed ${failureLimit} times with identical arguments and error. Berry stopped the task before attempt ${failureLimit + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
-        );
-      }
+      if (repeatedFailure) return this.stopToolUse(snapshot, step, identicalFailureGuard(step, repeatedFailure));
     }
     const repeatAssessments = new Map(steps.map((step) => [step.id, assessRepeatedToolCall(snapshot, step)]));
     const guardEnforced = this.toolRepeatGuardMode() === "enforce";
@@ -2404,48 +2420,44 @@ export class DurableTurnRunner {
     }
 
     const iteration = modelIteration(snapshot.steps) + 1;
-    const nextState: TurnRunState = hardNoProgress ? "failed" : "calling_model";
-    const finalEvents = hardNoProgress
-      ? [
-          ...events,
-          { kind: "error" as const, message: "Berry stopped the task after repeated successful read results made no durable progress." },
-          { kind: "turn.end" as const, turnId: snapshot.id, status: "failed" as const },
-        ]
-      : events;
+    // Repeated reads that change nothing end tool use, not the task (H-004).
+    const wrapUp = hardNoProgress ? noProgressReason(batchProgress.consecutiveNoProgress) : null;
     await this.commitAndWake(snapshot, {
       expectedState: "executing_tool",
-      nextState,
+      nextState: "calling_model",
       steps: [
         ...mutations,
-        ...(!hardNoProgress ? [{
+        {
           id: randomUUID(),
           sequence: nextStepSequence(snapshot.steps),
           type: "model.call",
           state: "pending" as const,
-          input: { iteration },
+          input: wrapUp ? { iteration, wrapUp } : { iteration },
           retryClass: "idempotent_with_key" as const,
           idempotencyKey: `${snapshot.id}:model:${iteration}`,
-        }] : []),
+        },
       ],
-      events: finalEvents,
+      events: wrapUp
+        ? [...events, {
+            kind: "turn.progress" as const,
+            progressKind: "result_repeated" as const,
+            progressEpoch: batchProgress.progressEpoch,
+            consecutiveNoProgress: batchProgress.consecutiveNoProgress,
+            budgetReason: "no_progress_budget",
+          }]
+        : events,
       entries,
       toolResultMessages,
       ...(sandbox ? { sandbox } : {}),
-      ...(hardNoProgress ? {
-        terminalAssistant: { status: "failed" as const, error: "no_progress_budget" },
-        error: "no_progress_budget",
-        taskStatus: "failed" as const,
-        nextAction: null,
-        waitingReason: null,
-      } : {
-        nextAction: "Continue the model with the persisted read-only tool batch",
-      }),
-      progress: batchProgress,
+      nextAction: wrapUp
+        ? "Ask the model for a final answer without tools"
+        : "Continue the model with the persisted read-only tool batch",
+      progress: wrapUp ? { ...batchProgress, budgetReason: "no_progress_budget" } : batchProgress,
       ...(sandbox ? {
         outbox: [scheduledSandboxSnapshot(snapshot, this.options.snapshotIntervalSeconds ?? 900)],
       } : {}),
     });
-    return nextState;
+    return "calling_model";
   }
 
   private async suppressRepeatedToolCall(
@@ -2640,80 +2652,12 @@ export class DurableTurnRunner {
     step: DurableTurnStep,
     assessment: ToolRepeatAssessment,
   ): Promise<TurnRunState> {
-    const toolCallId = toolCallIdForStep(step);
-    const toolName = toolNameForStep(step);
-    const entryId = randomUUID();
-    const error = DUPLICATE_TOOL_CALL_LOOP;
-    const message = "Berry stopped this task because the model repeatedly requested the same tool call after receiving an unchanged result and a correction instruction. No additional duplicate call was executed.";
-    const progress = nextProgress(snapshot, {
-      kind: "result_repeated",
-      noProgress: true,
-      budgetReason: error,
+    return this.stopToolUse(snapshot, step, {
+      error: DUPLICATE_TOOL_CALL_LOOP,
+      reason: "the same tool call kept being repeated after it returned an unchanged result.",
+      progressKind: "result_repeated",
+      repeat: assessment,
     });
-    await this.repository.commit(snapshot, {
-      expectedState: "executing_tool",
-      nextState: "failed",
-      steps: [{
-        ...step,
-        state: "failed",
-        error,
-        repeatDecision: "terminate",
-        repeatSignature: assessment.signature,
-        repeatPolicy: assessment.policy,
-      }],
-      events: [
-        {
-          kind: "tool.end",
-          toolCallId,
-          status: "failed",
-          summary: "Duplicate tool call loop stopped before execution.",
-        },
-        {
-          kind: "turn.progress",
-          progressKind: "result_repeated",
-          progressEpoch: progress.progressEpoch,
-          consecutiveNoProgress: progress.consecutiveNoProgress,
-          budgetReason: error,
-        },
-        { kind: "error", message },
-        { kind: "turn.end", turnId: snapshot.id, status: "failed" },
-      ],
-      toolResultMessage: {
-        id: entryId,
-        toolCallId,
-        name: toolName,
-        input: (step.input.arguments ?? {}) as JsonValue,
-        status: "failed",
-        output: { error, message },
-        summary: message,
-      },
-      entries: [{
-        entryId,
-        entryType: "message",
-        stepId: step.id,
-        payload: {
-          type: "message",
-          id: entryId,
-          parentId: snapshot.entries.at(-1)?.entryId ?? null,
-          timestamp: new Date().toISOString(),
-          message: {
-            role: "toolResult",
-            toolCallId,
-            toolName,
-            content: [{ type: "text", text: message }],
-            isError: true,
-            timestamp: Date.now(),
-          },
-        },
-      }],
-      terminalAssistant: { status: "failed", error: message },
-      nextAction: null,
-      waitingReason: null,
-      error,
-      taskStatus: "failed",
-      progress,
-    });
-    return "failed";
   }
 
   private async stopForNoProgress(
@@ -2724,74 +2668,155 @@ export class DurableTurnRunner {
     progress: DurableTurnProgress,
     durationMs: number,
   ): Promise<TurnRunState> {
-    const toolCallId = toolCallIdForStep(step);
-    const toolName = toolNameForStep(step);
-    const entryId = randomUUID();
-    const error = "no_progress_budget";
-    const summary = "Berry stopped the task after repeated successful tool results made no durable progress.";
-    await this.repository.commit(snapshot, {
+    return this.stopToolUse(snapshot, step, {
+      error: "no_progress_budget",
+      reason: noProgressReason(progress.consecutiveNoProgress),
+      progressKind: progress.progressKind === "alternating_no_progress"
+        ? "alternating_no_progress"
+        : progress.progressKind === "declared_polling" ? "declared_polling" : "result_repeated",
+      progress,
+      completed: { result, resultFingerprint, durationMs },
+    });
+  }
+
+  /**
+   * A loop or budget guard tripped. Instead of failing the task, Berry runs no
+   * more tools and asks the model for a final answer that says what it
+   * completed and what is blocking (H-004). `step` either ran (its result is
+   * kept) or is refused with the reason; other calls queued from the same
+   * response are not run, and each still gets a result so the history stays
+   * valid for providers.
+   */
+  private async stopToolUse(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    guard: {
+      error: string;
+      reason: string;
+      progressKind: "result_repeated" | "alternating_no_progress" | "declared_polling" | "repair_budget" | "budget_exceeded";
+      repeat?: ToolRepeatAssessment;
+      progress?: DurableTurnProgress;
+      completed?: { result: TurnToolResult; resultFingerprint: string; durationMs: number };
+    },
+  ): Promise<TurnRunState> {
+    const progress = {
+      ...(guard.progress ?? nextProgress(snapshot, { kind: guard.progressKind, noProgress: true })),
+      budgetReason: guard.error,
+    };
+    const parentId = snapshot.entries.at(-1)?.entryId ?? null;
+    const queued = snapshot.steps
+      .filter((candidate) => candidate.id !== step.id && isRunnableToolStep(candidate))
+      .sort((left, right) => left.sequence - right.sequence);
+    const results = [
+      guard.completed
+        ? {
+            step,
+            mutation: {
+              ...step,
+              state: "completed" as const,
+              output: guard.completed.result.output,
+              resultFingerprint: guard.completed.resultFingerprint,
+            },
+            status: "completed" as const,
+            output: guard.completed.result.output,
+            summary: guard.completed.result.summary.slice(0, 2_000),
+            text: durableToolResultText(guard.completed.result.output),
+            durationMs: guard.completed.durationMs,
+          }
+        : {
+            step,
+            mutation: {
+              ...step,
+              state: "failed" as const,
+              error: guard.error,
+              ...(guard.repeat ? {
+                repeatDecision: "terminate" as const,
+                repeatSignature: guard.repeat.signature,
+                repeatPolicy: guard.repeat.policy,
+              } : {}),
+            },
+            status: "failed" as const,
+            output: { error: guard.error, message: guard.reason } as JsonValue,
+            summary: `Not run: ${guard.reason}`,
+            text: `Not run: ${guard.reason}`,
+            durationMs: undefined,
+          },
+      ...queued.map((candidate) => ({
+        step: candidate,
+        mutation: { ...candidate, state: "cancelled" as const, error: TOOL_USE_STOPPED },
+        status: "failed" as const,
+        output: { error: TOOL_USE_STOPPED } as JsonValue,
+        summary: "Not run: Berry stopped tool use for this task before this call.",
+        text: "Not run: Berry stopped tool use for this task before this call.",
+        durationMs: undefined,
+      })),
+    ].map((entry) => ({ ...entry, entryId: randomUUID() }));
+    const iteration = modelIteration(snapshot.steps) + 1;
+    await this.commitAndWake(snapshot, {
       expectedState: "executing_tool",
-      nextState: "failed",
-      steps: [{
-        ...step,
-        state: "completed",
-        output: result.output,
-        resultFingerprint,
-        sessionEntryId: entryId,
-      }],
+      nextState: "calling_model",
+      steps: [
+        ...results.map((entry) => entry.status === "completed"
+          ? { ...entry.mutation, sessionEntryId: entry.entryId }
+          : entry.mutation),
+        {
+          id: randomUUID(),
+          sequence: nextStepSequence(snapshot.steps),
+          type: "model.call",
+          state: "pending",
+          input: { iteration, wrapUp: guard.reason.slice(0, 2_000) },
+          retryClass: "idempotent_with_key",
+          idempotencyKey: `${snapshot.id}:model:${iteration}`,
+        },
+      ],
       events: [
-        { kind: "tool.end", toolCallId, status: "completed", summary: result.summary.slice(0, 2_000) },
+        ...results.map((entry) => ({
+          kind: "tool.end" as const,
+          toolCallId: toolCallIdForStep(entry.step),
+          status: entry.status,
+          summary: entry.summary,
+        })),
         {
           kind: "turn.progress",
-          progressKind: progress.progressKind === "alternating_no_progress"
-            ? "alternating_no_progress"
-            : progress.progressKind === "declared_polling"
-              ? "declared_polling"
-              : "result_repeated",
+          progressKind: guard.progressKind,
           progressEpoch: progress.progressEpoch,
           consecutiveNoProgress: progress.consecutiveNoProgress,
-          budgetReason: error,
+          budgetReason: guard.error,
         },
-        { kind: "error", message: summary },
-        { kind: "turn.end", turnId: snapshot.id, status: "failed" },
       ],
-      toolResultMessage: {
-        id: entryId,
-        toolCallId,
-        name: toolName,
-        input: (step.input.arguments ?? {}) as JsonValue,
-        status: "completed",
-        output: result.output,
-        summary,
-        durationMs,
-      },
-      entries: [{
-        entryId,
+      toolResultMessages: results.map((entry) => ({
+        id: entry.entryId,
+        toolCallId: toolCallIdForStep(entry.step),
+        name: toolNameForStep(entry.step),
+        input: (entry.step.input.arguments ?? {}) as JsonValue,
+        status: entry.status,
+        output: entry.output,
+        summary: entry.summary,
+        ...(entry.durationMs !== undefined ? { durationMs: entry.durationMs } : {}),
+      })),
+      entries: results.map((entry) => ({
+        entryId: entry.entryId,
         entryType: "message",
-        stepId: step.id,
+        stepId: entry.step.id,
         payload: {
           type: "message",
-          id: entryId,
-          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          id: entry.entryId,
+          parentId,
           timestamp: new Date().toISOString(),
           message: {
             role: "toolResult",
-            toolCallId,
-            toolName,
-            content: [{ type: "text", text: summary }],
-            isError: true,
+            toolCallId: toolCallIdForStep(entry.step),
+            toolName: toolNameForStep(entry.step),
+            content: [{ type: "text", text: entry.text }],
+            isError: entry.status !== "completed",
             timestamp: Date.now(),
           },
         },
-      }],
-      terminalAssistant: { status: "failed", error: summary },
-      nextAction: null,
-      waitingReason: null,
-      error,
-      taskStatus: "failed",
-      progress: { ...progress, budgetReason: error },
+      })),
+      progress,
+      nextAction: "Ask the model for a final answer without tools",
     });
-    return "failed";
+    return "calling_model";
   }
 
   private async finalize(snapshot: DurableTurnSnapshot): Promise<void> {
@@ -4911,6 +4936,26 @@ function identicalToolFailureLimit(step: DurableTurnStep): number {
   return toolNameForStep(step) === "activate_skill" ? 3 : IDENTICAL_TOOL_FAILURE_LIMIT;
 }
 
+function identicalFailureGuard(step: DurableTurnStep, lastError: string) {
+  return {
+    error: "identical_tool_failure_limit",
+    reason: `${toolNameForStep(step)} failed ${identicalToolFailureLimit(step)} times with the same input and the same error. Last error: ${lastError.slice(0, 600)}`,
+    progressKind: "repair_budget" as const,
+  };
+}
+
+function toolTimeBudgetGuard(budgetMs: number) {
+  return {
+    error: "tool_time_budget",
+    reason: `the task used up its ${Math.round(budgetMs / 60_000)}-minute tool-time budget.`,
+    progressKind: "budget_exceeded" as const,
+  };
+}
+
+function noProgressReason(consecutive: number): string {
+  return `the last ${consecutive} tool results made no progress.`;
+}
+
 function toolFailureIdentity(value: unknown): string {
   if (typeof value !== "string") return "";
   return value.trim().replace(/^Tool failed \(repair attempt \d+\/\d+[^)]*\)\.\s*/i, "");
@@ -6471,9 +6516,13 @@ export function modelMessages(
   const continuationInstruction = snapshot.runtimeRequest.continueInterruptedTurn === true
     ? CONTINUATION_SYSTEM_INSTRUCTION[continuationPhase(snapshot)]
     : "";
-  const recoveryInstruction = latestStep(snapshot.steps, "model.call")?.input.recoveryReason === "empty_response"
-    ? "Recovery instruction: the provider's previous response contained no text and no tool call. Continue the user's task now. You must either call a declared tool or return a clear, non-empty final answer."
-    : "";
+  const activeModelInput = latestStep(snapshot.steps, "model.call")?.input;
+  const wrapUpReason = stringValue(activeModelInput?.wrapUp);
+  const recoveryInstruction = wrapUpReason
+    ? finalAnswerInstruction(wrapUpReason)
+    : activeModelInput?.recoveryReason === "empty_response"
+      ? "Recovery instruction: the provider's previous response contained no text and no tool call. Continue the user's task now. You must either call a declared tool or return a clear, non-empty final answer."
+      : "";
   const checkpointContext = checkpoint ? `Portable checkpoint:\n${JSON.stringify(checkpoint)}` : "";
   const groundingContext = Object.keys(snapshot.groundingContext).length > 0
     ? `Dynamic grounding context:\n<untrusted_grounding>${JSON.stringify(snapshot.groundingContext)}</untrusted_grounding>`
