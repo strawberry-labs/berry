@@ -18,6 +18,7 @@ import {
   piReadContent,
   sandboxNetworkFailureHint,
   piReadPdfContent,
+  type PreparationTiming,
   type SandboxSnapshotObjectStore,
   type SandboxSnapshotRepository,
 } from "./sandbox-continuity.js";
@@ -4314,6 +4315,42 @@ describe("SandboxContinuityManager", () => {
     expect(staged.transfer).toMatchObject({ files: 2, reusedFiles: 0 });
   });
 
+  it("records how long sandbox access and skill staging took, and ignores a failed record (H-013)", async () => {
+    const timings: PreparationTiming[] = [];
+    const recordTiming = vi.fn(async (timing: PreparationTiming) => {
+      timings.push(timing);
+      throw new Error("operational events unavailable");
+    });
+    const manager = managerWithProvider({
+      list: vi.fn(async () => ({ path: "/workspace", entries: [] })),
+      read: vi.fn(async () => { throw new Error("not found"); }),
+      write: vi.fn(),
+      writeManyBytes: vi.fn(async (input: { files: Array<{ path: string; content: Uint8Array }> }) => (
+        input.files.map((file) => ({ path: file.path, size_bytes: file.content.byteLength, mtime: null }))
+      )),
+    }, undefined, { recordTiming });
+
+    const staged = await manager.stageSkillPackage(snapshot(), "timed", [
+      { path: "SKILL.md", contentBytes: Buffer.from("---\nname: timed\ndescription: Timed\n---\n") },
+    ]);
+    await expect(manager.stageSkillPackage(snapshot(), "broken", [])).rejects.toThrow("Skill package must contain SKILL.md");
+
+    expect(staged.filePath).toMatch(/SKILL\.md$/);
+    await vi.waitFor(() => expect(timings.filter((timing) => timing.operation === "skill.stage")).toHaveLength(2));
+    expect(timings.map((timing) => timing.operation)).toContain("sandbox.ensure");
+    const [succeeded, failed] = timings.filter((timing) => timing.operation === "skill.stage");
+    expect(succeeded).toMatchObject({
+      tenantId: snapshot().tenantId,
+      runId: snapshot().id,
+      sessionId: snapshot().sessionId,
+      outcome: "success",
+      itemCount: staged.transfer.files,
+      byteCount: staged.transfer.bytes,
+    });
+    expect(succeeded!.durationMs).toBeGreaterThanOrEqual(0);
+    expect(failed).toMatchObject({ outcome: "failure" });
+  });
+
   it("stages a fresh explicit resource with SKILL.md in one batch and no probes", async () => {
     const read = vi.fn(async () => { throw new Error("read probe should not run"); });
     const writeManyBytes = vi.fn(async (input: { files: Array<{ path: string; content: Uint8Array }> }) => (
@@ -4540,8 +4577,10 @@ function managerWithProvider(
     ttlSeconds?: number;
     cwd?: string;
     documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
+    recordTiming?: (timing: PreparationTiming) => Promise<void>;
   } = {},
 ): SandboxContinuityManager {
+  const { recordTiming, ...managerOptions } = options;
   const provider = {
     kind: "e2b",
     create: vi.fn(async () => ({
@@ -4560,10 +4599,11 @@ function managerWithProvider(
     persistOutput: vi.fn(),
     persist: vi.fn(),
     recordSandbox: vi.fn(async () => undefined),
+    ...(recordTiming ? { recordTiming } : {}),
   } satisfies SandboxSnapshotRepository;
   return new SandboxContinuityManager(provider, repository, null, {
     image: "berry-sandbox",
-    ...options,
+    ...managerOptions,
   });
 }
 

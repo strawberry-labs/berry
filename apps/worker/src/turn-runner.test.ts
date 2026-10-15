@@ -30,6 +30,7 @@ import {
   queuedFollowUpRuntimeRequest,
   DurableToolTimeoutError,
   modelMessages,
+  stepTimingFields,
   usageCostMicros,
   type BudgetReservationDecision,
   type DurableTurnModel,
@@ -416,6 +417,54 @@ describe("durable turn runner", () => {
   it("starts in live mode without a global router for snapshot-admitted providers", () => {
     expect(createDurableTurnModel({ BERRY_API_MODEL_MODE: "live" }))
       .toBeInstanceOf(SnapshotProviderDurableTurnModel);
+  });
+
+  it("measures the time to the first streamed output (H-013)", async () => {
+    const encoder = new TextEncoder();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({
+      async start(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"ok"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"id":"resp-timed","model":"served-model","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\ndata: [DONE]\n\n'));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch);
+    const result = await new SnapshotProviderDurableTurnModel({}, null).call(
+      providerSnapshot("openai-responses"),
+      modelStep("pending", 1),
+      {
+        messageId: randomUUID(),
+        tools: [],
+        additionalUserContent: [],
+        emitDelta: async () => undefined,
+        policyForTool: () => ({
+          retryClass: "read_only",
+          repeatPolicy: "compare_result",
+          requiresApproval: false,
+          approvalKind: "mcp",
+        }),
+      },
+    );
+
+    expect(result.text).toBe("ok");
+    expect(result.firstTokenMs).toBeGreaterThanOrEqual(50);
+    expect(result.firstTokenMs).toBeLessThan(5_000);
+  });
+
+  it("adds step durations and time to first token to phase events (H-013)", () => {
+    expect(stepTimingFields({
+      state: "completed",
+      output: { providerDiagnostics: { latencyMs: 1_250, firstTokenMs: 400 } },
+      startedAt: "2026-10-15T08:00:00.000Z",
+      completedAt: "2026-10-15T08:00:09.000Z",
+    })).toEqual({ durationMs: 1_250, firstTokenMs: 400 });
+    expect(stepTimingFields({
+      state: "failed",
+      output: null,
+      startedAt: "2026-10-15T08:00:00.000Z",
+      completedAt: "2026-10-15T08:00:02.500Z",
+    })).toEqual({ durationMs: 2_500 });
+    expect(stepTimingFields({ state: "running", output: null, startedAt: "2026-10-15T08:00:00.000Z", completedAt: null })).toEqual({});
   });
 
   it.each([

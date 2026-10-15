@@ -77,6 +77,7 @@ import {
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
 import {
   emitWorkerOperationalEvent,
+  operationalDuration,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
 import { classifyToolFailure, storedToolFailure, type ToolFailure } from "./tool-failures.js";
@@ -380,6 +381,8 @@ export interface TurnModelResult {
   usage?: Extract<AgentStreamEvent, { kind: "usage" }>;
   promptManifest?: PromptManifest;
   toolCalls: readonly TurnModelToolIntent[];
+  /** Milliseconds from sending the request to the first streamed output. */
+  firstTokenMs?: number;
 }
 
 export interface DurableToolPolicy {
@@ -3884,6 +3887,7 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
             attempt: step.incrementAttempt ? 1 : 0,
             phaseClaimCount: step.phaseClaimCount ?? 0,
             outcome: step.state,
+            ...stepTimingFields(step),
             ...(step.type.startsWith("tool.") ? {
               toolFamily: stableToolFamily(step.type.slice(5)),
               toolName: toolNameForStep({
@@ -3938,7 +3942,8 @@ WHERE tenant_id=$1::uuid AND id=$2::uuid
           dedupeKey: `${snapshot.id}:finalization:telemetry:${mutation.nextState}`,
           workerRole: role,
           sourceRevision: revision,
-          fields: { runId: snapshot.id, outcome: mutation.nextState },
+          // Whole-run wall time, from the request to this terminal state.
+          fields: { runId: snapshot.id, outcome: mutation.nextState, durationMs: operationalDuration(Date.parse(snapshot.createdAt)) },
         });
         await persistWorkerOperationalEvent(executor, {
           tenantId: snapshot.tenantId,
@@ -4300,6 +4305,9 @@ export class SnapshotProviderDurableTurnModel implements DurableTurnModel {
   }
 }
 
+/** Stream events that carry model output; the first one marks the time to first token. */
+const MODEL_OUTPUT_EVENTS: ReadonlySet<string> = new Set(["text_delta", "thinking_delta", "toolcall_start", "toolcall_delta"]);
+
 async function callProviderStream(
   provider: DurableProviderTransport,
   apiKey: string | undefined,
@@ -4332,6 +4340,8 @@ async function callProviderStream(
     })),
   };
   const effort = reasoningEffort(snapshot.runtimeRequest.reasoning);
+  const requestStartedAt = Date.now();
+  let firstTokenMs: number | undefined;
   const stream = await streamFn(model, piContext, {
     sessionId: snapshot.sessionId,
     temperature: 0,
@@ -4342,6 +4352,7 @@ async function callProviderStream(
   });
   for await (const event of stream) {
     context.reportProgress?.();
+    if (firstTokenMs === undefined && MODEL_OUTPUT_EVENTS.has(event.type)) firstTokenMs = Date.now() - requestStartedAt;
     if (event.type === "text_delta") await context.emitDelta(event.delta, "text");
     else if (event.type === "thinking_delta") await context.emitDelta(event.delta, "reasoning");
   }
@@ -4406,6 +4417,7 @@ async function callProviderStream(
     outputTokens: assistant.usage.output,
     usage,
     toolCalls,
+    ...(firstTokenMs !== undefined ? { firstTokenMs } : {}),
   };
 }
 
@@ -4618,6 +4630,7 @@ function successfulProviderDiagnostics(
     retryDecision: "none",
     physicalAttempt: Math.max(1, (latestStep(snapshot.steps, "model.call")?.attempt ?? 0) + 1),
     latencyMs: Math.max(0, Date.now() - startedAt),
+    firstTokenMs: result.firstTokenMs ?? null,
     inputTokens: Math.max(0, Math.floor(result.inputTokens)),
     outputTokens: Math.max(0, Math.floor(result.outputTokens)),
     cacheReadTokens: result.usage?.cacheReadTokens ?? 0,
@@ -4625,6 +4638,25 @@ function successfulProviderDiagnostics(
     finishReason: result.finishReason ?? null,
     errorCode: null,
   };
+}
+
+/**
+ * Duration and, for model calls, time to first token of a finished step, for
+ * the persisted phase and tool events (H-013). Model calls use the measured
+ * request time; other steps use their start and completion timestamps.
+ */
+export function stepTimingFields(step: Pick<DurableStepMutation, "state" | "output" | "startedAt" | "completedAt">): Record<string, number> {
+  if (step.state !== "completed" && step.state !== "failed") return {};
+  const diagnostics = record(record(step.output ?? null)?.providerDiagnostics);
+  const fields: Record<string, number> = {};
+  const latency = nonnegativeNumber(diagnostics?.latencyMs);
+  const started = step.startedAt ? Date.parse(step.startedAt) : Number.NaN;
+  const completed = step.completedAt ? Date.parse(step.completedAt) : Number.NaN;
+  if (latency !== null) fields.durationMs = latency;
+  else if (Number.isFinite(started) && Number.isFinite(completed)) fields.durationMs = Math.max(0, completed - started);
+  const firstToken = nonnegativeNumber(diagnostics?.firstTokenMs);
+  if (firstToken !== null) fields.firstTokenMs = firstToken;
+  return fields;
 }
 
 /**

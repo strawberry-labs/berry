@@ -1,5 +1,6 @@
 const OUTBOX_BUCKETS_SECONDS = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60] as const;
 const PROVIDER_BUCKETS_SECONDS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 900, 1_800] as const;
+const PREPARATION_BUCKETS_SECONDS = [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300] as const;
 
 type Histogram = { count: number; sum: number; buckets: number[] };
 type ProviderSeries = {
@@ -9,11 +10,15 @@ type ProviderSeries = {
   histogram: Histogram;
 };
 type OutboxSeries = { jobName: string; count: number; histogram: Histogram };
+type FirstTokenSeries = { model: string; histogram: Histogram };
+type PreparationSeries = { operation: string; outcome: string; histogram: Histogram };
 export type WorkerCancellationSignalResult = "received" | "invalid_payload" | "subscriber_error";
 
 /** Process-local counters complementing BullMQ's queue-level gauges. */
 export class WorkerRuntimeMetrics {
   readonly #providers = new Map<string, ProviderSeries>();
+  readonly #firstToken = new Map<string, FirstTokenSeries>();
+  readonly #preparation = new Map<string, PreparationSeries>();
   readonly #outbox = new Map<string, OutboxSeries>();
   readonly #cancellationSignals = new Map<WorkerCancellationSignalResult, number>();
   readonly #outboxFenceMisses = new Map<string, number>();
@@ -34,6 +39,25 @@ export class WorkerRuntimeMetrics {
     };
     observe(series.histogram, millisecondsToSeconds(input.latencyMs), PROVIDER_BUCKETS_SECONDS);
     this.#providers.set(key, series);
+    if (outcome === "success" && typeof input.firstTokenMs === "number" && Number.isFinite(input.firstTokenMs)) {
+      const first = this.#firstToken.get(model) ?? { model, histogram: emptyHistogram(PROVIDER_BUCKETS_SECONDS) };
+      observe(first.histogram, millisecondsToSeconds(input.firstTokenMs), PROVIDER_BUCKETS_SECONDS);
+      this.#firstToken.set(model, first);
+    }
+  }
+
+  /** Duration of one sandbox preparation step: start, staging, extraction or snapshot. */
+  preparationStep(operation: string, outcome: string, durationMs: number): void {
+    const normalizedOperation = boundedLabel(operation, "unknown", 64);
+    const normalizedOutcome = boundedLabel(outcome, "unknown", 32);
+    const key = `${normalizedOperation}\0${normalizedOutcome}`;
+    const series = this.#preparation.get(key) ?? {
+      operation: normalizedOperation,
+      outcome: normalizedOutcome,
+      histogram: emptyHistogram(PREPARATION_BUCKETS_SECONDS),
+    };
+    observe(series.histogram, millisecondsToSeconds(durationMs), PREPARATION_BUCKETS_SECONDS);
+    this.#preparation.set(key, series);
   }
 
   outboxDispatch(jobName: string, latencyMs: number | null): void {
@@ -88,6 +112,20 @@ export class WorkerRuntimeMetrics {
     );
     for (const [, series] of sortedEntries(this.#providers)) {
       appendHistogram(lines, "berry_worker_provider_request_duration_seconds", providerLabels(series), series.histogram, PROVIDER_BUCKETS_SECONDS);
+    }
+    lines.push(
+      "# HELP berry_worker_provider_first_token_seconds Time from sending a model request to its first output (text, reasoning or a tool call), by model.",
+      "# TYPE berry_worker_provider_first_token_seconds histogram",
+    );
+    for (const [, series] of sortedEntries(this.#firstToken)) {
+      appendHistogram(lines, "berry_worker_provider_first_token_seconds", { model: series.model }, series.histogram, PROVIDER_BUCKETS_SECONDS);
+    }
+    lines.push(
+      "# HELP berry_worker_preparation_duration_seconds Sandbox preparation steps (start, input and skill staging, document extraction, snapshot) by operation and outcome.",
+      "# TYPE berry_worker_preparation_duration_seconds histogram",
+    );
+    for (const [, series] of sortedEntries(this.#preparation)) {
+      appendHistogram(lines, "berry_worker_preparation_duration_seconds", { operation: series.operation, outcome: series.outcome }, series.histogram, PREPARATION_BUCKETS_SECONDS);
     }
     lines.push(
       "# HELP berry_worker_turn_cancellation_signals_total Redis cancellation subscriber results.",

@@ -40,7 +40,8 @@ import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
-import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
+import { emitWorkerOperationalEvent, persistWorkerOperationalEvent } from "./operational-telemetry.js";
+import { workerRuntimeMetrics } from "./runtime-metrics.js";
 import type {
   DurableTurnSnapshot,
   DurableTurnStep,
@@ -407,6 +408,18 @@ interface SandboxInputFile {
   objectVersionId?: string | null;
 }
 
+/** How long one preparation step of a run took (H-013). */
+export interface PreparationTiming {
+  tenantId: string;
+  runId: string;
+  sessionId: string | null;
+  operation: string;
+  durationMs: number;
+  outcome: string;
+  itemCount?: number;
+  byteCount?: number;
+}
+
 interface SandboxOutputFile {
   fileId: string;
   name: string;
@@ -424,6 +437,7 @@ export interface SandboxSnapshotRepository {
   loadRun(tenantId: string, runId: string): Promise<SnapshotRun>;
   continuity(tenantId: string, runId: string): Promise<SessionContinuityRecord | null>;
   inputFiles(tenantId: string, runId: string, scope?: "turn" | "session"): Promise<readonly SandboxInputFile[]>;
+  recordTiming?(input: PreparationTiming): Promise<void>;
   publishedOutputs?(tenantId: string, sessionId: string): Promise<readonly PublishedSandboxOutput[]>;
   recordArtifactOperationStart?(input: {
     tenantId: string;
@@ -575,6 +589,36 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     },
   ) {}
 
+  /**
+   * Times one preparation step for the worker metrics and the run's timing
+   * record (H-013). The record is written in the background; its failure is
+   * ignored and never changes the step's result.
+   */
+  async #timed<T>(
+    run: { tenantId: string; runId: string; sessionId: string | null },
+    operation: string,
+    action: () => Promise<T>,
+    describe: (result: T) => { itemCount?: number; byteCount?: number } = () => ({}),
+  ): Promise<T> {
+    const startedAt = Date.now();
+    let outcome = "failure";
+    let details: { itemCount?: number; byteCount?: number } = {};
+    try {
+      const result = await action();
+      outcome = "success";
+      details = describe(result);
+      return result;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") outcome = "cancelled";
+      throw error;
+    } finally {
+      const durationMs = Math.max(0, Date.now() - startedAt);
+      workerRuntimeMetrics.preparationStep(operation, outcome, durationMs);
+      void this.repository.recordTiming?.({ ...run, operation, durationMs, outcome, ...details })
+        .catch(() => undefined);
+    }
+  }
+
   async modelContent(
     snapshot: DurableTurnSnapshot,
     signal?: AbortSignal,
@@ -582,18 +626,32 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   ): Promise<readonly ChatContentPart[]> {
     signal?.throwIfAborted();
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
-    const turnInputFiles = await this.awaitTurnInputFiles(snapshot, signal, reportProgress);
+    const run = { tenantId: snapshot.tenantId, runId: snapshot.id, sessionId: snapshot.sessionId ?? null };
+    const turnInputFiles = await this.#timed(
+      run,
+      "inputs.wait",
+      () => this.awaitTurnInputFiles(snapshot, signal, reportProgress),
+      (files) => ({ itemCount: files.length }),
+    );
     signal?.throwIfAborted();
     if (turnInputFiles.length > 0) {
       const sandbox = await this.ensureSandbox(snapshot, signal);
-      await this.stageInputFiles(
-        snapshot,
-        sandbox.id,
-        this.repository,
-        new Set(turnInputFiles.map((file) => file.fileId.toLowerCase())),
-        signal,
-        reportProgress,
-        turnInputFiles,
+      await this.#timed(
+        run,
+        "inputs.stage",
+        () => this.stageInputFiles(
+          snapshot,
+          sandbox.id,
+          this.repository,
+          new Set(turnInputFiles.map((file) => file.fileId.toLowerCase())),
+          signal,
+          reportProgress,
+          turnInputFiles,
+        ),
+        () => ({
+          itemCount: turnInputFiles.length,
+          byteCount: turnInputFiles.reduce((total, file) => total + file.sizeBytes, 0),
+        }),
       );
     }
     const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
@@ -809,6 +867,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     packageId: string,
     files: readonly DurableSkillPackageFile[],
     options: DurableSkillPackageStageOptions = {},
+  ): Promise<{ filePath: string; resources: string[]; stagedResources: string[]; stagingSandboxId: string; transfer: SkillStagingTransfer }> {
+    return this.#timed(
+      { tenantId: snapshot.tenantId, runId: snapshot.id, sessionId: snapshot.sessionId ?? null },
+      "skill.stage",
+      () => this.#stageSkillPackage(snapshot, packageId, files, options),
+      (staged) => ({ itemCount: staged.transfer.files, byteCount: staged.transfer.bytes }),
+    );
+  }
+
+  async #stageSkillPackage(
+    snapshot: DurableTurnSnapshot,
+    packageId: string,
+    files: readonly DurableSkillPackageFile[],
+    options: DurableSkillPackageStageOptions,
   ): Promise<{ filePath: string; resources: string[]; stagedResources: string[]; stagingSandboxId: string; transfer: SkillStagingTransfer }> {
     const sandbox = await this.ensureSandbox(snapshot, options.signal);
     options.signal?.throwIfAborted();
@@ -1044,7 +1116,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (bytes.byteLength !== source.size_bytes) {
           throw new Error(`Document read was incomplete: expected ${source.size_bytes} bytes, received ${bytes.byteLength}`);
         }
-        const content = await this.#extractOfficeText(snapshot.tenantId, bytes, mediaType);
+        const content = await this.#timed(
+          { tenantId: snapshot.tenantId, runId: snapshot.id, sessionId: snapshot.sessionId ?? null },
+          "document.extract",
+          () => this.#extractOfficeText(snapshot.tenantId, bytes, mediaType),
+          () => ({ byteCount: bytes.byteLength }),
+        );
         reportProgress?.();
         const formatted = piReadContent(content, args);
         return {
@@ -1759,7 +1836,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const expiry = new AbortController();
       const preserve = async () => {
         if (terminal && this.options.enableTerminalFinalization) await this.finalizeTerminalRun(run);
-        const archive = await this.capture(run.sandboxId!, Date.now() + snapshotTimeoutMs);
+        const timing = { tenantId: payload.tenantId, runId: payload.runId, sessionId: run.sessionId ?? null };
+        const archive = await this.#timed(
+          timing,
+          "snapshot.capture",
+          () => this.capture(run.sandboxId!, Date.now() + snapshotTimeoutMs),
+          (captured) => ({ itemCount: captured.files.length }),
+        );
         expiry.signal.throwIfAborted();
         const current = await repository.loadRun(payload.tenantId, payload.runId);
         if (!current.sandboxId || current.sandboxId !== run.sandboxId) {
@@ -1780,7 +1863,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (!this.objects) throw new Error("Sandbox snapshot object storage is not configured");
         const key = `sandbox-snapshots/${payload.tenantId}/${payload.runId}/${contentHash}.json`;
         expiry.signal.throwIfAborted();
-        await this.objects.put(key, bytes);
+        await this.#timed(timing, "snapshot.upload", () => this.objects!.put(key, bytes), () => ({ byteCount: bytes.byteLength }));
         expiry.signal.throwIfAborted();
         const record = await repository.persist({
           run: current,
@@ -1899,7 +1982,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const key = `${snapshot.tenantId}:${snapshot.id}`;
     const existing = this.#sandboxStarts.get(key);
     if (existing) return existing;
-    const started = this.ensureSandboxUncached(snapshot, signal).finally(() => {
+    const started = this.#timed(
+      { tenantId: snapshot.tenantId, runId: snapshot.id, sessionId: snapshot.sessionId ?? null },
+      "sandbox.ensure",
+      () => this.ensureSandboxUncached(snapshot, signal),
+    ).finally(() => {
       if (this.#sandboxStarts.get(key) === started) this.#sandboxStarts.delete(key);
     });
     this.#sandboxStarts.set(key, started);
@@ -2696,6 +2783,26 @@ WHERE a.tenant_id=$1::uuid AND a.session_id=$2::uuid AND a.role='output'
       [tenantId, sessionId],
     );
     return rows.map((row) => ({ sourcePath: row.source_path, sha256: row.sha256 }));
+  }
+
+  async recordTiming(input: PreparationTiming): Promise<void> {
+    await persistWorkerOperationalEvent(this.executor, {
+      tenantId: input.tenantId,
+      runId: input.runId,
+      sessionId: input.sessionId,
+      eventType: "sandbox.operation",
+      dedupeKey: `${input.runId}:timing:${input.operation}:${randomUUID()}`,
+      workerRole: normalizeWorkerRole(process.env.BERRY_WORKER_ROLE),
+      sourceRevision: sourceRevisionFromEnv(process.env),
+      fields: {
+        runId: input.runId,
+        operation: input.operation,
+        outcome: input.outcome,
+        durationMs: input.durationMs,
+        itemCount: input.itemCount,
+        byteCount: input.byteCount,
+      },
+    });
   }
 
   async recordArtifactOperationStart(input: {
