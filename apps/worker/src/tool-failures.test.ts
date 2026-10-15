@@ -60,6 +60,11 @@ describe("tool failure classes (H-003, H-006)", () => {
     const refused = Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443"), { code: "ECONNREFUSED" });
     expect(classifyToolFailure(refused, { changesState: true })).toMatchObject({ category: "transient", outcome: "not_applied" });
     expect(classifyToolFailure(new Error("socket hang up"), { changesState: false }).category).toBe("transient");
+    // A workspace that could not be reached ran nothing (H-009).
+    const unreachable = new Error("The workspace is temporarily unreachable (connect ETIMEDOUT 10.0.0.1:443). Nothing was run and no files were changed; retry this step.");
+    expect(classifyToolFailure(unreachable, { changesState: true })).toMatchObject({ category: "transient", outcome: "not_applied" });
+    const refusedSandbox = new Error("The sandbox provider refused access (401: Invalid API key). Nothing was run. An administrator must check the sandbox provider configuration; retrying will not help.");
+    expect(classifyToolFailure(refusedSandbox, { changesState: true }).category).toBe("configuration");
   });
 
   it("round-trips the stored class from a failed step's output", () => {

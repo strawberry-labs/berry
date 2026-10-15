@@ -13,6 +13,7 @@ import {
   SandboxContinuityManager,
   SqlSandboxSnapshotRepository,
   exposedSandboxImages,
+  classifySandboxLifecycleFailure,
   PI_BASH_WRAPPER_SCRIPT,
   PI_GREP_FILTER_SCRIPT,
   PI_READ_STREAM_SCRIPT,
@@ -23,12 +24,96 @@ import {
   type SandboxSnapshotObjectStore,
   type SandboxSnapshotRepository,
 } from "./sandbox-continuity.js";
-import type { DurableTurnSnapshot, DurableTurnStep } from "./turn-runner.js";
+import { DurableTurnRetryableError, type DurableTurnSnapshot, type DurableTurnStep } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 async function testPng(seed: number): Promise<Buffer> {
   return sharp({ create: { width: 2, height: 1, channels: 3, background: { r: seed, g: 40, b: 70 } } }).png().toBuffer();
 }
+
+describe("sandbox lifecycle failures (H-009)", () => {
+  it.each([
+    [Object.assign(new Error("Sandbox abc was not found"), { name: "SandboxNotFoundError" }), "missing"],
+    [new Error("502: The sandbox is probably not running anymore"), "missing"],
+    [new Error("connect ETIMEDOUT 10.0.0.1:443"), "transient"],
+    [new Error("Request timed out after 30000ms"), "transient"],
+    [new Error("503 Service Unavailable"), "transient"],
+    [new Error("401: Invalid API key"), "denied"],
+    [Object.assign(new Error("path not found: /workspace/a.txt"), { name: "FileNotFoundError" }), "unknown"],
+    [new Error("Unexpected provider response"), "unknown"],
+  ] as const)("classifies %s as %s", (error, expected) => {
+    expect(classifySandboxLifecycleFailure(error)).toBe(expected);
+  });
+
+  const lifecycleManager = (resume: () => Promise<unknown>) => {
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-new", provider: "e2b", status: "running" })),
+      resume: vi.fn(resume),
+      exec: vi.fn(),
+      files: { read: vi.fn(), write: vi.fn(), list: vi.fn(async (input: { path: string }) => ({ path: input.path, entries: [] })) },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+      recordTiming: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const manager = new SandboxContinuityManager(provider, repository, null, { image: "berry-sandbox", resumeRetryDelayMs: 1 });
+    const current = snapshot();
+    current.sandboxId = "sandbox-existing";
+    current.sandboxProvider = "e2b";
+    current.sandboxState = "running";
+    return { provider, repository, manager, current };
+  };
+
+  it("retries a timed-out resume once with a fresh connection instead of replacing the workspace", async () => {
+    let attempts = 0;
+    const { provider, manager, current } = lifecycleManager(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("connect ETIMEDOUT 10.0.0.1:443");
+      return { sandbox_id: "sandbox-existing", provider: "e2b", status: "running" };
+    });
+
+    await manager.execute(current, lsStep());
+    expect(provider.create).not.toHaveBeenCalled();
+    expect(provider.resume).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(provider.resume!).mock.calls[1]![0]).toMatchObject({ sandbox_id: "sandbox-existing", force_reconnect: true });
+  });
+
+  it.each([
+    ["connect ETIMEDOUT 10.0.0.1:443", "temporarily unreachable", "failure:transient"],
+    ["401: Invalid API key", "An administrator must check the sandbox provider configuration", "failure:denied"],
+  ])("reports %s with its class and keeps the workspace", async (message, expected, outcome) => {
+    const { provider, repository, manager, current } = lifecycleManager(async () => { throw new Error(message); });
+
+    await expect(manager.execute(current, lsStep())).rejects.toThrow(expected);
+    expect(provider.create).not.toHaveBeenCalled();
+    expect(repository.recordTiming).toHaveBeenCalledWith(expect.objectContaining({ operation: "sandbox.resume", outcome }));
+  });
+
+  it("still replaces a sandbox that is gone", async () => {
+    const { provider, manager, current } = lifecycleManager(async () => {
+      throw Object.assign(new Error("Sandbox sandbox-existing was not found"), { name: "SandboxNotFoundError" });
+    });
+
+    await manager.execute(current, lsStep());
+    expect(provider.resume).toHaveBeenCalledTimes(1);
+    expect(provider.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases preparation for a later attempt while the workspace is unreachable", async () => {
+    const { manager, current } = lifecycleManager(async () => { throw new Error("503 Service Unavailable"); });
+    const staged = manager.stageAssociatedInputFiles(current, ["00000000-0000-7000-8000-000000000090"]);
+
+    await expect(staged).rejects.toBeInstanceOf(DurableTurnRetryableError);
+    await expect(staged).rejects.toThrow("Berry will retry");
+  });
+});
 
 describe("SandboxContinuityManager", () => {
   it("identifies blocked S3 downloads without exposing signed URL credentials", () => {
@@ -2343,6 +2428,19 @@ describe("SandboxContinuityManager", () => {
         selected: [],
         withheld: batch.map((step) => String((step.output as { visionPath: string }).visionPath)),
       });
+    });
+
+    it("prepares once more after the sandbox disappears mid-preparation (H-009)", async () => {
+      const { manager, read } = await managerFor(new Set());
+      const original = read.getMockImplementation()!;
+      read.mockImplementationOnce(async () => {
+        throw Object.assign(new Error("The sandbox was not found"), { name: "SandboxNotFoundError" });
+      });
+      read.mockImplementation(original);
+
+      const content = await manager.modelContent(current([completedRead("/workspace/outputs/final.png", 1)]));
+      expect(content.filter((part) => part.type === "image_url")).toHaveLength(1);
+      expect(read).toHaveBeenCalledTimes(2);
     });
 
     it("still reports an explicitly requested missing image as an inspection error", async () => {

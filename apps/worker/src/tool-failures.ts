@@ -87,7 +87,9 @@ export function classifyToolFailure(error: unknown, options: { changesState: boo
       || TRANSIENT_PATTERN.test(message)
       || /PROXY_UNAVAILABLE|TIMEOUT|RATE_LIMIT/i.test(code ?? "");
     if (transient) {
-      return options.changesState && !NOT_SENT_CODES.has(code ?? "") ? "unknown_outcome" : "transient";
+      // Errors raised before anything reached the target say so (H-009).
+      const notSent = NOT_SENT_CODES.has(code ?? "") || /\bNothing was run\b/.test(message);
+      return options.changesState && !notSent ? "unknown_outcome" : "transient";
     }
     if (INVALID_SPECIFIC_PATTERN.test(message)) return "invalid_input";
     if (status === 404 || MISSING_PATTERN.test(message) || /NOT_FOUND|CHALLENGE/i.test(code ?? "")) return "missing_resource";

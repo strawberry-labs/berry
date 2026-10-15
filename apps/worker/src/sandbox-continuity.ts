@@ -18,6 +18,7 @@ import {
   type SandboxHandle,
   type SandboxCreateInput,
   type SandboxProvider,
+  type SandboxResumeInput,
 } from "@berry/sandbox-contract";
 import {
   artifactDisplayName,
@@ -44,6 +45,7 @@ import { emitWorkerOperationalEvent, persistWorkerOperationalEvent } from "./ope
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
 import {
   capabilityNoticeReason,
+  DurableTurnRetryableError,
   type DurableTurnSnapshot,
   type DurableTurnStep,
   type DurableTurnToolExecutor,
@@ -54,6 +56,7 @@ import {
 } from "./turn-runner.js";
 
 const MAX_SNAPSHOT_ARCHIVE_BYTES = 384 * 1024 * 1024;
+const SANDBOX_RESUME_RETRY_DELAY_MS = 1_000;
 const MAX_MODEL_IMAGE_BYTES = MODEL_IMAGE_LIMITS.maxSourceBytes;
 const MAX_MODEL_IMAGES = MODEL_IMAGE_LIMITS.maxCount;
 const PI_TOOL_MAX_LINES = 2_000;
@@ -578,6 +581,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       inputAvailabilityPollMs?: number;
       importAvailabilityTimeoutMs?: number;
       importAvailabilityPollMs?: number;
+      resumeRetryDelayMs?: number;
       enableTerminalFinalization?: boolean;
       documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
       imageGeneration?: {
@@ -621,6 +625,37 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   }
 
   async modelContent(
+    snapshot: DurableTurnSnapshot,
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<readonly ChatContentPart[]> {
+    return this.#withSandboxRecovery(signal, () => this.#modelContent(snapshot, signal, reportProgress));
+  }
+
+  /**
+   * Preparation before a model call only stages inputs and reads images, so it
+   * is safe to run again. A sandbox that disappeared after it was reached is
+   * reconnected or restored once; one that is temporarily unreachable is
+   * released for a later attempt instead of failing the task (H-009).
+   */
+  async #withSandboxRecovery<T>(signal: AbortSignal | undefined, prepare: () => Promise<T>): Promise<T> {
+    try {
+      return await prepare();
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const failure = classifySandboxLifecycleFailure(error);
+      if (failure === "missing") return prepare();
+      if (failure === "transient") {
+        throw new DurableTurnRetryableError(
+          `The workspace was temporarily unreachable while preparing this step (${errorDetail(error)}). Nothing was run; Berry will retry.`,
+          error,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #modelContent(
     snapshot: DurableTurnSnapshot,
     signal?: AbortSignal,
     reportProgress?: () => void,
@@ -806,6 +841,19 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     snapshot: DurableTurnSnapshot,
     fileIds: readonly string[],
     options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined } = {},
+  ): Promise<readonly {
+    fileId: string;
+    name: string;
+    mediaType: string;
+    path: string;
+  }[]> {
+    return this.#withSandboxRecovery(options.signal, () => this.#stageAssociatedInputFiles(snapshot, fileIds, options));
+  }
+
+  async #stageAssociatedInputFiles(
+    snapshot: DurableTurnSnapshot,
+    fileIds: readonly string[],
+    options: { signal?: AbortSignal | undefined; reportProgress?: (() => void) | undefined },
   ): Promise<readonly {
     fileId: string;
     name: string;
@@ -2045,9 +2093,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
                 ...(snapshot.sandboxState !== "running" ? { force_reconnect: true } : {}),
               } : {}),
             } as const;
-            const resumed = signal
-              ? await this.provider.resume?.(resumeInput, { signal })
-              : await this.provider.resume?.(resumeInput);
+            const resumed = await this.resumeSandbox(snapshot, resumeInput, signal);
             if (resumed) {
               activeSandbox = {
                 provider: resumed.provider ?? activeSandbox.provider,
@@ -2078,7 +2124,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       } catch (error) {
         if (signal?.aborted) throw error;
         if (error instanceof SandboxNetworkPolicyUpdateError) throw error;
-        // Restore from the newest complete archive below.
+        throwUnlessReplaceable(error);
+        // Gone, or failed in an unrecognised way: restore the newest complete archive below.
       }
     }
     const latest = await this.repository.latest(snapshot.tenantId, snapshot.id);
@@ -2112,9 +2159,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
                 force_reconnect: true,
               } : {}),
             } as const;
-            const resumed = signal
-              ? await this.provider.resume?.(resumeInput, { signal })
-              : await this.provider.resume?.(resumeInput);
+            const resumed = await this.resumeSandbox(snapshot, resumeInput, signal);
             if (resumed) {
               activeSandbox = {
                 provider: resumed.provider ?? activeSandbox.provider,
@@ -2142,6 +2187,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       } catch (error) {
         if (signal?.aborted) throw error;
         if (error instanceof SandboxNetworkPolicyUpdateError) throw error;
+        throwUnlessReplaceable(error);
         // The previous turn's sandbox expired. Restore its durable archive below.
       }
     }
@@ -2214,6 +2260,44 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       state: handle.status,
     });
     return { provider: handle.provider, id: handle.sandbox_id, state: handle.status };
+  }
+
+  /**
+   * Resumes a sandbox, retrying a timeout or refused connection once with a
+   * fresh connection. A final failure is recorded with its class, so the
+   * timing report shows why workspaces were replaced or unreachable (H-009).
+   */
+  private async resumeSandbox(
+    snapshot: DurableTurnSnapshot,
+    input: SandboxResumeInput,
+    signal?: AbortSignal,
+  ): Promise<SandboxHandle | undefined> {
+    const startedAt = Date.now();
+    const resume = (value: SandboxResumeInput) => signal
+      ? this.provider.resume?.(value, { signal })
+      : this.provider.resume?.(value);
+    try {
+      try {
+        return await resume(input);
+      } catch (error) {
+        if (signal?.aborted || classifySandboxLifecycleFailure(error) !== "transient") throw error;
+        await new Promise((resolve) => setTimeout(resolve, this.options.resumeRetryDelayMs ?? SANDBOX_RESUME_RETRY_DELAY_MS));
+        signal?.throwIfAborted();
+        return await resume(this.provider.kind === "e2b" ? { ...input, force_reconnect: true } : input);
+      }
+    } catch (error) {
+      if (!signal?.aborted) {
+        void this.repository.recordTiming?.({
+          tenantId: snapshot.tenantId,
+          runId: snapshot.id,
+          sessionId: snapshot.sessionId ?? null,
+          operation: "sandbox.resume",
+          durationMs: Math.max(0, Date.now() - startedAt),
+          outcome: `failure:${classifySandboxLifecycleFailure(error)}`,
+        }).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   private withSandboxLifecycleLock<T>(
@@ -3908,6 +3992,57 @@ function isMissingSandboxPath(error: unknown): boolean {
   return error.name === "FileNotFoundError"
     || /^\[not_found\]\s+path not found:/i.test(error.message)
     || /\bno such file or directory\b/i.test(error.message);
+}
+
+export type SandboxLifecycleFailure = "missing" | "transient" | "denied" | "unknown";
+
+/**
+ * Why a sandbox could not be reached (H-009). Only a sandbox that is gone is
+ * replaced from its last snapshot: a replacement loses files written since
+ * then, so a timeout or refused connection is retried instead, and a refused
+ * credential or policy needs an administrator. A missing file inside a live
+ * sandbox is not a lifecycle failure.
+ */
+export function classifySandboxLifecycleFailure(error: unknown): SandboxLifecycleFailure {
+  if (isMissingSandboxPath(error)) return "unknown";
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (name === "SandboxNotFoundError"
+    || /\bsandbox\b[^.\n]{0,80}\bnot found\b|sandbox is probably not running|sandbox (?:has been |was )?(?:killed|terminated|expired)/i.test(message)) {
+    return "missing";
+  }
+  if (/\b40[13]\b|unauthori[sz]ed|forbidden|invalid api key|authentication failed/i.test(message)) return "denied";
+  if (name === "TimeoutError"
+    || /timed out|timeout|temporarily|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|network error|\b50[234]\b|\b429\b|rate limit|service unavailable|bad gateway/i.test(message)) {
+    return "transient";
+  }
+  return "unknown";
+}
+
+/**
+ * A failed resume is followed by a replacement only when the sandbox is gone
+ * or the failure is unrecognised (the previous behaviour). Anything else is
+ * reported with its class instead of replacing a workspace that may still
+ * hold unsaved files (H-009).
+ */
+function throwUnlessReplaceable(error: unknown): void {
+  const failure = classifySandboxLifecycleFailure(error);
+  if (failure === "transient") {
+    throw new Error(
+      `The workspace is temporarily unreachable (${errorDetail(error)}). Nothing was run and no files were changed; retry this step.`,
+      { cause: error },
+    );
+  }
+  if (failure === "denied") {
+    // No cause: its HTTP 401 would read as a connector credential the user can renew.
+    throw new Error(
+      `The sandbox provider refused access (${errorDetail(error)}). Nothing was run. An administrator must check the sandbox provider configuration; retrying will not help.`,
+    );
+  }
+}
+
+function errorDetail(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
 }
 
 interface PiTruncation {
