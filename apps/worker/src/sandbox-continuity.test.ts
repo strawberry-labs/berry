@@ -1778,7 +1778,7 @@ describe("SandboxContinuityManager", () => {
     const masked = run("printf downloading; false; echo done");
     expect(masked.status, masked.stderr).toBe(0);
     expect(masked.stdout).toContain("done");
-    expect(masked.stdout).toContain("these commands exited non-zero earlier");
+    expect(masked.stdout).toContain("but these commands exited non-zero");
     expect(masked.stdout).toContain("exit 1: false");
     // The status the command reports, conditionals and successful runs are unchanged.
     expect(run('false; echo "status=$?"').stdout).toContain("status=1");
@@ -1790,6 +1790,50 @@ describe("SandboxContinuityManager", () => {
     const failed = run("false; exit 9");
     expect(failed.status).toBe(9);
     expect(failed.stdout).not.toContain("exited non-zero");
+  });
+
+  it("reports pipeline members that failed before a successful last member (H-016)", () => {
+    const run = (command: string) => spawnSync("bash", ["-c", PI_BASH_WRAPPER_SCRIPT, "berry-bash", command, "/dev/null"], { encoding: "utf8" });
+    // bash 3.2 (macOS) reports positions only; the sandboxes run bash 5, which also names the member.
+    const named = Number(spawnSync("bash", ["-c", "echo ${BASH_VERSINFO[0]}"], { encoding: "utf8" }).stdout) >= 4;
+    const expectReported = (command: string, status: string, member: string, position: string) => {
+      const result = run(command);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("but these commands exited non-zero");
+      expect(result.stdout).toContain(named ? `exit ${status}: ${member} (${position})` : `exit ${status}: ${position}`);
+      return result.stdout;
+    };
+    const clean = (command: string) => {
+      const result = run(command);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout, command).not.toContain("exited non-zero");
+      return result.stdout;
+    };
+    // curl failing (exit 35) into tail, a Python crash into tail, and the same inside a function.
+    expect(expectReported("sh -c 'echo partial; exit 35' | tail -5", "35", "sh -c 'echo partial; exit 35'", "pipeline member 1 of 2")).toContain("partial");
+    expectReported("printf 'print(1)\\nraise SystemExit(1)\\n' > /tmp/berry-h016.py; python3 /tmp/berry-h016.py | tail -5", "1", "python3 /tmp/berry-h016.py", "pipeline member 1 of 2");
+    expectReported("f() { false | cat; }; f; echo after", "1", "false", "pipeline member 1 of 2");
+    // A multi-line script under set -e: both masked failures are listed and the script still runs on.
+    const script = expectReported("set -e\ncd /\nfalse | cat\necho middle\nsh -c 'exit 9' | cat > /dev/null\necho end", "9", "sh -c 'exit 9'", "pipeline member 1 of 2");
+    expect(script).toContain("middle\nend");
+    expect(script).toContain(named ? "exit 1: false (pipeline member 1 of 2)" : "exit 1: pipeline member 1 of 2");
+    // Normal idioms: SIGPIPE upstream of head or grep -q, yes | head, grep finding nothing mid-pipe.
+    expect(clean("yes | head -1")).toBe("y\n");
+    clean("seq 1 200000 | head -1; seq 1 200000 | grep -q 5; echo ok");
+    if (named) clean("printf 'a\\n' | grep zzz | wc -l");
+    // A failing last member is already reported by the ERR trap, once.
+    const last = run("true | false; echo after");
+    expect(last.stdout.match(/exit 1:/g)).toHaveLength(1);
+    // Statuses, $? and PIPESTATUS are what the command would see without the traps, and pipefail is not imposed.
+    expect(run("false | true").status).toBe(0);
+    expect(run("false | true; echo \"status=$?\"").stdout).toContain("status=0");
+    if (named) expect(run("false | (exit 3); echo \"ps=${PIPESTATUS[*]}\"").stdout).toContain("ps=1 3");
+    expect(run("mkdir -p /tmp/berry-h016 && echo \"last=$_\"").stdout).toContain("last=/tmp/berry-h016");
+    const failed = run("false | cat; exit 4");
+    expect(failed.status).toBe(4);
+    expect(failed.stdout).not.toContain("exited non-zero");
+    // set -x output does not show the traps' own commands after the first one.
+    expect(run("set -x; echo one; echo two").stderr).not.toMatch(/two[\s\S]*__berry/);
   });
 
   it("creates the workspace outputs and tmp directories before a command runs (H-008)", () => {

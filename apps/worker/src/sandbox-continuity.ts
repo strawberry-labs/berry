@@ -124,12 +124,88 @@ with zipfile.ZipFile(archive) as source:
                 raise RuntimeError(f"ZIP entry exceeds the {max_ratio:g}:1 compression-ratio limit: {name}")
     print(json.dumps({"entryCount": len(infos), "totalBytes": total}))
 `;
-// Runs the model's command and tees its output. An ERR trap records commands
-// that exit non-zero; when the final status is still 0 their exits are
-// appended, so `curl ...; echo done` cannot pass as success. The exit status
-// itself is unchanged (H-016). It also makes sure the workspace's outputs/
-// and tmp/ exist, since a new sandbox only has its root (H-008).
-export const PI_BASH_WRAPPER_SCRIPT = "log_dir=$(dirname \"$2\")\nmkdir -p -- \"$log_dir\" || exit\n# Commands and skills write to outputs/ and tmp/ under the workspace root (H-008).\ncase \"$log_dir\" in */.berry-tool-output) mkdir -p -- \"${log_dir%/.berry-tool-output}/outputs\" \"${log_dir%/.berry-tool-output}/tmp\" 2>/dev/null ;; esac\nexits=$(mktemp 2>/dev/null) || exits=/dev/null\nset -o pipefail\nBERRY_EXITS=\"$exits\" bash -lc \"trap 'printf \\\"%s\\\\t%s\\\\n\\\" \\\"\\$?\\\" \\\"\\${BASH_COMMAND:0:240}\\\" >> \\\"\\$BERRY_EXITS\\\" 2>/dev/null' ERR; $1\" 2>&1 | tee -- \"$2\"\npipeline_status=(\"${PIPESTATUS[@]}\")\nstatus=${pipeline_status[0]}\n[ \"$status\" -eq 0 ] && status=${pipeline_status[1]}\nif [ \"$status\" -eq 0 ] && [ -s \"$exits\" ]; then\n  printf '\\n[Berry: the command finished with status 0, but these commands exited non-zero earlier; check that their work succeeded:]\\n'\n  head -n 10 -- \"$exits\" | while IFS=\"$(printf '\\t')\" read -r code command; do printf '  exit %s: %s\\n' \"$code\" \"$command\"; done\nfi\n[ \"$exits\" = /dev/null ] || rm -f -- \"$exits\"\nexit \"$status\"";
+// Shell code run before the model's command, on the same line so the
+// command's line numbers (and bash's error messages) are unchanged.
+//
+// - ERR records commands that exit non-zero (H-016, `curl ...; echo done`).
+// - DEBUG runs before each simple command. When PIPESTATUS of the pipeline
+//   that just finished shows a failed member other than the last one, that
+//   member is recorded too (`curl ... | tar xz`, `python x.py | tail -5`).
+//   set -T carries DEBUG into functions, subshells and command substitutions;
+//   RETURN and EXIT (also set in a subshell once it runs a second command)
+//   cover a pipeline that ends a function, subshell or the script.
+// - Nothing changes the command's statuses: pipefail is not imposed, $?,
+//   PIPESTATUS (bash >= 4) and $_ are what the command would see without the
+//   traps, no trap command can fail under set -e, and under set -x the
+//   handler switches to a variant whose trace goes to /dev/null.
+// - The members are named from the last DEBUG events with the same shell
+//   state (no command finished between them). If a member is a compound
+//   command, DEBUG does not see it in this shell and the report falls back to
+//   the member's position and line. (bash 3.2 gives neither names nor lines
+//   and does not restore PIPESTATUS after traps; the sandboxes run bash 5.)
+// - Not failures: 141 (SIGPIPE: a later member such as head or grep -q stopped
+//   reading, e.g. `yes | head`), curl's 23 (its write error in the same
+//   case), and 1 from grep/egrep/fgrep/zgrep/rg/diff/cmp ("no match",
+//   "files differ"). Statuses repeated by the very next pipeline are
+//   reported once.
+// Cost: one function call per simple command, about 7 microseconds.
+const PI_BASH_TRAP_PREFIX = [
+  "set -T; __berry_n=0 __berry_ps=0 __berry_old= __berry_sub=$BASH_SUBSHELL __berry_xt= __berry_fmt=$'%s\\t%s\\n%.0s';",
+  "__berry_debug() {",
+  "__berry_old=$__berry_ps __berry_ps=\"${PIPESTATUS[@]}\" __berry_key[__berry_n%8]=\"$__berry_ps|${2:0:100}|$BASH_SUBSHELL|${FUNCNAME[1]-}\" __berry_cmd[__berry_n++%8]=\"$1 ${BASH_COMMAND:0:240}\";",
+  "if [[ $__berry_ps == *' '* && $__berry_ps != \"$__berry_old\" || $BASH_SUBSHELL != \"$__berry_sub\" ]]; then __berry_pipes; fi;",
+  "case $- in *x*) if [[ -z $__berry_xt ]]; then __berry_xt=1; trap '{ __berry_debug \"$LINENO\" \"${_-}\"; } 2>/dev/null' DEBUG; fi ;; esac;",
+  "return 0; };",
+  "__berry_pipes() {",
+  "local IFS=' ' s k i j lo hi c m t n d;",
+  "if [[ $BASH_SUBSHELL != \"$__berry_sub\" ]]; then if [[ $__berry_sub == \"p$BASH_SUBSHELL\" ]]; then __berry_sub=$BASH_SUBSHELL; trap '{ :; } 2>/dev/null' EXIT; else __berry_sub=p$BASH_SUBSHELL; fi; fi;",
+  "[[ $__berry_ps == *' '* && $__berry_ps != \"$__berry_old\" ]] || return 0;",
+  "s=($__berry_ps); k=${#s[@]}; hi=$((__berry_n - 2)); lo=$hi; c=;",
+  "if (( hi >= 0 )); then",
+  "while (( lo > 0 && lo > __berry_n - 8 )) && [[ ${__berry_key[(lo - 1) % 8]-} == \"${__berry_key[hi % 8]-}\" ]]; do lo=$((lo - 1)); done;",
+  "for (( j = lo; j <= hi; j++ )); do t=${__berry_cmd[j % 8]-}; t=${t#* };",
+  "if (( j == lo && j > 0 && j > __berry_n - 8 )); then n=${__berry_cmd[(j - 1) % 8]-}; [[ $t == \"${n#* }\" ]] && continue; fi;",
+  "case $t in '[['*|'(('*|'for '*|'case '*|'select '*) continue ;; esac; c=\"$c $j\"; done; fi;",
+  "c=($c); m=${#c[@]};",
+  "for (( i = 0; i < k - 1; i++ )); do",
+  "[[ ${s[i]} == 0 || ${s[i]} == 141 ]] && continue; t=;",
+  "if (( m >= k )); then t=${__berry_cmd[${c[m - k + i]} % 8]}; t=${t#* }; fi;",
+  "n=$t; while [[ $n =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]] ]]; do n=${n#* }; done; n=${n%% *}; n=${n##*/};",
+  "case ${s[i]}:${n#\\\\} in 1:grep|1:egrep|1:fgrep|1:zgrep|1:rg|1:diff|1:cmp|23:curl) continue ;; esac;",
+  "if [[ -n $t ]]; then d=\"$t (pipeline member $((i + 1)) of $k)\"; else d=\"pipeline member $((i + 1)) of $k\"; if (( m > 0 )); then n=${__berry_cmd[${c[0]} % 8]%% *}; (( n > 0 )) && d=\"$d on line $n\"; fi; fi;",
+  "d=${d//$'\\n'/ }; d=${d//$'\\t'/ }; printf '%s\\t%s\\n' \"${s[i]}\" \"$d\" >> \"$BERRY_EXITS\" 2>/dev/null || :; done;",
+  "return 0; };",
+  "trap '{ printf \"$__berry_fmt\" \"$?\" \"${BASH_COMMAND:0:240}\" \"${_-}\" >> \"$BERRY_EXITS\"; } 2>/dev/null' ERR;",
+  "trap '{ : \"${_-}\"; } 2>/dev/null' RETURN; trap '{ :; } 2>/dev/null' EXIT; trap '__berry_debug \"$LINENO\" \"${_-}\"' DEBUG; ",
+].join(" ");
+// Runs the model's command and tees its output. The traps above record
+// commands and pipeline members that exited non-zero; when the final status
+// is still 0 those exits are appended (duplicates once, at most 10), so
+// `curl ...; echo done` or `python x.py | tail` cannot pass as success. The
+// exit status itself is unchanged (H-016). It also makes sure the
+// workspace's outputs/ and tmp/ exist, since a new sandbox only has its root
+// (H-008).
+export const PI_BASH_WRAPPER_SCRIPT = [
+  "log_dir=$(dirname \"$2\")",
+  "mkdir -p -- \"$log_dir\" || exit",
+  "# Commands and skills write to outputs/ and tmp/ under the workspace root (H-008).",
+  "case \"$log_dir\" in */.berry-tool-output) mkdir -p -- \"${log_dir%/.berry-tool-output}/outputs\" \"${log_dir%/.berry-tool-output}/tmp\" 2>/dev/null ;; esac",
+  "exits=$(mktemp 2>/dev/null) || exits=/dev/null",
+  "IFS= read -r -d '' berry_prefix <<'BERRY_PREFIX'",
+  PI_BASH_TRAP_PREFIX,
+  "BERRY_PREFIX",
+  "set -o pipefail",
+  "BERRY_EXITS=\"$exits\" bash -lc \"${berry_prefix%?}$1\" 2>&1 | tee -- \"$2\"",
+  "pipeline_status=(\"${PIPESTATUS[@]}\")",
+  "status=${pipeline_status[0]}",
+  "[ \"$status\" -eq 0 ] && status=${pipeline_status[1]}",
+  "if [ \"$status\" -eq 0 ] && [ -s \"$exits\" ]; then",
+  "  printf '\\n[Berry: the command finished with status 0, but these commands exited non-zero; check that their work succeeded:]\\n'",
+  "  awk 'function out() { if (r != \"\" && !seen[r]++) { i = index(r, \"\\t\"); printf \"  exit %s: %s\\n\", substr(r, 1, i - 1), substr(r, i + 1); if (++n == 10) exit } } /^[0-9]+\\t/ { out(); r = $0; next } { r = r \" \" $0 } END { out() }' \"$exits\"",
+  "fi",
+  "[ \"$exits\" = /dev/null ] || rm -f -- \"$exits\"",
+  "exit \"$status\"",
+].join("\n");
 export const DURABLE_IMAGE_REQUEST_TIMEOUT_MS = 15 * 60_000;
 export const DURABLE_IMAGE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TERMINAL_SNAPSHOT_TIMEOUT_MS = 120_000;
