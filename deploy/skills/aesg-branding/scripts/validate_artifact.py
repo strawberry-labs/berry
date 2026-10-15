@@ -14,11 +14,27 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
+# Template filler that never belongs in a finished file, wherever it appears.
 PLACEHOLDER_RE = re.compile(
-    r"(?:\b(?:lorem ipsum|insert title|sample heading|sample sub-heading|"
-    r"replace text|name another|name surname|client name|click to add|"
-    r"click to edit|section heading|xxxx-xxx)\b|x{8,}|"
-    r"\[[^\]]+\|\s*(?:word|excel|powerpoint)\])",
+    r"(?:\b(?:lorem ipsum|insert title|click to add|click to edit|xxxx-xxx)\b|x{8,}|"
+    r"\[[^\]]+\|\s*(?:word|excel|powerpoint)\]|"
+    r"[\[<{]\s*(?:client name|name surname|name another|replace text|"
+    r"section heading|sample heading|sample sub-heading)\s*[\]>}])",
+    re.IGNORECASE,
+)
+# Specimen text of the retained Word and PowerPoint templates.  The same words
+# are ordinary user content ("END CLIENT NAME", "Client name as stated in the
+# RFP"), so they block only when a whole paragraph outside a table is the
+# specimen itself; anywhere else they are reported for review and kept.
+SPECIMEN_PHRASE_RE = re.compile(
+    r"\b(?:client name|name surname|name another|replace text|section heading|"
+    r"sample heading|sample sub-heading)\b",
+    re.IGNORECASE,
+)
+SPECIMEN_UNIT_RE = re.compile(
+    r"(?:reference number\s+)?(?:subject:\s*|dear\s+)?"
+    r"(?:client name|name surname|name another|replace text|section heading(?:\s+[ivx]+)?|"
+    r"sample heading(?:\s+\w+)?|sample sub-heading(?:\s+\w+)?)\s*[,.:;]?",
     re.IGNORECASE,
 )
 ERROR_TOKENS = ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A", "#NUM!", "#NULL!")
@@ -80,6 +96,64 @@ def paragraph_texts(xml: bytes, namespace: str) -> list[str]:
     return paragraphs
 
 
+def text_units(xml: bytes, namespace: str) -> list[tuple[str, bool]]:
+    """Innermost paragraphs of one part, each with whether it sits in a table cell."""
+    root = ElementTree.fromstring(xml)
+    paragraph_tag = f"{{{namespace}}}p"
+    text_tag = f"{{{namespace}}}t"
+    cell_tag = f"{{{namespace}}}tc"
+    units: list[tuple[str, bool]] = []
+
+    def visit(node, in_cell: bool) -> None:
+        if node.tag == paragraph_tag and not any(
+            descendant is not node and descendant.tag == paragraph_tag
+            for descendant in node.iter()
+        ):
+            units.append(("".join(text.text or "" for text in node.iter(text_tag)), in_cell))
+            return
+        for child in node:
+            visit(child, in_cell or child.tag == cell_tag)
+
+    visit(root, False)
+    return units
+
+
+def placeholder_findings(
+    units: list[tuple[str, str, bool]], *, whole_specimens_block: bool
+) -> tuple[list[str], list[str]]:
+    """Split (location, text, in table cell) units into blocking text and review notes."""
+    blocking: set[str] = set()
+    review: list[str] = []
+    for location, text, in_cell in units:
+        compact = " ".join(text.split())
+        if not compact:
+            continue
+        filler = {match.group(0) for match in PLACEHOLDER_RE.finditer(compact)}
+        if filler:
+            blocking.update(filler)
+            continue
+        if whole_specimens_block and not in_cell and SPECIMEN_UNIT_RE.fullmatch(compact):
+            blocking.add(compact)
+            continue
+        phrases = sorted({match.group(0).casefold() for match in SPECIMEN_PHRASE_RE.finditer(compact)})
+        if phrases:
+            shown = compact if len(compact) <= 80 else compact[:77] + "..."
+            review.append(
+                f'{location}: "{shown}" contains template wording ({", ".join(phrases)}); kept as written'
+            )
+    return sorted(blocking), review
+
+
+def docx_story_units(path: Path) -> list[tuple[str, str, bool]]:
+    units: list[tuple[str, str, bool]] = []
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if WORD_TEXT_PART_RE.fullmatch(name):
+                for index, (text, in_cell) in enumerate(text_units(archive.read(name), WORD_NS), start=1):
+                    units.append((f"{name} paragraph {index}", text, in_cell))
+    return units
+
+
 def docx_story_text(path: Path) -> str:
     chunks: list[str] = []
     with zipfile.ZipFile(path) as archive:
@@ -89,6 +163,17 @@ def docx_story_text(path: Path) -> str:
                     paragraph_texts(archive.read(name), WORD_NS)
                 )
     return "\n".join(chunks)
+
+
+def pptx_text_units(path: Path, slide_order: dict[str, int]) -> list[tuple[str, str, bool]]:
+    units: list[tuple[str, str, bool]] = []
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if match := SLIDE_PART_RE.fullmatch(name):
+                number = slide_order.get(name, int(match.group(1)))
+                for text, in_cell in text_units(archive.read(name), DRAWING_NS):
+                    units.append((f"slide {number}", text, in_cell))
+    return sorted(units, key=lambda unit: int(unit[0].split()[1]))
 
 
 def inspect_pptx_slides(
@@ -156,10 +241,16 @@ def validate_pdf(path: Path, errors: list[str], evidence: dict) -> None:
         from pypdf import PdfReader
 
         document = PdfReader(path)
-        extracted = "\n".join(page.extract_text() or "" for page in document.pages)
-        placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(extracted)))
+        units = [
+            (f"page {number}", line, False)
+            for number, page in enumerate(document.pages, start=1)
+            for line in (page.extract_text() or "").splitlines()
+        ]
+        placeholders, review = placeholder_findings(units, whole_specimens_block=False)
         if placeholders:
             errors.append(f"placeholder text remains: {', '.join(placeholders)}")
+        if review:
+            evidence["placeholderReview"] = review[:12]
         evidence["pypdf"] = {"pages": len(document.pages), "textChecked": True}
     except Exception as exc:
         errors.append(f"PDF package validation failed: {exc}")
@@ -344,9 +435,11 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
 
     document = Document(path)
     text = docx_story_text(path)
-    placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(text)))
+    placeholders, review = placeholder_findings(docx_story_units(path), whole_specimens_block=True)
     if placeholders:
         errors.append(f"placeholder text remains: {', '.join(placeholders)}")
+    if review:
+        evidence["placeholderReview"] = review[:12]
     broken_fields = [
         token
         for token in ("error! bookmark not defined", "includepicture", "click here to enter text")
@@ -563,15 +656,25 @@ def validate_xlsx(path: Path, errors: list[str], evidence: dict) -> None:
         errors.append("forbidden Joiners worksheet found")
     formula_errors: list[str] = []
     placeholders: list[str] = []
+    review: list[str] = []
     for worksheet in workbook.worksheets:
         for row in worksheet.iter_rows():
             for cell in row:
                 value = cell.value
                 if isinstance(value, str):
+                    location = f"{worksheet.title}!{cell.coordinate}"
                     if any(token in value for token in ERROR_TOKENS):
-                        formula_errors.append(f"{worksheet.title}!{cell.coordinate}")
-                    if PLACEHOLDER_RE.search(value):
-                        placeholders.append(f"{worksheet.title}!{cell.coordinate}")
+                        formula_errors.append(location)
+                    # The workbook template has no specimen text, so template
+                    # wording in a cell is a label or value, never a leftover.
+                    blocking, notes = placeholder_findings(
+                        [(location, value, True)], whole_specimens_block=False
+                    )
+                    if blocking:
+                        placeholders.append(location)
+                    review.extend(notes)
+    if review:
+        evidence["placeholderReview"] = review[:12]
     if formula_errors:
         errors.append(f"formula error tokens at: {', '.join(formula_errors[:12])}")
     if placeholders:
@@ -599,9 +702,13 @@ def validate_pptx(path: Path, errors: list[str], evidence: dict) -> None:
     slide_text, empty_placeholders, picture_placeholders = inspect_pptx_slides(
         path, slide_order
     )
-    placeholders = sorted(set(match.group(0) for match in PLACEHOLDER_RE.finditer(slide_text)))
+    placeholders, review = placeholder_findings(
+        pptx_text_units(path, slide_order), whole_specimens_block=True
+    )
     if placeholders:
         errors.append(f"placeholder text remains: {', '.join(placeholders[:12])}")
+    if review:
+        evidence["placeholderReview"] = review[:12]
     if empty_placeholders:
         errors.append(
             f"empty structural placeholders remain: {', '.join(empty_placeholders[:12])}"
@@ -699,7 +806,10 @@ def main() -> int:
         except Exception as exc:
             errors.append(f"validation exception: {exc}")
 
-    report = {"ok": not errors, "errors": errors, "evidence": evidence}
+    # Review notes never fail the check: they point at user wording that looks
+    # like template text so it can be confirmed, not rewritten.
+    warnings = evidence.pop("placeholderReview", [])
+    report = {"ok": not errors, "errors": errors, "warnings": warnings, "evidence": evidence}
     print(json.dumps(report, indent=2))
     return 0 if report["ok"] else 1
 

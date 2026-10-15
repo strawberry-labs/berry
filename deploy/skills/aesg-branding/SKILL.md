@@ -125,6 +125,9 @@ For Office artifacts:
 
 1. Run the matching format generator.
 2. Run `python <aesg-branding-skill-directory>/scripts/validate_artifact.py <final-file>`.
+   Its `errors` include leftover template text, which must be replaced. Its
+   `warnings` only point at wording that resembles template text, such as a
+   field the user named `END CLIENT NAME`; keep the user's wording unchanged.
 3. Render with `python <aesg-branding-skill-directory>/scripts/render_artifact.py <final-file> --output-dir <tmp-dir>`.
 4. Inspect every rendered page, slide, or relevant sheet and correct clipping,
    overlap, blank placeholders, weak pagination, or distorted images.
