@@ -5,6 +5,7 @@ import {
 } from "@berry/personal-memory";
 import {
   MemoryOperationSchema,
+  memoryCandidateEligibility,
   normalizeMemoryStableKey,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
@@ -39,7 +40,7 @@ const PERSONAL_MEMORY_TOOL_DEFINITIONS: readonly ChatToolDefinition[] = [
     type: "function",
     function: {
       name: "remember_memory",
-      description: "Store a durable personal fact or preference for this user across chats. Use this when the user explicitly asks you to remember something. Never store credentials, secrets, copied documents, or temporary task details.",
+      description: "Store a durable personal fact or preference for this user across chats. Use this when the user explicitly asks you to remember something. Store only what the user stated or confirmed in their own words, not your own guesses, estimates or suggestions. Never store credentials, secrets, copied documents, or temporary task details.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -236,6 +237,9 @@ export class DurablePersonalMemoryToolExecutor implements DurableTurnToolExecuto
       expiresAt: input.expires_at ?? null,
       reason: "explicit_user_memory",
     });
+    // Explicit memories skip the implicit-memory filters, but never secrets (H-040).
+    const eligibility = memoryCandidateEligibility(operation, "personal");
+    if (!eligibility.eligible) throw new Error(`Not stored: ${eligibility.reason.replaceAll("_", " ")}.`);
     const result = await this.personalMemory!.remember(operationToPersonalMemoryInput(
       { tenantId: snapshot.tenantId, userId: snapshot.userId },
       operation,

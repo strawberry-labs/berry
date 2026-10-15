@@ -2372,3 +2372,20 @@ AESG packages.
 - **Tests.** Worker 684 passed, 3 skipped (isolated). A throwaway PostgreSQL run with two workers sent one email and created one event.
 - **Deployment.** Verify the SES sender and leave the SES sandbox; grant `ses:SendEmail` to the instance role; set the env vars in `deploy/.env.production` (see `docs/production-alert-delivery.md`); deploy (rebuilds api, worker, web; no schema change).
 - **Remaining.** In a shared multi-tenant deployment, router balance alerts go to every tenant's admins. The OpenRouter `/credits` response shape is from the docs. A crash between the SES send and recording it can send a duplicate after 10 minutes. Helm values are not updated.
+
+### H-040 — Memory and retrieval contamination (long-term fix)
+
+- **Map (15 October).** Grounding is assembled by the API at admission. Berry applied no relevance threshold: raw vector similarity was computed and then discarded, and only rank fusion survived. Earlier task answers carried authority 0.8 against 0.5 for files, and nothing stopped a task from retrieving its own earlier answer or answers from deleted tasks. Mem0 rejected queries over 4,000 characters, so long requests silently lost every personal memory. Explicit `remember_memory` writes skipped the secrets check. Grounding items carried no source label.
+- **Fix (no schema change).**
+  - Vector hits must reach a cosine-similarity floor (`BERRY_RETRIEVAL_MIN_SIMILARITY`, default 0.15). Earlier task answers need 0.45 (`BERRY_RETRIEVAL_TASK_OUTCOME_MIN_SIMILARITY`). With embeddings available, a keyword-only hit on an earlier answer is dropped.
+  - Earlier answers rank with authority 0.3 (below files) and are labelled "Earlier Berry answer (not confirmed by the user): …".
+  - All three retrieval lanes exclude the current task's own answer and answers of deleted tasks, at read time, so restoring a task restores them. Legacy memories learned in a deleted task are not recalled.
+  - Retrieval snapshots now store each candidate's raw similarity, for tuning the floors from data.
+  - The Mem0 query is cut to 4,000 characters instead of failing.
+  - `remember_memory` refuses secrets, and its description says to store only what the user stated or confirmed.
+  - The grounding block now states that the current message and files take precedence, that earlier Berry answers are not user-confirmed facts, and that unrelated recalled items are ignored.
+  - Already done earlier: personal-memory inference reads only the user's own words (`375f8dd`).
+- **Tests.** API: a retrieval case with close and unrelated files and earlier answers checks labels, gates, the authority cap and recorded similarity; the SQL filter is asserted in every lane. On a disposable migrated database, the earlier-answer filter returned only the other live task's answer and the file, and the memory filter dropped only the deleted task's memory. Worker: an explicit secret is not stored.
+- **Data impact.** None. Existing memories and sources are untouched; the filters apply at read time.
+- **Deployment.** API and worker (the shared config gains two optional env vars).
+- **Remaining.** The thresholds are set from the embedding model's typical score range, not from Berry data. Review them after a week using `retrieval_snapshots.candidates[].similarity`. The run ID is still not passed into retrieval snapshots, and Mem0's own scores are not yet gated beyond its internal 0.1.

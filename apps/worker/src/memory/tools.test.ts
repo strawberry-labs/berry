@@ -114,6 +114,21 @@ describe("DurablePersonalMemoryToolExecutor", () => {
     });
   });
 
+  it("never stores a secret, even when asked explicitly (H-040)", async () => {
+    let stored = false;
+    const executor = new DurablePersonalMemoryToolExecutor(
+      baseTools(),
+      repository({ memoryEnabled: true, implicitMemoryEnabled: true }),
+      personalMemory({ remember: async () => { stored = true; return { operation: "ADD", reason: "x", item: null }; } }),
+    );
+
+    await expect(executor.execute(snapshot(), memoryStep("remember_memory", {
+      kind: "preference",
+      content: "My api key: abcdefghijklmnop",
+    }))).rejects.toThrow("Not stored: credentials and secrets are not memory.");
+    expect(stored).toBe(false);
+  });
+
   it("does not expose or execute memory tools when the user disabled memory", async () => {
     const executor = new DurablePersonalMemoryToolExecutor(
       baseTools(),

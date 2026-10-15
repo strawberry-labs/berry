@@ -797,6 +797,11 @@ export const DurableContextConfigSchema = z.object({
   knowledgeChunkTokens: EnvPositiveIntegerSchema.default(300),
   knowledgeChunkOverlapTokens: EnvPositiveIntegerSchema.default(50),
   retrievalTokenBudget: EnvPositiveIntegerSchema.default(5000),
+  // Cosine similarity floors for vector hits (all-mpnet-base-v2 scores
+  // unrelated text below about 0.2). Earlier task answers need a closer match
+  // because they are Berry's own output, not source material (H-040).
+  retrievalMinSimilarity: z.coerce.number().min(0).max(1).default(0.15),
+  retrievalTaskOutcomeMinSimilarity: z.coerce.number().min(0).max(1).default(0.45),
   runLeaseSeconds: EnvPositiveIntegerSchema.default(90),
   sandboxSnapshotIntervalSeconds: EnvPositiveIntegerSchema.default(900),
   knowledgeMaxInputBytes: EnvPositiveIntegerSchema.default(104857600),
@@ -846,6 +851,8 @@ export function durableContextConfigFromEnv(env: Record<string, string | undefin
     knowledgeChunkTokens: env.BERRY_KNOWLEDGE_CHUNK_TOKENS,
     knowledgeChunkOverlapTokens: env.BERRY_KNOWLEDGE_CHUNK_OVERLAP_TOKENS,
     retrievalTokenBudget: env.BERRY_RETRIEVAL_TOKEN_BUDGET,
+    retrievalMinSimilarity: env.BERRY_RETRIEVAL_MIN_SIMILARITY,
+    retrievalTaskOutcomeMinSimilarity: env.BERRY_RETRIEVAL_TASK_OUTCOME_MIN_SIMILARITY,
     runLeaseSeconds: env.BERRY_RUN_LEASE_SECONDS,
     sandboxSnapshotIntervalSeconds: env.BERRY_SANDBOX_SNAPSHOT_INTERVAL_SECONDS,
     knowledgeMaxInputBytes: env.BERRY_KNOWLEDGE_MAX_INPUT_BYTES,
