@@ -147,6 +147,25 @@ describe("SupportViewController", () => {
     }));
   });
 
+  it("keeps the submission's Idempotency-Key when creating a task for the member (H-035)", async () => {
+    const agentApi = {
+      createTask: vi.fn(async (_request: unknown, _body: unknown) => ({ task: { id: taskId }, session: { id: sessionId } })),
+    };
+    const { controller } = await controllerFor("admin", agentApi);
+    const key = "6f0c2b1a-9d8e-4f7a-8b6c-5d4e3f2a1b0c";
+
+    await controller.createTask(
+      { ...requestFor(actorId), headers: { "idempotency-key": key } },
+      SELF_HOST_TENANT_ID,
+      subjectId,
+      { title: "Support draft" },
+    );
+
+    const delegatedRequest = agentApi.createTask.mock.calls[0]?.[0] as any;
+    expect(delegatedRequest.auth.user.id).toBe(subjectId);
+    expect(delegatedRequest.headers["idempotency-key"]).toBe(key);
+  });
+
   it("verifies session ownership before returning messages", async () => {
     const { controller, store } = await controllerFor("owner");
 

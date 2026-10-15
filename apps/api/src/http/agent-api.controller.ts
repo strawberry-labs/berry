@@ -64,7 +64,7 @@ import { CloudRuntimeConfigService } from "../runtime/cloud-runtime-config.ts";
 import type { AuthenticatedRequest } from "../auth/auth.guard.ts";
 import { BUDGET_SERVICE, budgetEstimateFromRequest, modelCostSnapshot, usageCostMicros, type BudgetService } from "../budget/budget.service.ts";
 import { MODEL_GOVERNANCE_SERVICE, type ModelGovernanceService } from "../model-governance/model-governance.service.ts";
-import { CLOUD_TASK_STORE, InMemoryCloudTaskStore, MESSAGE_HISTORY_MAX_CURSOR, type CloudTaskStore } from "./cloud-task-store.ts";
+import { CLOUD_TASK_STORE, InMemoryCloudTaskStore, MESSAGE_HISTORY_MAX_CURSOR, type CloudTaskStore, type TaskCreationIdempotency } from "./cloud-task-store.ts";
 import { ApiEventStreamService } from "./event-stream.service.ts";
 import { CompanionPushService, MOBILE_DEVICE_REGISTRY, type MobileDeviceRegistry } from "./mobile-devices.ts";
 import { USAGE_REPOSITORY, type UsageRepository } from "../usage/usage.repository.ts";
@@ -321,6 +321,34 @@ function providerIdFromRequest(provider: unknown): string | undefined {
 export function turnAdmissionFingerprint(request: z.infer<typeof StartTurnRequestSchema>): string {
   const { operationId: _operationId, ...operation } = request;
   return createHash("sha256").update(canonicalTurnOperation(operation)).digest("hex");
+}
+
+/** Hash of a parsed task-creation request; the idempotency key travels in a header. */
+export function taskCreationFingerprint(request: z.infer<typeof CreateTaskRequestSchema>): string {
+  return createHash("sha256").update(canonicalTurnOperation(request)).digest("hex");
+}
+
+/**
+ * Reads the optional `Idempotency-Key` header of POST /v1/tasks (H-035). The
+ * client sends one UUID per submit intent and repeats it on every retry of that
+ * submission; a header keeps older API builds compatible because they ignore it.
+ * Read from the request, not a handler parameter, so support view (which
+ * delegates with a derived request) applies the same key.
+ */
+function taskCreationIdempotency(
+  httpRequest: AuthenticatedRequest,
+  request: z.infer<typeof CreateTaskRequestSchema>,
+): TaskCreationIdempotency | undefined {
+  const header = httpRequest.headers["idempotency-key"];
+  if (header === undefined) return undefined;
+  const key = z.string().uuid().safeParse(header);
+  if (!key.success) {
+    throw new BadRequestException({
+      code: "invalid_idempotency_key",
+      message: "Idempotency-Key must be a single UUID.",
+    });
+  }
+  return { key: key.data.toLowerCase(), fingerprint: taskCreationFingerprint(request) };
 }
 
 type ObservedAdmissionPreparation<T> = Promise<
@@ -1053,6 +1081,13 @@ export class AgentApiController {
     const request = parseBody(CreateTaskRequestSchema, body);
     const tenantId = tenantIdFromRequest(httpRequest);
     const userId = httpRequest.auth?.user.id ?? null;
+    const idempotency = taskCreationIdempotency(httpRequest, request);
+    if (idempotency) {
+      // A retry of a submission that already created its task gets that task
+      // back without repeating model resolution or governance (H-035).
+      const created = await this.store.findCreatedTask(userId, idempotency);
+      if (created) return created;
+    }
     // `conversationKind` is accepted only as a legacy input. Web tasks use one
     // normal assistant flow, so model routing never branches on that value.
     const mode = "chat" as const;
@@ -1065,6 +1100,7 @@ export class AgentApiController {
         ...taskRequest,
         permissionMode: "full-access",
         ownerUserId: userId,
+        idempotency,
       });
     }
     const runtime = await this.runtimeConfig.resolve(tenantId, {
@@ -1110,6 +1146,7 @@ export class AgentApiController {
       modelProviderId: modelDecision.providerId,
       model: modelDecision.model,
       ownerUserId: userId,
+      idempotency,
     });
   }
 

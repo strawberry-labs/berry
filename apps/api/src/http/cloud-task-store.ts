@@ -46,6 +46,17 @@ export interface ListMessagesOptions {
   historyRevision?: string | undefined;
 }
 
+/**
+ * One client submit intent (H-035). The key is unique per tenant and owner, so
+ * a retried request returns the task that intent already created. The
+ * fingerprint is a hash of the creation request: the same key with a different
+ * request is rejected instead of returning an unrelated task.
+ */
+export interface TaskCreationIdempotency {
+  key: string;
+  fingerprint: string;
+}
+
 export interface CreateTaskInput {
   workspaceId?: string | undefined;
   workspaceKind?: "project" | "general" | undefined;
@@ -55,6 +66,7 @@ export interface CreateTaskInput {
   permissionMode?: PermissionMode | undefined;
   modelProviderId?: string | null | undefined;
   model?: string | null | undefined;
+  idempotency?: TaskCreationIdempotency | undefined;
 }
 
 export interface UpdateTaskInput {
@@ -111,7 +123,16 @@ export interface CloudTaskStore {
   ensureGeneralWorkspace(ownerUserId: string): Promise<Workspace>;
   listWorkspaces(filter?: ListWorkspacesOptions): Promise<Workspace[]>;
   listWorkspacePage(filter?: ListWorkspacesOptions): Promise<WorkspacePage>;
+  /**
+   * With `input.idempotency`, creates at most one task per owner and key, even
+   * for concurrent requests; a repeat returns the original task and session.
+   */
   createTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }>;
+  /**
+   * The task and session an earlier request with this key created, or null.
+   * Throws 409 when the key was used for a different creation request.
+   */
+  findCreatedTask(ownerUserId: string | null | undefined, idempotency: TaskCreationIdempotency): Promise<{ task: Task; session: Session } | null>;
   listTasks(filter?: ListTasksFilter): Promise<Task[]>;
   listTaskPage(filter?: ListTasksFilter): Promise<TaskPage>;
   taskSummary(ownerUserId?: string | null): Promise<TaskCollectionSummary>;
@@ -149,6 +170,7 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   readonly #messageHistoryRevisions = new Map<string, number>();
   readonly #messageHistoryDeletionRevisions = new Map<string, number>();
   readonly #taskOwners = new Map<string, string | null>();
+  readonly #taskCreations = new Map<string, { fingerprint: string; created: Promise<{ task: Task; session: Session }> }>();
 
   #taskBelongsToOwner(task: Task, ownerUserId: string | null | undefined): boolean {
     const workspace = this.#workspaces.get(task.workspaceId);
@@ -256,6 +278,36 @@ export class InMemoryCloudTaskStore implements CloudTaskStore {
   }
 
   async createTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }> {
+    const idempotency = input.idempotency;
+    if (!idempotency) return this.#insertTask(input);
+    const scope = taskCreationScope(input.ownerUserId, idempotency.key);
+    const existing = this.#taskCreations.get(scope);
+    if (existing) return this.#replayTaskCreation(existing, idempotency);
+    // Registered before the first await, so a concurrent duplicate waits for
+    // this creation instead of starting its own.
+    const created = this.#insertTask(input);
+    this.#taskCreations.set(scope, { fingerprint: idempotency.fingerprint, created });
+    created.catch(() => {
+      if (this.#taskCreations.get(scope)?.created === created) this.#taskCreations.delete(scope);
+    });
+    return created;
+  }
+
+  async findCreatedTask(ownerUserId: string | null | undefined, idempotency: TaskCreationIdempotency): Promise<{ task: Task; session: Session } | null> {
+    const existing = this.#taskCreations.get(taskCreationScope(ownerUserId, idempotency.key));
+    return existing ? this.#replayTaskCreation(existing, idempotency) : null;
+  }
+
+  async #replayTaskCreation(
+    existing: { fingerprint: string; created: Promise<{ task: Task; session: Session }> },
+    idempotency: TaskCreationIdempotency,
+  ): Promise<{ task: Task; session: Session }> {
+    if (existing.fingerprint !== idempotency.fingerprint) throw taskCreationKeyConflict();
+    const { task, session } = await existing.created;
+    return { task: await this.getTask(task.id), session: await this.getSession(session.id) };
+  }
+
+  async #insertTask(input: CreateTaskInput): Promise<{ task: Task; session: Session }> {
     const now = nowIso();
     const workspace = input.workspaceKind === "general"
       ? await this.ensureGeneralWorkspace(requiredOwner(input.ownerUserId))
@@ -758,13 +810,33 @@ LIMIT $7
         [this.tenantId, workspaceId, input.ownerUserId ?? null],
       );
       if (!workspace) throw new NotFoundException(`Workspace not found: ${workspaceId}`);
-      await executor.execute(
-        `
+      const values = [taskId, this.tenantId, workspaceId, input.ownerUserId ?? null, input.title?.trim() || "Untitled task", "chat", now];
+      const idempotency = input.idempotency;
+      // A request without a key does not touch the key columns. With a key,
+      // the partial unique index decides: a concurrent duplicate waits for the
+      // first insert to commit and then inserts nothing (H-035).
+      const inserted = await executor.query<{ id: string }>(
+        idempotency
+          ? `
+INSERT INTO tasks (id, tenant_id, workspace_id, user_id, title, status, conversation_kind, created_at, updated_at, creation_idempotency_key, creation_fingerprint)
+VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_kind, $7, $7, $8, $9)
+ON CONFLICT (tenant_id, user_id, creation_idempotency_key) WHERE creation_idempotency_key IS NOT NULL DO NOTHING
+RETURNING id
+          `.trim()
+          : `
 INSERT INTO tasks (id, tenant_id, workspace_id, user_id, title, status, conversation_kind, created_at, updated_at)
 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_kind, $7, $7)
-        `.trim(),
-        [taskId, this.tenantId, workspaceId, input.ownerUserId ?? null, input.title?.trim() || "Untitled task", "chat", now],
+RETURNING id
+          `.trim(),
+        idempotency ? [...values, idempotency.key, idempotency.fingerprint] : values,
       );
+      if (!inserted[0]) {
+        const existing = idempotency
+          ? await this.createdTaskInTenant(executor, input.ownerUserId ?? null, idempotency)
+          : null;
+        if (!existing) throw new ConflictException("The task could not be created; retry the request");
+        return existing;
+      }
       const session = await this.createSessionInTenant(executor, {
         taskId,
         permissionMode: "full-access",
@@ -778,6 +850,38 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'queued', $6::conversation_k
       );
       return { task: await this.getTaskInTenant(executor, taskId, input.ownerUserId), session };
     });
+  }
+
+  async findCreatedTask(ownerUserId: string | null | undefined, idempotency: TaskCreationIdempotency): Promise<{ task: Task; session: Session } | null> {
+    return this.database.withTenant(this.tenantId, (executor) => this.createdTaskInTenant(executor, ownerUserId ?? null, idempotency));
+  }
+
+  private async createdTaskInTenant(
+    executor: SqlExecutor,
+    ownerUserId: string | null,
+    idempotency: TaskCreationIdempotency,
+  ): Promise<{ task: Task; session: Session } | null> {
+    // The session created with the task is its earliest one; later sessions
+    // (forks, new sessions) do not change what the original request returned.
+    const [row] = await executor.query<{ id: string; creation_fingerprint: string | null; session_id: string | null }>(
+      `
+SELECT t.id, t.creation_fingerprint,
+       (SELECT s.id FROM sessions s
+        WHERE s.tenant_id = t.tenant_id AND s.task_id = t.id
+        ORDER BY s.created_at ASC, s.id ASC
+        LIMIT 1) AS session_id
+FROM tasks t
+WHERE t.tenant_id = $1::uuid AND t.user_id = $2::uuid AND t.creation_idempotency_key = $3
+      `.trim(),
+      [this.tenantId, ownerUserId, idempotency.key],
+    );
+    if (!row) return null;
+    if (row.creation_fingerprint !== idempotency.fingerprint) throw taskCreationKeyConflict();
+    if (!row.session_id) throw new NotFoundException(`Session not found for task: ${row.id}`);
+    return {
+      task: await this.getTaskInTenant(executor, row.id, ownerUserId),
+      session: await this.getSessionInTenant(executor, row.session_id),
+    };
   }
 
   async listTasks(filter: ListTasksFilter = {}): Promise<Task[]> {
@@ -1550,4 +1654,15 @@ function isoNullable(value: Date | string | null): string | null {
 function requiredOwner(ownerUserId: string | null | undefined): string {
   if (!ownerUserId) throw new NotFoundException("A signed-in user is required for General tasks");
   return ownerUserId;
+}
+
+function taskCreationScope(ownerUserId: string | null | undefined, key: string): string {
+  return `${ownerUserId ?? ""}\u0000${key}`;
+}
+
+function taskCreationKeyConflict(): ConflictException {
+  return new ConflictException({
+    code: "idempotency_key_reused",
+    message: "This Idempotency-Key was already used to create a task with a different request. Use a new key for a new task.",
+  });
 }

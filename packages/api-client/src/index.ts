@@ -306,6 +306,20 @@ export interface CreateTaskRequest {
   model?: string | null | undefined;
 }
 
+export interface CreateTaskOptions {
+  /**
+   * UUID for one submit intent. Pass the same key when the user retries the
+   * same submission so the API returns the task it already created; a new
+   * submission, even with identical content, needs a new key. When omitted,
+   * one key is generated for this call and its automatic retries.
+   */
+  idempotencyKey?: string | undefined;
+  signal?: AbortSignal | undefined;
+}
+
+/** Delays before automatic retries of a task creation whose outcome is unknown. */
+const CREATE_TASK_RETRY_DELAYS_MS: readonly number[] = [250, 1_000];
+
 export interface UpdateTaskRequest {
   title?: string | undefined;
   status?: "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled" | undefined;
@@ -723,12 +737,26 @@ export class BerryApiClient {
     });
   }
 
-  async createTask(input: CreateTaskRequest): Promise<CreateTaskResponse> {
+  async createTask(input: CreateTaskRequest, options: CreateTaskOptions = {}): Promise<CreateTaskResponse> {
     PermissionModeSchema.optional().parse(input.permissionMode);
-    return this.#request("/v1/tasks", CreateTaskResponseSchema, {
-      method: "POST",
-      body: input,
-    });
+    // Every attempt repeats the submission's key, so a retry after a lost
+    // response or a gateway error returns the task the first attempt created
+    // instead of a duplicate (H-035). Without a key a retry is unsafe.
+    const idempotencyKey = options.idempotencyKey ?? globalThis.crypto?.randomUUID?.();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#request("/v1/tasks", CreateTaskResponseSchema, {
+          method: "POST",
+          body: input,
+          ...(idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : {}),
+          ...(options.signal ? { signal: options.signal } : {}),
+        });
+      } catch (error) {
+        const delayMs = CREATE_TASK_RETRY_DELAYS_MS[attempt];
+        if (!idempotencyKey || delayMs === undefined || options.signal?.aborted || !isUnknownMutationOutcome(error)) throw error;
+        await abortableDelay(delayMs, options.signal);
+      }
+    }
   }
 
   async listTaskPage(filter: { workspaceId?: string | undefined; workspaceKind?: "project" | "general" | undefined; includeDeleted?: boolean | undefined; state?: "active" | "archived" | "deleted" | "all" | undefined; search?: string | undefined; cursor?: string | undefined; limit?: number | undefined; taskIds?: readonly string[] | undefined } = {}, requestOptions: { signal?: AbortSignal } = {}): Promise<TaskPage> {
@@ -1881,7 +1909,7 @@ export class BerryApiClient {
     }
   }
 
-  async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
+  async #request<TSchema extends z.ZodTypeAny>(path: string, schema: TSchema, init: { method?: string | undefined; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<z.output<TSchema>> {
     const { response, body } = await this.#rawRequest(path, init);
     if (!response.ok) {
       throw new BerryApiError(`Berry API request failed with ${response.status}`, response.status, body);
@@ -1935,9 +1963,10 @@ export class BerryApiClient {
     return typeof body === "string" ? body : JSON.stringify(body);
   }
 
-  async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
+  async #rawRequest(path: string, init: { method?: string | undefined; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<{ response: Response; body: unknown }> {
     const method = init.method ?? "GET";
     const headers = new Headers(this.#headers);
+    for (const [name, value] of Object.entries(init.headers ?? {})) headers.set(name, value);
     headers.set("Accept", "application/json");
     const request: RequestInit = { method, headers, credentials: "include", ...(init.signal ? { signal: init.signal } : {}) };
     if (init.body !== undefined) {
@@ -2030,6 +2059,33 @@ function chunk<T>(values: readonly T[], size: number): T[][] {
   const result: T[][] = [];
   for (let index = 0; index < values.length; index += size) result.push(values.slice(index, index + size));
   return result;
+}
+
+/**
+ * The request may or may not have taken effect: no response arrived (lost
+ * response, reconnect) or the server timed out, rate-limited or failed. Only a
+ * mutation with an idempotency key may be retried after this.
+ */
+function isUnknownMutationOutcome(error: unknown): boolean {
+  if (error instanceof BerryApiError) return error.status === 408 || error.status === 429 || error.status >= 500;
+  // The server answered with an unexpected body; retrying cannot change that.
+  if (error instanceof z.ZodError) return false;
+  const name = error && typeof error === "object" && "name" in error ? error.name : undefined;
+  return name !== "AbortError";
+}
+
+function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new DOMException("Request aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function usageQuery<TFilter extends object>(filter: TFilter): string {

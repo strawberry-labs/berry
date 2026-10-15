@@ -328,6 +328,45 @@ describe("BerryApiClient", () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(2, "https://api.berry.test/v1/tasks/page?workspaceKind=general&limit=100&taskIds=task_1%2Ctask_2", expect.objectContaining({ method: "GET" }));
   });
 
+  it("retries a task creation whose outcome is unknown with the same idempotency key (H-035)", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn()
+        .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+        .mockResolvedValueOnce(new Response("Bad gateway", { status: 502, headers: { "content-type": "text/plain" } }))
+        .mockResolvedValueOnce(json(createdTaskBody()));
+      const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+      const key = "8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d";
+
+      const created = client.createTask({ workspaceKind: "general", title: "General task" }, { idempotencyKey: key });
+      await vi.advanceTimersByTimeAsync(1_250);
+
+      await expect(created).resolves.toMatchObject({ task: { id: "task_1" }, session: { id: "session_1" } });
+      expect(fetchImpl).toHaveBeenCalledTimes(3);
+      expect(fetchImpl.mock.calls.map(([, init]) => idempotencyKeyOf(init))).toEqual([key, key, key]);
+      expect(fetchImpl.mock.calls.map(([, init]) => init.body)).toEqual(Array(3).fill(JSON.stringify({ workspaceKind: "general", title: "General task" })));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("gives each new submission its own key and does not retry definitive rejections (H-035)", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(json(createdTaskBody()))
+      .mockResolvedValueOnce(json(createdTaskBody()))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "idempotency_key_reused" }), { status: 409, headers: { "content-type": "application/json" } }));
+    const client = new BerryApiClient({ baseUrl: "https://api.berry.test", fetchImpl });
+
+    await client.createTask({ title: "Same prompt" });
+    await client.createTask({ title: "Same prompt" });
+    await expect(client.createTask({ title: "Same prompt" }, { idempotencyKey: "8a7b6c5d-4e3f-4a2b-9c1d-0e9f8a7b6c5d" }))
+      .rejects.toMatchObject({ status: 409, body: { code: "idempotency_key_reused" } });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    const [first, second] = fetchImpl.mock.calls.map(([, init]) => idempotencyKeyOf(init));
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).not.toBe(first);
+  });
+
   it("supports cancellable cursor pages for enterprise management collections", async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).includes("/members/page")) {
@@ -1051,6 +1090,23 @@ describe("BerryApiClient", () => {
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+}
+
+function createdTaskBody() {
+  const createdAt = "2026-07-20T00:00:00.000Z";
+  return {
+    task: {
+      id: "task_1", workspaceId: "general_1", title: "General task", status: "queued", activeSessionId: "session_1",
+      conversationKind: "chat", pinned: false, archived: false,
+      deletedAt: null, unreadAt: null, lastReadAt: null, worktreePath: null, worktreeBranch: null, worktreeBaseRef: null,
+      worktreeBaseSha: null, pullRequestUrl: null, pullRequestNumber: null, createdAt, updatedAt: createdAt,
+    },
+    session: { id: "session_1", taskId: "task_1", parentSessionId: null, status: "active", modelProviderId: null, model: null, permissionMode: "full-access", createdAt, updatedAt: createdAt },
+  };
+}
+
+function idempotencyKeyOf(init: RequestInit | undefined): string | null {
+  return new Headers(init?.headers).get("Idempotency-Key");
 }
 
 function auditIngest() {
