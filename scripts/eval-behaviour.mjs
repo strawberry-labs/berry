@@ -2,21 +2,27 @@
 // Behaviour evaluation for model-quality issues (H-002, H-012, H-017, H-019,
 // H-020, H-022, H-025, H-026, H-029, H-034). Each case is assembled with the
 // worker's real prompt and tool schemas (modelMessages + built-in tools), sent
-// once to an OpenAI-compatible endpoint, and checked deterministically.
+// to an OpenAI-compatible endpoint, and checked deterministically. Tools are
+// never executed: a tool call is answered "tool not run" for up to
+// --tool-rounds rounds (a case's "rounds" overrides), so the model still has to
+// give a final answer from what it has.
 //
 // Build first:  pnpm --filter @berry/worker... build
 // Offline check: node scripts/eval-behaviour.mjs --dry-run
 // Live run:      BERRY_EVAL_API_KEY=... node scripts/eval-behaviour.mjs \
 //                  --base-url https://openrouter.ai/api/v1 --model z-ai/glm-5.3-flash
 // Options: --suite <cases.json> --only H-022,H-002 --candidate <variant.json>
-//          --samples <n> --out <report.json> --concurrency <n>
+//          --samples <n> --temperature <t> --max-tokens <n> --tool-rounds <n>
+//          --out <report.json> --concurrency <n>
+// Reasoning models spend completion tokens before answering, so the default
+// --max-tokens is 8000; at 2000 many replies were cut off before any text.
 // The key is read from BERRY_EVAL_API_KEY only and is never printed. Cases are
 // synthetic; nothing here reads production data.
 import { readFile, writeFile } from "node:fs/promises";
 import { modelMessages, durableBuiltInToolDefinitions } from "../apps/worker/dist/turn-runner.js";
 import { serializeMessage } from "../packages/router-client/dist/index.js";
 import { DURABLE_BASE_BUILT_IN_TOOLS } from "../packages/shared/dist/index.js";
-import { checkResponse, responseOutcome } from "./behaviour-eval-checks.mjs";
+import { checkResponse, continueAfterTools, responseOutcome } from "./behaviour-eval-checks.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, index, all) => {
   if (value.startsWith("--")) pairs.push([value.slice(2), all[index + 1] && !all[index + 1].startsWith("--") ? all[index + 1] : "true"]);
@@ -26,6 +32,9 @@ const suitePath = args.suite ?? new URL("./behaviour-eval-cases.json", import.me
 const only = args.only ? new Set(args.only.split(",")) : null;
 const samples = Math.max(1, Number(args.samples ?? 1));
 const concurrency = Math.max(1, Number(args.concurrency ?? 4));
+const temperature = Number(args.temperature ?? 0);
+const maxTokens = Math.max(256, Number(args["max-tokens"] ?? 8_000));
+const toolRounds = Math.max(1, Number(args["tool-rounds"] ?? 3));
 const dryRun = args["dry-run"] === "true";
 const candidate = args.candidate ? JSON.parse(await readFile(args.candidate, "utf8")) : null;
 // systemReplaceFile swaps the stable system prompt (keeping the per-run runtime
@@ -82,13 +91,32 @@ async function call(request) {
     const response = await fetch(`${args["base-url"].replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: args.model, messages: request.messages, tools: request.tools, tool_choice: "auto", temperature: 0, max_tokens: 2_000, stream: false }),
+      body: JSON.stringify({ model: args.model, messages: request.messages, tools: request.tools, tool_choice: "auto", temperature, max_tokens: maxTokens, stream: false }),
       signal: AbortSignal.timeout(120_000),
     });
     if ((response.status === 429 || response.status >= 500) && attempt < 3) { await new Promise((resolve) => setTimeout(resolve, 2_000 * attempt)); continue; }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${JSON.stringify(body).slice(0, 300)}`);
     return { body, latencyMs: Date.now() - started };
+  }
+}
+
+/** Runs one case, answering tool calls with "tool not run" until a final reply or the round limit. */
+async function converse(item, request) {
+  let messages = request.messages;
+  const earlierCalls = [];
+  const usage = { prompt_tokens: 0, completion_tokens: 0 };
+  const limit = Math.max(1, Number(item.rounds ?? toolRounds));
+  let latencyMs = 0;
+  for (let round = 1; ; round += 1) {
+    const { body, latencyMs: elapsed } = await call({ messages, tools: request.tools });
+    latencyMs += elapsed;
+    usage.prompt_tokens += body.usage?.prompt_tokens ?? 0;
+    usage.completion_tokens += body.usage?.completion_tokens ?? 0;
+    const next = round < limit ? continueAfterTools(messages, body) : null;
+    if (!next) return { body, earlierCalls, rounds: round, latencyMs, usage };
+    earlierCalls.push(...(body.choices?.[0]?.message?.tool_calls ?? []));
+    messages = next;
   }
 }
 
@@ -104,9 +132,9 @@ await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, asy
       continue;
     }
     try {
-      const { body, latencyMs } = await call(request);
-      const checked = checkResponse(item, body);
-      results.push({ id: item.id, issue: item.issue, sample, pass: checked.pass, outcome: responseOutcome(body, checked), failures: checked.failures, calls: checked.calls, finishReason: body.choices?.[0]?.finish_reason ?? null, latencyMs, usage: body.usage ?? null, servedModel: body.model ?? null, answer: checked.answer.slice(0, 1_200) });
+      const { body, earlierCalls, rounds, latencyMs, usage } = await converse(item, request);
+      const checked = checkResponse(item, body, earlierCalls);
+      results.push({ id: item.id, issue: item.issue, sample, pass: checked.pass, outcome: responseOutcome(body, checked), failures: checked.failures, calls: checked.calls, rounds, finishReason: body.choices?.[0]?.finish_reason ?? null, latencyMs, usage, servedModel: body.model ?? null, answer: checked.answer.slice(0, 1_200) });
     } catch (error) {
       results.push({ id: item.id, issue: item.issue, sample, pass: false, outcome: "api_error", error: error.message });
     }
@@ -129,7 +157,7 @@ const usage = results.reduce((total, result) => ({
   prompt: total.prompt + (result.usage?.prompt_tokens ?? 0),
   completion: total.completion + (result.usage?.completion_tokens ?? 0),
 }), { prompt: 0, completion: 0 });
-const report = { model: args.model ?? null, baseHost: args["base-url"] ? new URL(args["base-url"]).host : null, variant: args.candidate ?? "baseline", dryRun, byIssue, usage, results };
+const report = { model: args.model ?? null, baseHost: args["base-url"] ? new URL(args["base-url"]).host : null, variant: args.candidate ?? "baseline", dryRun, settings: { samples, temperature, maxTokens, toolRounds }, byIssue, usage, results };
 if (args.out) await writeFile(args.out, `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify({ model: report.model, variant: report.variant, dryRun, byIssue, usage }, null, 2));
 if (!dryRun) for (const result of results.filter((item) => !item.pass)) console.log(`${result.outcome.toUpperCase()} ${result.id}#${result.sample}: ${result.error ?? result.failures.join("; ")}`);

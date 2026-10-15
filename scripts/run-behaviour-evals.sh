@@ -6,8 +6,10 @@
 #   scripts/run-behaviour-evals.sh https://openrouter.ai/api/v1 z-ai/glm-5.3-flash qwen/qwen3.8-flash
 #
 # Variants: today's prompt (baseline), today's prompt plus targeted rules, and
-# the SYSTEM_PROMPT.md proposal (skipped when that file is absent). Reports go
-# to eval-results/ (ignored by git); a summary is printed at the end.
+# the SYSTEM_PROMPT.md proposal (skipped when that file is absent). Each case
+# runs BERRY_EVAL_SAMPLES times (default 3) at BERRY_EVAL_TEMPERATURE (default
+# 0.5), so one lucky or unlucky reply does not decide a variant. Reports go to
+# eval-results/ (ignored by git); a summary is printed at the end.
 set -euo pipefail
 base_url="${1:?Usage: $0 <base-url> <model> [model...]}"
 shift
@@ -26,7 +28,7 @@ for model in "$@"; do
     [[ "$variant" != baseline ]] && candidate=(--candidate "$variant")
     echo "Running $model / $(basename "$variant" .json) (log: eval-results/$name.log)"
     node scripts/eval-behaviour.mjs --base-url "$base_url" --model "$model" ${candidate[@]+"${candidate[@]}"} \
-      --samples "${BERRY_EVAL_SAMPLES:-1}" --out "eval-results/$name.json" > "eval-results/$name.log" 2>&1 \
+      --samples "${BERRY_EVAL_SAMPLES:-3}" --temperature "${BERRY_EVAL_TEMPERATURE:-0.5}" --out "eval-results/$name.json" > "eval-results/$name.log" 2>&1 \
       || echo "  failed; see eval-results/$name.log" >&2
   done
 done
