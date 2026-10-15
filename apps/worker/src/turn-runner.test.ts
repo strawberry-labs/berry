@@ -44,6 +44,9 @@ import {
   type TurnToolResult,
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
+import { SandboxContinuityManager } from "./sandbox-continuity.js";
+import { DurableMcpToolExecutor } from "./mcp-tools.js";
+import { DurablePersonalMemoryToolExecutor } from "./memory/tools.js";
 import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
@@ -2422,6 +2425,138 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "calling_model" });
     expect(executions).toBe(0);
     expectFinalAnswerRequested(repository, "write failed 5 times with the same input and the same error");
+  });
+
+  describe("recoverable preparation failures (H-077)", () => {
+    const job = () => ({ tenantId, runId, reason: "continue" as const });
+    const recordingModel = () => {
+      const seen: Array<{ tools: string[]; extra: string }> = [];
+      const model: DurableTurnModel = {
+        call: vi.fn(async (...args: Parameters<DurableTurnModel["call"]>) => {
+          const context = args[2];
+          seen.push({
+            tools: context.tools.map((tool) => tool.function.name),
+            extra: JSON.stringify(context.additionalUserContent ?? []),
+          });
+          return { text: "Recovered", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        }),
+      };
+      return { model, seen };
+    };
+    const sandboxed = (current: MutableSnapshot) => {
+      current.sandboxId = "prep-sandbox";
+      current.sandboxProvider = "e2b";
+      current.sandboxState = "running";
+      return current;
+    };
+
+    it("keeps healthy connectors and plain writing usable when an unused connector's credentials cannot be opened", async () => {
+      const current = providerSnapshot("openai-responses");
+      const server = (id: string, name: string, credentialRef?: string) => ({
+        id, name, transport: "streamable-http" as const, command: null, args: [], url: `https://${id}.invalid/mcp`, env: {},
+        enabled: true, trusted: true, ...(credentialRef ? { credentialRef } : {}),
+        cachedTools: [{ name: "search", description: `Search ${name}`, inputSchema: { type: "object", properties: { query: { type: "string" } } } }],
+      });
+      current.runtimeRequest = {
+        ...current.runtimeRequest,
+        input: "Polish this sentence: I can attend.",
+        mcpServers: [server("broken", "Broken", "env:BERRY_TEST_MISSING_CONNECTOR_SECRET"), server("healthy", "Healthy")],
+      };
+      const tools = new DurableMcpToolExecutor(noTools(), [], undefined, 100, {});
+      const repository = new FakeTurnRepository(current);
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(seen[0]!.tools).toEqual(expect.arrayContaining(["tool_search", "use_tool"]));
+      const context = JSON.stringify(repository.current.entries.filter((entry) => entry.entryType === "context"));
+      expect(context).toContain("healthy (Healthy)");
+      expect(context).toContain("broken (Broken): its credentials could not be opened");
+      // The broken connector stays blocked; it is not opened without credentials.
+      await expect(tools.execute(repository.current, {
+        ...readOnlyToolStep("read", 9, "/workspace/a.txt"),
+        type: "tool.mcp__Broken__search",
+        input: { toolName: "mcp__Broken__search", arguments: { query: "x" } },
+      })).rejects.toThrow("The Broken connector is unavailable for this message");
+      await tools.close();
+    });
+
+    it("turns memory off for the request when its settings cannot be read, never assuming consent", async () => {
+      const tools = new DurablePersonalMemoryToolExecutor(
+        noTools(),
+        { settings: async () => { throw new Error("settings temporarily unavailable"); } } as never,
+        {} as never,
+        true,
+      );
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(seen[0]!.tools).not.toContain("remember_memory");
+      expect(seen[0]!.tools).not.toContain("forget_memory");
+      expect(seen[0]!.extra).toContain("Personal memory is unavailable for this message");
+    });
+
+    it("continues with a notice when optional context enrichment fails", async () => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const { model } = recordingModel();
+      const tools = { ...noTools(), turnContext: async () => { throw new Error("connector catalog unavailable"); } };
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(JSON.stringify(repository.current.entries)).toContain("Some task context could not be prepared for this message (connector catalog unavailable)");
+    });
+
+    it("still stops on cancellation raised while enriching the context", async () => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const { model } = recordingModel();
+      const tools = { ...noTools(), turnContext: async () => { throw new DurableTurnRetryableError("lease lost"); } };
+
+      await expect(new DurableTurnRunner(repository, model, tools).execute(job())).rejects.toThrow("lease lost");
+      expect(model.call).not.toHaveBeenCalled();
+    });
+
+    it("retries a failed attachment download once, then tells the model the file was not reviewed", async () => {
+      const current = sandboxed(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const getSource = vi.fn(async () => { throw new Error("source download connection reset"); });
+      const write = vi.fn();
+      const manager = new SandboxContinuityManager(
+        { kind: "e2b", resume: async () => ({ sandbox_id: "prep-sandbox", provider: "e2b", status: "running" }), files: { write, read: vi.fn(), list: vi.fn() } } as never,
+        {
+          inputFiles: async () => [{ fileId: "00000000-0000-7000-8000-000000000090", name: "brief.pdf", mediaType: "application/pdf", sizeBytes: 5, objectKey: "prep/brief.pdf" }],
+          recordSandbox: async () => undefined,
+        } as never,
+        { getSource } as never,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, manager).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(getSource).toHaveBeenCalledTimes(2);
+      expect(write).not.toHaveBeenCalled();
+      expect(seen[0]!.extra).toContain('Attached file not available: \\"brief.pdf\\" could not be prepared');
+      expect(seen[0]!.extra).toContain("has not been reviewed");
+    });
+
+    it("leaves an earlier image out with a notice after a network error, retrying once", async () => {
+      const current = sandboxed(snapshot("calling_model", [
+        admittedStep(),
+        { ...readOnlyToolStep("read", 1, "/workspace/old.png"), state: "completed", output: { path: "/workspace/old.png", binary: true, mediaType: "image/png", visionPath: "/workspace/old.png" } },
+        modelStep("pending", 2),
+      ]));
+      const read = vi.fn(async () => { throw Object.assign(new Error("fetch failed: ECONNRESET"), { code: "ECONNRESET" }); });
+      const manager = new SandboxContinuityManager(
+        { kind: "e2b", resume: async () => ({ sandbox_id: "prep-sandbox", provider: "e2b", status: "running" }), files: { read, list: async () => ({ entries: [] }), write: async () => ({}) } } as never,
+        { inputFiles: async () => [], recordSandbox: async () => undefined, latest: async () => null, continuity: async () => null } as never,
+        null,
+        { image: "berry-sandbox", preparationRetryDelayMs: 1 },
+      );
+      const repository = new FakeTurnRepository(current);
+      const { model, seen } = recordingModel();
+
+      await expect(new DurableTurnRunner(repository, model, manager).execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(seen[0]!.extra).toContain("could not be loaded right now (fetch failed: ECONNRESET)");
+    });
   });
 
   describe("stalled model streams (H-021)", () => {

@@ -95,6 +95,7 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
+| (this commit) | H-077 | None. Preparation behaviour only; no schema or stored-data change. |
 
 ## Status legend
 
@@ -2284,3 +2285,17 @@ AESG packages.
 - **Remaining.** Whether models act on the guidance is unevaluated. Shell quoting variants
   are not merged. A per-path "did you mean" hint after a missing-file error would address
   task 523's typo directly.
+
+### H-077 — Automatic preparation failures stop the task before the AI can recover
+
+- **Revalidation (15 October, after `7e8ae0c`).** The audit's fault cases were rerun on current code. `86367ea` (H-009) already turns a sandbox-level network error on an earlier image into a released retry rather than a failed task. The other four still failed the task before the model was called: an unused connector with an unopenable credential, an unreadable memory setting, a throwing context enrichment, and a failed attachment download.
+- **Fix.**
+  - `mcp-tools.ts`: credentials and environment are opened per connector (`Promise.allSettled`). An unopenable connector is recorded as unavailable for the run. The turn context lists it with the reason, its tools and a `tool_search` naming it fail with that reason, and healthy connectors stay usable. `tool_search`/`use_tool` stay declared, so the tool list is unchanged.
+  - `memory/tools.ts`: tool definitions and model content share one settings lookup per request. If it fails, memory is off for that request: no memory tools, and a notice not to save or claim memories.
+  - `turn-runner.ts`: a throwing `turnContext` becomes a journaled notice that optional context could not be prepared. Cancellation, retryable, terminal and abort errors still propagate.
+  - `sandbox-continuity.ts`: current-turn attachments are staged one by one, with one retry for a temporary failure (`classifyToolFailure` = transient). An attachment that still fails, or never finishes verification, is skipped and reported ("not staged and has not been reviewed… do not describe… ask the user to send it again"). Attachment images and earlier images get the same single retry, then an omission notice; explicit `inspect_images` paths stay errors. A lost sandbox still goes through `#withSandboxRecovery`. `tool-failures.ts` also treats "connection reset" as transient.
+  - Large skill files stay lazy; nothing new is staged eagerly.
+- **Tests.** Six runner cases in `turn-runner.test.ts` ("recoverable preparation failures (H-077)"): a broken unused connector beside a healthy one on a rewriting request (the broken connector's tool is refused); memory settings failure; context-enrichment failure; a retryable error from enrichment still stops; attachment download failure (two attempts, nothing written, notice); an earlier-image network error (two reads, notice). Five fail on the previous source; the propagation control passes on both. Worker suite: 625 passed, 3 skipped. The existing missing-preview, explicit-inspection, NUL/binary and cancellation tests pass.
+- **Data impact.** None.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** Connector credentials are still opened at preparation, though now per connector; opening them only on first use would need `McpToolSource` changes. An attachment notice is sent on each model request of the run rather than journaled once. Memory tools disappear from the tool list for a request whose settings lookup fails, which changes that request's cache prefix.

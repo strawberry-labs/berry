@@ -58,7 +58,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const inherited = await (this.base.definitions?.(snapshot) ?? Promise.resolve([]));
     return [
       ...inherited,
-      ...(context.servers.length > 0 || connectorsUnavailableReason(snapshot)
+      ...(context.servers.length > 0 || context.unavailable.length > 0 || connectorsUnavailableReason(snapshot)
         ? [durableToolSearchDefinition(), durableUseToolDefinition()]
         : []),
     ];
@@ -72,7 +72,12 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const catalog = context.servers
       .filter((server) => tools.some((tool) => this.#serverForTool(tool.name, [server]) !== undefined))
       .map((server) => `${server.id} (${server.name})`);
-    if (catalog.length === 0) return inherited;
+    const unavailable = context.unavailable.map((server) => `- ${server.id} (${server.name}): ${server.reason}`);
+    if (catalog.length === 0) {
+      return unavailable.length > 0
+        ? [inherited, ["Connectors unavailable for this message (their tools cannot run):", ...unavailable].join("\n")].filter(Boolean).join("\n\n")
+        : inherited;
+    }
     const visible = this.#visibleToolNames(snapshot, context);
     const ready = tools.filter((tool) => visible.has(tool.name));
     const lines: string[] = [];
@@ -94,6 +99,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       `Connectors available to this task: ${catalog.join(", ")}. Call tool_search to find their tools, then run a found tool with use_tool.`,
       ...(lines.length > 0 ? ["Connector tools ready now (run with use_tool, passing the exact name and arguments that match the schema):", ...lines] : []),
       ...(withoutSchema > 0 ? [`Call tool_search for the input schema of the ${withoutSchema} tool${withoutSchema === 1 ? "" : "s"} listed without one.`] : []),
+      ...(unavailable.length > 0 ? ["Connectors unavailable for this message (their tools cannot run):", ...unavailable] : []),
     ].join("\n");
     return [inherited, section].filter(Boolean).join("\n\n");
   }
@@ -188,6 +194,8 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     }
     const context = await this.#context(snapshot);
     if (!this.#serverForTool(toolName, context.servers)) {
+      const lost = context.unavailable.find((server) => toolName.startsWith(`mcp__${sanitizeName(server.name)}__`));
+      if (lost) throw new Error(`The ${lost.name} connector is unavailable for this message: ${lost.reason}`);
       throw new Error(`MCP tool ${toolName} is not enabled for this turn`);
     }
     if (!this.#visibleToolNames(snapshot, context).has(toolName)) {
@@ -268,10 +276,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     if (existing) return existing;
     const runtime = DurableTurnRuntimeRequestSchema.safeParse(snapshot.runtimeRequest);
     if (!runtime.success) {
-      return { source: this.#source, servers: this.#allowedServers(snapshot) };
+      return { source: this.#source, servers: this.#allowedServers(snapshot), unavailable: [] };
     }
-    const servers = await Promise.all(runtime.data.mcpServers
-      .filter((server) => server.enabled && server.trusted)
+    // Each connector opens its own credentials: one that cannot be opened is
+    // unavailable for this turn without blocking healthy connectors or a
+    // request that needs none (H-077).
+    const enabled = runtime.data.mcpServers.filter((server) => server.enabled && server.trusted);
+    const prepared = await Promise.allSettled(enabled
       .map(async (server): Promise<McpServerSpec> => {
         const credential = await durableMcpCredential(server.credential, server.credentialRef, this.env);
         const environment = await durableMcpEnvironment(server.environment, server.env, this.env);
@@ -300,6 +311,14 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
           ...(credential ? { credential } : {}),
         };
       }));
+    const servers = prepared.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    const unavailable = prepared.flatMap((result, index) => result.status === "rejected"
+      ? [{
+          id: enabled[index]!.id,
+          name: enabled[index]!.name,
+          reason: `its credentials could not be opened (${(result.reason instanceof Error ? result.reason.message : String(result.reason)).replace(/\s+/g, " ").slice(0, 200)}). An administrator or the connection owner should reconnect it.`,
+        }]
+      : []);
     const policy = NetworkPolicySchema.safeParse(runtime.data.networkPolicy);
     const source = new McpToolSource({
       servers: [...servers],
@@ -311,7 +330,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     });
     // Cached, administrator-reviewed schemas are enough for model preparation.
     // McpToolSource connects only when one exposed tool is actually executed.
-    const context = { source, servers };
+    const context = { source, servers, unavailable };
     this.#turnContexts.set(snapshot.id, context);
     return context;
   }
@@ -321,6 +340,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     const unavailable = connectorsUnavailableReason(snapshot);
     if (unavailable && context.servers.length === 0) {
       throw new Error(`Connectors are unavailable for this message: ${unavailable}`);
+    }
+    if (context.servers.length === 0 && context.unavailable.length > 0) {
+      throw new Error(`Connectors are unavailable for this message: ${context.unavailable.map((server) => `${server.name}: ${server.reason}`).join("; ")}`);
     }
     const input = record(step.input.arguments) ?? {};
     const query = stringValue(input.query);
@@ -342,6 +364,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       );
     }
     const connector = exactConnector ?? aliasMatches[0];
+    const lostConnector = connectorId && !connector
+      ? context.unavailable.find((server) => server.id === connectorId || normalizeCatalogIdentity(server.name) === normalizedConnectorId)
+      : undefined;
+    if (lostConnector) throw new Error(`The ${lostConnector.name} connector is unavailable for this message: ${lostConnector.reason}`);
     if (connectorId && !connector) {
       throw new Error(`Unknown or unauthorized connector: ${connectorId}`);
     }
@@ -463,6 +489,8 @@ function emitMcpLog(level: "debug" | "info" | "warn" | "error", runId?: string):
 type DurableMcpTurnContext = {
   source: McpToolSource;
   servers: readonly McpServerSpec[];
+  /** Enabled connectors whose credentials or environment could not be opened this turn (H-077). */
+  unavailable: readonly { id: string; name: string; reason: string }[];
 };
 
 /** Stable across turns and tenants: the connector catalog lives in the turn context (H-032). */

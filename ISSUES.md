@@ -2998,3 +2998,30 @@ SSM code-only verification at2026-10-14T08:15:37Z: deployed API connector SHA `a
 **Acceptance:** selected shared-drive file/folder is found via identical scoped query and children listing; next-page retains drive identity; incomplete search is explicit; revoked/unavailable scope stays restricted. Measure useful-file time and repeated searches. Private evidence: `group3-current-connector-module-proof.json`, `group3-current-connector-trace.md`.
 
 **Implementation (14 October):** child listing now infers and keeps the folder's shared-drive ID, and an empty unscoped search retries once across the user's drives; results report `searchScope` and `incompleteSearch`. Not deployed.
+
+
+## Error-boundary follow-up — 15 October 2026
+
+The existing missing-preview fix covers task `9688abaa-bd0a-43c9-999c-3b6e75c1e097`, but does not isolate all preparation/publication failures. [Targeted report](output/error-boundary-audit-2026-10-15/report.md) includes source hashes, fault cases, coverage, current-fix mapping and acceptance criteria. This is current working-tree code review plus retained production evidence, not a new complete history review. No application or production changes.
+
+**Verification:** 12 audit fault injections pass, including assertions that reproduce the gaps; 402 existing tests across seven current worker suites pass. A passing `GAP` assertion confirms current faulty behavior, not a fix. New incident frequency is unmeasured.
+
+### H-077 — Automatic preparation failures stop the task before the AI can recover (P1)
+
+**Confirmed current code / local reproduction; not implemented.** Five cases: network error reloading a historical image, attachment download failure during staging, unusable unused connector credential blocking an unrelated rewriting request, optional memory-settings lookup failure, and injected executor context-enrichment failure. These sit outside the normal single-tool error handler (`turn-runner.ts:902–922`, `:1001`, `:2978`). The outer handler terminalizes plain exceptions. H-046 catches missing historical paths only; H-003/H-006 classify execution failures only; H-068 import readiness and H-075 internal session lifetime do not close this boundary.
+
+**Fix:** bounded typed preparation retries; explicit unavailable-input notices or a wait/reattach action; per-connector isolation and credentials opened only when used; memory disabled for a turn if its consent/settings cannot be read. Preserve core journal, access, cancellation, file-integrity and tenant boundaries. Keep stable tool declarations/cache prefixes; no silent omission of required evidence, blanket catches or eager transfer of large skill templates. Estimated 1–2 days. Acceptance: the five fault cases safely retry/degrade/wait without claiming unavailable inputs were read, healthy capabilities remain usable, revoked access remains blocked.
+
+**Related H-046 / H-009 / H-068:** the current missing-path and text-only-finalization fixes remain valid. This is the uncovered adjacent class, not a reason to replace their focused fixes. Production frequency of these new exact variants is not established.
+
+- **Implementation (15 October):** each preparation seam now degrades on its own. Connectors open their credentials one by one: one that cannot be opened is listed as unavailable in the turn context and its tools refuse to run, while healthy connectors, `tool_search`/`use_tool` and plain writing continue. Unreadable memory settings turn memory off for that request (tools not declared, notice shown); consent is never assumed. A failing context enrichment becomes a notice. Attachment downloads and earlier-image reads are retried once after a temporary failure; an attachment that still cannot be staged is reported as not reviewed with a resend/re-attach action, and an earlier image is left out with a notice. Explicit image inspections, lost sandboxes, cancellation and the runner's retry/stop errors keep their behaviour. Not deployed.
+
+### H-078 — Parallel read deadline loses completed peer results before retry (P2)
+
+**Confirmed current code / local reproduction; not implemented.** With one fast and one slow read, `withHeartbeat(Promise.allSettled(...))` throws at the batch deadline before results are journaled (`turn-runner.ts:2157–2174`). Both steps remain running and the successful content is absent. This requests whole-batch retry because the timeout is retryable; it is not an immediate terminal crash. The equivalent single-tool timeout correctly returns an error to the AI. Polling, repeat-guard and timeout-cause fixes do not change this path. Production frequency and eventual exhaustion were not established.
+
+**Fix:** persist safely settled successful reads, report only timed-out reads as failed tool results, and let the model recover. Preserve cancellation/lost-lease handling and wait for non-abort-aware operations before releasing ownership. No external mutation replay. Estimated 0.5–1 day. Acceptance: one fast/one slow result yields one preserved success and one recoverable error, no duplicate read, and no writes after lease loss.
+
+**H-014 / H-009 publication gap remains:** the text-only scan exemption is fixed (`91208bc`), but output-writing turns still fail if automatic publication fails. Two new fault injections reproduce an upload failure after an answer exists and a scan that publishes one file before a missing peer rejects the scan. Preserve individual publication receipts and answer access; expose/retry the failed publication only. A required missing deliverable must remain visible. See EB-02 in the report; use the existing finalization/artifact-operation records.
+
+**H-011 defensive hypothesis, not a production incident:** a deliberately invalid adapter output (BigInt despite the JSON contract) throws in `journalSafeToolResult` outside the execution catch. NUL/binary fixes cover their observed incidents; this is optional small result-validation hardening, not a proven supported-tool regression. See EB-04. Do not add a large abstraction or blindly rerun a mutation after losing its receipt.

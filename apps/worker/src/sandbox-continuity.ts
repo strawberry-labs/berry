@@ -43,6 +43,7 @@ import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
 import { emitWorkerOperationalEvent, persistWorkerOperationalEvent } from "./operational-telemetry.js";
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
+import { classifyToolFailure } from "./tool-failures.js";
 import {
   capabilityNoticeReason,
   DurableTurnRetryableError,
@@ -582,6 +583,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       importAvailabilityTimeoutMs?: number;
       importAvailabilityPollMs?: number;
       resumeRetryDelayMs?: number;
+      preparationRetryDelayMs?: number;
       enableTerminalFinalization?: boolean;
       documentTextExtractor?: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>;
       imageGeneration?: {
@@ -663,33 +665,38 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     signal?.throwIfAborted();
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     const run = { tenantId: snapshot.tenantId, runId: snapshot.id, sessionId: snapshot.sessionId ?? null };
-    const turnInputFiles = await this.#timed(
+    const arrived = await this.#timed(
       run,
       "inputs.wait",
       () => this.awaitTurnInputFiles(snapshot, signal, reportProgress),
-      (files) => ({ itemCount: files.length }),
+      (result) => ({ itemCount: result.files.length }),
     );
     signal?.throwIfAborted();
+    // An attachment that cannot be prepared is reported to the model, which
+    // must not describe it as reviewed; the rest of the request continues
+    // (H-077). A lost sandbox is still recovered by #withSandboxRecovery.
+    const unavailableInputs = arrived.pending.map((name) => ({ name, reason: "it is still being verified after upload" }));
+    let turnInputFiles = arrived.files;
     if (turnInputFiles.length > 0) {
       const sandbox = await this.ensureSandbox(snapshot, signal);
-      await this.#timed(
+      const staging = turnInputFiles;
+      const failed = await this.#timed(
         run,
         "inputs.stage",
-        () => this.stageInputFiles(
-          snapshot,
-          sandbox.id,
-          this.repository,
-          new Set(turnInputFiles.map((file) => file.fileId.toLowerCase())),
-          signal,
-          reportProgress,
-          turnInputFiles,
-        ),
+        () => this.stageTurnInputFiles(snapshot, sandbox.id, staging, signal, reportProgress),
         () => ({
-          itemCount: turnInputFiles.length,
-          byteCount: turnInputFiles.reduce((total, file) => total + file.sizeBytes, 0),
+          itemCount: staging.length,
+          byteCount: staging.reduce((total, file) => total + file.sizeBytes, 0),
         }),
       );
+      unavailableInputs.push(...failed.map(({ file, reason }) => ({ name: file.name, reason })));
+      const failedIds = new Set(failed.map(({ file }) => file.fileId));
+      turnInputFiles = turnInputFiles.filter((file) => !failedIds.has(file.fileId));
     }
+    const inputNotices: ChatContentPart[] = unavailableInputs.map(({ name, reason }) => ({
+      type: "text",
+      text: `[Attached file not available: ${JSON.stringify(name)} could not be prepared for this message (${reason}). It was not staged and has not been reviewed. Do not describe, quote or rely on its contents, and do not say it was reviewed. Tell the user it could not be opened and ask them to send the message again, or to re-attach the file if it keeps failing.]`,
+    }));
     const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
@@ -711,9 +718,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         })
       : attachedImages;
     const withheld = exposed?.withheld ?? [];
-    if (requestedSandboxImages.length === 0 && selectedAttachments.length === 0 && withheld.length === 0) return [];
+    if (requestedSandboxImages.length === 0 && selectedAttachments.length === 0 && withheld.length === 0) return inputNotices;
 
-    const parts: ChatContentPart[] = [];
+    const parts: ChatContentPart[] = [...inputNotices];
     let totalBase64Bytes = 0;
     let imageCount = 0;
     const omit = (path: string, reason: string) => {
@@ -752,16 +759,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (!mediaType?.startsWith("image/")) throw new Error(`inspect_images only accepts image paths: ${path}`);
         const readInput = { sandbox_id: sandbox.id, path, encoding: "base64" } as const;
         try {
-          const source = await (signal
+          const source = await this.#retryTransientPreparation(signal, () => signal
             ? this.provider.files.read(readInput, { signal })
             : this.provider.files.read(readInput));
           reportProgress?.();
-          return { path, mediaType, bytes: Buffer.from(source.content, "base64") };
+          return { path, mediaType, bytes: Buffer.from(source.content, "base64"), unavailable: null };
         } catch (error) {
           // A file read earlier in the turn may since have been moved or
           // deleted. That is a per-image gap, not a reason to fail the turn.
-          if (!isMissingSandboxPath(error)) throw error;
-          return { path, mediaType, bytes: null };
+          if (isMissingSandboxPath(error)) return { path, mediaType, bytes: null, unavailable: null };
+          // An earlier image that still cannot be loaded after one retry is
+          // left out with a notice; an explicitly requested one stays an error
+          // (H-077).
+          if (explicitPaths || signal?.aborted || !transientPreparationFailure(error)) throw error;
+          return { path, mediaType, bytes: null, unavailable: errorDetail(error) };
         }
       }));
     };
@@ -774,17 +785,23 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
           return { path: durableAttachmentPath(file, workspaceRoot), mediaType: file.mediaType, bytes: new Uint8Array() };
         }
-        const bytes = await objects.getSource(file.objectKey, file.objectVersionId, signal);
+        const path = durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot);
+        let bytes: Uint8Array;
+        try {
+          bytes = await this.#retryTransientPreparation(signal, () => objects.getSource(file.objectKey, file.objectVersionId, signal));
+        } catch (error) {
+          // An attachment whose pixels cannot be loaded is reported, not
+          // shown; an explicit inspection of it stays an error (H-077).
+          if (explicitPaths || signal?.aborted) throw error;
+          return { path, mediaType: file.mediaType, bytes: null, unavailable: errorDetail(error) };
+        }
         signal?.throwIfAborted();
         reportProgress?.();
         if (bytes.byteLength !== file.sizeBytes) {
-          throw new Error(`Input image ${file.name} is incomplete`);
+          if (explicitPaths) throw new Error(`Input image ${file.name} is incomplete`);
+          return { path, mediaType: file.mediaType, bytes: null, unavailable: "the stored image is incomplete" };
         }
-        return {
-          path: durableAttachmentPath({ fileId: file.fileId, name: file.name }, workspaceRoot),
-          mediaType: file.mediaType,
-          bytes,
-        };
+        return { path, mediaType: file.mediaType, bytes, unavailable: null };
       }));
     };
 
@@ -796,7 +813,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       // An explicitly requested image that is missing stays a reported error.
       const loadedSources = [
         ...sandboxSources.flatMap((source) => source.bytes ? [{ ...source, bytes: source.bytes }] : []),
-        ...attachmentSources,
+        ...attachmentSources.flatMap((source) => source.bytes ? [{ ...source, bytes: source.bytes }] : []),
       ];
       const sources = explicitPaths.flatMap((path) => {
         const source = loadedSources.find((candidate) => candidate.path === path);
@@ -824,7 +841,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       attachmentFiles.push(file);
     }
     const attachmentSources = await loadAttachmentSources(attachmentFiles);
-    for (const source of attachmentSources) await append(source.path, source.bytes);
+    for (const source of attachmentSources) {
+      if (source.bytes) await append(source.path, source.bytes);
+      else omit(source.path, `the attached image could not be loaded (${source.unavailable}), so it has not been seen; ask the user to send it again`);
+    }
 
     for (const path of withheld) {
       omit(path, `only ${MAX_MODEL_IMAGES} images are sent per request; read this image again on its own or in a batch of at most ${MAX_MODEL_IMAGES} to inspect it`);
@@ -832,6 +852,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const sandboxSources = await loadSandboxSources(requestedSandboxImages);
     for (const source of sandboxSources) {
       if (source.bytes) await append(source.path, source.bytes);
+      else if (source.unavailable) omit(source.path, `the image could not be loaded right now (${source.unavailable}); read it again if you still need it`);
       else omit(source.path, "the file no longer exists at this path (it was moved or deleted after it was read); read its current path if you still need it");
     }
     return parts;
@@ -2374,10 +2395,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     snapshot: DurableTurnSnapshot,
     signal?: AbortSignal,
     reportProgress?: () => void,
-  ): Promise<readonly SandboxInputFile[]> {
+  ): Promise<{ files: readonly SandboxInputFile[]; pending: string[] }> {
     const expected = runtimeAttachmentFileIds(snapshot);
     let files = await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn");
-    if (expected.size === 0 || expectedInputFilesAvailable(files, expected)) return files;
+    if (expected.size === 0 || expectedInputFilesAvailable(files, expected)) return { files, pending: [] };
     const timeoutMs = Math.max(0, this.options.inputAvailabilityTimeoutMs ?? DEFAULT_INPUT_AVAILABILITY_TIMEOUT_MS);
     const pollMs = Math.max(1, this.options.inputAvailabilityPollMs ?? DEFAULT_INPUT_AVAILABILITY_POLL_MS);
     const deadline = Date.now() + timeoutMs;
@@ -2385,10 +2406,57 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       await waitForInputAvailability(Math.min(pollMs, Math.max(1, deadline - Date.now())), signal);
       files = await this.repository.inputFiles(snapshot.tenantId, snapshot.id, "turn");
       reportProgress?.();
-      if (expectedInputFilesAvailable(files, expected)) return files;
+      if (expectedInputFilesAvailable(files, expected)) return { files, pending: [] };
     }
+    // Files that never finished verification are reported to the model
+    // rather than failing the request (H-077).
     const missing = [...expected].filter((fileId) => !files.some((file) => file.fileId.toLowerCase() === fileId));
-    throw new Error(`Attached files are still being verified and cannot be staged: ${missing.join(", ")}`);
+    return { files, pending: missing.map((fileId) => runtimeAttachmentName(snapshot, fileId) ?? fileId) };
+  }
+
+  /**
+   * Stages each current-turn attachment on its own, retrying a temporary
+   * failure once. Returns the attachments that could not be staged, so one
+   * failed download does not fail the whole request (H-077). A lost sandbox
+   * and cancellation still end preparation.
+   */
+  private async stageTurnInputFiles(
+    snapshot: DurableTurnSnapshot,
+    sandboxId: string,
+    files: readonly SandboxInputFile[],
+    signal?: AbortSignal,
+    reportProgress?: () => void,
+  ): Promise<Array<{ file: SandboxInputFile; reason: string }>> {
+    const failed: Array<{ file: SandboxInputFile; reason: string }> = [];
+    await mapWithConcurrency(files, 4, async (file) => {
+      try {
+        await this.#retryTransientPreparation(signal, () => this.stageInputFiles(
+          snapshot,
+          sandboxId,
+          this.repository,
+          new Set([file.fileId.toLowerCase()]),
+          signal,
+          reportProgress,
+          [file],
+        ));
+      } catch (error) {
+        if (signal?.aborted || error instanceof DurableTurnRetryableError || classifySandboxLifecycleFailure(error) === "missing") throw error;
+        failed.push({ file, reason: errorDetail(error) });
+      }
+    });
+    return failed;
+  }
+
+  /** Runs a preparation step once more after a temporary failure (H-077). */
+  async #retryTransientPreparation<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (signal?.aborted || !transientPreparationFailure(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, this.options.preparationRetryDelayMs ?? SANDBOX_RESUME_RETRY_DELAY_MS));
+      signal?.throwIfAborted();
+      return operation();
+    }
   }
 
   private async isInputFileStaged(
@@ -3877,6 +3945,21 @@ function runtimeAttachmentFileIds(snapshot: DurableTurnSnapshot): Set<string> {
     const fileId = value ? stringValue(value.fileId) : undefined;
     return fileId ? [fileId.toLowerCase()] : [];
   }));
+}
+
+function runtimeAttachmentName(snapshot: DurableTurnSnapshot, fileId: string): string | null {
+  const attachments = Array.isArray(snapshot.runtimeRequest.attachments) ? snapshot.runtimeRequest.attachments : [];
+  for (const attachment of attachments) {
+    const value = objectValue(attachment);
+    if (value && stringValue(value.fileId)?.toLowerCase() === fileId) return stringValue(value.name) ?? null;
+  }
+  return null;
+}
+
+/** A temporary failure worth one more attempt; a lost sandbox is recovered elsewhere. */
+function transientPreparationFailure(error: unknown): boolean {
+  if (classifySandboxLifecycleFailure(error) === "missing") return false;
+  return classifyToolFailure(error, { changesState: false }).category === "transient";
 }
 
 function expectedInputFilesAvailable(files: readonly SandboxInputFile[], expected: ReadonlySet<string>): boolean {

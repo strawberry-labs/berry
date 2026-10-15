@@ -55,7 +55,7 @@ const MISSING_PATTERN = /\benoent\b|no such file|\[not_found\]|\bnot found\b|doe
 // Checked before missing resources: these name an argument, not an absent target.
 const INVALID_SPECIFIC_PATTERN = /oldtext was not found|was not found in the file|must remain under|paths must contain/i;
 const INVALID_PATTERN = /\binvalid\b|\bmust\b|\brequired\b|\bexpected\b|\bschema\b|unsupported|not supported|malformed|cannot parse|syntaxerror|was not found in|exceeds|limited to|must remain under|\b(?:400|422)\b/i;
-const TRANSIENT_PATTERN = /timed out|timeout|econnreset|etimedout|socket hang up|temporar(?:y|ily)|try again later|rate limit|too many requests|proxy_unavailable|tunnel|sandbox is probably not running|sandbox was not found|service unavailable|bad gateway|\b50[234]\b|\b429\b/i;
+const TRANSIENT_PATTERN = /timed out|timeout|econnreset|connection reset|etimedout|socket hang up|temporar(?:y|ily)|try again later|rate limit|too many requests|proxy_unavailable|tunnel|sandbox is probably not running|sandbox was not found|service unavailable|bad gateway|\b50[234]\b|\b429\b/i;
 // Failures raised before a request was sent cannot have changed anything.
 const NOT_SENT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH"]);
 

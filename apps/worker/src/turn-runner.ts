@@ -3001,7 +3001,22 @@ export class DurableTurnRunner {
    * (the connector catalog) is fetched only when the turn context is written.
    */
   private async journalContext(snapshot: DurableTurnSnapshot): Promise<void> {
-    const entries = await pendingContextEntries(snapshot, () => this.tools.turnContext?.(snapshot) ?? "");
+    // Executor context is optional enrichment (the connector catalogue). If it
+    // cannot be prepared, the turn continues and says so (H-077); cancellation
+    // and the runner's own retry and stop decisions still apply.
+    const executorContext = async (): Promise<string> => {
+      try {
+        return await (this.tools.turnContext?.(snapshot) ?? "");
+      } catch (error) {
+        if (error instanceof DurableTurnCancellationError
+          || error instanceof DurableTurnRetryableError
+          || error instanceof DurableTurnTerminalError
+          || (error instanceof Error && error.name === "AbortError")) throw error;
+        const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300);
+        return `Some task context could not be prepared for this message (${detail}). Connectors or other optional capabilities may be missing; if the task needs them, say so rather than guessing.`;
+      }
+    };
+    const entries = await pendingContextEntries(snapshot, executorContext);
     if (entries.length === 0) return;
     await this.repository.commit(snapshot, {
       expectedState: "calling_model",
