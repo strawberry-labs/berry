@@ -79,6 +79,7 @@ import {
   emitWorkerOperationalEvent,
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
+import { classifyToolFailure, storedToolFailure, type ToolFailure } from "./tool-failures.js";
 
 const TERMINAL_STATES = new Set<TurnRunState>([
   "completed",
@@ -95,6 +96,7 @@ export type ToolRepeatPolicy =
 
 const TOOL_REPEAT_HISTORY_LIMIT = 32;
 const DUPLICATE_TOOL_CALL_SUPPRESSED = "duplicate_tool_call_suppressed";
+const UNCHANGED_RETRY_REFUSED = "unchanged_retry_refused";
 const DUPLICATE_TOOL_CALL_LOOP = "duplicate_tool_call_loop";
 
 export interface DurableTurnStep {
@@ -1474,6 +1476,8 @@ export class DurableTurnRunner {
         `${toolName} failed ${identicalFailureLimit} times with identical arguments and error. Berry stopped the task before attempt ${identicalFailureLimit + 1} to prevent an agent loop. Last error: ${repeatedFailure}`,
       );
     }
+    const unchangedRetry = step.state === "pending" ? unchangedFailedRetry(snapshot, step) : null;
+    if (unchangedRetry) return this.refuseUnchangedRetry(snapshot, step, unchangedRetry);
     const repeatAssessment = assessRepeatedToolCall(snapshot, step);
     const repeatGuardEnforced = this.toolRepeatGuardMode() === "enforce";
     if (!(step.state === "running" && step.retryClass === "non_idempotent_manual")) {
@@ -1795,6 +1799,11 @@ export class DurableTurnRunner {
       const sameErrorGuidance = sameError >= 3 && sameError > repairAttempt
         ? `; same error ${sameError} times in a row with changed arguments: check that the target exists and the input is valid, change approach, or tell the user what is blocking`
         : "";
+      // The class and recovery action travel with the step, independent of wording (H-003).
+      const failure = classifyToolFailure(error, {
+        changesState: step.retryClass === "non_idempotent_manual",
+        timedOut,
+      });
       const typedRepairMessage = `Tool failed (repair attempt ${repairAttempt}/${repairBudget}${sameErrorGuidance}). ${message}`;
       const entryId = randomUUID();
       const remaining = snapshot.steps.some((candidate) =>
@@ -1809,6 +1818,7 @@ export class DurableTurnRunner {
             ...step,
             state: "failed",
             error: typedRepairMessage,
+            output: { failure: toolFailureJson(failure) },
             repeatDecision: repeatAssessment.decision,
             repeatSignature: repeatAssessment.signature,
             repeatPolicy: repeatAssessment.policy,
@@ -1866,7 +1876,7 @@ export class DurableTurnRunner {
               role: "toolResult",
               toolCallId,
               toolName,
-              content: [{ type: "text", text: typedRepairMessage }],
+              content: [{ type: "text", text: `${typedRepairMessage}\n${toolFailureNote(failure)}` }],
               isError: true,
               timestamp: Date.now(),
             },
@@ -2033,10 +2043,20 @@ export class DurableTurnRunner {
       return this.terminateForDuplicateToolLoop(snapshot, terminating, repeatAssessments.get(terminating.id)!);
     }
     const executableSteps: DurableTurnStep[] = [];
-    const suppressedSteps: Array<{ step: DurableTurnStep; assessment: ToolRepeatAssessment; batchDuplicate: boolean }> = [];
+    const suppressedSteps: Array<{
+      step: DurableTurnStep;
+      assessment: ToolRepeatAssessment;
+      batchDuplicate: boolean;
+      refusal?: UnchangedFailedRetry;
+    }> = [];
     const seenBatchSignatures = new Set<string>();
     for (const step of steps) {
       const assessment = repeatAssessments.get(step.id)!;
+      const refusal = step.state === "pending" ? unchangedFailedRetry(snapshot, step) : null;
+      if (refusal) {
+        suppressedSteps.push({ step, assessment, batchDuplicate: false, refusal });
+        continue;
+      }
       const batchDuplicate = seenBatchSignatures.has(assessment.signature);
       if (guardEnforced && (assessment.decision === "suppress" || batchDuplicate)) {
         suppressedSteps.push({ step, assessment, batchDuplicate });
@@ -2108,13 +2128,16 @@ export class DurableTurnRunner {
     const noProgressWarningThreshold = Math.max(1, this.options.noProgressWarningThreshold ?? DEFAULT_NO_PROGRESS_WARNING_THRESHOLD);
     const noProgressHardThreshold = Math.max(noProgressWarningThreshold + 1, this.options.noProgressHardThreshold ?? DEFAULT_NO_PROGRESS_HARD_THRESHOLD);
     for (const suppressed of suppressedSteps) {
-      const { step, assessment, batchDuplicate } = suppressed;
+      const { step, assessment, batchDuplicate, refusal } = suppressed;
       const entryId = randomUUID();
-      const message = batchDuplicate
+      const message = refusal
+        ? unchangedRetryMessage(refusal)
+        : batchDuplicate
         ? "Duplicate tool call suppressed because the same tool and input was already scheduled in this tool batch."
         : assessment.policy === "block_after_success"
           ? "Duplicate tool call suppressed because this external operation already completed successfully once."
           : "Duplicate tool call suppressed because this tool and input already completed successfully with no new result.";
+      const summary = refusal ? UNCHANGED_RETRY_REFUSED : "Duplicate tool call suppressed.";
       batchProgress = nextProgress({ ...snapshot, progress: batchProgress }, {
         kind: "result_repeated",
         noProgress: true,
@@ -2122,7 +2145,8 @@ export class DurableTurnRunner {
       mutations.push({
         ...step,
         state: "failed",
-        error: DUPLICATE_TOOL_CALL_SUPPRESSED,
+        error: refusal ? message : DUPLICATE_TOOL_CALL_SUPPRESSED,
+        ...(refusal ? { output: { failure: { ...toolFailureJson(refusal.failure), refusedUnchangedRetry: true } } } : {}),
         repeatDecision: "suppress",
         repeatSignature: assessment.signature,
         repeatPolicy: assessment.policy,
@@ -2132,7 +2156,7 @@ export class DurableTurnRunner {
           kind: "tool.end",
           toolCallId: toolCallIdForStep(step),
           status: "failed",
-          summary: "Duplicate tool call suppressed.",
+          summary,
         },
         {
           kind: "turn.progress",
@@ -2147,8 +2171,8 @@ export class DurableTurnRunner {
         name: toolNameForStep(step),
         input: (step.input.arguments ?? {}) as JsonValue,
         status: "failed",
-        output: { error: DUPLICATE_TOOL_CALL_SUPPRESSED, message },
-        summary: "Duplicate tool call suppressed.",
+        output: { error: refusal ? UNCHANGED_RETRY_REFUSED : DUPLICATE_TOOL_CALL_SUPPRESSED, message },
+        summary,
       });
       entries.push({
         entryId,
@@ -2268,11 +2292,13 @@ export class DurableTurnRunner {
         ? outcome.reason.usage
         : undefined;
       const message = (outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)).slice(0, 4_000).replace(/\u0000/g, "\uFFFD");
+      const failure = classifyToolFailure(outcome.reason, { changesState: false, timedOut: outcome.reason instanceof DurableToolTimeoutError });
       const repeatGuardAssessment = repeatAssessments.get(step.id)!;
       mutations.push({
         ...step,
         state: "failed",
         error: message,
+        output: { failure: toolFailureJson(failure) },
         repeatDecision: repeatGuardAssessment.decision,
         repeatSignature: repeatGuardAssessment.signature,
         repeatPolicy: repeatGuardAssessment.policy,
@@ -2312,7 +2338,7 @@ export class DurableTurnRunner {
             role: "toolResult",
             toolCallId,
             toolName,
-            content: [{ type: "text", text: `Tool failed: ${message}` }],
+            content: [{ type: "text", text: `Tool failed: ${message}\n${toolFailureNote(failure)}` }],
             isError: true,
             timestamp: Date.now(),
           },
@@ -2469,6 +2495,85 @@ export class DurableTurnRunner {
       nextAction: remaining
         ? "Execute the next tool step after suppressing the duplicate tool call"
         : "Give the model one correction turn after suppressing the duplicate tool call",
+    });
+    return nextState;
+  }
+
+  /** Fails a repeat of an unfixable failure without executing it (H-003). */
+  private async refuseUnchangedRetry(
+    snapshot: DurableTurnSnapshot,
+    step: DurableTurnStep,
+    retry: UnchangedFailedRetry,
+  ): Promise<TurnRunState> {
+    const toolCallId = toolCallIdForStep(step);
+    const toolName = toolNameForStep(step);
+    const entryId = randomUUID();
+    const iteration = modelIteration(snapshot.steps) + 1;
+    const message = unchangedRetryMessage(retry);
+    const progress = nextProgress(snapshot, { kind: "result_repeated", noProgress: true });
+    const remaining = snapshot.steps.some((candidate) => candidate.id !== step.id && isRunnableToolStep(candidate));
+    const nextState: TurnRunState = remaining ? "executing_tool" : "calling_model";
+    await this.commitAndWake(snapshot, {
+      expectedState: "executing_tool",
+      nextState,
+      steps: [
+        {
+          ...step,
+          state: "failed",
+          error: message,
+          output: { failure: { ...toolFailureJson(retry.failure), refusedUnchangedRetry: true, previousError: retry.previousError } },
+        },
+        ...(!remaining ? [{
+          id: randomUUID(),
+          sequence: nextStepSequence(snapshot.steps),
+          type: "model.call" as const,
+          state: "pending" as const,
+          input: { iteration },
+          retryClass: "idempotent_with_key" as const,
+          idempotencyKey: `${snapshot.id}:model:${iteration}`,
+        }] : []),
+      ],
+      events: [
+        { kind: "tool.end", toolCallId, status: "failed", summary: "Unchanged retry of a failed call was not run." },
+        {
+          kind: "turn.progress",
+          progressKind: "result_repeated",
+          progressEpoch: progress.progressEpoch,
+          consecutiveNoProgress: progress.consecutiveNoProgress,
+        },
+      ],
+      toolResultMessage: {
+        id: entryId,
+        toolCallId,
+        name: toolName,
+        input: (step.input.arguments ?? {}) as JsonValue,
+        status: "failed",
+        output: { error: UNCHANGED_RETRY_REFUSED, message },
+        summary: "Unchanged retry of a failed call was not run.",
+      },
+      entries: [{
+        entryId,
+        entryType: "message",
+        stepId: step.id,
+        payload: {
+          type: "message",
+          id: entryId,
+          parentId: snapshot.entries.at(-1)?.entryId ?? null,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "toolResult",
+            toolCallId,
+            toolName,
+            content: [{ type: "text", text: message }],
+            isError: true,
+            timestamp: Date.now(),
+          },
+        },
+      }],
+      progress,
+      nextAction: remaining
+        ? "Execute the next tool step after refusing an unchanged retry"
+        : "Let the model act on the refused unchanged retry",
     });
     return nextState;
   }
@@ -4699,6 +4804,72 @@ function maskedFailure(value: unknown): string {
 }
 
 /** Consecutive failures of this tool, including `message`, with the same masked error. */
+interface UnchangedFailedRetry {
+  previous: DurableTurnStep;
+  failure: ToolFailure;
+  previousError: string;
+}
+
+function toolFailureJson(failure: ToolFailure): Record<string, JsonValue> {
+  return { ...failure };
+}
+
+function toolFailureNote(failure: ToolFailure): string {
+  return `Failure class: ${failure.category}. ${failure.action}`;
+}
+
+/**
+ * The latest identical earlier call (same tool, same arguments up to path
+ * spelling) when it failed in a way an unchanged repeat cannot fix (H-003).
+ * Credentials, configuration and credit need a person; invalid input and
+ * missing resources need a change-making step in between; a call with an
+ * unknown outcome must be checked by some other step before it is repeated.
+ * Transient and unclassified failures keep the bounded repeat limit.
+ */
+function unchangedFailedRetry(snapshot: DurableTurnSnapshot, step: DurableTurnStep): UnchangedFailedRetry | null {
+  const fingerprint = failureArgumentFingerprint(snapshot, step);
+  const previous = snapshot.steps
+    .filter((candidate) => candidate.sequence < step.sequence
+      && candidate.type === step.type
+      && failureArgumentFingerprint(snapshot, candidate) === fingerprint)
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  if (!previous || previous.state !== "failed") return null;
+  const failure = storedToolFailure(previous.output);
+  if (!failure) return null;
+  const stored = record(record(previous.output)?.failure);
+  const previousError = stringValue(stored?.previousError)
+    ?? toolFailureIdentity(previous.error).split("\n")[0]?.slice(0, 500)
+    ?? "";
+  const ranBetween = snapshot.steps.filter((candidate) => candidate.sequence > previous.sequence
+    && candidate.sequence < step.sequence
+    && candidate.type.startsWith("tool.")
+    && (candidate.state === "completed" || (candidate.state === "failed"
+      && candidate.error !== DUPLICATE_TOOL_CALL_SUPPRESSED
+      && record(record(candidate.output)?.failure)?.refusedUnchangedRetry !== true)));
+  const refusal = { previous, failure, previousError };
+  switch (failure.category) {
+    case "credentials":
+    case "configuration":
+    case "credit_exhausted":
+      return refusal;
+    case "invalid_input":
+    case "missing_resource":
+      return ranBetween.some((candidate) => candidate.retryClass !== "read_only") ? null : refusal;
+    case "unknown_outcome":
+      return ranBetween.length > 0 ? null : refusal;
+    default:
+      return null;
+  }
+}
+
+function unchangedRetryMessage(retry: UnchangedFailedRetry): string {
+  return [
+    "Not run: this exact call already failed in this task, and nothing since could make it succeed.",
+    `Previous error: ${retry.previousError}`,
+    toolFailureNote(retry.failure),
+  ].join("\n");
+}
+
 function sameErrorRun(snapshot: DurableTurnSnapshot, step: DurableTurnStep, message: string): number {
   const masked = maskedFailure(message);
   const preceding = snapshot.steps

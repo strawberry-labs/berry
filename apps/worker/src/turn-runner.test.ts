@@ -2152,6 +2152,165 @@ describe("durable turn runner", () => {
     expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
   });
 
+  describe("typed tool failures (H-003, H-006)", () => {
+    type ScriptedCall = { name: string; args: Record<string, unknown>; retryClass?: "read_only" | "idempotent" | "non_idempotent_manual" };
+    // Each entry is one model turn issuing one or more tool calls; the tool
+    // executor decides per call whether it fails.
+    async function driveCalls(turns: ScriptedCall[][], execute: (call: { name: string; args: Record<string, unknown> }) => unknown) {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      let modelCalls = 0;
+      const executed: Array<{ name: string; args: Record<string, unknown> }> = [];
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => {
+          const turn = turns[modelCalls];
+          modelCalls += 1;
+          if (!turn) return { text: "Done.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+          return {
+            text: "",
+            inputTokens: 1,
+            outputTokens: 1,
+            toolCalls: turn.map((call, index) => ({
+              id: `call-${modelCalls}-${index}`,
+              name: call.name,
+              input: call.args as never,
+              retryClass: call.retryClass ?? "read_only",
+              repeatPolicy: call.retryClass === "non_idempotent_manual" ? "block_after_success" as const : "compare_result" as const,
+              idempotencyKey: null,
+              requiresApproval: false,
+              approvalKind: call.name.startsWith("mcp__") ? "mcp" as const : "file-edit" as const,
+            })),
+          };
+        },
+      }, {
+        execute: async (_snapshot, step) => {
+          const call = { name: String(step.input.toolName), args: (step.input.arguments ?? {}) as Record<string, unknown> };
+          executed.push(call);
+          return { output: (await execute(call)) as never ?? { ok: true }, summary: "ok" };
+        },
+      });
+      let state: string = "calling_model";
+      for (let turn = 0; turn < turns.length * 4 + 4 && (state === "calling_model" || state === "executing_tool"); turn += 1) {
+        state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
+      }
+      const toolSteps = repository.current.steps.filter((step) => step.type.startsWith("tool."));
+      const failure = (index: number) => (toolSteps[index]?.output as { failure?: Record<string, unknown> } | null)?.failure;
+      // What the model reads back for each tool step.
+      const modelText = (index: number) => {
+        const entry = repository.mutations.flatMap((mutation) => mutation.entries ?? [])
+          .find((candidate) => (candidate as { stepId?: string }).stepId === toolSteps[index]?.id);
+        const content = ((entry?.payload as { message?: { content?: Array<{ text?: string }> } } | undefined)?.message?.content ?? []);
+        return content.map((part) => part.text ?? "").join("\n");
+      };
+      return { state, executed, toolSteps, failure, modelText };
+    }
+    const countOf = (executed: Array<{ name: string }>, name: string) => executed.filter((call) => call.name === name).length;
+
+    it("refuses an unchanged repeat of an invalid-input failure and runs the corrected call", async () => {
+      const bad = { name: "read", args: { path: "notes.md", offset: -1 } };
+      const result = await driveCalls([[bad], [bad], [{ name: "read", args: { path: "notes.md", offset: 0 } }]], ({ args }) => {
+        if (Number(args.offset) < 0) throw new Error("offset must be a non-negative integer");
+        return { content: "notes" };
+      });
+
+      expect(countOf(result.executed, "read")).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "invalid_input", deterministic: true });
+      expect(result.modelText(0)).toContain("Failure class: invalid_input");
+      expect(String(result.toolSteps[0]?.error)).not.toContain("Failure class");
+      expect(result.toolSteps[1]?.state).toBe("failed");
+      expect(result.failure(1)).toMatchObject({ category: "invalid_input", refusedUnchangedRetry: true, previousError: "offset must be a non-negative integer" });
+      expect(result.modelText(1)).toContain("Not run: this exact call already failed");
+      expect(result.toolSteps[2]?.state).toBe("completed");
+    });
+
+    it("re-runs a missing-resource call only after a change-making step", async () => {
+      let built = false;
+      const read = { name: "read", args: { path: "out/report.md" } };
+      const result = await driveCalls([
+        [read],
+        [{ name: "ls", args: { path: "out" } }],
+        [read],
+        [{ name: "bash", args: { command: "make report" }, retryClass: "idempotent" }],
+        [read],
+      ], ({ name }) => {
+        if (name === "bash") built = true;
+        if (name === "read" && !built) throw new Error("ENOENT: no such file or directory, open '/workspace/out/report.md'");
+        return { content: "ok" };
+      });
+
+      expect(countOf(result.executed, "read")).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "missing_resource" });
+      expect(result.failure(2)).toMatchObject({ refusedUnchangedRetry: true });
+      expect(result.toolSteps[4]?.state).toBe("completed");
+    });
+
+    it("keeps refusing a credential failure for the rest of the run", async () => {
+      const drive = { name: "mcp__Google_Workspace__drive_read_file", args: { fileId: "drive-1" } };
+      const result = await driveCalls([[drive], [{ name: "bash", args: { command: "echo hi" }, retryClass: "idempotent" }], [drive]], ({ name }) => {
+        if (name === drive.name) throw new Error("Connector token is invalid or expired");
+        return { ok: true };
+      });
+
+      expect(countOf(result.executed, drive.name)).toBe(1);
+      expect(result.failure(0)).toMatchObject({ category: "credentials" });
+      expect(String(result.failure(0)?.action)).toContain("Settings → Connectors");
+      expect(result.failure(2)).toMatchObject({ category: "credentials", refusedUnchangedRetry: true });
+    });
+
+    it("lets a transient read failure be retried within the existing limit", async () => {
+      let attempts = 0;
+      const read = { name: "read", args: { path: "remote.csv" } };
+      const result = await driveCalls([[read], [read]], () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("socket hang up");
+        return { content: "a,b" };
+      });
+
+      expect(countOf(result.executed, "read")).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "transient", deterministic: false });
+      expect(result.toolSteps[1]?.state).toBe("completed");
+    });
+
+    it("marks an interrupted change-making call as an unknown outcome and never replays it unchecked", async () => {
+      const create = { name: "mcp__Connect_Aesg_MCP__create_record", args: { title: "Tender A" }, retryClass: "non_idempotent_manual" as const };
+      let creates = 0;
+      const result = await driveCalls([
+        [create],
+        [create],
+        [{ name: "mcp__Connect_Aesg_MCP__list_records", args: { title: "Tender A" } }],
+        [create],
+      ], ({ name }) => {
+        if (name === create.name) {
+          creates += 1;
+          if (creates === 1) throw new Error("socket hang up");
+        }
+        return { ok: true };
+      });
+
+      expect(countOf(result.executed, create.name)).toBe(2);
+      expect(result.failure(0)).toMatchObject({ category: "unknown_outcome", outcome: "unknown" });
+      expect(result.modelText(0)).toContain("may already have taken effect");
+      expect(result.failure(1)).toMatchObject({ category: "unknown_outcome", refusedUnchangedRetry: true });
+      expect(result.toolSteps[3]?.state).toBe("completed");
+    });
+
+    it("refuses an unchanged deterministic repeat inside a parallel read batch", async () => {
+      const missing = { name: "read", args: { path: "missing.md" } };
+      const result = await driveCalls([
+        [missing, { name: "read", args: { path: "present.md" } }],
+        [missing, { name: "read", args: { path: "other.md" } }],
+      ], ({ args }) => {
+        if (args.path === "missing.md") throw new Error("[not_found] file not found: lstat /workspace/missing.md no such file or directory");
+        return { content: String(args.path) };
+      });
+
+      expect(result.executed.filter((call) => call.args.path === "missing.md")).toHaveLength(1);
+      expect(result.executed.some((call) => call.args.path === "other.md")).toBe(true);
+      const refused = result.toolSteps.filter((step) => (step.output as { failure?: { refusedUnchangedRetry?: boolean } } | null)?.failure?.refusedUnchangedRetry);
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.input.arguments).toEqual({ path: "missing.md" });
+    });
+  });
+
   describe("repair loops across changed arguments (H-004)", () => {
     // A scripted model keeps calling read with a new path each turn; the tool
     // fails every time, naming the path it was given.
@@ -2195,7 +2354,7 @@ describe("durable turn runner", () => {
     }
     const missing = (path: string) => `ENOENT: no such file or directory, open '${path}'`;
 
-    it("treats re-spelt paths to the same file as the same call and stops the loop", async () => {
+    it("treats re-spelt paths to the same file as the same call and stops the loop (H-003 refuses them unrun)", async () => {
       const spellings = [
         "outputs/Q3-report.docx",
         "./outputs/Q3-report.docx",
@@ -2206,10 +2365,16 @@ describe("durable turn runner", () => {
       ];
       const result = await driveFailingRead((attempt) => spellings[(attempt - 1) % spellings.length]!, missing, 12);
 
-      expect(result.executed).toHaveLength(5);
+      // The first spelling runs and fails as a missing resource; every re-spelling
+      // is refused without running, and the identical refusals end the run.
+      expect(result.executed).toHaveLength(1);
       expect(result.state).toBe("failed");
       expect(result.error).toContain("failed 5 times with identical arguments and error");
-      expect(result.failures.slice(0, 5).map((failure) => /repair attempt (\d)\/5/.exec(failure)?.[1])).toEqual(["1", "2", "3", "4", "5"]);
+      expect(result.failures[0]).toMatch(/repair attempt 1\/5/);
+      const refused = result.failures.slice(1, -1);
+      expect(refused).toHaveLength(5);
+      expect(refused.every((failure) => failure.startsWith("Not run: this exact call already failed"))).toBe(true);
+      expect(result.failures.at(-1)).toContain("Berry stopped the task before attempt 6");
     });
 
     it("tells the model when different arguments keep producing the same error", async () => {

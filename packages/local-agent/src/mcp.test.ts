@@ -41,6 +41,19 @@ describe("McpToolSource", () => {
     await source.close();
   });
 
+  it("keeps an error result's structured content on the thrown error", async () => {
+    const source = new McpToolSource({ servers: [stdioServer()] });
+    await source.connect();
+    const fail = source.listTools().find((tool) => tool.name === "mcp__echo__fail")!;
+
+    await expect(fail.execute("call_3", {} as never, undefined, undefined)).rejects.toMatchObject({
+      name: "McpToolError",
+      message: "intentional failure",
+      structuredContent: { error: { code: "INTENTIONAL_FAILURE", status: 409 } },
+    });
+    await source.close();
+  });
+
   it("lazily discovers tools for an authorized server without cached schemas", async () => {
     const source = new McpToolSource({ servers: [stdioServer()] });
 

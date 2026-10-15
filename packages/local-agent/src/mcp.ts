@@ -279,6 +279,21 @@ function canonicalJson(value: unknown): string {
 }
 
 /** Connects MCP servers independently. Cached schemas are usable immediately; live startup never needs to block turn creation. */
+/**
+ * An MCP tool returned an error result. The structured content (error codes,
+ * statuses, diagnostics) stays attached so callers can classify the failure
+ * without parsing its text.
+ */
+export class McpToolError extends Error {
+  readonly structuredContent: unknown;
+
+  constructor(message: string, structuredContent: unknown) {
+    super(message);
+    this.name = "McpToolError";
+    this.structuredContent = structuredContent;
+  }
+}
+
 export class McpToolSource {
   readonly #options: McpToolSourceOptions;
   readonly #servers = new Map<string, ConnectedServer>();
@@ -411,9 +426,10 @@ export class McpToolSource {
       signal ? { signal } : undefined,
     );
     if (result.isError) {
-      const failure = contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
+      const structuredContent = (result as { structuredContent?: unknown }).structuredContent;
+      const failure = contentToToolResult(result.content, structuredContent);
       const text = failure.content[0];
-      throw new Error(text && text.type === "text" ? text.text : "MCP tool failed");
+      throw new McpToolError(text && text.type === "text" ? text.text : "MCP tool failed", structuredContent);
     }
     return contentToToolResult(result.content, (result as { structuredContent?: unknown }).structuredContent);
   }
