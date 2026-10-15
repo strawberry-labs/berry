@@ -1233,11 +1233,15 @@ describe("durable turn runner", () => {
       abortCleanupTimeoutMs: 10,
     });
 
+    // Both reads time out: they are reported to the model, not retried as a batch (H-078).
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .rejects.toThrow("Parallel read-only tool batch stalled");
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(aborted).toBe(2);
     expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")))
-      .toEqual([expect.objectContaining({ id: first.id, state: "running" }), expect.objectContaining({ id: second.id, state: "running" })]);
+      .toEqual([
+        expect.objectContaining({ id: first.id, state: "failed", timedOut: true, error: expect.stringContaining("Parallel read-only tool batch stalled") }),
+        expect.objectContaining({ id: second.id, state: "failed", timedOut: true }),
+      ]);
   });
 
   it("does not abort a parallel read-only batch when one step lacks support", async () => {
@@ -1258,9 +1262,12 @@ describe("durable turn runner", () => {
       abortCleanupTimeoutMs: 10,
     });
 
+    // Not aborted: the batch waits for both reads, which settle after the
+    // deadline and are therefore reported as timed out (H-078).
     await expect(runner.execute({ tenantId, runId, reason: "continue" }))
-      .rejects.toThrow("Parallel read-only tool batch stalled");
+      .resolves.toMatchObject({ state: "calling_model" });
     expect(aborted).toBe(false);
+    expect(repository.current.steps.filter((step) => step.type.startsWith("tool.")).every((step) => step.state === "failed" && step.timedOut)).toBe(true);
   });
 
   it("cancels a read-only adapter that observes its signal", async () => {
@@ -2630,6 +2637,111 @@ describe("durable turn runner", () => {
 
       await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
       expect(repository.current.steps.find((step) => step.type === "turn.finalize")?.output).toEqual({ completed: true });
+    });
+  });
+
+  describe("parallel read deadline (H-078)", () => {
+    const job = () => ({ tenantId, runId, reason: "continue" as const });
+    const fastAndSlow = () => {
+      const fast = readOnlyToolStep("read", 1, "/workspace/fast.txt");
+      const slow = readOnlyToolStep("read", 2, "/workspace/slow.txt");
+      return { fast, slow, repository: new FakeTurnRepository(snapshot("executing_tool", [admittedStep(), fast, slow])) };
+    };
+    const reads = () => {
+      const executed: string[] = [];
+      return {
+        executed,
+        execute: async (_snapshot: DurableTurnSnapshot, step: DurableTurnStep) => {
+          const path = String((step.input.arguments as { path: string }).path);
+          executed.push(path);
+          if (path.endsWith("slow.txt")) await new Promise((resolve) => setTimeout(resolve, 40));
+          return { output: { text: path.endsWith("fast.txt") ? "preserve fast result" : "late slow result" }, summary: "read" };
+        },
+      };
+    };
+
+    it("keeps the read that finished in time and reports the slow one as timed out", async () => {
+      const { fast, slow, repository } = fastAndSlow();
+      const tools = reads();
+      const runner = new DurableTurnRunner(repository, unusedModel(), tools, { toolIdleTimeoutMs: 5, toolMaxDurationMs: 10 });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(tools.executed).toEqual(["/workspace/fast.txt", "/workspace/slow.txt"]);
+      expect(repository.current.steps.find((step) => step.id === fast.id)).toMatchObject({ state: "completed", output: { text: "preserve fast result" } });
+      expect(repository.current.steps.find((step) => step.id === slow.id)).toMatchObject({ state: "failed", timedOut: true, outcomeCertainty: "known" });
+      const journal = JSON.stringify(repository.current.entries);
+      expect(journal.split("preserve fast result")).toHaveLength(2);
+      expect(journal).not.toContain("late slow result");
+      expect(repository.events).toContainEqual(expect.objectContaining({ kind: "phase.deadline_exceeded", phase: "tool" }));
+      expect(repository.mutations.filter((mutation) => mutation.toolResultMessages?.length)).toHaveLength(1);
+    });
+
+    it("still records one success and one ordinary failure without a deadline", async () => {
+      const { fast, slow, repository } = fastAndSlow();
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        execute: async (_snapshot, step) => {
+          if (step.id === slow.id) throw new Error("File not found: /workspace/slow.txt");
+          return { output: { text: "ok" }, summary: "read" };
+        },
+      });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.current.steps.find((step) => step.id === fast.id)?.state).toBe("completed");
+      expect(repository.current.steps.find((step) => step.id === slow.id)).toMatchObject({ state: "failed", timedOut: false });
+    });
+
+    it("keeps a fast read and times out an abort-aware read that does not stop in time", async () => {
+      const { fast, slow, repository } = fastAndSlow();
+      let lateSettled = false;
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        supportsAbort: () => true,
+        execute: async (_snapshot, step) => {
+          if (step.id === fast.id) return { output: { text: "preserve fast result" }, summary: "read" };
+          // Ignores the abort and settles only after cleanup gave up waiting.
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          lateSettled = true;
+          return { output: { text: "late slow result" }, summary: "read" };
+        },
+      }, { toolIdleTimeoutMs: 5, toolMaxDurationMs: 10, abortCleanupTimeoutMs: 5 });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      const commits = repository.mutations.length;
+      expect(repository.current.steps.find((step) => step.id === slow.id)).toMatchObject({ state: "failed", timedOut: true, abortAcknowledged: false });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(lateSettled).toBe(true);
+      expect(repository.mutations).toHaveLength(commits);
+      expect(JSON.stringify(repository.current.entries)).not.toContain("late slow result");
+    });
+
+    it("saves nothing when ownership is lost before the deadline", async () => {
+      const { repository } = fastAndSlow();
+      repository.heartbeat = async () => false;
+      const runner = new DurableTurnRunner(repository, unusedModel(), reads(), { toolIdleTimeoutMs: 5, toolMaxDurationMs: 20, heartbeatMs: 1 });
+
+      await expect(runner.execute(job())).rejects.toBeInstanceOf(DurableToolTimeoutError);
+      expect(repository.mutations.some((mutation) => mutation.toolResultMessages?.length)).toBe(false);
+      expect(JSON.stringify(repository.current.entries)).not.toContain("preserve fast result");
+    });
+
+    it("keeps a user cancellation during the batch a cancellation", async () => {
+      const { repository } = fastAndSlow();
+      const cancellations = new ActiveTurnCancellationRegistry();
+      let started!: () => void;
+      const slowStarted = new Promise<void>((resolve) => { started = resolve; });
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        supportsAbort: () => true,
+        execute: async (_snapshot, step, signal) => {
+          if (String((step.input.arguments as { path: string }).path).endsWith("fast.txt")) return { output: { text: "preserve fast result" }, summary: "read" };
+          started();
+          return new Promise<never>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        },
+      }, { cancellations, toolIdleTimeoutMs: 1_000, toolMaxDurationMs: 1_000 });
+
+      const execution = runner.execute(job());
+      await slowStarted;
+      cancellations.cancel(runId);
+      await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+      expect(JSON.stringify(repository.current.entries)).not.toContain("preserve fast result");
     });
   });
 

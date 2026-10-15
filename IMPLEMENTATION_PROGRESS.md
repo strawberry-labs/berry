@@ -96,7 +96,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 | `095530e` | H-077 | None. Preparation behaviour only; no schema or stored-data change. |
-| (this commit) | H-014 | None. Reuses the artifact-operation and finalization records (`partial` status already exists). |
+| `be1e488` | H-014 | None. Reuses the artifact-operation and finalization records (`partial` status already exists). |
+| (this commit) | H-078 | None. |
 
 ## Status legend
 
@@ -2311,3 +2312,24 @@ AESG packages.
 - **Data impact.** None.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** The web UI shows unpublished files as failed `persist_artifact` results; there is no dedicated "retry publication" button. A retry happens through a follow-up turn, whose scan publishes only what is still unpublished, or through the terminal finalizer.
+
+### H-078 — A parallel-read deadline discards completed peer results
+
+- **Revalidation (15 October, after `be1e488`).** Still present: with one fast and one slow read, the batch deadline threw `DurableToolTimeoutError` from `withHeartbeat` before the settled results were journaled, so both steps stayed `running` and the whole batch was released for retry.
+- **Fix** (`turn-runner.ts`):
+  - `executeParallelReadOnlyTools` records each read's outcome and settle time.
+  - `withHeartbeat` gains an `onInterrupt` hook that reports a deadline, lost ownership or a user cancellation.
+  - On a pure timeout of a read-only batch, reads settled before the deadline are kept. The rest (unfinished, settled late, or rejected by the abort) become timed-out failed results, through the existing per-step loop: one receipt per read, usage counted once, and a `phase.deadline_exceeded` event, as for a single-tool timeout. The model call follows.
+  - Lost ownership or cancellation rethrows as before, so nothing is saved after ownership is gone.
+  - Non-abort-aware reads are still awaited before the batch returns, unchanged.
+- **Tests.** Five cases in `turn-runner.test.ts` ("parallel read deadline (H-078)"):
+  - fast plus slow read: one preserved success, one timed-out failure, each executed once, one commit;
+  - success plus ordinary failure;
+  - an abort-aware read that ignores the abort settles after cleanup, adding no later commit or content;
+  - ownership lost: rejects and saves nothing;
+  - cancellation during the batch stays a cancellation.
+
+  The two behaviour cases fail on the previous source; the three controls pass on both. Two existing tests about abort support now expect timed-out failed results instead of a whole-batch retry; their abort assertions are unchanged. Worker suite: 637 passed, 3 skipped.
+- **Data impact.** None.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** A read that finishes after the deadline is reported as timed out even when its result arrived before the batch returned, consistent with the single-tool timeout; the model can read it again.

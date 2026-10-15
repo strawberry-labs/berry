@@ -2186,22 +2186,56 @@ export class DurableTurnRunner {
 
     const startedAt = batchStartedAt;
     const entryIds = executableSteps.map(() => randomUUID());
-    const settled = await this.withHeartbeat(
-      snapshot,
-      ({ signal, reportProgress }) => Promise.allSettled(
-        executableSteps.map((step) => this.tools.execute(snapshot, step, signal, reportProgress)),
-      ),
-      {
-        label: "Parallel read-only tool batch",
-        abortable: executableSteps.every((step) =>
-          step.retryClass === "read_only"
-          && this.tools.supportsAbort?.(snapshot, step) === true
+    // Each read's outcome is kept as it settles, so a batch deadline keeps the
+    // reads that finished in time and reports only the others as timed out
+    // (H-078). Ownership loss and cancellation still end the batch unsaved.
+    const outcomes: Array<{ outcome: PromiseSettledResult<TurnToolResult>; at: number } | undefined> = executableSteps.map(() => undefined);
+    let timedOutAt: number | null = null;
+    let interrupted = false;
+    let settled: PromiseSettledResult<TurnToolResult>[];
+    try {
+      settled = await this.withHeartbeat(
+        snapshot,
+        ({ signal, reportProgress }) => Promise.allSettled(
+          executableSteps.map((step, index) => this.tools.execute(snapshot, step, signal, reportProgress).then(
+            (value) => {
+              outcomes[index] = { outcome: { status: "fulfilled", value }, at: Date.now() };
+              return value;
+            },
+            (reason: unknown) => {
+              outcomes[index] = { outcome: { status: "rejected", reason }, at: Date.now() };
+              throw reason;
+            },
+          )),
         ),
-        operation: "tool",
-        idleTimeoutMs: toolLimits.idleTimeoutMs,
-        maxDurationMs: toolLimits.maxDurationMs,
-      },
-    );
+        {
+          label: "Parallel read-only tool batch",
+          abortable: executableSteps.every((step) =>
+            step.retryClass === "read_only"
+            && this.tools.supportsAbort?.(snapshot, step) === true
+          ),
+          operation: "tool",
+          idleTimeoutMs: toolLimits.idleTimeoutMs,
+          maxDurationMs: toolLimits.maxDurationMs,
+          onInterrupt: (cause) => {
+            if (cause === "timeout") timedOutAt ??= Date.now();
+            else interrupted = true;
+          },
+        },
+      );
+    } catch (error) {
+      const deadline = timedOutAt;
+      if (!(error instanceof DurableToolTimeoutError) || interrupted || deadline === null
+        || !executableSteps.every((step) => step.retryClass === "read_only")) throw error;
+      settled = outcomes.map((recorded) => {
+        const aborted = recorded?.outcome.status === "rejected"
+          && (recorded.outcome.reason instanceof DurableToolTimeoutError
+            || (recorded.outcome.reason instanceof Error && recorded.outcome.reason.name === "AbortError"));
+        return recorded && recorded.at <= deadline && !aborted
+          ? recorded.outcome
+          : { status: "rejected", reason: error };
+      });
+    }
     const cancellation = settled.find((outcome): outcome is PromiseRejectedResult =>
       outcome.status === "rejected" && outcome.reason instanceof DurableTurnCancellationError
     );
@@ -2387,6 +2421,11 @@ export class DurableTurnRunner {
         ...step,
         state: "failed",
         error: message,
+        ...(outcome.reason instanceof DurableToolTimeoutError ? {
+          timedOut: true,
+          outcomeCertainty: "known" as const,
+          abortAcknowledged: outcome.reason.abortAcknowledged,
+        } : {}),
         output: { failure: toolFailureJson(failure) },
         repeatDecision: repeatGuardAssessment.decision,
         repeatSignature: repeatGuardAssessment.signature,
@@ -2398,6 +2437,9 @@ export class DurableTurnRunner {
         status: "failed",
         summary: message.slice(0, 2_000),
       });
+      if (outcome.reason instanceof DurableToolTimeoutError) {
+        events.push({ kind: "phase.deadline_exceeded", phase: "tool", deadlineKind: outcome.reason.phase });
+      }
       if (failureUsage) events.push(AgentStreamEventSchema.parse(failureUsage));
       batchProgress = nextProgress({ ...snapshot, progress: batchProgress }, {
         kind: "repair_budget",
@@ -3187,6 +3229,8 @@ export class DurableTurnRunner {
       idleTimeoutMs?: number;
       maxDurationMs?: number;
       operation?: "tool" | "model" | "model_preparation" | "compaction" | "finalization" | "generic";
+      /** Told when a deadline passes, ownership is lost or the user cancels, in that order of occurrence. */
+      onInterrupt?: (cause: "timeout" | "ownership" | "cancelled") => void;
     } = {},
   ): Promise<T> {
     const leaseSeconds = this.options.leaseSeconds ?? 90;
@@ -3209,6 +3253,7 @@ export class DurableTurnRunner {
           "idle",
           limits.operation ?? "generic",
         );
+        limits.onInterrupt?.("timeout");
         if (limits.abortable) controller.abort(timeoutFailure);
       }, limits.idleTimeoutMs);
       idleTimer.unref?.();
@@ -3225,10 +3270,12 @@ export class DurableTurnRunner {
         );
         if (!retained) {
           heartbeatFailure = new DurableTurnRetryableError("Turn lease was lost during a long-running operation");
+          limits.onInterrupt?.("ownership");
           if (limits.abortable) controller.abort(heartbeatFailure);
         }
       } catch (error) {
         heartbeatFailure = error;
+        limits.onInterrupt?.("ownership");
         if (limits.abortable) controller.abort(error);
       }
       if (heartbeatFailure) return;
@@ -3237,6 +3284,9 @@ export class DurableTurnRunner {
     };
     timer = setTimeout(() => void heartbeat(), heartbeatMs);
     timer.unref?.();
+    controller.signal.addEventListener("abort", () => {
+      if (controller.signal.reason instanceof DurableTurnCancellationError) limits.onInterrupt?.("cancelled");
+    }, { once: true });
     if (limits.maxDurationMs) {
       durationTimer = setTimeout(() => {
         timeoutFailure = new DurableToolTimeoutError(
@@ -3244,6 +3294,7 @@ export class DurableTurnRunner {
           "wall",
           limits.operation ?? "generic",
         );
+        limits.onInterrupt?.("timeout");
         if (limits.abortable) controller.abort(timeoutFailure);
       }, limits.maxDurationMs);
       durationTimer.unref?.();
