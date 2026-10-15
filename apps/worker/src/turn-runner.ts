@@ -83,6 +83,13 @@ import {
   persistWorkerOperationalEvent,
 } from "./operational-telemetry.js";
 import { classifyToolFailure, storedToolFailure, type ToolFailure } from "./tool-failures.js";
+import {
+  PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
+  raiseProviderCreditAlert,
+  urlHost,
+  type ProviderCreditAlert,
+  type ProviderCreditAlertSink,
+} from "./provider-credits.js";
 
 const TERMINAL_STATES = new Set<TurnRunState>([
   "completed",
@@ -664,6 +671,8 @@ export class DurableTurnRunner {
       cancellations?: ActiveTurnCancellationRegistry;
       workerRole?: OperationalWorkerRole;
       sourceRevision?: string;
+      /** Emails administrators when the provider account is out of credit (H-005). */
+      providerCreditAlerts?: ProviderCreditAlertSink;
     } = {},
   ) {}
 
@@ -727,6 +736,17 @@ export class DurableTurnRunner {
       const message = providerFailure
         ? publicProviderFailureMessage(providerFailure)
         : error instanceof Error ? error.message : String(error);
+      if (providerFailure?.status === 402) {
+        // Not awaited: the alert never delays or changes this run's outcome.
+        raiseProviderCreditAlert(this.options.providerCreditAlerts, {
+          tenantId: snapshot.tenantId,
+          event: "exhausted",
+          surface: "chat",
+          ...creditAlertProvider(snapshot),
+          detectedAt: new Date().toISOString(),
+          status: 402,
+        });
+      }
       if (hasAmbiguousNonIdempotentTool(snapshot)) {
         try {
           await this.transitionAmbiguousToolToRecovery(snapshot, message);
@@ -4975,6 +4995,14 @@ function providerFailureDiagnostics(
   };
 }
 
+/** The run's admitted provider; legacy runs fall back to the deployment's router in the sink. */
+function creditAlertProvider(snapshot: DurableTurnSnapshot): Pick<ProviderCreditAlert, "providerId" | "providerName" | "providerHost"> {
+  const provider = durableRuntimeRequest(snapshot)?.provider;
+  return provider
+    ? { providerId: provider.id, providerName: provider.name, providerHost: urlHost(provider.baseUrl) }
+    : {};
+}
+
 function publicProviderFailureMessage(
   failure: ReturnType<typeof classifyProviderFailure>,
 ): string {
@@ -4983,7 +5011,7 @@ function publicProviderFailureMessage(
   }
   if (failure.status === 402) {
     // Retrying, or switching to another model on the same route, repeats it (H-005).
-    return "The model provider declined the request because the account's credit or quota is exhausted (HTTP 402). An administrator needs to add credit or change the provider route; retrying or choosing another model from the same provider will not help.";
+    return PROVIDER_CREDIT_EXHAUSTED_MESSAGE;
   }
   const base = {
     aborted: "The model provider request was aborted",

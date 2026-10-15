@@ -186,4 +186,17 @@ describe("processBerryWorkerJob", () => {
 
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ reason: "queued-follow-up" }));
   });
+
+  it("finishes provider credit jobs without sending when email is not configured (H-005)", async () => {
+    const payload = {
+      tenantId, event: "exhausted", surface: "chat", providerId: "router", providerName: "Berry Router",
+      detectedAt: "2026-10-15T09:12:00.000Z", status: 402,
+    };
+    await expect(processBerryWorkerJob("alerts.provider-credits", payload, testDependencies())).resolves.toEqual({ outcome: "email_disabled" });
+    await expect(processBerryWorkerJob("alerts.provider-balance", { tenantId, scheduledFor: "2026-10-15T09:30:00.000Z" }, testDependencies()))
+      .resolves.toEqual({ outcome: "email_disabled" });
+    const deliver = vi.fn(async () => ({ outcome: "delivered" }));
+    await processBerryWorkerJob("alerts.provider-credits", payload, { ...testDependencies(), providerCreditAlerts: { deliver } as never });
+    expect(deliver).toHaveBeenCalledWith({ ...payload, providerHost: null, balance: null });
+  });
 });

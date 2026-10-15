@@ -45,6 +45,13 @@ import { emitWorkerOperationalEvent, persistWorkerOperationalEvent } from "./ope
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
 import { classifyToolFailure } from "./tool-failures.js";
 import {
+  IMAGE_PROVIDER_CREDIT_EXHAUSTED_MESSAGE,
+  raiseProviderCreditAlert,
+  urlHost,
+  type ProviderCreditAlertSink,
+} from "./provider-credits.js";
+import { storedToolFailure } from "./tool-failures.js";
+import {
   capabilityNoticeReason,
   DurableTurnRetryableError,
   type DurableTurnSnapshot,
@@ -137,7 +144,7 @@ const DEFAULT_IMPORT_AVAILABILITY_POLL_MS = 250;
 const MAX_SNAPSHOT_FILES = 5_000;
 const OFFICE_TEXT_CACHE_MAX_CHARACTERS = 32 * 1024 * 1024;
 const IMAGE_PROVIDER_CREDIT_EXHAUSTED = /insufficient_quota|billing details|payment required|(?:out of|exhausted|insufficient) (?:your )?credits?/i;
-const IMAGE_PROVIDER_CREDIT_MESSAGE = "Image generation is unavailable: the image provider reports that its credit or quota is exhausted. An administrator must add credit or change the image provider; changing the prompt or retrying will not help. Tell the user instead of calling create_image again";
+const IMAGE_PROVIDER_CREDIT_MESSAGE = IMAGE_PROVIDER_CREDIT_EXHAUSTED_MESSAGE;
 const MAX_SNAPSHOT_BYTES = 250 * 1024 * 1024;
 const INACTIVE_SANDBOX_STATES = new Set(["paused", "missing", "stopped", "destroyed"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "recovery_required"]);
@@ -593,6 +600,8 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         model: string;
         responseFormat: "url" | "b64_json";
       };
+      /** Emails administrators when the image provider is out of credit (H-005). */
+      providerCreditAlerts?: ProviderCreditAlertSink;
     },
   ) {}
 
@@ -1455,9 +1464,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
       const prompt = stringValue(args.prompt);
       if (!prompt) throw new Error("create_image requires a prompt");
+      // The stored failure class also covers steps recorded with earlier wording.
       if ((snapshot.steps ?? []).some((candidate) => candidate.state === "failed"
         && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "create_image"
-        && candidate.error?.includes(IMAGE_PROVIDER_CREDIT_MESSAGE))) {
+        && (candidate.error?.includes(IMAGE_PROVIDER_CREDIT_MESSAGE)
+          || storedToolFailure(candidate.output)?.category === "credit_exhausted"))) {
         throw new Error(`${IMAGE_PROVIDER_CREDIT_MESSAGE}. (An earlier image request in this task already failed for this reason; the provider was not called again.)`);
       }
       const references = Array.isArray(args.reference_image_paths)
@@ -1483,6 +1494,20 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         idempotencyKey: step.idempotencyKey ?? step.id,
         ...(referenceImageUrls.length > 0 ? { referenceImageUrls } : {}),
         ...(signal ? { signal } : {}),
+      }).catch((error: unknown) => {
+        if (error instanceof ImageProviderCreditError) {
+          // Not awaited: the alert never delays or changes the tool result.
+          raiseProviderCreditAlert(this.options.providerCreditAlerts, {
+            tenantId: snapshot.tenantId,
+            event: "exhausted",
+            surface: "image",
+            providerId: stringValue(capability.providerId) ?? undefined,
+            providerHost: urlHost(config.endpoint),
+            detectedAt: new Date().toISOString(),
+            status: error.httpStatus,
+          });
+        }
+        throw error;
       });
       const first = generated.data[0];
       if (!first) throw new Error("The image provider returned no image");
@@ -3800,6 +3825,18 @@ async function downloadGeneratedImage(url: string | undefined, signal?: AbortSig
   return Buffer.from(await response.arrayBuffer());
 }
 
+/**
+ * The image provider's account is out of credit or quota (H-005). The HTTP
+ * status is kept off `status` so retry classifiers keep reading the message,
+ * exactly as for the plain error this replaced.
+ */
+class ImageProviderCreditError extends Error {
+  constructor(message: string, readonly httpStatus: number) {
+    super(message);
+    this.name = "ImageProviderCreditError";
+  }
+}
+
 async function generateDurableImage(
   config: NonNullable<ConstructorParameters<typeof SandboxContinuityManager>[3]["imageGeneration"]>,
   input: {
@@ -3842,7 +3879,7 @@ async function generateDurableImage(
     // Credit or quota exhaustion is an account problem: say so, so the model
     // stops rewording prompts against it (H-005).
     if (response.status === 402 || IMAGE_PROVIDER_CREDIT_EXHAUSTED.test(body)) {
-      throw new Error(`${IMAGE_PROVIDER_CREDIT_MESSAGE} (HTTP ${response.status}: ${body.slice(0, 300)})`);
+      throw new ImageProviderCreditError(`${IMAGE_PROVIDER_CREDIT_MESSAGE} (HTTP ${response.status}: ${body.slice(0, 300)})`, response.status);
     }
     throw new Error(`Image provider request failed with ${response.status}: ${body}`);
   }

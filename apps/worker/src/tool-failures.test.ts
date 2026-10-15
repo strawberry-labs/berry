@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { McpToolError } from "@berry/local-agent/mcp";
 import { classifyToolFailure, storedToolFailure, type ToolFailureCategory } from "./tool-failures.js";
+import { IMAGE_PROVIDER_CREDIT_EXHAUSTED_MESSAGE } from "./provider-credits.js";
 
 // Strings recorded by the production evidence audit (H-003, H-006), masked.
 describe("tool failure classes (H-003, H-006)", () => {
@@ -33,6 +34,13 @@ describe("tool failure classes (H-003, H-006)", () => {
     expect(failure.deterministic).toBe(
       ["invalid_input", "missing_resource", "configuration", "credentials", "credit_exhausted"].includes(category),
     );
+  });
+
+  it("tells the model to send the user to support when a provider is out of credit (H-005)", () => {
+    const failure = classifyToolFailure(new Error(`${IMAGE_PROVIDER_CREDIT_EXHAUSTED_MESSAGE} (HTTP 402: Payment Required)`), { changesState: false });
+    expect(failure.category).toBe("credit_exhausted");
+    expect(failure.action).toContain("contact support or their administrator");
+    expect(failure.action).not.toContain("change the provider");
   });
 
   it("uses HTTP statuses before wording", () => {

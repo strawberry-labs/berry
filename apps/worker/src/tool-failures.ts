@@ -42,7 +42,7 @@ const ACTIONS: Record<ToolFailureCategory, string> = {
   missing_resource: "Check the exact path, ID or URL first (list, search or read what exists). If it is right, the source is unavailable: use another source or tell the user. The same call fails the same way.",
   configuration: "This needs a configuration or administrator change (admission, connector review, proxy or network settings). Tell the user what is blocked; retrying will not help.",
   credentials: "The connection's credentials are invalid or expired. Ask the user to reconnect it in Settings → Connectors; retrying before that will not help.",
-  credit_exhausted: "The provider account has no credit or quota left. Tell the user an administrator must add credit or change the provider; retrying will not help.",
+  credit_exhausted: "The provider is out of credit or quota. Tell the user that plainly and that they should contact support or their administrator; retrying will not help.",
   transient: "This looks temporary. One retry of the same call is reasonable; if it fails again, use another approach or tell the user.",
   unknown_outcome: "This call changes something and failed partway, so it may already have taken effect. Check whether the change happened before repeating it; do not repeat it blindly.",
   unknown: "Read the error, change the approach or the arguments, and do not repeat the same call unchanged.",

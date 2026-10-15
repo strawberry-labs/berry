@@ -19,6 +19,8 @@ describe("BullMqBerryQueueClient", () => {
       "usage.rollup",
       "report.run",
       "alerts.evaluate",
+      "alerts.provider-credits",
+      "alerts.provider-balance",
       "knowledge.extract",
       "knowledge.chunk",
       "knowledge.embed",

@@ -48,6 +48,7 @@ import { SandboxContinuityManager } from "./sandbox-continuity.js";
 import { DurableMcpToolExecutor } from "./mcp-tools.js";
 import { DurablePersonalMemoryToolExecutor } from "./memory/tools.js";
 import { ActiveTurnCancellationRegistry } from "./turn-cancellation.js";
+import type { ProviderCreditAlert, ProviderCreditAlertSink } from "./provider-credits.js";
 
 const tenantId = "00000000-0000-7000-8000-000000000001";
 const runId = "00000000-0000-7000-8000-000000000002";
@@ -4389,15 +4390,70 @@ describe("durable turn runner", () => {
     ]);
   });
 
-  it("explains a 402 as an account credit problem rather than a model setting (H-005)", async () => {
+  it("explains a 402 as the AI provider being out of credit and points the user to support (H-005)", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
     const runner = new DurableTurnRunner(repository, {
       call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
     }, noTools(), { owner: "worker-credit" });
     await runner.execute({ tenantId, runId, reason: "continue" });
+    expect(repository.current.state).toBe("failed");
     const text = JSON.stringify([repository.current.error, repository.events, repository.mutations]);
-    expect(text).toContain("credit or quota is exhausted (HTTP 402)");
-    expect(text).toContain("choosing another model from the same provider will not help");
+    expect(text).toContain("The AI provider is out of credit");
+    expect(text).toContain("Please contact support or your administrator.");
+    expect(text).toContain("choosing another model from the same provider won't help");
+    // Nothing the user cannot act on, and no blame.
+    expect(text).not.toContain("change the provider route");
+    expect(text).not.toContain("your account");
+  });
+
+  it("raises an administrator credit alert for a 402 without waiting for it (H-005)", async () => {
+    const raised: ProviderCreditAlert[] = [];
+    const repository = new FakeTurnRepository(providerSnapshot("openai-responses"));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
+    }, noTools(), {
+      owner: "worker-credit-alert",
+      // Never settles: the run must not wait for the alert.
+      providerCreditAlerts: { raise: (alert) => { raised.push(alert); return new Promise<void>(() => undefined); } },
+    });
+
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ runId, state: "failed" });
+    expect(JSON.stringify(repository.current.error)).toContain("The AI provider is out of credit");
+    expect(raised).toEqual([{
+      tenantId,
+      event: "exhausted",
+      surface: "chat",
+      providerId: "provider-openai-responses",
+      providerName: "openai-responses",
+      providerHost: "provider.example.test",
+      detectedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      status: 402,
+    }]);
+  });
+
+  it("fails a 402 run the same way when raising the alert fails (H-005)", async () => {
+    const failingSinks: ProviderCreditAlertSink[] = [
+      { raise: async () => { throw new Error("database unavailable"); } },
+      { raise: () => { throw new Error("synchronous failure"); } },
+    ];
+    for (const providerCreditAlerts of failingSinks) {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const runner = new DurableTurnRunner(repository, {
+        call: async () => { throw new RouterClientError("Payment Required", 402, "PAYMENT_REQUIRED", { code: "payment_required" }); },
+      }, noTools(), { owner: "worker-credit-alert-failure", providerCreditAlerts });
+      await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ runId, state: "failed" });
+      expect(JSON.stringify(repository.current.error)).toContain("Please contact support or your administrator.");
+    }
+  });
+
+  it("raises no credit alert for other provider rejections (H-005)", async () => {
+    const raise = vi.fn(async () => undefined);
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => { throw new RouterClientError("Bad Request", 400, "INVALID_ARGUMENT", { code: "invalid_request" }); },
+    }, noTools(), { owner: "worker-credit-alert-400", providerCreditAlerts: { raise } });
+    await expect(runner.execute({ tenantId, runId, reason: "continue" })).resolves.toMatchObject({ state: "failed" });
+    expect(raise).not.toHaveBeenCalled();
   });
 
   it("uses the router streaming transport and assembles streamed tool calls", async () => {

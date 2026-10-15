@@ -3333,6 +3333,7 @@ describe("SandboxContinuityManager", () => {
       persistOutput: vi.fn(), persist: vi.fn(), recordSandbox: vi.fn(async () => undefined),
     } satisfies SandboxSnapshotRepository;
     const objects = { put: vi.fn(), putArtifact: vi.fn(), get: vi.fn(), getSource: vi.fn() } satisfies SandboxSnapshotObjectStore;
+    const raise = vi.fn(async () => undefined);
     const manager = new SandboxContinuityManager(provider, repository, objects, {
       image: "berry-sandbox",
       imageGeneration: {
@@ -3342,23 +3343,42 @@ describe("SandboxContinuityManager", () => {
         model: "gpt-image-1",
         responseFormat: "b64_json",
       },
+      providerCreditAlerts: { raise },
     });
     const current = snapshot();
-    current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1" } };
+    current.runtimeRequest = { imageGeneration: { version: 1, model: "gpt-image-1", providerId: "router" } };
     const step = (sequence: number) => ({ ...toolStep("create_image", { prompt: "A site logo", title: "Site logo" }), id: `image-${sequence}`, sequence, retryClass: "non_idempotent_manual" as const });
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { code: "insufficient_quota", message: "You exceeded your current quota, please check your plan and billing details." } }), { status: 429 }));
     vi.stubGlobal("fetch", fetchMock);
     try {
       const failure = await manager.execute(current, step(1)).then(() => null, (error: Error) => error.message);
-      expect(failure).toContain("the image provider reports that its credit or quota is exhausted");
+      expect(failure).toContain("Image generation is unavailable because the AI provider is out of credit");
+      expect(failure).toContain("contact support or their administrator");
       expect(failure).toContain("HTTP 429");
+      expect(failure).not.toContain("change the image provider");
+      expect(raise).toHaveBeenCalledTimes(1);
+      expect(raise).toHaveBeenCalledWith(expect.objectContaining({
+        tenantId: current.tenantId, event: "exhausted", surface: "image", providerId: "router", providerHost: "images.example.test", status: 429,
+      }));
       current.steps = [{ ...step(1), state: "failed", error: `Tool failed (repair attempt 1/3). ${failure}` }];
+      await expect(manager.execute(current, step(3))).rejects.toThrow("the provider was not called again");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // A step recorded with earlier wording is recognised by its stored failure class.
+      current.steps = [{
+        ...step(1),
+        state: "failed",
+        error: "Tool failed (repair attempt 1/3). Image generation is unavailable: the image provider reports that its credit or quota is exhausted.",
+        output: { failure: { category: "credit_exhausted", deterministic: true, outcome: "not_applied", action: "" } },
+      }];
       await expect(manager.execute(current, step(3))).rejects.toThrow("the provider was not called again");
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
       fetchMock.mockImplementation(async () => new Response("Payment Required", { status: 402 }));
       current.steps = [];
-      await expect(manager.execute(current, step(5))).rejects.toThrow("credit or quota is exhausted");
+      await expect(manager.execute(current, step(5))).rejects.toThrow("the AI provider is out of credit");
+      // The fast-failed calls did not reach the provider and raised nothing; the 402 raised once more.
+      expect(raise).toHaveBeenCalledTimes(2);
+      expect(raise).toHaveBeenLastCalledWith(expect.objectContaining({ surface: "image", status: 402 }));
     } finally {
       vi.unstubAllGlobals();
     }

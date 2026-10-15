@@ -74,6 +74,31 @@ export type UsageRollupJobPayload = z.infer<typeof UsageRollupJobPayloadSchema>;
 export const ReportRunJobPayloadSchema=z.object({tenantId:z.string().uuid(),scheduleId:z.string().uuid(),windowKey:z.string().min(1)});export type ReportRunJobPayload=z.infer<typeof ReportRunJobPayloadSchema>;
 export const AlertEvaluationJobPayloadSchema=z.object({tenantId:z.string().uuid(),from:z.string().datetime({offset:true}),to:z.string().datetime({offset:true})});export type AlertEvaluationJobPayload=z.infer<typeof AlertEvaluationJobPayloadSchema>;
 
+/** One administrator notification that an AI provider account is out of, or low on, credit (H-005). */
+export const ProviderCreditAlertJobPayloadSchema = z.object({
+  tenantId: z.string().uuid(),
+  event: z.enum(["exhausted", "low"]),
+  /** What raised it: a chat model call, image generation, or the periodic balance check. */
+  surface: z.enum(["chat", "image", "balance"]),
+  providerId: z.string().trim().min(1).max(200),
+  providerName: z.string().trim().min(1).max(200),
+  providerHost: z.string().trim().min(1).max(253).nullable().default(null),
+  detectedAt: z.string().datetime({ offset: true }),
+  status: z.number().int().min(100).max(599).nullable().default(null),
+  balance: z.object({
+    remaining: z.number().finite(),
+    threshold: z.number().finite().nonnegative(),
+    currency: z.string().trim().min(1).max(16),
+  }).nullable().default(null),
+});
+export type ProviderCreditAlertJobPayload = z.infer<typeof ProviderCreditAlertJobPayloadSchema>;
+
+export const ProviderBalanceCheckJobPayloadSchema = z.object({
+  tenantId: z.string().uuid(),
+  scheduledFor: z.string().datetime({ offset: true }),
+});
+export type ProviderBalanceCheckJobPayload = z.infer<typeof ProviderBalanceCheckJobPayloadSchema>;
+
 export const KnowledgeRevisionJobPayloadSchema = z.object({
   tenantId: z.string().uuid(),
   sourceId: z.string().uuid(),
@@ -157,6 +182,8 @@ export const BerryWorkerJobNameSchema = z.enum([
   "usage.rollup",
   "report.run",
   "alerts.evaluate",
+  "alerts.provider-credits",
+  "alerts.provider-balance",
   "knowledge.extract",
   "knowledge.chunk",
   "knowledge.embed",
@@ -181,6 +208,8 @@ export interface BerryWorkerJobMap {
   "usage.rollup": UsageRollupJobPayload;
   "report.run": ReportRunJobPayload;
   "alerts.evaluate": AlertEvaluationJobPayload;
+  "alerts.provider-credits": ProviderCreditAlertJobPayload;
+  "alerts.provider-balance": ProviderBalanceCheckJobPayload;
   "knowledge.extract": KnowledgeRevisionJobPayload;
   "knowledge.chunk": KnowledgeRevisionJobPayload;
   "knowledge.embed": KnowledgeRevisionJobPayload;
@@ -213,6 +242,8 @@ export function parseWorkerJob(name: string, data: unknown): BerryWorkerJobPaylo
   if(jobName==="usage.rollup")return UsageRollupJobPayloadSchema.parse(data);
   if(jobName==="report.run")return ReportRunJobPayloadSchema.parse(data);
   if(jobName==="alerts.evaluate")return AlertEvaluationJobPayloadSchema.parse(data);
+  if (jobName === "alerts.provider-credits") return ProviderCreditAlertJobPayloadSchema.parse(data);
+  if (jobName === "alerts.provider-balance") return ProviderBalanceCheckJobPayloadSchema.parse(data);
   if(jobName==="knowledge.index-task")return KnowledgeIndexTaskJobPayloadSchema.parse(data);
   if(jobName==="file.delete-object")return FileDeleteObjectJobPayloadSchema.parse(data);
   if(jobName==="file.delete-blob")return FileDeleteBlobJobPayloadSchema.parse(data);

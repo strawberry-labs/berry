@@ -1,4 +1,5 @@
 import { promoteIdleQueuedFollowUps } from "./turn-runner.js";
+import { enqueueProviderBalanceCheck } from "./provider-balance.js";
 import {
   BerryWorkerJobNameSchema,
   SandboxSnapshotJobPayloadSchema,
@@ -42,6 +43,7 @@ export class RuntimeOutboxDispatcher {
   #timer: NodeJS.Timeout | null = null;
   #running = false;
   #nextTerminalCleanupAt = 0;
+  #providerBalanceCheckScheduledFor: string | null = null;
 
   constructor(
     private readonly executor: SqlExecutor,
@@ -59,6 +61,8 @@ export class RuntimeOutboxDispatcher {
       enableTerminalFinalization?: boolean;
       workerRole?: OperationalWorkerRole;
       sourceRevision?: string;
+      /** Schedules `alerts.provider-balance` for every tenant once per interval (H-005). */
+      providerBalanceCheckIntervalMs?: number;
     },
   ) {}
 
@@ -82,6 +86,7 @@ export class RuntimeOutboxDispatcher {
       const rows: OutboxRow[] = [];
       const tenantIds = await this.tenantIds();
       const runTerminalCleanup = this.terminalCleanupDue();
+      await this.scheduleProviderBalanceChecks(tenantIds);
       for (const tenantId of tenantIds) {
         await this.withTenant(tenantId, (executor) => this.recoverExpiredAdmissions(executor, tenantId));
         await this.withTenant(tenantId, (executor) => promoteIdleQueuedFollowUps(executor, tenantId));
@@ -555,6 +560,29 @@ WHERE tenant_id=$1::uuid
       `, [row.tenant_id, row.id, this.options.workerId, retryMs, leaseEpoch(row)]);
       if (!rows[0]) workerRuntimeMetrics.outboxFenceMiss("defer");
     });
+  }
+
+  /**
+   * Every worker runs this loop, so each interval is a fixed time bucket and
+   * the outbox dedupe key leaves exactly one balance check per tenant and bucket.
+   * A failure is retried on the next cycle and never stops dispatching.
+   */
+  private async scheduleProviderBalanceChecks(tenantIds: readonly string[]): Promise<void> {
+    const intervalMs = this.options.providerBalanceCheckIntervalMs ?? 0;
+    if (intervalMs <= 0) return;
+    const scheduledFor = new Date(Math.floor(Date.now() / intervalMs) * intervalMs).toISOString();
+    if (scheduledFor === this.#providerBalanceCheckScheduledFor) return;
+    try {
+      for (const tenantId of tenantIds) {
+        await this.withTenant(tenantId, (executor) => enqueueProviderBalanceCheck(executor, tenantId, scheduledFor));
+      }
+      this.#providerBalanceCheckScheduledFor = scheduledFor;
+    } catch {
+      emitWorkerOperationalEvent("outbox.transition", this.options.workerRole ?? "unknown", this.options.sourceRevision ?? "unknown", {
+        phase: "provider_balance_schedule",
+        outcome: "failed",
+      });
+    }
   }
 
   private terminalCleanupDue(): boolean {
