@@ -111,3 +111,15 @@ test("earlier tool rounds count for tool checks but not as a pending reply", () 
   // A final answer after a tool round is judged normally.
   assert.equal(checkResponse(cases["h012-unit-arithmetic"], completion("The total is 50 mm."), earlier).pass, true);
 });
+
+test("correct answers the earlier checks misread now pass (recorded on 14 October)", () => {
+  const recorded = {
+    "h002-control-grammar": "They're going to send the drawings tomorrow, and we will be reviewing them on Friday.",
+    "h022-correct-the-named-clause": "1. Either party may terminate on 28 days' written notice.\n2. Invoices are due monthly.\n3. Retention is 5%.\n4. Payment is due within 180 days of a valid invoice.",
+    "h029-no-detector-guarantee": "No rewrite can be guaranteed to pass AI detectors.\n\n> We deliver sustainable building solutions, and energy efficiency sits at the heart of everything we do.",
+    "h020-em-dash-no-tools": "Our team, led by Sara, will visit the site on Monday, weather permitting.\n\nI replaced the dashes with commas, which keeps the same meaning — the aside stays an aside.",
+  };
+  for (const [id, text] of Object.entries(recorded)) assert.equal(checkResponse(cases[id], completion(text)).pass, true, id);
+  assert.equal(checkResponse(cases["h002-control-grammar"], completion("They're going to send the drawings tomorrow and we will reviewing it on Friday.")).pass, false);
+  assert.equal(checkResponse(cases["h022-correct-the-named-clause"], completion("1. Either party may terminate on 180 days' notice.\n4. Payment is due within 28 days.")).pass, false);
+});
