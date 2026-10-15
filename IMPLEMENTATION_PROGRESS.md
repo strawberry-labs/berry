@@ -2397,3 +2397,12 @@ AESG packages.
 - **Tests.** One H-016 and five H-008 cases running the real wrapper and real Python output; all fail on the previous source. Worker suite 691 passed.
 - **Deployment.** Worker only; the sandbox image is unchanged.
 - **Remaining.** Python or Node piped to `head` exit 1 on a broken pipe and are reported; `xargs grep` 123 is reported; a user's own EXIT/DEBUG/RETURN trap replaces Berry's.
+
+### H-011 — Remaining encodings, Office routing and malformed tool arguments
+
+- **Encodings (`6c282be`).** The sandbox reader decodes UTF-16 and UTF-32 in both byte orders, with or without a BOM. BOM-less samples with NULs count as text only when they read cleanly in one byte order; otherwise binary. Checked on 318 encoded samples, 1,400 synthetic binaries and 20,000 real files.
+- **Office routing (`3718cec`).** OLE2 files (`.xls`, `.doc`, `.ppt`) are recognised by their streams whatever their name; `.xlsx` packages named `.xls` are extracted as packages; HTML, XML Spreadsheet 2003 or CSV text named as Office is read as text with a note. Template and macro extensions were added.
+- **Malformed arguments.** Each tool call is checked on arrival. Invalid JSON is reported with reason, character, line, column and nearby text, and cut-off calls are flagged; arguments are checked against the tool's schema, connector schemas included. A bad call fails as "`<tool>` was not run: …" without approval or execution, while the assistant message keeps the call as sent so provider history replays. It works in the parallel read batch too.
+- **Tests.** 26 new cases; 24 fail on the previous source, 2 are guards. Worker suite 710 passed.
+- **Deployment.** Worker only.
+- **Remaining.** BOM-less UTF-16 with no ASCII at all is still binary; Excel 2–4 and corrupt `.xls` still fail in the extractor; schema checks may refuse loosely typed values such as `"5"` for a number; OLE2 detection was tested on generated files only.

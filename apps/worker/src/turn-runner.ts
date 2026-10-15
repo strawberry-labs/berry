@@ -90,6 +90,13 @@ import {
   type ProviderCreditAlert,
   type ProviderCreditAlertSink,
 } from "./provider-credits.js";
+import {
+  ToolArgumentError,
+  invalidJsonProblem,
+  notRunMessage,
+  schemaArgumentProblems,
+  unparsedToolArguments,
+} from "./tool-arguments.js";
 
 const TERMINAL_STATES = new Set<TurnRunState>([
   "completed",
@@ -538,6 +545,8 @@ export interface DurableTurnToolExecutor {
     reportProgress?: () => void,
   ): Promise<readonly ChatContentPart[]>;
   policy?(snapshot: DurableTurnSnapshot, toolName: string, permissionMode: string): DurableToolPolicy | undefined;
+  /** Input schema of a tool the model reaches without a declared definition (a connector tool behind use_tool). */
+  argumentSchema?(snapshot: DurableTurnSnapshot, toolName: string): unknown;
   /** Return true only when every awaited part of this tool observes the signal. */
   supportsAbort?(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean;
   /** Return true only when every awaited model-preparation seam observes the signal. */
@@ -1402,6 +1411,12 @@ export class DurableTurnRunner {
       } as JsonValue,
     }];
     const nextSequence = nextStepSequence(snapshot.steps);
+    const declaredSchemas = new Map(definitions.map((definition) => [definition.function.name, definition.function.parameters]));
+    const argumentErrors = result.toolCalls.map((call) => toolArgumentError(
+      call,
+      declaredSchemas,
+      (name) => this.tools.argumentSchema?.(snapshot, name),
+    ));
     const toolSteps = result.toolCalls.map((call, index): DurableStepMutation => ({
       id: randomUUID(),
       sequence: nextSequence + index,
@@ -1415,6 +1430,7 @@ export class DurableTurnRunner {
         requiresApproval: call.requiresApproval,
         approvalKind: call.approvalKind,
         ...(call.invocation ? { invokedAs: call.invocation.name } : {}),
+        ...(argumentErrors[index] ? { argumentError: argumentErrors[index] } : {}),
       },
       retryClass: call.retryClass,
       idempotencyKey: call.idempotencyKey,
@@ -1607,8 +1623,11 @@ export class DurableTurnRunner {
         return this.suppressRepeatedToolCall(snapshot, step, repeatAssessment);
       }
     }
+    // Malformed arguments were found when the call arrived; the tool never runs (H-011).
+    const storedArgumentError = typeof step.input.argumentError === "string" ? step.input.argumentError : null;
     const questionProblem = toolName === "ask_user_question" ? questionBatchProblem(step.input.arguments) : null;
-    if (toolName === "ask_user_question" && !questionProblem) {
+    const argumentError = questionProblem ? null : storedArgumentError;
+    if (toolName === "ask_user_question" && !questionProblem && !argumentError) {
       const questions = durableQuestionItems(step.input.arguments);
       const first = questions[0];
       if (!first) throw new DurableTurnTerminalError("ask_user_question requires at least one valid question");
@@ -1660,7 +1679,7 @@ export class DurableTurnRunner {
       });
       return "waiting";
     }
-    if (step.state === "running" && step.retryClass === "non_idempotent_manual") {
+    if (step.state === "running" && step.retryClass === "non_idempotent_manual" && !argumentError) {
       await this.repository.commit(snapshot, {
         expectedState: "executing_tool",
         nextState: "recovery_required",
@@ -1707,7 +1726,7 @@ export class DurableTurnRunner {
     }
 
     const approval = snapshot.approvals.find((candidate) => candidate.stepId === step.id);
-    const requiresApproval = step.input.requiresApproval === true;
+    const requiresApproval = step.input.requiresApproval === true && !argumentError;
     if (requiresApproval && approval?.status !== "approved") {
       if (approval?.status === "denied" || approval?.status === "expired") {
         const entryId = randomUUID();
@@ -1845,6 +1864,7 @@ export class DurableTurnRunner {
     try {
       // A malformed question batch is a repairable argument error, never a
       // silently reduced question shown to the user (H-057).
+      if (argumentError) throw new ToolArgumentError(argumentError);
       if (questionProblem) throw new Error(questionProblem);
       if (toolName === "create_image") {
         const imageCost = durableRuntimeRequest(snapshot)?.imageGeneration?.costMicros;
@@ -2220,7 +2240,9 @@ export class DurableTurnRunner {
       settled = await this.withHeartbeat(
         snapshot,
         ({ signal, reportProgress }) => Promise.allSettled(
-          executableSteps.map((step, index) => this.tools.execute(snapshot, step, signal, reportProgress).then(
+          executableSteps.map((step, index) => (typeof step.input.argumentError === "string"
+            ? Promise.reject(new ToolArgumentError(step.input.argumentError))
+            : this.tools.execute(snapshot, step, signal, reportProgress)).then(
             (value) => {
               outcomes[index] = { outcome: { status: "fulfilled", value }, at: Date.now() };
               return value;
@@ -6473,7 +6495,8 @@ export function unwrapToolInvocation(
   const name = stringValue(args?.tool);
   if (!name || name === USE_TOOL_NAME) return call;
   const nested = args?.arguments;
-  const input = (nested && typeof nested === "object" && !Array.isArray(nested) ? nested : {}) as JsonValue;
+  if (nested !== undefined && nested !== null && (typeof nested !== "object" || Array.isArray(nested))) return call;
+  const input = (nested ?? {}) as JsonValue;
   const policy = policyForTool(name);
   return {
     ...call,
@@ -8902,6 +8925,30 @@ function safeJson(value: string): JsonValue {
     return candidate as JsonValue;
   }
   return candidate as JsonValue;
+}
+
+/** Executors that repair known argument damage before validating these themselves. */
+const SELF_VALIDATING_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+
+/**
+ * Why a call's arguments cannot run, or null (H-011): text that is not valid
+ * JSON (the `{ raw }` marker the model adapters keep), or a value that breaks
+ * the tool's schema. The assistant message keeps the call as written.
+ */
+function toolArgumentError(
+  call: TurnModelToolIntent,
+  declaredSchemas: ReadonlyMap<string, unknown>,
+  undeclaredSchema: (name: string) => unknown,
+): string | null {
+  const sentName = call.invocation?.name ?? call.name;
+  const sent = call.invocation?.arguments ?? call.input;
+  const raw = unparsedToolArguments(sent, declaredSchemas.get(sentName));
+  if (raw !== null) return notRunMessage(sentName, invalidJsonProblem(raw));
+  if (SELF_VALIDATING_TOOLS.has(call.name)) return null;
+  const schema = declaredSchemas.get(call.name) ?? undeclaredSchema(call.name);
+  if (!schema) return null;
+  const problems = schemaArgumentProblems(schema, call.input);
+  return problems.length > 0 ? notRunMessage(call.name, `its arguments do not match the tool schema: ${problems.join("; ")}`) : null;
 }
 
 function uuidFromToolCall(value: string): string {

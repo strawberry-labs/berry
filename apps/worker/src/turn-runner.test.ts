@@ -4,6 +4,7 @@ import {
   DURABLE_BASE_BUILT_IN_TOOLS,
   latestAssistantStreamDraft,
   type AgentStreamEvent,
+  type JsonValue,
   type TurnRunState,
 } from "@berry/shared";
 import {
@@ -41,6 +42,7 @@ import {
   type DurableTurnSnapshot,
   type DurableTurnStep,
   type DurableTurnToolExecutor,
+  type TurnModelToolIntent,
   type TurnToolResult,
 } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
@@ -845,6 +847,97 @@ describe("durable turn runner", () => {
       payload: { type: "message", id: "drive-result", message: { role: "toolResult", toolCallId: "call-drive", toolName: "mcp__Drive__search", content: "3 files" } },
     });
     expect(modelMessages(repository.current).messages.at(-1)).toMatchObject({ role: "tool", name: "use_tool", content: "3 files" });
+  });
+
+  describe("malformed tool arguments (H-011)", () => {
+    const callWith = (name: string, input: JsonValue, overrides: Partial<TurnModelToolIntent> = {}): DurableTurnModel => ({
+      call: async () => ({
+        text: "",
+        inputTokens: 3,
+        outputTokens: 2,
+        toolCalls: [{
+          id: "call-bad",
+          name,
+          input,
+          retryClass: "idempotent",
+          idempotencyKey: null,
+          requiresApproval: false,
+          approvalKind: "file-edit",
+          ...overrides,
+        }],
+      }),
+    });
+    const run = async (model: DurableTurnModel, tools: Partial<DurableTurnToolExecutor> = {}) => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const execute = vi.fn(async () => ({ output: { ok: true }, summary: "ran" }));
+      const runner = new DurableTurnRunner(repository, model, { execute, ...tools }, { owner: "worker-arguments" });
+      await runner.execute({ tenantId, runId, reason: "continue" });
+      const state = (await runner.execute({ tenantId, runId, reason: "continue" })).state;
+      const step = repository.current.steps.find((candidate) => candidate.type.startsWith("tool."));
+      const result = repository.current.entries
+        .map((entry) => (entry.payload as { message?: { role?: string; content?: Array<{ text?: string }> } }).message)
+        .find((message) => message?.role === "toolResult");
+      const assistant = repository.current.entries
+        .map((entry) => (entry.payload as { message?: { role?: string; content?: unknown[] } }).message)
+        .find((message) => message?.role === "assistant");
+      return { repository, execute, state, step, resultText: result?.content?.[0]?.text ?? "", assistant };
+    };
+
+    it("does not run a call whose JSON is invalid and says where it broke", async () => {
+      const broken = '{"path": "/workspace/a.ts", "edits": [{"oldText": "x", "newText": "\\d+"}]}';
+      const { execute, state, step, resultText, assistant } = await run(callWith("edit", { raw: broken }));
+      expect(execute).not.toHaveBeenCalled();
+      expect(state).toBe("calling_model");
+      expect(step).toMatchObject({ state: "failed", output: { failure: { category: "invalid_input", outcome: "not_applied" } } });
+      expect(resultText).toContain(`edit was not run: its arguments are invalid JSON: bad escape "\\d" in a string; a backslash must start`);
+      expect(resultText).toContain(`at character ${broken.indexOf("\\d") + 1} of ${broken.length}`);
+      expect(resultText).toContain('"newText": "⟨HERE⟩\\d+"}]}');
+      // The journal keeps the call as the model made it, so provider history stays valid.
+      expect(assistant?.content).toEqual([{ type: "toolCall", id: "call-bad", name: "edit", arguments: { raw: broken } }]);
+    });
+
+    it("does not run a call that breaks the tool schema and names each field", async () => {
+      const { execute, step, resultText } = await run(callWith("compose_message", { id: "draft", kind: "sms", variants: "[]" }));
+      expect(execute).not.toHaveBeenCalled();
+      expect(step?.state).toBe("failed");
+      expect(resultText).toContain('compose_message was not run: its arguments do not match the tool schema: "kind" must be one of "email", "textMessage", "other", but "sms" was sent; "variants" must be an array, but a string ("[]") was sent; send the value itself, not JSON text inside a string');
+    });
+
+    it("keeps use_tool with non-object arguments from running the connector with empty arguments", async () => {
+      const { execute, step, resultText } = await run(
+        callWith("use_tool", { tool: "mcp__Drive__search", arguments: '{"query": "pump"}' }),
+        {
+          definitions: async () => [{
+            type: "function",
+            function: {
+              name: "use_tool",
+              parameters: { type: "object", required: ["tool", "arguments"], properties: { tool: { type: "string" }, arguments: { type: "object" } } },
+            },
+          }],
+        },
+      );
+      expect(execute).not.toHaveBeenCalled();
+      expect(step?.type).toBe("tool.use_tool");
+      expect(resultText).toContain('use_tool was not run: its arguments do not match the tool schema: "arguments" must be an object, but a string');
+    });
+
+    it("refuses a connector call missing a required field before asking for approval", async () => {
+      const { repository, execute, step, resultText } = await run(
+        callWith("use_tool", { tool: "mcp__Drive__search", arguments: { limit: 5 } }, { retryClass: "read_only", approvalKind: "mcp" }),
+        {
+          policy: (_snapshot, name) => name === "mcp__Drive__search"
+            ? { retryClass: "non_idempotent_manual", repeatPolicy: "block_after_success", requiresApproval: true, approvalKind: "mcp" }
+            : undefined,
+          argumentSchema: (_snapshot, name) => name === "mcp__Drive__search"
+            ? { type: "object", required: ["query"], properties: { query: { type: "string" }, limit: { type: "integer" } } }
+            : undefined,
+        },
+      );
+      expect(execute).not.toHaveBeenCalled();
+      expect(repository.current.approvals).toHaveLength(0);
+      expect(step).toMatchObject({ type: "tool.mcp__Drive__search", state: "failed" });
+      expect(resultText).toContain('mcp__Drive__search was not run: its arguments do not match the tool schema: "query" is required but missing (sent fields: limit)');
+    });
   });
 
   it("does not spend the turn wall-clock budget on persisted human wait", async () => {

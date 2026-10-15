@@ -1,4 +1,5 @@
 import { classifyProviderFailure } from "./provider-retry.js";
+import { ToolArgumentError } from "./tool-arguments.js";
 
 /**
  * Typed tool-failure classes (H-003, H-006). The repair message alone told the
@@ -76,6 +77,8 @@ export function classifyToolFailure(error: unknown, options: { changesState: boo
   // Codes such as invalid_token or SCRAPE_PROXY_UNAVAILABLE carry the class on their own.
   const message = [errorText(error), details.text, code].filter(Boolean).join(" ");
   const category = ((): ToolFailureCategory => {
+    // Rejected before running; the quoted arguments must not steer the class.
+    if (error instanceof ToolArgumentError) return "invalid_input";
     if (status === 402 || CREDIT_EXHAUSTED_PATTERN.test(message)) return "credit_exhausted";
     if (status === 401 || CREDENTIALS_PATTERN.test(message)) return "credentials";
     if (status === 403 || CONFIGURATION_PATTERN.test(message)) return "configuration";

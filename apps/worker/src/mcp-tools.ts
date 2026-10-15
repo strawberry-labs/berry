@@ -162,6 +162,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     return durableMcpToolPolicy(server, hints, permissionMode);
   }
 
+  /** A connector tool's reviewed input schema, so malformed calls are refused before approval (H-011). */
+  argumentSchema(snapshot: DurableTurnSnapshot, toolName: string): unknown {
+    if (!toolName.startsWith("mcp__")) return this.base.argumentSchema?.(snapshot, toolName);
+    const source = this.#turnContexts.get(snapshot.id)?.source;
+    return source?.listTools().find((tool) => tool.name === toolName)?.parameters;
+  }
+
   supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "tool_search" || toolName === USE_TOOL_NAME) return false;

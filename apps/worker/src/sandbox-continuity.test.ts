@@ -1492,8 +1492,20 @@ describe("SandboxContinuityManager", () => {
 
     await expect(manager.execute(snapshot(), toolStep("bash", {
       raw: "{\"command\":\"printf done\"",
-    }))).rejects.toThrow("arguments were incomplete or invalid JSON");
+    }))).rejects.toThrow('bash was not run: its arguments are invalid JSON: the text ends inside an object, before its closing "}", after the last of its 24 characters (line 1, column 25), near {"command":"printf done"⟨HERE⟩. The arguments look cut off');
     expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("says a core tool was not run and why when its edits are not valid (H-011)", async () => {
+    const write = vi.fn();
+    const manager = managerWithProvider({ read: vi.fn(), write, list: vi.fn() });
+    await expect(manager.execute(snapshot(), toolStep("edit", {
+      path: "/workspace/a.ts",
+      edits: '[{"oldText": "a", "newText": "\\q"}]',
+    }))).rejects.toThrow('edit was not run: edit edits must be an array of {oldText, newText} objects; a string was sent whose JSON is invalid: bad escape "\\q"');
+    await expect(manager.execute(snapshot(), toolStep("write", { path: "/workspace/a.ts" })))
+      .rejects.toThrow("write was not run: write requires a string content. Correct the arguments and call it again.");
     expect(write).not.toHaveBeenCalled();
   });
 

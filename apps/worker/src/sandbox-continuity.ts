@@ -39,6 +39,7 @@ import {
 } from "@berry/shared";
 import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageLabel, modelImageOmission, prepareModelImage } from "./model-image.js";
 import { durableAttachmentPath } from "./durable-attachments.js";
+import { ToolArgumentError, invalidJsonProblem, jsonSyntaxError, notRunMessage } from "./tool-arguments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
@@ -1391,7 +1392,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     const prepared = prepareCoreToolArguments(toolName, step.input.arguments);
     const args = prepared.args;
-    validateCoreToolArguments(toolName, args);
+    try {
+      validateCoreToolArguments(toolName, args);
+    } catch (error) {
+      // Nothing has run yet; say so, so the model fixes the call (H-011).
+      if (!CORE_TOOL_NAMES.has(toolName)) throw error;
+      throw new ToolArgumentError(notRunMessage(toolName, (error as Error).message));
+    }
     const inputRepairDetails = prepared.repairs.length > 0
       ? { inputRepairs: prepared.repairs }
       : {};
@@ -5007,9 +5014,9 @@ function coreToolArgumentsValid(toolName: string, args: Record<string, unknown>)
 function validateCoreToolArguments(toolName: string, args: Record<string, unknown>): void {
   if (!CORE_TOOL_NAMES.has(toolName)) return;
   if (typeof args.raw === "string") {
-    throw new Error(
-      `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper.`,
-    );
+    throw new Error(jsonSyntaxError(args.raw)
+      ? invalidJsonProblem(args.raw)
+      : "its arguments were wrapped in a raw field; send the schema fields directly");
   }
   const allowed = toolName === "read" ? ["path", "offset", "limit", "page_start", "page_end", "as_image"]
     : toolName === "bash" ? ["command", "timeout"]
@@ -5046,7 +5053,12 @@ function validateCoreToolArguments(toolName: string, args: Record<string, unknow
   }
   if (toolName === "edit") {
     validateCorePath(args, toolName, true);
-    if (!Array.isArray(args.edits)) throw new Error("edit edits must be an array");
+    if (!Array.isArray(args.edits)) {
+      const sent = args.edits;
+      throw new Error(typeof sent === "string" && jsonSyntaxError(sent)
+        ? `edit edits must be an array of {oldText, newText} objects; a string was sent whose JSON is invalid: ${invalidJsonProblem(sent).replace(/^its arguments are invalid JSON: /, "")}`
+        : `edit edits must be an array of {oldText, newText} objects, but ${sent === undefined ? "it is missing" : `${Array.isArray(sent) ? "an array" : sent === null ? "null" : `a ${typeof sent}`} was sent`}`);
+    }
     piEditEntries(args);
     return;
   }
