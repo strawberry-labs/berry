@@ -250,6 +250,58 @@ tool permission policy, so it has not been run:
 reproduced as a UI race and fixed (`966d9a1`); H-047 reproduced as a layout fault and fixed (see
 its entry).
 
+## Round 2 (14 October evening): local changes from the production evidence
+
+Source: the read-only production evidence report (`eval-results/production-evidence-report.md`,
+private and git-ignored). These changes are **local and uncommitted**: nothing was committed,
+pushed, deployed or published. They add 17 working-tree entries to the 213 pre-existing
+ones, with no overlap.
+
+- **H-068 / H-024: connector import readiness.**
+  - **Existing fix validated.** Production evidence: the Drive receipt carried a Berry file ID and no path; verification finished 59.6 ms later; the running worker lacks `f2923b2`. That commit passes new acceptance tests under fake timers at the real 30 s / 250 ms bounds:
+    - verification at 200 ms and at 2 s stages the exact bytes, with the original identity;
+    - past 30 s nothing is read or staged;
+    - cancellation stops polling;
+    - a hydration error surfaces.
+  - **Added locally.**
+    - Repeating an import whose file was not staged retries staging of the Berry file already held, without a second Drive call.
+    - A staging failure of a verified file returns `stagingStatus: "failed"` with guidance instead of failing the step and inviting a re-download.
+    - Cancellation still propagates.
+  - **Real-PostgreSQL script.** `scripts/test-connector-import-readiness.mjs` passes 4 scenarios:
+    - an import stays hidden until its blob is verified;
+    - deleted files, deleted blobs and removed associations are never staged;
+    - other sessions and tenants cannot stage it;
+    - a repeat import writes no new bytes and adds no Library entry.
+- **H-003 / H-006: typed tool failures.**
+  - **Failure classes.** `apps/worker/src/tool-failures.ts` sorts failures into invalid input, missing resource, configuration, credentials, credit exhaustion, transient, unknown outcome and unknown. Transport detection reuses the shared provider classifier.
+  - **What failed steps carry.** Each failed step stores its class and recovery action in `output.failure`. The model reads a class note; the stored error text is unchanged, so the H-004 counters are unaffected.
+  - **MCP boundary.** `McpToolError` keeps an error result's structured content, so codes such as `invalid_token` and `SCRAPE_PROXY_UNAVAILABLE` survive.
+  - **Refusing unchanged retries.** An unchanged retry of a deterministic failure is refused without running, in both the single and batch paths:
+    - credentials, configuration and credit failures are refused for the rest of the run;
+    - invalid input and missing resources until a change-making step runs;
+    - unknown-outcome mutations until another step has checked.
+  - **Retries that still run.** Transient failures keep the bounded repeat limit. Re-spelt paths of a missing file now stop after one real attempt.
+  - **Not duplicated.** H-075 (`d95b252`) already covers internal connector-session expiry.
+- **H-021: stalled model streams.**
+  - **Evidence.** Three 240 s idle aborts per failed step, recorded as `aborted/cancelled` with a final cause of `unknown`.
+  - **Now.** Berry's own idle or duration deadline is recorded as `timeout` with `failureCause: idle_timeout`, and a per-attempt cause history persists through retry release. At exhaustion the message names the cause and lists the files already saved, and suggests Continue. User cancellation stays `aborted/cancelled` and is not retried. Timeouts and retry defaults are unchanged.
+- **Evaluation runner.**
+  - **Outcomes.** Results are classed as passed, failed (completed answers only), tool-pending, token-limited or API error.
+  - **Summary.** `scripts/behaviour-eval-summary.mjs` skips non-report JSON. On the real `eval-results/` folder it skipped 52 audit files and reported Qwen's runs as API errors rather than 0/28.
+- **Verification (clean HEAD plus these files only).**
+  - Web typecheck and build, API typecheck and build, worker build and typecheck all pass.
+  - Worker 582 passed / 3 skipped; local-agent 171 passed; evaluation scripts 31 passed.
+  - PostgreSQL readiness 4/4; H-069 Library 3/3.
+  - API 450 passed with the 24 known QueuedFollowUpService dependency-injection failures, unchanged.
+  - **Pre-fix check (new tests on the previous source).** The H-068 manager tests pass there, validating `f2923b2`. These fail there:
+    - the resume and failed-staging receipt tests;
+    - all six H-003 runner tests, plus the classifier and MCP-boundary tests;
+    - the H-021 idle-cause test;
+    - the stricter H-004 test;
+    - both evaluation test files.
+- **Blocked: H-055, H-073, H-074 (CV package).** Copying the private `cv-creator-new` export into a candidate folder was refused by the tool permission policy. The work needs the user's explicit confirmation. A local renderer environment exists (`aesg-cv-migration/.venv`: lxml 6.1.1, python-docx 1.2.0, python-pptx 1.0.2, Pillow 12.3.0).
+- **Not changed (operational).** Remote BerryCrawl proxy configuration and the production owner credential (`BERRY_DATABASE_URL` fails authentication; a future migration or role bootstrap would fail).
+
 ## Final verification (14 October)
 
 Clean checkout of `36022d9` (and of `d65df09` for the script change), compiled tests removed from
