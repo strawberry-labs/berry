@@ -97,7 +97,7 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
 | `095530e` | H-077 | None. Preparation behaviour only; no schema or stored-data change. |
 | `be1e488` | H-014 | None. Reuses the artifact-operation and finalization records (`partial` status already exists). |
-| (this commit) | H-078 | None. |
+| `d8af99d` | H-078 | None. |
 
 ## Status legend
 
@@ -2311,6 +2311,7 @@ AESG packages.
 - **Tests.** Sandbox: first upload succeeds and second fails; a file disappears after listing; a temporary upload failure is retried on the same key; a later scan uploads only the changed file (unchanged content not re-uploaded). Runner: a repair turn followed by completion with the failure listed and the answer intact; workspace-unavailable completes without a repair turn; all-published control. Five fail on the previous source; the two controls pass on both. The H-009 test for a bash run with a lost sandbox now expects unpublished outputs instead of a failed run. Worker suite: 632 passed, 3 skipped.
 - **Data impact.** None.
 - **Deployment.** Not deployed (worker).
+- **Follow-up.** A finalizer that throws outright (the audit's injected upload failure) is recorded as unpublished output files and the run completes with its answer; cancellation, retryable (timeout, lost lease) and terminal errors keep their handling.
 - **Remaining.** The web UI shows unpublished files as failed `persist_artifact` results; there is no dedicated "retry publication" button. A retry happens through a follow-up turn, whose scan publishes only what is still unpublished, or through the terminal finalizer.
 
 ### H-078 — A parallel-read deadline discards completed peer results

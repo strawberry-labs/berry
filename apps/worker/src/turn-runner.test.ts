@@ -2631,6 +2631,27 @@ describe("durable turn runner", () => {
       expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "failed" })]);
     });
 
+    it("keeps the answer when publication fails outright, and still retries a timeout", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        ...noTools(),
+        finalize: async () => { throw new Error("upload connection reset"); },
+      });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([
+        expect.objectContaining({ status: "failed", output: expect.objectContaining({ reason: "upload connection reset" }) }),
+      ]);
+      expect(JSON.stringify(repository.current.entries)).toContain("Both files are ready.");
+
+      const retrying = new FakeTurnRepository(answered());
+      await expect(new DurableTurnRunner(retrying, unusedModel(), {
+        ...noTools(),
+        finalize: async () => { throw new DurableTurnRetryableError("lease lost"); },
+      }).execute(job())).rejects.toThrow("lease lost");
+      expect(retrying.current.state).toBe("finalizing");
+    });
+
     it("completes normally when every file was published", async () => {
       const repository = new FakeTurnRepository(answered());
       const runner = new DurableTurnRunner(repository, unusedModel(), { ...noTools(), finalize: async () => [receipt] });

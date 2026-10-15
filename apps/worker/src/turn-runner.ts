@@ -2878,10 +2878,30 @@ export class DurableTurnRunner {
   }
 
   private async finalize(snapshot: DurableTurnSnapshot): Promise<TurnRunState> {
-    const finalizedArtifacts = await this.withHeartbeat(
-      snapshot,
-      async () => this.tools.finalize?.(snapshot) ?? [],
-    );
+    let finalizedArtifacts: readonly TurnToolResult[];
+    try {
+      finalizedArtifacts = await this.withHeartbeat(
+        snapshot,
+        async () => this.tools.finalize?.(snapshot) ?? [],
+      );
+    } catch (error) {
+      // A publication step that fails outright leaves the answer delivered and
+      // its outputs reported as not published (H-014). Timeouts, lost
+      // ownership and cancellation keep their retry or stop handling.
+      if (error instanceof DurableTurnCancellationError
+        || error instanceof DurableTurnRetryableError
+        || error instanceof DurableTurnTerminalError) throw error;
+      finalizedArtifacts = [{
+        output: {
+          publication: "failed",
+          path: "outputs/",
+          name: "output files",
+          reason: (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300),
+          workspaceUnavailable: true,
+        },
+        summary: "Not published: output files",
+      }];
+    }
     // Publication after the answer can fail for some files. Their receipts
     // and the answer are kept; the model gets one turn to publish or report
     // the files it can repair, then the run completes with the rest listed as
