@@ -7277,7 +7277,11 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
           prompt: { type: "string", minLength: 1, maxLength: 32_000 },
           title: { type: "string", maxLength: 160 },
           size: { type: "string" },
-          aspect_ratio: { type: "string", enum: ["1:1", "3:4", "4:3", "9:16", "16:9"] },
+          aspect_ratio: {
+            type: "string",
+            enum: ["1:1", "3:4", "4:3", "9:16", "16:9"],
+            description: "Shape to ask for. Image models have few native sizes: gpt-image models return 1024x1024 for 1:1, 1536x1024 (3:2) for 4:3 and 16:9, and 1024x1536 (2:3) for 3:4 and 9:16. The result states the actual size. When an exact ratio matters, ask in the prompt to keep key content away from the edges, then crop a copy deterministically.",
+          },
           transparent_background: { type: "boolean" },
           purpose: { type: "string", enum: ["final", "draft"], description: "final (default) publishes the image; draft keeps a working base under drafts/ for further editing." },
           reference_image_paths: {
