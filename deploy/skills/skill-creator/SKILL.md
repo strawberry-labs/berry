@@ -137,6 +137,24 @@ Use these conventions when relevant:
 For PDF, Word, Excel, PowerPoint, CV, or AESG-branded work, route through the
 matching managed skills instead of duplicating their detailed instructions.
 
+## Rules taken from outside sources
+
+When a skill encodes rules that come from outside the conversation, such as
+statutory or regulatory requirements, tax, payroll or benefit formulas,
+standards, thresholds, rates or official procedures:
+
+- Find the authoritative source (the regulator, statute or standards body) with
+  the research tools available in the task, and read its current version. If no
+  source can be retrieved, tell the user and mark the rule as unverified in the
+  skill.
+- Cite each rule in the skill: the source, its URL or document and section, and
+  the date it was checked. Write the jurisdiction, scope and effective date.
+- Test calculations against worked examples from the source or the user, not
+  only against your own formula, including the caps, minimums and eligibility
+  conditions the source states.
+- Keep a rule the user gave as their own policy labelled as such; do not present
+  it as law.
+
 ## Tool and safety guidance
 
 Skills are instructions, not a permission bypass. They may guide the use of
@@ -165,6 +183,9 @@ Before saving, verify:
 - reusable task attachments have been copied into stable `assets/` paths;
 - substantial reusable code lives in `scripts/` instead of a long inline block;
 - the workflow includes a concrete completion or validation condition;
+- rules, formulas, thresholds and rates from regulations or standards cite their
+  source and check date, and calculations were tested against the source's
+  examples (or are marked unverified);
 - the document is concise enough to load only useful context.
 
 ### 4. Save the skill
