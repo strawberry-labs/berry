@@ -234,6 +234,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 
 - **Continue intent (14 October):** continuation instructions are now phase-aware (no response yet / partial text / after completed tools); with no response the pending request is answered instead of "continuing" an older answer (task 176). Unit regressions fail on the old source. Not deployed.
 
+- **Status (15 October):** complete. Continue re-enters at the right phase (earlier commits), automatic retry handles transient failures, and publication failures after an answer no longer fail the run (`be1e488`, `04106c8`). Per-failure buttons were dropped by the owner: Continue is the manual action.
+
 ### H-015 — Expired queued text
 
 - Evidence: 12 weekly queue entries expired. Current queue listing excludes expired items; expiry is 24 hours by default.
@@ -314,6 +316,8 @@ Weekly incidents are historical evidence, not proof that the same problem remain
 - Verification needed: inspect rendered dates and prompt date injection on the deployed revision. Historical conversation discrepancies are confirmed; deployment cause is not.
 - **Implementation (14 October):** confirmed that no prompt carried the current date. The per-turn context now states the date and time the turn started (UTC unless a valid request time zone is supplied), stable across the turn's model calls so the cached prefix is unaffected. Not deployed.
 
+- **Decision (15 October):** the date is part of the journaled turn context (`a27cf4e`): written once when a run starts, replayed byte-identically, and refreshed as an appended entry only after 30 minutes. It no longer changes the system prompt or earlier messages, so it does not break the prompt cache and adds one short line per turn. This follows the DeepSeek harness (time as durable history messages, periodic refresh) rather than Pi (no date at all). The worker already uses `runtimeRequest.timezone` when present; the browser sends its time zone in the uncommitted scheduled-tasks work, so until that lands the date is in UTC. Closed for the worker.
+
 ### H-024 — Connector download to sandbox handoff
 
 - Observed: task `2743dd77-227e-4343-b50b-2d0a4ea164a5` successfully called Drive file read, then repeatedly searched for downloaded bytes and ultimately asked for reattachment or a helper. The user's request to open a random file was not fulfilled with an inspected preview.
@@ -352,6 +356,8 @@ These examples establish historical occurrence. Current production remediation r
 - Proposal: distinguish directory drops from files, recursively import supported folders or offer ZIP guidance, and show empty-file diagnostics before submission. Preserve relative paths and report upload counts/bytes. Empty inputs must not become substantive negative findings.
 - Acceptance: folder drag/drop, cloud placeholders, legitimate empty text files, failed uploads and nested ZIPs have distinct tested outcomes.
 - **Implementation (14 October):** the task composer no longer uploads 0-byte files; untyped ones are explained as folders or online-only placeholders (attach the contents or a ZIP), typed ones as empty. Not deployed. Recursive folder import and the other upload dialogs remain.
+
+- **Status (15 October):** complete. Empty folder drops are refused with an explanation (`f5ec9f5`); folder upload with structure will not be built (owner decision: file upload is enough).
 
 ### Additional evidence from the complete-history review
 
@@ -486,6 +492,8 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - Proposal: preserve a structured durable reference and latest relevant result; expose truncation explicitly, with source version/ACL checks. Avoid simply increasing context without measurement.
 - Acceptance: threshold multi-tool histories retain retrievable decisive results and accurate answers inside provider limits. Estimate 1–2 days if reproduced.
 - **Implementation (14 October):** a result past the budget is no longer sent as an empty string; it carries its durable reference and says it was omitted for the context limit. The cache-friendly oldest-first allocation is unchanged. Not deployed.
+
+- **Decision (15 October):** keep the current design. Results are bounded when created (read/bash 2,000 lines or 50 KB with the full output saved, MCP results valid and bounded with a receipt), and the shared history budget shows a past-budget result as a stated omission with its durable reference instead of blank text. Pi and the DeepSeek harness also cut at creation (head and tail plus a saved-file pointer) and rely on compaction, which runs here before the history budget is reached. No change; revisit only if a production run shows a past-budget omission.
 
 ### H-037 — Search query operators lost
 
@@ -688,6 +696,8 @@ Monthly provider-attempt evidence:36,154 reports cover33,532 logical groups;1,24
 - **Proposal:** retain explicit language preference in the task, and assess paragraph-level automatic direction with isolated English terms, URLs and numbers; preserve original technical identifiers where needed. Match streaming, settled output, editing and copying. Prefer logical spacing/alignment where direction applies. No need for a disruptive error modal. Approximately 1–2 days after browser reproduction and deployment comparison. Tradeoff: automatic direction must not reorder code, tables or copied identifiers.
 - **Verification:** replay the actual mixed-language complaint; visually inspect Arabic-first and English-first paragraphs, bullets, tables, dates, negative numbers, URLs, code and copy/paste. Include streaming-to-settled transition, selection, keyboard editing and screen-reader language. Record whether the issue is model language adherence, layout or both before declaring a fix.
 - **Implementation (14 October):** a browser reproduction showed the layout cause. Every Arabic block was laid out left-to-right, so clauses around English names read in reverse order, in settled answers, streaming text and prompt bubbles alike. Direction now follows the script most of a block's words use, with logical spacing; code stays left-to-right. A Chromium check fails before and passes after. A behaviour case for keeping a requested language awaits the evaluation run. Not deployed. DeepSeek's harness renderer was compared and has no direction handling.
+
+- **Status (15 October):** complete (owner decision). Recheck in the next seven days of logs; reopen only on a new report.
 
 ### Monthly audit: page-count and date constraints
 
@@ -958,6 +968,8 @@ Private evidence: \`task1164-admitted-skill-catalog.json\` and its fully reviewe
 - **Implementation (14 October):** when a request explicitly asks to use a term matching one enabled skill's name or distinctive first segment, the per-turn context tells the model to activate that skill before searching files (several matches are listed). Not deployed; the behavioural effect needs the issue's model evaluation.
 
 - **H-012/H-017, task 1038 (October 8), aggregation and confidence fixture:** the software-identification answer correctly finds named STAAD bracket captions and EasyFix4 version headers, and it renders selected image pages rather than relying on sparse PDF text alone. Its optional numeric summary labels the combined concrete-utilisation values 43.6%/69.4% as maxima even though the captured individual tensile checks reach 56.5%/77.3%. Distinguish individual, combined and governing checks before calling a value “maximum”; omit unrequested calculations when they add an unvalidated conclusion. The glass software identification is based on visual style and should carry that inference qualifier. Underlying structural adequacy and original source pixels were not independently adjudicated. Add this to the numeric-summary/source-confidence evaluation set; no new execution or extraction outage is established.
+
+- **Status (15 October):** complete (`36022d9`). Behaviour under real models is covered by the pending evaluation re-run.
 
 ### Certificate and continuation verification — 458/1,229 tasks
 
@@ -2194,6 +2206,7 @@ Task **983** (`1aba1c13-2df6-4d64-a647-90647539a29e`), October7: all **47 messag
 
 **Acceptance:** the six-offset reproduction makes one Tika request with identical text and cursor/line-limit receipts; changed bytes/MIME/engine/OCR configuration miss, duplicate concurrent readers extract once, timeout/error responses are not cached, and deleted/revoked or cross-tenant sources cannot be served. Compare warm-read p50/p95, whole-file transfers, Tika request volume and exact output hashes under these scenarios. Fixtures must preserve useful text/quality flags rather than treating a faster empty extraction as success. Evidence: `office-repeat-immutable-source-month-proof.json`, `office-repeat-current-runtime-proof.json`, task983's complete control flow. Recommendations only; no cache implemented.
 
+- **Decision (15 October):** no shared cache yet. The per-worker cache (`747f510`) already removes repeated extraction within a worker, and a cross-worker cache only pays off if extraction, not byte transfer, dominates. H-013's timing records (`document.extract` vs the read) will show that after deployment; decide then. Deferred, not open work.
 
 ### Monthly audit: task1171 — unusable Retry, later recovery, costly OCR and unsupported review claims
 
