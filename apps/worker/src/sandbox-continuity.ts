@@ -1786,6 +1786,16 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           ? `\n\n[Showing lines ${startLine}-${truncated.totalLines} of ${truncated.totalLines}. Full output: ${fullOutputPath}]`
           : `\n\n[Showing lines ${startLine}-${truncated.totalLines} of ${truncated.totalLines} (50.0KB limit). Full output: ${fullOutputPath}]`;
       }
+      // A failed Python run, or one masked by a pipeline or a later command,
+      // gets a hint that tells its cause apart (H-008).
+      if (exitCode !== 0 || rawOutput.includes("[Berry: the command finished with status 0, but")) {
+        const pythonFailure = sandboxPythonFailureHint(rawOutput, {
+          policy: networkPolicy(snapshot.runtimeRequest.networkPolicy),
+          workspaceRoot,
+          skills: stagedSkillFiles(snapshot),
+        });
+        if (pythonFailure) text += `\n\n${pythonFailure}`;
+      }
       if (exitCode !== 0) throw new Error(`${text}\n\nCommand exited with code ${exitCode ?? "unknown"}`);
       return {
         output: {
@@ -5391,6 +5401,109 @@ export function sandboxNetworkFailureHint(command: string, policy: NetworkPolicy
   }
   if (!blocked.size) return null;
   return `Network access to ${[...blocked].join(", ")} is blocked by this task's sandbox policy. An organization admin must allow the hostname in Execution & network, then retry in a new turn. Certificate verification is not the cause; do not retry with curl -k or disable TLS checks. Signed URL parameters have been omitted.`;
+}
+
+export interface StagedSkillFiles {
+  /** Directory that holds the skill's SKILL.md in the sandbox. */
+  root: string;
+  /** Package files in the sandbox, staged or not. */
+  files: readonly string[];
+}
+
+// Directories where skill files live or are referred to: staged packages
+// (<root>/runtime-skills/<id>-<revision>) and the logical skill locations
+// the model sees in skill listings.
+const SKILL_PATH = /(?:\/[\w.-]+)*\/(?:runtime-skills|organization-skills|personal-skills|managed-skills|cloud-skills|skills)\/[^\s'"`:,)]+/;
+const PYTHON_LIBRARY_FRAME = /(?:site-packages|dist-packages|\/lib\/python3[\d.]*\/|^<frozen )/;
+
+/**
+ * Adds a short, factual hint to a failed Python command so the model fixes
+ * the actual cause instead of guessing (H-008): (a) a package that is not
+ * installed, (b) skill files that are not at the path used, (c) an error in
+ * the script itself. Returns null when the output matches none of these.
+ */
+export function sandboxPythonFailureHint(output: string, options: {
+  policy: NetworkPolicy;
+  workspaceRoot: string;
+  skills?: readonly StagedSkillFiles[];
+}): string | null {
+  const lines = output.split("\n");
+  const frames = [...output.matchAll(/^\s*File "([^"]+)", line (\d+)/gm)].map((match) => ({ file: match[1]!, line: match[2]! }));
+  const exception = [...output.matchAll(/^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt)): ?(.*)$/gm)].at(-1);
+  const type = exception?.[1]?.split(".").at(-1);
+  const message = exception?.[2] ?? "";
+  const skills = options.skills ?? [];
+  const activation = skills.length
+    ? `Staged skill directories in this task: ${skills.map((skill) => skill.root).join(", ")}.`
+    : "No skill has been activated in this task.";
+  const unopened = lines.map((line) => /can't open file '([^']+)': \[Errno 2\]/.exec(line)?.[1]).find(Boolean);
+  const missingPath = unopened ?? (type === "FileNotFoundError" ? /No such file or directory: '([^']+)'/.exec(message)?.[1] : undefined);
+  if (missingPath && SKILL_PATH.test(missingPath)) {
+    return `[Berry: ${missingPath} does not exist in this sandbox: the skill's files are not at that path. Call activate_skill with the skill's name and a resources array listing the package files you need (for example scripts/<file>.py); its result gives the staged paths to use. ${activation}]`;
+  }
+  if (type === "ModuleNotFoundError" || type === "ImportError") {
+    const module = /No module named '([^']+)'/.exec(message)?.[1];
+    if (!module) return null;
+    const top = module.split(".")[0]!;
+    const helper = skills.flatMap((skill) => skill.files.map((file) => ({ skill, file })))
+      .find(({ file }) => file.endsWith(`/${top}.py`) || file.endsWith(`/${top}/__init__.py`));
+    if (helper) {
+      const directory = helper.file.slice(0, helper.file.lastIndexOf("/")).replace(new RegExp(`/${top}$`), "");
+      return `[Berry: '${top}' is a helper module of the skill in ${helper.skill.root}, not an installed package; installing packages will not help. Make sure ${helper.file} is staged (activate_skill with that path in resources), then run the script from ${directory} or set PYTHONPATH=${directory}.]`;
+    }
+    const importer = frames.at(-1)?.file;
+    if (importer && SKILL_PATH.test(importer)) {
+      return `[Berry: '${top}' is imported by the skill script ${importer} but is neither installed nor a staged file of an activated skill. If it is one of the skill's helper files, call activate_skill with it in resources; otherwise it is a package missing from this sandbox (check python -m pip list). ${activation}]`;
+    }
+    return `[Berry: the module '${top}' is not installed in this sandbox. Run python -m pip list to see the installed packages and use one of them if it fits. ${pipAvailability(options.policy, options.workspaceRoot)}]`;
+  }
+  if (type === "SyntaxError" || type === "IndentationError" || type === "TabError") {
+    const location = frames.at(-1);
+    return `[Berry: ${type} in the script${location ? ` at ${location.file}:${location.line}` : ""}. This is a bug in the code itself; installing packages or retrying will not fix it. Correct the code and run it again.]`;
+  }
+  const innermost = frames.at(-1);
+  if (
+    type
+    && innermost
+    && output.includes("Traceback (most recent call last):")
+    && !PYTHON_LIBRARY_FRAME.test(innermost.file)
+    && !SKILL_PATH.test(innermost.file)
+    && !/^(?:OSError|IOError|FileNotFoundError|PermissionError|IsADirectoryError|NotADirectoryError|ConnectionError|ConnectionRefusedError|ConnectionResetError|TimeoutError|BrokenPipeError|MemoryError|KeyboardInterrupt|SystemExit)$/.test(type)
+  ) {
+    return `[Berry: ${type} raised by the script's own code at ${innermost.file}:${innermost.line}. This is an error in the script; installing packages will not fix it. Fix the code at that line.]`;
+  }
+  return null;
+}
+
+function pipAvailability(policy: NetworkPolicy, workspaceRoot: string): string {
+  const reachable = policy.egress === "unrestricted"
+    || (policy.egress === "on" && ["pypi.org", "files.pythonhosted.org"].every((host) => networkDomainAllowed(host, policy.allowedDomains)));
+  if (policy.egress === "off") return "Installing is not possible: this task's sandbox has no network access.";
+  if (!reachable) return "pip cannot download it: pypi.org and files.pythonhosted.org are not allowed by this task's network policy (an organization admin can allow them in Execution & network).";
+  return `Installing may work: python -m pip install --target ${workspaceRoot}/tmp/pylib <package>, then add PYTHONPATH=${workspaceRoot}/tmp/pylib (the preinstalled environment may not be writable).`;
+}
+
+function stagedSkillFiles(snapshot: DurableTurnSnapshot): StagedSkillFiles[] {
+  const skills = new Map<string, Set<string>>();
+  for (const step of snapshot.steps ?? []) {
+    if (step.state !== "completed") continue;
+    if ((stringValue(step.input.toolName) ?? step.type.slice(5)) !== "activate_skill") continue;
+    const output = objectValue(step.output);
+    for (const receipt of [output, ...(Array.isArray(output.dependencies) ? output.dependencies.map(objectValue) : [])]) {
+      const location = stringValue(receipt.location);
+      if (!location?.endsWith("/SKILL.md")) continue;
+      const root = location.slice(0, -"/SKILL.md".length);
+      const files = skills.get(root) ?? new Set<string>();
+      for (const value of [
+        ...(Array.isArray(receipt.resources) ? receipt.resources : []),
+        ...(Array.isArray(receipt.stagedResources) ? receipt.stagedResources : []),
+      ]) {
+        if (typeof value === "string") files.add(value.startsWith("/") ? value : `${root}/${value}`);
+      }
+      skills.set(root, files);
+    }
+  }
+  return [...skills].map(([root, files]) => ({ root, files: [...files] }));
 }
 
 function networkPolicy(value: unknown): {

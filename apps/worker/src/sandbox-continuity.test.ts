@@ -19,6 +19,7 @@ import {
   PI_READ_STREAM_SCRIPT,
   piReadContent,
   sandboxNetworkFailureHint,
+  sandboxPythonFailureHint,
   piReadPdfContent,
   type PreparationTiming,
   type SandboxSnapshotObjectStore,
@@ -1379,6 +1380,95 @@ describe("SandboxContinuityManager", () => {
         outcome: "empty",
         fingerprintBasis: { exitCode: 0, output: "", truncated: false },
       },
+    });
+  });
+
+  describe("Python failure hints (H-008)", () => {
+    const python = (args: string[], cwd?: string) => {
+      const result = spawnSync("python3", args, { encoding: "utf8", ...(cwd ? { cwd } : {}) });
+      expect(result.status).not.toBe(0);
+      return `${result.stdout}${result.stderr}`;
+    };
+    const offline = { egress: "off" as const, allowedDomains: [] };
+    const options = { policy: offline, workspaceRoot: "/workspace" };
+
+    it("names a package that is not installed and says whether pip can reach PyPI", () => {
+      const output = python(["-c", "import berry_h008_missing.sub"]);
+      expect(output).toContain("ModuleNotFoundError");
+      const hint = sandboxPythonFailureHint(output, options);
+      expect(hint).toContain("the module 'berry_h008_missing' is not installed in this sandbox");
+      expect(hint).toContain("python -m pip list");
+      expect(hint).toContain("no network access");
+      expect(sandboxPythonFailureHint(output, { ...options, policy: { egress: "on", allowedDomains: ["example.com"] } }))
+        .toContain("pypi.org and files.pythonhosted.org are not allowed");
+      expect(sandboxPythonFailureHint(output, { ...options, policy: { egress: "on", allowedDomains: ["pypi.org", "files.pythonhosted.org"] } }))
+        .toContain("Installing may work: python -m pip install --target /workspace/tmp/pylib");
+    });
+
+    it("says when skill files are not at the path used and how to stage them", () => {
+      const root = mkdtempSync(join(tmpdir(), "berry-h008-"));
+      try {
+        const missing = python([join(root, "skills", "pdf", "scripts", "fill.py")]);
+        expect(missing).toContain("can't open file");
+        const hint = sandboxPythonFailureHint(missing, options);
+        expect(hint).toContain("the skill's files are not at that path");
+        expect(hint).toContain("activate_skill");
+        expect(hint).toContain("No skill has been activated");
+        // A staged script whose sibling helper was not staged.
+        const skillRoot = join(root, "runtime-skills", "pdf-0123456789abcdef");
+        const scripts = join(skillRoot, "scripts");
+        spawnSync("mkdir", ["-p", scripts]);
+        writeFileSync(join(scripts, "fill.py"), "import pdf_helpers\n");
+        const helperOutput = python([join(scripts, "fill.py")], root);
+        const helper = sandboxPythonFailureHint(helperOutput, {
+          ...options,
+          skills: [{ root: skillRoot, files: [join(scripts, "fill.py"), join(scripts, "pdf_helpers.py")] }],
+        });
+        expect(helper).toContain(`'pdf_helpers' is a helper module of the skill in ${skillRoot}`);
+        expect(helper).toContain(`PYTHONPATH=${scripts}`);
+        expect(helper).toContain("installing packages will not help");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("points at the script's own line for syntax errors and errors in its code", () => {
+      const root = mkdtempSync(join(tmpdir(), "berry-h008-"));
+      try {
+        writeFileSync(join(root, "broken.py"), "def main(:\n    pass\n");
+        writeFileSync(join(root, "divide.py"), "total = 0\nprint(10 / total)\n");
+        const syntax = sandboxPythonFailureHint(python([join(root, "broken.py")]), options);
+        expect(syntax).toContain(`SyntaxError in the script at ${join(root, "broken.py")}:1`);
+        expect(syntax).toContain("installing packages or retrying will not fix it");
+        const runtime = sandboxPythonFailureHint(python([join(root, "divide.py")]), options);
+        expect(runtime).toContain(`ZeroDivisionError raised by the script's own code at ${join(root, "divide.py")}:2`);
+        expect(runtime).toContain("installing packages will not fix it");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("adds nothing to failures that match none of these cases", () => {
+      expect(sandboxPythonFailureHint("ls: cannot access 'missing': No such file or directory\n", options)).toBeNull();
+      // Raised inside the standard library, not the script's own code.
+      const library = python(["-c", "import json; json.loads('{')"]);
+      expect(library).toContain("JSONDecodeError");
+      expect(sandboxPythonFailureHint(library, options)).toBeNull();
+      // A data file the script could not open is not a skill path or a code bug.
+      expect(sandboxPythonFailureHint(python(["-c", "open('/workspace/inputs/missing.csv')"]), options)).toBeNull();
+    });
+
+    it("appends the hint to a failed bash result and keeps the original error", async () => {
+      const traceback = "Traceback (most recent call last):\n  File \"/workspace/make_doc.py\", line 1, in <module>\n    import docx\nModuleNotFoundError: No module named 'docx'\n";
+      const manager = managerWithProvider(
+        { read: vi.fn(), write: vi.fn(), list: vi.fn() },
+        async function* () {
+          yield { kind: "stderr", data: traceback };
+          yield { kind: "exit", exit_code: 1, signal: null };
+        },
+      );
+      await expect(manager.execute(snapshot(), toolStep("bash", { command: "python make_doc.py" })))
+        .rejects.toThrow(`${traceback}\n\n[Berry: the module 'docx' is not installed in this sandbox.`);
     });
   });
 

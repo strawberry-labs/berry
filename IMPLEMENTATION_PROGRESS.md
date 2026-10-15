@@ -2389,3 +2389,11 @@ AESG packages.
 - **Data impact.** None. Existing memories and sources are untouched; the filters apply at read time.
 - **Deployment.** API and worker (the shared config gains two optional env vars).
 - **Remaining.** The thresholds are set from the embedding model's typical score range, not from Berry data. Review them after a week using `retrieval_snapshots.candidates[].similarity`. The run ID is still not passed into retrieval snapshots, and Mem0's own scores are not yet gated beyond its internal 0.1.
+
+### H-016 / H-008 — Hidden pipeline failures and unclear Python errors
+
+- **H-016 (`1475124`).** A DEBUG trap reads `PIPESTATUS` after each pipeline (with `set -T`, plus RETURN/EXIT traps for pipelines ending a function, subshell or script) and lists failed earlier members, e.g. `exit 35: sh -c '...' (pipeline member 1 of 2)`. Exit statuses, `$?`, `PIPESTATUS` and `$_` are unchanged; pipefail is not imposed. 141, curl 23 and grep/diff/cmp 1 are not reported. About 7 µs per command.
+- **H-008.** A failed Python command gets a short hint after the untouched error: a missing third-party package (with what the task's network policy allows for pip); a skill file or helper not at that path (how to stage it with `activate_skill`, or the staging directory and `PYTHONPATH`); or a bug in the script itself (file:line, and that installing packages will not fix it). No hint for non-Python failures, library tracebacks or I/O errors on data files.
+- **Tests.** One H-016 and five H-008 cases running the real wrapper and real Python output; all fail on the previous source. Worker suite 691 passed.
+- **Deployment.** Worker only; the sandbox image is unchanged.
+- **Remaining.** Python or Node piped to `head` exit 1 on a broken pipe and are reported; `xargs grep` 123 is reported; a user's own EXIT/DEBUG/RETURN trap replaces Berry's.
