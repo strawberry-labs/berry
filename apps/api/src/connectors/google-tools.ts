@@ -281,7 +281,9 @@ async function searchDriveFiles(token: string, input: Record<string, unknown>): 
   const requestedScope = optionalString(input.searchScope) === "allDrives" ? "allDrives" : "user";
   const search = async (corpora: "drive" | "user" | "allDrives") => {
     const result = await googleJson(token, driveUrl("files", { q: optionalString(input.query), pageSize: boundedInteger(input.pageSize, 50, 1, 100), pageToken, orderBy: optionalString(input.orderBy), spaces: "drive", corpora, driveId: corpora === "drive" ? driveId : undefined, includeItemsFromAllDrives: true, supportsAllDrives: true, fields: `nextPageToken,incompleteSearch,files(${DRIVE_FIELDS})` })) as Record<string, unknown>;
-    const files = Array.isArray(result.files) ? result.files.filter((file) => eligibleDriveFile(file)) : [];
+    const files = Array.isArray(result.files)
+      ? result.files.filter((file) => eligibleDriveFile(file)).map((file) => driveListingEntry(file as Record<string, unknown>))
+      : [];
     return {
       ...result,
       files,
@@ -307,6 +309,38 @@ async function listDriveChildren(token: string, input: Record<string, unknown>):
   const driveId = optionalString(input.driveId)
     ?? optionalString(record(await googleJson(token, driveUrl(`files/${encodeURIComponent(folderId)}`, { fields: "id,driveId", supportsAllDrives: true })))?.driveId);
   return searchDriveFiles(token, { query: `'${escapeDriveQuery(folderId)}' in parents and trashed = false`, pageSize: input.pageSize, pageToken: input.pageToken, driveId });
+}
+/**
+ * A listing gives each eligible file's identity and the three permissions a
+ * next step needs, not its full capability and restriction metadata: 100 full
+ * records ran past the tool-result limit and cut off the next-page token
+ * (H-070). drive_get_file_metadata still returns one file's full metadata.
+ */
+function driveListingEntry(file: Record<string, unknown>): Record<string, unknown> {
+  const capabilities = record(file.capabilities) ?? {};
+  const owners = Array.isArray(file.owners)
+    ? file.owners.flatMap((owner) => {
+        const value = record(owner);
+        const entry = compact({ displayName: optionalString(value?.displayName), emailAddress: optionalString(value?.emailAddress) });
+        return Object.keys(entry).length > 0 ? [entry] : [];
+      })
+    : undefined;
+  return compact({
+    id: file.id,
+    name: file.name,
+    mimeType: file.mimeType,
+    size: file.size,
+    createdTime: file.createdTime,
+    modifiedTime: file.modifiedTime,
+    webViewLink: file.webViewLink,
+    parents: file.parents,
+    driveId: file.driveId,
+    resourceKey: file.resourceKey,
+    owners,
+    canEdit: typeof capabilities.canEdit === "boolean" ? capabilities.canEdit : undefined,
+    canDownload: typeof capabilities.canDownload === "boolean" ? capabilities.canDownload : undefined,
+    canCopy: typeof capabilities.canCopy === "boolean" ? capabilities.canCopy : undefined,
+  });
 }
 function eligibleDriveFile(value: unknown): boolean { if (!value || typeof value !== "object" || Array.isArray(value)) return false; const file = value as Record<string, unknown>; const capabilities = record(file.capabilities); return file.trashed !== true && capabilities?.canAccessViaGenAi !== false; }
 async function driveFilePreflight(token: string, fileId: string, operation: "read" | "download" | "edit" | "copy"): Promise<Record<string, unknown>> {

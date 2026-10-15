@@ -467,6 +467,25 @@ describe("durable MCP tool exposure", () => {
 });
 
 describe("durable MCP journal serialization", () => {
+  it("says what it left out when a value exceeds the journal limits (H-070)", () => {
+    const fields = Object.fromEntries(Array.from({ length: 130 }, (_, index) => [`field${index}`, index]));
+    const value = sanitizeMcpJournalValue({
+      text: "x".repeat(120_005),
+      files: Array.from({ length: 260 }, (_, index) => ({ id: `file-${index}` })),
+      fields,
+    }) as { text: string; files: unknown[]; fields: Record<string, unknown> };
+
+    expect(value.text).toHaveLength(120_000 + "…[Berry kept 120,000 of 120,005 characters]".length);
+    expect(value.text.endsWith("…[Berry kept 120,000 of 120,005 characters]")).toBe(true);
+    expect(value.files).toHaveLength(257);
+    expect(value.files.at(-1)).toBe("[Berry omitted 4 more of 260 items]");
+    expect(Object.keys(value.fields)).toHaveLength(129);
+    expect(value.fields.berryOmittedFields).toBe("2 more of 130 fields");
+
+    const small = { text: "ok", files: [{ id: "a" }], fields: { a: 1 } };
+    expect(sanitizeMcpJournalValue(small)).toEqual(small);
+  });
+
   it("redacts binary content from both parts and raw result details", () => {
     const binary = "a".repeat(32_000);
 

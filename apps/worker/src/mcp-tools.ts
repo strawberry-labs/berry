@@ -985,14 +985,24 @@ const MCP_JOURNAL_OBJECT_LIMIT = 128;
 const MCP_JOURNAL_DEPTH_LIMIT = 8;
 const MCP_BINARY_FIELD = /^(?:b64_json|base64|blob|bytes|data)$/i;
 
-/** Removes binary MCP payloads and bounds structured metadata before journaling it. */
+/**
+ * Removes binary MCP payloads and bounds structured metadata before journaling
+ * it. Every cut says what was left out, so a bounded record is never read as
+ * the complete response (H-070).
+ */
 export function sanitizeMcpJournalValue(value: unknown, depth = 0): JsonValue {
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
-  if (typeof value === "string") return value.slice(0, MCP_JOURNAL_STRING_LIMIT);
+  if (typeof value === "string") {
+    return value.length > MCP_JOURNAL_STRING_LIMIT
+      ? `${value.slice(0, MCP_JOURNAL_STRING_LIMIT)}…[Berry kept ${MCP_JOURNAL_STRING_LIMIT.toLocaleString("en-US")} of ${value.length.toLocaleString("en-US")} characters]`
+      : value;
+  }
   if (depth >= MCP_JOURNAL_DEPTH_LIMIT) return "[omitted: MCP metadata nesting limit reached]";
   if (Array.isArray(value)) {
-    return value.slice(0, MCP_JOURNAL_ARRAY_LIMIT)
-      .map((item) => sanitizeMcpJournalValue(item, depth + 1));
+    const kept = value.slice(0, MCP_JOURNAL_ARRAY_LIMIT).map((item) => sanitizeMcpJournalValue(item, depth + 1));
+    return value.length > MCP_JOURNAL_ARRAY_LIMIT
+      ? [...kept, `[Berry omitted ${value.length - MCP_JOURNAL_ARRAY_LIMIT} more of ${value.length} items]`]
+      : kept;
   }
   const object = record(value);
   if (!object) return String(value).slice(0, MCP_JOURNAL_STRING_LIMIT);
@@ -1006,13 +1016,19 @@ export function sanitizeMcpJournalValue(value: unknown, depth = 0): JsonValue {
       ...(stringValue(object.uri) ? { uri: stringValue(object.uri)! } : {}),
     };
   }
-  const entries = Object.entries(object).slice(0, MCP_JOURNAL_OBJECT_LIMIT);
-  return Object.fromEntries(entries.map(([key, item]) => [
-    key,
-    MCP_BINARY_FIELD.test(key)
-      ? "[omitted: binary MCP content is not stored in the journal]"
-      : sanitizeMcpJournalValue(item, depth + 1),
-  ]));
+  const allEntries = Object.entries(object);
+  const entries = allEntries.slice(0, MCP_JOURNAL_OBJECT_LIMIT);
+  return Object.fromEntries([
+    ...entries.map(([key, item]) => [
+      key,
+      MCP_BINARY_FIELD.test(key)
+        ? "[omitted: binary MCP content is not stored in the journal]"
+        : sanitizeMcpJournalValue(item, depth + 1),
+    ]),
+    ...(allEntries.length > MCP_JOURNAL_OBJECT_LIMIT
+      ? [["berryOmittedFields", `${allEntries.length - MCP_JOURNAL_OBJECT_LIMIT} more of ${allEntries.length} fields`]]
+      : []),
+  ]);
 }
 
 function compactMcpAnnotations(value: {

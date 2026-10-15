@@ -301,6 +301,39 @@ describe("Google Drive shared-drive scope", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("lists each file's identity without its full capability metadata (H-070)", async () => {
+    const full = {
+      ...file("spec"),
+      size: "2048",
+      modifiedTime: "2026-10-01T08:00:00.000Z",
+      webViewLink: "https://drive.google.com/file/d/spec/view",
+      parents: ["folder-1"],
+      owners: [{ displayName: "Amal Haddad", emailAddress: "amal@example.com", photoLink: "https://example.com/p.png", kind: "drive#user" }],
+      capabilities: { canAccessViaGenAi: true, canEdit: false, canDownload: true, canCopy: true, canComment: true, canShare: false, canTrash: false },
+      contentRestrictions: [{ readOnly: false }],
+      linkShareMetadata: { securityUpdateEligible: false },
+      version: "42",
+      md5Checksum: "abc",
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(json({ files: [full, { ...file("blocked"), capabilities: { canAccessViaGenAi: false } }], nextPageToken: "page-2" })));
+
+    const result = await run("drive_search_files", { query: "name contains 'Spec'" }) as { files: unknown[]; nextPageToken: string; omittedIneligibleCount: number };
+    expect(result.files).toEqual([{
+      id: "spec",
+      name: "spec.pdf",
+      mimeType: "application/pdf",
+      size: "2048",
+      modifiedTime: "2026-10-01T08:00:00.000Z",
+      webViewLink: "https://drive.google.com/file/d/spec/view",
+      parents: ["folder-1"],
+      owners: [{ displayName: "Amal Haddad", emailAddress: "amal@example.com" }],
+      canEdit: false,
+      canDownload: true,
+      canCopy: true,
+    }]);
+    expect(result).toMatchObject({ nextPageToken: "page-2", omittedIneligibleCount: 1 });
+  });
+
   it("searches only the named shared drive when a drive ID is given", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(json({ files: [] }));
     vi.stubGlobal("fetch", fetchMock);
