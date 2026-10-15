@@ -1,6 +1,6 @@
 {
   "schemaVersion": 8,
-  "generated": "2026-09-24",
+  "generated": "2026-10-15",
   "sourceEvidence": [
     {
       "name": "General Template_AESG.docx",
@@ -35,10 +35,10 @@
     },
     {
       "path": "templates/AESG_General_Presentation.pptx",
-      "sha256": "7e081409636535a50b4e6647adc12bbbb0ceb20e7303ed21d02566c08ffcd943",
-      "bytes": 10999817,
+      "sha256": "4070823ae3bc90f4f69026fe12ca1bff5794e209dde2865a72dbdaf6bda7d45f",
+      "bytes": 10999359,
       "purpose": "Compact CRC-clean General Presentation with 17 specimens, 1 master, and 17 reachable layouts",
-      "evidence": "Unused masters, layouts, and their media were pruned with compact_pptx_template.py; retained body specimens were then normalised to Verdana 9 pt and AESG Gray"
+      "evidence": "Unused masters, layouts, and their media were pruned with compact_pptx_template.py; retained body specimens were then normalised to Verdana 9 pt and AESG Gray. October 2026: theme major/minor fonts and every explicit text or bullet typeface in the master, layouts and specimens set to Verdana (symbol bullet fonts kept), so inherited text such as slide numbers no longer falls back from Arial; applied by normalise_office_templates.py --presentation"
     },
     {
       "path": "templates/AESG_Excel_Template_2023.xlsx",

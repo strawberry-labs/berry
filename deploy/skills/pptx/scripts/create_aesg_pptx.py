@@ -186,15 +186,29 @@ def text_lines(value) -> list[str]:
 def set_bullet(paragraph, enabled: bool) -> None:
     properties = paragraph._p.get_or_add_pPr()
     for child in list(properties):
-        if child.tag.rsplit("}", 1)[-1] in {"buNone", "buChar", "buAutoNum"}:
+        if child.tag.rsplit("}", 1)[-1] in {"buNone", "buChar", "buAutoNum", "buFont", "buFontTx"}:
             properties.remove(child)
+    # Bullet elements come before these in a:pPr.
+    following = next(
+        (child for child in properties if child.tag.rsplit("}", 1)[-1] in {"tabLst", "defRPr", "extLst"}),
+        None,
+    )
+
+    def place(element) -> None:
+        if following is None:
+            properties.append(element)
+        else:
+            following.addprevious(element)
+
     if enabled:
         properties.set("marL", "285750")
         properties.set("indent", "-228600")
-        bullet = properties.makeelement(qn("a:buChar"), {"char": "•"})
-        properties.append(bullet)
+        # Name the bullet's font: without one LibreOffice draws the bullet in its
+        # own default sans, which the PDF font gate rejects (H-043).
+        place(properties.makeelement(qn("a:buFont"), {"typeface": "Verdana"}))
+        place(properties.makeelement(qn("a:buChar"), {"char": "•"}))
     else:
-        properties.append(properties.makeelement(qn("a:buNone"), {}))
+        place(properties.makeelement(qn("a:buNone"), {}))
 
 
 def set_block(
