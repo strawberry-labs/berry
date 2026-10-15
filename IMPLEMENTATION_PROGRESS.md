@@ -2350,3 +2350,9 @@ AESG packages.
 - **Tests.** Five copy cases and one file-path case in `packages/desktop-ui` (89 passed); light and dark themes produced identical HTML in a Chromium check against a fake API.
 - **Data impact.** None. **Deployment.** Not deployed (web).
 - **Remaining.** Not checked in real Outlook, Gmail or Safari/WebKit; Firefox selections that cross unselectable text use the browser's copy; the extension side panel is not covered.
+
+### H-038 — Desktop local-agent merges tool calls when a gateway restarts indices
+
+- **Fix.** The desktop agent's stream accumulator applies the worker's rule from `8f966ed`: a different call id arriving with a name on an occupied index starts a new call, and a repeated id is not doubled. Ordinary fragmented streams are unchanged.
+- **Tests.** The worker regression cases ported to `packages/local-agent/src/model.test.ts`, plus interleaved parallel calls; local-agent suite 174 passed.
+- **Data impact.** None. **Deployment.** Desktop app release (not part of the web deployment).
