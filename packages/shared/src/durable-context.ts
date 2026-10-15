@@ -7,7 +7,8 @@ const JsonObjectSchema = z.record(z.unknown());
 
 // Keep admission estimates and the worker's overview request on the same
 // bounded output ceiling. Focused inspections use a smaller worker-only cap.
-export const VISION_ADAPTER_MAX_OUTPUT_TOKENS = 1_536;
+// Reasoning vision models spend part of it before the answer (H-039).
+export const VISION_ADAPTER_MAX_OUTPUT_TOKENS = 3_072;
 // The adapter retries once when a provider returns reasoning without final
 // content. Admission must reserve enough budget for both provider calls.
 export const VISION_ADAPTER_MAX_ATTEMPTS = 2;

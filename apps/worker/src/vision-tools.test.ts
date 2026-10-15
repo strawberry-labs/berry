@@ -123,7 +123,8 @@ describe("DurableVisionToolExecutor", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
     const requestBody = JSON.parse(String(request?.body)) as Record<string, unknown>;
-    expect(requestBody).toMatchObject({ max_tokens: 1_536 });
+    // Overview output is capped by the admitted vision maxTokens (2,048 here).
+    expect(requestBody).toMatchObject({ max_tokens: 2_048 });
     expect(requestBody).not.toHaveProperty("reasoning");
     expect(requestBody).not.toHaveProperty("reasoning_effort");
   });
@@ -336,7 +337,7 @@ describe("DurableVisionToolExecutor", () => {
     await executor.execute(snapshot, visionStep({ mode: "focused", question: "What color is the helmet?" }));
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
-    expect(JSON.parse(String(request?.body))).toMatchObject({ max_tokens: 1_024 });
+    expect(JSON.parse(String(request?.body))).toMatchObject({ max_tokens: 2_048 });
   });
 
   it("reuses the first focused observation by stable user intent when the model paraphrases its question", async () => {
@@ -430,21 +431,63 @@ describe("DurableVisionToolExecutor", () => {
     };
     const question = { mode: "focused", question: "List every employee name in the table." };
 
-    it("reports a length-stopped observation as incomplete and does not cache it", async () => {
+    it("reports an observation still cut off after its continuation as incomplete and does not cache it", async () => {
       const fetchMock = respond("1. Amal Haddad\n2. Bilal Khan\n3. Chen", "length");
       vi.stubGlobal("fetch", fetchMock);
       const cache = new MemoryVisionCache();
       const executor = new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" });
 
       const first = await executor.execute(visionSnapshot(), visionStep(question));
-      expect(first.output).toMatchObject({ vision: { complete: false, cacheHit: false, diagnostics: [{ finishReason: "length" }] } });
+      expect(first.output).toMatchObject({
+        vision: {
+          complete: false,
+          cacheHit: false,
+          diagnostics: [{ purpose: "first", finishReason: "length" }, { purpose: "continuation", finishReason: "length" }],
+        },
+      });
       expect((first.output as { content: string }).content).toContain("Incomplete observation");
       expect(first.summary).toContain("incomplete");
       expect(cache.values.size).toBe(0);
 
       const repeated = await executor.execute(visionSnapshot(), visionStep(question));
       expect(repeated.output).toMatchObject({ vision: { complete: false, cacheHit: false } });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
+
+    it("continues a cut-off observation once in the same conversation and caches the whole answer", async () => {
+      const replies = [
+        { content: "1. Amal Haddad\n2. Bilal Khan\n3. Chen", finish: "length" },
+        { content: " Wei\n4. Dana Ortiz", finish: "stop" },
+      ];
+      const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) => {
+        const reply = replies[fetchMock.mock.calls.length - 1]!;
+        return new Response(JSON.stringify({
+          id: "vision-response",
+          model: "minimax-m3",
+          choices: [{ message: { content: reply.content }, finish_reason: reply.finish }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const cache = new MemoryVisionCache();
+      const result = await new DurableVisionToolExecutor(base, cache, { VISION_TEST_KEY: "secret" })
+        .execute(visionSnapshot(), visionStep(question));
+
+      expect(result.output).toMatchObject({
+        vision: { complete: true, diagnostics: [{ purpose: "first" }, { purpose: "continuation", finishReason: "stop" }] },
+      });
+      expect((result.output as { content: string }).content).toContain("1. Amal Haddad\n2. Bilal Khan\n3. Chen Wei\n4. Dana Ortiz");
+      expect((result.output as { content: string }).content).not.toContain("Incomplete observation");
+      expect(cache.values.size).toBe(1);
+      const first = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body)) as { messages: Array<{ role: string; content: unknown }> };
+      const second = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body)) as { messages: Array<{ role: string; content: unknown }> };
+      // Same system and image message first, so the provider can reuse its cached prefix.
+      expect(second.messages.slice(0, 2)).toEqual(first.messages);
+      expect(second.messages.slice(2)).toEqual([
+        { role: "assistant", content: "1. Amal Haddad\n2. Bilal Khan\n3. Chen" },
+        { role: "user", content: expect.stringContaining("Continue exactly where it stopped") },
+      ]);
+      expect(result.usage).toMatchObject({ inputTokens: 20, outputTokens: 40 });
     });
 
     it("still caches and reuses a complete observation", async () => {
@@ -484,7 +527,7 @@ describe("DurableVisionToolExecutor", () => {
     it("answers a question with no mode as a focused question", async () => {
       const { result, body, prompt } = await run({ question });
       expect(prompt).toContain(question);
-      expect(body.max_tokens).toBe(1_024);
+      expect(body.max_tokens).toBe(2_048);
       expect(result.output).toMatchObject({ vision: { mode: "focused" } });
       expect((result.output as { content: string }).content).not.toContain("was not sent");
     });
