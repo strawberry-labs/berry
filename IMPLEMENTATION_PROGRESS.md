@@ -151,7 +151,7 @@ fixture; this is fixed in `54c9255`.
 | H-032 (cache metric truth) | Committed — partial | `29dd951` | Not deployed (worker + API + web) |
 | H-032 (served backend + retention diagnostics) | Committed — partial | `3a27931` | Not deployed (worker) |
 | H-032 (per-turn context out of the system prefix) | Validated locally (offline); live evaluation pending | `9eecde6` | Not deployed (worker) |
-| H-064 / H-007 (skill dependency closure + staging) | Committed — platform part; AESG manifests pending | `f6f9074` | Not deployed (worker) |
+| H-064 / H-007 (skill dependency closure + staging) | Committed — platform (`f6f9074`) and AESG manifests (`2ae7cbb`); fresh-sandbox replay pending | `f6f9074`, `2ae7cbb` | Not deployed (worker); manifests not published (organization skill packages) |
 | H-068 (import readiness) | Committed | `f2923b2` | Not deployed (worker) |
 | H-069 (temporary imports kept out of Library) | Committed | `3104547` | Not deployed (API) |
 | H-076 (shared-drive scope) | Committed | `920a84c` | Not deployed (API) |
@@ -191,64 +191,98 @@ fixture; this is fixed in `54c9255`.
 | H-065 (unfinished image bases published as finals) | Committed — partial | `6469a9d` | Not deployed (worker) |
 | H-045 (assistant-saved skills look domain-verified) | Committed — partial | `ec134cc` | Not deployed (worker + web) |
 | H-047 (mixed Arabic/English laid out left-to-right) | Committed — partial (layout fixed; language adherence awaits evaluation) | `6655e89` | Not deployed (web, via desktop-ui) |
-| H-024 (connector download handoff) | Revalidated — same no-path cause as H-068 (`f2923b2`); task's raw receipt not checked | — | — |
-| H-015 (expired queued text) | Blocked — web queue model is mid-refactor in uncommitted work | — | — |
-| H-043 (presentation font inheritance) | Blocked — python-pptx unavailable offline; template change collides with prepared manifest | — | — |
-| H-056 / H-058 (DOCX duplicate keys, placeholder validator) | Blocked — fixes belong in prepared, already-published AESG sources | — | — |
+| H-024 / H-068 (unstaged import resumed without a second download) | Committed | `230c8a8` | Not deployed (worker) |
+| H-003 / H-006 (typed tool failures; unchanged retries refused) | Committed | `4d7928d` | Not deployed (worker + local-agent) |
+| H-021 (idle-timeout cause kept through retry exhaustion) | Committed | `5e03305` | Not deployed (worker) |
+| Evaluation outcomes (inconclusive replies kept apart) | Committed | `d98ffbf` | Test only |
+| AESG branding and Word packages as published (provenance, unchanged) | Committed | `540a1b8` | Already published (hash-verified) |
+| H-056 (repeated JSON keys silently drop content) | Committed | `59fd12a` | Not published (organization `docx`, `pptx`, `xlsx` packages) |
+| H-058 (placeholder check rejects real labels) | Committed | `8fee1bb` | Not published (organization `aesg-branding` package) |
+| H-043 (presentation page numbers and bullets fall back from Verdana) | Committed — production-image render pending | `c5be1ef` | Not published (organization `aesg-branding` and `pptx` packages) |
+| Evaluation harness (tool rounds, token cap, corrected checks) | Committed | `a937cc8`, `1152c54` | Test only |
+| H-013 (where run time goes) | Committed — measurement; optimisations await the data | `d280bd1` | Not deployed (shared package: worker rebuild; API and web rebuild with it) |
+| H-015 (expired queued text) | Committed | `aefe3ae` | Not deployed (API and web together) |
+| H-055 / H-073 / H-074 (personal `cv-creator-new` package) | Fixed in the package, not in this repository | — | `~/Downloads/cv-creator-new-15-10-26.skill`; each owner re-uploads |
 | H-004 (repair loops across changed arguments) | Committed — partial (re-spelt paths stop; other changed arguments get guidance) | `80559b3` | Not deployed (worker) |
 | H-002 (prerequisite) | Committed — source of the already-deployed hotfix | `d5b9138` | Already in production since 2026-09-24 (hash-verified); prompt work itself still open |
 
-## Remaining issues (23 of 76) and what each needs
+## Remaining issues (11 of 76) and what each needs
 
-53 of the 76 registered issues have committed fixes (24 full, 29 partial). None is
-deployed. The other 23 are not done for the reasons below; no code was changed for them.
+65 of the 76 registered issues have committed or packaged fixes. None is deployed. The 11
+below are not done:
 
-**Needs a live model evaluation** (behavioural; prompt changes need measured evidence).
-`scripts/run-behaviour-evals.sh <base-url> <model...>` runs the 28-case suite for each prompt
-variant with a key from `BERRY_EVAL_API_KEY` (verified offline against a fake endpoint);
-reading a key from local files was refused by the tool permission policy, so no live run yet:
+**Needs the live model re-run** (behavioural; a prompt change must show a measured gain).
+The 15 October harness fixes (`a937cc8`, `1152c54`) make the run judge real answers: tool
+calls are answered "tool not run" for up to three rounds, replies get 8,000 tokens, three
+samples per case at temperature 0.5, and four checks that misread correct answers are
+fixed. Re-scoring the saved 14 October answers with the corrected checks leaves at most one
+real failure per model and prompt among completed answers; 9-11 cases per run need the
+re-run to be judged. Run `scripts/run-behaviour-evals.sh <base-url> <model...>` with
+`BERRY_EVAL_API_KEY` exported (reading a key from local files is refused by the tool
+permission policy here).
 
-| ID | What is ready / what is missing |
+| ID | What the re-run must show |
 | --- | --- |
-| H-002 | Prompt proposal in `SYSTEM_PROMPT.md`; deployed prompt and offline eval harness committed (`d5b9138`). Needs the paired multi-model evaluation with saved-draft checks. |
-| H-012 | Numerical/deliverable correctness; needs domain fixtures with deterministic checks and an evaluation. |
-| H-017 | Source freshness and verification claims; needs claim/evidence evaluation. |
-| H-019 | Structural versus visual validation claims (the placeholder false positive is H-058). |
-| H-020 | Text-only work entering the sandbox; savings must be measured first. |
-| H-022 | Explicit corrections and constraints missed. |
-| H-025 | Technical claims without source verification. |
-| H-026 | Tenant facts for platform/privacy answers; also needs approved tenant fact content. |
-| H-029 | Unsupported authorship and verification guarantees. |
-| H-034 | Benign file conversion refused. |
+| H-002 | Rewrites keep meaning, modality and the right recipient. |
+| H-012 | Arithmetic and computed targets are right, including after tool rounds. |
+| H-017 | No claim of a fresh check after a failed fetch; possible changes flagged. |
+| H-019 | A failed render is not reported as checked. |
+| H-020 | Text-only edits use no tools. |
+| H-022 | Corrections and constraints are followed. |
+| H-025 | Uncertainty is kept when challenged; no invented clauses. |
+| H-026 | Tenant facts are not invented. |
+| H-029 | No detector or authorship guarantees. |
+| H-034 | Third-party file conversion is not refused. |
 
-**Needs production evidence or a reproduction** (cause not established; a change now would
-be speculative). `scripts/aws-read-only-evidence.sh <aws-profile> <hostname> [since]` collects
-it over SSM in one read-only transaction (`scripts/remaining-issue-evidence.sql`, validated
-on a migrated disposable database); production access from this session was refused by the
-tool permission policy, so it has not been run:
-
-| ID | Missing evidence |
-| --- | --- |
-| H-003 | Incident-to-category mapping for tool errors. |
-| H-006 | Exact remote MCP/BerryCrawl error strings, current manifests and allowlist. |
-| H-013 | Benchmarks of preparation and snapshot work. |
-| H-021 | Retry and model timing for the stranded-work cases. |
-| H-024 | The task's raw connector receipt (same symptom as H-068, fixed in `f2923b2`). |
-
-**Owned elsewhere or outside this repository:**
+**Owned elsewhere:**
 
 | ID | Owner / location |
 | --- | --- |
-| H-015 | Web queue model is being moved into the uncommitted `packages/client-core`. |
-| H-037 | Remote BerryCrawl revision. |
-| H-043 | Needs python-pptx (not installed; no network installs) and touches the prepared template manifest. |
-| H-055, H-073, H-074 | The user's personal `cv-creator-new` package in the production database; none of the cited production hashes match this repository's `cv-creator`. |
-| H-056, H-058 (and the H-064 AESG manifests) | Prepared, already-published AESG sources that are not committed (see "Blocked: prepared AESG skill sources"). |
+| H-037 | BerryCrawl (`~/Documents/berrycrawl`, `backend/src/search/search.service.ts`): quoted phrases, `site:`, `inurl:`, `intitle:` and `-word` are stripped and never sent. A repair prompt was handed to the BerryCrawl owner on 15 October. |
 
 **Design decisions taken (14 October):** H-065 drafts stay unpublished under `drafts/`
 (`6469a9d`); H-045 assistant-saved skills carry an unverified-rules status (`ec134cc`). H-035
 reproduced as a UI race and fixed (`966d9a1`); H-047 reproduced as a layout fault and fixed (see
 its entry).
+
+## Round 3 (15 October): AESG document tools, timing, queue and evaluation
+
+Committed on `codex/web-audit`; nothing pushed, deployed or published. Each commit holds
+only its own files; the other 200 working-tree entries are untouched.
+
+- **AESG sources recorded (`540a1b8`).** The September 24 Word report template and generator
+  fixes were live but uncommitted. Package hashes computed the API's way equal production:
+  `aesg-branding` `8363b241a041438f` (22 files), `docx` `5700c3ec51eeffbb` (4 files). The
+  Downloads packages are older (`AESG-branding (2).skill` equals the previous HEAD).
+- **H-064 manifests (`2ae7cbb`).** `skill-dependencies.json` for docx (helpers and both
+  templates), pdf (converter and the Word generator), pptx (template) and xlsx (logo); a worker
+  test checks every declared file exists.
+- **H-056 (`59fd12a`).** Word, PowerPoint and Excel generators refuse a repeated JSON key with
+  its path before writing anything.
+- **H-058 (`8fee1bb`).** Template filler still blocks; the templates' sample wording blocks only
+  as a whole Word/PowerPoint paragraph outside a table; otherwise it is a non-blocking warning.
+  The recorded task card passes unchanged.
+- **H-043 (`c5be1ef`).** Theme, master, layout and specimen fonts set to Verdana by the
+  normaliser; generated bullets name Verdana. A deck of all 17 layouts embeds only Verdana and
+  Verdana Bold (before: Arial page numbers on every content page and Helvetica bullets).
+- **Evaluation (`a937cc8`, `1152c54`).** See "Remaining issues".
+- **H-013 (`d280bd1`).** Time to first token, step durations, whole-run time and sandbox
+  preparation steps are recorded per run; `scripts/run-timing-report.sql` reports them.
+- **H-015 (`aefe3ae`).** Expired queued text stays visible for seven days as "Expired, not
+  sent" with Copy and Remove; it is never delivered. The same mapping change is applied to
+  the uncommitted `packages/client-core` copy.
+- **CV package (H-055, H-073, H-074).** Fixed in the user's personal `cv-creator-new` package
+  (`~/Downloads/cv-creator-new-15-10-26.skill`, skill name unchanged): photo preparation writes
+  all photos or none, structured project names stay literal, the required photos follow the
+  requested layouts, `--no-photo` is explicit, and an unknown employer stays not stated.
+  16 package tests pass; four end-to-end scenarios and a pre-render rejection were checked.
+- **Verification.** AESG tests (`deploy/tests`, 31) pass; web 297, worker 589, shared 64 and
+  evaluation 36 tests pass on a clean copy with each change; API has only the 24 known
+  `QueuedFollowUpService` injection failures; nine PostgreSQL queue scenarios pass.
+- **Deployment notes.** Organization skills publish with `deploy/e2b-aesg/sync-skills.sh`, which
+  republishes all seven packages from the server checkout (it backs up the two package tables
+  first). H-015 needs API and web together. H-013 changes the shared package, so the worker,
+  API and web rebuild from the same commit. No migration in this round.
 
 ## Round 2 (14 October evening): local changes from the production evidence
 
