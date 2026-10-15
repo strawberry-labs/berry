@@ -81,7 +81,9 @@ tables, images with captions/sources, page breaks, approval pages, and branded
 section dividers. Image objects accept `path`, `caption`, `source`, and
 `widthInches`. Table `widths` accepts one positive relative width per header.
 When source order matters, use an ordered `blocks` array instead of the legacy
-grouped fields. `bullets`, `numbered`, and `items` accept strings or nested
+grouped fields. Never repeat a key inside one JSON object, such as a second
+`paragraphs`: JSON keeps only the last value, so the generators refuse the spec
+and name the repeated key. Put all of that text under one key, in reading order. `bullets`, `numbered`, and `items` accept strings or nested
 objects `{"text": "...", "items": [...]}` up to three levels; bullets render as
 `a.` → `i` → `•` and numbered items as `1.` → `a.` → `i.`, restarting for every
 list block. Supported block types are `paragraph`, `label`,

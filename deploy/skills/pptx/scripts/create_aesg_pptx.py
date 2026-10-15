@@ -442,6 +442,46 @@ def fill_slide(slide, slide_spec: dict, slide_number: int) -> None:
                     node.text = ""
 
 
+def load_spec(path: Path) -> dict:
+    """Read the JSON spec, refusing a key repeated inside one object.
+
+    json.loads keeps only the last of two equal keys, so a second "paragraphs"
+    once dropped the opening of a published document without any error (H-056).
+    """
+    repeated: dict[int, tuple[dict, list[str]]] = {}
+
+    def keep_pairs(pairs: list[tuple[str, object]]) -> dict:
+        mapping: dict = {}
+        for key, value in pairs:
+            if key in mapping:
+                repeated.setdefault(id(mapping), (mapping, []))[1].append(key)
+            mapping[key] = value
+        return mapping
+
+    spec = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=keep_pairs)
+    if repeated:
+        found: list[str] = []
+
+        def visit(value: object, where: str) -> None:
+            if isinstance(value, dict):
+                found.extend(f'"{key}" in {where}' for key in repeated.get(id(value), ({}, []))[1])
+                for key, child in value.items():
+                    visit(child, f"{where}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, f"{where}[{index}]")
+
+        visit(spec, "spec")
+        raise ValueError(
+            f"{path} repeats {', '.join(found)}. JSON keeps only the last value, so the "
+            "earlier content would be silently lost. Put all of it under one key, in "
+            "reading order, and run again; nothing was written."
+        )
+    if not isinstance(spec, dict):
+        raise ValueError(f"{path} must contain one JSON object")
+    return spec
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True, type=Path)
@@ -454,7 +494,7 @@ def main() -> int:
     template = args.template or args.branding_skill_dir / "assets/templates/AESG_General_Presentation.pptx"
     if not template.is_file():
         raise FileNotFoundError(template)
-    spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    spec = load_spec(args.spec)
     slide_specs = spec.get("slides") or [{"layout": "cover", "title": spec.get("title", "AESG")}]
     if not isinstance(slide_specs, list):
         raise ValueError("spec.slides must be a list")
