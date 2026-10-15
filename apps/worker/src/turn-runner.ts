@@ -854,7 +854,7 @@ export class DurableTurnRunner {
     const maxModelAttempts = Math.max(1, this.options.maxModelAttempts ?? 3);
     if (step.attempt >= maxModelAttempts) {
       throw new DurableTurnTerminalError(
-        `Model request failed after ${step.attempt} attempts.`,
+        modelRetryExhaustedMessage(snapshot, step, this.options.modelIdleTimeoutMs ?? 240_000),
       );
     }
     const modelProgress = progressState(snapshot);
@@ -1041,6 +1041,25 @@ export class DurableTurnRunner {
       });
     } catch (error) {
       const diagnostics = providerFailureDiagnostics(snapshot, error, modelStartedAt);
+      if (error instanceof DurableToolTimeoutError) {
+        // Berry's own idle or duration deadline aborted these streams. Record
+        // them as timeouts, not user cancellations, so the cause survives
+        // retry exhaustion (H-021).
+        const finalAttempt = step.attempt + 1 >= maxModelAttempts;
+        for (const attempt of providerAttempts) {
+          if (attempt.category !== "aborted") continue;
+          attempt.category = "timeout";
+          if (attempt.retryDecision === "cancelled" || attempt.retryDecision === undefined) {
+            attempt.retryDecision = finalAttempt ? "terminal" : "retry";
+          }
+        }
+        if (finalAttempt) diagnostics.retryDecision = "terminal";
+      }
+      const priorCauses = record(record(step.output)?.providerDiagnostics)?.attemptCauses;
+      diagnostics.attemptCauses = [
+        ...(Array.isArray(priorCauses) ? priorCauses : []),
+        { cause: diagnostics.failureCause ?? null, latencyMs: diagnostics.latencyMs ?? null },
+      ].slice(-10);
       const failedModelProgress = reconcileModelCallProgress(
         modelProgress,
         providerAttempts,
@@ -4608,6 +4627,41 @@ function successfulProviderDiagnostics(
   };
 }
 
+/**
+ * The terminal message when a model step runs out of attempts: what stopped
+ * each attempt and which files the run had already saved (H-021).
+ */
+function modelRetryExhaustedMessage(snapshot: DurableTurnSnapshot, step: DurableTurnStep, idleTimeoutMs: number): string {
+  const diagnostics = record(record(step.output)?.providerDiagnostics);
+  const causes = (Array.isArray(diagnostics?.attemptCauses) ? diagnostics.attemptCauses : [])
+    .map((entry) => stringValue(record(entry)?.cause))
+    .filter((cause): cause is string => Boolean(cause));
+  const lastCause = stringValue(diagnostics?.failureCause) ?? causes.at(-1);
+  const reason = causes.length > 0 && causes.every((cause) => cause === "idle_timeout")
+    ? `the model stopped sending output, and Berry ended ${causes.length === 1 ? "the attempt" : `each of ${causes.length} attempts`} after ${Math.round(idleTimeoutMs / 1_000)} seconds without progress (idle timeout)`
+    : lastCause === "idle_timeout"
+      ? `the last attempt stopped sending output for ${Math.round(idleTimeoutMs / 1_000)} seconds (idle timeout)`
+      : lastCause === "max_duration"
+        ? "the last attempt exceeded the maximum model request duration"
+        : lastCause && lastCause !== "unknown"
+          ? `the last attempt failed with a ${lastCause.replace(/_/g, " ")} error`
+          : "";
+  const saved = [...new Map(snapshot.steps.flatMap((candidate) => {
+    if (candidate.state !== "completed" || !candidate.type.startsWith("tool.")) return [];
+    const artifact = record(record(candidate.output)?.artifact);
+    const fileId = stringValue(artifact?.fileId);
+    const name = stringValue(artifact?.name);
+    return fileId && name ? [[fileId, name] as const] : [];
+  })).values()];
+  return [
+    `Model request failed after ${step.attempt} attempts${reason ? `: ${reason}` : ""}.`,
+    saved.length > 0
+      ? `Work saved before the failure is kept: ${saved.slice(0, 8).join(", ")}${saved.length > 8 ? ` and ${saved.length - 8} more` : ""}.`
+      : "",
+    "Use Continue to resume from what is already saved.",
+  ].filter(Boolean).join(" ");
+}
+
 function providerFailureDiagnostics(
   snapshot: DurableTurnSnapshot,
   error: unknown,
@@ -4615,15 +4669,22 @@ function providerFailureDiagnostics(
 ): Record<string, JsonValue> {
   const details = classifyProviderFailure(error);
   const status = details.status ?? null;
+  const cancelled = error instanceof DurableTurnCancellationError;
+  const deadline = error instanceof DurableToolTimeoutError ? error : null;
   return {
-    outcome: error instanceof DurableTurnCancellationError ? "cancelled" : "failure",
+    outcome: cancelled ? "cancelled" : "failure",
     model: stringValue(snapshot.runtimeRequest.model) ?? "unknown",
     status,
     statusClass: providerAttemptStatusClass(details.status, error),
-    category: error instanceof DurableTurnCancellationError ? "aborted" : details.category,
-    retryDecision: error instanceof DurableTurnCancellationError
+    category: cancelled ? "aborted" : deadline ? "timeout" : details.category,
+    retryDecision: cancelled
       ? "cancelled"
-      : details.retryable ? "retry" : "terminal",
+      : deadline || details.retryable ? "retry" : "terminal",
+    // Distinguishes Berry's idle and duration deadlines from user cancellation
+    // and provider-side failures (H-021).
+    failureCause: cancelled
+      ? "user_cancelled"
+      : deadline ? (deadline.phase === "idle" ? "idle_timeout" : "max_duration") : details.category,
     physicalAttempt: Math.max(1, (latestStep(snapshot.steps, "model.call")?.attempt ?? 0) + 1),
     latencyMs: Math.max(0, Date.now() - startedAt),
     inputTokens: 0,

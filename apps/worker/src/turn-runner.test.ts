@@ -28,6 +28,7 @@ import {
   durableBuiltInToolDefinitions,
   durableToolManifestMetrics,
   queuedFollowUpRuntimeRequest,
+  DurableToolTimeoutError,
   modelMessages,
   usageCostMicros,
   type BudgetReservationDecision,
@@ -722,6 +723,8 @@ describe("durable turn runner", () => {
         cacheWriteTokens: 0,
         finishReason: null,
         errorCode: "UPSTREAM_UNAVAILABLE",
+        failureCause: "server",
+        attemptCauses: [{ cause: "server", latencyMs: expect.any(Number) }],
       },
     });
     expect(JSON.stringify(repository.releasedRetryDiagnostics)).not.toContain("sensitive upstream response body");
@@ -2150,6 +2153,97 @@ describe("durable turn runner", () => {
       .resolves.toMatchObject({ state: "failed" });
     expect(executions).toBe(0);
     expect(repository.current.error).toContain("failed 5 times with identical arguments and error");
+  });
+
+  describe("stalled model streams (H-021)", () => {
+    // Persists retry diagnostics on the model step, as the SQL repository does.
+    class ReleasingTurnRepository extends FakeTurnRepository {
+      override async release(snapshotValue: DurableTurnSnapshot, error?: string, retryDiagnostics?: DurableTurnRetryDiagnostics): Promise<void> {
+        await super.release(snapshotValue, error, retryDiagnostics);
+        const step = retryDiagnostics ? this.current.steps.find((candidate) => candidate.id === retryDiagnostics.stepId) : undefined;
+        if (step && retryDiagnostics) {
+          step.output = { ...((step.output ?? {}) as Record<string, unknown>), providerDiagnostics: retryDiagnostics.providerDiagnostics } as never;
+        }
+      }
+    }
+    // An earlier image the run already saved (task f1bb2668's pattern).
+    const savedImage: DurableTurnStep = {
+      ...toolStep("completed", "idempotent", false),
+      sequence: 1,
+      type: "tool.create_image",
+      input: { toolCallId: "image-call", toolName: "create_image", arguments: { prompt: "hero" }, requiresApproval: false, approvalKind: "file-edit" },
+      output: { text: "Generated hero.png (1536x1024, 3:2)", artifact: { kind: "file", fileId: "00000000-0000-7000-8000-0000000000aa", name: "hero.png", path: "/v1/files/x/content" } },
+    };
+
+    // The provider accepts the request, sends a little reasoning, then goes silent.
+    function stallingModel(onStart: () => void) {
+      return {
+        call: async (_snapshot: DurableTurnSnapshot, _step: DurableTurnStep, context: Parameters<DurableTurnModel["call"]>[2]) => {
+          onStart();
+          await context.emitDelta("Planning the table", "reasoning");
+          return new Promise<never>((_resolve, reject) => {
+            context.signal?.addEventListener("abort", () => {
+              context.onProviderAttempt?.({ physicalAttempt: 1, model: "kimi", status: 200, statusClass: "2xx", category: "aborted", retryDecision: "cancelled", latencyMs: 240_000 });
+              reject(new DOMException("This operation was aborted", "AbortError"));
+            }, { once: true });
+          });
+        },
+      } satisfies DurableTurnModel;
+    }
+
+    it("keeps the idle-timeout cause through retry exhaustion and names the saved work", async () => {
+      vi.useFakeTimers();
+      try {
+        const repository = new ReleasingTurnRepository(snapshot("calling_model", [admittedStep(), savedImage, modelStep("pending", 2)]));
+        let modelCalls = 0;
+        const tools = { execute: vi.fn(async () => ({ output: {}, summary: "unexpected" })) };
+        const runner = new DurableTurnRunner(repository, stallingModel(() => { modelCalls += 1; }), tools, { owner: "worker-stall" });
+
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const pending = runner.execute({ tenantId, runId, reason: "continue" });
+          const settled = expect(pending).rejects.toBeInstanceOf(DurableToolTimeoutError);
+          await vi.advanceTimersByTimeAsync(240_000);
+          await settled;
+        }
+        const final = await runner.execute({ tenantId, runId, reason: "continue" });
+
+        expect(modelCalls).toBe(3);
+        expect(tools.execute).not.toHaveBeenCalled();
+        const attempts = repository.events.filter((event) => event.kind === "provider.attempt");
+        expect(attempts.map((event) => [event.kind === "provider.attempt" && event.category, event.kind === "provider.attempt" && event.retryDecision]))
+          .toEqual([["timeout", "retry"], ["timeout", "retry"], ["timeout", "terminal"]]);
+        const diagnostics = (repository.current.steps.find((step) => step.type === "model.call")?.output as { providerDiagnostics?: { failureCause?: string; attemptCauses?: Array<{ cause: string }> } }).providerDiagnostics;
+        expect(diagnostics?.failureCause).toBe("idle_timeout");
+        expect(diagnostics?.attemptCauses?.map((entry) => entry.cause)).toEqual(["idle_timeout", "idle_timeout", "idle_timeout"]);
+        expect(final.state).toBe("failed");
+        expect(repository.current.error).toContain("Model request failed after 3 attempts: the model stopped sending output, and Berry ended each of 3 attempts after 240 seconds without progress (idle timeout).");
+        expect(repository.current.error).toContain("Work saved before the failure is kept: hero.png.");
+        expect(repository.current.error).toContain("Use Continue to resume from what is already saved.");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps a user cancellation distinct from a timeout and does not retry it", async () => {
+      const repository = new ReleasingTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const cancellations = new ActiveTurnCancellationRegistry();
+      let modelCalls = 0;
+      let started!: () => void;
+      const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+      const runner = new DurableTurnRunner(repository, stallingModel(() => { modelCalls += 1; started(); }), noTools(), {
+        owner: "worker-cancel", cancellations,
+      });
+
+      const execution = runner.execute({ tenantId, runId, reason: "continue" });
+      await providerStarted;
+      cancellations.cancel(runId);
+
+      await expect(execution).resolves.toMatchObject({ state: "cancelled" });
+      expect(modelCalls).toBe(1);
+      const attempts = repository.events.filter((event) => event.kind === "provider.attempt");
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ category: "aborted", retryDecision: "cancelled" });
+    });
   });
 
   describe("typed tool failures (H-003, H-006)", () => {
