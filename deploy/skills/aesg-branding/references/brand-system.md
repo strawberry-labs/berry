@@ -101,7 +101,7 @@ converter fallback.
 | Artifact | Role | Font | Size | Colour |
 |---|---|---|---:|---|
 | General Report DOCX/PDF | Body, bullets, numbered text, table text | Verdana | 10 pt | `#343741` |
-| General Report DOCX/PDF | H1 / H2 / H3 | Verdana | 22 / 16 / 14 pt | `#008C95` |
+| General Report DOCX/PDF | Heading 1 / 2 / 3 | Verdana | 14 / 12 / 11 pt | `#008C95` |
 | Letterhead DOCX/PDF | Body, metadata, lists | Verdana | 9 pt | `#53565A` |
 | Letterhead DOCX/PDF | Subject / optional heading | Verdana | 12 pt | `#53565A` / `#008C95` |
 | AESG PPTX | Body text | Verdana | 9 pt | `#343741` |
@@ -109,7 +109,9 @@ converter fallback.
 | AESG PPTX | Divider text | Verdana | 22 pt | `#FFFFFF` |
 
 Report body paragraphs use 1.15 line spacing with 0 pt before and 3 pt after.
-H1 uses 10 pt before and H2/H3 use 4 pt before, with 0 pt after. Table captions
+Headings use single line spacing: Heading 1 is 14 pt before and 14 pt after,
+Heading 2 is 12 pt before and after, and Heading 3 is 11 pt before and after.
+See "Report headings, lists, and contents" below for numbering. Table captions
 are centred Verdana 9 pt in `#04999A`; figure captions are centred Verdana 9 pt
 italic in `#008C95`. The new `General Template_AESG.docx` has portrait
 narrative pages with a 1701 DXA top margin, A4 left/right/bottom margins of 720
@@ -170,8 +172,9 @@ the tool and reference-image workflow.
   DXA landscape/appendix top margin; never create top spacing with blank
   paragraphs.
 - Preserve its cover artwork, section relationship hierarchy, media, and AESG
-  styles. Main headings are 22 pt, first subheadings 16 pt, and second
-  subheadings 14 pt in the retained template.
+  styles. Headings are the built-in Word Heading 1 / 2 / 3 styles at
+  14 / 12 / 11 pt; the legacy `AESG Main Heading`, `AESG Sub H1`, and
+  `AESG H2` names are aliases based on them.
 - Clone the specimen-backed cover, approval table, and complete photographic
   divider component. Use `Plain Table 4` banding for standard tables, the
   source three-column grid for image tables (white header, teal labels,
@@ -181,7 +184,37 @@ the tool and reference-image workflow.
   use `rowSpans` for grouped monitoring labels when the source merges them.
   Use inline images to avoid the source floating-image/caption collisions.
   Never copy the 66 pages of Lorem Ipsum samples or their broken TOC/bookmark
-  fields into output documents.
+  fields into output documents; the generator builds a fresh TOC field from
+  the report's own headings.
+
+## Report headings, lists, and contents
+
+AESG reviewers check generated reports in Word. Headings, numbering, lists,
+and the contents page must be real Word functionality, never typed text.
+
+| Element | Word feature | Format |
+|---|---|---|
+| Heading 1 | Built-in `Heading 1` style, outline level 1 | Verdana 14 pt, `4.`; 14 pt before / 14 pt after |
+| Heading 2 | Built-in `Heading 2` style, outline level 2 | Verdana 12 pt, `4.1`; 12 pt before / 12 pt after |
+| Heading 3 | Built-in `Heading 3` style, outline level 3 | Verdana 11 pt, `4.1.1`; 11 pt before / 11 pt after |
+| Heading numbers | One multilevel list linked to the three styles | Left 1.9 cm, hanging 1.9 cm at every level so text aligns and `10.12.3` fits |
+| Bullets | `AESG Bullet` / `AESG Bullet 2` / `AESG Bullet 3` on one multilevel list | `a.` → `i` → `•`; 1.27 / 1.9 / 2.54 cm left, 0.635 cm hanging |
+| Numbered steps | `AESG Numbering` / `2` / `3` on one multilevel list | `1.` → `a.` → `i.` with the same indents |
+| Contents | Word `TOC \o "1-3" \h \z \u` field after the cover/approval pages | `toc 1`–`toc 3` styles, dot leaders, hyperlinked page numbers |
+
+- Never type `1.`, `2.1`, `a.`, `i`, or a bullet glyph into heading or list
+  text. The number comes from the style's list, so Word renumbers and the TOC
+  updates when sections move. Strip source numbering from heading text unless
+  the label is not a sequence number (for example `Appendix A`), then set
+  `headingNumbered: false`.
+- Each list starts again at `a.` or `1.`. Nest items to reach the second and
+  third levels; do not simulate indentation with spaces, tabs, or manual
+  line breaks.
+- The generator fills the TOC's page numbers from a LibreOffice render, so
+  Word, PDFs, and previews open with correct pages and no "update fields"
+  prompt. After editing in Word, right-click the TOC and choose Update Field.
+- Divider pages repeat the chapter number and title as static artwork text,
+  matched to the heading that follows.
 
 ## PowerPoint system
 

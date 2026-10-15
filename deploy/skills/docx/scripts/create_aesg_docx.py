@@ -7,6 +7,9 @@ import argparse
 import copy
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -19,6 +22,12 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
+
+# Repository layout fallback for imports and tests; main() puts the activated
+# --branding-skill-dir first on sys.path for runtime skill mounts.
+_LOCAL_BRANDING_SCRIPTS = Path(__file__).resolve().parents[2] / "aesg-branding" / "scripts"
+if _LOCAL_BRANDING_SCRIPTS.is_dir() and str(_LOCAL_BRANDING_SCRIPTS) not in sys.path:
+    sys.path.append(str(_LOCAL_BRANDING_SCRIPTS))
 
 GREEN = "008C95"
 GRAY = "343741"
@@ -38,10 +47,23 @@ LETTER_BLOCK_LINE_PT = 13.8
 REPORT_BODY_PT = 10.0
 REPORT_BODY_COLOR = GRAY
 REPORT_HEADING_COLOR = GREEN
-REPORT_HEADING_SIZES = {1: 22.0, 2: 16.0, 3: 14.0}
+REPORT_HEADING_SIZES = {1: 14.0, 2: 12.0, 3: 11.0}
 REPORT_BODY_LINE_SPACING = 1.15
 REPORT_BODY_SPACE_PT = 3.0
-REPORT_HEADING_SPACING_PT = {1: (10.0, 0.0), 2: (4.0, 0.0), 3: (4.0, 0.0)}
+REPORT_HEADING_SPACING_PT = {1: (14.0, 14.0), 2: (12.0, 12.0), 3: (11.0, 11.0)}
+REPORT_HEADING_STYLES = {
+    1: ("Heading 1", "AESG Main Heading"),
+    2: ("Heading 2", "AESG Sub H1"),
+    3: ("Heading 3", "AESG H2"),
+}
+REPORT_LIST_STYLES = {
+    "bullets": (("AESG Bullet", "List Bullet"), ("AESG Bullet 2", "List Bullet 2"), ("AESG Bullet 3", "List Bullet 3")),
+    "numbered": (("AESG Numbering", "List Number"), ("AESG Numbering 2", "List Number 2"), ("AESG Numbering 3", "List Number 3")),
+}
+REPORT_LIST_BASE_NUM_IDS = {"bullets": "4", "numbered": "5"}
+REPORT_LIST_LEVELS = 3
+TOC_TITLE = "Table of Contents"
+TOC_LEVEL_STYLES = {1: "toc 1", 2: "toc 2", 3: "toc 3"}
 REPORT_CAPTION_PT = 9.0
 REPORT_CAPTION_COLOR = "04999A"
 REPORT_FIGURE_CAPTION_COLOR = GREEN
@@ -693,12 +715,14 @@ def add_divider(
     divider_source,
     *,
     start_on_new_page: bool,
+    entry: dict | None = None,
 ) -> None:
     if start_on_new_page:
         document.add_page_break()
     divider = [copy.deepcopy(element) for element in divider_source]
     for element in divider:
         replace_leaf_text(element, {"Section Heading II": heading})
+    number_divider(divider, entry)
     next_shape_id = max(
         [
             int(node.get("id"))
@@ -718,6 +742,335 @@ def add_divider(
                 node.set("id", f"_x0000_s{next_shape_id}")
                 next_shape_id += 1
         append_before_final_section(document, element)
+
+
+class ReportStructure:
+    """Track native heading numbers, bookmarks, and list instances."""
+
+    def __init__(self, document: Document) -> None:
+        self.document = document
+        self.counters = [0, 0, 0]
+        self.headings: list[dict] = []
+        self.next_bookmark_id = 9000
+        self.toc_placeholder = None
+        self.toc_after_page_break = False
+
+    def reserve_heading(self, level: int, numbered: bool) -> dict:
+        number = ""
+        if numbered:
+            self.counters[level - 1] += 1
+            for index in range(level, len(self.counters)):
+                self.counters[index] = 0
+            parts = [str(value) for value in self.counters[:level]]
+            number = f"{parts[0]}." if level == 1 else ".".join(parts)
+        self.next_bookmark_id += 1
+        entry = {
+            "level": level,
+            "number": number,
+            "bookmark": f"_Toc{self.next_bookmark_id:09d}",
+            "bookmarkId": str(self.next_bookmark_id),
+        }
+        self.headings.append(entry)
+        return entry
+
+    def new_list(self, kind: str) -> str | None:
+        """Create a restarted instance of the template's multilevel list."""
+
+        numbering_part = getattr(self.document.part, "numbering_part", None)
+        if numbering_part is None:
+            return None
+        root = numbering_part.element
+        base_id = REPORT_LIST_BASE_NUM_IDS[kind]
+        abstract_id = None
+        for num in root.findall(qn("w:num")):
+            if num.get(qn("w:numId")) == base_id:
+                abstract_id = num.find(qn("w:abstractNumId")).get(qn("w:val"))
+        if abstract_id is None:
+            return None
+        next_id = max(int(num.get(qn("w:numId"))) for num in root.findall(qn("w:num"))) + 1
+        num = OxmlElement("w:num")
+        num.set(qn("w:numId"), str(next_id))
+        abstract = OxmlElement("w:abstractNumId")
+        abstract.set(qn("w:val"), abstract_id)
+        num.append(abstract)
+        override = OxmlElement("w:lvlOverride")
+        override.set(qn("w:ilvl"), "0")
+        start = OxmlElement("w:startOverride")
+        start.set(qn("w:val"), "1")
+        override.append(start)
+        num.append(override)
+        cleanup = root.find(qn("w:numIdMacAtCleanup"))
+        if cleanup is not None:
+            cleanup.addprevious(num)
+        else:
+            root.append(num)
+        return str(next_id)
+
+
+def order_paragraph_properties(paragraph) -> None:
+    properties = paragraph._p.get_or_add_pPr()
+    from report_structure import PPR_ORDER, reorder  # noqa: PLC0415
+
+    reorder(properties, PPR_ORDER)
+
+
+def set_paragraph_numbering(paragraph, num_id: str, level: int) -> None:
+    properties = paragraph._p.get_or_add_pPr()
+    for existing in properties.findall(qn("w:numPr")):
+        properties.remove(existing)
+    numbering = OxmlElement("w:numPr")
+    ilvl = OxmlElement("w:ilvl")
+    ilvl.set(qn("w:val"), str(level))
+    numbering.append(ilvl)
+    num = OxmlElement("w:numId")
+    num.set(qn("w:val"), num_id)
+    numbering.append(num)
+    properties.append(numbering)
+    order_paragraph_properties(paragraph)
+
+
+def field_runs(instruction: str, cached: str, *, dirty: bool = False) -> list:
+    """Return the runs for a complex Word field with a cached result."""
+
+    runs = []
+    for kind in ("begin", "instr", "separate", "result", "end"):
+        run = OxmlElement("w:r")
+        if kind in {"begin", "separate", "end"}:
+            char = OxmlElement("w:fldChar")
+            char.set(qn("w:fldCharType"), kind)
+            if kind == "begin" and dirty:
+                char.set(qn("w:dirty"), "true")
+            run.append(char)
+        elif kind == "instr":
+            text = OxmlElement("w:instrText")
+            text.set(qn("xml:space"), "preserve")
+            text.text = f" {instruction} "
+            run.append(text)
+        else:
+            text = OxmlElement("w:t")
+            text.set(qn("xml:space"), "preserve")
+            text.text = cached
+            run.append(text)
+        runs.append(run)
+    return runs
+
+
+def text_run(value: str, *, tab_before: bool = False):
+    run = OxmlElement("w:r")
+    if tab_before:
+        run.append(OxmlElement("w:tab"))
+    if value:
+        text = OxmlElement("w:t")
+        text.set(qn("xml:space"), "preserve")
+        text.text = value
+        run.append(text)
+    return run
+
+
+def flatten_list_items(items, level: int = 0):
+    """Yield (text, level) pairs from nested list specifications."""
+
+    for item in items or []:
+        if isinstance(item, dict):
+            item_level = int(item.get("level", level))
+            item_level = min(max(item_level, 0), REPORT_LIST_LEVELS - 1)
+            text = item.get("text", item.get("value", ""))
+            if str(text).strip():
+                yield str(text), item_level
+            yield from flatten_list_items(
+                item.get("items", item.get("children", [])),
+                min(item_level + 1, REPORT_LIST_LEVELS - 1),
+            )
+        elif isinstance(item, (list, tuple)):
+            yield from flatten_list_items(item, min(level + 1, REPORT_LIST_LEVELS - 1))
+        elif str(item).strip():
+            yield str(item), level
+
+
+def add_report_list(document: Document, items, kind: str, structure: ReportStructure | None) -> None:
+    """Render one list block as a restarted native multilevel Word list."""
+
+    num_id = structure.new_list(kind) if structure is not None else None
+    for text, level in flatten_list_items(items):
+        paragraph = add_text(
+            document,
+            text,
+            *REPORT_LIST_STYLES[kind][level],
+            bold=False,
+            italic=False,
+            size_pt=REPORT_BODY_PT,
+            color=REPORT_BODY_COLOR,
+        )
+        if num_id is not None:
+            set_paragraph_numbering(paragraph, num_id, level)
+
+
+def add_report_heading(
+    document: Document,
+    heading: str,
+    level: int,
+    entry: dict,
+) -> None:
+    """Add a built-in Word heading whose number comes from the style's list."""
+
+    style = style_by_name(document, *REPORT_HEADING_STYLES[level])
+    paragraph = document.add_paragraph(style=style)
+    if not entry["number"]:
+        set_paragraph_numbering(paragraph, "0", 0)
+        properties = paragraph._p.get_or_add_pPr()
+        indent = OxmlElement("w:ind")
+        indent.set(qn("w:left"), "0")
+        indent.set(qn("w:firstLine"), "0")
+        properties.append(indent)
+        order_paragraph_properties(paragraph)
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), entry["bookmarkId"])
+    start.set(qn("w:name"), entry["bookmark"])
+    paragraph._p.append(start)
+    run = paragraph.add_run(heading)
+    set_run_font(run)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), entry["bookmarkId"])
+    paragraph._p.append(end)
+    entry["text"] = heading
+
+
+def toc_paragraph(document: Document, style_name: str):
+    style = style_by_name(document, style_name)
+    paragraph = OxmlElement("w:p")
+    properties = OxmlElement("w:pPr")
+    style_node = OxmlElement("w:pStyle")
+    style_node.set(qn("w:val"), style.style_id if style is not None else style_name)
+    properties.append(style_node)
+    paragraph.append(properties)
+    return paragraph
+
+
+def build_table_of_contents(document: Document, structure: ReportStructure, title: str) -> list:
+    """Build a Word TOC field whose cached result mirrors the headings."""
+
+    elements = []
+    heading = toc_paragraph(document, "TOC Heading")
+    if structure.toc_after_page_break:
+        properties = heading.find(qn("w:pPr"))
+        properties.append(OxmlElement("w:pageBreakBefore"))
+        order = [qn("w:pStyle"), qn("w:keepNext"), qn("w:keepLines"), qn("w:pageBreakBefore")]
+        for node in sorted(list(properties), key=lambda node: order.index(node.tag) if node.tag in order else 99):
+            properties.remove(node)
+            properties.append(node)
+    heading.append(text_run(title))
+    elements.append(heading)
+    entries = [entry for entry in structure.headings if entry.get("text")]
+    begin, instruction, separate, _, end = field_runs('TOC \\o "1-3" \\h \\z \\u', "")
+    for index, entry in enumerate(entries):
+        paragraph = toc_paragraph(document, TOC_LEVEL_STYLES[entry["level"]])
+        if index == 0:
+            paragraph.extend([begin, instruction, separate])
+        link = OxmlElement("w:hyperlink")
+        link.set(qn("w:anchor"), entry["bookmark"])
+        link.set(qn("w:history"), "1")
+        if entry["number"]:
+            link.append(text_run(entry["number"]))
+            link.append(text_run(entry["text"], tab_before=True))
+        else:
+            link.append(text_run(entry["text"]))
+        link.append(text_run("", tab_before=True))
+        page_runs = field_runs(f"PAGEREF {entry['bookmark']} \\h", entry.get("page", ""))
+        link.extend(page_runs)
+        paragraph.append(link)
+        elements.append(paragraph)
+    closing = toc_paragraph(document, "Normal")
+    if not entries:
+        closing.extend([begin, instruction, separate])
+    closing.append(end)
+    elements.append(closing)
+    return elements
+
+
+def insert_table_of_contents(document: Document, structure: ReportStructure, title: str) -> None:
+    placeholder = structure.toc_placeholder
+    if placeholder is None:
+        return
+    for element in build_table_of_contents(document, structure, title):
+        placeholder.addprevious(element)
+    placeholder.getparent().remove(placeholder)
+
+
+def grow_text_box_to_fit(paragraph) -> None:
+    """Let the one-line divider text box grow instead of clipping long titles."""
+
+    shape = paragraph.getparent()
+    while shape is not None and etree_localname(shape) not in {"wsp", "shape"}:
+        shape = shape.getparent()
+    if shape is None:
+        return
+    if etree_localname(shape) == "wsp":
+        for body in shape.xpath('./*[local-name()="bodyPr"]'):
+            for node in body.xpath('./*[local-name()="noAutofit" or local-name()="normAutofit" or local-name()="spAutoFit"]'):
+                body.remove(node)
+            fit = OxmlElement("a:spAutoFit")
+            warp = body.xpath('./*[local-name()="prstTxWarp"]')
+            if warp:
+                warp[-1].addnext(fit)
+            else:
+                body.insert(0, fit)
+    else:
+        for box in shape.xpath('./*[local-name()="textbox"]'):
+            style = box.get("style", "")
+            if "mso-fit-shape-to-text" not in style:
+                box.set("style", f"{style};mso-fit-shape-to-text:t".lstrip(";"))
+
+
+def etree_localname(node) -> str:
+    return node.tag.rsplit("}", 1)[-1] if isinstance(node.tag, str) else ""
+
+
+def number_divider(elements: list, entry: dict | None) -> None:
+    """Replace the divider's independent list counter with the heading's number."""
+
+    for element in elements:
+        for paragraph in element.xpath('.//*[local-name()="p"]'):
+            style = paragraph.xpath('./*[local-name()="pPr"]/*[local-name()="pStyle"]/@*[local-name()="val"]')
+            if not style or style[0] != "AESGDividerHeading":
+                continue
+            properties = paragraph.find(qn("w:pPr"))
+            for existing in properties.findall(qn("w:numPr")):
+                properties.remove(existing)
+            numbering = OxmlElement("w:numPr")
+            ilvl = OxmlElement("w:ilvl")
+            ilvl.set(qn("w:val"), "0")
+            numbering.append(ilvl)
+            num = OxmlElement("w:numId")
+            num.set(qn("w:val"), "0")
+            numbering.append(num)
+            properties.append(numbering)
+            # Without the list's hanging indent the style's 720 DXA left
+            # indent would push the title away from its source position.
+            for existing in properties.findall(qn("w:ind")):
+                properties.remove(existing)
+            indent = OxmlElement("w:ind")
+            indent.set(qn("w:left"), "0")
+            indent.set(qn("w:firstLine"), "0")
+            properties.append(indent)
+            from report_structure import PPR_ORDER, reorder  # noqa: PLC0415
+
+            reorder(properties, PPR_ORDER)
+            grow_text_box_to_fit(paragraph)
+            if entry is None or not entry["number"]:
+                continue
+            # The divider title is a static copy of the heading text, so its
+            # label is static too. LibreOffice renders REF \r without the
+            # level's trailing full stop, which made PDFs disagree with Word.
+            first_run = paragraph.find(qn("w:r"))
+            reference = [text_run(f"{entry['number']} ")]
+            template_properties = first_run.find(qn("w:rPr")) if first_run is not None else None
+            for run in reference:
+                if template_properties is not None:
+                    run.insert(0, copy.deepcopy(template_properties))
+                if first_run is not None:
+                    first_run.addprevious(run)
+                else:
+                    paragraph.append(run)
 
 
 def section_is_landscape(section: dict) -> bool:
@@ -745,7 +1098,7 @@ def section_is_landscape(section: dict) -> bool:
     return False
 
 
-def add_report_block(document: Document, block: dict) -> None:
+def add_report_block(document: Document, block: dict, structure: ReportStructure | None = None) -> None:
     """Render one ordered report block without flattening its structure."""
 
     if not isinstance(block, dict):
@@ -768,36 +1121,10 @@ def add_report_block(document: Document, block: dict) -> None:
         )
         return
     if kind in {"bullets", "bullet-list", "list"}:
-        for item in block.get("items", []):
-            add_text(
-                document,
-                str(item),
-                "AESG Bullet",
-                "List Bullet",
-                bold=False,
-                italic=False,
-                size_pt=REPORT_BODY_PT,
-                color=REPORT_BODY_COLOR,
-                space_before_pt=0,
-                space_after_pt=REPORT_BODY_SPACE_PT,
-                line_spacing=REPORT_BODY_LINE_SPACING,
-            )
+        add_report_list(document, block.get("items", []), "bullets", structure)
         return
     if kind in {"numbered", "numbered-list"}:
-        for item in block.get("items", []):
-            add_text(
-                document,
-                str(item),
-                "AESG Numbering",
-                "List Number",
-                bold=False,
-                italic=False,
-                size_pt=REPORT_BODY_PT,
-                color=REPORT_BODY_COLOR,
-                space_before_pt=0,
-                space_after_pt=REPORT_BODY_SPACE_PT,
-                line_spacing=REPORT_BODY_LINE_SPACING,
-            )
+        add_report_list(document, block.get("items", []), "numbered", structure)
         return
     if kind == "callout":
         add_callout(
@@ -860,6 +1187,7 @@ def add_sections(
     *,
     portrait_section=None,
     landscape_section=None,
+    structure: ReportStructure | None = None,
 ) -> None:
     in_landscape = False
     for index, section in enumerate(sections):
@@ -874,52 +1202,29 @@ def add_sections(
             )
             in_landscape = wants_landscape
         heading = str(section.get("heading", "")).strip()
+        level = min(max(int(section.get("level", 1)), 1), 3)
+        entry = None
+        if heading and structure is not None:
+            entry = structure.reserve_heading(level, section.get("headingNumbered") is not False)
         if section.get("divider") and heading and divider_source is not None:
+            if entry is not None:
+                entry["divider"] = True
             add_divider(
                 document,
                 heading,
                 divider_source,
                 start_on_new_page=index > 0,
+                entry=entry,
             )
         elif section.get("pageBreak") and (index or document.paragraphs):
             document.add_page_break()
         if heading:
-            level = min(max(int(section.get("level", 1)), 1), 3)
-            styles = {
-                1: ("AESG Main Heading", "Heading 1"),
-                2: ("AESG Sub H1", "Heading 2"),
-                3: ("AESG H2", "Heading 3"),
-            }[level]
-            heading_before, heading_after = REPORT_HEADING_SPACING_PT[level]
-            heading_paragraph = add_text(
-                document,
-                heading,
-                *styles,
-                size_pt=REPORT_HEADING_SIZES[level],
-                color=REPORT_HEADING_COLOR,
-                space_before_pt=heading_before,
-                space_after_pt=heading_after,
-                line_spacing=1.0,
-            )
-            if section.get("headingNumbered") is False:
-                properties = heading_paragraph._p.get_or_add_pPr()
-                numbering = properties.find(qn("w:numPr"))
-                if numbering is None:
-                    numbering = OxmlElement("w:numPr")
-                    properties.append(numbering)
-                ilvl = numbering.find(qn("w:ilvl"))
-                if ilvl is None:
-                    ilvl = OxmlElement("w:ilvl")
-                    numbering.append(ilvl)
-                ilvl.set(qn("w:val"), "0")
-                num_id = numbering.find(qn("w:numId"))
-                if num_id is None:
-                    num_id = OxmlElement("w:numId")
-                    numbering.append(num_id)
-                num_id.set(qn("w:val"), "0")
+            if entry is None:
+                entry = ReportStructure(document).reserve_heading(level, section.get("headingNumbered") is not False)
+            add_report_heading(document, heading, level, entry)
         if "blocks" in section:
             for block in section.get("blocks", []):
-                add_report_block(document, block)
+                add_report_block(document, block, structure)
             continue
         for paragraph in section.get("paragraphs", []):
             value = paragraph.get("text", "") if isinstance(paragraph, dict) else paragraph
@@ -936,34 +1241,10 @@ def add_sections(
                 space_after_pt=REPORT_BODY_SPACE_PT,
                 line_spacing=REPORT_BODY_LINE_SPACING,
             )
-        for bullet in section.get("bullets", []):
-            add_text(
-                document,
-                str(bullet),
-                "AESG Bullet",
-                "List Bullet",
-                bold=False,
-                italic=False,
-                size_pt=REPORT_BODY_PT,
-                color=REPORT_BODY_COLOR,
-                space_before_pt=0,
-                space_after_pt=REPORT_BODY_SPACE_PT,
-                line_spacing=REPORT_BODY_LINE_SPACING,
-            )
-        for numbered in section.get("numbered", []):
-            add_text(
-                document,
-                str(numbered),
-                "AESG Numbering",
-                "List Number",
-                bold=False,
-                italic=False,
-                size_pt=REPORT_BODY_PT,
-                color=REPORT_BODY_COLOR,
-                space_before_pt=0,
-                space_after_pt=REPORT_BODY_SPACE_PT,
-                line_spacing=REPORT_BODY_LINE_SPACING,
-            )
+        if section.get("bullets"):
+            add_report_list(document, section["bullets"], "bullets", structure)
+        if section.get("numbered"):
+            add_report_list(document, section["numbered"], "numbered", structure)
         if section.get("callout"):
             add_callout(
                 document,
@@ -1068,7 +1349,7 @@ def populate_approval_table(table_element, spec: dict) -> None:
                 node.text = ""
 
 
-def create_report(document: Document, spec: dict) -> None:
+def create_report(document: Document, spec: dict) -> ReportStructure | None:
     cover, approval, divider, sections = source_parts(document)
     clear_body(document)
     content_section = copy.deepcopy(sections[0])
@@ -1082,6 +1363,10 @@ def create_report(document: Document, spec: dict) -> None:
         set_section_top_margin(landscape_section, REPORT_LANDSCAPE_TOP_DXA)
         set_section_page_number_start(landscape_section, None)
     set_final_section(document, final_section)
+    structure = ReportStructure(document)
+    wants_toc = bool(spec.get("tableOfContents", spec.get("toc", True))) and any(
+        str(section.get("heading", "")).strip() for section in spec.get("sections", [])
+    )
     if spec.get("cover", True):
         remove_shape_by_leaf_text(cover, "Client Logo")
         replace_leaf_text(
@@ -1100,9 +1385,22 @@ def create_report(document: Document, spec: dict) -> None:
         if approval_page:
             populate_approval_table(approval, spec)
             append_before_final_section(document, approval)
+        if wants_toc:
+            # The cover and approval tables float and anchor to the next
+            # paragraph, so give them an empty anchor before the TOC page. The
+            # TOC is filled once every heading has a number and bookmark.
+            anchor = document.add_paragraph()
+            anchor.paragraph_format.space_before = Pt(0)
+            anchor.paragraph_format.space_after = Pt(0)
+            anchor.paragraph_format.line_spacing = 1.0
+            structure.toc_placeholder = document.add_paragraph()._p
+            structure.toc_after_page_break = True
         add_section_break(document, content_section)
     else:
         set_final_section(document, content_section)
+        if wants_toc:
+            structure.toc_placeholder = document.add_paragraph()._p
+            document.add_page_break()
     replacements = {
         "Project Name": spec.get("project", spec.get("title", "AESG")),
         "Report Title": spec.get("title", "AESG report"),
@@ -1128,12 +1426,20 @@ def create_report(document: Document, spec: dict) -> None:
         divider,
         portrait_section=final_section,
         landscape_section=landscape_section,
+        structure=structure,
     )
+    if wants_toc:
+        insert_table_of_contents(
+            document,
+            structure,
+            str(spec.get("tocTitle", TOC_TITLE)),
+        )
     for section in document.sections:
         replace_leaf_text(section.header._element, replacements)
         replace_leaf_text(section.footer._element, replacements)
         clear_text_highlight(section.header._element)
         clear_text_highlight(section.footer._element)
+    return structure if wants_toc else None
 
 
 def add_letter_multiline(document: Document, lines: list[str]) -> None:
@@ -1370,12 +1676,34 @@ def restore_letter_template_parts(template: Path, output: Path) -> None:
     temporary.replace(output)
 
 
+def use_branding_scripts(branding_skill_dir: Path) -> Path:
+    """Import shared AESG helpers from the activated branding skill.
+
+    Runtime skills are mounted as unrelated sibling directories, so the
+    branding scripts must be resolved from --branding-skill-dir rather than
+    from this file's location.
+    """
+
+    candidates = [
+        branding_skill_dir / "scripts",
+        Path(__file__).resolve().parents[2] / "aesg-branding" / "scripts",
+    ]
+    for scripts_dir in candidates:
+        if (scripts_dir / "report_structure.py").is_file():
+            if str(scripts_dir) in sys.path:
+                sys.path.remove(str(scripts_dir))
+            sys.path.insert(0, str(scripts_dir))
+            return scripts_dir
+    raise FileNotFoundError(
+        "aesg-branding scripts/report_structure.py was not found; pass the activated "
+        "aesg-branding directory with --branding-skill-dir"
+    )
+
+
 def normalise_report_output_parts(output: Path) -> None:
     """Make every generated report story explicit after python-docx saves it."""
 
-    scripts_dir = Path(__file__).resolve().parents[2] / "aesg-branding" / "scripts"
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
+    from report_structure import transform_numbering, transform_settings  # noqa: PLC0415
     from normalise_office_templates import (  # noqa: PLC0415
         normalise_document_part,
         normalise_docx_styles,
@@ -1389,6 +1717,8 @@ def normalise_report_output_parts(output: Path) -> None:
         transforms = {
             "word/document.xml": normalise_document_part,
             "word/styles.xml": lambda data: normalise_docx_styles(data, report=True),
+            "word/numbering.xml": transform_numbering,
+            "word/settings.xml": transform_settings,
             "word/theme/theme1.xml": normalise_theme_fonts,
         }
         for name in names:
@@ -1415,6 +1745,104 @@ def normalise_report_output_parts(output: Path) -> None:
                 temporary.unlink()
 
 
+def heading_line_pattern(entry: dict):
+    words = entry["text"].split()
+    prefix = r"\s+".join(re.escape(word) for word in words[:3])
+    number = rf"{re.escape(entry['number'])}\s+" if entry["number"] else ""
+    return re.compile(rf"^\s*{number}{prefix}", re.MULTILINE)
+
+
+def locate_heading_pages(pages: list[str], headings: list[dict], toc_title: str) -> dict[str, int]:
+    """Map heading bookmarks to 1-based page numbers in a rendered PDF."""
+
+    leader = re.compile(r"\.{5,}\s*\d*\s*$", re.MULTILINE)
+    cursor = 0
+    for index, page in enumerate(pages):
+        if toc_title.casefold() in page.casefold():
+            cursor = index
+            while cursor < len(pages) and leader.search(pages[cursor]):
+                cursor += 1
+            break
+    found: dict[str, int] = {}
+    for entry in headings:
+        if not entry.get("text"):
+            continue
+        pattern = heading_line_pattern(entry)
+        matches_needed = 2 if entry.get("divider") else 1
+        page_index = cursor
+        while page_index < len(pages):
+            if pattern.search(pages[page_index]):
+                matches_needed -= 1
+                if matches_needed == 0:
+                    break
+                page_index += 1
+                continue
+            page_index += 1
+        if page_index >= len(pages):
+            continue
+        found[entry["bookmark"]] = page_index + 1
+        cursor = page_index
+    return found
+
+
+def paginate_table_of_contents(output: Path, headings: list[dict], toc_title: str) -> bool:
+    """Fill cached TOC page numbers from a LibreOffice render.
+
+    The cached values make Word, LibreOffice previews, and converted PDFs show
+    correct pages without an open-time field refresh prompt.
+    """
+
+    if not headings or not shutil.which("pdftotext"):
+        return False
+    try:
+        from office_converter import convert_to_pdf, resolve_soffice  # noqa: PLC0415
+
+        resolve_soffice()
+    except (ImportError, RuntimeError):
+        return False
+    with tempfile.TemporaryDirectory(prefix="aesg-toc-") as directory:
+        try:
+            pdf = convert_to_pdf(output, Path(directory), profile_parent=Path(directory))
+            text = subprocess.run(
+                ["pdftotext", "-layout", str(pdf), "-"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        except (RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"warning: TOC page numbers left for Word to update: {error}", file=sys.stderr)
+            return False
+    pages = text.split("\f")
+    found = locate_heading_pages(pages, headings, toc_title)
+    if not found:
+        return False
+    with zipfile.ZipFile(output) as source:
+        document_xml = source.read("word/document.xml")
+    from lxml import etree  # noqa: PLC0415
+
+    root = etree.fromstring(document_xml)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    for instruction in root.iterfind(".//w:instrText", namespace):
+        match = re.match(r"\s*PAGEREF\s+(\S+)", instruction.text or "")
+        if not match or match.group(1) not in found:
+            continue
+        run = instruction.getparent()
+        sibling = run.getnext()
+        while sibling is not None and not sibling.xpath('./w:fldChar[@w:fldCharType="separate"]', namespaces=namespace):
+            sibling = sibling.getnext()
+        result = sibling.getnext() if sibling is not None else None
+        nodes = result.xpath("./w:t", namespaces=namespace) if result is not None else []
+        if nodes:
+            nodes[0].text = str(found[match.group(1)])
+    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    temporary = output.with_name(f".{output.stem}.toc{output.suffix}")
+    with zipfile.ZipFile(output) as source, zipfile.ZipFile(temporary, "w") as target:
+        for info in source.infolist():
+            target.writestr(info, data if info.filename == "word/document.xml" else source.read(info.filename))
+    temporary.replace(output)
+    return len(found) == len([entry for entry in headings if entry.get("text")])
+
+
 def normalise_new_text(document: Document) -> None:
     for paragraph in document.paragraphs:
         for run in paragraph.runs:
@@ -1435,6 +1863,11 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--template", type=Path)
     parser.add_argument("--branding-skill-dir", required=True, type=Path)
+    parser.add_argument(
+        "--no-toc-pages",
+        action="store_true",
+        help="skip the LibreOffice pass that fills cached TOC page numbers",
+    )
     args = parser.parse_args()
     if args.output.suffix.casefold() != ".docx":
         raise ValueError("--output must end in .docx")
@@ -1455,9 +1888,12 @@ def main() -> int:
     if not template.is_file():
         raise FileNotFoundError(template)
 
-    document = Document(template)
     if kind == "report":
-        create_report(document, spec)
+        use_branding_scripts(args.branding_skill_dir)
+    document = Document(template)
+    structure = None
+    if kind == "report":
+        structure = create_report(document, spec)
     else:
         create_letter(document, spec)
     normalise_new_text(document)
@@ -1472,8 +1908,21 @@ def main() -> int:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     document.save(args.output)
+    toc_pages = None
     if kind == "report":
         normalise_report_output_parts(args.output)
+        if structure is not None and not args.no_toc_pages:
+            toc_pages = paginate_table_of_contents(
+                args.output,
+                structure.headings,
+                str(spec.get("tocTitle", TOC_TITLE)),
+            )
+        if structure is not None and not toc_pages:
+            # Without cached page numbers the TOC would show blanks, so let
+            # Word refresh it on open (Word will ask the user once).
+            from report_structure import enable_field_update_in_package  # noqa: PLC0415
+
+            enable_field_update_in_package(args.output)
     else:
         restore_letter_template_parts(template, args.output)
     print(
@@ -1484,6 +1933,7 @@ def main() -> int:
                 "bytes": args.output.stat().st_size,
                 "kind": kind,
                 "template": template.name,
+                **({"tocPageNumbers": toc_pages} if toc_pages is not None else {}),
             }
         )
     )

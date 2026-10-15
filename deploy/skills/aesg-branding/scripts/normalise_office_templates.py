@@ -11,6 +11,12 @@ from pathlib import Path
 
 from lxml import etree
 
+from report_structure import (
+    apply_report_styles,
+    transform_numbering,
+    transform_settings,
+)
+
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -35,12 +41,6 @@ HEADER_TEXTBOX_HEIGHT_PT = 30
 # resolve to Verdana so that Word and LibreOffice do not select a theme or
 # platform fallback for imported text.
 REPORT_GENERIC_STYLES = {
-    "Heading 1": (20, "262930", False),
-    "Heading 2": (16, "262930", False),
-    "Heading 3": (14, "262930", False),
-    "Heading 1 Char": (20, "262930", False),
-    "Heading 2 Char": (16, "262930", False),
-    "Heading 3 Char": (14, "262930", False),
     "Title": (28, "343741", False),
     "Title Char": (28, "343741", False),
     "Caption": (9, "0E2841", False),
@@ -64,11 +64,9 @@ REPORT_BODY_STYLES = {
     "AESG Figure Captions": (9, "008C95", False),
     "AESG Figure Captions Char": (9, "008C95", False),
 }
-REPORT_HEADING_STYLES = {
-    "AESG Main Heading": (22, "008C95", False),
-    "AESG Sub H1": (16, "008C95", False),
-    "AESG H2": (14, "008C95", False),
-}
+# Heading 1-3, the legacy AESG heading aliases, list levels, and TOC styles
+# are owned by report_structure.py and applied after this contract.
+REPORT_HEADING_STYLES: dict[str, tuple[int, str, bool]] = {}
 LETTER_STYLES = {
     "Normal": (9, "53565A", False),
     "Heading 1": (12, "008C95", True),
@@ -404,6 +402,8 @@ def normalise_docx_styles(data: bytes, *, report: bool) -> bytes:
                 set_style_spacing(style, 0, 0, 240)
             else:
                 set_style_spacing(style, 0, 60, 276)
+    if report:
+        apply_report_styles(root)
     normalise_word_fonts(
         root,
         default_size_pt=10 if report else 9,
@@ -468,6 +468,8 @@ def normalise_report(path: Path) -> None:
         {
             "word/styles.xml": lambda data: normalise_docx_styles(data, report=True),
             "word/document.xml": normalise_document_part,
+            "word/numbering.xml": transform_numbering,
+            "word/settings.xml": transform_settings,
             "word/theme/theme1.xml": normalise_theme_fonts,
             **{
                 name: (

@@ -29,6 +29,7 @@ Create `/workspace/tmp/docx/spec.json`:
   "client": "Client organisation",
   "date": "06 August 2026",
   "approvalPage": true,
+  "tableOfContents": true,
   "documentControl": {
     "issue": "01",
     "revision": "00",
@@ -41,7 +42,10 @@ Create `/workspace/tmp/docx/spec.json`:
       "heading": "Executive summary",
       "divider": true,
       "paragraphs": ["Concise, evidence-based summary."],
-      "bullets": ["Finding one", "Finding two"],
+      "bullets": [
+        "Finding one",
+        {"text": "Finding two", "items": ["Supporting point", {"text": "Detail", "items": ["Evidence"]}]}
+      ],
       "callout": "Overall status: on track"
     },
     {
@@ -77,7 +81,10 @@ tables, images with captions/sources, page breaks, approval pages, and branded
 section dividers. Image objects accept `path`, `caption`, `source`, and
 `widthInches`. Table `widths` accepts one positive relative width per header.
 When source order matters, use an ordered `blocks` array instead of the legacy
-grouped fields. Supported block types are `paragraph`, `label`,
+grouped fields. `bullets`, `numbered`, and `items` accept strings or nested
+objects `{"text": "...", "items": [...]}` up to three levels; bullets render as
+`a.` → `i` → `•` and numbered items as `1.` → `a.` → `i.`, restarting for every
+list block. Supported block types are `paragraph`, `label`,
 `finding-header`, `bullets`, `numbered`, `callout`, `table`, `image`, and
 `page-break`. For example:
 
@@ -99,21 +106,29 @@ Do not stream every non-heading source paragraph into `paragraphs`. Classify
 source content before generation and preserve explicit list introductions,
 list items, finding labels, tables, and paragraph boundaries in `blocks`.
 Use real `bullets` or `numbered` blocks for list-shaped content; never imitate a
-list with line breaks or consecutive body paragraphs. `Objective:` normally
+list with line breaks or consecutive body paragraphs, and never type `a.`,
+`i`, `-`, or `•` markers into item text. Express sub-points as nested `items`. `Objective:` normally
 introduces one prose statement, not a list. Treat `Recommendations:`,
 `Examples:`, `Suggested priorities:`, and `The locking strategy should
-include:` as list signals when meaningful items follow. If a source-authored
-heading already includes a numeric or Appendix label, set
-`headingNumbered: false` so the template does not add a second prefix.
+include:` as list signals when meaningful items follow. Heading numbers are
+automatic Word numbering: put only the title in `heading` and set `level`
+1, 2, or 3. When the source heading starts with a sequence number such as
+`4.`, `4.1`, or `4.1.1`, strip that number from `heading` and let the template
+number it. Set `headingNumbered: false` only for headings that must not be in
+the sequence, such as `Appendices`, `Appendix A`, `Glossary`, or when the user
+explicitly requires the source numbers verbatim.
 
 Keep report-specific editorial cleanup outside the generic skill. Remove
 unambiguous placeholders and window-title fragments, but do not globally strip
 people's names or infer section renumbering. Flag duplicate section labels,
 ambiguous anchors, and uncertain editorial notes for review.
 
-Validation fails when source-numbered headings still inherit template
-numbering, list-shaped blocks remain flat body paragraphs, compliance tables
-retain empty scaffold rows, or RAG values use inconsistent case. Fix the spec
+Validation fails when headings are typed as static numbered text instead of
+Heading styles, Heading 1-3 lose their automatic numbering or spacing, a
+report with headings has no TOC field, list items lack Word list numbering,
+source-numbered headings still inherit template numbering, list-shaped blocks
+remain flat body paragraphs, compliance tables retain empty scaffold rows, or
+RAG values use inconsistent case. Fix the spec
 or run the repair pass, then validate again before screenshot QA.
 
 Use `pattern: "images"` for the supplied three-column evidence table (white
@@ -121,8 +136,8 @@ header with teal labels and alternating body rows) and `pattern: "monitoring"`
 for the landscape monitoring table (teal header, grey banding, and dark grouped
 edge columns). Monitoring tables may use `rowSpans` objects such as
 `{ "column": 0, "start": 0, "span": 4 }` to merge group labels across rows.
-Set a heading's `headingNumbered` field to `false` for source-authored unnumbered
-headings such as `Appendices`.
+Set a heading's `headingNumbered` field to `false` for unnumbered headings
+such as `Appendices`.
 The generator clones the native cover, approval table, and complete
 photographic divider component; it clears unused approval placeholders and
 keeps image captions after their figures.
@@ -156,9 +171,17 @@ approval page for these documents.
 
 The report route follows the supplied `General Template_AESG.docx` contract:
 Verdana 10 pt in `#343741` for body, bullet, numbered, table, and callout text;
-Verdana 22/16/14 pt in `#008C95` for H1/H2/H3; 1.15 line spacing; and 3 pt
-body paragraph spacing after (0 pt before). Heading spacing is 10 pt before for
-H1 and 4 pt before for H2/H3, with 0 pt after. Table captions are centred,
+1.15 line spacing; and 3 pt body paragraph spacing after (0 pt before).
+Headings are the built-in Word `Heading 1` / `Heading 2` / `Heading 3` styles:
+Verdana 14 / 12 / 11 pt in `#008C95`, single spaced, 14/14, 12/12, and
+11/11 pt before/after, numbered automatically as `4.` / `4.1` / `4.1.1` with
+one 1.9 cm hanging indent at every level. The generator inserts a Word
+`TOC \o "1-3" \h \z \u` field after the cover/approval pages (set
+`"tableOfContents": false` to omit it, `"tocTitle"` to rename it), bookmarks
+every heading, and fills the cached page numbers from a LibreOffice render;
+no open-time "update fields" prompt is set. That pass needs `soffice` and
+`pdftotext`; if it is skipped (`--no-toc-pages`) or fails, the generator
+enables Word's open-time field update instead so the TOC is not left blank. Table captions are centred,
 Verdana 9 pt in `#04999A`; figure captions are centred, Verdana 9 pt italic in
 `#008C95`. The narrative portrait section uses the template's 1701 DXA top
 margin; landscape monitoring pages use 720 DXA. Left, right, and bottom margins
@@ -189,7 +212,8 @@ user to review it:
 ```bash
 python <docx-skill-directory>/scripts/repair_aesg_docx.py \
   --input /workspace/input/report.docx \
-  --output /workspace/outputs/report-repaired.docx
+  --output /workspace/outputs/report-repaired.docx \
+  --branding-skill-dir <aesg-branding-skill-directory>
 python <aesg-branding-skill-directory>/scripts/validate_artifact.py \
   /workspace/outputs/report-repaired.docx
 python <aesg-branding-skill-directory>/scripts/render_artifact.py \
@@ -198,8 +222,10 @@ python <aesg-branding-skill-directory>/scripts/render_artifact.py \
 ```
 
 The repair pass makes fonts and colours explicit in every report story,
-removes conflicting theme font mappings and accidental automatic heading
-numbering, restores the measured page/header/footer geometry, splits body
+removes conflicting theme font mappings, relinks headings to the automatic
+`4.` / `4.1` / `4.1.1` numbering and lists to the multilevel definitions,
+adds a Word TOC when the report has none, renumbers divider pages to match
+their chapter, restores the measured page/header/footer geometry, splits body
 items that were joined with manual line breaks, removes source-system tokens,
 and removes only empty or incomplete unmerged gap-table scaffolding. It preserves
 source-authored findings and manual section labels, so content review remains
@@ -217,6 +243,9 @@ while a multi-page signed letter may use letterhead continuation pages.
 
 - Preserve existing sections, styles, fields, headers, footers, relationships,
   and media when editing an AESG DOCX.
+- Never write a report with raw `python-docx` or OOXML in place of the
+  generator: hand-built reports lose the heading numbering, multilevel lists,
+  and TOC. If the generator cannot express something, extend the spec or ask.
 - Use OOXML only for features `python-docx` cannot preserve.
 - Inspect every rendered page. Correct orphan headings, broken tables,
   stretched images, and stray sample text.

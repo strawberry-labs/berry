@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 7,
-  "generated": "2026-08-20",
+  "schemaVersion": 8,
+  "generated": "2026-09-24",
   "sourceEvidence": [
     {
       "name": "General Template_AESG.docx",
@@ -24,8 +24,9 @@
   "runtimeTemplates": [
     {
       "path": "templates/AESG_General_Report_Template.docx",
-      "sha256": "d995820a51c6ec20d8cad9271a8f5c5df262929c9517a1e92fa9a4e5a68c6856",
-      "purpose": "Supplied General Template_AESG.docx, retained as the report source after Verdana metadata sanitisation"
+      "sha256": "4e26653067619fd1ca1f3de9da687d63d692a838483224693e1aaf052d554089",
+      "purpose": "Supplied General Template_AESG.docx, retained as the report source after Verdana metadata sanitisation and the September 2026 Word-structure review",
+      "evidence": "Built-in Heading 1/2/3 (Verdana 14/12/11 pt; 14/14, 12/12, 11/11 pt spacing) linked to one multilevel list (4. / 4.1 / 4.1.1) with a shared 1.9 cm hanging indent; AESG a. / i / • bullet and 1. / a. / i. numbered multilevel lists; TOC Heading and toc 1-3 styles; no updateFields open prompt. Applied by scripts/report_structure.py via normalise_office_templates.py --report"
     },
     {
       "path": "templates/AESG_Letterhead_Dubai.docx",

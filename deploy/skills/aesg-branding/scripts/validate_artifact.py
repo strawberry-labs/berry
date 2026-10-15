@@ -204,6 +204,140 @@ def validate_pdf(path: Path, errors: list[str], evidence: dict) -> None:
             errors.append(f"unexpected MIME type: {mime}")
 
 
+REPORT_HEADING_CONTRACT = {
+    # level: (style id, size pt, before pt, after pt, number format)
+    1: ("Heading1", 14, 14, 14, "%1."),
+    2: ("Heading2", 12, 12, 12, "%1.%2"),
+    3: ("Heading3", 11, 11, 11, "%1.%2.%3"),
+}
+STATIC_HEADING_RE = re.compile(r"^\s*\d+(?:\.\d+){0,3}\.?\s+[A-Z]")
+
+
+def validate_report_structure(path: Path, document, errors: list[str], evidence: dict) -> None:
+    """Require native Word headings, multilevel numbering, lists, and a TOC."""
+
+    from docx.oxml.ns import qn
+
+    with zipfile.ZipFile(path) as archive:
+        styles = ElementTree.fromstring(archive.read("word/styles.xml"))
+        numbering = (
+            ElementTree.fromstring(archive.read("word/numbering.xml"))
+            if "word/numbering.xml" in archive.namelist()
+            else None
+        )
+        document_xml = archive.read("word/document.xml").decode("utf-8", errors="ignore")
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    styles_by_id = {style.get(f"{w}styleId"): style for style in styles.iter(f"{w}style")}
+
+    def level_texts(num_id: str) -> dict[int, tuple[str, int, int]]:
+        if numbering is None:
+            return {}
+        abstract_id = None
+        for num in numbering.iter(f"{w}num"):
+            if num.get(f"{w}numId") == num_id:
+                abstract_id = num.find(f"{w}abstractNumId").get(f"{w}val")
+        for abstract in numbering.iter(f"{w}abstractNum"):
+            if abstract.get(f"{w}abstractNumId") != abstract_id:
+                continue
+            levels = {}
+            for lvl in abstract.iter(f"{w}lvl"):
+                text = lvl.find(f"{w}lvlText")
+                indent = lvl.find(f"{w}pPr/{w}ind")
+                levels[int(lvl.get(f"{w}ilvl"))] = (
+                    text.get(f"{w}val") if text is not None else "",
+                    int(indent.get(f"{w}left", "0")) if indent is not None else 0,
+                    int(indent.get(f"{w}hanging", "0")) if indent is not None else 0,
+                )
+            return levels
+        return {}
+
+    heading_indents = set()
+    for level, (style_id, _size, before, after, number_format) in REPORT_HEADING_CONTRACT.items():
+        style = styles_by_id.get(style_id)
+        if style is None:
+            errors.append(f"report template is missing built-in style {style_id}")
+            continue
+        num_id = style.find(f"{w}pPr/{w}numPr/{w}numId")
+        if num_id is None or num_id.get(f"{w}val") in {None, "0"}:
+            errors.append(f"{style_id} is not linked to automatic multilevel numbering")
+            continue
+        levels = level_texts(num_id.get(f"{w}val"))
+        actual = levels.get(level - 1, ("", 0, 0))
+        if actual[0] != number_format:
+            errors.append(f"{style_id} numbering is {actual[0]!r}, expected {number_format!r}")
+        heading_indents.add(actual[1:])
+        spacing = style.find(f"{w}pPr/{w}spacing")
+        actual_spacing = (
+            int(spacing.get(f"{w}before", "0")) / 20 if spacing is not None else None,
+            int(spacing.get(f"{w}after", "0")) / 20 if spacing is not None else None,
+        )
+        if actual_spacing != (before, after):
+            errors.append(
+                f"{style_id} spacing is {actual_spacing}, expected ({before}, {after}) pt before/after"
+            )
+    if len(heading_indents) > 1:
+        errors.append(f"heading numbering indents differ by level: {sorted(heading_indents)}")
+
+    def paragraph_level(paragraph) -> int | None:
+        style = paragraph.style
+        while style is not None:
+            if style.style_id in {"Heading1", "Heading2", "Heading3"}:
+                return int(style.style_id[-1])
+            style = style.base_style
+        return None
+
+    headings = [paragraph for paragraph in document.paragraphs if paragraph.text.strip() and paragraph_level(paragraph)]
+    static_headings = [
+        paragraph.text.strip()
+        for paragraph in document.paragraphs
+        if paragraph_level(paragraph) is None
+        and STATIC_HEADING_RE.match(paragraph.text)
+        and len(paragraph.text.strip()) <= 120
+        and paragraph._p.find(f"{qn('w:pPr')}/{qn('w:numPr')}") is None
+        and paragraph.style is not None
+        and not paragraph.style.name.casefold().startswith(("aesg numbering", "list number", "toc"))
+        and any(
+            run.bold or (run.font.size is not None and run.font.size.pt > 10.5)
+            for run in paragraph.runs
+            if run.text.strip()
+        )
+    ]
+    if static_headings:
+        errors.append(
+            "headings are typed as static numbered text instead of Heading styles: "
+            + ", ".join(static_headings[:5])
+        )
+    has_toc = bool(re.search(r"<w:instrText[^>]*>\s*TOC\s+\\o", document_xml))
+    if len(headings) >= 2 and not has_toc:
+        errors.append("report has headings but no Word TOC field")
+
+    list_styles = ("aesg bullet", "aesg numbering", "list bullet", "list number")
+    unnumbered_items = []
+    for paragraph in document.paragraphs:
+        name = paragraph.style.name.casefold() if paragraph.style is not None else ""
+        if not name.startswith(list_styles) or not paragraph.text.strip():
+            continue
+        direct = paragraph._p.find(f"{qn('w:pPr')}/{qn('w:numPr')}/{qn('w:numId')}")
+        style = paragraph.style
+        inherited = None
+        while style is not None and inherited is None:
+            inherited = style.element.find(f"{qn('w:pPr')}/{qn('w:numPr')}/{qn('w:numId')}")
+            style = style.base_style
+        node = direct if direct is not None else inherited
+        if node is None or node.get(qn("w:val")) == "0":
+            unnumbered_items.append(paragraph.text.strip())
+    if unnumbered_items:
+        errors.append(
+            "list items have no Word list numbering: " + ", ".join(unnumbered_items[:5])
+        )
+    evidence["reportWordStructure"] = {
+        "headings": len(headings),
+        "tocField": has_toc,
+        "staticHeadings": len(static_headings),
+        "unnumberedListItems": len(unnumbered_items),
+    }
+
+
 def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     from docx import Document
     from docx.oxml.ns import qn
@@ -283,9 +417,12 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
     if is_report:
         check_style("Normal", 10, "343741")
         check_style("AESG Body Text", 10, "343741")
-        check_style("AESG Main Heading", 22, "008C95")
-        check_style("AESG Sub H1", 16, "008C95")
-        check_style("AESG H2", 14, "008C95")
+        check_style("Heading 1", 14, "008C95")
+        check_style("Heading 2", 12, "008C95")
+        check_style("Heading 3", 11, "008C95")
+        check_style("AESG Main Heading", 14, "008C95")
+        check_style("AESG Sub H1", 12, "008C95")
+        check_style("AESG H2", 11, "008C95")
         check_style("AESG Bullet", 10, "343741")
         check_style("AESG Numbering", 10, "343741")
         check_style("AESG Table Caption", 9, "04999A")
@@ -301,7 +438,15 @@ def validate_docx(path: Path, errors: list[str], evidence: dict) -> None:
             errors.append(
                 f"report content top margins are {top_margins}; expected {expected_margins} DXA"
             )
-        heading_styles = {"aesg main heading", "aesg sub h1", "aesg h2"}
+        heading_styles = {
+            "heading 1",
+            "heading 2",
+            "heading 3",
+            "aesg main heading",
+            "aesg sub h1",
+            "aesg h2",
+        }
+        validate_report_structure(path, document, errors, evidence)
         manual_heading_re = re.compile(
             r"^\s*(?:\d+(?:\.\d+)*(?:[.)])?\s+|appendix\s+[a-z]\b)",
             re.IGNORECASE,

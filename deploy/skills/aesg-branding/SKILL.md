@@ -76,6 +76,12 @@ before generating anything.
 - Office generators must apply the role-level typography contract in
   `references/brand-system.md` directly to generated runs. Do not rely on
   specimen inheritance for font family, size, colour, or boldness.
+- General Reports must use native Word structure: built-in Heading 1/2/3
+  styles with automatic `4.` / `4.1` / `4.1.1` numbering, multilevel
+  `a.` / `i` / `•` bullet lists, and a Word TOC field. Never type heading
+  numbers, list letters, or bullet glyphs as text, and never hand-build a
+  report DOCX outside the generator. See "Report headings, lists, and
+  contents" in `references/brand-system.md`.
 - For office PDFs, set `AESG_SOFFICE` to the approved converter when more than
   one LibreOffice runtime is available. A PDF without embedded Verdana, or
   with a known fallback such as Linux Libertine, fails validation.
@@ -125,5 +131,8 @@ For Office artifacts:
 5. For a report, compare the first content line on page 1 with a continuation
    page. The header-to-body spacing must be consistent; do not add blank lead-in
    paragraphs to compensate.
-6. Publish only the final artifact, once, with the correct extension and MIME
+6. For a report, check the Table of Contents page: every heading is listed
+   with its number and correct page, heading text aligns at the same indent
+   for `4.`, `4.1`, and `4.1.1`, and nested lists read `a.` → `i` → `•`.
+7. Publish only the final artifact, once, with the correct extension and MIME
    type.
