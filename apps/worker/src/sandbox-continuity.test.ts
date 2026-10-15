@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
 import { MODEL_IMAGE_LIMITS } from "./model-image.js";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { SandboxNetworkPolicyUpdateError, type SandboxProvider } from "@berry/sandbox-contract";
 import {
@@ -1779,6 +1779,70 @@ describe("SandboxContinuityManager", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  describe("sandbox read helper encodings (H-011)", () => {
+    let directory = "";
+    beforeAll(() => { directory = mkdtempSync(join(tmpdir(), "berry-encoding-")); });
+    afterAll(() => rmSync(directory, { recursive: true, force: true }));
+    const read = (name: string, bytes: Buffer) => {
+      const path = join(directory, name);
+      writeFileSync(path, bytes);
+      const result = spawnSync(process.execPath, ["-e", PI_READ_STREAM_SCRIPT, path, "1", "0", "2000", String(50 * 1024), "2000"], { encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return JSON.parse(result.stdout) as Record<string, unknown>;
+    };
+    const utf16be = (text: string) => Buffer.from(text, "utf16le").swap16();
+    const csv = "Name,Total\r\nAlpha,12\r\nBeta,7\r\n";
+    const chinese = "第一章 总则\n第一条 为了规范合同管理，保护当事人的合法权益，制定本办法。\n第二条 本办法适用于公司及所属单位签订的各类合同。\n";
+    const arabic = "نص حكيم له سر قاطع وذو شأن عظيم مكتوب على ثوب أخضر.\nالتقرير السنوي لعام 2024\n";
+    const russian = "Съешь же ещё этих мягких французских булок, да выпей чаю.\nОтчёт за 2024 год.\n";
+
+    it("decodes UTF-16BE with and without a byte-order mark", () => {
+      expect(read("bom-be.csv", Buffer.concat([Buffer.from([0xfe, 0xff]), utf16be(csv)])))
+        .toMatchObject({ content: "Name,Total\nAlpha,12\nBeta,7", details: { encoding: "utf-16be" } });
+      expect(read("plain-be.csv", utf16be(csv)))
+        .toMatchObject({ content: "Name,Total\nAlpha,12\nBeta,7", details: { encoding: "utf-16be" } });
+      expect(read("chinese-be.txt", utf16be(chinese.repeat(3))))
+        .toMatchObject({ content: chinese.repeat(3).trimEnd(), details: { encoding: "utf-16be" } });
+    });
+
+    it.each([["chinese", chinese], ["arabic", arabic], ["russian", russian]])(
+      "decodes BOM-less UTF-16LE %s text whose bytes are rarely NUL",
+      (name, text) => {
+        expect(read(`${name}.txt`, Buffer.from(text.repeat(3), "utf16le")))
+          .toMatchObject({ content: text.repeat(3).trimEnd(), details: { encoding: "utf-16le" } });
+      },
+    );
+
+    it("decodes UTF-32 in both byte orders", () => {
+      const le = Buffer.alloc(csv.length * 4);
+      Array.from(csv).forEach((character, index) => le.writeUInt32LE(character.codePointAt(0)!, index * 4));
+      const be = Buffer.alloc(csv.length * 4);
+      Array.from(csv).forEach((character, index) => be.writeUInt32BE(character.codePointAt(0)!, index * 4));
+      expect(read("le.csv", le)).toMatchObject({ content: "Name,Total\nAlpha,12\nBeta,7", details: { encoding: "utf-32le" } });
+      expect(read("be.csv", Buffer.concat([Buffer.from([0, 0, 0xfe, 0xff]), be])))
+        .toMatchObject({ content: "Name,Total\nAlpha,12\nBeta,7", details: { encoding: "utf-32be" } });
+    });
+
+    it("still reports random binary and text with stray NULs as binary", () => {
+      let seed = 0x9e3779b9;
+      const next = () => { seed ^= seed << 13; seed >>>= 0; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0; return seed & 0xff; };
+      for (let round = 0; round < 25; round += 1) {
+        const bytes = Buffer.from(Array.from({ length: 512 + round * 300 }, next));
+        bytes[100] = 0;
+        expect(read(`random-${round}.bin`, bytes)).toEqual({ binary: true, sizeBytes: bytes.byteLength });
+      }
+      const stray = (text: Buffer) => Buffer.concat([text.subarray(0, 40), Buffer.from([0]), text.subarray(40)]);
+      // UTF-8 Cyrillic with a NUL reads as plausible UTF-16BE Hangul; it must stay binary.
+      expect(read("russian-nul.txt", stray(Buffer.from(russian.repeat(3))))).toMatchObject({ binary: true });
+      expect(read("latin1-nul.txt", stray(Buffer.from("Le café est très bon à Genève.\n".repeat(20), "latin1")))).toMatchObject({ binary: true });
+      const tsv = Buffer.from(Array.from({ length: 200 }, (_, row) => `${row}\t${row * 7 % 13}\n`).join(""));
+      expect(read("numbers-nul.tsv", stray(tsv))).toMatchObject({ binary: true });
+      // Binary records after an ASCII header (a PostScript CIDFont).
+      const records = Buffer.from(Array.from({ length: 400 }, (_, index) => [0x00, 0x91, (index * 7) & 0xff, 0x03]).flat());
+      expect(read("font.ps", Buffer.concat([Buffer.from("%!PS-Adobe-3.0 Resource-CIDFont\n".repeat(150)), records]))).toMatchObject({ binary: true });
+    });
   });
 
   it("parses a grep JSON record larger than one megabyte before bounding its rendered line", () => {

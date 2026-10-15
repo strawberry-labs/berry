@@ -315,20 +315,143 @@ const consume = (text) => {
     }
   }
 };
-// Like git, a NUL in the first 8000 bytes means binary, unless the NULs follow
-// the UTF-16LE pattern of mostly-ASCII text (H-011).
-const sniffEncoding = (chunk) => {
-  if (chunk.length >= 2 && chunk[0] === 0xff && chunk[1] === 0xfe) return "utf16le";
-  const sample = chunk.subarray(0, 8000);
-  let nuls = 0;
-  let oddNuls = 0;
-  for (let index = 0; index < sample.length; index += 1) {
-    if (sample[index] !== 0) continue;
-    nuls += 1;
-    if (index % 2 === 1) oddNuls += 1;
+const startsWith = (bytes, signature) => bytes.length >= signature.length && signature.every((value, index) => bytes[index] === value);
+// Control, private-use and noncharacter code points, and planes without
+// common scripts: rare in text, common in binary data read as text.
+const unusualCharacter = (code) => (code < 0x20 && (code < 0x09 || code > 0x0d))
+  || (code >= 0x7f && code <= 0x9f) || (code >= 0xe000 && code <= 0xf8ff)
+  || (code >= 0xfdd0 && code <= 0xfdef) || (code >= 0xfff0 && code <= 0xfffb)
+  || (code & 0xfffe) === 0xfffe || code > 0x3ffff;
+// "ascii" when every byte is below 0x80, "utf8" when the sample is UTF-8 with
+// multi-byte characters (stray invalid bytes are outnumbered at least four to
+// one), otherwise "other".
+const utf8Shape = (sample) => {
+  let multibyte = 0;
+  let invalid = 0;
+  for (let index = 0; index < sample.length;) {
+    const byte = sample[index];
+    if (byte < 0x80) {
+      index += 1;
+      continue;
+    }
+    const size = byte >= 0xc2 && byte <= 0xdf ? 2 : byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xf0 && byte <= 0xf4 ? 4 : 0;
+    if (size > 0 && index + size > sample.length) break;
+    let next = 1;
+    while (size > 0 && next < size && (sample[index + next] & 0xc0) === 0x80) next += 1;
+    if (size > 0 && next === size) multibyte += 1;
+    else invalid += 1;
+    index += size > 0 && next === size ? size : 1;
   }
+  if (multibyte === 0 && invalid === 0) return "ascii";
+  return multibyte > 0 && invalid * 4 <= multibyte ? "utf8" : "other";
+};
+// True when the sample reads as UTF-32 or UTF-16 text: no NUL characters, no
+// unpaired surrogates, at most 1% unusual characters, and not mostly pairs of
+// printable ASCII bytes (single-byte text with a stray NUL reads like that).
+// When every byte is ASCII, text in one script also keeps most characters in
+// at most three 256-code-point blocks (ASCII, Cyrillic and punctuation, say);
+// ASCII text with a stray NUL spreads over many.
+const decodesAsText = (sample, encoding, asciiBytes) => {
+  const width = encoding.startsWith("utf32") ? 4 : 2;
+  const littleEndian = encoding.endsWith("le");
+  const read = (offset) => width === 4
+    ? (littleEndian ? sample.readUInt32LE(offset) : sample.readUInt32BE(offset))
+    : (littleEndian ? sample.readUInt16LE(offset) : sample.readUInt16BE(offset));
+  const units = Math.floor(sample.length / width);
+  const blocks = new Map();
+  let characters = 0;
+  let unusual = 0;
+  let wide = 0;
+  let asciiPairs = 0;
+  for (let index = 0; index < units; index += 1) {
+    let code = read(index * width);
+    if (width === 2 && code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 === units) break;
+      const low = read((index + 1) * width);
+      if (low < 0xdc00 || low > 0xdfff) return false;
+      code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+      index += 1;
+    } else if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
+      return false;
+    }
+    characters += 1;
+    blocks.set(code >> 8, (blocks.get(code >> 8) || 0) + 1);
+    if (unusualCharacter(code)) unusual += 1;
+    if (code > 0xff && code <= 0xffff) {
+      wide += 1;
+      if (code >> 8 >= 0x20 && code >> 8 <= 0x7e && (code & 0xff) >= 0x20 && (code & 0xff) <= 0x7e) asciiPairs += 1;
+    }
+  }
+  if (characters === 0 || unusual > characters * 0.01 || asciiPairs > wide * 0.85) return false;
+  const topBlocks = [...blocks.values()].sort((left, right) => right - left).slice(0, 3);
+  return !asciiBytes || topBlocks.reduce((total, count) => total + count, 0) >= characters * 0.9;
+};
+// A byte-order mark decides the encoding (H-011). Otherwise, like git, the
+// first 8000 bytes decide: without a NUL byte the file is UTF-8; with one it
+// is binary unless the sample reads as UTF-32 or UTF-16 text in one byte
+// order. UTF-16 text in any script has NUL bytes once it holds a line break,
+// space, digit or other ASCII character. UTF-8 text with stray NULs stays
+// binary. Unsure means binary.
+const sniffEncoding = (chunk) => {
+  if (startsWith(chunk, [0xff, 0xfe, 0x00, 0x00])) return "utf32le";
+  if (startsWith(chunk, [0x00, 0x00, 0xfe, 0xff])) return "utf32be";
+  if (startsWith(chunk, [0xff, 0xfe])) return "utf16le";
+  if (startsWith(chunk, [0xfe, 0xff])) return "utf16be";
+  const sample = chunk.subarray(0, 8000);
+  let oddNuls = 0;
+  let evenNuls = 0;
+  for (let index = 0; index < sample.length; index += 1) {
+    if (sample[index] === 0) {
+      if (index % 2 === 1) oddNuls += 1;
+      else evenNuls += 1;
+    }
+  }
+  const nuls = oddNuls + evenNuls;
   if (nuls === 0) return "utf8";
-  return nuls >= sample.length * 0.3 && oddNuls >= nuls * 0.9 ? "utf16le" : null;
+  const shape = utf8Shape(sample);
+  if (shape === "utf8") return null;
+  // Single-byte text (ASCII, Latin-1) with a stray NUL is binary too: UTF-16
+  // text puts a NUL or another byte outside printable ASCII in most characters.
+  let textBytes = 0;
+  for (const byte of sample) {
+    if ((byte >= 0x20 && byte <= 0x7e) || byte === 0x09 || byte === 0x0a || byte === 0x0d) textBytes += 1;
+  }
+  if (nuls <= sample.length * 0.01 && textBytes >= sample.length * 0.9) return null;
+  // ASCII characters put the NUL in the high byte: odd offsets in UTF-16LE.
+  // Only that byte order is tried (binary records read the other way can look
+  // like text). Too short a sample needs that ASCII pattern outright.
+  const majority = Math.max(oddNuls, evenNuls);
+  const utf16 = sample.length >= 64 || (nuls >= sample.length * 0.3 && majority >= nuls * 0.9)
+    ? [oddNuls >= evenNuls ? "utf16le" : "utf16be"]
+    : [];
+  return ["utf32le", "utf32be", ...utf16].find((encoding) => decodesAsText(sample, encoding, shape === "ascii")) || null;
+};
+// StringDecoder knows UTF-8 and UTF-16LE only; swap UTF-16BE byte pairs and
+// decode UTF-32 here so the reader stays dependency-free.
+const createDecoder = (encoding) => {
+  if (encoding === "utf8" || encoding === "utf16le") return new StringDecoder(encoding);
+  let pending = Buffer.alloc(0);
+  const width = encoding === "utf16be" ? 2 : 4;
+  const utf16 = new StringDecoder("utf16le");
+  const take = (chunk) => {
+    const bytes = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+    const whole = bytes.length - (bytes.length % width);
+    pending = Buffer.from(bytes.subarray(whole));
+    return bytes.subarray(0, whole);
+  };
+  return {
+    write: (chunk) => {
+      const bytes = take(chunk);
+      if (width === 2) return utf16.write(Buffer.from(bytes).swap16());
+      const characters = [];
+      for (let offset = 0; offset < bytes.length; offset += 4) {
+        const code = encoding === "utf32le" ? bytes.readUInt32LE(offset) : bytes.readUInt32BE(offset);
+        characters.push(code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) ? "�" : String.fromCodePoint(code));
+      }
+      return characters.join("");
+    },
+    end: () => (width === 2 ? utf16.end() : "") + (pending.length > 0 ? "�" : ""),
+  };
 };
 (async () => {
   let decoder = null;
@@ -340,14 +463,14 @@ const sniffEncoding = (chunk) => {
         process.stdout.write(JSON.stringify({ binary: true, sizeBytes: fs.statSync(filePath).size }));
         return;
       }
-      decoder = new StringDecoder(encoding);
+      decoder = createDecoder(encoding);
     }
     consume(decoder.write(chunk));
   }
   if (decoder) consume(decoder.end());
   if (sawContent && !endedWithLineBreak) finishLine();
   const sizeBytes = fs.statSync(filePath).size;
-  const details = encoding === "utf16le" ? { encoding: "utf-16le" } : {};
+  const details = encoding === "utf8" ? {} : { encoding: encoding.replace(/^utf(16|32)/, "utf-$1") };
   let content;
   if (totalLines === 0) {
     content = "[File is empty.]";
