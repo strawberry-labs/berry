@@ -17,6 +17,9 @@ import { CloudDatabaseService, type SqlExecutor } from "./../db/cloud-database.s
 const DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 const MAX_QUEUE_ITEMS = 100;
 const ACTIVE_QUEUE_STATUSES = ["queued", "delivering", "paused", "failed"] as const;
+// Expired text stays listed this long so its author can copy it; it is never
+// sent and the user can remove it (H-015).
+const EXPIRED_VISIBLE_DAYS = 7;
 
 type QueueRow = {
   id: string;
@@ -166,11 +169,12 @@ export class QueuedFollowUpService {
          FROM queued_follow_up_items q
          JOIN tasks t ON t.tenant_id=q.tenant_id AND t.id=q.task_id
          WHERE q.tenant_id=$1::uuid AND q.session_id=$2::uuid AND t.user_id=$3::uuid
-           AND q.status = ANY($4::text[]) AND q.expires_at>now()
+           AND ((q.status = ANY($4::text[]) AND q.expires_at>now())
+             OR (q.status='expired' AND q.updated_at>now()-make_interval(days => $7::integer)))
            AND ($5::integer IS NULL OR q.ordinal>$5::integer)
          ORDER BY q.ordinal ASC,q.id ASC
          LIMIT $6`,
-        [tenantId, sessionId, userId, [...ACTIVE_QUEUE_STATUSES], parsedCursor?.ordinal ?? null, boundedLimit + 1],
+        [tenantId, sessionId, userId, [...ACTIVE_QUEUE_STATUSES], parsedCursor?.ordinal ?? null, boundedLimit + 1, EXPIRED_VISIBLE_DAYS],
       );
       const hasMore = rows.length > boundedLimit;
       const items = rows.slice(0, boundedLimit).map(mapQueueRow);
@@ -196,8 +200,13 @@ export class QueuedFollowUpService {
       await expireQueueItems(executor, tenantId);
       const current = await loadOwnedQueueRow(executor, tenantId, userId, id, true);
       if (!current) throw new NotFoundException("Queued follow-up not found");
-      if (["delivered", "cancelled", "expired"].includes(current.status)) {
-        throw new ConflictException("This queued follow-up is no longer editable");
+      // Removing expired text is the only change it accepts; it is never re-sent.
+      const dismissingExpired = current.status === "expired" && input.status === "cancelled"
+        && input.input === undefined && input.intent === undefined && input.attachments === undefined && input.orderedIds === undefined;
+      if (["delivered", "cancelled", "expired"].includes(current.status) && !dismissingExpired) {
+        throw new ConflictException(current.status === "expired"
+          ? "This queued follow-up expired without being sent; copy its text to send it again"
+          : "This queued follow-up is no longer editable");
       }
       if (input.orderedIds) {
         await reorder(executor, tenantId, userId, current.session_id, input.orderedIds);

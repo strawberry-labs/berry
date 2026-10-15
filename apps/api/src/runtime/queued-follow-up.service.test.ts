@@ -104,6 +104,30 @@ describe("QueuedFollowUpService", () => {
     expect(duplicate.queries.some(({ sql }) => sql.includes("INSERT INTO queued_follow_up_items"))).toBe(false);
   });
 
+  it("lists recently expired text and lets the user remove it, but not edit or resend it (H-015)", async () => {
+    const fake = executorFor();
+    const service = new QueuedFollowUpService(new CloudDatabaseService(fake.executor));
+    await service.list(tenantId, userId, sessionId);
+    const list = fake.queries.find(({ sql }) => sql.includes("ORDER BY q.ordinal"));
+    expect(list?.sql).toContain("q.status='expired' AND q.updated_at>now()-make_interval(days => $7::integer)");
+    expect(list?.params[6]).toBe(7);
+
+    const expiredRow = queueRow({ status: "expired", last_error: "This queued follow-up expired" });
+    const expired = executorFor();
+    const originalQuery = expired.executor.query;
+    expired.executor.query = async <T>(sql: string, params: readonly unknown[] = []) => {
+      const removed = expired.executions.some(({ sql: executed, params: values }) => executed.includes("cancelled_at=CASE") && values[7] === "cancelled");
+      if (sql.includes("q.id=$2::uuid")) return [removed ? { ...expiredRow, status: "cancelled" } : expiredRow] as T[];
+      return originalQuery<T>(sql, params);
+    };
+    const expiredService = new QueuedFollowUpService(new CloudDatabaseService(expired.executor));
+    await expect(expiredService.update(tenantId, userId, queueId, { input: "Changed" })).rejects.toThrow("expired without being sent");
+    await expect(expiredService.update(tenantId, userId, queueId, { status: "queued" })).rejects.toThrow("expired without being sent");
+    await expect(expiredService.cancel(tenantId, userId, queueId)).resolves.toMatchObject({ status: "cancelled" });
+    const cancellation = expired.executions.find(({ sql }) => sql.includes("cancelled_at=CASE"));
+    expect(cancellation?.params[7]).toBe("cancelled");
+  });
+
   it("scopes listing to active rows and expires stale or unauthorized tasks", async () => {
     const fake = executorFor();
     const service = new QueuedFollowUpService(new CloudDatabaseService(fake.executor));

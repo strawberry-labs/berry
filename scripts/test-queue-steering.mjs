@@ -132,6 +132,20 @@ try {
   assert.equal((await query("SELECT status FROM queued_follow_up_items WHERE id=$1",[a.id]))[0].status,"expired");
   assert.equal((await query("SELECT b.status FROM budget_reservations b JOIN queued_follow_up_items q ON b.request_id=q.runtime_request->>'queuedBudgetRequestId' AND b.tenant_id=q.tenant_id WHERE q.id=$1",[a.id]))[0].status,"released");
  });
+ await test("expired text stays listed for seven days, is never sent, and can only be removed (H-015)",async()=>{
+  const f=await fixture(),first=await admit(f,"original"),a=await enqueue(f,"send the revised schedule"),old=await enqueue(f,"older expired text");
+  await query("UPDATE queued_follow_up_items SET expires_at=now()-interval '1 second' WHERE id=ANY($1::uuid[])",[[a.id,old.id]]);
+  await drain(first.runId);await scoped(e=>promoteIdleQueuedFollowUps(e,tenantId));assert.equal(await child(f,first.runId),undefined);
+  await queue.list(tenantId,userId,f.sessionId);
+  await query("UPDATE queued_follow_up_items SET updated_at=now()-interval '8 days' WHERE id=$1",[old.id]);
+  const listed=(await queue.list(tenantId,userId,f.sessionId)).items;
+  assert.deepEqual(listed.map((item)=>[item.input,item.status]),[["send the revised schedule","expired"]]);
+  await assert.rejects(()=>queue.update(tenantId,userId,a.id,{status:"queued"}),/expired without being sent/);
+  await assert.rejects(()=>queue.update(tenantId,userId,a.id,{input:"edited"}),/expired without being sent/);
+  assert.equal((await queue.cancel(tenantId,userId,a.id)).status,"cancelled");
+  assert.deepEqual((await queue.list(tenantId,userId,f.sessionId)).items,[]);
+  await scoped(e=>promoteIdleQueuedFollowUps(e,tenantId));assert.equal(await child(f,first.runId),undefined);
+ });
  console.log(`${passed} PostgreSQL queue/steering integration scenarios passed`);
  if(process.argv.includes("--serve")) {
   const {serveQueueFixture}=await import("./queue-steering-browser-server.mjs");

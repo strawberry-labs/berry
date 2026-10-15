@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Pause, Play, Send } from "lucide-react";
+import { Copy, Pause, Play, Send } from "lucide-react";
 import { Button } from "@berry/desktop-ui/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@berry/desktop-ui/components/ui/dropdown-menu";
 import { ChevronRight, Ellipsis, GripVerticalIcon, PencilLine, Queue01Icon, RefreshCw, Trash2 } from "@berry/desktop-ui/lib/icons";
@@ -68,21 +68,24 @@ export function QueuedMessageList({
     };
   }, [updateScrollFade]);
 
+  // Expired text is not part of the queue order; only pending items move.
+  const pending = React.useMemo(() => reorderableFollowUps(followUps), [followUps]);
+
   const reorder = React.useCallback((sourceId: string, targetId: string, after: boolean) => {
-    const ordered = reorderQueuedFollowUps(followUps, sourceId, targetId, after);
-    if (ordered === followUps || ordered.length === 0) return;
+    const ordered = reorderQueuedFollowUps(pending, sourceId, targetId, after);
+    if (ordered === pending || ordered.length === 0) return;
     onReorder(ordered[0]!.sessionId, ordered.map((item) => item.id));
-  }, [followUps, onReorder]);
+  }, [onReorder, pending]);
 
   const moveWithKeyboard = React.useCallback((sourceId: string, direction: -1 | 1) => {
-    const sourceIndex = followUps.findIndex((item) => item.id === sourceId);
+    const sourceIndex = pending.findIndex((item) => item.id === sourceId);
     const targetIndex = sourceIndex + direction;
-    if (sourceIndex < 0 || targetIndex < 0 || targetIndex >= followUps.length) return;
-    const ordered = [...followUps];
+    if (sourceIndex < 0 || targetIndex < 0 || targetIndex >= pending.length) return;
+    const ordered = [...pending];
     const [moved] = ordered.splice(sourceIndex, 1);
     ordered.splice(targetIndex, 0, moved!);
     onReorder(ordered[0]!.sessionId, ordered.map((item) => item.id));
-  }, [followUps, onReorder]);
+  }, [onReorder, pending]);
 
   if (rows.length === 0) return null;
 
@@ -108,7 +111,7 @@ export function QueuedMessageList({
                 setDraggingId(followUp.id);
               }}
               onDragOver={(event) => {
-                if (!draggingId || draggingId === followUp.id || presence === "exiting") return;
+                if (!draggingId || draggingId === followUp.id || presence === "exiting" || followUp.status === "expired") return;
                 event.preventDefault();
                 const box = event.currentTarget.getBoundingClientRect();
                 setDropTarget({ id: followUp.id, after: event.clientY > box.top + box.height / 2 });
@@ -165,7 +168,27 @@ function QueuedMessageRow({
   const isSaving = sending;
   const failed = followUp.status === "failed";
   const paused = followUp.status === "paused";
+  const expired = followUp.status === "expired";
   const actionLabel = queuedActionLabel({ active, failed });
+
+  if (expired) {
+    return (
+      <article className="berry-queued-message-row" role="listitem" data-expired>
+        <span className="berry-queued-message-drag" aria-hidden>
+          <Queue01Icon className="berry-queued-message-queue-icon" />
+        </span>
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="shrink-0 text-[11px] text-[var(--berry-text-tertiary)]">Expired, not sent</span>
+          <p className="berry-queued-message-text" title={followUp.input}>{followUp.input}</p>
+        </div>
+        <span className="sr-only">This message expired before it could be sent. Copy it to send it again.</span>
+        <div className="berry-queued-message-actions">
+          <CopyQueuedText text={followUp.input} />
+          <Button variant="ghost" size="icon-xs" className="berry-queued-message-delete" onClick={() => void onRemove(followUp)} aria-label={`Remove expired message ${followUp.input}`}><Trash2 aria-hidden /></Button>
+        </div>
+      </article>
+    );
+  }
 
   return (
     <article
@@ -215,6 +238,31 @@ function QueuedMessageRow({
   );
 }
 
+/** Copies expired text and reports the result only after the clipboard answers. */
+function CopyQueuedText({ text }: { text: string }) {
+  const [state, setState] = React.useState<"idle" | "copied" | "failed">("idle");
+  React.useEffect(() => {
+    if (state === "idle") return;
+    const timer = window.setTimeout(() => setState("idle"), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [state]);
+  return (
+    <Button
+      variant="ghost"
+      size="xs"
+      className="berry-queued-message-action"
+      onClick={() => {
+        void Promise.resolve()
+          .then(() => navigator.clipboard.writeText(text))
+          .then(() => setState("copied"), () => setState("failed"));
+      }}
+    >
+      <Copy aria-hidden />
+      <span aria-live="polite">{state === "copied" ? "Copied" : state === "failed" ? "Copy failed" : "Copy"}</span>
+    </Button>
+  );
+}
+
 function useReducedMotion(): boolean {
   const [reduced, setReduced] = React.useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   React.useEffect(() => {
@@ -229,6 +277,13 @@ function useReducedMotion(): boolean {
 
 export function queuedActionLabel({ active, failed }: { active: boolean; failed: boolean }): "Retry" | "Steer" | "Send now" {
   return failed ? "Retry" : active ? "Steer" : "Send now";
+}
+
+/** Items that still belong to the queue order: everything except expired text. */
+export function reorderableFollowUps(followUps: QueuedFollowUp[]): QueuedFollowUp[] {
+  return followUps.some((item) => item.status === "expired")
+    ? followUps.filter((item) => item.status !== "expired")
+    : followUps;
 }
 
 export function reorderQueuedFollowUps(followUps: QueuedFollowUp[], sourceId: string, targetId: string, after: boolean): QueuedFollowUp[] {
