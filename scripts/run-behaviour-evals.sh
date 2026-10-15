@@ -30,10 +30,4 @@ for model in "$@"; do
       || echo "  failed; see eval-results/$name.log" >&2
   done
 done
-node -e '
-const fs = require("node:fs");
-for (const file of fs.readdirSync("eval-results").filter((name) => name.endsWith(".json")).sort()) {
-  const report = JSON.parse(fs.readFileSync(`eval-results/${file}`, "utf8"));
-  const total = Object.values(report.byIssue).reduce((sum, item) => ({ cases: sum.cases + item.cases, passed: sum.passed + item.passed }), { cases: 0, passed: 0 });
-  console.log(`${file}: ${total.passed}/${total.cases} passed, ${report.usage.prompt} prompt + ${report.usage.completion} completion tokens`);
-}'
+node scripts/behaviour-eval-summary.mjs eval-results

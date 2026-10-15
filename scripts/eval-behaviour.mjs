@@ -16,7 +16,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { modelMessages, durableBuiltInToolDefinitions } from "../apps/worker/dist/turn-runner.js";
 import { serializeMessage } from "../packages/router-client/dist/index.js";
 import { DURABLE_BASE_BUILT_IN_TOOLS } from "../packages/shared/dist/index.js";
-import { checkResponse } from "./behaviour-eval-checks.mjs";
+import { checkResponse, responseOutcome } from "./behaviour-eval-checks.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, index, all) => {
   if (value.startsWith("--")) pairs.push([value.slice(2), all[index + 1] && !all[index + 1].startsWith("--") ? all[index + 1] : "true"]);
@@ -105,21 +105,25 @@ await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, asy
     }
     try {
       const { body, latencyMs } = await call(request);
-      const outcome = checkResponse(item, body);
-      results.push({ id: item.id, issue: item.issue, sample, pass: outcome.pass, failures: outcome.failures, calls: outcome.calls, latencyMs, usage: body.usage ?? null, servedModel: body.model ?? null, answer: outcome.answer.slice(0, 1_200) });
+      const checked = checkResponse(item, body);
+      results.push({ id: item.id, issue: item.issue, sample, pass: checked.pass, outcome: responseOutcome(body, checked), failures: checked.failures, calls: checked.calls, finishReason: body.choices?.[0]?.finish_reason ?? null, latencyMs, usage: body.usage ?? null, servedModel: body.model ?? null, answer: checked.answer.slice(0, 1_200) });
     } catch (error) {
-      results.push({ id: item.id, issue: item.issue, sample, pass: false, error: error.message });
+      results.push({ id: item.id, issue: item.issue, sample, pass: false, outcome: "api_error", error: error.message });
     }
   }
 }));
 
 results.sort((left, right) => left.id.localeCompare(right.id) || left.sample - right.sample);
+// "evaluated" counts completed answers only; inconclusive outcomes are kept apart.
 const byIssue = {};
 for (const result of results) {
-  const bucket = byIssue[result.issue] ??= { cases: 0, passed: 0, errors: 0 };
+  const bucket = byIssue[result.issue] ??= { cases: 0, evaluated: 0, passed: 0, failed: 0, toolPending: 0, tokenLimited: 0, errors: 0 };
   bucket.cases += 1;
-  if (result.pass) bucket.passed += 1;
-  if (result.error) bucket.errors += 1;
+  if (result.outcome === "passed") { bucket.passed += 1; bucket.evaluated += 1; }
+  if (result.outcome === "failed") { bucket.failed += 1; bucket.evaluated += 1; }
+  if (result.outcome === "tool_pending") bucket.toolPending += 1;
+  if (result.outcome === "token_limited") bucket.tokenLimited += 1;
+  if (result.outcome === "api_error") bucket.errors += 1;
 }
 const usage = results.reduce((total, result) => ({
   prompt: total.prompt + (result.usage?.prompt_tokens ?? 0),
@@ -128,4 +132,4 @@ const usage = results.reduce((total, result) => ({
 const report = { model: args.model ?? null, baseHost: args["base-url"] ? new URL(args["base-url"]).host : null, variant: args.candidate ?? "baseline", dryRun, byIssue, usage, results };
 if (args.out) await writeFile(args.out, `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify({ model: report.model, variant: report.variant, dryRun, byIssue, usage }, null, 2));
-if (!dryRun) for (const result of results.filter((item) => !item.pass)) console.log(`FAIL ${result.id}#${result.sample}: ${result.error ?? result.failures.join("; ")}`);
+if (!dryRun) for (const result of results.filter((item) => !item.pass)) console.log(`${result.outcome.toUpperCase()} ${result.id}#${result.sample}: ${result.error ?? result.failures.join("; ")}`);

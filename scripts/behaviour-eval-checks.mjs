@@ -36,7 +36,24 @@ export function checkResponse(item, response) {
   return { pass: failures.length === 0, failures, calls, answer };
 }
 
+/**
+ * Separates a failed check into what it says about behaviour. The harness runs
+ * one completion and never executes tools, so a reply that only calls an
+ * allowed tool, or that hit the token limit before answering, is inconclusive
+ * rather than a behaviour failure. Tool-expectation failures always count.
+ * @returns "passed" | "failed" | "tool_pending" | "token_limited"
+ */
+export function responseOutcome(response, checked) {
+  if (checked.pass) return "passed";
+  if (checked.failures.some((failure) => failure.startsWith("called ") || failure.startsWith("expected one of"))) return "failed";
+  if (checked.answer.trim()) return "failed";
+  const finish = String(response.choices?.[0]?.finish_reason ?? "").toLowerCase();
+  if (finish === "length" || finish === "max_tokens") return "token_limited";
+  if (checked.calls.length > 0) return "tool_pending";
+  return "failed";
+}
+
 /** Builds a minimal completion for tests and for re-checking saved answers. */
-export function completion(content, toolCalls = []) {
-  return { choices: [{ message: { content, tool_calls: toolCalls.map((name, index) => ({ id: `call-${index}`, type: "function", function: { name, arguments: "{}" } })) } }] };
+export function completion(content, toolCalls = [], finishReason = toolCalls.length ? "tool_calls" : "stop") {
+  return { choices: [{ finish_reason: finishReason, message: { content, tool_calls: toolCalls.map((name, index) => ({ id: `call-${index}`, type: "function", function: { name, arguments: "{}" } })) } }] };
 }

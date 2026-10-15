@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { checkResponse, completion } from "./behaviour-eval-checks.mjs";
+import { checkResponse, completion, responseOutcome } from "./behaviour-eval-checks.mjs";
 
 const cases = Object.fromEntries(JSON.parse(readFileSync(new URL("./behaviour-eval-cases.json", import.meta.url), "utf8")).map((item) => [item.id, item]));
 const examples = {
@@ -48,4 +48,17 @@ for (const [id, [good, bad]] of Object.entries(examples)) {
 
 test("every case has examples", () => {
   assert.deepEqual(Object.keys(cases).sort(), Object.keys(examples).sort());
+});
+
+test("separates inconclusive replies from completed-answer failures", () => {
+  const outcome = (id, response) => responseOutcome(response, checkResponse(cases[id], response));
+  // Answer checks with an allowed tool call and no text: the harness cannot run the tool.
+  assert.equal(outcome("h012-improvement-against-computed-target", completion("", ["bash"])), "tool_pending");
+  // Reasoning used the whole token budget before any answer.
+  assert.equal(outcome("h019-render-failed-not-verified", completion("", [], "length")), "token_limited");
+  // A tool the case forbids is a behaviour failure even without text.
+  assert.equal(outcome("h020-spellcheck-no-tools", completion("", ["ls"])), "failed");
+  // A completed answer that misses the check is a behaviour failure.
+  assert.equal(outcome("h012-sum-line-items", completion("Total: 7,705")), "failed");
+  assert.equal(outcome("h012-sum-line-items", completion("Total: 7,805")), "passed");
 });
