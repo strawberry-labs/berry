@@ -112,6 +112,23 @@ function finalAnswerInstruction(reason: string): string {
   ].join("\n\n");
 }
 
+function failedPublication(result: TurnToolResult): boolean {
+  return record(result.output)?.publication === "failed";
+}
+
+/** What the model is told when files could not be published after its answer (H-014). */
+function publicationRepairInstruction(unpublished: readonly TurnToolResult[]): string {
+  const lines = unpublished.map((result) => {
+    const output = record(result.output);
+    return `- ${stringValue(output?.name) ?? "file"} (${stringValue(output?.path) ?? "unknown path"}): ${stringValue(output?.reason) ?? "publication failed"}`;
+  });
+  return [
+    "Berry could not publish these output files after your answer:",
+    ...lines,
+    "Your answer is saved and any other files were published. For each file the user still needs, publish it with persist_artifact using its path; if it is missing or broken, recreate it first. If it cannot be published, tell the user which file was not delivered. Do not say a file was delivered unless it was published.",
+  ].join("\n");
+}
+
 /** The answer Berry gives when the model returns nothing usable after tool use stopped. */
 function finalAnswerFallback(reason: string): string {
   return `I stopped working on this because ${reason.charAt(0).toLowerCase()}${reason.slice(1)}\n\nTell me how you would like to continue, or correct the input and ask again.`;
@@ -682,8 +699,7 @@ export class DurableTurnRunner {
         return { runId: snapshot.id, state: "calling_model" };
       }
       if (snapshot.state === "finalizing" || snapshot.state === "persisting_response") {
-        await this.finalize(snapshot);
-        return { runId: snapshot.id, state: "completed" };
+        return { runId: snapshot.id, state: await this.finalize(snapshot) };
       }
       await this.repository.release(snapshot);
       return { runId: snapshot.id, state: snapshot.state, noOp: true };
@@ -2819,11 +2835,58 @@ export class DurableTurnRunner {
     return "calling_model";
   }
 
-  private async finalize(snapshot: DurableTurnSnapshot): Promise<void> {
+  private async finalize(snapshot: DurableTurnSnapshot): Promise<TurnRunState> {
     const finalizedArtifacts = await this.withHeartbeat(
       snapshot,
       async () => this.tools.finalize?.(snapshot) ?? [],
     );
+    // Publication after the answer can fail for some files. Their receipts
+    // and the answer are kept; the model gets one turn to publish or report
+    // the files it can repair, then the run completes with the rest listed as
+    // not published (H-014).
+    const published = finalizedArtifacts.filter((result) => !failedPublication(result));
+    const unpublished = finalizedArtifacts.filter(failedPublication);
+    const publicationMessages = (results: readonly TurnToolResult[], status: "completed" | "failed") => results.map((result) => ({
+      id: randomUUID(),
+      toolCallId: randomUUID(),
+      name: "persist_artifact",
+      input: {},
+      status,
+      output: result.output,
+      summary: result.summary,
+    }));
+    const repairable = unpublished.filter((result) => record(result.output)?.workspaceUnavailable !== true);
+    const repairRequested = snapshot.steps.some((step) => step.type === "model.call" && stringValue(record(step.input)?.publicationRepair));
+    if (repairable.length > 0 && !repairRequested) {
+      const iteration = modelIteration(snapshot.steps) + 1;
+      const sequence = nextStepSequence(snapshot.steps);
+      await this.commitAndWake(snapshot, {
+        expectedState: snapshot.state,
+        nextState: "calling_model",
+        steps: [
+          {
+            id: randomUUID(),
+            sequence,
+            type: "turn.finalize",
+            state: "completed",
+            input: {},
+            output: { completed: false, unpublished: unpublished.map((result) => result.output) },
+          },
+          {
+            id: randomUUID(),
+            sequence: sequence + 1,
+            type: "model.call",
+            state: "pending",
+            input: { iteration, publicationRepair: publicationRepairInstruction(unpublished) },
+            retryClass: "idempotent_with_key",
+            idempotencyKey: `${snapshot.id}:model:${iteration}:publication-repair`,
+          },
+        ],
+        toolResultMessages: publicationMessages(published, "completed"),
+        nextAction: "Ask the model to publish or report the files that could not be published",
+      });
+      return "calling_model";
+    }
     const lastAssistant = [...snapshot.entries].reverse().find((entry) => {
       const payload = record(entry.payload);
       return record(payload?.message)?.role === "assistant";
@@ -2839,18 +2902,16 @@ export class DurableTurnRunner {
         type: "turn.finalize",
         state: "completed",
         input: {},
-        output: { completed: true },
+        output: {
+          completed: true,
+          ...(unpublished.length > 0 ? { unpublished: unpublished.map((result) => result.output) } : {}),
+        },
       }],
       events: [{ kind: "turn.end", turnId: snapshot.id, status: "completed" }],
-      toolResultMessages: finalizedArtifacts.map((result) => ({
-        id: randomUUID(),
-        toolCallId: randomUUID(),
-        name: "persist_artifact",
-        input: {},
-        status: "completed" as const,
-        output: result.output,
-        summary: result.summary,
-      })),
+      toolResultMessages: [
+        ...publicationMessages(published, "completed"),
+        ...publicationMessages(unpublished, "failed"),
+      ],
       nextAction: null,
       waitingReason: null,
       taskStatus: "completed",
@@ -2894,6 +2955,7 @@ export class DurableTurnRunner {
         }] : []),
       ],
     });
+    return "completed";
   }
 
   private async cancel(snapshot: DurableTurnSnapshot): Promise<void> {
@@ -6533,7 +6595,10 @@ export function modelMessages(
     : "";
   const activeModelInput = latestStep(snapshot.steps, "model.call")?.input;
   const wrapUpReason = stringValue(activeModelInput?.wrapUp);
-  const recoveryInstruction = wrapUpReason
+  const publicationRepair = stringValue(activeModelInput?.publicationRepair);
+  const recoveryInstruction = publicationRepair
+    ? publicationRepair
+    : wrapUpReason
     ? finalAnswerInstruction(wrapUpReason)
     : activeModelInput?.recoveryReason === "empty_response"
       ? "Recovery instruction: the provider's previous response contained no text and no tool call. Continue the user's task now. You must either call a declared tool or return a clear, non-empty final answer."

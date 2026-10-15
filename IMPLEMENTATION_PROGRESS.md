@@ -95,7 +95,8 @@ Production data must not be disrupted or lost. Rules for every change in this lo
 | `f30b651` | H-031 | None. Fixes how *new* receipts are written; the 834 historical dead-letter rows are not touched (separate reviewed plan required). |
 | `49815ef` | H-048 | None. New `session_entries` projections of failed messages store the error as a typed `error` part; existing rows are not rewritten (legacy shape is handled at read time). |
 | `2a7af6b` | H-066 | None. On operator Retry/Mark complete: one new `budget_reservations` row (`<request>:recovery:<n>`) through the normal budget path and new JSON keys merged into that run's `runtime_request`. Existing settled reservations, usage rows and ledger entries are never modified. |
-| (this commit) | H-077 | None. Preparation behaviour only; no schema or stored-data change. |
+| `095530e` | H-077 | None. Preparation behaviour only; no schema or stored-data change. |
+| (this commit) | H-014 | None. Reuses the artifact-operation and finalization records (`partial` status already exists). |
 
 ## Status legend
 
@@ -2299,3 +2300,14 @@ AESG packages.
 - **Data impact.** None.
 - **Deployment.** Not deployed (worker).
 - **Remaining.** Connector credentials are still opened at preparation, though now per connector; opening them only on first use would need `McpToolSource` changes. An attachment notice is sent on each model request of the run rather than journaled once. Memory tools disappear from the tool list for a request whose settings lookup fails, which changes that request's cache prefix.
+
+### H-014 / H-009 — Publication failure after the answer fails the task
+
+- **Revalidation (15 October, after `095530e`).** The audit's two cases still failed the run: an upload error after the answer existed, and a scan that published one file before a missing second file rejected it. `91208bc` covers only runs that cannot have written files.
+- **Fix.**
+  - `sandbox-continuity.ts`: `finalizeSandboxOutputs` publishes each file through `publishOutputFile` and returns `{ published, failed }`. A per-file failure is recorded (artifact operation failed, as before) and does not stop its peers. `putArtifact` gets one retry of a temporary failure on the same content-addressed key. `finalize` returns receipts plus a `publication: "failed"` result per failure. An unreachable workspace in a run that may have written files becomes one such result (`workspaceUnavailable`) instead of a thrown error; non-writing runs still skip quietly. The terminal finalizer records `partial` with completed/failed counts.
+  - `turn-runner.ts`: `finalize` keeps published receipts. When a failure the model can act on exists and no repair turn has run, it commits a `turn.finalize` step (`completed: false`) and a model call whose `publicationRepair` instruction is appended last (cache-safe). The model can publish with `persist_artifact` (normal tool errors) or tell the user. Otherwise the run completes with the receipts, a failed `persist_artifact` result per unpublished file, and `unpublished` on the `turn.finalize` output. The answer is never removed.
+- **Tests.** Sandbox: first upload succeeds and second fails; a file disappears after listing; a temporary upload failure is retried on the same key; a later scan uploads only the changed file (unchanged content not re-uploaded). Runner: a repair turn followed by completion with the failure listed and the answer intact; workspace-unavailable completes without a repair turn; all-published control. Five fail on the previous source; the two controls pass on both. The H-009 test for a bash run with a lost sandbox now expects unpublished outputs instead of a failed run. Worker suite: 632 passed, 3 skipped.
+- **Data impact.** None.
+- **Deployment.** Not deployed (worker).
+- **Remaining.** The web UI shows unpublished files as failed `persist_artifact` results; there is no dedicated "retry publication" button. A retry happens through a follow-up turn, whose scan publishes only what is still unpublished, or through the terminal finalizer.

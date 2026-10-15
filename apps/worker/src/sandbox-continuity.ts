@@ -1711,18 +1711,33 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     throw new Error(`Unsupported durable tool: ${toolName}`);
   }
 
+  /**
+   * Publishes new files under outputs/ after the answer. Each file is
+   * published on its own: one that fails is returned as a failed publication
+   * next to the receipts of the files that succeeded, and the answer stays
+   * delivered (H-014). Unpublished files stay in the workspace, so a later
+   * scan publishes only them; identical content is never uploaded twice.
+   */
   async finalize(snapshot: DurableTurnSnapshot): Promise<readonly TurnToolResult[]> {
     if (!snapshot.sandboxId || !this.objects) return [];
+    const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     try {
       const sandbox = await this.ensureSandbox(snapshot);
-      return await this.finalizeSandboxOutputs(snapshot, sandbox);
+      const { published, failed } = await this.finalizeSandboxOutputs(snapshot, sandbox);
+      return [...published, ...failed.map(publicationFailureResult)];
     } catch (error) {
-      // The answer is already delivered. A run that executed nothing able to
-      // write files cannot have produced new outputs, so an unavailable
-      // sandbox must not turn it into a failure. Earlier unpublished outputs
-      // stay in the sandbox/snapshot for the next scan; runs that did write
-      // files still fail visibly when their outputs cannot be reached.
-      if (runMayHaveWrittenFiles(snapshot)) throw error;
+      // A run that executed nothing able to write files cannot have produced
+      // new outputs, so an unavailable sandbox is skipped quietly (H-009).
+      // A run that may have written files reports its outputs as not yet
+      // published instead of failing the delivered answer (H-014).
+      if (runMayHaveWrittenFiles(snapshot)) {
+        return [publicationFailureResult({
+          path: `${workspaceRoot}/outputs`,
+          name: "files in outputs/",
+          reason: `the workspace could not be reached (${errorDetail(error)}); the files stay in the workspace and are published by the next scan`,
+          workspaceUnavailable: true,
+        })];
+      }
       emitWorkerOperationalEvent("sandbox.operation", "unknown", "unknown", {
         operation: "finalize.output_scan",
         outcome: "skipped_sandbox_unavailable",
@@ -1736,9 +1751,9 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
   private async finalizeSandboxOutputs(
     snapshot: DurableTurnSnapshot,
     sandbox: { provider: string; id: string; state: string },
-  ): Promise<readonly TurnToolResult[]> {
+  ): Promise<{ published: TurnToolResult[]; failed: OutputPublicationFailure[] }> {
     const objects = this.objects;
-    if (!objects) return [];
+    if (!objects) return { published: [], failed: [] };
     const workspaceRoot = safeWorkspaceRoot(this.options.cwd ?? "/workspace");
     let listed: Awaited<ReturnType<SandboxProvider["files"]["list"]>>;
     try {
@@ -1752,7 +1767,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       // FileNotFoundError, while local providers generally surface ENOENT.
       // Both mean there is simply nothing to publish; availability and other
       // listing failures must still fail finalization visibly.
-      if (isMissingSandboxPath(error)) return [];
+      if (isMissingSandboxPath(error)) return { published: [], failed: [] };
       throw error;
     }
     const explicitlyPersisted = new Set(snapshot.steps.flatMap((step) => {
@@ -1774,72 +1789,101 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       }
     }
     const results: TurnToolResult[] = [];
+    const failed: OutputPublicationFailure[] = [];
     for (const entry of listed.entries) {
       if (entry.type !== "file" || explicitlyPersisted.has(entry.path) || !isDurableArtifact(entry.path)) continue;
       const path = safeOutputPath(entry.path, workspaceRoot);
-      const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
-      const bytes = Buffer.from(source.content, "base64");
-      if (bytes.byteLength === 0) continue;
       const name = safeArtifactName(path.split("/").at(-1) ?? "artifact");
-      const mediaType = resolveArtifactMediaType({ bytes, sourcePath: path, requestedName: name });
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      if (previouslyPublished.has(`${path}\0${sha256}`)) continue;
-      const relativeKey = path.slice(`${workspaceRoot}/`.length);
-      const relativeKeyFingerprint = createHash("sha256").update(relativeKey).digest("hex");
-      const operationKey = `${snapshot.id}:artifact:${relativeKeyFingerprint}`;
-      const fileId = stableArtifactUuid(`${snapshot.id}:${path}:${sha256}`);
-      await this.repository.recordArtifactOperationStart?.({
+      try {
+        const published = await this.publishOutputFile(snapshot, sandbox, objects, path, name, workspaceRoot, previouslyPublished);
+        if (published) results.push(published);
+      } catch (error) {
+        const lifecycle = classifySandboxLifecycleFailure(error);
+        failed.push({
+          path,
+          name,
+          reason: isMissingSandboxPath(error)
+            ? "the file no longer exists at this path"
+            : errorDetail(error),
+          ...(lifecycle === "missing" || lifecycle === "transient" ? { workspaceUnavailable: true } : {}),
+        });
+      }
+    }
+    return { published: results, failed };
+  }
+
+  /** Publishes one output file; null when it is empty or already published unchanged. */
+  private async publishOutputFile(
+    snapshot: DurableTurnSnapshot,
+    sandbox: { provider: string; id: string; state: string },
+    objects: SandboxSnapshotObjectStore,
+    path: string,
+    name: string,
+    workspaceRoot: string,
+    previouslyPublished: ReadonlySet<string>,
+  ): Promise<TurnToolResult | null> {
+    const source = await this.provider.files.read({ sandbox_id: sandbox.id, path, encoding: "base64" });
+    const bytes = Buffer.from(source.content, "base64");
+    if (bytes.byteLength === 0) return null;
+    const mediaType = resolveArtifactMediaType({ bytes, sourcePath: path, requestedName: name });
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (previouslyPublished.has(`${path}\0${sha256}`)) return null;
+    const relativeKey = path.slice(`${workspaceRoot}/`.length);
+    const relativeKeyFingerprint = createHash("sha256").update(relativeKey).digest("hex");
+    const operationKey = `${snapshot.id}:artifact:${relativeKeyFingerprint}`;
+    const fileId = stableArtifactUuid(`${snapshot.id}:${path}:${sha256}`);
+    await this.repository.recordArtifactOperationStart?.({
+      tenantId: snapshot.tenantId,
+      runId: snapshot.id,
+      operationKey,
+      relativeKeyFingerprint,
+      sourcePath: path,
+    });
+    try {
+      // The object key is fixed by run, path and content, so one retry of a
+      // temporary storage failure rewrites the same object.
+      const stored = await this.#retryTransientPreparation(undefined, () => objects.putArtifact(
+        `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${fileId}/${sha256}/${name}`,
+        bytes,
+        mediaType,
+      ));
+      await this.repository.recordArtifactOperationStorage?.({
         tenantId: snapshot.tenantId,
         runId: snapshot.id,
         operationKey,
-        relativeKeyFingerprint,
+        storageReceipt: {
+          bucket: stored.bucket,
+          key: stored.key,
+          etag: stored.etag,
+          ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
+        },
+      });
+      const output = await this.repository.persistOutput({
+        snapshot, fileId, name, mediaType, sizeBytes: bytes.byteLength, sha256,
+        bucket: stored.bucket, objectKey: stored.key, etag: stored.etag,
+        ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
         sourcePath: path,
       });
-      try {
-        const stored = await objects.putArtifact(
-          `tenants/${snapshot.tenantId}/users/${snapshot.userId}/files/auto/${fileId}/${sha256}/${name}`,
-          bytes,
-          mediaType,
-        );
-        await this.repository.recordArtifactOperationStorage?.({
-          tenantId: snapshot.tenantId,
-          runId: snapshot.id,
-          operationKey,
-          storageReceipt: {
-            bucket: stored.bucket,
-            key: stored.key,
-            etag: stored.etag,
-            ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
-          },
-        });
-        const output = await this.repository.persistOutput({
-          snapshot, fileId, name, mediaType, sizeBytes: bytes.byteLength, sha256,
-          bucket: stored.bucket, objectKey: stored.key, etag: stored.etag,
-          ...(stored.objectVersionId !== undefined ? { objectVersionId: stored.objectVersionId } : {}),
-          sourcePath: path,
-        });
-        await this.repository.completeArtifactOperation?.({
-          tenantId: snapshot.tenantId,
-          runId: snapshot.id,
-          operationKey,
-          fileId: output.fileId,
-        });
-        results.push({
-          output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
-          summary: `Published ${name}`,
-          sandbox,
-        });
-      } catch (error) {
-        await this.repository.failArtifactOperation?.({
-          tenantId: snapshot.tenantId,
-          runId: snapshot.id,
-          operationKey,
-          errorClass: error instanceof Error ? error.name : "artifact_operation_error",
-        });
-        throw error;
-      }
+      await this.repository.completeArtifactOperation?.({
+        tenantId: snapshot.tenantId,
+        runId: snapshot.id,
+        operationKey,
+        fileId: output.fileId,
+      });
+      return {
+        output: { text: `Published artifact: ${name}`, artifact: { kind: "file", path: `/v1/files/${output.fileId}/content`, name, mediaType, size: bytes.byteLength, fileId: output.fileId } },
+        summary: `Published ${name}`,
+        sandbox,
+      };
+    } catch (error) {
+      await this.repository.failArtifactOperation?.({
+        tenantId: snapshot.tenantId,
+        runId: snapshot.id,
+        operationKey,
+        errorClass: error instanceof Error ? error.name : "artifact_operation_error",
+      });
+      throw error;
     }
-    return results;
   }
 
   private async finalizeTerminalRun(run: SnapshotRun): Promise<{ noOp: boolean; completedCount?: number }> {
@@ -1853,7 +1897,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (this.repository.beginFinalization && !lease) return { noOp: true };
     const snapshot = terminalFinalizationSnapshot(run);
     try {
-      const results = await this.finalizeSandboxOutputs(snapshot, {
+      const { published: results, failed } = await this.finalizeSandboxOutputs(snapshot, {
         provider: run.sandboxProvider ?? this.provider.kind,
         id: run.sandboxId,
         state: run.sandboxState ?? "running",
@@ -1864,11 +1908,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         sessionId: run.sessionId,
         owner,
         operationKey: `${run.runId}:finalization`,
-        status: "complete",
-        itemCount: results.length,
+        status: failed.length > 0 ? "partial" : "complete",
+        itemCount: results.length + failed.length,
         completedCount: results.length,
-        failedCount: 0,
-        manifest: results.map((result) => result.output) as JsonValue,
+        failedCount: failed.length,
+        manifest: [...results.map((result) => result.output), ...failed.map((failure) => publicationFailureResult(failure).output)] as JsonValue,
       });
       return { noOp: false, completedCount: results.length };
     } catch (error) {
@@ -3945,6 +3989,28 @@ function runtimeAttachmentFileIds(snapshot: DurableTurnSnapshot): Set<string> {
     const fileId = value ? stringValue(value.fileId) : undefined;
     return fileId ? [fileId.toLowerCase()] : [];
   }));
+}
+
+/** An output file that could not be published after the answer (H-014). */
+export interface OutputPublicationFailure {
+  path: string;
+  name: string;
+  reason: string;
+  /** The workspace itself could not be reached; the model cannot repair this file now. */
+  workspaceUnavailable?: boolean;
+}
+
+function publicationFailureResult(failure: OutputPublicationFailure): TurnToolResult {
+  return {
+    output: {
+      publication: "failed",
+      path: failure.path,
+      name: failure.name,
+      reason: failure.reason,
+      ...(failure.workspaceUnavailable ? { workspaceUnavailable: true } : {}),
+    },
+    summary: `Not published: ${failure.name} (${failure.reason})`,
+  };
 }
 
 function runtimeAttachmentName(snapshot: DurableTurnSnapshot, fileId: string): string | null {

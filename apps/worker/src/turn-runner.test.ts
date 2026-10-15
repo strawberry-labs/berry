@@ -2559,6 +2559,80 @@ describe("durable turn runner", () => {
     });
   });
 
+  describe("partial publication after the answer (H-014)", () => {
+    const job = () => ({ tenantId, runId, reason: "continue" as const });
+    const receipt: TurnToolResult = {
+      output: { text: "Published artifact: a.txt", artifact: { kind: "file", path: "/v1/files/f1/content", name: "a.txt", mediaType: "text/plain", size: 5, fileId: "f1" } },
+      summary: "Published a.txt",
+    };
+    const failure = (extra: Record<string, unknown> = {}): TurnToolResult => ({
+      output: { publication: "failed", path: "/workspace/outputs/b.txt", name: "b.txt", reason: "access denied by storage policy", ...extra },
+      summary: "Not published: b.txt (access denied by storage policy)",
+    });
+    const answered = () => {
+      const current = snapshot("finalizing", [admittedStep()]);
+      current.entries.push({
+        entryId: "finished-answer",
+        parentEntryId: null,
+        entryType: "message",
+        sequence: 2,
+        payload: { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Both files are ready." }] } } as never,
+      });
+      return current;
+    };
+
+    it("keeps the answer and receipts, asks the model once to repair, then lists what was not published", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const finalize = vi.fn(async () => [receipt, failure()]);
+      let instruction = "";
+      const model: DurableTurnModel = {
+        call: vi.fn(async (current: DurableTurnSnapshot) => {
+          instruction = String((modelMessages(current).messages.at(-1) as { content: unknown }).content);
+          return { text: "a.txt is ready; b.txt could not be published.", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        }),
+      };
+      const runner = new DurableTurnRunner(repository, model, { ...noTools(), finalize });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "calling_model" });
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "completed", summary: "Published a.txt" })]);
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "finalizing" });
+      expect(instruction).toContain("Berry could not publish these output files");
+      expect(instruction).toContain("- b.txt (/workspace/outputs/b.txt): access denied by storage policy");
+      expect(instruction).toContain("Do not say a file was delivered unless it was published");
+
+      // Still failing after the repair turn: the run completes with it listed.
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(model.call).toHaveBeenCalledTimes(1);
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([
+        expect.objectContaining({ status: "completed", summary: "Published a.txt" }),
+        expect.objectContaining({ status: "failed", summary: "Not published: b.txt (access denied by storage policy)" }),
+      ]);
+      expect(repository.current.error).toBeNull();
+      expect(JSON.stringify(repository.current.entries)).toContain("Both files are ready.");
+      expect(repository.current.steps.filter((step) => step.type === "turn.finalize").at(-1)?.output)
+        .toMatchObject({ completed: true, unpublished: [expect.objectContaining({ name: "b.txt" })] });
+    });
+
+    it("completes without a repair turn when the workspace itself could not be reached", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const runner = new DurableTurnRunner(repository, unusedModel(), {
+        ...noTools(),
+        finalize: async () => [failure({ workspaceUnavailable: true })],
+      });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(repository.mutations.at(-1)?.toolResultMessages).toEqual([expect.objectContaining({ status: "failed" })]);
+    });
+
+    it("completes normally when every file was published", async () => {
+      const repository = new FakeTurnRepository(answered());
+      const runner = new DurableTurnRunner(repository, unusedModel(), { ...noTools(), finalize: async () => [receipt] });
+
+      await expect(runner.execute(job())).resolves.toMatchObject({ state: "completed" });
+      expect(repository.current.steps.find((step) => step.type === "turn.finalize")?.output).toEqual({ completed: true });
+    });
+  });
+
   describe("stalled model streams (H-021)", () => {
     // Persists retry diagnostics on the model step, as the SQL repository does.
     class ReleasingTurnRepository extends FakeTurnRepository {

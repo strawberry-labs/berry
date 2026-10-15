@@ -24,7 +24,7 @@ import {
   type SandboxSnapshotObjectStore,
   type SandboxSnapshotRepository,
 } from "./sandbox-continuity.js";
-import { DurableTurnRetryableError, type DurableTurnSnapshot, type DurableTurnStep } from "./turn-runner.js";
+import { DurableTurnRetryableError, type DurableTurnSnapshot, type DurableTurnStep, type TurnToolResult } from "./turn-runner.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 
 async function testPng(seed: number): Promise<Buffer> {
@@ -112,6 +112,112 @@ describe("sandbox lifecycle failures (H-009)", () => {
 
     await expect(staged).rejects.toBeInstanceOf(DurableTurnRetryableError);
     await expect(staged).rejects.toThrow("Berry will retry");
+  });
+});
+
+describe("partial output publication (H-014)", () => {
+  const publication = (
+    files: Record<string, string | null>,
+    options: { upload?: (key: string) => Promise<{ bucket: string; key: string; etag: string }>; published?: Array<{ sourcePath: string; sha256: string }> } = {},
+  ) => {
+    const provider = {
+      kind: "e2b",
+      create: vi.fn(),
+      resume: vi.fn(async () => ({ sandbox_id: "sandbox-publish", provider: "e2b", status: "running" })),
+      exec: vi.fn(),
+      files: {
+        read: vi.fn(async (input: { path: string }) => {
+          const content = files[input.path];
+          if (content === null || content === undefined) throw Object.assign(new Error(`path not found: ${input.path}`), { name: "FileNotFoundError" });
+          return { path: input.path, content: Buffer.from(content).toString("base64"), size_bytes: content.length, mtime: null };
+        }),
+        write: vi.fn(),
+        list: vi.fn(async () => ({
+          path: "/workspace/outputs",
+          entries: Object.keys(files).map((path) => ({ path, type: "file", size_bytes: 5, mtime: null })),
+        })),
+      },
+    } as unknown as SandboxProvider;
+    const repository = {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      publishedOutputs: vi.fn(async () => options.published ?? []),
+      persistOutput: vi.fn(async (input: { fileId: string; name: string; mediaType: string; sizeBytes: number; objectKey: string }) => ({ ...input })),
+      recordArtifactOperationStart: vi.fn(async () => undefined),
+      recordArtifactOperationStorage: vi.fn(async () => undefined),
+      completeArtifactOperation: vi.fn(async () => undefined),
+      failArtifactOperation: vi.fn(async () => undefined),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    } satisfies SandboxSnapshotRepository;
+    const objects = {
+      put: vi.fn(),
+      putArtifact: vi.fn(options.upload ?? (async (key: string) => ({ bucket: "berry", key, etag: "etag" }))),
+      get: vi.fn(),
+      getSource: vi.fn(),
+    } satisfies SandboxSnapshotObjectStore;
+    const manager = new SandboxContinuityManager(provider, repository, objects, { image: "berry-sandbox", preparationRetryDelayMs: 1 });
+    const current = snapshot();
+    current.sandboxId = "sandbox-publish";
+    current.sandboxProvider = "e2b";
+    current.sandboxState = "running";
+    current.steps = [{ ...toolStep("bash", { command: "make files" }), state: "completed" }];
+    return { manager, repository, objects, current };
+  };
+  const failures = (results: readonly TurnToolResult[]) => results.filter((result) => (result.output as { publication?: string }).publication === "failed");
+  const receipts = (results: readonly TurnToolResult[]) => results.filter((result) => (result.output as { artifact?: unknown }).artifact);
+
+  it("keeps the first file's receipt when the second upload fails", async () => {
+    const { manager, repository, current } = publication(
+      { "/workspace/outputs/a.txt": "alpha", "/workspace/outputs/b.txt": "bravo" },
+      { upload: async (key) => { if (key.endsWith("/b.txt")) throw new Error("access denied by storage policy"); return { bucket: "berry", key, etag: "etag" }; } },
+    );
+
+    const results = await manager.finalize(current);
+    expect(receipts(results).map((result) => (result.output as { artifact: { name: string } }).artifact.name)).toEqual(["a.txt"]);
+    expect(failures(results)).toEqual([expect.objectContaining({
+      output: expect.objectContaining({ path: "/workspace/outputs/b.txt", reason: expect.stringContaining("access denied") }),
+    })]);
+    expect(repository.completeArtifactOperation).toHaveBeenCalledTimes(1);
+    expect(repository.failArtifactOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a file that disappeared after listing and still publishes its peer", async () => {
+    const { manager, current } = publication({ "/workspace/outputs/a.txt": "alpha", "/workspace/outputs/gone.txt": null });
+
+    const results = await manager.finalize(current);
+    expect(receipts(results)).toHaveLength(1);
+    expect(failures(results)[0]?.output).toMatchObject({ name: "gone.txt", reason: "the file no longer exists at this path" });
+  });
+
+  it("retries a temporary upload failure once with the same object key", async () => {
+    let attempts = 0;
+    const { manager, objects, current } = publication(
+      { "/workspace/outputs/a.txt": "alpha" },
+      { upload: async (key) => { attempts += 1; if (attempts === 1) throw new Error("503 Service Unavailable"); return { bucket: "berry", key, etag: "etag" }; } },
+    );
+
+    const results = await manager.finalize(current);
+    expect(receipts(results)).toHaveLength(1);
+    expect(failures(results)).toHaveLength(0);
+    expect(objects.putArtifact).toHaveBeenCalledTimes(2);
+    expect(objects.putArtifact.mock.calls[0]![0]).toBe(objects.putArtifact.mock.calls[1]![0]);
+  });
+
+  it("publishes only the unpublished file on a later scan and versions changed content", async () => {
+    const sha = (value: string) => createHash("sha256").update(Buffer.from(value)).digest("hex");
+    const { manager, objects, current } = publication(
+      { "/workspace/outputs/a.txt": "alpha", "/workspace/outputs/b.txt": "bravo-2" },
+      { published: [{ sourcePath: "/workspace/outputs/a.txt", sha256: sha("alpha") }, { sourcePath: "/workspace/outputs/b.txt", sha256: sha("bravo") }] },
+    );
+
+    const results = await manager.finalize(current);
+    // a.txt is unchanged and already published; b.txt changed, so it is a new version.
+    expect(objects.putArtifact).toHaveBeenCalledTimes(1);
+    expect(objects.putArtifact.mock.calls[0]![0]).toContain(`/${sha("bravo-2")}/b.txt`);
+    expect(receipts(results)).toHaveLength(1);
   });
 });
 
@@ -2828,7 +2934,7 @@ describe("SandboxContinuityManager", () => {
   it.each([
     ["a text-only answer", [] as string[], "completes"],
     ["a run that only read and drafted", ["read", "compose_message"], "completes"],
-    ["a run that executed bash", ["read", "bash"], "fails"],
+    ["a run that executed bash", ["read", "bash"], "reports unpublished outputs"],
   ] as const)("finalizes %s when its sandbox can no longer be resumed", async (_label, tools, expected) => {
     const unavailable = Object.assign(new Error("The sandbox was not found"), { name: "SandboxNotFoundError" });
     const provider = {
@@ -2863,7 +2969,11 @@ describe("SandboxContinuityManager", () => {
     if (expected === "completes") {
       await expect(manager.finalize(current)).resolves.toEqual([]);
     } else {
-      await expect(manager.finalize(current)).rejects.toThrow();
+      // The answer stays delivered; the outputs are reported as not yet published (H-014).
+      await expect(manager.finalize(current)).resolves.toEqual([{
+        output: expect.objectContaining({ publication: "failed", path: "/workspace/outputs", workspaceUnavailable: true }),
+        summary: expect.stringContaining("Not published: files in outputs/"),
+      }]);
     }
     expect(objects.putArtifact).not.toHaveBeenCalled();
   });
