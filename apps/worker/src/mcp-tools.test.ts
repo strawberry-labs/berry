@@ -36,7 +36,7 @@ describe("durable MCP tool exposure", () => {
     expect(baseSupportsAbort).toHaveBeenCalledTimes(1);
   });
 
-  it("exposes only the relevant calendar connector plus core and lazy discovery tools", async () => {
+  it("declares the same tools for every request and lists only the mentioned connector's tools as ready (H-032)", async () => {
     const inherited: ChatToolDefinition = {
       type: "function",
       function: { name: "remember_memory", description: "Remember a fact", parameters: { type: "object" } },
@@ -47,20 +47,20 @@ describe("durable MCP tool exposure", () => {
     };
     const tools = new DurableMcpToolExecutor(base, connectorServers(), undefined);
 
-    const definitions = await tools.definitions(mcpSnapshot("Show my calendar events tomorrow"));
-    const names = definitions.map((definition) => definition.function.name);
-
-    expect(names).toContain("remember_memory");
-    expect(names).toContain("tool_search");
-    expect(names).toContain("mcp__Google_Calendar__list_events");
-    expect(names.some((name) => name.startsWith("mcp__Gmail__"))).toBe(false);
-    expect(names.some((name) => name.startsWith("mcp__Google_Workspace__"))).toBe(false);
-    expect(names.some((name) => name.startsWith("mcp__BerryCrawl__"))).toBe(false);
-    expect({
-      toolCount: definitions.length,
-      serializedBytes: Buffer.byteLength(JSON.stringify(definitions), "utf8"),
-    }).toMatchObject({ toolCount: 3, serializedBytes: expect.any(Number) });
+    const calendar = mcpSnapshot("Show my calendar events tomorrow");
+    const definitions = await tools.definitions(calendar);
+    expect(definitions.map((definition) => definition.function.name)).toEqual(["remember_memory", "tool_search", "use_tool"]);
+    // Another request, another connector: the declared tools are byte-identical.
+    expect(JSON.stringify(await tools.definitions(mcpSnapshot("Search my email")))).toBe(JSON.stringify(definitions));
     expect(Buffer.byteLength(JSON.stringify(definitions), "utf8")).toBeLessThan(4_000);
+
+    const context = await tools.turnContext(calendar);
+    expect(context).toContain("Connectors available to this task: calendar (Google Calendar), gmail (Gmail)");
+    expect(context).toContain("- mcp__Google_Calendar__list_events: ");
+    expect(context).toContain("input schema: ");
+    expect(context).not.toContain("mcp__Gmail__");
+    expect(context).not.toContain("mcp__Google_Workspace__");
+    expect(context).not.toContain("mcp__BerryCrawl__");
   });
 
   it("recovers a semantically selected connector when the request is a paraphrase", async () => {
@@ -70,12 +70,10 @@ describe("durable MCP tool exposure", () => {
     const snapshot = mcpSnapshot("What appointments do I have tomorrow?");
 
     const initial = await tools.definitions(snapshot);
-    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search"]);
-    expect(initial[0]?.function.parameters).toMatchObject({
-      properties: {
-        connector: { enum: expect.arrayContaining(["calendar", "gmail", "workspace", "crawl"]) },
-      },
-    });
+    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search", "use_tool"]);
+    // The catalog lives in the turn context, not in a tool enum that changes with it.
+    expect(JSON.stringify(initial[0]?.function.parameters)).not.toContain("enum");
+    expect(await tools.turnContext(snapshot)).toMatch(/calendar \(Google Calendar\).*gmail \(Gmail\).*workspace.*crawl/);
 
     const result = await tools.execute(snapshot, {
       id: "search-appointments",
@@ -181,12 +179,11 @@ describe("durable MCP tool exposure", () => {
       execute: vi.fn(async () => ({ output: {}, summary: "base" })),
     }, [berryCrawl], undefined);
 
-    const definitions = await tools.definitions(mcpSnapshot("Answer this general question"));
+    const snapshot = mcpSnapshot("Answer this general question");
+    const definitions = await tools.definitions(snapshot);
 
-    expect(definitions.map((definition) => definition.function.name)).toEqual([
-      "tool_search",
-      "mcp__BerryCrawl__berrycrawl_search_web",
-    ]);
+    expect(definitions.map((definition) => definition.function.name)).toEqual(["tool_search", "use_tool"]);
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__BerryCrawl__berrycrawl_search_web: Search the web\n  input schema: ");
   });
 
   it("discovers an initially omitted authorized tool and exposes it on the next model call", async () => {
@@ -196,7 +193,7 @@ describe("durable MCP tool exposure", () => {
     const tools = new DurableMcpToolExecutor(base, connectorServers(), undefined);
     const snapshot = mcpSnapshot("Answer the question");
     const initial = await tools.definitions(snapshot);
-    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search"]);
+    expect(initial.map((definition) => definition.function.name)).toEqual(["tool_search", "use_tool"]);
 
     const searchStep = {
       id: "search-gmail",
@@ -215,11 +212,13 @@ describe("durable MCP tool exposure", () => {
       activatedTools: ["mcp__Gmail__search_messages"],
       activatedServerIds: ["gmail"],
     });
+    // The result carries the schema and how to run it, so the declared tools never change.
+    expect(String(result.output && (result.output as { content: string }).content))
+      .toMatch(/use_tool[\s\S]*- mcp__Gmail__search_messages: [^\n]*\n  input schema: \{/);
     snapshot.steps = [{ ...searchStep, state: "completed", output: result.output }] as never;
 
-    const revealed = await tools.definitions(snapshot);
-    expect(revealed.map((definition) => definition.function.name))
-      .toContain("mcp__Gmail__search_messages");
+    expect(JSON.stringify(await tools.definitions(snapshot))).toBe(JSON.stringify(initial));
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Gmail__search_messages: ");
   });
 
   it("keeps a connector revealed across turns after a successful tool_search", async () => {
@@ -252,10 +251,7 @@ describe("durable MCP tool exposure", () => {
       payload: { type: "message", message: { role: "user", content: "d.kelly@aesg.com" } },
     }] as never;
 
-    const definitions = await tools.definitions(snapshot);
-
-    expect(definitions.map((definition) => definition.function.name))
-      .toContain("mcp__Gmail__search_messages");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Gmail__search_messages: ");
   });
 
   it("reveals an admitted connector after its first deferred call fails", async () => {
@@ -285,12 +281,10 @@ describe("durable MCP tool exposure", () => {
     } catch (error) {
       failure = error instanceof Error ? error.message : String(error);
     }
-    expect(failure).toContain("connector is now enabled for the next model call");
+    expect(failure).toContain("Call tool_search for it to get its input schema, then run it with use_tool");
     snapshot.steps = [{ ...deferredStep, state: "failed", error: failure }] as never;
 
-    const definitions = await tools.definitions(snapshot);
-    expect(definitions.map((definition) => definition.function.name))
-      .toContain("mcp__Gmail__search_messages");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__Gmail__search_messages: ");
   });
 
   it("keeps unauthorized connector schemas unavailable to exposure and discovery", async () => {
@@ -369,8 +363,7 @@ describe("durable MCP tool exposure", () => {
     }, [server], undefined);
     const snapshot = mcpSnapshot("Echo this message");
 
-    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
-      .toContain("mcp__echo__echo");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__echo__echo: Echo a message");
     expect(tools.policy(snapshot, "mcp__echo__echo", "ask"))
       .toMatchObject({ requiresApproval: true, approvalKind: "mcp" });
     await expect(tools.execute(snapshot, {
@@ -409,7 +402,7 @@ describe("durable MCP tool exposure", () => {
     const snapshot = mcpSnapshot("Find an echo capability");
 
     expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
-      .toEqual(["tool_search"]);
+      .toEqual(["tool_search", "use_tool"]);
     await expect(tools.execute(snapshot, {
       id: "search-live-echo",
       type: "tool.tool_search",
@@ -450,8 +443,7 @@ describe("durable MCP tool exposure", () => {
       firstDrive,
     );
 
-    expect((await tools.definitions(snapshot)).map((definition) => definition.function.name))
-      .toContain("mcp__First_Drive__search_first");
+    expect(await tools.turnContext(snapshot)).toContain("- mcp__First_Drive__search_first: ");
 
     await tools.release(snapshot);
     expect(release).toHaveBeenCalledOnce();
@@ -466,8 +458,8 @@ describe("durable MCP tool exposure", () => {
     );
     secondDrive.defaultTools = ["search_second"];
     snapshot.runtimeRequest = admittedRuntimeRequest(snapshot, secondDrive);
-    const refreshed = (await tools.definitions(snapshot)).map((definition) => definition.function.name);
-    expect(refreshed).toContain("mcp__Second_Drive__search_second");
+    const refreshed = await tools.turnContext(snapshot);
+    expect(refreshed).toContain("- mcp__Second_Drive__search_second: ");
     expect(refreshed).not.toContain("mcp__First_Drive__search_first");
 
     await tools.close();

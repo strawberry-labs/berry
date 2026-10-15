@@ -30,6 +30,7 @@ import {
   queuedFollowUpRuntimeRequest,
   DurableToolTimeoutError,
   modelMessages,
+  pendingContextEntries,
   stepTimingFields,
   usageCostMicros,
   type BudgetReservationDecision,
@@ -146,6 +147,170 @@ describe("durable turn runner", () => {
       { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 4: fire pumps" },
       { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" },
     ];
+
+    const journal = (current: MutableSnapshot, entries: Array<{ entryId: string; entryType: string; payload: unknown }>) => {
+      for (const entry of entries) {
+        current.entries.push({
+          entryId: entry.entryId,
+          parentEntryId: current.entries.at(-1)?.entryId ?? null,
+          entryType: entry.entryType,
+          sequence: current.entries.length + 1,
+          payload: entry.payload,
+        });
+      }
+    };
+    const pushMessage = (current: MutableSnapshot, id: string, message: Record<string, unknown>) => {
+      current.entries.push({
+        entryId: id, parentEntryId: current.entries.at(-1)?.entryId ?? null, entryType: "message", sequence: current.entries.length + 1,
+        payload: { type: "message", id, message },
+      });
+    };
+
+    it("journals each run's turn context once so the whole earlier run stays a prefix of the next turn (H-032)", async () => {
+      const current = turn({ memory: "project uses NFPA 20" }, ["read"], firstTurn);
+      const first = await pendingContextEntries(current);
+      expect(first).toHaveLength(1);
+      expect(first[0]).toMatchObject({ entryType: "context", payload: { runId: current.id, scope: "turn" } });
+      journal(current, first);
+      // Written once: the next call of the run adds nothing and splices no copy.
+      expect(await pendingContextEntries(current)).toEqual([]);
+      const call1 = modelMessages(current).messages;
+      expect(call1.filter((message) => String(message.content).startsWith("<berry_turn_context>"))).toHaveLength(1);
+      expect(String(call1[2]?.content)).toContain("project uses NFPA 20");
+
+      pushMessage(current, "assistant-1", { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "spec.pdf" } }], stopReason: "toolUse" });
+      pushMessage(current, "result-1", { role: "toolResult", toolCallId: "call-1", toolName: "read", content: "Section 4: fire pumps" });
+      const call2 = modelMessages(current).messages;
+      expect(call2.slice(0, call1.length)).toEqual(call1);
+      pushMessage(current, "answer-1", { role: "assistant", content: [{ type: "text", text: "Section 4 covers fire pumps." }], stopReason: "stop" });
+
+      // The next turn: a new run, new grounding, a new request.
+      const next = turn({ memory: "pumps were replaced in 2025" }, ["read"], []);
+      next.id = "00000000-0000-7000-8000-0000000000f2";
+      next.entries = [...current.entries];
+      pushMessage(next, "request-2", { role: "user", content: "Now check section 5." });
+      next.requestMessageId = "request-2";
+      journal(next, await pendingContextEntries(next));
+      const turn2 = modelMessages(next).messages;
+      // Everything the provider saw in the earlier run is reused byte for byte.
+      expect(turn2.slice(0, call2.length)).toEqual(call2);
+      expect(String(turn2.at(-1)?.content)).toContain("pumps were replaced in 2025");
+    });
+
+    it("does not repeat grounding that an earlier turn already gave (H-032)", async () => {
+      const memory = (id: string, content: string) => ({ memoryId: id, content, label: "fact", explicit: false, confidence: 0.7, sourceTaskId: null, sourceMessageId: null });
+      const fact = (id: string, content: string) => ({ sourceId: `source-${id}`, chunkId: id, content, citationLabel: `Doc ${id}` });
+      const grounding = (facts: ReturnType<typeof fact>[]) => ({
+        personalMemory: [memory("m1", "Prefers metric units")],
+        projectFacts: facts,
+        citations: facts.map((item) => ({ sourceId: item.sourceId, chunkId: item.chunkId, label: item.citationLabel, href: null })),
+        retrieval: { snapshotId: null, queryHash: "q", tokenBudget: 5000, tokensSelected: 100, degradedReason: "none" },
+      });
+      const current = turn(grounding([fact("c1", "Pump room is level B2")]), ["read"], firstTurn);
+      journal(current, await pendingContextEntries(current));
+      pushMessage(current, "answer-1", { role: "assistant", content: [{ type: "text", text: "Done." }], stopReason: "stop" });
+
+      const next = turn(grounding([fact("c1", "Pump room is level B2"), fact("c2", "Sprinklers are wet-pipe")]), ["read"], []);
+      next.id = "00000000-0000-7000-8000-0000000000f3";
+      next.entries = [...current.entries];
+      pushMessage(next, "request-2", { role: "user", content: "And the sprinklers?" });
+      next.requestMessageId = "request-2";
+      const [context] = await pendingContextEntries(next);
+      const text = String((context?.payload as { text: string }).text);
+      expect(text).toContain("Sprinklers are wet-pipe");
+      expect(text).not.toContain("Pump room is level B2");
+      expect(text).not.toContain("Prefers metric units");
+      expect(text).toContain("2 grounding items were given earlier in this conversation and still apply");
+    });
+
+    it("appends a document skill found mid-run instead of rewriting the turn context (H-032)", async () => {
+      const pdf = { name: "pdf", description: "Work with PDFs", content: "# PDF skill", filePath: "/organization-skills/pdf/SKILL.md", disableModelInvocation: false, resources: [] };
+      const current = turn({}, ["read", "activate_skill"], firstTurn);
+      current.runtimeRequest = { ...current.runtimeRequest, extraSkills: [pdf] };
+      journal(current, await pendingContextEntries(current));
+      const before = modelMessages(current).messages;
+      expect(JSON.stringify(before)).not.toContain("# PDF skill");
+
+      current.steps = [...current.steps, {
+        ...toolStep("completed", "read_only", false), type: "tool.mcp__Drive__download", id: "import",
+        output: { artifacts: [{ name: "spec.pdf", mediaType: "application/pdf" }] },
+      } as DurableTurnStep];
+      const update = await pendingContextEntries(current);
+      expect(update).toHaveLength(1);
+      expect(update[0]).toMatchObject({ payload: { scope: "update", attachmentSkill: "pdf" } });
+      journal(current, update);
+      const after = modelMessages(current).messages;
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(String(after.at(-1)?.content)).toMatch(/^<berry_context_update>[\s\S]*# PDF skill/);
+      expect(await pendingContextEntries(current)).toEqual([]);
+    });
+
+    it("restates the time when a run resumes long after its turn started (H-023)", async () => {
+      const current = turn({}, ["read"], firstTurn);
+      current.createdAt = "2026-10-15T08:00:00.000Z";
+      journal(current, await pendingContextEntries(current, () => "", new Date("2026-10-15T08:00:05.000Z")));
+      expect(await pendingContextEntries(current, () => "", new Date("2026-10-15T08:20:00.000Z"))).toEqual([]);
+      const [update] = await pendingContextEntries(current, () => "", new Date("2026-10-15T11:45:00.000Z"));
+      expect(String((update?.payload as { text: string }).text))
+        .toContain("Current date and time now (this turn resumed later than it started): Thursday, 15 October 2026 at 11:45 (UTC)");
+    });
+
+    it("keeps each supplied image at a fixed place so later calls reuse it from the cache (H-032)", async () => {
+      const attachmentId = "00000000-0000-7000-8000-0000000000a1";
+      const current = turn({}, ["read"], firstTurn);
+      current.runtimeRequest = {
+        ...current.runtimeRequest,
+        contextWindowTokens: 128_000,
+        attachments: [{ fileId: attachmentId, name: "plan.png", mediaType: "image/png", size: 10 }],
+      };
+      journal(current, await pendingContextEntries(current));
+      const label = (path: string) => ({ type: "text" as const, text: `Workspace image ${JSON.stringify(path)}` });
+      const pixels = (value: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${value}` } });
+      const attachment = [label(`/workspace/inputs/${attachmentId}/plan.png`), pixels("PLAN")];
+
+      const call1 = modelMessages(current, attachment).messages;
+      // The attachment follows the turn context, not the end of the request.
+      expect(String(call1[2]?.content)).toMatch(/^<berry_turn_context>/);
+      expect(call1[3]?.content).toContainEqual(pixels("PLAN"));
+
+      pushMessage(current, "assistant-1", { role: "assistant", content: [{ type: "toolCall", id: "call-render", name: "read", arguments: { path: "/workspace/outputs/page-1.png" } }], stopReason: "toolUse" });
+      pushMessage(current, "result-1", { role: "toolResult", toolCallId: "call-render", toolName: "read", content: "Image ready" });
+      current.steps = [...current.steps, {
+        ...toolStep("completed", "read_only", false), id: "render", sequence: 10, type: "tool.read",
+        input: { toolCallId: "call-render", toolName: "read", arguments: {} }, output: { visionPath: "/workspace/outputs/page-1.png" },
+      } as DurableTurnStep];
+      const page = [label("/workspace/outputs/page-1.png"), pixels("PAGE")];
+      const call2 = modelMessages(current, [...page, ...attachment]).messages;
+      expect(call2.slice(0, call1.length)).toEqual(call1);
+      // The read image follows its own tool result.
+      expect(call2.at(-2)).toMatchObject({ role: "tool", content: "Image ready" });
+      expect(call2.at(-1)?.content).toContainEqual(pixels("PAGE"));
+
+      pushMessage(current, "assistant-2", { role: "assistant", content: [{ type: "toolCall", id: "call-ls", name: "ls", arguments: { path: "/workspace" } }], stopReason: "toolUse" });
+      pushMessage(current, "result-2", { role: "toolResult", toolCallId: "call-ls", toolName: "ls", content: "outputs/" });
+      const call3 = modelMessages(current, [...page, ...attachment]).messages;
+      expect(call3.slice(0, call2.length)).toEqual(call2);
+      expect(call3.at(-1)).toMatchObject({ role: "tool", content: "outputs/" });
+    });
+
+    it("declares activate_skill without a skill-name list so enabling a skill keeps the tools unchanged (H-032)", () => {
+      const skill = (name: string) => ({ name, description: name, content: `# ${name}`, filePath: `/personal-skills/${name}/SKILL.md`, disableModelInvocation: false, resources: [] });
+      const definitions = (skills: ReturnType<typeof skill>[]) => {
+        const current = turn({}, ["read", "activate_skill"], firstTurn);
+        current.runtimeRequest = { ...current.runtimeRequest, extraSkills: skills };
+        return JSON.stringify(durableBuiltInToolDefinitions(current));
+      };
+      expect(definitions([skill("pdf")])).toBe(definitions([skill("pdf"), skill("docx")]));
+      expect(definitions([skill("pdf")])).not.toContain("enum");
+    });
+
+    it("shows an unavailable capability's reason in the turn context (H-050)", async () => {
+      const current = turn({}, ["read"], firstTurn);
+      current.runtimeRequest = { ...current.runtimeRequest, capabilityNotices: [{ capability: "vision", reason: "The image-reading service did not finish in time for this message." }] };
+      const [context] = await pendingContextEntries(current);
+      expect(String((context?.payload as { text: string }).text))
+        .toContain("- Image reading (inspect_images): The image-reading service did not finish in time for this message.");
+    });
 
     it("points an explicitly requested short skill name at the enabled skill (H-052)", () => {
       const skill = (name: string, description: string) => ({
@@ -624,6 +789,58 @@ describe("durable turn runner", () => {
     expect(modelCalls).toBe(2);
     expect(repository.current.entries.some((entry) => JSON.stringify(entry.payload).includes("Completed after retry.")))
       .toBe(true);
+  });
+
+  it("runs a use_tool call as the connector tool it names and journals the call as written (H-032)", async () => {
+    const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+    const runner = new DurableTurnRunner(repository, {
+      call: async () => ({
+        text: "",
+        inputTokens: 3,
+        outputTokens: 2,
+        toolCalls: [{
+          id: "call-drive",
+          name: "use_tool",
+          input: { tool: "mcp__Drive__search", arguments: { query: "pump schedule" } },
+          retryClass: "non_idempotent_manual",
+          idempotencyKey: null,
+          requiresApproval: true,
+          approvalKind: "mcp",
+        }],
+      }),
+    }, {
+      ...noTools(),
+      policy: (_snapshot, name) => name === "mcp__Drive__search"
+        ? { retryClass: "read_only", repeatPolicy: "compare_result", requiresApproval: false, approvalKind: "mcp" }
+        : undefined,
+    }, { owner: "worker-use-tool" });
+
+    await runner.execute({ tenantId, runId, reason: "continue" });
+
+    const step = repository.current.steps.find((candidate) => candidate.type === "tool.mcp__Drive__search");
+    expect(step?.input).toMatchObject({
+      toolName: "mcp__Drive__search",
+      arguments: { query: "pump schedule" },
+      invokedAs: "use_tool",
+      requiresApproval: false,
+    });
+    expect(step?.retryClass).toBe("read_only");
+    const assistant = repository.current.entries
+      .map((entry) => (entry.payload as { message?: { role?: string; content?: unknown[] } }).message)
+      .find((message) => message?.role === "assistant");
+    expect(assistant?.content).toEqual([{
+      type: "toolCall", id: "call-drive", name: "use_tool",
+      arguments: { tool: "mcp__Drive__search", arguments: { query: "pump schedule" } },
+    }]);
+    // The run's turn context was journaled before the call.
+    expect(repository.current.entries.filter((entry) => entry.entryType === "context")).toHaveLength(1);
+    // The result replays under the call's name, as providers require.
+    repository.current.entries.push({
+      entryId: "drive-result", parentEntryId: repository.current.entries.at(-1)?.entryId ?? null, entryType: "message",
+      sequence: repository.current.entries.length + 1,
+      payload: { type: "message", id: "drive-result", message: { role: "toolResult", toolCallId: "call-drive", toolName: "mcp__Drive__search", content: "3 files" } },
+    });
+    expect(modelMessages(repository.current).messages.at(-1)).toMatchObject({ role: "tool", name: "use_tool", content: "3 files" });
   });
 
   it("does not spend the turn wall-clock budget on persisted human wait", async () => {
@@ -3923,12 +4140,12 @@ describe("durable turn runner", () => {
       "Never JSON-stringify the entire argument object inside raw",
     );
     const userContent = request?.messages.find((message) => message.role === "user")?.content;
-    expect(Array.isArray(userContent)).toBe(true);
     expect(JSON.stringify(userContent)).toContain(
       "Sandbox path: /home/user/workspace/inputs/00000000-0000-7000-8000-000000000099/candidate.pdf",
     );
     expect(JSON.stringify(userContent)).toContain("page-numbered text");
-    expect(userContent).toContainEqual({
+    // Supplied images go in their own message; the request is never rewritten (H-032).
+    expect(request?.messages.at(-1)?.content).toContainEqual({
       type: "image_url",
       image_url: { url: "data:image/png;base64,AQID" },
     });

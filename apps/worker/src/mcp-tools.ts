@@ -12,12 +12,14 @@ import {
   type JsonValue,
 } from "@berry/shared";
 import type { ChatContentPart, ChatToolDefinition } from "@berry/router-client";
-import type {
-  DurableToolPolicy,
-  DurableTurnSnapshot,
-  DurableTurnStep,
-  DurableTurnToolExecutor,
-  TurnToolResult,
+import {
+  CONTEXT_ENTRY_TYPE,
+  USE_TOOL_NAME,
+  type DurableToolPolicy,
+  type DurableTurnSnapshot,
+  type DurableTurnStep,
+  type DurableTurnToolExecutor,
+  type TurnToolResult,
 } from "./turn-runner.js";
 import { emitWorkerOperationalEvent } from "./operational-telemetry.js";
 
@@ -44,27 +46,56 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     });
   }
 
+  /**
+   * The declared tools never include connector tools themselves: tool_search
+   * finds them and use_tool runs them, so revealing a tool appends to the
+   * conversation instead of rewriting the tool list, and the provider's cached
+   * prefix survives (H-032). Both stay declared while connectors are
+   * configured but unavailable for a turn (H-050).
+   */
   async definitions(snapshot: DurableTurnSnapshot): Promise<readonly ChatToolDefinition[]> {
     const context = await this.#context(snapshot);
     const inherited = await (this.base.definitions?.(snapshot) ?? Promise.resolve([]));
-    const visibleNames = this.#visibleToolNames(snapshot, context);
-    const mcpTools = context.source.listTools()
-      .filter((tool) => visibleNames.has(tool.name))
-      .map((tool): ChatToolDefinition => ({
-        type: "function",
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: jsonValue(tool.parameters),
-        },
-      }));
     return [
       ...inherited,
-      ...(context.servers.length > 0
-        ? [durableToolSearchDefinition(context.servers)]
+      ...(context.servers.length > 0 || connectorsUnavailableReason(snapshot)
+        ? [durableToolSearchDefinition(), durableUseToolDefinition()]
         : []),
-      ...mcpTools,
     ];
+  }
+
+  /** The connector catalog and the connector tools ready this turn, with schemas. */
+  async turnContext(snapshot: DurableTurnSnapshot): Promise<string> {
+    const inherited = await (this.base.turnContext?.(snapshot) ?? Promise.resolve(""));
+    const context = await this.#context(snapshot);
+    const tools = context.source.listTools();
+    const catalog = context.servers
+      .filter((server) => tools.some((tool) => this.#serverForTool(tool.name, [server]) !== undefined))
+      .map((server) => `${server.id} (${server.name})`);
+    if (catalog.length === 0) return inherited;
+    const visible = this.#visibleToolNames(snapshot, context);
+    const ready = tools.filter((tool) => visible.has(tool.name));
+    const lines: string[] = [];
+    let budget = CONNECTOR_CONTEXT_SCHEMA_CHARACTERS;
+    let withoutSchema = 0;
+    for (const tool of ready) {
+      if (connectorSchemaGiven(snapshot, tool.name)) continue;
+      const schema = JSON.stringify(jsonValue(tool.parameters));
+      const line = `- ${tool.name}: ${tool.description}\n  input schema: ${schema}`;
+      if (line.length <= budget) {
+        lines.push(line);
+        budget -= line.length;
+      } else {
+        lines.push(`- ${tool.name}: ${tool.description}`);
+        withoutSchema += 1;
+      }
+    }
+    const section = [
+      `Connectors available to this task: ${catalog.join(", ")}. Call tool_search to find their tools, then run a found tool with use_tool.`,
+      ...(lines.length > 0 ? ["Connector tools ready now (run with use_tool, passing the exact name and arguments that match the schema):", ...lines] : []),
+      ...(withoutSchema > 0 ? [`Call tool_search for the input schema of the ${withoutSchema} tool${withoutSchema === 1 ? "" : "s"} listed without one.`] : []),
+    ].join("\n");
+    return [inherited, section].filter(Boolean).join("\n\n");
   }
 
   async modelContent(
@@ -96,7 +127,9 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
     toolName: string,
     permissionMode: string,
   ): DurableToolPolicy | undefined {
-    if (toolName === "tool_search") {
+    if (toolName === "tool_search" || toolName === USE_TOOL_NAME) {
+      // A use_tool step only exists when the call could not be unwrapped; it
+      // runs nothing and fails with guidance.
       return {
         retryClass: "read_only",
         repeatPolicy: "compare_result",
@@ -125,7 +158,7 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
 
   supportsAbort(snapshot: DurableTurnSnapshot, step: DurableTurnStep): boolean {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
-    if (toolName === "tool_search") return false;
+    if (toolName === "tool_search" || toolName === USE_TOOL_NAME) return false;
     // Connector setup, lazy discovery, and artifact staging can still await
     // work that has no AbortSignal contract. Keep the whole MCP path
     // non-abortable until every one of those seams is signal-aware.
@@ -141,6 +174,13 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
   ): Promise<TurnToolResult> {
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName === "tool_search") return this.#searchTools(snapshot, step);
+    if (toolName === USE_TOOL_NAME) {
+      throw new Error('use_tool needs {"tool": "<exact connector tool name>", "arguments": {...}}. Call tool_search to find tool names and their input schemas.');
+    }
+    const unavailable = connectorsUnavailableReason(snapshot);
+    if (unavailable && toolName.startsWith("mcp__") && !(await this.#context(snapshot)).servers.some((server) => this.#serverForTool(toolName, [server]))) {
+      throw new Error(`Connectors are unavailable for this message: ${unavailable}`);
+    }
     if (!toolName.startsWith("mcp__")) {
       return signal || reportProgress
         ? this.base.execute(snapshot, step, signal, reportProgress)
@@ -278,6 +318,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
 
   async #searchTools(snapshot: DurableTurnSnapshot, step: DurableTurnStep): Promise<TurnToolResult> {
     const context = await this.#context(snapshot);
+    const unavailable = connectorsUnavailableReason(snapshot);
+    if (unavailable && context.servers.length === 0) {
+      throw new Error(`Connectors are unavailable for this message: ${unavailable}`);
+    }
     const input = record(step.input.arguments) ?? {};
     const query = stringValue(input.query);
     if (!query) throw new Error("tool_search requires a non-empty query describing the connector capability needed");
@@ -334,7 +378,10 @@ export class DurableMcpToolExecutor implements DurableTurnToolExecutor {
       ))
       .map((server) => ({ id: server.id, name: server.name }));
     const content = activatedTools.length > 0
-      ? `Enabled connector tools for the next model call: ${activatedTools.join(", ")}`
+      ? [
+          'Connector tools found. Run one with use_tool: {"tool": "<name>", "arguments": {...}} using arguments that match its input schema.',
+          ...matches.map((tool) => `- ${tool.name}: ${tool.description}\n  input schema: ${JSON.stringify(jsonValue(tool.parameters))}`),
+        ].join("\n")
       : `No authorized connector tools matched that capability. Retry with one connector id from: ${connectorCatalog.map((item) => `${item.id} (${item.name})`).join(", ")}.`;
     return {
       output: {
@@ -418,21 +465,20 @@ type DurableMcpTurnContext = {
   servers: readonly McpServerSpec[];
 };
 
-function durableToolSearchDefinition(servers: readonly McpServerSpec[]): ChatToolDefinition {
-  const catalog = servers.map((server) => `${server.id} (${server.name})`).join(", ");
+/** Stable across turns and tenants: the connector catalog lives in the turn context (H-032). */
+function durableToolSearchDefinition(): ChatToolDefinition {
   return {
     type: "function",
     function: {
       name: "tool_search",
-      description: `Search authorized deferred connector tools by capability. Select a connector when the request uses a paraphrase that may not occur in a tool name. Authorized connectors: ${catalog}. Matching tools become available on the next model call.`,
+      description: "Find connector tools by capability. The connectors this task may use are listed in the turn context. Select a connector when the request uses a paraphrase that may not occur in a tool name. Results give each tool's input schema; run a found tool with use_tool.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", minLength: 1 },
           connector: {
             type: "string",
-            enum: servers.map((server) => server.id),
-            description: "Authorized connector id chosen from the catalog in this tool description.",
+            description: "Optional exact connector id from the turn context's connector list.",
           },
           limit: { type: "integer", minimum: 1, maximum: 20 },
         },
@@ -441,6 +487,54 @@ function durableToolSearchDefinition(servers: readonly McpServerSpec[]): ChatToo
       },
     },
   };
+}
+
+function durableUseToolDefinition(): ChatToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: USE_TOOL_NAME,
+      description: "Run a connector tool that tool_search returned or the turn context lists as ready. Pass its exact name and arguments that match its input schema.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool: { type: "string", minLength: 1, description: "Exact connector tool name, for example mcp__drive__search." },
+          arguments: { type: "object", description: "Arguments matching that tool's input schema." },
+        },
+        required: ["tool", "arguments"],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+/** Connector schemas the turn context lists, at most this many characters per turn. */
+const CONNECTOR_CONTEXT_SCHEMA_CHARACTERS = 16_000;
+
+/** True when this conversation already gave the tool's schema (turn context or tool_search). */
+function connectorSchemaGiven(snapshot: DurableTurnSnapshot, toolName: string): boolean {
+  const marker = `- ${toolName}: `;
+  return snapshot.entries.some((entry) => {
+    const payload = record(entry.payload);
+    if (entry.entryType === CONTEXT_ENTRY_TYPE) {
+      const text = typeof payload?.text === "string" ? payload.text : "";
+      return text.includes(marker) && text.includes("input schema");
+    }
+    const message = record(payload?.message);
+    if (message?.role !== "toolResult" || message.toolName !== "tool_search") return false;
+    const text = mcpToolNamesInContent(message.content).includes(toolName) ? JSON.stringify(message.content) : "";
+    return text.includes(marker) && text.includes("input schema");
+  });
+}
+
+/** Why configured connectors could not be prepared for this turn, if they could not (H-050). */
+function connectorsUnavailableReason(snapshot: DurableTurnSnapshot): string | null {
+  if (!Array.isArray(snapshot.runtimeRequest.capabilityNotices)) return null;
+  for (const candidate of snapshot.runtimeRequest.capabilityNotices) {
+    const notice = record(candidate);
+    if (notice?.capability === "connectors" && typeof notice.reason === "string" && notice.reason) return notice.reason;
+  }
+  return null;
 }
 
 function explicitlyMentionedMcpServerIds(
@@ -516,12 +610,13 @@ function mcpToolNamesInContent(content: unknown): string[] {
 }
 
 function deferredMcpToolError(toolName: string): string {
-  return `MCP tool ${toolName} was deferred because its connector schema was not active. The connector is now enabled for the next model call; retry the tool with the provided schema.`;
+  return `MCP tool ${toolName} has not been found in this conversation yet. Call tool_search for it to get its input schema, then run it with use_tool.`;
 }
 
 function isDeferredMcpToolFailure(step: DurableTurnStep, toolName: string): boolean {
   if (step.state !== "failed" || typeof step.error !== "string") return false;
   return step.error === deferredMcpToolError(toolName)
+    || step.error === `MCP tool ${toolName} was deferred because its connector schema was not active. The connector is now enabled for the next model call; retry the tool with the provided schema.`
     || step.error === `MCP tool ${toolName} is deferred. Call tool_search for the required connector capability first.`;
 }
 

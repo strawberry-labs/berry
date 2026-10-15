@@ -1255,7 +1255,9 @@ function contentText(value: unknown): string {
 }
 
 function serializeEntries(entries: readonly CompactionEntryRecord[], maxCharacters: number): string {
-  const serialized = entries.map((entry) => JSON.stringify({
+  // Journaled turn context (grounding, date, guidance) is Berry-supplied and
+  // rebuilt each turn; summarising it would repeat stale grounding (H-032).
+  const serialized = entries.filter((entry) => entry.entryType !== "context").map((entry) => JSON.stringify({
     entryId: entry.entryId,
     parentEntryId: entry.parentEntryId,
     entryType: entry.entryType,

@@ -35,21 +35,22 @@ import {
   networkDomainAllowed,
   type NetworkPolicy,
 } from "@berry/shared";
-import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageOmission, prepareModelImage } from "./model-image.js";
+import { MODEL_IMAGE_LIMITS, describeImageBytes, modelImageLabel, modelImageOmission, prepareModelImage } from "./model-image.js";
 import { durableAttachmentPath } from "./durable-attachments.js";
 import type { SandboxSnapshotJobPayload } from "./jobs.js";
 import type { SqlExecutor } from "./sql-repositories.js";
 import { s3ClientOptions } from "./s3-client-options.js";
 import { emitWorkerOperationalEvent, persistWorkerOperationalEvent } from "./operational-telemetry.js";
 import { workerRuntimeMetrics } from "./runtime-metrics.js";
-import type {
-  DurableTurnSnapshot,
-  DurableTurnStep,
-  DurableTurnToolExecutor,
-  DurableSkillPackageFile,
-  DurableSkillPackageStageOptions,
-  SkillStagingTransfer,
-  TurnToolResult,
+import {
+  capabilityNoticeReason,
+  type DurableTurnSnapshot,
+  type DurableTurnStep,
+  type DurableTurnToolExecutor,
+  type DurableSkillPackageFile,
+  type DurableSkillPackageStageOptions,
+  type SkillStagingTransfer,
+  type TurnToolResult,
 } from "./turn-runner.js";
 
 const MAX_SNAPSHOT_ARCHIVE_BYTES = 384 * 1024 * 1024;
@@ -657,7 +658,11 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     const attachedImages = turnInputFiles.filter((file) => file.mediaType.startsWith("image/"));
     const attachedImageIds = new Set(attachedImages.map((file) => file.fileId));
     const explicitPaths = requestedInspectionImagePaths(snapshot, workspaceRoot);
-    const exposed = explicitPaths ? null : exposedSandboxImages(snapshot);
+    // Valid attachments take their slots first and keep them for the run.
+    const attachmentSlots = Math.min(MAX_MODEL_IMAGES, attachedImages.filter((file) =>
+      file.sizeBytes > 0 && file.sizeBytes <= MAX_MODEL_IMAGE_BYTES
+    ).length);
+    const exposed = explicitPaths ? null : exposedSandboxImages(snapshot, MAX_MODEL_IMAGES - attachmentSlots);
     const requestedSandboxImages = (explicitPaths ?? exposed!.selected)
       .filter((path) => {
         const attachmentId = sandboxAttachmentId(path, workspaceRoot);
@@ -697,7 +702,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       const note = image.transformed
         ? ` [Preview: ${image.originalWidth}x${image.originalHeight} to ${image.width}x${image.height}; ${image.mediaType}. The original is unchanged. Crop and read a detail if text is too small.${image.firstFrameOnly ? " Only the first frame is shown." : ""}${image.matte ? ` Transparent areas are shown on ${image.matte}.` : ""}]`
         : "";
-      parts.push({ type: "text", text: `Workspace image ${imageCount + 1}: ${JSON.stringify(path)}${note}` });
+      parts.push({ type: "text", text: modelImageLabel(path, note) });
       parts.push({ type: "image_url", image_url: { url: `data:${image.mediaType};base64,${image.data}` } });
       totalBase64Bytes += image.data.length;
       imageCount += 1;
@@ -771,21 +776,12 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
       return parts;
     }
 
-    for (const path of withheld) {
-      omit(path, `only the ${MAX_MODEL_IMAGES} most recently read images are sent per request; read this image again on its own or in a batch of at most ${MAX_MODEL_IMAGES} to inspect it`);
-    }
-    const sandboxSources = await loadSandboxSources(requestedSandboxImages);
-    for (const source of sandboxSources) {
-      if (source.bytes) await append(source.path, source.bytes);
-      else omit(source.path, "the file no longer exists at this path (it was moved or deleted after it was read); read its current path if you still need it");
-    }
-
-    // Choose attachments only after sandbox images are validated. This keeps
-    // concurrent reads while allowing later valid files to backfill slots left
-    // by oversized or over-budget candidates.
+    // Attachments come first: they sit at a fixed place after the turn context
+    // for the whole run, so their slots must not depend on later reads (H-032).
+    // Oversized candidates are skipped so later valid files take their slots.
     const attachmentFiles: SandboxInputFile[] = [];
     for (const file of selectedAttachments) {
-      if (attachmentFiles.length >= MAX_MODEL_IMAGES - imageCount) break;
+      if (attachmentFiles.length >= MAX_MODEL_IMAGES) break;
       if (file.sizeBytes <= 0 || file.sizeBytes > MAX_MODEL_IMAGE_BYTES) {
         omit(durableAttachmentPath(file, workspaceRoot), "the source is empty or exceeds the 20 MiB image inspection limit");
         continue;
@@ -794,6 +790,15 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     }
     const attachmentSources = await loadAttachmentSources(attachmentFiles);
     for (const source of attachmentSources) await append(source.path, source.bytes);
+
+    for (const path of withheld) {
+      omit(path, `only ${MAX_MODEL_IMAGES} images are sent per request; read this image again on its own or in a batch of at most ${MAX_MODEL_IMAGES} to inspect it`);
+    }
+    const sandboxSources = await loadSandboxSources(requestedSandboxImages);
+    for (const source of sandboxSources) {
+      if (source.bytes) await append(source.path, source.bytes);
+      else omit(source.path, "the file no longer exists at this path (it was moved or deleted after it was read); read its current path if you still need it");
+    }
     return parts;
   }
 
@@ -1353,7 +1358,10 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (toolName === "create_image") {
       const capability = objectValue(snapshot.runtimeRequest.imageGeneration);
       const config = this.options.imageGeneration;
-      if (!config || !stringValue(capability.model)) throw new Error("Image generation is not configured for this durable turn");
+      if (!config || !stringValue(capability.model)) {
+        const reason = capabilityNoticeReason(snapshot, "image_generation");
+        throw new Error(reason ? `Image generation is unavailable for this message: ${reason}` : "Image generation is not configured for this durable turn");
+      }
       const prompt = stringValue(args.prompt);
       if (!prompt) throw new Error("create_image requires a prompt");
       if ((snapshot.steps ?? []).some((candidate) => candidate.state === "failed"
@@ -2414,35 +2422,47 @@ async function sandboxFileEntry(
 }
 
 /**
- * Images read or generated in this run, newest last. `withheld` lists images
- * read since the last model call that do not fit the per-request window; the
- * model was promised their pixels, so they must be disclosed, not dropped.
+ * Images read or generated in this run that the next request shows. Each image
+ * stays at its place after the batch that read it, so whole batches are kept
+ * together in blocks of at most `capacity` images: a batch that does not fit
+ * starts a new block. Dropping images one by one changed an early part of
+ * every request and defeated the provider's cache (H-032). `withheld` lists
+ * images read since the last model call that do not fit; the model was
+ * promised their pixels, so they are disclosed, not dropped.
  */
-function exposedSandboxImages(snapshot: DurableTurnSnapshot): { selected: string[]; withheld: string[] } {
-  const lastModelCall = Math.max(-1, ...snapshot.steps
+export function exposedSandboxImages(
+  snapshot: Pick<DurableTurnSnapshot, "steps">,
+  capacity: number = MAX_MODEL_IMAGES,
+): { selected: string[]; withheld: string[] } {
+  const modelCalls = snapshot.steps
     .filter((step) => step.type === "model.call" && step.state === "completed")
-    .map((step) => step.sequence));
-  const recent = new Set<string>();
-  const paths = snapshot.steps.flatMap((step) => {
+    .map((step) => step.sequence);
+  const batchOf = (sequence: number) => modelCalls.filter((call) => call < sequence).length;
+  const reads = [...snapshot.steps].sort((left, right) => left.sequence - right.sequence).flatMap((step) => {
     if (step.state !== "completed") return [];
     const toolName = stringValue(step.input.toolName) ?? step.type.slice(5);
     if (toolName !== "read" && toolName !== "create_image") return [];
-    const output = objectValue(step.output);
-    const path = stringValue(output.visionPath);
+    const path = stringValue(objectValue(step.output).visionPath);
     if (!path || !binaryMediaType(path)?.startsWith("image/")) return [];
-    if (step.sequence > lastModelCall) recent.add(path);
-    return [path];
+    return [{ path, batch: batchOf(step.sequence) }];
   });
-  // Rank by most recent read: re-reading an older image must make it eligible
-  // for the next request rather than keeping its first-read position.
-  const latest = new Set<string>();
-  for (const path of paths) {
-    latest.delete(path);
-    latest.add(path);
+  // A re-read moves an image to the batch that read it last.
+  const latest = new Map<string, number>();
+  for (const read of reads) {
+    latest.delete(read.path);
+    latest.set(read.path, read.batch);
   }
-  const ordered = [...latest];
-  const selected = ordered.slice(-MAX_MODEL_IMAGES);
-  const withheld = ordered.slice(0, -MAX_MODEL_IMAGES).filter((path) => recent.has(path));
+  const batches = new Map<number, string[]>();
+  for (const [path, batch] of latest) batches.set(batch, [...(batches.get(batch) ?? []), path]);
+  const limit = Math.max(0, capacity);
+  let block: string[] = [];
+  for (const paths of [...batches.entries()].sort(([left], [right]) => left - right).map(([, paths]) => paths)) {
+    if (block.length + paths.length > limit) block = [];
+    block.push(...paths);
+  }
+  const selected = limit === 0 ? [] : block.slice(-limit);
+  const current = batches.get(modelCalls.length) ?? [];
+  const withheld = current.filter((path) => !selected.includes(path));
   return { selected, withheld };
 }
 

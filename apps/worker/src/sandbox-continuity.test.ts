@@ -12,6 +12,7 @@ import {
   S3SandboxSnapshotObjectStore,
   SandboxContinuityManager,
   SqlSandboxSnapshotRepository,
+  exposedSandboxImages,
   PI_BASH_WRAPPER_SCRIPT,
   PI_GREP_FILTER_SCRIPT,
   PI_READ_STREAM_SCRIPT,
@@ -807,7 +808,7 @@ describe("SandboxContinuityManager", () => {
       },
     }];
 
-    await expect(manager.modelContent(current)).resolves.toEqual([{ type: "text", text: 'Workspace image 1: "/workspace/inputs/connector-download/brent.png"' }, {
+    await expect(manager.modelContent(current)).resolves.toEqual([{ type: "text", text: 'Workspace image "/workspace/inputs/connector-download/brent.png"' }, {
       type: "image_url",
       image_url: { url: `data:image/png;base64,${image.toString("base64")}` },
     }]);
@@ -857,7 +858,7 @@ describe("SandboxContinuityManager", () => {
 
     const images = await Promise.all(paths.map((path) => testPng(Number(/page-(\d+)/.exec(path)?.[1] ?? 0))));
     expect(content).toEqual(paths.flatMap((path, index) => [
-      { type: "text", text: `Workspace image ${index + 1}: ${JSON.stringify(path)}` },
+      { type: "text", text: `Workspace image ${JSON.stringify(path)}` },
       { type: "image_url", image_url: { url: `data:image/png;base64,${images[index]!.toString("base64")}` } },
     ]));
     expect(maxActiveReads).toBe(3);
@@ -916,7 +917,7 @@ describe("SandboxContinuityManager", () => {
 
     expect(content[0]).toEqual({ type: "text", text: expect.stringContaining("Image not sent:") });
     expect(content.slice(1)).toEqual([2, 3, 4, 5, 6].flatMap((value, index) => [
-      { type: "text", text: `Workspace image ${index + 1}: "/workspace/inputs/image-${value}/image-${value}.png"` },
+      { type: "text", text: `Workspace image "/workspace/inputs/image-${value}/image-${value}.png"` },
       { type: "image_url", image_url: { url: `data:image/png;base64,${images[value - 1]!.toString("base64")}` } },
     ]));
     expect(getSource).toHaveBeenCalledTimes(5);
@@ -2230,7 +2231,7 @@ describe("SandboxContinuityManager", () => {
       expect(content[0]).toEqual({ type: "text", text: expect.stringContaining("no longer exists at this path") });
       expect(content[0]).toEqual({ type: "text", text: expect.stringContaining("/workspace/tmp/contact-sheet.png") });
       expect(content.filter((part) => part.type === "image_url")).toHaveLength(1);
-      expect(content).toContainEqual({ type: "text", text: 'Workspace image 1: "/workspace/outputs/final.png"' });
+      expect(content).toContainEqual({ type: "text", text: 'Workspace image "/workspace/outputs/final.png"' });
     });
 
     it("makes a re-read older image eligible for the next request", async () => {
@@ -2257,6 +2258,41 @@ describe("SandboxContinuityManager", () => {
       expect(notices[0]).toContain("/workspace/pages/page-1.png");
       expect(notices[1]).toContain("/workspace/pages/page-2.png");
       expect(notices.join("\n")).not.toContain("cover.png");
+    });
+
+    it("keeps whole batches in place and starts a new block only when a batch does not fit", () => {
+      const modelCall = (sequence: number) => ({
+        ...toolStep("unused", {}),
+        id: `00000000-0000-7000-8000-${String(300 + sequence).padStart(12, "0")}`,
+        sequence,
+        type: "model.call",
+        state: "completed",
+      }) as DurableTurnStep;
+      const first = [1, 2, 3].map((page) => completedRead(`/workspace/pages/a-${page}.png`, page));
+      const second = [5, 6].map((sequence, index) => completedRead(`/workspace/pages/b-${index + 1}.png`, sequence));
+      const third = completedRead("/workspace/pages/c-1.png", 8);
+      const paths = (steps: DurableTurnStep[]) => steps.map((step) => String((step.output as { visionPath: string }).visionPath));
+
+      // Each request extends the previous one: images already sent stay where they were.
+      expect(exposedSandboxImages({ steps: first })).toEqual({ selected: paths(first), withheld: [] });
+      expect(exposedSandboxImages({ steps: [...first, modelCall(4), ...second] }))
+        .toEqual({ selected: paths([...first, ...second]), withheld: [] });
+      // The next batch does not fit, so the earlier block is dropped as a whole once.
+      expect(exposedSandboxImages({ steps: [...first, modelCall(4), ...second, modelCall(7), third] }))
+        .toEqual({ selected: paths([third]), withheld: [] });
+    });
+
+    it("gives sandbox images only the slots attachments leave free", () => {
+      const batch = [1, 2, 3].map((page) => completedRead(`/workspace/pages/page-${page}.png`, page));
+
+      expect(exposedSandboxImages({ steps: batch }, 2)).toEqual({
+        selected: ["/workspace/pages/page-2.png", "/workspace/pages/page-3.png"],
+        withheld: ["/workspace/pages/page-1.png"],
+      });
+      expect(exposedSandboxImages({ steps: batch }, 0)).toEqual({
+        selected: [],
+        withheld: batch.map((step) => String((step.output as { visionPath: string }).visionPath)),
+      });
     });
 
     it("still reports an explicitly requested missing image as an inspection error", async () => {
@@ -2341,16 +2377,17 @@ describe("SandboxContinuityManager", () => {
       },
     }];
 
+    // Attachments take their slots first (H-032); each image is placed by its label.
     await expect(manager.modelContent(current)).resolves.toEqual([
-      { type: "text", text: 'Workspace image 1: "/workspace/outputs/chart.png"' },
-      {
-        type: "image_url",
-        image_url: { url: `data:image/png;base64,${generated.toString("base64")}` },
-      },
-      { type: "text", text: 'Workspace image 2: "/workspace/inputs/00000000-0000-7000-8000-000000000090/reference.png"' },
+      { type: "text", text: 'Workspace image "/workspace/inputs/00000000-0000-7000-8000-000000000090/reference.png"' },
       {
         type: "image_url",
         image_url: { url: `data:image/png;base64,${attached.toString("base64")}` },
+      },
+      { type: "text", text: 'Workspace image "/workspace/outputs/chart.png"' },
+      {
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${generated.toString("base64")}` },
       },
     ]);
     expect(provider.files.read).toHaveBeenCalledWith({

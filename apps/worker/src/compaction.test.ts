@@ -605,6 +605,44 @@ describe("durable session compactor", () => {
     });
   });
 
+  it("leaves journaled turn context out of the compaction model's input (H-032)", async () => {
+    const state = compactionState();
+    state.entries = [
+      state.entries[0]!,
+      {
+        entryId: "context-1",
+        parentEntryId: "entry-1",
+        entryType: "context",
+        sequence: 2,
+        payload: { type: "context", runId: "run-1", scope: "turn", text: "<berry_turn_context>STALE-GROUNDING-MARKER</berry_turn_context>" },
+        isLeafMarker: false,
+        createdAt: "2026-07-28T12:00:30.000Z",
+      },
+      { ...state.entries[1]!, parentEntryId: "context-1", sequence: 3 },
+    ];
+    const conversations: string[] = [];
+    const repository: SessionCompactionRepository = {
+      claim: async () => true,
+      load: async () => state,
+      persist: async () => ({ segmentCheckpointId: "segment", rollingCheckpointId: "rolling", usageEventId: null }),
+      release: async () => {},
+    };
+    const generator: CheckpointGenerator = {
+      provider: "test",
+      model: "checkpoint-test",
+      generate: async (input) => {
+        conversations.push(input.conversation);
+        return { checkpoint: null, validationStatus: "fallback", attempts: 1, fallbackReason: "checkpoint_validation_failed" };
+      },
+    };
+
+    await new DurableSessionCompactor(repository, generator, { leaseOwner: "test-worker", keepRecentTokens: 1 }).compactSession(job);
+
+    expect(conversations.length).toBeGreaterThan(0);
+    expect(conversations.join("\n")).toContain("Implement durable compaction.");
+    expect(conversations.join("\n")).not.toContain("STALE-GROUNDING-MARKER");
+  });
+
   it("rejects a final rolling checkpoint whose protected identity exceeds the serialized byte limit", async () => {
     const releasedErrors: Array<string | undefined> = [];
     const persist = vi.fn();

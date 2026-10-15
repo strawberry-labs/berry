@@ -180,6 +180,27 @@ export async function describeImageBytes(input: Uint8Array): Promise<{
   }
 }
 
+/**
+ * The label before each image Berry supplies. The path alone identifies the
+ * image; a running number would change as images come and go and move the
+ * provider's cached prefix (H-032).
+ */
+export function modelImageLabel(path: string, note = ""): string {
+  return `Workspace image ${JSON.stringify(path)}${note}`;
+}
+
+/** The path a modelImageLabel names (also the older numbered form), or null. */
+export function modelImageLabelPath(text: string): string | null {
+  const match = /^Workspace image (?:\d+: )?("(?:[^"\\]|\\.)*")/.exec(text);
+  if (!match) return null;
+  try {
+    const path = JSON.parse(match[1]!) as unknown;
+    return typeof path === "string" ? path : null;
+  } catch {
+    return null;
+  }
+}
+
 export function modelImageOmission(path: string, reason: string): string {
   return `[Image not sent: ${JSON.stringify(path)}; ${reason}. The original file is unchanged. Use bash to create a smaller PNG/JPEG copy or crop the relevant region, then read that new path. Do not repeat read on this unchanged image or claim to have seen its pixels.]`;
 }

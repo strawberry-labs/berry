@@ -328,6 +328,13 @@ type ObservedAdmissionPreparation<T> = Promise<
   | { status: "rejected"; reason: unknown }
 >;
 
+/** What the model and the user are told when an optional capability could not be prepared (H-050). */
+export function degradedCapabilityReason(what: string, status: "timeout" | "unavailable"): string {
+  return status === "timeout"
+    ? `${what} did not finish in time for this message. Sending the next message tries again.`
+    : `${what} failed for this message. Sending the next message tries again; if it keeps failing, an administrator should check it.`;
+}
+
 function observeAdmissionPreparation<T>(work: Promise<T>): ObservedAdmissionPreparation<T> {
   return work.then(
     (value) => ({ status: "fulfilled" as const, value }),
@@ -346,6 +353,7 @@ export async function resolveOptionalAdmissionPreparation<T>(
   fallback: T,
   deadlineAt: number,
   label: string,
+  onDegraded?: (status: "timeout" | "unavailable") => void,
 ): Promise<T> {
   const remainingMs = Math.max(0, deadlineAt - Date.now());
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -364,10 +372,12 @@ export async function resolveOptionalAdmissionPreparation<T>(
   if (timeout) clearTimeout(timeout);
   if (result.status === "timeout") {
     logAdmissionPreparationDegraded(label, "timeout");
+    onDegraded?.("timeout");
     return fallback;
   }
   if (result.status === "rejected") {
     logAdmissionPreparationDegraded(label, "unavailable");
+    onDegraded?.("unavailable");
     return fallback;
   }
   return result.value;
@@ -1886,12 +1896,15 @@ export class AgentApiController {
           resolvedRuntime.apiKey,
           resolvedRuntime.credentialRef,
         );
-        const mcpServersWork = observeAdmissionPreparation(Promise.all(governedRequest.mcpServers
-          .filter((server) => server.enabled && server.trusted)
-          .map((server) => durableMcpServer(server))));
+        const enabledMcpServers = governedRequest.mcpServers.filter((server) => server.enabled && server.trusted);
+        const mcpServersWork = observeAdmissionPreparation(Promise.all(enabledMcpServers.map((server) => durableMcpServer(server))));
         const visionWork = observeAdmissionPreparation(governedCapabilities.vision === true
           ? Promise.resolve(null)
           : this.#resolveVisionAdapter(tenantId, userId, departmentId, mode));
+        // A configured capability that could not be prepared for this turn
+        // stays declared with the reason, so the tool list does not change
+        // between turns and the model can say why (H-032, H-050).
+        const capabilityNotices: Array<{ capability: "connectors" | "vision" | "image_generation"; reason: string }> = [];
         const [provider, mcpServers, vision] = await Promise.all([
           providerWork,
           resolveOptionalAdmissionPreparation(
@@ -1899,18 +1912,34 @@ export class AgentApiController {
             [],
             optionalPreparationDeadlineAt,
             "mcp_runtime",
+            (status) => {
+              if (enabledMcpServers.length > 0) {
+                capabilityNotices.push({ capability: "connectors", reason: degradedCapabilityReason("Connector setup", status) });
+              }
+            },
           ),
           resolveOptionalAdmissionPreparation(
             visionWork,
             null,
             optionalPreparationDeadlineAt,
             "vision_runtime",
+            (status) => {
+              if (governedCapabilities.vision !== true) {
+                capabilityNotices.push({ capability: "vision", reason: degradedCapabilityReason("The image-reading service", status) });
+              }
+            },
           ),
         ]);
+        if (imageInfo && !imageDecision?.allowed) {
+          capabilityNotices.push({
+            capability: "image_generation",
+            reason: imageDecision ? modelGovernanceMessage(imageDecision.reason) : "Image generation is not allowed for this request.",
+          });
+        }
         const builtInTools = [
           ...DURABLE_BASE_BUILT_IN_TOOLS,
-          ...(imageInfo && imageDecision?.allowed ? ["create_image" as const] : []),
-          ...(vision ? ["inspect_images" as const] : []),
+          ...(imageInfo ? ["create_image" as const] : []),
+          ...(vision || capabilityNotices.some((notice) => notice.capability === "vision") ? ["inspect_images" as const] : []),
           ...(governedRequest.extraSkills.some((skill) => !skill.disableModelInvocation)
             ? ["activate_skill" as const]
             : []),
@@ -1965,6 +1994,7 @@ export class AgentApiController {
             ...(attachment.sourceKind !== undefined ? { sourceKind: attachment.sourceKind } : {}),
           })),
           ...(portableCheckpoint ? { portableCheckpoint } : {}),
+          ...(capabilityNotices.length > 0 ? { capabilityNotices } : {}),
         });
         const durableBudgetCheck = await reserveModelBudget();
         const budgetReservationRequired = Boolean(durableBudgetCheck.reservation);

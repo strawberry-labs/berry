@@ -17,6 +17,7 @@ import type { SqlExecutor } from "./sql-repositories.js";
 import {
   resolveDurableCredential,
   DurableToolExecutionError,
+  capabilityNoticeReason,
   usageCostMicros,
   type DurableToolPolicy,
   type DurableTurnSnapshot,
@@ -199,7 +200,10 @@ export class DurableVisionToolExecutor implements DurableTurnToolExecutor {
       );
     }
     const runtime = DurableTurnRuntimeRequestSchema.parse(snapshot.runtimeRequest);
-    if (!runtime.vision) throw new Error("Vision inspection was not admitted for this turn");
+    if (!runtime.vision) {
+      const reason = capabilityNoticeReason(snapshot, "vision");
+      throw new Error(reason ? `Image reading is unavailable for this message: ${reason}` : "Vision inspection was not admitted for this turn");
+    }
     const args = record(step.input.arguments);
     const mode = effectiveVisionMode(args);
     const question = stringValue(args?.question)?.trim();

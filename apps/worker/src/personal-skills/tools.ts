@@ -250,7 +250,12 @@ WHERE personal_skills.tenant_id=EXCLUDED.tenant_id AND personal_skills.user_id=E
     const requestedName = parsedInput.data.name;
     const requestedResources = [...new Set(parsedInput.data.resources ?? [])];
     const skill = runtime.extraSkills.find((candidate) => candidate.name === requestedName);
-    if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}`);
+    if (!skill || !/^\/(personal|organization)-skills\//.test(skill.filePath)) {
+      const available = runtime.extraSkills
+        .filter((candidate) => !candidate.disableModelInvocation && /^\/(personal|organization)-skills\//.test(candidate.filePath))
+        .map((candidate) => candidate.name);
+      throw new Error(`Unknown stored skill: ${requestedName ?? "(missing)"}. Use one exact name from: ${available.join(", ") || "(no skills are installed)"}.`);
+    }
     const previousActivation = [...snapshot.steps].reverse().find((candidate) => candidate.id !== step.id
       && candidate.state === "completed"
       && (stringValue(candidate.input.toolName) ?? candidate.type.slice(5)) === "activate_skill"

@@ -672,7 +672,17 @@ export const DurableTurnRuntimeRequestSchema = z.object({
     sourceKind: z.string().nullable().optional(),
   }).strict()).default([]),
   portableCheckpoint: SessionCheckpointV2Schema.optional(),
+  /**
+   * Optional capabilities declared for this turn that could not be prepared,
+   * with the reason the model and the user see. The tool stays declared so the
+   * tool list does not change between turns (H-032, H-050).
+   */
+  capabilityNotices: z.array(z.object({
+    capability: z.enum(["connectors", "vision", "image_generation"]),
+    reason: z.string().min(1).max(500),
+  }).strict()).max(10).optional(),
 }).strict().superRefine((request, context) => {
+  const noticed = new Set((request.capabilityNotices ?? []).map((notice) => notice.capability));
   const hasImageTool = request.builtInTools.includes("create_image");
   if (request.intent === "image_generation" && !hasImageTool) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["builtInTools"], message: "Image intent requires the create_image tool" });
@@ -680,11 +690,11 @@ export const DurableTurnRuntimeRequestSchema = z.object({
   if (request.intent === "image_generation" && !request.imageGeneration) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "Image intent requires admitted image generation configuration" });
   }
-  if (hasImageTool && !request.imageGeneration) {
+  if (hasImageTool && !request.imageGeneration && !noticed.has("image_generation")) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["imageGeneration"], message: "The create_image tool requires admitted image generation configuration" });
   }
   const hasVisionTool = request.builtInTools.includes("inspect_images");
-  if (hasVisionTool && !request.vision) {
+  if (hasVisionTool && !request.vision && !noticed.has("vision")) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["vision"], message: "The inspect_images tool requires admitted vision configuration" });
   }
   if (request.vision && !hasVisionTool) {
