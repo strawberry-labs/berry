@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "entryPoints": {
+    "scripts/create_aesg_docx.py": {
+      "requires": [
+        {
+          "skill": "aesg-branding",
+          "resources": [
+            "scripts/report_structure.py",
+            "scripts/normalise_office_templates.py",
+            "scripts/office_converter.py",
+            "assets/templates/AESG_General_Report_Template.docx",
+            "assets/templates/AESG_Letterhead_Dubai.docx"
+          ]
+        }
+      ]
+    },
+    "scripts/repair_aesg_docx.py": {
+      "requires": [
+        {
+          "skill": "aesg-branding",
+          "resources": [
+            "scripts/report_structure.py",
+            "scripts/normalise_office_templates.py"
+          ]
+        }
+      ]
+    }
+  }
+}

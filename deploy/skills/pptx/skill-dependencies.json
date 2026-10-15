@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "entryPoints": {
+    "scripts/create_aesg_pptx.py": {
+      "requires": [
+        {
+          "skill": "aesg-branding",
+          "resources": ["assets/templates/AESG_General_Presentation.pptx"]
+        }
+      ]
+    }
+  }
+}

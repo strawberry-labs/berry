@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "entryPoints": {
+    "scripts/create_aesg_xlsx.py": {
+      "requires": [
+        {
+          "skill": "aesg-branding",
+          "resources": ["assets/logos/aesg-brandmark-rgb.png"]
+        }
+      ]
+    }
+  }
+}
