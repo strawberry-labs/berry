@@ -7092,7 +7092,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
     type: "function" as const,
     function: {
       name: "read",
-      description: "Read text and extract searchable content from PDFs, Word documents, spreadsheets, presentations, ZIP archives, and supported images. PDFs return page markers and accept page_start/page_end. ZIPs return exact extracted entry paths. Use offset/limit to continue long text. Output is capped at 2000 lines/50KB; use a format skill when visual layout, formulas, rendering, or editing matter.",
+      description: "Read text and extract searchable content from PDFs, Word documents, spreadsheets, presentations, ZIP archives, and supported images. PDFs return page markers and accept page_start/page_end; as_image=true shows one PDF page as an image instead. ZIPs return exact extracted entry paths. Use offset/limit to continue long text. Output is capped at 2000 lines/50KB; use a format skill when visual layout, formulas, rendering, or editing matter.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -7103,6 +7103,7 @@ export const DURABLE_TOOL_DEFINITIONS: ChatToolDefinition[] = [
           limit: { type: "number", description: "Maximum number of lines to read" },
           page_start: { type: "number", description: "First PDF page, inclusive (1-based)" },
           page_end: { type: "number", description: "Last PDF page, inclusive (1-based)" },
+          as_image: { type: "boolean", description: "PDF only: show page page_start as an image. Use it when a page has no extractable text (scans, drawings, pictures of tables) and the task needs that page." },
         },
       },
     },

@@ -1057,6 +1057,28 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
     if (toolName === "read") {
       const path = safeReadablePath(requiredToolPath(args, toolName), workspaceRoot);
       const mediaType = binaryMediaType(path);
+      if (args.as_image === true && mediaType !== "application/pdf") {
+        throw new Error("read as_image works only for PDF pages. Read an image file directly to see it.");
+      }
+      if (mediaType === "application/pdf" && args.as_image === true) {
+        const page = numberValue(args.page_start) ?? 1;
+        const rendered = await renderPdfPage(this.provider, sandbox.id, path, page, step, workspaceRoot, signal, reportProgress);
+        return {
+          output: {
+            path: rendered.imagePath,
+            sourcePath: path,
+            page,
+            totalPages: rendered.totalPages,
+            binary: true,
+            mediaType: "image/png",
+            visionPath: rendered.imagePath,
+            content: `Page ${page} of ${rendered.totalPages} of ${path} was rendered as an image at ${rendered.imagePath}. It will be attached to the next model request for visual inspection.`,
+            ...inputRepairDetails,
+          },
+          summary: `Rendered page ${page} of ${path} as an image`,
+          sandbox,
+        };
+      }
       if (mediaType === "application/pdf") {
         const extraction = await extractPdfText(this.provider, sandbox.id, path, args, step, workspaceRoot, signal, reportProgress);
         const formatted = piReadPdfContent(extraction.content, args, {
@@ -4163,7 +4185,7 @@ export function piReadPdfContent(
   const unreviewed = `${pagesWithoutText.slice(0, 20).join(", ")}${pagesWithoutText.length > 20 ? ` and ${pagesWithoutText.length - 20} more` : ""}`;
   const notices = [
     ...(pagesWithoutText.length > 0
-      ? [`${pagesWithoutText.length === 1 ? `Page ${unreviewed} has` : `Pages ${unreviewed} have`} no extractable text (scanned content, images or blank pages) and ${pagesWithoutText.length === 1 ? "was" : "were"} not reviewed. Before saying information is missing from this document, render those pages to images (for example pdftoppm -f ${pagesWithoutText[0]} -l ${pagesWithoutText[0]} -r 150 -png) and inspect them, or run OCR.`]
+      ? [`${pagesWithoutText.length === 1 ? `Page ${unreviewed} has` : `Pages ${unreviewed} have`} no extractable text (scanned content, drawings, pictures of tables, or blank pages) and ${pagesWithoutText.length === 1 ? "was" : "were"} not reviewed. Decide from the task whether ${pagesWithoutText.length === 1 ? "it" : "they"} may matter. If so, look at ${pagesWithoutText.length === 1 ? "it" : "each page"}: read with page_start=${pagesWithoutText[0]} and as_image=true (one page per call). Do not say information is missing from this document while relevant pages are unreviewed.`]
       : []),
     ...(textWasTruncated && nextOffset !== null
       ? [`This page range exceeded the read limit. Continue with page_start=${actualStart}, page_end=${actualEnd}, offset=${nextOffset}.`]
@@ -4349,7 +4371,7 @@ function validateCoreToolArguments(toolName: string, args: Record<string, unknow
       `The ${toolName} arguments were incomplete or invalid JSON. Call the tool again with its schema fields directly; do not send a raw wrapper.`,
     );
   }
-  const allowed = toolName === "read" ? ["path", "offset", "limit", "page_start", "page_end"]
+  const allowed = toolName === "read" ? ["path", "offset", "limit", "page_start", "page_end", "as_image"]
     : toolName === "bash" ? ["command", "timeout"]
       : toolName === "edit" ? ["path", "edits"]
         : toolName === "write" ? ["path", "content"]
@@ -4367,6 +4389,12 @@ function validateCoreToolArguments(toolName: string, args: Record<string, unknow
     validateOptionalInteger(args, "limit", 1, toolName);
     validateOptionalInteger(args, "page_start", 1, toolName);
     validateOptionalInteger(args, "page_end", 1, toolName);
+    if (args.as_image !== undefined && typeof args.as_image !== "boolean") {
+      throw new Error("read as_image must be true or false");
+    }
+    if (args.as_image === true && args.page_end !== undefined && args.page_end !== args.page_start) {
+      throw new Error("read as_image shows one PDF page per call: set page_start only, and read further pages in separate calls");
+    }
     return;
   }
   if (toolName === "bash") {
@@ -4725,6 +4753,56 @@ async function extractPdfText(
     pageEnd,
     sourceTruncated: extracted.stdoutTruncated,
   };
+}
+
+/**
+ * Renders one PDF page to a PNG for visual inspection (H-049). Pages without a
+ * text layer (scans, drawings, pictures of tables) are read this way when the
+ * task needs them; nothing is rendered or OCRed automatically. The longer side
+ * is capped so an A0 drawing stays within the image limits; the file name
+ * carries a hash of the source path so two PDFs never share an image.
+ */
+async function renderPdfPage(
+  provider: SandboxProvider,
+  sandboxId: string,
+  path: string,
+  page: number,
+  step: DurableTurnStep,
+  workspaceRoot: string,
+  signal?: AbortSignal,
+  reportProgress?: () => void,
+): Promise<{ imagePath: string; totalPages: number }> {
+  const requestId = step.idempotencyKey ?? step.id;
+  const pageInfo = await sandboxCommandOutput(
+    provider,
+    sandboxId,
+    `${requestId}:pdf-info`,
+    ["pdfinfo", path],
+    workspaceRoot,
+    signal,
+    reportProgress,
+    120_000,
+  );
+  const pageMatch = pageInfo.stdout.match(/(?:^|\n)Pages:\s*(\d+)\s*(?:\n|$)/);
+  const totalPages = pageMatch ? Number(pageMatch[1]) : NaN;
+  if (!Number.isSafeInteger(totalPages) || totalPages < 1) {
+    throw new Error(`PDF page metadata did not contain a valid page count for ${path}`);
+  }
+  if (page > totalPages) throw new Error(`Page ${page} is beyond the end of this PDF (${totalPages} pages total).`);
+  const stem = (path.split("/").at(-1) ?? "document").replace(/\.pdf$/i, "").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 60) || "document";
+  const directory = `${workspaceRoot}/tmp/pdf-pages`;
+  const prefix = `${directory}/${stem}-${createHash("sha256").update(path).digest("hex").slice(0, 8)}-page-${page}`;
+  await sandboxCommandOutput(
+    provider,
+    sandboxId,
+    `${requestId}:pdf-page:${page}`,
+    ["sh", "-c", 'mkdir -p "$1" && pdftoppm -f "$2" -l "$2" -scale-to 2000 -png -singlefile "$3" "$4"', "render-pdf-page", directory, String(page), path, prefix],
+    workspaceRoot,
+    signal,
+    reportProgress,
+    120_000,
+  );
+  return { imagePath: `${prefix}.png`, totalPages };
 }
 
 async function extractZipArchive(

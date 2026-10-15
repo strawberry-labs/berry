@@ -1857,6 +1857,54 @@ describe("SandboxContinuityManager", () => {
     ]);
   });
 
+  it("shows one PDF page as an image when the model asks for it (H-049)", async () => {
+    const commands: string[][] = [];
+    const manager = managerWithProvider({
+      read: vi.fn(),
+      write: vi.fn(),
+      list: vi.fn(),
+    }, async function* (input: { command: string[] }) {
+      commands.push(input.command);
+      if (input.command[0] === "pdfinfo") yield { kind: "stdout", data: "Pages: 10\n" };
+      yield { kind: "exit", exit_code: 0, signal: null };
+    });
+
+    const result = await manager.execute(snapshot(), toolStep("read", {
+      path: "/workspace/inputs/file-id/rfp.pdf",
+      page_start: 7,
+      as_image: true,
+    }));
+    const imagePath = String((result.output as { visionPath?: unknown }).visionPath);
+    expect(imagePath).toMatch(/^\/workspace\/tmp\/pdf-pages\/rfp-[0-9a-f]{8}-page-7\.png$/);
+    expect(result.output).toMatchObject({
+      path: imagePath,
+      sourcePath: "/workspace/inputs/file-id/rfp.pdf",
+      page: 7,
+      totalPages: 10,
+      binary: true,
+      mediaType: "image/png",
+      content: expect.stringContaining("will be attached to the next model request"),
+    });
+    expect(commands.at(-1)).toEqual([
+      "sh",
+      "-c",
+      expect.stringContaining("pdftoppm -f \"$2\" -l \"$2\" -scale-to 2000 -png -singlefile"),
+      "render-pdf-page",
+      "/workspace/tmp/pdf-pages",
+      "7",
+      "/workspace/inputs/file-id/rfp.pdf",
+      imagePath.replace(/\.png$/, ""),
+    ]);
+    expect(commands.some((command) => command[0] === "pdftotext")).toBe(false);
+
+    await expect(manager.execute(snapshot(), toolStep("read", { path: "/workspace/inputs/file-id/rfp.pdf", page_start: 12, as_image: true })))
+      .rejects.toThrow("Page 12 is beyond the end of this PDF (10 pages total).");
+    await expect(manager.execute(snapshot(), toolStep("read", { path: "/workspace/inputs/file-id/rfp.pdf", page_start: 2, page_end: 4, as_image: true })))
+      .rejects.toThrow("one PDF page per call");
+    await expect(manager.execute(snapshot(), toolStep("read", { path: "/workspace/inputs/file-id/brief.docx", as_image: true })))
+      .rejects.toThrow("as_image works only for PDF pages");
+  });
+
   it("marks PDF pages without a text layer as not reviewed (H-049)", () => {
     // Task 383: the scope extract on page 7 of the RFP was an image.
     const pages = Array.from({ length: 10 }, (_, index) => index === 6 ? "" : `Section ${index + 1} requirements`);
@@ -1864,7 +1912,9 @@ describe("SandboxContinuityManager", () => {
     expect(result.details).toMatchObject({ outputPages: 10, textCoverage: "partial", pagesWithoutText: [7] });
     expect(result.content).toContain("--- Page 7 of 10 ---\n[No extractable text on this page.]");
     expect(result.content).toContain("Page 7 has no extractable text");
-    expect(result.content).toContain("Before saying information is missing from this document");
+    expect(result.content).toContain("Decide from the task whether it may matter");
+    expect(result.content).toContain("read with page_start=7 and as_image=true");
+    expect(result.content).toContain("Do not say information is missing from this document while relevant pages are unreviewed");
 
     const complete = piReadPdfContent("Intro\fScope\fFees", {});
     expect(complete.details).not.toHaveProperty("textCoverage");
