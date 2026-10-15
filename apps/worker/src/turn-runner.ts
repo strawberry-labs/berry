@@ -42,6 +42,7 @@ import {
   type PromptManifest,
   ProviderAttemptError,
   type ProviderAttemptReport,
+  type ProviderAttemptRetryLayer,
   type SessionCheckpointV2,
   type ToolRetryClass,
   type TurnRunState,
@@ -49,6 +50,7 @@ import {
 import {
   OpenAIChatCompletionsClient,
   parseKimiToolCalls,
+  PROVIDER_ATTEMPT_ID_HEADER,
   type ChatContentPart,
   type ChatMessage,
   type ChatToolCall,
@@ -1057,6 +1059,7 @@ export class DurableTurnRunner {
     const writer = new DurableMessageEventWriter(this.repository, snapshot, messageId);
     const repetitionGuard = new ExactOutputRepetitionGuard();
     const providerAttempts: ProviderAttemptReport[] = [];
+    const attemptLayer = runnerAttemptLayer(step);
     let result: TurnModelResult;
     try {
       result = await this.withHeartbeat(snapshot, async ({ signal, reportProgress, abort }) => {
@@ -1069,7 +1072,7 @@ export class DurableTurnRunner {
             signal,
             reportProgress,
             onProviderAttempt: (report) => {
-              providerAttempts.push({ ...report });
+              providerAttempts.push(attributeRunnerAttempt(report, attemptLayer));
             },
             onProviderAttemptDecision: (physicalAttempt, decision) => {
               const report = [...providerAttempts].reverse().find((candidate) => candidate.physicalAttempt === physicalAttempt);
@@ -1132,8 +1135,9 @@ export class DurableTurnRunner {
       };
       const failureEvents = providerAttempts.length > 0
         ? providerAttempts.map((attempt) => providerAttemptEventFromReport(step.id, attempt))
-        : [providerAttemptEvent(step.id, diagnostics)];
+        : [providerAttemptEvent(step.id, diagnostics, unreportedProviderAttempt(snapshot, attemptLayer))];
       await this.repository.appendEvents(snapshot, failureEvents).catch(() => undefined);
+      const finalAttempt = failureEvents.at(-1);
       emitWorkerOperationalEvent("provider.attempt", this.options.workerRole ?? snapshot.workerRole ?? "unknown", this.options.sourceRevision ?? snapshot.sourceRevision ?? "unknown", {
         runId: snapshot.id,
         stepId: step.id,
@@ -1144,6 +1148,9 @@ export class DurableTurnRunner {
         inputTokens: diagnostics.inputTokens,
         outputTokens: diagnostics.outputTokens,
         retryDecision: diagnostics.retryDecision,
+        attemptId: finalAttempt?.attemptId,
+        retryLayer: finalAttempt?.retryLayer,
+        transport: finalAttempt?.transport,
       });
       if (!(error instanceof DurableTurnCancellationError)) {
         await this.repository.commit(snapshot, {
@@ -1203,12 +1210,19 @@ export class DurableTurnRunner {
       );
     }
 
-    const responseUsageEvents: AgentStreamEvent[] = result.usage
-      ? [AgentStreamEventSchema.parse(result.usage)]
-      : [];
     const responseProviderAttempts = providerAttempts.length > 0
       ? providerAttempts.map((attempt) => providerAttemptEventFromReport(step.id, attempt))
-      : [providerAttemptEvent(step.id, providerDiagnostics)];
+      : [providerAttemptEvent(step.id, providerDiagnostics, unreportedProviderAttempt(snapshot, attemptLayer))];
+    // The usage came from the request that succeeded; name it so billing can
+    // be reconciled with physical provider requests (H-033).
+    const usageAttemptId = [...responseProviderAttempts].reverse()
+      .find((attempt) => attempt.category === "success")?.attemptId;
+    const responseUsageEvents: AgentStreamEvent[] = result.usage
+      ? [AgentStreamEventSchema.parse({
+          ...result.usage,
+          ...(result.usage.providerAttemptId || !usageAttemptId ? {} : { providerAttemptId: usageAttemptId }),
+        })]
+      : [];
     const responseEndEvents: AgentStreamEvent[] = [
       { kind: "message.end", messageId },
       ...responseProviderAttempts,
@@ -1319,7 +1333,7 @@ export class DurableTurnRunner {
     const messageEvents: AgentStreamEvent[] = [
       { kind: "message.end", messageId },
       ...responseProviderAttempts,
-      ...(result.usage ? [AgentStreamEventSchema.parse(result.usage)] : []),
+      ...responseUsageEvents,
     ];
     const providerToolCalls: Record<string, JsonValue> = {};
     for (const call of result.toolCalls) {
@@ -1486,20 +1500,9 @@ export class DurableTurnRunner {
           ? `Context compacted from ${result.tokensBefore} tokens into a portable checkpoint.`
           : `Context compacted from ${result.tokensBefore} to ${result.tokensAfter} tokens.`,
       },
-      ...(result.providerAttempts ?? []).map((attempt, index) => AgentStreamEventSchema.parse({
-        kind: "provider.attempt",
-        logicalStepId: step.id,
+      ...(result.providerAttempts ?? []).map((attempt, index) => providerAttemptEventFromReport(step.id, {
+        ...attributeRunnerAttempt(attempt, runnerAttemptLayer(step)),
         physicalAttempt: attempt.physicalAttempt ?? index + 1,
-        model: attempt.model ?? "unknown",
-        statusClass: attempt.statusClass ?? providerAttemptStatusClass(attempt.status),
-        category: attempt.category,
-        retryDecision: attempt.retryDecision,
-        latencyMs: attempt.latencyMs,
-        inputTokens: attempt.inputTokens ?? 0,
-        outputTokens: attempt.outputTokens ?? 0,
-        cacheReadTokens: attempt.cacheReadTokens ?? 0,
-        cacheWriteTokens: attempt.cacheWriteTokens ?? 0,
-        finishReason: attempt.finishReason ?? null,
       })),
       ...(result.usage ? [AgentStreamEventSchema.parse({
         kind: "usage",
@@ -4520,7 +4523,11 @@ export class SnapshotProviderDurableTurnModel implements DurableTurnModel {
     const apiKey = await resolveDurableCredential(provider, this.env);
     const model = runtime.model ?? provider.defaultModel;
     if (provider.apiType === "openai-chat-completions") {
-      const compatible = new OpenAIChatCompletionsClient({ provider: provider as never, apiKey });
+      const compatible = new OpenAIChatCompletionsClient({
+        provider: provider as never,
+        apiKey,
+        attemptIdHeader: PROVIDER_ATTEMPT_ID_HEADER,
+      });
       const streamed = provider.completionTransport === "buffered"
         ? new BufferedChatCompletionClient(compatible)
         : provider.completionFallback === "buffered"
@@ -4761,6 +4768,7 @@ export function createDurableTurnModel(env: NodeJS.ProcessEnv): DurableTurnModel
     ? new RouterDurableTurnModel(
         new OpenAIChatCompletionsClient({
           provider: {
+            id: env.BERRY_ROUTER_PROVIDER_ID?.trim() || "router",
             baseUrl,
             defaultModel: model,
             kind: "openai-compatible",
@@ -4769,6 +4777,7 @@ export function createDurableTurnModel(env: NodeJS.ProcessEnv): DurableTurnModel
             endpointPath: env.BERRY_ROUTER_CHAT_COMPLETIONS_PATH?.trim() || "/chat/completions",
           },
           apiKey,
+          attemptIdHeader: PROVIDER_ATTEMPT_ID_HEADER,
         }),
         model,
         {
@@ -4992,9 +5001,14 @@ function publicProviderFailureMessage(
   return `${base}${status}.${action}`;
 }
 
+type ProviderAttemptLabels = Pick<ProviderAttemptReport, "attemptId" | "retryLayer" | "transport" | "provider" | "route">;
+
+const PROVIDER_ATTEMPT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 function providerAttemptEvent(
   logicalStepId: string,
   diagnostics: Record<string, JsonValue>,
+  labels: ProviderAttemptLabels,
 ): Extract<AgentStreamEvent, { kind: "provider.attempt" }> {
   return AgentStreamEventSchema.parse({
     kind: "provider.attempt",
@@ -5010,6 +5024,7 @@ function providerAttemptEvent(
     cacheReadTokens: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.cacheReadTokens) ?? 0)),
     cacheWriteTokens: Math.max(0, Math.floor(nonnegativeNumber(diagnostics.cacheWriteTokens) ?? 0)),
     finishReason: stringValue(diagnostics.finishReason) ?? null,
+    ...providerAttemptLabels(labels),
   }) as Extract<AgentStreamEvent, { kind: "provider.attempt" }>;
 }
 
@@ -5031,7 +5046,69 @@ function providerAttemptEventFromReport(
     cacheReadTokens: Math.max(0, Math.floor(report.cacheReadTokens ?? 0)),
     cacheWriteTokens: Math.max(0, Math.floor(report.cacheWriteTokens ?? 0)),
     finishReason: report.finishReason ?? null,
+    ...providerAttemptLabels(report),
   }) as Extract<AgentStreamEvent, { kind: "provider.attempt" }>;
+}
+
+/** Bounded H-033 labels, so a long configured provider or path cannot fail the event. */
+function providerAttemptLabels(labels: ProviderAttemptLabels): Record<string, string> {
+  const provider = labels.provider?.trim().slice(0, 128);
+  const route = labels.route?.trim().slice(0, 256);
+  return {
+    ...(labels.attemptId && PROVIDER_ATTEMPT_ID_PATTERN.test(labels.attemptId) ? { attemptId: labels.attemptId } : {}),
+    ...(labels.retryLayer ? { retryLayer: labels.retryLayer } : {}),
+    ...(labels.transport ? { transport: labels.transport } : {}),
+    ...(provider ? { provider } : {}),
+    ...(route ? { route } : {}),
+  };
+}
+
+/**
+ * The layer behind the first request of a model or compaction step: the
+ * runner's retry once the step has run before, else the step's own reason.
+ */
+function runnerAttemptLayer(step: DurableTurnStep): ProviderAttemptRetryLayer {
+  if (step.attempt > 0) return "runner_retry";
+  return record(step.input)?.recoveryReason === "empty_response" ? "empty_response_recovery" : "initial";
+}
+
+/**
+ * Completes a transport report for the runner (H-033). Every attempt keeps a
+ * unique ID, and a request the transport made first is credited to the
+ * runner layer that caused it. Fallback layers are kept as reported.
+ */
+function attributeRunnerAttempt(
+  report: ProviderAttemptReport,
+  layer: ProviderAttemptRetryLayer,
+): ProviderAttemptReport {
+  return {
+    ...report,
+    attemptId: report.attemptId && PROVIDER_ATTEMPT_ID_PATTERN.test(report.attemptId) ? report.attemptId : randomUUID(),
+    retryLayer: !report.retryLayer || report.retryLayer === "initial" ? layer : report.retryLayer,
+  };
+}
+
+/**
+ * Labels for a model request no transport reported (the Responses and
+ * Anthropic adapters do not report attempts), so its event is still unique.
+ */
+function unreportedProviderAttempt(
+  snapshot: DurableTurnSnapshot,
+  layer: ProviderAttemptRetryLayer,
+): ProviderAttemptLabels {
+  const provider = record(snapshot.runtimeRequest.provider);
+  const providerId = stringValue(provider?.id) ?? stringValue(snapshot.runtimeRequest.providerId);
+  const apiType = stringValue(provider?.apiType) ?? "openai-chat-completions";
+  const route = stringValue(provider?.endpointPath)?.split("?")[0] || apiType;
+  return {
+    attemptId: randomUUID(),
+    retryLayer: layer,
+    ...(provider ? {
+      transport: apiType === "openai-chat-completions" && provider.completionTransport === "buffered" ? "buffer" : "stream",
+      route,
+    } as const : {}),
+    ...(providerId ? { provider: providerId } : {}),
+  };
 }
 
 function retryableProviderDiagnostics(

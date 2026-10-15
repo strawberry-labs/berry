@@ -251,7 +251,11 @@ export class FallbackChatCompletionClient implements ChatCompletionStreamClient 
       if (emitted || options.signal?.aborted || !classifyProviderFailure(error).retryable) throw error;
       options.onProviderAttemptDecision?.(primaryAttempt, "fallback");
     }
-    yield* this.fallback.stream({ ...options, providerAttemptOrdinal: primaryAttempt + 1 });
+    yield* this.fallback.stream({
+      ...options,
+      providerAttemptOrdinal: primaryAttempt + 1,
+      providerAttemptLayer: "transport_retry",
+    });
   }
 }
 
@@ -289,7 +293,13 @@ export class ContentFallbackChatCompletionClient implements ChatCompletionStream
       if (emittedContent || options.signal?.aborted || !classifyProviderFailure(error).retryable) throw error;
       options.onProviderAttemptDecision?.(primaryAttempt, "fallback");
     }
-    yield* this.fallback.stream({ ...options, providerAttemptOrdinal: primaryAttempt + 1 });
+    // Same route, buffered: the attempt names this layer so it is not mistaken
+    // for a provider or route fallback (H-033).
+    yield* this.fallback.stream({
+      ...options,
+      providerAttemptOrdinal: primaryAttempt + 1,
+      providerAttemptLayer: "stream_buffer_fallback",
+    });
   }
 }
 

@@ -2395,6 +2395,8 @@ export const AgentStreamEventSchema = z.discriminatedUnion("kind", [
     cacheMissComponentId: z.string().optional(),
     routerRequestId: z.string().optional(),
     providerResponseId: z.string().optional(),
+    /** The provider.attempt whose response carried this usage (H-033). */
+    providerAttemptId: z.string().uuid().optional(),
     model: z.string().optional(),
     requestedModel: z.string().optional(),
     servedProvider: z.string().optional(),

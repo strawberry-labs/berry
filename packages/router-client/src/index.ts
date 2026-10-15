@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ProviderAttemptError,
   classifyProviderFailure,
@@ -7,6 +8,8 @@ import {
   type ProviderAttemptDecision,
   type ProviderAttemptErrorDetails,
   type ProviderAttemptReport,
+  type ProviderAttemptRetryLayer,
+  type ProviderAttemptTransport,
   type ProviderAuthType,
   type RemoteModel,
   type RouterAccount,
@@ -122,6 +125,8 @@ export interface ResponsesCompactionResult {
  * working with bearer-auth Chat Completions defaults.
  */
 export interface ProviderTransportInfo {
+  /** Configured provider ID; provider attempts fall back to `kind` without it. */
+  id?: string;
   baseUrl: string;
   defaultModel: string;
   /** Provider kind; kept as a plain string at the transport layer. */
@@ -141,6 +146,22 @@ export interface RouterClientOptions {
   appName?: string;
   referer?: string;
   fetchImpl?: typeof fetch;
+}
+
+/**
+ * Conventional client-supplied request ID header. OpenAI logs it for support
+ * correlation; other providers ignore unknown headers. It is a header only,
+ * never prompt content, so it cannot change a cached prompt prefix.
+ */
+export const PROVIDER_ATTEMPT_ID_HEADER = "X-Client-Request-Id";
+
+export interface ChatCompletionsClientOptions extends RouterClientOptions {
+  /**
+   * Sends each physical request's attempt ID in this header so router and
+   * provider logs can be joined to provider.attempt events (H-033). Unset
+   * sends no header.
+   */
+  attemptIdHeader?: string;
 }
 
 export interface BerryRouterAccountClientOptions extends RouterClientOptions {
@@ -174,6 +195,8 @@ export interface ChatCompletionOptions {
   /** Fallback wrappers annotate the already-reported physical attempt. */
   onProviderAttemptDecision?: (physicalAttempt: number, decision: ProviderAttemptDecision) => void;
   providerAttemptOrdinal?: number;
+  /** The retry or fallback layer issuing this request; defaults to `initial`. */
+  providerAttemptLayer?: ProviderAttemptRetryLayer;
 }
 
 export interface ImageGenerationOptions {
@@ -585,20 +608,21 @@ export class OpenAIChatCompletionsClient {
   readonly #appName: string;
   readonly #referer: string | undefined;
   readonly #fetch: typeof fetch;
+  readonly #attemptIdHeader: string | undefined;
 
-  constructor(options: RouterClientOptions) {
+  constructor(options: ChatCompletionsClientOptions) {
     this.#provider = options.provider;
     this.#apiKey = options.apiKey;
     this.#appName = options.appName ?? "Berry Desktop";
     this.#referer = options.referer;
     this.#fetch = options.fetchImpl ?? fetch;
+    this.#attemptIdHeader = options.attemptIdHeader?.trim() || undefined;
   }
 
   async complete(options: ChatCompletionOptions): Promise<ChatCompletionResult> {
-    const startedAt = Date.now();
-    const physicalAttempt = Math.max(1, Math.floor(options.providerAttemptOrdinal ?? 1));
+    const attempt = this.#beginAttempt(options, "buffer");
     try {
-      const response = await this.#post({ ...options, stream: false });
+      const response = await this.#post({ ...options, stream: false }, attempt.labels.attemptId);
       const payload = (await response.json()) as OpenAICompletionResponse;
       const choice = payload.choices[0];
       if (!choice) {
@@ -637,13 +661,14 @@ export class OpenAIChatCompletionsClient {
       const attribution = routerAttribution(this.#provider, options.model ?? this.#provider.defaultModel, response.headers, payload as unknown as Record<string, unknown>);
       if (attribution) result.attribution = attribution;
       reportProviderAttempt(options, {
-        physicalAttempt,
+        ...attempt.labels,
+        physicalAttempt: attempt.ordinal,
         model,
         status: response.status,
         statusClass: providerAttemptStatusClass(response.status),
         category: "success",
         retryDecision: "none",
-        latencyMs: Math.max(0, Date.now() - startedAt),
+        latencyMs: Math.max(0, Date.now() - attempt.startedAt),
         ...(finalUsage ? {
           inputTokens: finalUsage.inputTokens,
           outputTokens: finalUsage.outputTokens,
@@ -654,14 +679,13 @@ export class OpenAIChatCompletionsClient {
       });
       return result;
     } catch (error) {
-      reportProviderFailure(options, error, startedAt, physicalAttempt);
+      reportProviderFailure(options, error, attempt);
       throw error;
     }
   }
 
   async *stream(options: ChatCompletionOptions): AsyncGenerator<ChatCompletionChunk> {
-    const startedAt = Date.now();
-    const physicalAttempt = Math.max(1, Math.floor(options.providerAttemptOrdinal ?? 1));
+    const attempt = this.#beginAttempt(options, "stream");
     const requestedModel = options.model ?? this.#provider.defaultModel;
     let response: Response | undefined;
     let requestId: string | undefined;
@@ -670,8 +694,9 @@ export class OpenAIChatCompletionsClient {
     let lastFinishReason: string | null = null;
     let lastModel = requestedModel;
     let lastChunk: ChatCompletionChunk | undefined;
+    let reported = false;
     try {
-      response = await this.#post({ ...options, stream: true });
+      response = await this.#post({ ...options, stream: true }, attempt.labels.attemptId);
       requestId = requestIdHeader(response.headers);
       headerUsage = normalizeUsageHeaders(response.headers);
       const taggedContentParser = usesThinkTaggedReasoning(requestedModel) ? new ThinkTaggedContentParser() : undefined;
@@ -736,6 +761,26 @@ export class OpenAIChatCompletionsClient {
         lastChunk = chunk;
         yield chunk;
       }
+      // The provider stream has ended; the trailing chunk below is local
+      // parser state, so the request is complete even if nobody reads it.
+      reported = true;
+      reportProviderAttempt(options, {
+        ...attempt.labels,
+        physicalAttempt: attempt.ordinal,
+        model: lastModel,
+        status: response.status,
+        statusClass: providerAttemptStatusClass(response.status),
+        category: "success",
+        retryDecision: "none",
+        latencyMs: Math.max(0, Date.now() - attempt.startedAt),
+        ...(lastUsage ? {
+          inputTokens: lastUsage.inputTokens,
+          outputTokens: lastUsage.outputTokens,
+          cacheReadTokens: lastUsage.cacheReadTokens ?? 0,
+          cacheWriteTokens: lastUsage.cacheWriteTokens ?? 0,
+        } : {}),
+        finishReason: lastFinishReason,
+      });
       const trailingContent = taggedContentParser?.finish();
       if (lastChunk && trailingContent && (trailingContent.text.length > 0 || trailingContent.reasoning.length > 0)) {
         yield {
@@ -748,23 +793,8 @@ export class OpenAIChatCompletionsClient {
           raw: lastChunk.raw,
         };
       }
-      reportProviderAttempt(options, {
-        physicalAttempt,
-        model: lastModel,
-        status: response.status,
-        statusClass: providerAttemptStatusClass(response.status),
-        category: "success",
-        retryDecision: "none",
-        latencyMs: Math.max(0, Date.now() - startedAt),
-        ...(lastUsage ? {
-          inputTokens: lastUsage.inputTokens,
-          outputTokens: lastUsage.outputTokens,
-          cacheReadTokens: lastUsage.cacheReadTokens ?? 0,
-          cacheWriteTokens: lastUsage.cacheWriteTokens ?? 0,
-        } : {}),
-        finishReason: lastFinishReason,
-      });
     } catch (error) {
+      reported = true;
       const finalError = error instanceof RouterClientError || options.signal?.aborted
         ? error
         : new RouterClientError(
@@ -778,9 +808,46 @@ export class OpenAIChatCompletionsClient {
               ...(requestId ? { requestId } : {}),
             },
           );
-      reportProviderFailure(options, finalError, startedAt, physicalAttempt, response?.status);
+      reportProviderFailure(options, finalError, attempt, response?.status);
       throw finalError;
+    } finally {
+      if (!reported) {
+        // The consumer stopped reading before the provider stream ended, so
+        // the request was abandoned rather than failed. Report it once so
+        // its attempt ID is not lost (H-033).
+        reportProviderAttempt(options, {
+          ...attempt.labels,
+          physicalAttempt: attempt.ordinal,
+          model: lastModel,
+          ...(response ? { status: response.status } : {}),
+          statusClass: providerAttemptStatusClass(response?.status),
+          category: "aborted",
+          retryDecision: "cancelled",
+          latencyMs: Math.max(0, Date.now() - attempt.startedAt),
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          finishReason: null,
+        });
+      }
     }
+  }
+
+  #beginAttempt(options: ChatCompletionOptions, transport: ProviderAttemptTransport): PhysicalAttempt {
+    return {
+      ordinal: Math.max(1, Math.floor(options.providerAttemptOrdinal ?? 1)),
+      startedAt: Date.now(),
+      labels: {
+        attemptId: randomUUID(),
+        retryLayer: options.providerAttemptLayer ?? "initial",
+        transport,
+        provider: boundedLabel(this.#provider.id, 128) ?? boundedLabel(this.#provider.kind, 128) ?? "unknown",
+        // Berry's route label (as in prompt-cache planning): the configured
+        // path without its query, or the API type for the default path.
+        route: boundedLabel(this.#provider.endpointPath?.split("?")[0], 256) ?? "openai-chat-completions",
+      },
+    };
   }
 
   /** Fetches the provider's model list (`GET {baseUrl}{modelsPath ?? "/models"}`). */
@@ -793,7 +860,7 @@ export class OpenAIChatCompletionsClient {
     });
   }
 
-  async #post(options: ChatCompletionOptions & { stream: boolean }): Promise<Response> {
+  async #post(options: ChatCompletionOptions & { stream: boolean }, attemptId: string): Promise<Response> {
     const url = requestUrl(this.#provider, this.#provider.endpointPath ?? "/chat/completions");
     const model = options.model ?? this.#provider.defaultModel;
     const usesKimiThinking = usesKimiThinkingShape(model);
@@ -819,13 +886,15 @@ export class OpenAIChatCompletionsClient {
       body.tools = options.tools;
       if (options.toolChoice) body.tool_choice = options.toolChoice;
     }
+    const headers = buildHeaders(this.#provider, this.#apiKey, {
+      appName: this.#appName,
+      ...(this.#referer ? { referer: this.#referer } : {}),
+      ...(options.metadata ? { metadata: options.metadata } : {}),
+    });
+    if (this.#attemptIdHeader) headers.set(this.#attemptIdHeader, attemptId);
     const init: RequestInit = {
       method: "POST",
-      headers: buildHeaders(this.#provider, this.#apiKey, {
-        appName: this.#appName,
-        ...(this.#referer ? { referer: this.#referer } : {}),
-        ...(options.metadata ? { metadata: options.metadata } : {}),
-      }),
+      headers,
       body: JSON.stringify(body),
     };
     if (options.signal) init.signal = options.signal;
@@ -835,6 +904,13 @@ export class OpenAIChatCompletionsClient {
     }
     return response;
   }
+}
+
+/** One physical HTTP request: its ordinal, start time, and per-request labels. */
+interface PhysicalAttempt {
+  ordinal: number;
+  startedAt: number;
+  labels: Required<Pick<ProviderAttemptReport, "attemptId" | "retryLayer" | "transport" | "provider" | "route">>;
 }
 
 function reportProviderAttempt(options: ChatCompletionOptions, report: ProviderAttemptReport): void {
@@ -849,15 +925,15 @@ function reportProviderAttempt(options: ChatCompletionOptions, report: ProviderA
 function reportProviderFailure(
   options: ChatCompletionOptions,
   error: unknown,
-  startedAt: number,
-  physicalAttempt: number,
+  attempt: PhysicalAttempt,
   responseStatus?: number,
 ): void {
   const classification = classifyProviderFailure(error);
   const status = classification.status ?? responseStatus;
   const category = options.signal?.aborted ? "aborted" : classification.category;
   reportProviderAttempt(options, {
-    physicalAttempt,
+    ...attempt.labels,
+    physicalAttempt: attempt.ordinal,
     model: options.model ?? "unknown",
     ...(status === undefined ? {} : { status }),
     statusClass: providerAttemptStatusClass(status, error),
@@ -865,13 +941,18 @@ function reportProviderFailure(
     retryDecision: category === "aborted"
       ? "cancelled"
       : classification.retryable ? "retry" : "terminal",
-    latencyMs: Math.max(0, Date.now() - startedAt),
+    latencyMs: Math.max(0, Date.now() - attempt.startedAt),
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     finishReason: null,
   });
+}
+
+function boundedLabel(value: string | undefined, maximum: number): string | undefined {
+  const normalized = value?.trim().slice(0, maximum);
+  return normalized || undefined;
 }
 
 /** Native Ollama `/api/chat` transport used when its OpenAI-compatible stream is unavailable or malformed. */

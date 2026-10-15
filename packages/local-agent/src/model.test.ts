@@ -1,4 +1,5 @@
 import { OpenRouterCompatibleClient, RouterClientError } from "@berry/router-client";
+import type { ProviderAttemptReport } from "@berry/shared";
 import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { BerryModelAdapter, BufferedChatCompletionClient, ContentFallbackChatCompletionClient, contextForModelCapabilities, contextToChatMessages, createBerryModel, createBerryModels } from "./model.ts";
@@ -129,6 +130,42 @@ describe("BerryModelAdapter", () => {
     expect(completed).toBe(1);
     expect(chunks).toHaveLength(1);
     expect(chunks[0]?.delta).toBe("recovered");
+  });
+
+  it("labels a same-route buffered fallback apart from the stream it replaced (H-033)", async () => {
+    const compatible = new OpenRouterCompatibleClient({
+      provider: { ...provider, endpointPath: "/chat/completions" },
+      apiKey: "secret-key",
+      fetchImpl: async (_url, init) => {
+        if ((JSON.parse(String(init?.body)) as { stream?: boolean }).stream) {
+          return new Response(JSON.stringify({ error: { message: "upstream stalled" } }), { status: 504 });
+        }
+        return new Response(JSON.stringify({
+          id: "buffered",
+          model: "test-model",
+          choices: [{ message: { content: "recovered" }, finish_reason: "stop" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    });
+    const client = new ContentFallbackChatCompletionClient(compatible, new BufferedChatCompletionClient(compatible));
+    const reports: ProviderAttemptReport[] = [];
+    const decisions: Array<[number, string]> = [];
+
+    for await (const _chunk of client.stream({
+      messages: [{ role: "user", content: "hello" }],
+      onProviderAttempt: (report) => reports.push(report),
+      onProviderAttemptDecision: (attempt, decision) => decisions.push([attempt, decision]),
+    })) {
+      // Consume the recovered response.
+    }
+
+    expect(reports.map((report) => [report.physicalAttempt, report.transport, report.retryLayer, report.category]))
+      .toEqual([[1, "stream", "initial", "server"], [2, "buffer", "stream_buffer_fallback", "success"]]);
+    expect(decisions).toEqual([[1, "fallback"]]);
+    expect(reports[0]?.route).toBe("/chat/completions");
+    expect(reports[1]?.route).toBe(reports[0]?.route);
+    expect(reports[1]?.provider).toBe("provider_test");
+    expect(reports[1]?.attemptId).not.toBe(reports[0]?.attemptId);
   });
 
   it("does not replay a buffered completion after streaming emitted a partial chunk", async () => {

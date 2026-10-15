@@ -48,6 +48,8 @@ const SAFE_FIELDS = new Set([
   "statusClass",
   "category",
   "retryDecision",
+  "retryLayer",
+  "transport",
   "inputTokens",
   "outputTokens",
   "cacheReadTokens",
@@ -87,7 +89,9 @@ const SAFE_FIELDS = new Set([
 // made every production run report an unknown revision.
 const SOURCE_REVISION_PATTERN = /^[A-Za-z0-9._/+-]+$/;
 
-const DURABLE_REFERENCE_FIELDS = new Set(["runId", "stepId", "outboxId"]);
+// `attemptId` is the Berry-generated ID of one physical provider request, as
+// recorded on its provider.attempt event; provider request IDs stay excluded.
+const DURABLE_REFERENCE_FIELDS = new Set(["runId", "stepId", "outboxId", "attemptId"]);
 
 export type OperationalScalar = string | number | boolean | null;
 

@@ -5,8 +5,10 @@ import {
   type JsonValue,
   type MemoryOperation,
   type MemoryScope,
+  type ProviderAttemptReport,
+  type ProviderAttemptRetryLayer,
 } from "@berry/shared";
-import { OpenAIChatCompletionsClient } from "@berry/router-client";
+import { OpenAIChatCompletionsClient, PROVIDER_ATTEMPT_ID_HEADER } from "@berry/router-client";
 import { z } from "zod";
 import type { MemoryExtractJobPayload } from "../jobs.js";
 import { classifyProviderFailure } from "../provider-retry.js";
@@ -78,21 +80,27 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
         role: "user" as const,
         content: `The previous structured output failed validation: ${parsed.error.issues.map((issue) => issue.message).join("; ")}. Return one corrected memory_operations tool call only.`,
       },
-    ]);
+    ], "other");
     const repairedParsed = parseEnvelope(repaired);
     return repairedParsed.success
       ? repairedParsed.data.operations.filter((operation) => allowedScopes.has(operation.scope))
       : [];
   }
 
-  private async complete(messages: Array<{ role: "system" | "user"; content: string }>) {
+  private async complete(
+    messages: Array<{ role: "system" | "user"; content: string }>,
+    attemptLayer: ProviderAttemptRetryLayer = "initial",
+  ) {
     const startedAt = this.now();
+    let attempt: ProviderAttemptReport | undefined;
     try {
       const result = await this.client.complete({
         model: this.model,
         messages,
         temperature: 0,
         maxTokens: 2_000,
+        providerAttemptLayer: attemptLayer,
+        onProviderAttempt: (report) => { attempt = report; },
         tools: [{
           type: "function",
           function: {
@@ -129,6 +137,9 @@ export class RouterMemoryOperationGenerator implements MemoryOperationGenerator 
         category: failure.category,
         durationMs: latencyMs,
         retryDecision: "not_retryable",
+        attemptId: attempt?.attemptId,
+        retryLayer: attempt?.retryLayer,
+        transport: attempt?.transport,
       });
       throw error;
     }
@@ -149,6 +160,7 @@ export function createMemoryOperationGenerator(env: NodeJS.ProcessEnv): MemoryOp
       apiType: "openai-chat-completions",
     },
     apiKey,
+    attemptIdHeader: PROVIDER_ATTEMPT_ID_HEADER,
   });
   return new RouterMemoryOperationGenerator(client, model);
 }

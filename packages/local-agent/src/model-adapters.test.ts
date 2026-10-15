@@ -1,5 +1,5 @@
 import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
-import { BERRY_ROUTER_METADATA_KEY, RouterClientError } from "@berry/router-client";
+import { BERRY_ROUTER_METADATA_KEY, RouterClientError, type ChatCompletionOptions } from "@berry/router-client";
 import { describe, expect, it } from "vitest";
 import {
   AnthropicMessagesAdapter,
@@ -349,8 +349,10 @@ describe("Ollama adapter", () => {
         throw new Error("malformed compatibility stream");
       },
     };
+    const fallbackOptions: ChatCompletionOptions[] = [];
     const fallback = {
-      async *stream() {
+      async *stream(options: ChatCompletionOptions) {
+        fallbackOptions.push(options);
         yield { id: "native", model: "qwen3:8b", delta: "native", finishReason: "stop", raw: {} };
       },
     };
@@ -358,6 +360,10 @@ describe("Ollama adapter", () => {
     const chunks = [];
     for await (const chunk of client.stream({ messages: [{ role: "user", content: "hi" }] })) chunks.push(chunk);
     expect(chunks.map((chunk) => chunk.delta)).toEqual(["native"]);
+    expect(fallbackOptions).toEqual([expect.objectContaining({
+      providerAttemptOrdinal: 2,
+      providerAttemptLayer: "transport_retry",
+    })]);
   });
 
   it("omits tools for a model whose native capabilities reject tool calling", async () => {

@@ -4722,6 +4722,185 @@ describe("durable turn runner", () => {
     }
   });
 
+  describe("provider attempt identity (H-033)", () => {
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const attemptEvents = (events: readonly AgentStreamEvent[]) =>
+      events.filter((event): event is Extract<AgentStreamEvent, { kind: "provider.attempt" }> => event.kind === "provider.attempt");
+
+    it("identifies every physical request across a buffered fallback and a runner retry", async () => {
+      const current = providerSnapshot("openai-chat-completions");
+      (current.runtimeRequest.provider as Record<string, unknown>).completionFallback = "buffered";
+      const modelStepId = current.steps.find((step) => step.type === "model.call")!.id;
+      const sentAttemptIds: Array<string | null> = [];
+      const responses = [
+        () => new Response(JSON.stringify({ error: { message: "stream lane stalled" } }), { status: 504 }),
+        () => new Response(JSON.stringify({ error: { message: "buffered lane unavailable" } }), { status: 503 }),
+        () => new Response([
+          `data: ${JSON.stringify({ id: "completion-1", model: "test-model", choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}`,
+          `data: ${JSON.stringify({ id: "completion-1", model: "test-model", choices: [], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } })}`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      ];
+      vi.stubGlobal("fetch", vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        sentAttemptIds.push(new Headers(init?.headers).get("x-client-request-id"));
+        return responses[sentAttemptIds.length - 1]!();
+      }) as typeof fetch);
+      const repository = new FakeTurnRepository(current);
+      const runner = new DurableTurnRunner(repository, new SnapshotProviderDurableTurnModel({}, null), noTools(), {
+        owner: "worker-attempt-identity",
+      });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .rejects.toBeInstanceOf(DurableTurnRetryableError);
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "finalizing" });
+
+      const attempts = attemptEvents(repository.events);
+      expect(attempts.map((attempt) => [attempt.physicalAttempt, attempt.transport, attempt.retryLayer, attempt.category, attempt.retryDecision]))
+        .toEqual([
+          [1, "stream", "initial", "server", "fallback"],
+          [2, "buffer", "stream_buffer_fallback", "server", "retry"],
+          [1, "stream", "runner_retry", "success", "none"],
+        ]);
+      // One logical model step throughout: its ordinal repeats, the attempt ID does not.
+      expect(new Set(attempts.map((attempt) => attempt.logicalStepId))).toEqual(new Set([modelStepId]));
+      expect(new Set(attempts.map((attempt) => attempt.attemptId)).size).toBe(3);
+      for (const attempt of attempts) {
+        expect(attempt.attemptId).toMatch(uuidV4);
+        expect(attempt).toMatchObject({ provider: "provider-openai-chat-completions", route: "/chat/completions" });
+      }
+      expect(sentAttemptIds).toEqual(attempts.map((attempt) => attempt.attemptId));
+      expect(repository.events.filter((event) => event.kind === "usage")).toEqual([
+        expect.objectContaining({ inputTokens: 5, outputTokens: 1, providerAttemptId: attempts[2]!.attemptId }),
+      ]);
+    });
+
+    it("credits the empty-response recovery request and fills an ID the transport did not send", async () => {
+      const repository = new FakeTurnRepository(snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]));
+      const runner = new DurableTurnRunner(repository, {
+        call: async (_snapshot, step, context) => {
+          const recovering = step.input.recoveryReason === "empty_response";
+          context.onProviderAttempt?.({
+            physicalAttempt: 1,
+            model: "provider/model",
+            status: 200,
+            statusClass: "2xx",
+            category: "success",
+            retryDecision: "none",
+            latencyMs: 5,
+            retryLayer: "initial",
+            transport: "stream",
+          });
+          if (recovering) await context.emitDelta("Done.", "text");
+          return { text: recovering ? "Done." : "", inputTokens: 1, outputTokens: 1, toolCalls: [] };
+        },
+      }, noTools(), { owner: "worker-empty-recovery-identity" });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "finalizing" });
+
+      const modelSteps = repository.current.steps.filter((step) => step.type === "model.call");
+      const attempts = attemptEvents(repository.events);
+      expect(attempts.map((attempt) => [attempt.logicalStepId, attempt.retryLayer, attempt.transport])).toEqual([
+        [modelSteps[0]!.id, "initial", "stream"],
+        [modelSteps[1]!.id, "empty_response_recovery", "stream"],
+      ]);
+      expect(attempts[0]!.attemptId).toMatch(uuidV4);
+      expect(attempts[1]!.attemptId).toMatch(uuidV4);
+      expect(attempts[1]!.attemptId).not.toBe(attempts[0]!.attemptId);
+    });
+
+    it("gives a request no transport reported a unique ID in its event and failure log", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(
+        JSON.stringify({ error: { message: "temporarily unavailable" } }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      )) as typeof fetch);
+      const logs = vi.spyOn(console, "info").mockImplementation(() => undefined);
+      const repository = new FakeTurnRepository(providerSnapshot("openai-responses"));
+      const runner = new DurableTurnRunner(repository, new SnapshotProviderDurableTurnModel({}, null), noTools(), {
+        owner: "worker-unreported-attempt",
+      });
+
+      try {
+        await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+          .rejects.toBeInstanceOf(DurableTurnRetryableError);
+        const attempts = attemptEvents(repository.events);
+        expect(attempts).toEqual([expect.objectContaining({
+          attemptId: expect.stringMatching(uuidV4),
+          retryLayer: "initial",
+          transport: "stream",
+          provider: "provider-openai-responses",
+          route: "/responses",
+          category: "server",
+        })]);
+        const failureLog = logs.mock.calls
+          .map(([line]) => String(line))
+          .filter((line) => line.startsWith("{"))
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .find((entry) => entry.event === "berry.provider.attempt");
+        expect(failureLog).toMatchObject({ attemptId: attempts[0]!.attemptId, retryLayer: "initial", transport: "stream" });
+      } finally {
+        logs.mockRestore();
+      }
+    });
+
+    it("keeps compaction attempt IDs and credits a retried compaction to the runner", async () => {
+      const compactStep: DurableTurnStep = {
+        id: randomUUID(),
+        sequence: 2,
+        type: "session.compact",
+        state: "pending",
+        input: { reason: "token-threshold" },
+        output: null,
+        retryClass: "idempotent_with_key",
+        idempotencyKey: `${runId}:compact:entry`,
+        attempt: 1,
+        error: null,
+      };
+      const repository = new FakeTurnRepository(snapshot("compacting", [admittedStep(), modelStep("pending", 1), compactStep]));
+      const firstAttemptId = randomUUID();
+      const repairAttemptId = randomUUID();
+      const report = {
+        model: "checkpoint-model",
+        status: 200,
+        statusClass: "2xx",
+        category: "success",
+        retryDecision: "none",
+        latencyMs: 5,
+        transport: "buffer",
+        provider: "router",
+        route: "/chat/completions",
+      } as const;
+      const runner = new DurableTurnRunner(repository, unusedModel(), noTools(), {
+        owner: "worker-compaction-identity",
+        compactor: {
+          compactSession: async () => ({
+            sessionId: repository.current.sessionId,
+            summary: "Checkpointed.",
+            tokensBefore: 2_000,
+            tokensAfter: 100,
+            providerAttempts: [
+              { ...report, physicalAttempt: 1, attemptId: firstAttemptId, retryLayer: "initial" },
+              { ...report, physicalAttempt: 2, attemptId: repairAttemptId, retryLayer: "other" },
+            ],
+          }),
+        },
+      });
+
+      await expect(runner.execute({ tenantId, runId, reason: "continue" }))
+        .resolves.toMatchObject({ state: "calling_model" });
+
+      expect(attemptEvents(repository.events).map((attempt) => [attempt.logicalStepId, attempt.attemptId, attempt.retryLayer]))
+        .toEqual([
+          [compactStep.id, firstAttemptId, "runner_retry"],
+          [compactStep.id, repairAttemptId, "other"],
+        ]);
+    });
+  });
+
   it("persists and replays reasoning plus provider continuation metadata with tool calls", async () => {
     const repository = new FakeTurnRepository(snapshot("calling_model", [
       admittedStep(),
@@ -5470,7 +5649,7 @@ function snapshot(state: TurnRunState, steps: DurableTurnStep[]): MutableSnapsho
   };
 }
 
-function providerSnapshot(apiType: "openai-responses" | "anthropic-messages"): MutableSnapshot {
+function providerSnapshot(apiType: "openai-responses" | "anthropic-messages" | "openai-chat-completions"): MutableSnapshot {
   const current = snapshot("calling_model", [admittedStep(), modelStep("pending", 1)]);
   current.runtimeRequest = {
     capabilityVersion: 1,
@@ -5483,7 +5662,7 @@ function providerSnapshot(apiType: "openai-responses" | "anthropic-messages"): M
       baseUrl: "https://provider.example.test/v1",
       defaultModel: "test-model",
       apiType,
-      endpointPath: apiType === "openai-responses" ? "/responses" : "/messages",
+      endpointPath: apiType === "openai-responses" ? "/responses" : apiType === "anthropic-messages" ? "/messages" : "/chat/completions",
       authType: "none",
       models: [],
     },

@@ -27,6 +27,20 @@ describe("operational telemetry", () => {
     expect(safeOperationalLog("run.claim", fields)).not.toHaveProperty("requestId");
   });
 
+  it("keeps a provider attempt's ID, retry layer and transport but not its route (H-033)", () => {
+    expect(safeOperationalFields({
+      attemptId: "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+      retryLayer: "runner_retry",
+      transport: "stream",
+      route: "/v1/projects/private/chat/completions",
+      requestId: "provider-request",
+    })).toEqual({
+      attemptId: "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+      retryLayer: "runner_retry",
+      transport: "stream",
+    });
+  });
+
   it("normalizes revisions and exposes bounded rotation policy defaults", () => {
     expect(sourceRevisionFromEnv({ BERRY_BUILD_REVISION: "release/2026.08" })).toBe("release/2026.08");
     expect(sourceRevisionFromEnv({ BERRY_BUILD_REVISION: "hostname with spaces" })).toBe("unknown");
