@@ -22,6 +22,7 @@ import {
 } from "@berry/sandbox-contract";
 import {
   artifactDisplayName,
+  detectArtifactMediaType,
   isAutoPublishableArtifact,
   resolveArtifactMediaType,
 } from "@berry/local-agent";
@@ -453,11 +454,80 @@ const createDecoder = (encoding) => {
     end: () => (width === 2 ? utf16.end() : "") + (pending.length > 0 ? "�" : ""),
   };
 };
+// Legacy Office files are OLE2 compound files whatever their name says; the
+// streams in the root storage tell Word, Excel and PowerPoint apart (H-011).
+const ole2MediaType = () => {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const header = Buffer.alloc(512);
+    if (fs.readSync(fd, header, 0, 512, 0) < 512) return null;
+    const shift = header.readUInt16LE(0x1e);
+    if (shift !== 9 && shift !== 12) return null;
+    const size = 2 ** shift;
+    const perSector = size / 4;
+    const sector = (index) => {
+      const bytes = Buffer.alloc(size);
+      return fs.readSync(fd, bytes, 0, size, (index + 1) * size) === size ? bytes : null;
+    };
+    const fatSectors = [];
+    for (let index = 0; index < 109; index += 1) fatSectors.push(header.readUInt32LE(0x4c + index * 4));
+    for (let next = header.readUInt32LE(0x44), hops = 0; next < 0xfffffffa && hops < 64; hops += 1) {
+      const bytes = sector(next);
+      if (!bytes) break;
+      for (let index = 0; index < perSector - 1; index += 1) fatSectors.push(bytes.readUInt32LE(index * 4));
+      next = bytes.readUInt32LE(size - 4);
+    }
+    const fats = new Map();
+    const following = (index) => {
+      const fat = Math.floor(index / perSector);
+      const location = fatSectors[fat];
+      if (location === undefined || location >= 0xfffffffa) return null;
+      if (!fats.has(fat)) fats.set(fat, sector(location));
+      return fats.get(fat) ? fats.get(fat).readUInt32LE((index % perSector) * 4) : null;
+    };
+    const entries = [];
+    for (let current = header.readUInt32LE(0x30), hops = 0; current !== null && current < 0xfffffffa && hops < 256; hops += 1) {
+      const bytes = sector(current);
+      if (!bytes) break;
+      for (let offset = 0; offset < size; offset += 128) {
+        const nameBytes = Math.min(64, bytes.readUInt16LE(offset + 0x40));
+        entries.push({
+          name: bytes.toString("utf16le", offset, offset + Math.max(0, nameBytes - 2)).toLowerCase(),
+          type: bytes[offset + 0x42],
+          siblings: [bytes.readUInt32LE(offset + 0x44), bytes.readUInt32LE(offset + 0x48)],
+          child: bytes.readUInt32LE(offset + 0x4c),
+        });
+      }
+      current = following(current);
+    }
+    const names = new Set();
+    const pending = entries[0] && entries[0].type === 5 ? [entries[0].child] : [];
+    const seen = new Set();
+    while (pending.length > 0) {
+      const index = pending.pop();
+      if (index >= entries.length || seen.has(index)) continue;
+      seen.add(index);
+      if (entries[index].type === 2) names.add(entries[index].name);
+      pending.push(...entries[index].siblings);
+    }
+    if (names.has("worddocument")) return "application/msword";
+    if (names.has("workbook") || names.has("book")) return "application/vnd.ms-excel";
+    if (names.has("powerpoint document")) return "application/vnd.ms-powerpoint";
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+};
 (async () => {
   let decoder = null;
   let encoding = "utf8";
   for await (const chunk of fs.createReadStream(filePath)) {
     if (!decoder) {
+      if (startsWith(chunk, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])) {
+        const mediaType = ole2MediaType();
+        process.stdout.write(JSON.stringify({ binary: true, sizeBytes: fs.statSync(filePath).size, ...(mediaType ? { mediaType } : {}) }));
+        return;
+      }
       encoding = sniffEncoding(chunk);
       if (!encoding) {
         process.stdout.write(JSON.stringify({ binary: true, sizeBytes: fs.statSync(filePath).size }));
@@ -1405,7 +1475,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
           sandbox,
         };
       }
-      if (mediaType && isExtractableOfficeMediaType(mediaType) && this.options.documentTextExtractor) {
+      const readDocumentBytes = async (): Promise<Buffer> => {
         const source = await this.provider.files.read({
           sandbox_id: sandbox.id,
           path,
@@ -1420,10 +1490,13 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (bytes.byteLength !== source.size_bytes) {
           throw new Error(`Document read was incomplete: expected ${source.size_bytes} bytes, received ${bytes.byteLength}`);
         }
+        return bytes;
+      };
+      const extractOffice = async (bytes: Buffer, officeMediaType: string, notice?: string): Promise<TurnToolResult> => {
         const content = await this.#timed(
           { tenantId: snapshot.tenantId, runId: snapshot.id, sessionId: snapshot.sessionId ?? null },
           "document.extract",
-          () => this.#extractOfficeText(snapshot.tenantId, bytes, mediaType),
+          () => this.#extractOfficeText(snapshot.tenantId, bytes, officeMediaType),
           () => ({ byteCount: bytes.byteLength }),
         );
         reportProgress?.();
@@ -1431,15 +1504,30 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         return {
           output: {
             path,
-            content: formatted.content,
-            mediaType,
+            content: notice ? `${formatted.content}\n\n[${notice}]` : formatted.content,
+            mediaType: officeMediaType,
             extractedText: true,
+            ...(officeMediaType !== mediaType ? { detectedFromContent: true } : {}),
             ...formatted.details,
             ...inputRepairDetails,
           },
           summary: `Extracted text from ${path}`,
           sandbox,
         };
+      };
+      // The extension proposes a format; the first bytes decide it (H-011).
+      let textNotice: { mediaType: string; notice: string } | null = null;
+      if (mediaType && isExtractableOfficeMediaType(mediaType) && this.options.documentTextExtractor) {
+        const bytes = await readDocumentBytes();
+        const target = officeReadTarget(bytes, mediaType);
+        if ("mediaType" in target) {
+          return extractOffice(
+            bytes,
+            target.mediaType,
+            target.mediaType === mediaType ? undefined : `Read by content: this file is ${officeFormatName(target.mediaType)}, not what its name suggests.`,
+          );
+        }
+        textNotice = target.text;
       }
       if (mediaType?.startsWith("image/")) {
         // The receipt promises pixels on the next request; a typo or a file
@@ -1449,7 +1537,7 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         if (!entry || entry.type !== "file") throw new Error(`File not found: ${path}. List its directory to find the correct path before reading again.`);
         if (entry.size_bytes === 0) throw new Error(`Image file is empty: ${path}`);
       }
-      if (mediaType) {
+      if (mediaType && !textNotice) {
         return {
           output: {
             path,
@@ -1475,13 +1563,21 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         signal,
         reportProgress,
       );
+      if (result.binary && result.mediaType && this.options.documentTextExtractor) {
+        // An OLE2 Word, Excel or PowerPoint file under another name (H-011).
+        return extractOffice(
+          await readDocumentBytes(),
+          result.mediaType,
+          `Read by content: this file is ${officeFormatName(result.mediaType)}, not what its name suggests.`,
+        );
+      }
       if (result.binary) {
         // NUL bytes that are not UTF-16 text: never pass them on (H-011).
         return {
           output: {
             path,
             binary: true,
-            mediaType: "application/octet-stream",
+            mediaType: result.mediaType ?? "application/octet-stream",
             sizeBytes: result.sizeBytes,
             content: "This file contains binary data, so it was not decoded as text. Use a document-capable skill/tool, or bash with an appropriate inspection utility (for example unzip -l for a ZIP-based package).",
             ...inputRepairDetails,
@@ -1491,7 +1587,14 @@ export class SandboxContinuityManager implements DurableTurnToolExecutor {
         };
       }
       return {
-        output: { path, content: result.content, sizeBytes: result.sizeBytes, ...result.details, ...inputRepairDetails },
+        output: {
+          path,
+          content: textNotice ? `${result.content}\n\n[${textNotice.notice}]` : result.content,
+          sizeBytes: result.sizeBytes,
+          ...result.details,
+          ...(textNotice ? { mediaType: textNotice.mediaType, declaredMediaType: mediaType } : {}),
+          ...inputRepairDetails,
+        },
         summary: `Read ${path}`,
         sandbox,
       };
@@ -3963,7 +4066,7 @@ async function readSandboxText(
   cwd: string,
   signal?: AbortSignal,
   reportProgress?: () => void,
-): Promise<{ content: string; details: Record<string, JsonValue>; sizeBytes: number; binary?: true }> {
+): Promise<{ content: string; details: Record<string, JsonValue>; sizeBytes: number; binary?: true; mediaType?: string }> {
   const offset = numberValue(args.offset) ?? 1;
   const limit = numberValue(args.limit) ?? 0;
   const result = await sandboxCommandOutput(provider, sandboxId, requestId, [
@@ -3985,7 +4088,14 @@ async function readSandboxText(
   }
   const sizeBytes = numberValue(parsed.sizeBytes);
   if (parsed.binary === true && sizeBytes !== null && Number.isSafeInteger(sizeBytes) && sizeBytes >= 0) {
-    return { content: "", details: {}, sizeBytes, binary: true };
+    const mediaType = stringValue(parsed.mediaType);
+    return {
+      content: "",
+      details: {},
+      sizeBytes,
+      binary: true,
+      ...(mediaType && LEGACY_OFFICE_MEDIA_TYPES.has(mediaType) ? { mediaType } : {}),
+    };
   }
   const content = stringValue(parsed.content, true);
   if (content === null || sizeBytes === null || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0) {
@@ -5464,12 +5574,21 @@ function binaryMediaType(path: string): string | null {
     doc: "application/msword",
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     xls: "application/vnd.ms-excel",
+    // Legacy templates and slideshows are the same OLE2 formats.
+    xlt: "application/vnd.ms-excel",
+    dot: "application/msword",
+    pot: "application/vnd.ms-powerpoint",
+    pps: "application/vnd.ms-powerpoint",
     xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
     ppt: "application/vnd.ms-powerpoint",
     pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     // Office macro/template/slideshow variants share the same packages.
     docm: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    dotm: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xltm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+    potm: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ppsm: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     dotx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     xltx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     pptm: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -5487,6 +5606,81 @@ function binaryMediaType(path: string): string | null {
     mp4: "video/mp4",
     mov: "video/quicktime",
   } as Record<string, string>)[extension] ?? null;
+}
+
+const LEGACY_OFFICE_MEDIA_TYPES = new Set([
+  "application/msword",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-powerpoint",
+]);
+const OLE2_SIGNATURE = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+
+/**
+ * What a file named as an Office document holds, judged by its first bytes
+ * (H-011). Legacy formats are OLE2 compound files and the others ZIP
+ * packages; a matching container keeps the extension's type. A ZIP package
+ * under a legacy name is read as the package it is. Text under an Office name
+ * (HTML, XML Spreadsheet 2003, CSV: common "Excel exports") is read as text.
+ * Anything else keeps the extension's type, as before.
+ */
+export function officeReadTarget(
+  bytes: Buffer,
+  declared: string,
+): { mediaType: string } | { text: { mediaType: string; notice: string } } {
+  const ole2 = bytes.subarray(0, 8).equals(OLE2_SIGNATURE);
+  const zip = bytes[0] === 0x50 && bytes[1] === 0x4b && [3, 5, 7].includes(bytes[2] ?? 0);
+  if (LEGACY_OFFICE_MEDIA_TYPES.has(declared) ? ole2 : zip) return { mediaType: declared };
+  if (zip) {
+    const detected = detectArtifactMediaType(bytes) ?? "";
+    const packaged = detected.startsWith("application/vnd.ms-word")
+      ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      : detected.startsWith("application/vnd.ms-powerpoint")
+        ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        : detected;
+    return { mediaType: isExtractableOfficeMediaType(packaged) ? packaged : declared };
+  }
+  if (ole2 || bytes.subarray(0, 5).toString("latin1") === "%PDF-" || !looksLikeText(bytes)) return { mediaType: declared };
+  const head = bytes.subarray(0, 4_096).toString("latin1").replace(/\0/g, "")
+    .replace(/^(?:\xef\xbb\xbf|\xff\xfe|\xfe\xff)/, "").trimStart().toLowerCase();
+  const workbook = declared.includes("ms-excel") || declared.includes("spreadsheet");
+  const [mediaType, label, hint] = head.includes("urn:schemas-microsoft-com:office:spreadsheet") || head.includes('progid="excel.sheet"')
+    ? ["application/xml", "XML Spreadsheet 2003 markup", "Parse it as XML (for example pandas.read_xml or an XML parser)"]
+    : /<html|<!doctype html|<table/.test(head)
+      ? ["text/html", "HTML", "Parse it as HTML (for example pandas.read_html)"]
+      : head.startsWith("{\\rtf")
+        ? ["application/rtf", "RTF", "Treat it as RTF text"]
+        : head.startsWith("<")
+          ? ["application/xml", "XML markup", "Parse it as XML"]
+          : ["text/plain", "plain text such as CSV or tab-separated values", "Parse it as delimited text (for example pandas.read_csv)"];
+  return {
+    text: {
+      mediaType,
+      notice: `Read by content: despite its name, this file is ${label}, not ${workbook ? "a binary Excel workbook" : "a binary Office document"}, so it is shown as text. ${hint}; ${workbook ? "xlrd and openpyxl" : "Office libraries"} cannot open it.`,
+    },
+  };
+}
+
+/** Text by its first bytes: a UTF-16 byte-order mark, no NUL, or the UTF-16 ASCII NUL pattern. */
+function looksLikeText(bytes: Buffer): boolean {
+  if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) return true;
+  const sample = bytes.subarray(0, 8_000);
+  let nuls = 0;
+  let oddNuls = 0;
+  sample.forEach((byte, index) => {
+    if (byte !== 0) return;
+    nuls += 1;
+    if (index % 2 === 1) oddNuls += 1;
+  });
+  return nuls === 0 || (nuls >= sample.length * 0.3 && Math.max(oddNuls, nuls - oddNuls) >= nuls * 0.9);
+}
+
+function officeFormatName(mediaType: string): string {
+  if (mediaType === "application/vnd.ms-excel") return "a legacy Excel workbook (.xls)";
+  if (mediaType === "application/msword") return "a legacy Word document (.doc)";
+  if (mediaType === "application/vnd.ms-powerpoint") return "a legacy PowerPoint presentation (.ppt)";
+  if (mediaType.includes("spreadsheet") || mediaType.includes("ms-excel")) return "an Excel workbook (.xlsx)";
+  if (mediaType.includes("presentation")) return "a PowerPoint presentation (.pptx)";
+  return "a Word document (.docx)";
 }
 
 function isExtractableOfficeMediaType(mediaType: string): boolean {

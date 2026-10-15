@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharp from "sharp";
@@ -1845,6 +1845,101 @@ describe("SandboxContinuityManager", () => {
     });
   });
 
+  describe("Office files routed by content (H-011)", () => {
+    let directory = "";
+    beforeAll(() => { directory = mkdtempSync(join(tmpdir(), "berry-office-")); });
+    afterAll(() => rmSync(directory, { recursive: true, force: true }));
+    const local = (path: string) => join(directory, path.split("/").at(-1)!);
+    // A real sandbox: files and the read helper run against local files.
+    const manager = (documentTextExtractor: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>) => new SandboxContinuityManager({
+      kind: "e2b",
+      create: vi.fn(async () => ({ sandbox_id: "sandbox-contract", provider: "e2b", status: "running" })),
+      exec: async function* (input: { command: string[] }) {
+        if (input.command[2] === PI_READ_STREAM_SCRIPT) {
+          const result = spawnSync(process.execPath, ["-e", PI_READ_STREAM_SCRIPT, local(input.command[3]!), ...input.command.slice(4)], { encoding: "utf8" });
+          yield { kind: "stdout", data: result.stdout };
+        }
+        yield { kind: "exit", exit_code: 0, signal: null };
+      },
+      files: {
+        read: vi.fn(async (input: { path: string }) => {
+          const bytes = readFileSync(local(input.path));
+          return { path: input.path, encoding: "base64" as const, content: bytes.toString("base64"), size_bytes: bytes.byteLength, mtime: null };
+        }),
+        write: vi.fn(),
+        list: vi.fn(),
+      },
+    } as unknown as SandboxProvider, {
+      loadRun: vi.fn(),
+      continuity: vi.fn(async () => null),
+      latest: vi.fn(async () => null),
+      inputFiles: vi.fn(async () => []),
+      persistOutput: vi.fn(),
+      persist: vi.fn(),
+      recordSandbox: vi.fn(async () => undefined),
+    }, null, { image: "berry-sandbox", documentTextExtractor });
+    const readFile = async (name: string, bytes: Buffer, extract: (input: { bytes: Uint8Array; mediaType: string }) => Promise<string>) => {
+      writeFileSync(join(directory, name), bytes);
+      return (await manager(extract).execute(snapshot(), toolStep("read", { path: `/workspace/inputs/file-id/${name}` }))).output as Record<string, unknown>;
+    };
+
+    it("detects an OLE2 Excel workbook by its streams inside the read helper", () => {
+      const run = (name: string, bytes: Buffer) => {
+        writeFileSync(join(directory, name), bytes);
+        return JSON.parse(spawnSync(process.execPath, ["-e", PI_READ_STREAM_SCRIPT, join(directory, name), "1", "0", "2000", "51200", "2000"], { encoding: "utf8" }).stdout) as Record<string, unknown>;
+      };
+      expect(run("report.csv", ole2File(["Workbook", "\u0005SummaryInformation"]))).toMatchObject({ binary: true, mediaType: "application/vnd.ms-excel" });
+      expect(run("old", ole2File(["Book"]))).toMatchObject({ binary: true, mediaType: "application/vnd.ms-excel" });
+      expect(run("letter.txt", ole2File(["WordDocument", "1Table"]))).toMatchObject({ binary: true, mediaType: "application/msword" });
+      expect(run("message.dat", ole2File(["__properties_version1.0"]))).toEqual({ binary: true, sizeBytes: 1536 });
+    });
+
+    it("extracts an .xls saved with a .csv name or no extension as a spreadsheet", async () => {
+      const extract = vi.fn(async () => "Sheet1\nName\tTotal\nAlpha\t12");
+      for (const name of ["export.csv", "export"]) {
+        await expect(readFile(name, ole2File(["Workbook"]), extract)).resolves.toMatchObject({
+          mediaType: "application/vnd.ms-excel",
+          extractedText: true,
+          detectedFromContent: true,
+          content: expect.stringContaining("Alpha\t12\n\n[Read by content: this file is a legacy Excel workbook (.xls)"),
+        });
+      }
+      expect(extract).toHaveBeenCalledTimes(2);
+      expect(extract).toHaveBeenCalledWith(expect.objectContaining({ mediaType: "application/vnd.ms-excel" }));
+    });
+
+    it("reads HTML, XML Spreadsheet 2003 and CSV named .xls as text instead of failing in the xls extractor", async () => {
+      const extract = vi.fn(async () => { throw new Error("Tika extraction failed with 422"); });
+      const html = '<html xmlns:x="urn:schemas-microsoft-com:office:excel">\n<table><tr><td>Name</td><td>Total</td></tr><tr><td>Alpha</td><td>12</td></tr></table>\n</html>\n';
+      await expect(readFile("report.xls", Buffer.from(html), extract)).resolves.toMatchObject({
+        mediaType: "text/html",
+        declaredMediaType: "application/vnd.ms-excel",
+        content: expect.stringMatching(/<td>Alpha<\/td>[\s\S]*this file is HTML, not a binary Excel workbook[\s\S]*pandas\.read_html/),
+      });
+      const xml = '<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet">\n</Workbook>\n';
+      await expect(readFile("sheet.xls", Buffer.from(xml), extract)).resolves.toMatchObject({
+        mediaType: "application/xml",
+        content: expect.stringContaining("XML Spreadsheet 2003 markup"),
+      });
+      const csv = "Name\tTotal\r\nAlpha\t12\r\n";
+      await expect(readFile("unicode.xls", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(csv, "utf16le")]), extract)).resolves.toMatchObject({
+        mediaType: "text/plain",
+        encoding: "utf-16le",
+        content: expect.stringContaining("Alpha\t12\n\n[Read by content"),
+      });
+      expect(extract).not.toHaveBeenCalled();
+    });
+
+    it("keeps extracting a correctly named .xls with the spreadsheet extractor", async () => {
+      const extract = vi.fn(async () => "Sheet1\nAlpha\t12");
+      await expect(readFile("real.xls", ole2File(["Workbook"]), extract)).resolves.toEqual(expect.objectContaining({
+        mediaType: "application/vnd.ms-excel",
+        content: "Sheet1\nAlpha\t12",
+      }));
+      expect(extract).toHaveBeenCalledWith(expect.objectContaining({ mediaType: "application/vnd.ms-excel" }));
+    });
+  });
+
   it("parses a grep JSON record larger than one megabyte before bounding its rendered line", () => {
     const event = JSON.stringify({
       type: "match",
@@ -2378,7 +2473,7 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("extracts Office document text through the shared document extractor", async () => {
-    const bytes = Buffer.from("binary docx bytes");
+    const bytes = Buffer.from("PK\u0003\u0004binary docx bytes", "latin1");
     const read = vi.fn(async () => ({
       path: "/workspace/inputs/file-id/requirements.docx",
       encoding: "base64" as const,
@@ -2406,14 +2501,14 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("reuses one Office extraction across paginated reads of unchanged bytes (H-067)", async () => {
-    let bytes = Buffer.from("docx bytes v1");
+    let bytes = Buffer.from("PK\u0003\u0004docx bytes v1", "latin1");
     const read = vi.fn(async (input: { path: string }) => ({
       path: input.path, encoding: "base64" as const, content: bytes.toString("base64"), size_bytes: bytes.byteLength, mtime: null,
     }));
     let failNext = false;
     const documentTextExtractor = vi.fn(async (input: { bytes: Uint8Array }) => {
       if (failNext) { failNext = false; throw new Error("Tika timed out"); }
-      return Array.from({ length: 40 }, (_, index) => `Line ${index + 1} of ${Buffer.from(input.bytes).toString()}`).join("\n");
+      return Array.from({ length: 40 }, (_, index) => `Line ${index + 1} of ${Buffer.from(input.bytes).subarray(4).toString()}`).join("\n");
     });
     const manager = managerWithProvider({ read, write: vi.fn(), list: vi.fn() }, undefined, { documentTextExtractor });
     const page = (offset: number) => manager.execute(snapshot(), toolStep("read", { path: "/workspace/inputs/file-id/spec.docx", offset, limit: 10 }));
@@ -2422,7 +2517,7 @@ describe("SandboxContinuityManager", () => {
     await expect(page(11)).resolves.toMatchObject({ output: { content: expect.stringContaining("Line 11 of docx bytes v1") } });
     expect(documentTextExtractor).toHaveBeenCalledTimes(1);
 
-    bytes = Buffer.from("docx bytes v2");
+    bytes = Buffer.from("PK\u0003\u0004docx bytes v2", "latin1");
     failNext = true;
     await expect(page(1)).rejects.toThrow("Tika timed out");
     await expect(page(1)).resolves.toMatchObject({ output: { content: expect.stringContaining("Line 1 of docx bytes v2") } });
@@ -2430,7 +2525,7 @@ describe("SandboxContinuityManager", () => {
   });
 
   it("extracts macro-enabled Excel through the shared document extractor", async () => {
-    const bytes = Buffer.from("binary xlsm bytes");
+    const bytes = Buffer.from("PK\u0003\u0004binary xlsm bytes", "latin1");
     const read = vi.fn(async () => ({
       path: "/workspace/inputs/file-id/forecast.xlsm",
       encoding: "base64" as const,
@@ -2529,7 +2624,7 @@ describe("SandboxContinuityManager", () => {
       path: input.path,
       entries: input.path.includes("/tmp/archives/") ? [{ path: `${input.path}/SKILL.md`, type: "file", size_bytes: 120 }] : [],
     }));
-    const bytes = Buffer.from("binary ppsx bytes");
+    const bytes = Buffer.from("PK\u0003\u0004binary ppsx bytes", "latin1");
     const read = vi.fn(async (input: { path: string }) => ({
       path: input.path,
       encoding: "base64" as const,
@@ -5153,4 +5248,40 @@ function piReadAwareExec(files: unknown, fallback: unknown): unknown {
       yield event;
     }
   };
+}
+
+/** A minimal OLE2 compound file (512-byte sectors): FAT, one directory sector, root streams named here. */
+function ole2File(streams: string[]): Buffer {
+  const file = Buffer.alloc(512 * 3, 0);
+  Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(file, 0);
+  file.writeUInt16LE(0x3e, 0x18);
+  file.writeUInt16LE(3, 0x1a);
+  file.writeUInt16LE(0xfffe, 0x1c);
+  file.writeUInt16LE(9, 0x1e);
+  file.writeUInt16LE(6, 0x20);
+  file.writeUInt32LE(1, 0x2c);
+  file.writeUInt32LE(1, 0x30);
+  file.writeUInt32LE(4096, 0x38);
+  file.writeUInt32LE(0xfffffffe, 0x3c);
+  file.writeUInt32LE(0xfffffffe, 0x44);
+  for (let index = 0; index < 109; index += 1) file.writeUInt32LE(index === 0 ? 0 : 0xffffffff, 0x4c + index * 4);
+  const fat = 512;
+  for (let index = 0; index < 128; index += 1) file.writeUInt32LE(0xffffffff, fat + index * 4);
+  file.writeUInt32LE(0xfffffffd, fat);
+  file.writeUInt32LE(0xfffffffe, fat + 4);
+  const entry = (index: number, name: string, type: number, child: number, right: number) => {
+    const offset = 1024 + index * 128;
+    file.write(name, offset, "utf16le");
+    file.writeUInt16LE((name.length + 1) * 2, offset + 0x40);
+    file[offset + 0x42] = type;
+    file.writeUInt32LE(0xffffffff, offset + 0x44);
+    file.writeUInt32LE(right, offset + 0x48);
+    file.writeUInt32LE(child, offset + 0x4c);
+    file.writeUInt32LE(0xfffffffe, offset + 0x74);
+  };
+  entry(0, "Root Entry", 5, streams.length > 0 ? 1 : 0xffffffff, 0xffffffff);
+  // Up to three root children, chained through their right-sibling pointers.
+  const children = streams.slice(0, 3);
+  children.forEach((name, index) => entry(index + 1, name, 2, 0xffffffff, index + 1 < children.length ? index + 2 : 0xffffffff));
+  return file;
 }
