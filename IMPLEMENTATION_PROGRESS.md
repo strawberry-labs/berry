@@ -2356,3 +2356,9 @@ AESG packages.
 - **Fix.** The desktop agent's stream accumulator applies the worker's rule from `8f966ed`: a different call id arriving with a name on an occupied index starts a new call, and a repeated id is not doubled. Ordinary fragmented streams are unchanged.
 - **Tests.** The worker regression cases ported to `packages/local-agent/src/model.test.ts`, plus interleaved parallel calls; local-agent suite 174 passed.
 - **Data impact.** None. **Deployment.** Desktop app release (not part of the web deployment).
+
+### H-062 — Reconciliation of files left in "processing" (prepared, not run)
+
+- **Script.** `scripts/reconcile-stuck-processing-files.sql`. Default is a READ ONLY report by failure reason; `-v apply=1` moves qualifying files from `processing` to `available` in one transaction and prints each changed id with its previous status. A file qualifies only if it is not deleted, is over an hour old, has a live failed file knowledge source, and has no live source still pending/extracting/chunking/embedding. Nothing else changes; failure reasons stay on `knowledge_sources`.
+- **Tested** on a disposable migrated database: of six fixtures, only the failed-and-idle file changed. A pending retry, a file with no failure, a recent file, a deleted file and an already available file were untouched. The report run changed nothing, and a second apply updated 0 rows.
+- **Not run against production.** Needs the owner's go-ahead (see the deployment steps).
